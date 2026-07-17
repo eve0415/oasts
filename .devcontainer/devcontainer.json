@@ -1,0 +1,20 @@
+{
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1.1.0": {
+      "extensions": "",
+      "installDirectlyFromGitHubRelease": true,
+      "version": "latest"
+    },
+    "ghcr.io/devcontainers/features/node:2.1.0": {
+      "installYarnUsingApt": false,
+      "nodeGypDependencies": false,
+      "npmVersion": "none",
+      "nvmInstallPath": "/usr/local/share/nvm",
+      "nvmVersion": "latest",
+      "pnpmVersion": "latest",
+      "version": "lts"
+    }
+  },
+  "image": "mcr.microsoft.com/devcontainers/rust:2.0.13-trixie",
+  "name": "oasts"
+}
