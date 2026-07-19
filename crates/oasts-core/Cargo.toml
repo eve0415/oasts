@@ -1,0 +1,24 @@
+[package]
+name = "oasts-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+ryu = "=1.0.23"
+serde_json = { version = "=1.0.150", features = ["arbitrary_precision", "preserve_order"] }
+sha2 = "=0.10.9"
+unicode-general-category = "=1.1.0"
+unicode-normalization = "=0.1.25"
+url = "=2.5.7"
+yaml-rust2 = { version = "=0.11.0", default-features = false }
+
+[dev-dependencies]
+tempfile = "=3.23.0"

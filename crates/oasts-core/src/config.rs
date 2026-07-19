@@ -1,0 +1,2063 @@
+//! Schema-version 1 configuration loading for the local, single-spec wedge.
+
+use std::ffi::OsStr;
+use std::fs;
+use std::io;
+use std::path::{Component, Path, PathBuf};
+
+use serde::{Deserialize, Deserializer};
+use serde_json::{Number, Value};
+
+use crate::diag::{Diagnostic, DiagnosticSink};
+use crate::syntax::parse_yaml_value;
+
+const CODE_IO: &str = "OASTS0001";
+const CODE_DISCOVERY: &str = "OASTS0011";
+const CODE_SCRIPT_CONFIG_UNSUPPORTED: &str = "OASTS0012";
+const CODE_PARSE: &str = "OASTS0031";
+const CODE_SCHEMA_VERSION: &str = "OASTS0041";
+const CODE_SCHEMA_URI: &str = "OASTS0042";
+const CODE_WORKSPACE_ROOT: &str = "OASTS0051";
+const CODE_SINGLE_SHAPE: &str = "OASTS0061";
+const CODE_WORKSPACE_UNSUPPORTED: &str = "OASTS0062";
+const CODE_INPUT_SHAPE: &str = "OASTS0071";
+const CODE_INPUT_PATH: &str = "OASTS0073";
+const CODE_OUTPUT: &str = "OASTS0081";
+const CODE_NAMESPACE: &str = "OASTS0091";
+const CODE_NO_ARTIFACT: &str = "OASTS0101";
+const CODE_ARTIFACT_DIRECTORY: &str = "OASTS0102";
+const CODE_DISABLED_ARTIFACT_OPTIONS: &str = "OASTS0103";
+const CODE_UNSUPPORTED_ARTIFACT: &str = "OASTS0111";
+const CODE_DISABLED_OPTIONS: &str = "OASTS0121";
+const CODE_DATE_REPRESENTATION: &str = "OASTS0131";
+const CODE_NAMING: &str = "OASTS0201";
+const CODE_EMIT: &str = "OASTS0211";
+const CODE_TRUST_LIMITS: &str = "OASTS0221";
+const CODE_BLOCK_UNSUPPORTED: &str = "OASTS0222";
+
+const DISCOVERY_NAMES: [&str; 8] = [
+    "oasts.config.ts",
+    "oasts.config.mts",
+    "oasts.config.cts",
+    "oasts.config.js",
+    "oasts.config.mjs",
+    "oasts.config.cjs",
+    "oasts.yaml",
+    "oasts.json",
+];
+
+const SCRIPT_EXTENSIONS: [&str; 6] = ["ts", "mts", "cts", "js", "mjs", "cjs"];
+const DATA_EXTENSIONS: [&str; 2] = ["yaml", "json"];
+
+#[inline(never)]
+fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// The unvalidated schema-version 1 root object.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RawConfig {
+    #[serde(
+        default,
+        rename = "$schema",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub schema: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub schema_version: Option<Number>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub workspace_root: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub input: Option<Input>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub output: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub namespace: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub specs: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub shared: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub artifacts: Option<ArtifactsConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub types: Option<TypesConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub client: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub validation: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub naming: Option<NamingConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub documentation: Option<DocumentationConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub emit: Option<EmitConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub local: Option<LocalTrustConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub remote: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub limits: Option<LimitsConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub watch: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub ci: Option<Value>,
+}
+
+/// A single input selector. Cross-field validation enforces exactly one field.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Input {
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub url: Option<String>,
+}
+
+/// Boolean shorthand or an artifact option block.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(untagged)]
+pub enum ArtifactSetting {
+    Enabled(bool),
+    Options(ArtifactOptions),
+}
+
+/// Options accepted by every artifact selector.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactOptions {
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub directory: Option<String>,
+}
+
+/// Artifact selectors before defaults are applied.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactsConfig {
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub types: Option<ArtifactSetting>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub client: Option<ArtifactSetting>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub zod: Option<ArtifactSetting>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub validators: Option<ArtifactSetting>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub tanstack: Option<ArtifactSetting>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub msw: Option<ArtifactSetting>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnumRepresentation {
+    #[default]
+    Literal,
+    Const,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnumExtensions {
+    #[default]
+    Accept,
+    Reject,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum DateTimeRepresentation {
+    #[default]
+    String,
+    Date,
+    Temporal,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum DateRepresentation {
+    #[default]
+    String,
+    Temporal,
+}
+
+/// Type artifact options with schema defaults applied during deserialization.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct TypesConfig {
+    #[serde(rename = "enum")]
+    pub enum_representation: EnumRepresentation,
+    pub enum_extensions: EnumExtensions,
+    pub date_time: DateTimeRepresentation,
+    pub date: DateRepresentation,
+    pub readonly: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum FileCase {
+    #[default]
+    Kebab,
+    Snake,
+    Camel,
+    Pascal,
+    Preserve,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum OperationCase {
+    #[default]
+    Camel,
+    Preserve,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum EnumMemberCase {
+    #[default]
+    Pascal,
+    Camel,
+    ScreamingSnake,
+    Preserve,
+}
+
+/// Naming options. Fixed casing keys remain strings so rule 20 can name them.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct NamingConfig {
+    pub file_case: FileCase,
+    pub type_case: String,
+    pub property_case: String,
+    pub operation_case: OperationCase,
+    pub enum_member_case: EnumMemberCase,
+    pub type_prefix: String,
+    pub type_suffix: String,
+}
+
+impl Default for NamingConfig {
+    fn default() -> Self {
+        Self {
+            file_case: FileCase::Kebab,
+            type_case: "pascal".to_owned(),
+            property_case: "preserve".to_owned(),
+            operation_case: OperationCase::Camel,
+            enum_member_case: EnumMemberCase::Pascal,
+            type_prefix: String::new(),
+            type_suffix: String::new(),
+        }
+    }
+}
+
+/// Documentation switches.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DocumentationConfig {
+    pub enabled: bool,
+    pub summary: bool,
+    pub description: bool,
+    pub deprecated: bool,
+    pub examples: bool,
+    pub constraints: bool,
+}
+
+impl Default for DocumentationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            summary: true,
+            description: true,
+            deprecated: true,
+            examples: true,
+            constraints: true,
+        }
+    }
+}
+
+/// Emission options. Literal-valued strings are validated as rule 21.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct EmitConfig {
+    pub runtime_directory: String,
+    pub import_extension: String,
+    pub banner: Vec<String>,
+    pub format: String,
+}
+
+impl Default for EmitConfig {
+    fn default() -> Self {
+        Self {
+            runtime_directory: "runtime".to_owned(),
+            import_extension: ".js".to_owned(),
+            banner: Vec::new(),
+            format: "deterministic".to_owned(),
+        }
+    }
+}
+
+/// Local file trust options.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct LocalTrustConfig {
+    pub allow_paths: Vec<String>,
+}
+
+/// Document graph bounds.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct LimitsConfig {
+    pub max_document_bytes: u64,
+    pub max_total_bytes: u64,
+    pub max_documents: u64,
+    pub max_ref_depth: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_document_bytes: 33_554_432,
+            max_total_bytes: 268_435_456,
+            max_documents: 256,
+            max_ref_depth: 64,
+        }
+    }
+}
+
+/// A resolved artifact selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedArtifact {
+    pub enabled: bool,
+    pub directory: PathBuf,
+}
+
+/// Fully resolved artifact selectors.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedArtifactsConfig {
+    pub types: ResolvedArtifact,
+    pub client: ResolvedArtifact,
+    pub zod: ResolvedArtifact,
+    pub validators: ResolvedArtifact,
+    pub tanstack: ResolvedArtifact,
+    pub msw: ResolvedArtifact,
+}
+
+/// The fully-defaulted, absolute-path configuration consumed by the core.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedConfig {
+    pub config_path: PathBuf,
+    pub config_dir: PathBuf,
+    pub schema: Option<String>,
+    pub schema_version: u64,
+    pub workspace_root: PathBuf,
+    pub input: PathBuf,
+    pub output: PathBuf,
+    pub namespace: String,
+    pub artifacts: ResolvedArtifactsConfig,
+    pub types: TypesConfig,
+    pub naming: NamingConfig,
+    pub documentation: DocumentationConfig,
+    pub emit: EmitConfig,
+    pub local_allow_paths: Vec<PathBuf>,
+    pub limits: LimitsConfig,
+}
+
+/// Discovers a supported configuration file.
+pub fn discover(cwd: &Path, explicit: Option<&Path>) -> Result<PathBuf, Diagnostic> {
+    if let Some(explicit_path) = explicit {
+        let path = if explicit_path.is_absolute() {
+            explicit_path.to_path_buf()
+        } else {
+            cwd.join(explicit_path)
+        };
+        let extension = path.extension().and_then(OsStr::to_str);
+        let supported = extension.is_some_and(|candidate| {
+            SCRIPT_EXTENSIONS.contains(&candidate) || DATA_EXTENSIONS.contains(&candidate)
+        });
+        if !supported {
+            return Err(config_error(
+                CODE_DISCOVERY,
+                format!(
+                    "explicit config path '{}' has an unsupported extension",
+                    path.display()
+                ),
+                Some(&path),
+                None,
+            ));
+        }
+        if !path.is_file() {
+            return Err(config_error(
+                CODE_DISCOVERY,
+                format!("explicit config path '{}' does not exist", path.display()),
+                Some(&path),
+                None,
+            ));
+        }
+        reject_script_extension(&path)?;
+        return Ok(path);
+    }
+
+    let mut candidates = DISCOVERY_NAMES
+        .iter()
+        .map(|name| cwd.join(name))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return Err(config_error(
+            CODE_DISCOVERY,
+            format!(
+                "config discovery expected exactly one candidate, found {}",
+                candidates.len()
+            ),
+            None,
+            None,
+        ));
+    }
+
+    let path = candidates.swap_remove(0);
+    reject_script_extension(&path)?;
+    Ok(path)
+}
+
+fn reject_script_extension(path: &Path) -> Result<(), Diagnostic> {
+    if path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|candidate| SCRIPT_EXTENSIONS.contains(&candidate))
+    {
+        return Err(config_error(
+            CODE_SCRIPT_CONFIG_UNSUPPORTED,
+            "TypeScript/JavaScript config is not supported in this build",
+            Some(path),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Discovers, parses, validates, and resolves one configuration file.
+pub fn load_config(explicit: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+    let discovered = discover(cwd, explicit).map_err(|diagnostic| vec![diagnostic])?;
+    let config_path = if discovered.is_absolute() {
+        discovered
+    } else {
+        absolutize_config_path(discovered, std::env::current_dir())?
+    };
+    let source = fs::read_to_string(&config_path).map_err(|error| {
+        vec![config_error(
+            CODE_IO,
+            format!("failed to read config: {error}"),
+            Some(&config_path),
+            None,
+        )]
+    })?;
+    let raw = parse_config(&config_path, &source).map_err(|diagnostic| vec![diagnostic])?;
+    resolve_config(config_path, raw)
+}
+
+fn absolutize_config_path(
+    discovered: PathBuf,
+    current_dir: io::Result<PathBuf>,
+) -> Result<PathBuf, Vec<Diagnostic>> {
+    current_dir
+        .map(|current| current.join(discovered))
+        .map_err(|error| {
+            vec![config_error(
+                CODE_IO,
+                format!("failed to resolve current directory: {error}"),
+                None,
+                None,
+            )]
+        })
+}
+
+fn parse_config(path: &Path, source: &str) -> Result<RawConfig, Diagnostic> {
+    if path.extension() == Some(OsStr::new("json")) {
+        serde_json::from_str(source).map_err(|error| {
+            config_error(
+                CODE_PARSE,
+                format!("invalid JSON config: {error}"),
+                Some(path),
+                None,
+            )
+            .with_location(to_u32(error.line()), to_u32(error.column()))
+        })
+    } else {
+        let value = parse_yaml_value(source).map_err(|error| {
+            config_error(CODE_PARSE, error.message, Some(path), None)
+                .with_location(error.line, error.col)
+        })?;
+        serde_json::from_value(value).map_err(|error| {
+            config_error(
+                CODE_PARSE,
+                format!("invalid YAML config value: {error}"),
+                Some(path),
+                None,
+            )
+        })
+    }
+}
+
+fn resolve_config(config_path: PathBuf, raw: RawConfig) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+    let mut sink = DiagnosticSink::new();
+    let source_path = config_path.as_path();
+    let config_parent = config_path
+        .parent()
+        .expect("resolved config paths always have a parent");
+    let config_dir = match fs::canonicalize(config_parent) {
+        Ok(path) => path,
+        Err(error) => {
+            sink.push(config_error(
+                CODE_IO,
+                format!("failed to resolve config directory: {error}"),
+                Some(source_path),
+                None,
+            ));
+            config_parent.to_path_buf()
+        }
+    };
+
+    match raw.schema_version.as_ref().and_then(Number::as_u64) {
+        Some(1) => {}
+        _ => sink.push(config_error(
+            CODE_SCHEMA_VERSION,
+            "schemaVersion is required and must be the integer literal 1",
+            Some(source_path),
+            Some("/schemaVersion"),
+        )),
+    }
+    if raw.schema.as_deref().is_some_and(|uri| !is_uri(uri)) {
+        sink.push(config_error(
+            CODE_SCHEMA_URI,
+            "$schema must be a URI string",
+            Some(source_path),
+            Some("/$schema"),
+        ));
+    }
+
+    let workspace_text = raw.workspace_root.as_deref().unwrap_or(".");
+    let workspace_root = match resolve_below(&config_dir, Path::new(workspace_text), true) {
+        Ok(path) => path,
+        Err(reason) => {
+            sink.push(config_error(
+                CODE_WORKSPACE_ROOT,
+                format!("invalid workspaceRoot: {reason}"),
+                Some(source_path),
+                Some("/workspaceRoot"),
+            ));
+            config_dir.clone()
+        }
+    };
+
+    let workspace_shape = raw.specs.is_some() || raw.shared.is_some();
+    if workspace_shape {
+        sink.push(config_error(
+            CODE_WORKSPACE_UNSUPPORTED,
+            "multi-spec workspace config is not supported in this build",
+            Some(source_path),
+            raw.specs.as_ref().map(|_| "/specs").or(Some("/shared")),
+        ));
+    }
+
+    let input = if workspace_shape {
+        None
+    } else {
+        resolve_input(raw.input.as_ref(), &workspace_root, source_path, &mut sink)
+    };
+    let output = if workspace_shape {
+        None
+    } else {
+        resolve_output(
+            raw.output.as_deref(),
+            &workspace_root,
+            source_path,
+            &mut sink,
+        )
+    };
+
+    let namespace = raw.namespace.unwrap_or_else(|| "api".to_owned());
+    if !is_ts_identifier(&namespace) {
+        sink.push(config_error(
+            CODE_NAMESPACE,
+            format!("namespace '{namespace}' is not a valid TypeScript identifier"),
+            Some(source_path),
+            Some("/namespace"),
+        ));
+    }
+
+    let raw_artifacts = raw.artifacts.unwrap_or_default();
+    let artifact_states = resolve_artifacts(raw_artifacts, source_path, &mut sink);
+    if raw.types.is_some() && !artifact_states.types.enabled {
+        sink.push(config_error(
+            CODE_DISABLED_OPTIONS,
+            "types options are invalid while the types artifact is disabled",
+            Some(source_path),
+            Some("/types"),
+        ));
+    }
+    if raw.client.is_some() {
+        sink.push(config_error(
+            CODE_DISABLED_OPTIONS,
+            "client options are not supported because the client artifact is unavailable in this build",
+            Some(source_path),
+            Some("/client"),
+        ));
+    }
+    if raw.validation.is_some() {
+        sink.push(config_error(
+            CODE_DISABLED_OPTIONS,
+            "validation options are not supported because the client artifact is unavailable in this build",
+            Some(source_path),
+            Some("/validation"),
+        ));
+    }
+
+    let types = raw.types.unwrap_or_default();
+    if types.date_time != DateTimeRepresentation::String || types.date != DateRepresentation::String
+    {
+        sink.push(config_error(
+            CODE_DATE_REPRESENTATION,
+            "non-string dateTime/date representations require the client artifact",
+            Some(source_path),
+            Some("/types"),
+        ));
+    }
+
+    let naming = raw.naming.unwrap_or_default();
+    validate_naming(&naming, source_path, &mut sink);
+    let documentation = raw.documentation.unwrap_or_default();
+    let emit = raw.emit.unwrap_or_default();
+    validate_emit(&emit, source_path, &mut sink);
+
+    let local = raw.local.unwrap_or_default();
+    let local_allow_paths = resolve_local_paths(&local, &config_dir, source_path, &mut sink);
+    let limits = raw.limits.unwrap_or_default();
+    validate_limits(&limits, source_path, &mut sink);
+
+    for (present, pointer, name) in [
+        (raw.remote.is_some(), "/remote", "remote"),
+        (raw.watch.is_some(), "/watch", "watch"),
+        (raw.ci.is_some(), "/ci", "ci"),
+    ] {
+        if present {
+            sink.push(config_error(
+                CODE_BLOCK_UNSUPPORTED,
+                format!("{name} config is not supported in this build"),
+                Some(source_path),
+                Some(pointer),
+            ));
+        }
+    }
+
+    let diagnostics = sink.into_sorted_vec();
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
+
+    let input = input.expect("an unresolved input always emits a diagnostic");
+    let output = output.expect("an unresolved output always emits a diagnostic");
+    let artifacts = artifact_states.with_output(&output);
+
+    Ok(ResolvedConfig {
+        config_path,
+        config_dir,
+        schema: raw.schema,
+        schema_version: 1,
+        workspace_root,
+        input,
+        output,
+        namespace,
+        artifacts,
+        types,
+        naming,
+        documentation,
+        emit,
+        local_allow_paths,
+        limits,
+    })
+}
+
+fn resolve_input(
+    input: Option<&Input>,
+    workspace_root: &Path,
+    source: &Path,
+    sink: &mut DiagnosticSink,
+) -> Option<PathBuf> {
+    let Some(input) = input else {
+        sink.push(config_error(
+            CODE_SINGLE_SHAPE,
+            "single-spec config requires input",
+            Some(source),
+            Some("/input"),
+        ));
+        return None;
+    };
+    match (input.path.as_deref(), input.url.as_deref()) {
+        (Some(path), None) if is_uri(path) => Some(PathBuf::from(path)),
+        (Some(path), None) => match resolve_below(workspace_root, Path::new(path), true) {
+            Ok(resolved) => Some(resolved),
+            Err(reason) => {
+                sink.push(config_error(
+                    CODE_INPUT_PATH,
+                    format!("invalid local input path: {reason}"),
+                    Some(source),
+                    Some("/input/path"),
+                ));
+                None
+            }
+        },
+        (None, Some(url)) if is_uri(url) => Some(PathBuf::from(url)),
+        (None, Some(_)) => {
+            sink.push(config_error(
+                CODE_INPUT_PATH,
+                "input.url must be an absolute URI",
+                Some(source),
+                Some("/input/url"),
+            ));
+            None
+        }
+        _ => {
+            sink.push(config_error(
+                CODE_INPUT_SHAPE,
+                "input must contain exactly one of path or url",
+                Some(source),
+                Some("/input"),
+            ));
+            None
+        }
+    }
+}
+
+fn resolve_output(
+    output: Option<&str>,
+    workspace_root: &Path,
+    source: &Path,
+    sink: &mut DiagnosticSink,
+) -> Option<PathBuf> {
+    let Some(output) = output else {
+        sink.push(config_error(
+            CODE_SINGLE_SHAPE,
+            "single-spec config requires output",
+            Some(source),
+            Some("/output"),
+        ));
+        return None;
+    };
+    match resolve_below(workspace_root, Path::new(output), false) {
+        Ok(path) => Some(path),
+        Err(reason) => {
+            sink.push(config_error(
+                CODE_OUTPUT,
+                format!("invalid output: {reason}"),
+                Some(source),
+                Some("/output"),
+            ));
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArtifactState {
+    enabled: bool,
+    directory: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArtifactStates {
+    types: ArtifactState,
+    client: ArtifactState,
+    zod: ArtifactState,
+    validators: ArtifactState,
+    tanstack: ArtifactState,
+    msw: ArtifactState,
+}
+
+impl ArtifactStates {
+    fn with_output(self, output: &Path) -> ResolvedArtifactsConfig {
+        ResolvedArtifactsConfig {
+            types: resolved_artifact(self.types, output),
+            client: resolved_artifact(self.client, output),
+            zod: resolved_artifact(self.zod, output),
+            validators: resolved_artifact(self.validators, output),
+            tanstack: resolved_artifact(self.tanstack, output),
+            msw: resolved_artifact(self.msw, output),
+        }
+    }
+}
+
+fn resolved_artifact(state: ArtifactState, output: &Path) -> ResolvedArtifact {
+    ResolvedArtifact {
+        enabled: state.enabled,
+        directory: output.join(state.directory),
+    }
+}
+
+fn resolve_artifacts(
+    raw: ArtifactsConfig,
+    source: &Path,
+    sink: &mut DiagnosticSink,
+) -> ArtifactStates {
+    let types = resolve_artifact_setting(raw.types, true, "types", "types", source, sink);
+    let client = resolve_artifact_setting(raw.client, false, "client", "client", source, sink);
+    let zod = resolve_artifact_setting(raw.zod, false, "zod", "zod", source, sink);
+    let validators = resolve_artifact_setting(
+        raw.validators,
+        false,
+        "validators",
+        "validators",
+        source,
+        sink,
+    );
+    let tanstack =
+        resolve_artifact_setting(raw.tanstack, false, "tanstack", "tanstack", source, sink);
+    let msw = resolve_artifact_setting(raw.msw, false, "msw", "msw", source, sink);
+    let states = ArtifactStates {
+        types,
+        client,
+        zod,
+        validators,
+        tanstack,
+        msw,
+    };
+
+    let entries = [
+        ("types", &states.types),
+        ("client", &states.client),
+        ("zod", &states.zod),
+        ("validators", &states.validators),
+        ("tanstack", &states.tanstack),
+        ("msw", &states.msw),
+    ];
+    if !entries.iter().any(|(_, state)| state.enabled) {
+        sink.push(config_error(
+            CODE_NO_ARTIFACT,
+            "at least one artifact must be enabled",
+            Some(source),
+            Some("/artifacts"),
+        ));
+    }
+    for (name, state) in entries.into_iter().skip(1) {
+        if state.enabled {
+            sink.push(config_error(
+                CODE_UNSUPPORTED_ARTIFACT,
+                format!("artifact '{name}' is not supported in this build"),
+                Some(source),
+                Some("/artifacts"),
+            ));
+        }
+    }
+    states
+}
+
+fn resolve_artifact_setting(
+    setting: Option<ArtifactSetting>,
+    default_enabled: bool,
+    default_directory: &str,
+    name: &str,
+    source: &Path,
+    sink: &mut DiagnosticSink,
+) -> ArtifactState {
+    let (enabled, directory, disabled_option_block) = match setting {
+        None => (default_enabled, default_directory.to_owned(), false),
+        Some(ArtifactSetting::Enabled(enabled)) => (enabled, default_directory.to_owned(), false),
+        Some(ArtifactSetting::Options(options)) => {
+            let enabled = options.enabled.unwrap_or(true);
+            let disabled = !enabled && options.directory.is_some();
+            (
+                enabled,
+                options
+                    .directory
+                    .unwrap_or_else(|| default_directory.to_owned()),
+                disabled,
+            )
+        }
+    };
+    if disabled_option_block {
+        sink.push(config_error(
+            CODE_DISABLED_ARTIFACT_OPTIONS,
+            format!("disabled artifact '{name}' cannot specify directory options"),
+            Some(source),
+            Some("/artifacts"),
+        ));
+    }
+    if !is_valid_directory(&directory) {
+        sink.push(config_error(
+            CODE_ARTIFACT_DIRECTORY,
+            format!("artifact '{name}' has invalid directory '{directory}'"),
+            Some(source),
+            Some("/artifacts"),
+        ));
+    }
+    ArtifactState { enabled, directory }
+}
+
+fn validate_naming(naming: &NamingConfig, source: &Path, sink: &mut DiagnosticSink) {
+    if naming.type_case != "pascal" {
+        sink.push(config_error(
+            CODE_NAMING,
+            "naming.typeCase must be 'pascal'",
+            Some(source),
+            Some("/naming/typeCase"),
+        ));
+    }
+    if naming.property_case != "preserve" {
+        sink.push(config_error(
+            CODE_NAMING,
+            "naming.propertyCase must be 'preserve'",
+            Some(source),
+            Some("/naming/propertyCase"),
+        ));
+    }
+    if !naming.type_prefix.is_empty() && !is_ts_identifier(&naming.type_prefix) {
+        sink.push(config_error(
+            CODE_NAMING,
+            "naming.typePrefix must be empty or a valid identifier prefix",
+            Some(source),
+            Some("/naming/typePrefix"),
+        ));
+    }
+    if !naming
+        .type_suffix
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$')
+    {
+        sink.push(config_error(
+            CODE_NAMING,
+            "naming.typeSuffix must contain only identifier characters",
+            Some(source),
+            Some("/naming/typeSuffix"),
+        ));
+    }
+}
+
+fn validate_emit(emit: &EmitConfig, source: &Path, sink: &mut DiagnosticSink) {
+    if !is_valid_directory(&emit.runtime_directory) {
+        sink.push(config_error(
+            CODE_EMIT,
+            "emit.runtimeDirectory must be a non-empty relative directory without '..'",
+            Some(source),
+            Some("/emit/runtimeDirectory"),
+        ));
+    }
+    if emit.import_extension != ".js" && emit.import_extension != "none" {
+        sink.push(config_error(
+            CODE_EMIT,
+            "emit.importExtension must be '.js' or 'none'",
+            Some(source),
+            Some("/emit/importExtension"),
+        ));
+    }
+    if emit.format != "deterministic" {
+        sink.push(config_error(
+            CODE_EMIT,
+            "emit.format must be 'deterministic'",
+            Some(source),
+            Some("/emit/format"),
+        ));
+    }
+    for (index, line) in emit.banner.iter().enumerate() {
+        let forbidden = line.contains('\0')
+            || line.contains('\n')
+            || line.contains('\r')
+            || line.contains('\u{2028}')
+            || line.contains('\u{2029}')
+            || line.contains("sourceMappingURL=")
+            || line.contains("Generated by Oasts");
+        if forbidden {
+            sink.push(config_error(
+                CODE_EMIT,
+                format!("emit.banner element {index} contains a forbidden sequence"),
+                Some(source),
+                Some("/emit/banner"),
+            ));
+        }
+    }
+}
+
+fn resolve_local_paths(
+    local: &LocalTrustConfig,
+    config_dir: &Path,
+    source: &Path,
+    sink: &mut DiagnosticSink,
+) -> Vec<PathBuf> {
+    local
+        .allow_paths
+        .iter()
+        .filter_map(|entry| {
+            let path = Path::new(entry);
+            if path.is_absolute() {
+                sink.push(config_error(
+                    CODE_TRUST_LIMITS,
+                    format!("local.allowPaths entry '{entry}' must be relative"),
+                    Some(source),
+                    Some("/local/allowPaths"),
+                ));
+                None
+            } else {
+                Some(normalize_join(config_dir, path))
+            }
+        })
+        .collect()
+}
+
+fn validate_limits(limits: &LimitsConfig, source: &Path, sink: &mut DiagnosticSink) {
+    let ranges = [
+        (
+            "maxDocumentBytes",
+            limits.max_document_bytes,
+            1_024,
+            1_073_741_824,
+        ),
+        (
+            "maxTotalBytes",
+            limits.max_total_bytes,
+            1_024,
+            4_294_967_296,
+        ),
+        ("maxDocuments", limits.max_documents, 1, 4_096),
+        ("maxRefDepth", limits.max_ref_depth, 1, 1_024),
+    ];
+    for (name, value, minimum, maximum) in ranges {
+        if !(minimum..=maximum).contains(&value) {
+            sink.push(config_error(
+                CODE_TRUST_LIMITS,
+                format!("limits.{name} value {value} is outside {minimum}..={maximum}"),
+                Some(source),
+                Some("/limits"),
+            ));
+        }
+    }
+}
+
+fn config_error(
+    code: &'static str,
+    message: impl Into<String>,
+    source: Option<&Path>,
+    pointer: Option<&str>,
+) -> Diagnostic {
+    let mut diagnostic = Diagnostic::config(code, message);
+    if let Some(source) = source {
+        diagnostic = diagnostic.with_source(source.to_string_lossy());
+    }
+    if let Some(pointer) = pointer {
+        diagnostic = diagnostic.with_json_pointer(pointer);
+    }
+    diagnostic
+}
+
+fn is_uri(value: &str) -> bool {
+    let Some((scheme, remainder)) = value.split_once(':') else {
+        return false;
+    };
+    !remainder.is_empty()
+        && scheme
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        && !value.bytes().any(|byte| byte.is_ascii_whitespace())
+}
+
+fn is_ts_identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || matches!(first, b'_' | b'$'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
+}
+
+fn is_valid_directory(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && value != "."
+        && !path.is_absolute()
+        && path.components().all(|component| {
+            !matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+}
+
+fn resolve_below(base: &Path, relative: &Path, allow_equal: bool) -> Result<PathBuf, String> {
+    if relative.is_absolute() {
+        return Err("path must be relative".to_owned());
+    }
+    let candidate = lexical_join_below(base, relative)
+        .ok_or_else(|| "path escapes its allowed root".to_owned())?;
+    if !allow_equal && candidate == base {
+        return Err("path must be below, not equal to, its allowed root".to_owned());
+    }
+
+    if base.exists() {
+        let canonical_base = canonicalize_result(fs::canonicalize(base), "allowed root")?;
+        let existing_ancestor = nearest_existing_ancestor(&candidate)
+            .expect("an existing base is always an ancestor of its lexical child");
+        let canonical_ancestor =
+            canonicalize_result(fs::canonicalize(&existing_ancestor), "path ancestor")?;
+        if !canonical_ancestor.starts_with(&canonical_base) {
+            return Err("path resolves through a symlink outside its allowed root".to_owned());
+        }
+        if candidate.exists() {
+            return canonicalize_result(fs::canonicalize(&candidate), "path");
+        }
+    }
+    Ok(candidate)
+}
+
+fn canonicalize_result(result: io::Result<PathBuf>, context: &str) -> Result<PathBuf, String> {
+    match result {
+        Ok(path) => Ok(path),
+        Err(error) => Err(format!("failed to canonicalize {context}: {error}")),
+    }
+}
+
+fn lexical_join_below(base: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut result = base.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => result.push(part),
+            Component::ParentDir => {
+                if result == base || !result.pop() {
+                    return None;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    result.starts_with(base).then_some(result)
+}
+
+fn normalize_join(base: &Path, relative: &Path) -> PathBuf {
+    let mut result = base.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => result.push(part),
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    result
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut candidate = path.to_path_buf();
+    loop {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !candidate.pop() {
+            return None;
+        }
+    }
+}
+
+fn to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::diag::Category;
+
+    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "oasts-config-test-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("test directory should be created");
+            Self { path }
+        }
+
+        fn new_relative() -> Self {
+            let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = PathBuf::from("../../target").join(format!(
+                "oasts-config-relative-test-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("relative test directory should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn write(&self, name: &str, contents: &str) -> PathBuf {
+            let path = self.path.join(name);
+            fs::write(&path, contents).expect("test config should be written");
+            path
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.path).expect("test directory should be removed");
+        }
+    }
+
+    fn valid_yaml() -> &'static str {
+        "schemaVersion: 1\ninput:\n  path: openapi.yaml\noutput: generated\n"
+    }
+
+    fn valid_json_value() -> Value {
+        json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.yaml" },
+            "output": "generated"
+        })
+    }
+
+    fn load_yaml(contents: &str) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+        let directory = TestDirectory::new();
+        let path = directory.write("config.yaml", contents);
+        load_config(Some(&path), directory.path())
+    }
+
+    fn load_json(value: &Value) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+        let directory = TestDirectory::new();
+        let contents = serde_json::to_string(value).expect("test JSON should serialize");
+        let path = directory.write("config.json", &contents);
+        load_config(Some(&path), directory.path())
+    }
+
+    fn assert_code(
+        result: Result<ResolvedConfig, Vec<Diagnostic>>,
+        code: &'static str,
+    ) -> Vec<Diagnostic> {
+        let diagnostics = result.expect_err("config should be rejected");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == code)
+            .expect("expected config diagnostic code");
+        assert_eq!(diagnostic.category, Category::Config);
+        assert_eq!(diagnostic.category.exit_code(), 2);
+        diagnostics
+    }
+
+    fn assert_discovery_code(result: Result<PathBuf, Diagnostic>, code: &'static str) {
+        let diagnostic = result.expect_err("discovery should fail");
+        assert_eq!(diagnostic.code, code);
+        assert_eq!(diagnostic.category, Category::Config);
+        assert_eq!(diagnostic.category.exit_code(), 2);
+    }
+
+    #[test]
+    fn default_types_only_config_resolves_absolute_paths_and_defaults() {
+        let directory = TestDirectory::new();
+        let path = directory.write("config.yaml", valid_yaml());
+
+        let resolved =
+            load_config(Some(&path), directory.path()).expect("valid config should resolve");
+
+        assert_eq!(resolved.schema_version, 1);
+        assert_eq!(resolved.config_dir, directory.path());
+        assert_eq!(resolved.workspace_root, directory.path());
+        assert_eq!(resolved.input, directory.path().join("openapi.yaml"));
+        assert_eq!(resolved.output, directory.path().join("generated"));
+        assert_eq!(resolved.namespace, "api");
+        assert!(resolved.artifacts.types.enabled);
+        assert_eq!(
+            resolved.artifacts.types.directory,
+            directory.path().join("generated/types")
+        );
+        assert!(!resolved.artifacts.client.enabled);
+        assert_eq!(resolved.emit.runtime_directory, "runtime");
+        assert_eq!(resolved.limits, LimitsConfig::default());
+    }
+
+    #[test]
+    fn discovery_rejects_zero_candidates() {
+        let directory = TestDirectory::new();
+        assert_discovery_code(discover(directory.path(), None), CODE_DISCOVERY);
+    }
+
+    #[test]
+    fn discovery_rejects_two_candidates() {
+        let directory = TestDirectory::new();
+        directory.write("oasts.yaml", valid_yaml());
+        directory.write("oasts.json", "{}");
+        assert_discovery_code(discover(directory.path(), None), CODE_DISCOVERY);
+    }
+
+    #[test]
+    fn discovery_ignores_yml_alias() {
+        let directory = TestDirectory::new();
+        directory.write("oasts.yml", valid_yaml());
+        let yaml = directory.write("oasts.yaml", valid_yaml());
+        assert_eq!(
+            discover(directory.path(), None).expect("yaml candidate should be found"),
+            yaml
+        );
+    }
+
+    #[test]
+    fn discovery_reports_script_config_as_unsupported() {
+        let directory = TestDirectory::new();
+        directory.write("oasts.config.ts", "export default {};");
+        assert_discovery_code(
+            discover(directory.path(), None),
+            CODE_SCRIPT_CONFIG_UNSUPPORTED,
+        );
+    }
+
+    #[test]
+    fn explicit_script_config_is_also_unsupported() {
+        let directory = TestDirectory::new();
+        let script = directory.write("custom.mjs", "export default {};");
+        assert_discovery_code(
+            discover(directory.path(), Some(&script)),
+            CODE_SCRIPT_CONFIG_UNSUPPORTED,
+        );
+    }
+
+    #[test]
+    fn relative_discovery_is_absolutized_before_loading() {
+        let directory = TestDirectory::new_relative();
+        directory.write("oasts.yaml", valid_yaml());
+
+        let resolved = load_config(None, directory.path()).expect("relative config should load");
+        assert!(resolved.config_path.is_absolute());
+    }
+
+    #[test]
+    fn current_directory_failure_is_a_config_io_diagnostic() {
+        let error = absolutize_config_path(
+            PathBuf::from("config.yaml"),
+            Err(io::Error::other("current directory unavailable")),
+        )
+        .expect_err("current directory failure should be reported");
+        assert_eq!(error[0].code, CODE_IO);
+        assert!(error[0].message.contains("current directory unavailable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_config_is_a_config_io_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new();
+        let path = directory.write("config.yaml", valid_yaml());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
+            .expect("config permissions should change");
+        let result = load_config(Some(&path), directory.path());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("config permissions should be restored");
+        assert_code(result, CODE_IO);
+    }
+
+    #[test]
+    fn explicit_yml_extension_is_rejected() {
+        let directory = TestDirectory::new();
+        let path = directory.write("config.yml", valid_yaml());
+        assert_discovery_code(discover(directory.path(), Some(&path)), CODE_DISCOVERY);
+    }
+
+    #[test]
+    fn explicit_missing_config_is_rejected() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("missing.json");
+        assert_discovery_code(discover(directory.path(), Some(&path)), CODE_DISCOVERY);
+    }
+
+    #[test]
+    fn yaml_duplicate_root_key_is_rejected_with_location() {
+        let diagnostics = assert_code(
+            load_yaml(
+                "schemaVersion: 1\nschemaVersion: 1\ninput: { path: openapi.yaml }\noutput: generated\n",
+            ),
+            CODE_PARSE,
+        );
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_PARSE)
+            .expect("parse diagnostic should exist");
+        assert!(diagnostic.line.is_some());
+        assert!(diagnostic.col.is_some());
+    }
+
+    #[test]
+    fn yaml_duplicate_nested_key_is_rejected() {
+        assert_code(
+            load_yaml(
+                "schemaVersion: 1\ninput: { path: openapi.yaml }\noutput: generated\ntypes:\n  readonly: true\n  readonly: false\n",
+            ),
+            CODE_PARSE,
+        );
+    }
+
+    #[test]
+    fn yaml_core_schema_leaves_off_yes_and_no_as_strings() {
+        let value =
+            parse_yaml_value("values: [off, yes, no]").expect("core-schema strings should parse");
+        assert_eq!(value, json!({ "values": ["off", "yes", "no"] }));
+    }
+
+    #[test]
+    fn yaml_quoted_false_stays_a_string() {
+        let value = parse_yaml_value("value: \"false\"").expect("quoted string should parse");
+        assert_eq!(value, json!({ "value": "false" }));
+    }
+
+    #[test]
+    fn yaml_core_schema_resolves_supported_numbers_and_literals() {
+        let value = parse_yaml_value("values: [0o10, 0x10, 12, 1.5, 1e2, null, TRUE]")
+            .expect("core-schema scalars should parse");
+        assert_eq!(
+            value,
+            json!({ "values": [8, 16, 12, 1.5, 100.0, null, true] })
+        );
+    }
+
+    #[test]
+    fn yaml_core_schema_does_not_resolve_non_matching_number_spellings() {
+        let value = parse_yaml_value("values: [1_0, -0o7, +0xA, +.nan, 12:34]")
+            .expect("non-matching scalars should remain strings");
+        assert_eq!(
+            value,
+            json!({ "values": ["1_0", "-0o7", "+0xA", "+.nan", "12:34"] })
+        );
+    }
+
+    #[test]
+    fn yaml_unknown_key_is_rejected() {
+        assert_code(
+            load_yaml(&format!("{}unknown: true\n", valid_yaml())),
+            CODE_PARSE,
+        );
+
+        assert_code(
+            load_yaml(
+                "schemaVersion: 1\ninput: { path: openapi.yaml, unknown: true }\noutput: generated\n",
+            ),
+            CODE_PARSE,
+        );
+    }
+
+    #[test]
+    fn yaml_string_is_not_coerced_to_boolean() {
+        assert_code(
+            load_yaml(&format!("{}types:\n  readonly: \"false\"\n", valid_yaml())),
+            CODE_PARSE,
+        );
+    }
+
+    #[test]
+    fn yaml_plain_off_is_not_coerced_to_boolean() {
+        assert_code(
+            load_yaml(&format!("{}types:\n  readonly: off\n", valid_yaml())),
+            CODE_PARSE,
+        );
+    }
+
+    #[test]
+    fn yaml_syntax_error_has_a_location() {
+        let diagnostics = assert_code(load_yaml("schemaVersion: [\n"), CODE_PARSE);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_PARSE)
+            .expect("parse diagnostic should exist");
+        assert!(diagnostic.line.is_some());
+        assert!(diagnostic.col.is_some());
+    }
+
+    #[test]
+    fn yaml_anchors_are_rejected_clearly() {
+        assert_code(
+            load_yaml(
+                "schemaVersion: 1\ninput: &input { path: openapi.yaml }\noutput: generated\n",
+            ),
+            CODE_PARSE,
+        );
+    }
+
+    #[test]
+    fn missing_schema_version_is_rule_4() {
+        assert_code(
+            load_yaml("input: { path: openapi.yaml }\noutput: generated\n"),
+            CODE_SCHEMA_VERSION,
+        );
+    }
+
+    #[test]
+    fn unsupported_schema_version_is_rule_4() {
+        let mut value = valid_json_value();
+        value["schemaVersion"] = json!(2);
+        assert_code(load_json(&value), CODE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn non_integer_schema_version_is_rule_4() {
+        let mut value = valid_json_value();
+        value["schemaVersion"] = json!(1.0);
+        assert_code(load_json(&value), CODE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn string_schema_version_is_a_wrong_type() {
+        let mut value = valid_json_value();
+        value["schemaVersion"] = json!("1");
+        assert_code(load_json(&value), CODE_PARSE);
+    }
+
+    #[test]
+    fn schema_uri_is_validated() {
+        let mut valid = valid_json_value();
+        valid["$schema"] = json!("https://eve0415.github.io/oasts/schema/config-v1.json");
+        load_json(&valid).expect("URI schema metadata should be accepted");
+
+        valid["$schema"] = json!("not a uri");
+        assert_code(load_json(&valid), CODE_SCHEMA_URI);
+    }
+
+    #[test]
+    fn workspace_shape_reports_named_unsupported_feature() {
+        let value = json!({ "schemaVersion": 1, "specs": {} });
+        let diagnostics = assert_code(load_json(&value), CODE_WORKSPACE_UNSUPPORTED);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_SINGLE_SHAPE)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn missing_single_spec_fields_are_rule_6() {
+        assert_code(load_yaml("schemaVersion: 1\n"), CODE_SINGLE_SHAPE);
+    }
+
+    #[test]
+    fn input_with_both_selectors_is_rule_7() {
+        assert_code(
+            load_yaml(
+                "schemaVersion: 1\ninput: { path: openapi.yaml, url: https://example.com/openapi.yaml }\noutput: generated\n",
+            ),
+            CODE_INPUT_SHAPE,
+        );
+    }
+
+    #[test]
+    fn input_with_neither_selector_is_rule_7() {
+        assert_code(
+            load_yaml("schemaVersion: 1\ninput: {}\noutput: generated\n"),
+            CODE_INPUT_SHAPE,
+        );
+    }
+
+    #[test]
+    fn remote_input_is_deferred_to_the_document_loader() {
+        let resolved = load_yaml(
+            "schemaVersion: 1\ninput: { url: https://example.com/openapi.yaml }\noutput: generated\n",
+        )
+        .expect("URL input should resolve for the document loader");
+        assert_eq!(
+            resolved.input,
+            PathBuf::from("https://example.com/openapi.yaml")
+        );
+    }
+
+    #[test]
+    fn input_url_must_be_absolute() {
+        assert_code(
+            load_yaml("schemaVersion: 1\ninput: { url: openapi.yaml }\noutput: generated\n"),
+            CODE_INPUT_PATH,
+        );
+    }
+
+    #[test]
+    fn local_input_cannot_escape_workspace_root() {
+        assert_code(
+            load_yaml("schemaVersion: 1\ninput: { path: ../openapi.yaml }\noutput: generated\n"),
+            CODE_INPUT_PATH,
+        );
+    }
+
+    #[test]
+    fn workspace_root_must_be_relative_and_bounded() {
+        let mut absolute = valid_json_value();
+        absolute["workspaceRoot"] = json!("/tmp");
+        assert_code(load_json(&absolute), CODE_WORKSPACE_ROOT);
+
+        let mut escaping = valid_json_value();
+        escaping["workspaceRoot"] = json!("../outside");
+        assert_code(load_json(&escaping), CODE_WORKSPACE_ROOT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_root_cannot_escape_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let outside = TestDirectory::new();
+        symlink(outside.path(), directory.path().join("escape"))
+            .expect("test symlink should be created");
+        let path = directory.write(
+            "config.yaml",
+            "schemaVersion: 1\nworkspaceRoot: escape\ninput: { path: openapi.yaml }\noutput: generated\n",
+        );
+        assert_code(
+            load_config(Some(&path), directory.path()),
+            CODE_WORKSPACE_ROOT,
+        );
+    }
+
+    #[test]
+    fn relative_workspace_root_resolves_successfully() {
+        let directory = TestDirectory::new();
+        fs::create_dir(directory.path().join("workspace"))
+            .expect("workspace directory should be created");
+        let path = directory.write(
+            "config.yaml",
+            "schemaVersion: 1\nworkspaceRoot: workspace\ninput: { path: openapi.yaml }\noutput: generated\n",
+        );
+        let resolved =
+            load_config(Some(&path), directory.path()).expect("workspace should resolve");
+        assert_eq!(resolved.workspace_root, directory.path().join("workspace"));
+        assert_eq!(
+            resolved.output,
+            directory.path().join("workspace/generated")
+        );
+    }
+
+    #[test]
+    fn output_must_be_relative_below_workspace_root() {
+        for output in ["/tmp/generated", "../generated", "."] {
+            let mut value = valid_json_value();
+            value["output"] = json!(output);
+            assert_code(load_json(&value), CODE_OUTPUT);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_cannot_escape_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let outside = TestDirectory::new();
+        symlink(outside.path(), directory.path().join("generated"))
+            .expect("test symlink should be created");
+        let path = directory.write("config.yaml", valid_yaml());
+        assert_code(load_config(Some(&path), directory.path()), CODE_OUTPUT);
+    }
+
+    #[test]
+    fn namespace_must_be_a_ts_identifier() {
+        let mut invalid = valid_json_value();
+        invalid["namespace"] = json!("1-invalid");
+        assert_code(load_json(&invalid), CODE_NAMESPACE);
+
+        let mut valid = valid_json_value();
+        valid["namespace"] = json!("$api_2");
+        load_json(&valid).expect("valid namespace should resolve");
+    }
+
+    #[test]
+    fn artifact_defaults_are_types_only() {
+        let resolved = load_yaml(valid_yaml()).expect("default artifacts should resolve");
+        assert!(resolved.artifacts.types.enabled);
+        assert!(!resolved.artifacts.client.enabled);
+        assert!(!resolved.artifacts.zod.enabled);
+        assert!(!resolved.artifacts.validators.enabled);
+        assert!(!resolved.artifacts.tanstack.enabled);
+        assert!(!resolved.artifacts.msw.enabled);
+    }
+
+    #[test]
+    fn every_non_types_artifact_reports_named_unsupported_error() {
+        for artifact in ["client", "zod", "validators", "tanstack", "msw"] {
+            let mut value = valid_json_value();
+            value["artifacts"] = json!({ (artifact): true });
+            let diagnostics = assert_code(load_json(&value), CODE_UNSUPPORTED_ARTIFACT);
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == CODE_UNSUPPORTED_ARTIFACT
+                    && diagnostic.message.contains(artifact)
+            }));
+        }
+    }
+
+    #[test]
+    fn artifact_selector_rejects_string_coercion() {
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "types": "true" });
+        assert_code(load_json(&value), CODE_PARSE);
+    }
+
+    #[test]
+    fn disabling_every_artifact_is_rule_10() {
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "types": false });
+        assert_code(load_json(&value), CODE_NO_ARTIFACT);
+    }
+
+    #[test]
+    fn disabled_artifact_directory_options_are_rule_10() {
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({
+            "types": { "enabled": false, "directory": "model" }
+        });
+        assert_code(load_json(&value), CODE_DISABLED_ARTIFACT_OPTIONS);
+    }
+
+    #[test]
+    fn artifact_directories_are_validated() {
+        for directory in ["", ".", "/absolute", "../outside", "a/../b"] {
+            let mut value = valid_json_value();
+            value["artifacts"] = json!({ "types": { "directory": directory } });
+            assert_code(load_json(&value), CODE_ARTIFACT_DIRECTORY);
+        }
+
+        let mut valid = valid_json_value();
+        valid["artifacts"] = json!({ "types": { "directory": "model/types" } });
+        let resolved = load_json(&valid).expect("nested artifact directory should resolve");
+        assert!(resolved.artifacts.types.directory.ends_with("model/types"));
+    }
+
+    #[test]
+    fn client_block_is_rule_12_in_types_only_build() {
+        let mut value = valid_json_value();
+        value["client"] = json!({});
+        assert_code(load_json(&value), CODE_DISABLED_OPTIONS);
+    }
+
+    #[test]
+    fn validation_block_is_rule_12_in_types_only_build() {
+        let mut value = valid_json_value();
+        value["validation"] = json!({});
+        assert_code(load_json(&value), CODE_DISABLED_OPTIONS);
+    }
+
+    #[test]
+    fn types_options_with_disabled_types_are_rule_12() {
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "types": false });
+        value["types"] = json!({});
+        assert_code(load_json(&value), CODE_DISABLED_OPTIONS);
+    }
+
+    #[test]
+    fn object_artifact_selector_defaults_to_enabled() {
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "types": { "directory": "model" } });
+        let resolved = load_json(&value).expect("object selector should default to enabled");
+        assert!(resolved.artifacts.types.enabled);
+        assert!(resolved.artifacts.types.directory.ends_with("model"));
+    }
+
+    #[test]
+    fn object_date_time_without_client_is_rule_13() {
+        let mut value = valid_json_value();
+        value["types"] = json!({ "dateTime": "date" });
+        assert_code(load_json(&value), CODE_DATE_REPRESENTATION);
+    }
+
+    #[test]
+    fn temporal_date_without_client_is_rule_13() {
+        let mut value = valid_json_value();
+        value["types"] = json!({ "date": "temporal" });
+        assert_code(load_json(&value), CODE_DATE_REPRESENTATION);
+    }
+
+    #[test]
+    fn fixed_naming_cases_are_rule_20() {
+        let mut type_case = valid_json_value();
+        type_case["naming"] = json!({ "typeCase": "camel" });
+        assert_code(load_json(&type_case), CODE_NAMING);
+
+        let mut property_case = valid_json_value();
+        property_case["naming"] = json!({ "propertyCase": "camel" });
+        assert_code(load_json(&property_case), CODE_NAMING);
+    }
+
+    #[test]
+    fn naming_affixes_are_validated() {
+        for naming in [
+            json!({ "typePrefix": "1bad" }),
+            json!({ "typeSuffix": "bad-name" }),
+        ] {
+            let mut value = valid_json_value();
+            value["naming"] = naming;
+            assert_code(load_json(&value), CODE_NAMING);
+        }
+
+        let mut valid = valid_json_value();
+        valid["naming"] = json!({ "typePrefix": "$Api_", "typeSuffix": "_2" });
+        load_json(&valid).expect("identifier affixes should resolve");
+    }
+
+    #[test]
+    fn all_naming_enum_values_parse() {
+        for file_case in ["kebab", "snake", "camel", "pascal", "preserve"] {
+            let mut value = valid_json_value();
+            value["naming"] = json!({ "fileCase": file_case });
+            load_json(&value).expect("fileCase value should parse");
+        }
+        for operation_case in ["camel", "preserve"] {
+            let mut value = valid_json_value();
+            value["naming"] = json!({ "operationCase": operation_case });
+            load_json(&value).expect("operationCase value should parse");
+        }
+        for enum_member_case in ["pascal", "camel", "screamingSnake", "preserve"] {
+            let mut value = valid_json_value();
+            value["naming"] = json!({ "enumMemberCase": enum_member_case });
+            load_json(&value).expect("enumMemberCase value should parse");
+        }
+    }
+
+    #[test]
+    fn all_type_enum_values_parse_when_valid_for_types_only() {
+        for representation in ["literal", "const"] {
+            let mut value = valid_json_value();
+            value["types"] = json!({ "enum": representation });
+            load_json(&value).expect("enum representation should parse");
+        }
+        for extensions in ["accept", "reject"] {
+            let mut value = valid_json_value();
+            value["types"] = json!({ "enumExtensions": extensions });
+            load_json(&value).expect("enumExtensions value should parse");
+        }
+    }
+
+    #[test]
+    fn documentation_defaults_true_and_accepts_booleans() {
+        let resolved = load_yaml(valid_yaml()).expect("defaults should resolve");
+        assert_eq!(resolved.documentation, DocumentationConfig::default());
+
+        let mut value = valid_json_value();
+        value["documentation"] = json!({
+            "enabled": false,
+            "summary": false,
+            "description": false,
+            "deprecated": false,
+            "examples": false,
+            "constraints": false
+        });
+        load_json(&value).expect("documentation booleans should parse");
+    }
+
+    #[test]
+    fn each_forbidden_banner_sequence_is_rule_21() {
+        for forbidden in [
+            "before\nafter",
+            "before\rafter",
+            "before\u{2028}after",
+            "before\u{2029}after",
+            "before\0after",
+            "//# sourceMappingURL=evil.js.map",
+            "Generated by Oasts",
+        ] {
+            let mut value = valid_json_value();
+            value["emit"] = json!({ "banner": [forbidden] });
+            assert_code(load_json(&value), CODE_EMIT);
+        }
+    }
+
+    #[test]
+    fn valid_banner_and_emit_literals_resolve() {
+        let mut value = valid_json_value();
+        value["emit"] = json!({
+            "runtimeDirectory": "support/runtime",
+            "importExtension": "none",
+            "banner": ["Copyright Example"],
+            "format": "deterministic"
+        });
+        load_json(&value).expect("valid emit config should resolve");
+    }
+
+    #[test]
+    fn invalid_emit_literals_and_path_are_rule_21() {
+        for emit in [
+            json!({ "runtimeDirectory": "../runtime" }),
+            json!({ "importExtension": ".ts" }),
+            json!({ "format": "prettier" }),
+        ] {
+            let mut value = valid_json_value();
+            value["emit"] = emit;
+            assert_code(load_json(&value), CODE_EMIT);
+        }
+    }
+
+    #[test]
+    fn local_allow_paths_must_be_relative() {
+        let mut invalid = valid_json_value();
+        invalid["local"] = json!({ "allowPaths": ["/tmp/schemas"] });
+        assert_code(load_json(&invalid), CODE_TRUST_LIMITS);
+
+        let mut valid = valid_json_value();
+        valid["local"] = json!({ "allowPaths": ["../shared-schemas"] });
+        let resolved = load_json(&valid).expect("relative allow path should resolve");
+        assert_eq!(resolved.local_allow_paths.len(), 1);
+        assert!(resolved.local_allow_paths[0].is_absolute());
+    }
+
+    #[test]
+    fn every_limit_rejects_low_and_high_values() {
+        for (name, low, high) in [
+            ("maxDocumentBytes", 1_023_u64, 1_073_741_825_u64),
+            ("maxTotalBytes", 1_023, 4_294_967_297),
+            ("maxDocuments", 0, 4_097),
+            ("maxRefDepth", 0, 1_025),
+        ] {
+            for invalid in [low, high] {
+                let mut value = valid_json_value();
+                value["limits"] = json!({ name: invalid });
+                assert_code(load_json(&value), CODE_TRUST_LIMITS);
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_limit_values_are_accepted() {
+        for limits in [
+            json!({
+                "maxDocumentBytes": 1_024,
+                "maxTotalBytes": 1_024,
+                "maxDocuments": 1,
+                "maxRefDepth": 1
+            }),
+            json!({
+                "maxDocumentBytes": 1_073_741_824_u64,
+                "maxTotalBytes": 4_294_967_296_u64,
+                "maxDocuments": 4_096,
+                "maxRefDepth": 1_024
+            }),
+        ] {
+            let mut value = valid_json_value();
+            value["limits"] = limits;
+            load_json(&value).expect("boundary limits should resolve");
+        }
+    }
+
+    #[test]
+    fn schema_known_unavailable_blocks_report_named_errors() {
+        for name in ["remote", "watch", "ci"] {
+            let mut value = valid_json_value();
+            value[name] = json!({});
+            let diagnostics = assert_code(load_json(&value), CODE_BLOCK_UNSUPPORTED);
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == CODE_BLOCK_UNSUPPORTED && diagnostic.message.contains(name)
+            }));
+        }
+    }
+
+    #[test]
+    fn schema_known_unavailable_null_block_is_still_present() {
+        let mut value = valid_json_value();
+        value["remote"] = Value::Null;
+        assert_code(load_json(&value), CODE_BLOCK_UNSUPPORTED);
+    }
+
+    #[test]
+    fn null_is_not_accepted_for_typed_optional_fields() {
+        for name in ["input", "output", "namespace", "artifacts", "types"] {
+            let mut value = valid_json_value();
+            value[name] = Value::Null;
+            assert_code(load_json(&value), CODE_PARSE);
+        }
+    }
+
+    #[test]
+    fn resolution_helpers_cover_structural_boundaries() {
+        assert!(!is_ts_identifier(""));
+        assert!(!is_uri(":missing"));
+        assert!(!is_uri("1http:value"));
+        assert!(!is_uri("http:with space"));
+
+        let base = Path::new("base");
+        assert_eq!(
+            lexical_join_below(base, Path::new("./one/../two")),
+            Some(PathBuf::from("base/two"))
+        );
+        assert_eq!(lexical_join_below(base, Path::new("..")), None);
+        assert_eq!(lexical_join_below(base, Path::new("/absolute")), None);
+        assert_eq!(
+            normalize_join(base, Path::new("./one/../two")),
+            PathBuf::from("base/two")
+        );
+        assert_eq!(
+            normalize_join(base, Path::new("/absolute")),
+            PathBuf::from("base/absolute")
+        );
+        assert_eq!(
+            nearest_existing_ancestor(Path::new("missing-relative-path")),
+            None
+        );
+        assert_eq!(to_u32(usize::MAX), u32::MAX);
+        assert_eq!(
+            canonicalize_result(Ok(PathBuf::from("resolved")), "path"),
+            Ok(PathBuf::from("resolved"))
+        );
+        assert!(
+            canonicalize_result(Err(io::Error::other("blocked")), "path")
+                .expect_err("canonicalization error")
+                .contains("failed to canonicalize path: blocked")
+        );
+    }
+
+    #[test]
+    fn optional_deserializers_accept_each_structured_value_domain() {
+        let emit: Option<EmitConfig> =
+            deserialize_optional_non_null(json!({})).expect("emit config");
+        let naming: Option<NamingConfig> =
+            deserialize_optional_non_null(json!({})).expect("naming config");
+        let artifact: Option<ArtifactSetting> =
+            deserialize_optional_non_null(json!(true)).expect("artifact setting");
+        let artifacts: Option<ArtifactsConfig> =
+            deserialize_optional_non_null(json!({})).expect("artifacts config");
+        let documentation: Option<DocumentationConfig> =
+            deserialize_optional_non_null(json!({})).expect("documentation config");
+        let value: Option<Value> =
+            deserialize_optional_non_null(json!({ "value": true })).expect("JSON value");
+
+        assert!(emit.is_some());
+        assert!(naming.is_some());
+        assert!(artifact.is_some());
+        assert!(artifacts.is_some());
+        assert!(documentation.is_some());
+        assert_eq!(value, Some(json!({ "value": true })));
+    }
+
+    #[test]
+    fn missing_config_parent_is_reported_by_resolution() {
+        let raw = serde_json::from_value::<RawConfig>(valid_json_value())
+            .expect("valid raw config should deserialize");
+        let missing = std::env::temp_dir()
+            .join("oasts-parent-that-does-not-exist")
+            .join("config.json");
+        let diagnostics = resolve_config(missing, raw).expect_err("missing parent should fail");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_IO)
+        );
+    }
+}

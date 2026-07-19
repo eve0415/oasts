@@ -1,0 +1,994 @@
+//! Deterministic generated-file writing and ownership tracking.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::diag::Diagnostic;
+use crate::emit::GeneratedFile;
+
+const MANIFEST_NAME: &str = ".oasts-manifest.json";
+const CODE_MANIFEST: &str = "OASTS0231";
+const CODE_PATH: &str = "OASTS0232";
+const CODE_IO: &str = "OASTS0233";
+const CODE_DUPLICATE: &str = "OASTS0234";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Manifest {
+    manifest_version: u32,
+    files: Vec<String>,
+}
+
+/// One on-disk difference found by [`check_drift`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DriftEntry {
+    pub relative_path: String,
+    pub state: DriftState,
+}
+
+/// The comparison state of one generated path.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DriftState {
+    Clean,
+    Edited,
+    Missing,
+    Stale,
+}
+
+impl fmt::Display for DriftState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Clean => "clean",
+            Self::Edited => "edited",
+            Self::Missing => "missing",
+            Self::Stale => "stale",
+        })
+    }
+}
+
+/// Deterministic drift results plus configuration/IO failures.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DriftReport {
+    pub entries: Vec<DriftEntry>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl DriftReport {
+    /// Returns whether every generated file and the ownership manifest match.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.diagnostics.is_empty()
+            && self
+                .entries
+                .iter()
+                .all(|entry| entry.state == DriftState::Clean)
+    }
+}
+
+/// Counts from one successful writer run.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WriteReport {
+    pub files_written: usize,
+    pub files_deleted: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedFile {
+    relative_path: String,
+    content: Vec<u8>,
+}
+
+/// Writes generated files and updates the output-root ownership manifest.
+pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport, Vec<Diagnostic>> {
+    let prepared = prepare_files(files)?;
+    validate_output_path(output_dir)?;
+
+    let output_existed = output_dir.exists();
+    let canonical_output = if output_existed {
+        canonical_output_dir(output_dir)?
+    } else {
+        output_dir.to_path_buf()
+    };
+    let previous = if output_existed {
+        validate_target(&canonical_output, MANIFEST_NAME)?;
+        read_manifest(&canonical_output)?
+    } else {
+        None
+    };
+    validate_manifest_paths(previous.as_ref())?;
+
+    if !output_existed {
+        fs::create_dir_all(output_dir).map_err(|error| {
+            vec![io_diagnostic(
+                format!("failed to create output directory: {error}"),
+                Some(output_dir),
+            )]
+        })?;
+    }
+    let canonical_output = canonical_output_dir(output_dir)?;
+    preflight_targets(&canonical_output, &prepared, previous.as_ref())?;
+
+    let new_paths = prepared
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut stale_paths = previous
+        .as_ref()
+        .into_iter()
+        .flat_map(|manifest| manifest.files.iter())
+        .filter(|path| !new_paths.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    stale_paths.sort_unstable();
+
+    let mut files_deleted = 0;
+    for relative_path in stale_paths {
+        let target = validate_target(&canonical_output, &relative_path)?;
+        match fs::remove_file(&target) {
+            Ok(()) => files_deleted += 1,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(vec![io_diagnostic(
+                    format!("failed to delete obsolete generated file '{relative_path}': {error}"),
+                    Some(&target),
+                )]);
+            }
+        }
+    }
+
+    for file in &prepared {
+        let target = validate_target(&canonical_output, &file.relative_path)?;
+        let parent = target
+            .parent()
+            .expect("a validated target inside an absolute output directory has a parent");
+        fs::create_dir_all(parent).map_err(|error| {
+            vec![io_diagnostic(
+                format!(
+                    "failed to create parent directory for '{}': {error}",
+                    file.relative_path
+                ),
+                Some(parent),
+            )]
+        })?;
+        let target = validate_target(&canonical_output, &file.relative_path)?;
+        fs::write(&target, &file.content).map_err(|error| {
+            vec![io_diagnostic(
+                format!(
+                    "failed to write generated file '{}': {error}",
+                    file.relative_path
+                ),
+                Some(&target),
+            )]
+        })?;
+    }
+
+    let manifest = Manifest {
+        manifest_version: 1,
+        files: new_paths.into_iter().collect(),
+    };
+    let manifest_bytes = manifest_bytes(&manifest);
+    let manifest_target = validate_target(&canonical_output, MANIFEST_NAME)?;
+    fs::write(&manifest_target, manifest_bytes).map_err(|error| {
+        vec![io_diagnostic(
+            format!("failed to write ownership manifest: {error}"),
+            Some(&manifest_target),
+        )]
+    })?;
+
+    Ok(WriteReport {
+        files_written: prepared.len(),
+        files_deleted,
+    })
+}
+
+/// Compares generated bytes and ownership metadata without changing the output tree.
+#[must_use]
+pub fn check_drift(output_dir: &Path, files: Vec<GeneratedFile>) -> DriftReport {
+    match check_drift_inner(output_dir, files) {
+        Ok(report) => report,
+        Err(diagnostics) => DriftReport {
+            entries: Vec::new(),
+            diagnostics,
+        },
+    }
+}
+
+fn check_drift_inner(
+    output_dir: &Path,
+    files: Vec<GeneratedFile>,
+) -> Result<DriftReport, Vec<Diagnostic>> {
+    let prepared = prepare_files(files)?;
+    validate_output_path(output_dir)?;
+    if !output_dir.exists() {
+        let mut entries = prepared
+            .into_iter()
+            .map(|file| DriftEntry {
+                relative_path: file.relative_path,
+                state: DriftState::Stale,
+            })
+            .collect::<Vec<_>>();
+        entries.push(DriftEntry {
+            relative_path: MANIFEST_NAME.to_owned(),
+            state: DriftState::Stale,
+        });
+        entries.sort_unstable_by(|left, right| {
+            left.relative_path
+                .as_bytes()
+                .cmp(right.relative_path.as_bytes())
+        });
+        return Ok(DriftReport {
+            entries,
+            diagnostics: Vec::new(),
+        });
+    }
+
+    let canonical_output = canonical_output_dir(output_dir)?;
+    validate_target(&canonical_output, MANIFEST_NAME)?;
+    let manifest_read = read_manifest_bytes(&canonical_output)?;
+    let manifest = manifest_read.as_ref().map(|(manifest, _)| manifest);
+    validate_manifest_paths(manifest)?;
+    preflight_targets(&canonical_output, &prepared, manifest)?;
+
+    let expected_manifest = Manifest {
+        manifest_version: 1,
+        files: prepared
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect(),
+    };
+    let expected_manifest_bytes = manifest_bytes(&expected_manifest);
+    let manifest_is_current = manifest_read
+        .as_ref()
+        .is_some_and(|(_, bytes)| *bytes == expected_manifest_bytes);
+    let recorded = manifest
+        .into_iter()
+        .flat_map(|manifest| manifest.files.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let generated = prepared
+        .iter()
+        .map(|file| (file.relative_path.clone(), file))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut entries = Vec::with_capacity(generated.len() + recorded.len() + 1);
+    for (relative_path, file) in &generated {
+        let state = if !recorded.contains(relative_path) {
+            DriftState::Stale
+        } else {
+            let target = validate_target(&canonical_output, relative_path)?;
+            match fs::read(&target) {
+                Ok(bytes) if bytes == file.content => DriftState::Clean,
+                Ok(_) => DriftState::Edited,
+                Err(error) if error.kind() == ErrorKind::NotFound => DriftState::Missing,
+                Err(error) => {
+                    return Err(vec![io_diagnostic(
+                        format!("failed to read generated file '{relative_path}': {error}"),
+                        Some(&target),
+                    )]);
+                }
+            }
+        };
+        entries.push(DriftEntry {
+            relative_path: relative_path.clone(),
+            state,
+        });
+    }
+    for relative_path in recorded
+        .iter()
+        .filter(|path| !generated.contains_key(path.as_str()))
+    {
+        entries.push(DriftEntry {
+            relative_path: relative_path.clone(),
+            state: DriftState::Stale,
+        });
+    }
+    entries.push(DriftEntry {
+        relative_path: MANIFEST_NAME.to_owned(),
+        state: if manifest_is_current {
+            DriftState::Clean
+        } else {
+            DriftState::Stale
+        },
+    });
+    entries.sort_unstable_by(|left, right| {
+        left.relative_path
+            .as_bytes()
+            .cmp(right.relative_path.as_bytes())
+    });
+
+    Ok(DriftReport {
+        entries,
+        diagnostics: Vec::new(),
+    })
+}
+
+fn prepare_files(files: Vec<GeneratedFile>) -> Result<Vec<PreparedFile>, Vec<Diagnostic>> {
+    let mut prepared = Vec::with_capacity(files.len());
+    let mut paths = BTreeSet::new();
+    for file in files {
+        validate_relative_path(&file.relative_path)?;
+        if file.relative_path == MANIFEST_NAME {
+            return Err(vec![path_diagnostic(
+                &file.relative_path,
+                "generated files cannot replace the ownership manifest",
+            )]);
+        }
+        if !paths.insert(file.relative_path.clone()) {
+            return Err(vec![Diagnostic::config(
+                CODE_DUPLICATE,
+                format!("duplicate generated path '{}'", file.relative_path),
+            )]);
+        }
+        prepared.push(PreparedFile {
+            relative_path: file.relative_path,
+            content: normalize_lf(file.content).into_bytes(),
+        });
+    }
+    prepared.sort_unstable_by(|left, right| {
+        left.relative_path
+            .as_bytes()
+            .cmp(right.relative_path.as_bytes())
+    });
+    Ok(prepared)
+}
+
+fn normalize_lf(content: String) -> String {
+    if !content.contains('\r') {
+        return content;
+    }
+    content.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn validate_output_path(output_dir: &Path) -> Result<(), Vec<Diagnostic>> {
+    if !output_dir.is_absolute() {
+        return Err(vec![Diagnostic::config(
+            CODE_PATH,
+            format!(
+                "output directory '{}' must be absolute",
+                output_dir.display()
+            ),
+        )]);
+    }
+    Ok(())
+}
+
+fn canonical_output_dir(output_dir: &Path) -> Result<PathBuf, Vec<Diagnostic>> {
+    let canonical = fs::canonicalize(output_dir).map_err(|error| {
+        vec![io_diagnostic(
+            format!("failed to canonicalize output directory: {error}"),
+            Some(output_dir),
+        )]
+    })?;
+    if !canonical.is_dir() {
+        return Err(vec![io_diagnostic(
+            "output path is not a directory".to_owned(),
+            Some(&canonical),
+        )]);
+    }
+    Ok(canonical)
+}
+
+fn read_manifest(output_dir: &Path) -> Result<Option<Manifest>, Vec<Diagnostic>> {
+    read_manifest_bytes(output_dir).map(|manifest| manifest.map(|(manifest, _)| manifest))
+}
+
+fn read_manifest_bytes(output_dir: &Path) -> Result<Option<(Manifest, Vec<u8>)>, Vec<Diagnostic>> {
+    let path = output_dir.join(MANIFEST_NAME);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(vec![io_diagnostic(
+                format!("failed to read ownership manifest: {error}"),
+                Some(&path),
+            )]);
+        }
+    };
+    let manifest = serde_json::from_slice::<Manifest>(&bytes).map_err(|error| {
+        vec![Diagnostic::config(
+            CODE_MANIFEST,
+            format!("invalid ownership manifest '{}': {error}", path.display()),
+        )]
+    })?;
+    if manifest.manifest_version != 1 {
+        return Err(vec![Diagnostic::config(
+            CODE_MANIFEST,
+            format!(
+                "unsupported ownership manifest version {} in '{}'",
+                manifest.manifest_version,
+                path.display()
+            ),
+        )]);
+    }
+    let unique = manifest.files.iter().collect::<BTreeSet<_>>();
+    if unique.len() != manifest.files.len() {
+        return Err(vec![Diagnostic::config(
+            CODE_MANIFEST,
+            format!(
+                "ownership manifest '{}' contains duplicate paths",
+                path.display()
+            ),
+        )]);
+    }
+    Ok(Some((manifest, bytes)))
+}
+
+fn validate_manifest_paths(manifest: Option<&Manifest>) -> Result<(), Vec<Diagnostic>> {
+    if let Some(manifest) = manifest {
+        for relative_path in &manifest.files {
+            validate_relative_path(relative_path)?;
+            if relative_path == MANIFEST_NAME {
+                return Err(vec![path_diagnostic(
+                    relative_path,
+                    "ownership manifest cannot own itself",
+                )]);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_relative_path(relative_path: &str) -> Result<(), Vec<Diagnostic>> {
+    let bytes = relative_path.as_bytes();
+    let invalid = relative_path.is_empty()
+        || relative_path.starts_with(['/', '\\'])
+        || relative_path.contains('\\')
+        || bytes.get(1) == Some(&b':')
+        || relative_path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."));
+    if invalid {
+        return Err(vec![path_diagnostic(
+            relative_path,
+            "path must be relative and contain no absolute, empty, '.', or '..' components",
+        )]);
+    }
+    Ok(())
+}
+
+fn preflight_targets(
+    output_dir: &Path,
+    files: &[PreparedFile],
+    previous: Option<&Manifest>,
+) -> Result<(), Vec<Diagnostic>> {
+    validate_target(output_dir, MANIFEST_NAME)?;
+    for file in files {
+        validate_target(output_dir, &file.relative_path)?;
+    }
+    if let Some(previous) = previous {
+        for relative_path in &previous.files {
+            validate_target(output_dir, relative_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_target(output_dir: &Path, relative_path: &str) -> Result<PathBuf, Vec<Diagnostic>> {
+    validate_relative_path(relative_path)?;
+    let mut components = relative_path.split('/').peekable();
+    let mut resolved_parent = output_dir.to_path_buf();
+    let file_name = components
+        .next_back()
+        .expect("validated relative paths contain a file name");
+    for component in components {
+        let candidate = resolved_parent.join(component);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => {
+                if !metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    return Err(vec![path_diagnostic(
+                        relative_path,
+                        "a parent component is not a directory",
+                    )]);
+                }
+                let canonical = fs::canonicalize(&candidate).map_err(|error| {
+                    vec![io_diagnostic(
+                        format!(
+                            "failed to canonicalize parent of generated path '{relative_path}': {error}"
+                        ),
+                        Some(&candidate),
+                    )]
+                })?;
+                if !canonical.is_dir() || !is_strictly_within(output_dir, &canonical) {
+                    return Err(vec![path_diagnostic(
+                        relative_path,
+                        "symlink-canonicalized parent escapes the output directory",
+                    )]);
+                }
+                resolved_parent = canonical;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                resolved_parent.push(component);
+            }
+            Err(error) => {
+                return Err(vec![io_diagnostic(
+                    format!("failed to inspect generated path '{relative_path}': {error}"),
+                    Some(&candidate),
+                )]);
+            }
+        }
+    }
+    let target = resolved_parent.join(file_name);
+    validate_target_metadata(relative_path, &target, fs::symlink_metadata(&target))
+}
+
+fn validate_target_metadata(
+    relative_path: &str,
+    target: &Path,
+    metadata: std::io::Result<fs::Metadata>,
+) -> Result<PathBuf, Vec<Diagnostic>> {
+    match metadata {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(vec![path_diagnostic(
+            relative_path,
+            "generated file target must not be a symlink",
+        )]),
+        Ok(metadata) if metadata.is_dir() => Err(vec![path_diagnostic(
+            relative_path,
+            "generated file target is a directory",
+        )]),
+        Ok(_) => Ok(target.to_path_buf()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(target.to_path_buf()),
+        Err(error) => Err(vec![io_diagnostic(
+            format!("failed to inspect generated path '{relative_path}': {error}"),
+            Some(target),
+        )]),
+    }
+}
+
+fn is_strictly_within(output_dir: &Path, target: &Path) -> bool {
+    target != output_dir && target.starts_with(output_dir)
+}
+
+fn manifest_bytes(manifest: &Manifest) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(manifest)
+        .expect("the ownership manifest contains only JSON-serializable fields");
+    bytes.push(b'\n');
+    bytes
+}
+
+fn path_diagnostic(relative_path: &str, reason: &str) -> Diagnostic {
+    Diagnostic::config(
+        CODE_PATH,
+        format!("unsafe generated path '{relative_path}': {reason}"),
+    )
+}
+
+fn io_diagnostic(message: String, path: Option<&Path>) -> Diagnostic {
+    let diagnostic = Diagnostic::config(CODE_IO, message);
+    if let Some(path) = path {
+        diagnostic.with_source(path.to_string_lossy())
+    } else {
+        diagnostic
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generated(path: &str, content: &str) -> GeneratedFile {
+        GeneratedFile {
+            relative_path: path.to_owned(),
+            content: content.to_owned(),
+        }
+    }
+
+    #[test]
+    fn writes_sorted_manifest_and_normalizes_line_endings() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        let report = write(
+            &output,
+            vec![generated("z.ts", "z\r\n"), generated("a/a.ts", "a\r")],
+        )
+        .expect("write");
+
+        assert_eq!(report.files_written, 2);
+        assert_eq!(fs::read(output.join("z.ts")).expect("z"), b"z\n");
+        assert_eq!(fs::read(output.join("a/a.ts")).expect("a"), b"a\n");
+        assert_eq!(
+            fs::read(output.join(MANIFEST_NAME)).expect("manifest"),
+            b"{\"manifestVersion\":1,\"files\":[\"a/a.ts\",\"z.ts\"]}\n"
+        );
+    }
+
+    #[test]
+    fn regeneration_deletes_only_obsolete_owned_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        write(
+            &output,
+            vec![generated("keep.ts", "keep\n"), generated("old.ts", "old\n")],
+        )
+        .expect("first write");
+        fs::write(output.join("user.ts"), "user\n").expect("user file");
+
+        let report = write(&output, vec![generated("keep.ts", "keep\n")]).expect("second write");
+
+        assert_eq!(report.files_deleted, 1);
+        assert!(!output.join("old.ts").exists());
+        assert!(output.join("user.ts").exists());
+    }
+
+    #[test]
+    fn hostile_manifest_paths_abort_before_mutation() {
+        for hostile in ["../victim.ts", "/absolute/victim.ts"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let output = temp.path().join("generated");
+            fs::create_dir(&output).expect("output");
+            let victim = temp.path().join("victim.ts");
+            fs::write(&victim, "safe\n").expect("victim");
+            let manifest = format!(
+                "{{\"manifestVersion\":1,\"files\":[{}]}}\n",
+                serde_json::to_string(hostile).expect("path JSON")
+            );
+            fs::write(output.join(MANIFEST_NAME), manifest).expect("manifest");
+
+            let diagnostics = write(&output, vec![generated("new.ts", "new\n")])
+                .expect_err("hostile manifest must fail");
+
+            assert_eq!(diagnostics[0].category, crate::diag::Category::Config);
+            assert_eq!(fs::read_to_string(&victim).expect("victim"), "safe\n");
+            assert!(!output.join("new.ts").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_escape_aborts_before_write_or_delete() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&output).expect("output");
+        fs::create_dir(&outside).expect("outside");
+        let victim = outside.join("victim.ts");
+        fs::write(&victim, "safe\n").expect("victim");
+        symlink(&outside, output.join("escape")).expect("escape symlink");
+        let manifest = Manifest {
+            manifest_version: 1,
+            files: vec!["escape/victim.ts".to_owned()],
+        };
+        fs::write(output.join(MANIFEST_NAME), manifest_bytes(&manifest)).expect("manifest");
+
+        let diagnostics = write(&output, vec![generated("new.ts", "new\n")])
+            .expect_err("symlink escape must fail");
+
+        assert_eq!(diagnostics[0].category, crate::diag::Category::Config);
+        assert_eq!(fs::read_to_string(victim).expect("victim"), "safe\n");
+        assert!(!output.join("new.ts").exists());
+    }
+
+    #[test]
+    fn drift_distinguishes_edited_missing_and_stale() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        let files = vec![generated("a.ts", "a\n"), generated("b.ts", "b\n")];
+        write(&output, files.clone()).expect("write");
+        assert!(check_drift(&output, files.clone()).is_clean());
+
+        fs::write(output.join("a.ts"), "edited\n").expect("edit");
+        fs::remove_file(output.join("b.ts")).expect("remove");
+        let manifest = Manifest {
+            manifest_version: 1,
+            files: vec!["a.ts".to_owned(), "b.ts".to_owned(), "old.ts".to_owned()],
+        };
+        fs::write(output.join(MANIFEST_NAME), manifest_bytes(&manifest)).expect("manifest");
+
+        let report = check_drift(&output, files);
+        assert_eq!(
+            report.entries,
+            vec![
+                DriftEntry {
+                    relative_path: MANIFEST_NAME.to_owned(),
+                    state: DriftState::Stale,
+                },
+                DriftEntry {
+                    relative_path: "a.ts".to_owned(),
+                    state: DriftState::Edited,
+                },
+                DriftEntry {
+                    relative_path: "b.ts".to_owned(),
+                    state: DriftState::Missing,
+                },
+                DriftEntry {
+                    relative_path: "old.ts".to_owned(),
+                    state: DriftState::Stale,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn state_display_alias_and_missing_output_drift_are_covered() {
+        for (state, label) in [
+            (DriftState::Clean, "clean"),
+            (DriftState::Edited, "edited"),
+            (DriftState::Missing, "missing"),
+            (DriftState::Stale, "stale"),
+        ] {
+            assert_eq!(state.to_string(), label);
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("missing");
+        let report = check_drift(&output, vec![generated("a.ts", "a\n")]);
+        assert!(!report.is_clean());
+        assert_eq!(report.entries.len(), 2);
+        assert!(
+            report
+                .entries
+                .iter()
+                .all(|entry| entry.state == DriftState::Stale)
+        );
+
+        let written = write(&output, vec![generated("a.ts", "a\n")]).expect("write");
+        assert_eq!(written.files_written, 1);
+    }
+
+    #[test]
+    fn generated_and_manifest_paths_reject_unsafe_or_duplicate_entries() {
+        for path in [
+            "",
+            "/absolute",
+            "\\absolute",
+            "a\\b",
+            "C:drive",
+            "a//b",
+            "a/./b",
+            "a/../b",
+        ] {
+            assert_eq!(
+                prepare_files(vec![generated(path, "")]).expect_err("unsafe")[0].code,
+                CODE_PATH
+            );
+        }
+        assert_eq!(
+            prepare_files(vec![generated(MANIFEST_NAME, "")]).expect_err("manifest replacement")[0]
+                .code,
+            CODE_PATH
+        );
+        assert_eq!(
+            prepare_files(vec![generated("a.ts", "1"), generated("a.ts", "2")])
+                .expect_err("duplicate")[0]
+                .code,
+            CODE_DUPLICATE
+        );
+        assert_eq!(
+            validate_output_path(Path::new("relative")).expect_err("relative")[0].code,
+            CODE_PATH
+        );
+
+        let self_owned = Manifest {
+            manifest_version: 1,
+            files: vec![MANIFEST_NAME.to_owned()],
+        };
+        assert_eq!(
+            validate_manifest_paths(Some(&self_owned)).expect_err("self owned")[0].code,
+            CODE_PATH
+        );
+        let unsafe_manifest = Manifest {
+            manifest_version: 1,
+            files: vec!["../bad.ts".to_owned()],
+        };
+        assert_eq!(
+            validate_manifest_paths(Some(&unsafe_manifest)).expect_err("unsafe")[0].code,
+            CODE_PATH
+        );
+        validate_manifest_paths(None).expect("absent manifest");
+        assert!(!is_strictly_within(
+            Path::new("/tmp/out"),
+            Path::new("/tmp/out")
+        ));
+    }
+
+    #[test]
+    fn manifest_reader_reports_syntax_version_and_duplicate_errors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path();
+        assert_eq!(read_manifest_bytes(output).expect("missing manifest"), None);
+        for (contents, code) in [
+            ("{", CODE_MANIFEST),
+            (r#"{"manifestVersion":2,"files":[]}"#, CODE_MANIFEST),
+            (
+                r#"{"manifestVersion":1,"files":["a.ts","a.ts"]}"#,
+                CODE_MANIFEST,
+            ),
+            (
+                r#"{"manifestVersion":1,"files":[],"extra":true}"#,
+                CODE_MANIFEST,
+            ),
+        ] {
+            fs::write(output.join(MANIFEST_NAME), contents).expect("manifest");
+            assert_eq!(
+                read_manifest_bytes(output).expect_err("invalid manifest")[0].code,
+                code
+            );
+        }
+        fs::write(
+            output.join(MANIFEST_NAME),
+            r#"{"manifestVersion":1,"files":[]}"#,
+        )
+        .expect("manifest");
+        assert!(read_manifest(output).expect("valid manifest").is_some());
+    }
+
+    #[test]
+    fn canonical_output_and_drift_errors_are_diagnostics() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing");
+        assert_eq!(
+            canonical_output_dir(&missing).expect_err("missing")[0].code,
+            CODE_IO
+        );
+        let file = temp.path().join("file");
+        fs::write(&file, "x").expect("file");
+        assert_eq!(
+            canonical_output_dir(&file).expect_err("file output")[0].code,
+            CODE_IO
+        );
+
+        let report = check_drift(temp.path(), vec![generated("../bad.ts", "")]);
+        assert_eq!(report.diagnostics[0].code, CODE_PATH);
+        assert!(report.entries.is_empty());
+
+        let output = temp.path().join("generated");
+        fs::create_dir(&output).expect("output");
+        let report = check_drift(&output, vec![generated("new.ts", "new\n")]);
+        assert!(
+            report.entries.iter().any(|entry| {
+                entry.relative_path == "new.ts" && entry.state == DriftState::Stale
+            })
+        );
+    }
+
+    #[test]
+    fn stale_manifest_entry_missing_on_disk_is_ignored_during_delete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        fs::create_dir(&output).expect("output");
+        let manifest = Manifest {
+            manifest_version: 1,
+            files: vec!["missing.ts".to_owned()],
+        };
+        fs::write(output.join(MANIFEST_NAME), manifest_bytes(&manifest)).expect("manifest");
+        let report = write(&output, Vec::new()).expect("missing stale file is harmless");
+        assert_eq!(report.files_deleted, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_reports_create_delete_parent_file_and_manifest_io_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &Path, value: u32) {
+            fs::set_permissions(path, fs::Permissions::from_mode(value)).expect("permissions");
+        }
+
+        let create_temp = tempfile::tempdir().expect("tempdir");
+        mode(create_temp.path(), 0o555);
+        let create_error = write(&create_temp.path().join("new"), Vec::new()).expect_err("create");
+        mode(create_temp.path(), 0o755);
+        assert_eq!(create_error[0].code, CODE_IO);
+
+        let delete_temp = tempfile::tempdir().expect("tempdir");
+        let delete_output = delete_temp.path().join("generated");
+        write(&delete_output, vec![generated("old.ts", "old")]).expect("initial write");
+        mode(&delete_output, 0o555);
+        let delete_error = write(&delete_output, Vec::new()).expect_err("delete");
+        mode(&delete_output, 0o755);
+        assert_eq!(delete_error[0].code, CODE_IO);
+
+        let parent_temp = tempfile::tempdir().expect("tempdir");
+        let parent_output = parent_temp.path().join("generated");
+        fs::create_dir(&parent_output).expect("output");
+        mode(&parent_output, 0o555);
+        let parent_error =
+            write(&parent_output, vec![generated("nested/a.ts", "a")]).expect_err("parent create");
+        mode(&parent_output, 0o755);
+        assert_eq!(parent_error[0].code, CODE_IO);
+
+        let file_temp = tempfile::tempdir().expect("tempdir");
+        let file_output = file_temp.path().join("generated");
+        write(&file_output, vec![generated("a.ts", "a")]).expect("initial write");
+        mode(&file_output.join("a.ts"), 0o400);
+        let file_error = write(&file_output, vec![generated("a.ts", "b")]).expect_err("file write");
+        mode(&file_output.join("a.ts"), 0o600);
+        assert_eq!(file_error[0].code, CODE_IO);
+
+        mode(&file_output.join(MANIFEST_NAME), 0o400);
+        let manifest_error =
+            write(&file_output, vec![generated("a.ts", "a")]).expect_err("manifest write");
+        mode(&file_output.join(MANIFEST_NAME), 0o600);
+        assert_eq!(manifest_error[0].code, CODE_IO);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drift_and_manifest_permission_failures_are_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &Path, value: u32) {
+            fs::set_permissions(path, fs::Permissions::from_mode(value)).expect("permissions");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        let files = vec![generated("a.ts", "a")];
+        write(&output, files.clone()).expect("initial write");
+        mode(&output.join("a.ts"), 0o000);
+        let report = check_drift(&output, files.clone());
+        mode(&output.join("a.ts"), 0o600);
+        assert_eq!(report.diagnostics[0].code, CODE_IO);
+
+        mode(&output.join(MANIFEST_NAME), 0o000);
+        let report = check_drift(&output, files);
+        mode(&output.join(MANIFEST_NAME), 0o600);
+        assert_eq!(report.diagnostics[0].code, CODE_IO);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_validation_rejects_parent_and_target_filesystem_hazards() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = fs::canonicalize(temp.path()).expect("canonical output");
+
+        fs::write(output.join("parent-file"), "x").expect("parent file");
+        assert_eq!(
+            validate_target(&output, "parent-file/a.ts").expect_err("parent file")[0].code,
+            CODE_PATH
+        );
+
+        symlink(output.join("missing"), output.join("dangling")).expect("dangling symlink");
+        assert_eq!(
+            validate_target(&output, "dangling/a.ts").expect_err("dangling")[0].code,
+            CODE_IO
+        );
+
+        symlink(output.join("parent-file"), output.join("file-link")).expect("file symlink");
+        assert_eq!(
+            validate_target(&output, "file-link/a.ts").expect_err("file symlink")[0].code,
+            CODE_PATH
+        );
+
+        symlink(output.join("parent-file"), output.join("target-link")).expect("target symlink");
+        assert_eq!(
+            validate_target(&output, "target-link").expect_err("target symlink")[0].code,
+            CODE_PATH
+        );
+        fs::create_dir(output.join("target-dir")).expect("target dir");
+        assert_eq!(
+            validate_target(&output, "target-dir").expect_err("target dir")[0].code,
+            CODE_PATH
+        );
+
+        let locked = output.join("locked");
+        fs::create_dir(&locked).expect("locked dir");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock");
+        let error = validate_target(&output, "locked/inside/a.ts").expect_err("locked target");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("unlock");
+        assert_eq!(error[0].code, CODE_IO);
+    }
+
+    #[test]
+    fn diagnostic_helpers_cover_optional_path() {
+        let diagnostic = io_diagnostic("io".to_owned(), None);
+        assert_eq!(diagnostic.code, CODE_IO);
+        assert!(diagnostic.source_id.is_none());
+        assert_eq!(path_diagnostic("bad", "reason").code, CODE_PATH);
+
+        let error = validate_target_metadata(
+            "blocked.ts",
+            Path::new("blocked.ts"),
+            Err(std::io::Error::from(ErrorKind::PermissionDenied)),
+        )
+        .expect_err("metadata failure");
+        assert_eq!(error[0].code, CODE_IO);
+    }
+}
