@@ -1,0 +1,23 @@
+{
+  "name": "oasts",
+  "version": "0.0.0",
+  "description": "Types-only OpenAPI to TypeScript generator",
+  "bin": {
+    "oasts": "./bin/oasts.mjs"
+  },
+  "type": "module",
+  "scripts": {
+    "build:napi": "napi build --platform --release --esm --manifest-path ../../crates/oasts-napi/Cargo.toml -o napi"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.7.3",
+    "@types/node": "24.13.3",
+    "oxfmt": "0.59.0",
+    "oxlint": "1.74.0",
+    "oxlint-tsgolint": "0.25.0",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

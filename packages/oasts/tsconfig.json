@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true
+  },
+  "include": ["config.ts", "oxlint.config.ts", "bin", "napi/index.d.ts"]
+}

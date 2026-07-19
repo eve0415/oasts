@@ -5,6 +5,7 @@ pub mod ir;
 pub mod loader;
 pub mod num;
 pub mod parse;
+pub mod pipeline;
 pub mod semantic;
 mod syntax;
 pub mod writer;

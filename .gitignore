@@ -17,3 +17,8 @@ target/
 #.idea/
 
 docs/
+
+# Node
+node_modules/
+packages/oasts/napi/
+.pnpm-store/

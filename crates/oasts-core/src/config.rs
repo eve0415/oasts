@@ -367,8 +367,31 @@ pub struct ResolvedConfig {
     pub limits: LimitsConfig,
 }
 
-/// Discovers a supported configuration file.
+/// A discovered configuration candidate before script-support policy is applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredConfig {
+    /// Path of the single discovered configuration file.
+    pub path: PathBuf,
+    /// Whether the file uses a TypeScript/JavaScript extension.
+    pub is_script: bool,
+}
+
+/// Discovers a supported configuration file, rejecting script configs.
 pub fn discover(cwd: &Path, explicit: Option<&Path>) -> Result<PathBuf, Diagnostic> {
+    let candidate = discover_candidate(cwd, explicit)?;
+    reject_script_extension(&candidate.path)?;
+    Ok(candidate.path)
+}
+
+/// Discovers the single configuration candidate without script-support policy.
+///
+/// Hosts that can evaluate TypeScript/JavaScript configs (the Node CLI) use this
+/// entry point and handle `is_script` candidates themselves; the standalone
+/// binary goes through [`discover`], which rejects them.
+pub fn discover_candidate(
+    cwd: &Path,
+    explicit: Option<&Path>,
+) -> Result<DiscoveredConfig, Diagnostic> {
     if let Some(explicit_path) = explicit {
         let path = if explicit_path.is_absolute() {
             explicit_path.to_path_buf()
@@ -398,8 +421,10 @@ pub fn discover(cwd: &Path, explicit: Option<&Path>) -> Result<PathBuf, Diagnost
                 None,
             ));
         }
-        reject_script_extension(&path)?;
-        return Ok(path);
+        return Ok(DiscoveredConfig {
+            is_script: is_script_path(&path),
+            path,
+        });
     }
 
     let mut candidates = DISCOVERY_NAMES
@@ -420,16 +445,20 @@ pub fn discover(cwd: &Path, explicit: Option<&Path>) -> Result<PathBuf, Diagnost
     }
 
     let path = candidates.swap_remove(0);
-    reject_script_extension(&path)?;
-    Ok(path)
+    Ok(DiscoveredConfig {
+        is_script: is_script_path(&path),
+        path,
+    })
+}
+
+fn is_script_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|candidate| SCRIPT_EXTENSIONS.contains(&candidate))
 }
 
 fn reject_script_extension(path: &Path) -> Result<(), Diagnostic> {
-    if path
-        .extension()
-        .and_then(OsStr::to_str)
-        .is_some_and(|candidate| SCRIPT_EXTENSIONS.contains(&candidate))
-    {
+    if is_script_path(path) {
         return Err(config_error(
             CODE_SCRIPT_CONFIG_UNSUPPORTED,
             "TypeScript/JavaScript config is not supported in this build",
@@ -458,6 +487,38 @@ pub fn load_config(explicit: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig
     })?;
     let raw = parse_config(&config_path, &source).map_err(|diagnostic| vec![diagnostic])?;
     resolve_config(config_path, raw)
+}
+
+/// Loads a configuration from in-memory JSON bytes anchored at `config_path`.
+///
+/// Hosts that evaluate script configs (the Node CLI) serialize the evaluated
+/// module to JSON and pass the bytes here; the file at `config_path` is never
+/// read, but every path in the config still resolves from its parent
+/// directory exactly as in [`load_config`].
+pub fn load_config_from_json(
+    config_path: &Path,
+    json: &[u8],
+) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+    let config_path = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        absolutize_config_path(config_path.to_path_buf(), std::env::current_dir())?
+    };
+    let raw = parse_config_json(&config_path, json).map_err(|diagnostic| vec![diagnostic])?;
+    resolve_config(config_path, raw)
+}
+
+/// Parses in-memory JSON config bytes into an unvalidated [`RawConfig`].
+pub fn parse_config_json(config_path: &Path, json: &[u8]) -> Result<RawConfig, Diagnostic> {
+    serde_json::from_slice(json).map_err(|error| {
+        config_error(
+            CODE_PARSE,
+            format!("invalid JSON config: {error}"),
+            Some(config_path),
+            None,
+        )
+        .with_location(to_u32(error.line()), to_u32(error.column()))
+    })
 }
 
 fn absolutize_config_path(
@@ -503,7 +564,11 @@ fn parse_config(path: &Path, source: &str) -> Result<RawConfig, Diagnostic> {
     }
 }
 
-fn resolve_config(config_path: PathBuf, raw: RawConfig) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+/// Validates and resolves a parsed configuration anchored at `config_path`.
+pub fn resolve_config(
+    config_path: PathBuf,
+    raw: RawConfig,
+) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     let mut sink = DiagnosticSink::new();
     let source_path = config_path.as_path();
     let config_parent = config_path
@@ -1293,6 +1358,67 @@ mod tests {
     }
 
     #[test]
+    fn load_config_from_json_matches_file_based_loading() {
+        let directory = TestDirectory::new();
+        directory.write("openapi.yaml", "openapi: 3.1.0\npaths: {}\n");
+        let json =
+            br#"{"schemaVersion":1,"input":{"path":"./openapi.yaml"},"output":"./generated"}"#;
+        let file = directory.write("oasts.json", std::str::from_utf8(json).expect("UTF-8"));
+
+        let from_bytes =
+            load_config_from_json(&file, json).expect("JSON bytes config should resolve");
+        let from_file =
+            load_config(Some(&file), directory.path()).expect("file config should resolve");
+        assert_eq!(from_bytes.input, from_file.input);
+        assert_eq!(from_bytes.output, from_file.output);
+        assert_eq!(from_bytes.namespace, from_file.namespace);
+        assert_eq!(from_bytes.config_dir, from_file.config_dir);
+
+        let relative_temp = tempfile::tempdir_in("../../target").expect("relative tempdir");
+        fs::write(
+            relative_temp.path().join("openapi.yaml"),
+            "openapi: 3.1.0\npaths: {}\n",
+        )
+        .expect("relative OpenAPI file");
+        let relative = PathBuf::from("../../target")
+            .join(relative_temp.path().file_name().expect("tempdir name"))
+            .join("oasts.json");
+        let resolved = load_config_from_json(&relative, json).expect("relative path resolves");
+        assert!(resolved.input.is_absolute());
+    }
+
+    #[test]
+    fn load_config_from_json_reports_validation_twins_and_parse_errors() {
+        let directory = TestDirectory::new();
+        directory.write("openapi.yaml", "openapi: 3.1.0\npaths: {}\n");
+        let invalid =
+            br#"{"schemaVersion":2,"input":{"path":"./openapi.yaml"},"output":"./generated"}"#;
+        let file = directory.write(
+            "oasts.json",
+            std::str::from_utf8(invalid).expect("UTF-8"),
+        );
+
+        let from_bytes =
+            load_config_from_json(&file, invalid).expect_err("schemaVersion 2 is invalid");
+        let from_file = load_config(Some(&file), directory.path())
+            .expect_err("file twin reports the same failure");
+        let codes = |diagnostics: &[Diagnostic]| {
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(codes(&from_bytes), codes(&from_file));
+        assert!(codes(&from_bytes).contains(&CODE_SCHEMA_VERSION));
+
+        let malformed = load_config_from_json(&file, b"{").expect_err("malformed JSON");
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].code, CODE_PARSE);
+        assert!(malformed[0].line.is_some());
+        assert!(malformed[0].col.is_some());
+    }
+
+    #[test]
     fn discovery_rejects_zero_candidates() {
         let directory = TestDirectory::new();
         assert_discovery_code(discover(directory.path(), None), CODE_DISCOVERY);
@@ -1314,6 +1440,49 @@ mod tests {
         assert_eq!(
             discover(directory.path(), None).expect("yaml candidate should be found"),
             yaml
+        );
+    }
+
+    #[test]
+    fn discover_candidate_reports_script_and_data_candidates() {
+        let directory = TestDirectory::new();
+        let script = directory.write("oasts.config.ts", "export default {};");
+        assert_eq!(
+            discover_candidate(directory.path(), None).expect("script candidate"),
+            DiscoveredConfig {
+                path: script.clone(),
+                is_script: true
+            }
+        );
+        assert_eq!(
+            discover_candidate(directory.path(), Some(&script)).expect("explicit script candidate"),
+            DiscoveredConfig {
+                path: script,
+                is_script: true
+            }
+        );
+
+        let data = TestDirectory::new();
+        let yaml = data.write("oasts.yaml", valid_yaml());
+        assert_eq!(
+            discover_candidate(data.path(), None).expect("data candidate"),
+            DiscoveredConfig {
+                path: yaml,
+                is_script: false
+            }
+        );
+
+        let empty = TestDirectory::new();
+        assert_discovery_code(
+            discover_candidate(empty.path(), None).map(|candidate| candidate.path),
+            CODE_DISCOVERY,
+        );
+        let ambiguous = TestDirectory::new();
+        ambiguous.write("oasts.yaml", valid_yaml());
+        ambiguous.write("oasts.json", "{}");
+        assert_discovery_code(
+            discover_candidate(ambiguous.path(), None).map(|candidate| candidate.path),
+            CODE_DISCOVERY,
         );
     }
 

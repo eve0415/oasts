@@ -16,5 +16,6 @@
     }
   },
   "image": "mcr.microsoft.com/devcontainers/rust:2.0.13-trixie",
-  "name": "oasts"
+  "name": "oasts",
+  "postCreateCommand": "pnpm install --frozen-lockfile && pnpm -C packages/oasts build:napi"
 }

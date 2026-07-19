@@ -169,6 +169,45 @@ impl DiagnosticSink {
     }
 }
 
+/// Renders diagnostics in the stable `severity[CODE]: message` stderr format.
+///
+/// Diagnostics are sorted before rendering so output order is deterministic.
+pub fn render(
+    diagnostics: Vec<Diagnostic>,
+    writer: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    writer.write_all(render_to_string(diagnostics).as_bytes())
+}
+
+/// Renders diagnostics into a `String` for hosts without a stderr stream.
+#[must_use]
+pub fn render_to_string(mut diagnostics: Vec<Diagnostic>) -> String {
+    diagnostics.sort();
+    let mut rendered = String::new();
+    for diagnostic in diagnostics {
+        let severity = match diagnostic.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        };
+        rendered.push_str(&format!(
+            "{severity}[{}]: {}\n",
+            diagnostic.code, diagnostic.message
+        ));
+        if let Some(source_id) = diagnostic.source_id {
+            let line = diagnostic.line.unwrap_or(1);
+            let col = diagnostic.col.unwrap_or(1);
+            rendered.push_str(&format!("  --> {source_id}:{line}:{col}"));
+            if let Some(pointer) = diagnostic.json_pointer {
+                rendered.push_str(&format!(" {pointer}"));
+            }
+            rendered.push('\n');
+        } else if let Some(pointer) = diagnostic.json_pointer {
+            rendered.push_str(&format!("  --> <config>:1:1 {pointer}\n"));
+        }
+    }
+    rendered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +229,51 @@ mod tests {
             json_pointer: None,
             category: Category::Config,
         }
+    }
+
+    #[test]
+    fn render_to_string_covers_warnings_locations_and_config_pointers() {
+        let mut warning = Diagnostic::input("OASTS1999", "warning").with_source("source.yaml");
+        warning.severity = Severity::Warning;
+        let pointer_only = Diagnostic::config("OASTS0999", "config").with_json_pointer("/config");
+        let rendered = render_to_string(vec![warning, pointer_only]);
+        assert!(rendered.contains("warning[OASTS1999]"));
+        assert!(rendered.contains("source.yaml:1:1"));
+        assert!(rendered.contains("<config>:1:1 /config"));
+    }
+
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn render_propagates_writer_failures() {
+        let mut writer = FailingWriter;
+        std::io::Write::flush(&mut writer).expect("flush is infallible");
+        render(vec![Diagnostic::config("OASTS0001", "failure")], &mut writer)
+            .expect_err("write failure");
+    }
+
+    #[test]
+    fn render_writes_located_diagnostics_to_writer() {
+        let located = Diagnostic::config("OASTS0001", "failure")
+            .with_source("config.yaml")
+            .with_location(4, 2)
+            .with_json_pointer("/input");
+        let mut buffer = Vec::new();
+        render(vec![located], &mut buffer).expect("render");
+        assert_eq!(
+            String::from_utf8(buffer).expect("UTF-8"),
+            "error[OASTS0001]: failure\n  --> config.yaml:4:2 /input\n"
+        );
     }
 
     #[test]

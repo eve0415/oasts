@@ -9,7 +9,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd /workspaces/oasts && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings"
+            "command": "cd /workspaces/oasts && bash scripts/gate.sh"
           }
         ]
       }

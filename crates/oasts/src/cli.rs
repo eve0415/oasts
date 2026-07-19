@@ -10,11 +10,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use oasts_core::config::{ResolvedConfig, load_config};
-use oasts_core::diag::{Diagnostic, DiagnosticSink, Severity};
-use oasts_core::emit::{GeneratedFile, emit};
-use oasts_core::loader::load_graph;
-use oasts_core::parse::parse;
-use oasts_core::semantic::analyze;
+use oasts_core::diag::{self, Diagnostic, DiagnosticSink};
+use oasts_core::emit::GeneratedFile;
+use oasts_core::pipeline;
 use oasts_core::writer::{DriftState, check_drift, write};
 
 const CODE_CURRENT_DIR: &str = "OASTS0001";
@@ -207,23 +205,8 @@ fn compile(
             return (None, None, sink);
         }
     };
-    let Some(graph) = load_graph(&config, &mut sink) else {
-        return (Some(config), None, sink);
-    };
-    let Some(ir) = parse(&graph, &mut sink) else {
-        return (Some(config), None, sink);
-    };
-    let analyzed = analyze(ir, &config, &mut sink);
-    if sink.has_errors() {
-        return (Some(config), None, sink);
-    }
-    let source_tuples = graph.source_tuples();
-    let files = emit(&analyzed, &config, &source_tuples, &mut sink);
-    (
-        Some(config),
-        if should_emit { Some(files) } else { None },
-        sink,
-    )
+    let files = pipeline::compile(&config, should_emit, &mut sink);
+    (Some(config), files, sink)
 }
 
 fn report_sink(sink: DiagnosticSink, stderr: &mut dyn Write) -> u8 {
@@ -238,31 +221,8 @@ fn report_diagnostics(diagnostics: Vec<Diagnostic>, stderr: &mut dyn Write) -> u
     report_sink(sink, stderr)
 }
 
-fn render_diagnostics(mut diagnostics: Vec<Diagnostic>, stderr: &mut dyn Write) -> io::Result<()> {
-    diagnostics.sort();
-    for diagnostic in diagnostics {
-        let severity = match diagnostic.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-        };
-        writeln!(
-            stderr,
-            "{severity}[{}]: {}",
-            diagnostic.code, diagnostic.message
-        )?;
-        if let Some(source_id) = diagnostic.source_id {
-            let line = diagnostic.line.unwrap_or(1);
-            let col = diagnostic.col.unwrap_or(1);
-            write!(stderr, "  --> {source_id}:{line}:{col}")?;
-            if let Some(pointer) = diagnostic.json_pointer {
-                write!(stderr, " {pointer}")?;
-            }
-            writeln!(stderr)?;
-        } else if let Some(pointer) = diagnostic.json_pointer {
-            writeln!(stderr, "  --> <config>:1:1 {pointer}")?;
-        }
-    }
-    Ok(())
+fn render_diagnostics(diagnostics: Vec<Diagnostic>, stderr: &mut dyn Write) -> io::Result<()> {
+    diag::render(diagnostics, stderr)
 }
 
 #[cfg(test)]
@@ -825,19 +785,6 @@ mod tests {
                 .expect("stderr")
                 .contains("cwd unavailable")
         );
-    }
-
-    #[test]
-    fn rendering_covers_warnings_default_locations_and_config_pointers() {
-        let mut warning = Diagnostic::input("OASTS1999", "warning").with_source("source.yaml");
-        warning.severity = Severity::Warning;
-        let pointer_only = Diagnostic::config("OASTS0999", "config").with_json_pointer("/config");
-        let mut stderr = Vec::new();
-        render_diagnostics(vec![warning, pointer_only], &mut stderr).expect("render");
-        let rendered = String::from_utf8(stderr).expect("stderr");
-        assert!(rendered.contains("warning[OASTS1999]"));
-        assert!(rendered.contains("source.yaml:1:1"));
-        assert!(rendered.contains("<config>:1:1 /config"));
     }
 
     #[test]
