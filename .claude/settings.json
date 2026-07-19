@@ -14,5 +14,39 @@
         ]
       }
     ]
+  },
+  "permissions": {
+    "deny": [
+      "Bash(npm *)",
+      "Bash(npx *)"
+    ],
+    "allow": [
+      "Bash(cargo fmt --check *)",
+      "Bash(cargo fmt --check)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo check *)",
+      "Bash(cargo test *)",
+      "Bash(cargo doc *)",
+      "Bash(cargo --version)",
+      "Bash(cargo bench *)",
+      "Bash(pnpm exec tsc *)",
+      "Bash(pnpm exec oxlint *)",
+      "Bash(pnpm exec oxfmt *)",
+      "Bash(pnpm lint:ci *)",
+      "Bash(pnpm lint:ci)",
+      "Bash(pnpm lint *)",
+      "Bash(pnpm lint)",
+      "Bash(pnpm typecheck *)",
+      "Bash(pnpm typecheck)",
+      "Bash(pnpm fmt:check *)",
+      "Bash(pnpm fmt:check)",
+      "Bash(pnpm format:check *)",
+      "Bash(pnpm format:check)",
+      "Bash(rustup show *)",
+      "Bash(rustup show)",
+      "Bash(rustup check *)",
+      "Bash(rustup check)",
+      "Bash(rustc --version)"
+    ]
   }
 }
