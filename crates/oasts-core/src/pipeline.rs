@@ -213,6 +213,401 @@ mod tests {
         }
     }
 
+    fn compile_multifile(
+        files: &[(&str, &str)],
+        should_emit: bool,
+    ) -> (DiagnosticSink, Option<Vec<GeneratedFile>>) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (relative, contents) in files {
+            let path = temp.path().join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create parent");
+            }
+            fs::write(&path, contents).expect("write spec file");
+        }
+        let raw = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.yaml" },
+            "output": "generated"
+        });
+        let config = load_config_from_json(
+            &temp.path().join("oasts.json"),
+            &serde_json::to_vec(&raw).expect("config JSON"),
+        )
+        .expect("resolved config");
+        let mut sink = DiagnosticSink::new();
+        let files = compile(&config, should_emit, &mut sink);
+        (sink, files)
+    }
+
+    const CROSS_FILE_OPENAPI: &str = r##"openapi: "3.1.0"
+info: { title: cross, version: "1" }
+paths:
+  /cross:
+    get:
+      operationId: get-cross
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "./schemas/part-a.yaml#/CrossFileRoot"
+"##;
+
+    const CROSS_FILE_PART_A: &str = r##"CrossFileRoot:
+  type: object
+  properties:
+    toB:
+      $ref: "./part-b.yaml#/FromB"
+    cycleStart:
+      $ref: "#/CrossFileA"
+CrossFileA:
+  type: object
+  properties:
+    label: { type: string }
+    toB:
+      $ref: "./part-b.yaml#/CrossFileB"
+"##;
+
+    const CROSS_FILE_PART_B: &str = r##"FromB:
+  type: object
+  properties:
+    note: { type: string }
+    backToA:
+      $ref: "./part-a.yaml#/CrossFileA"
+CrossFileB:
+  type: object
+  properties:
+    count: { type: integer }
+    backToA:
+      $ref: "./part-a.yaml#/CrossFileA"
+"##;
+
+    #[test]
+    fn external_file_schemas_allocate_component_types_across_a_cycle() {
+        let (sink, files) = compile_multifile(
+            &[
+                ("openapi.yaml", CROSS_FILE_OPENAPI),
+                ("schemas/part-a.yaml", CROSS_FILE_PART_A),
+                ("schemas/part-b.yaml", CROSS_FILE_PART_B),
+            ],
+            true,
+        );
+        let files = files.expect("expected emitted files");
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        // Both-direction and self-referential external schemas each get a type file.
+        let paths = files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            "types/components/crossfileroot.ts",
+            "types/components/crossfilea.ts",
+            "types/components/fromb.ts",
+            "types/components/crossfileb.ts",
+        ] {
+            assert!(paths.contains(expected), "missing {expected}: {paths:#?}");
+        }
+    }
+
+    #[test]
+    fn external_schema_name_collides_with_root_component_under_casefold() {
+        let openapi = r##"openapi: "3.1.0"
+info: { title: collide, version: "1" }
+paths:
+  /collide:
+    get:
+      operationId: get-collide
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "./schemas/part.yaml#/Shared"
+components:
+  schemas:
+    Shared:
+      type: string
+"##;
+        let part = "Shared:\n  type: object\n  properties:\n    value: { type: string }\n";
+        let (sink, files) = compile_multifile(
+            &[("openapi.yaml", openapi), ("schemas/part.yaml", part)],
+            true,
+        );
+        assert!(files.is_none(), "collision must be fatal");
+        let collided = sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == "OASTS1202" && diagnostic.message.contains("collision")
+        });
+        assert!(collided, "expected case-fold collision diagnostic");
+    }
+
+    #[test]
+    fn external_ref_inside_additional_properties_is_materialized() {
+        let openapi = r##"openapi: "3.1.0"
+info:
+  title: additional
+  version: "1"
+paths:
+  /bag:
+    get:
+      operationId: get-bag
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "./schemas/part.yaml#/Bag"
+"##;
+        let part = r##"Bag:
+  type: object
+  additionalProperties:
+    $ref: "#/Item"
+Item:
+  type: string
+"##;
+        let (sink, files) = compile_multifile(
+            &[("openapi.yaml", openapi), ("schemas/part.yaml", part)],
+            true,
+        );
+        assert!(!sink.has_errors(), "diagnostics: {:?}", sink.as_slice());
+        let names: Vec<&str> = files
+            .as_deref()
+            .expect("emission succeeds")
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        assert!(names.iter().any(|path| path.contains("item")), "{names:?}");
+    }
+
+    #[test]
+    fn external_ref_in_a_request_encoding_header_schema_is_materialized() {
+        let openapi = r##"openapi: "3.1.0"
+info:
+  title: encoding
+  version: "1"
+paths:
+  /upload:
+    post:
+      operationId: post-upload
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string }
+            encoding:
+              file:
+                headers:
+                  X-Meta:
+                    schema:
+                      $ref: "./schemas/part.yaml#/HeaderMeta"
+      responses:
+        "200":
+          description: ok
+"##;
+        let part = "HeaderMeta:\n  type: object\n  properties:\n    trace: { type: string }\n";
+        let (sink, files) = compile_multifile(
+            &[("openapi.yaml", openapi), ("schemas/part.yaml", part)],
+            true,
+        );
+        assert!(!sink.has_errors(), "diagnostics: {:?}", sink.as_slice());
+        let names: Vec<&str> = files
+            .as_deref()
+            .expect("emission succeeds")
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        assert!(
+            names.contains(&"types/components/headermeta.ts"),
+            "encoding header schema must materialize a type file: {names:?}"
+        );
+    }
+
+    #[test]
+    fn all_of_self_reference_terminates_and_renders_the_named_type() {
+        // A component whose property `allOf`s a `$ref` back to itself would inline forever
+        // without the walk-side cycle guard; the recursive branch must render as the bare
+        // named type instead. Reaching this test's assertions at all proves no stack overflow.
+        let openapi = r##"openapi: "3.1.0"
+info:
+  title: loop
+  version: "1"
+paths:
+  /loop:
+    get:
+      operationId: get-loop
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Loop"
+components:
+  schemas:
+    Loop:
+      type: object
+      properties:
+        child:
+          allOf:
+            - $ref: "#/components/schemas/Loop"
+"##;
+        let (sink, files) = compile_multifile(&[("openapi.yaml", openapi)], true);
+        assert!(!sink.has_errors(), "diagnostics: {:?}", sink.as_slice());
+        let files = files.expect("emission succeeds");
+        let loop_file = files
+            .iter()
+            .find(|file| file.relative_path == "types/components/loop.ts")
+            .expect("Loop component type file");
+        // The declaration names the type once; the recursive child branch references it again.
+        assert!(loop_file.content.contains("child"), "{}", loop_file.content);
+        assert!(
+            loop_file.content.matches("Loop").count() >= 2,
+            "recursive branch should render as the named type Loop: {}",
+            loop_file.content
+        );
+    }
+
+    #[test]
+    fn multifile_materialization_walks_every_schema_shape() {
+        // Single-document specs skip materialization entirely, so the reference-collection walk is
+        // exercised only through multi-file specs. This one carries every schema shape the walk
+        // branches on — array, tuple, allOf/anyOf/oneOf, a closed object, an operation parameter,
+        // and entry-internal refs (which the worklist skips) — plus one external ref that makes the
+        // graph multi-document so materialization actually runs.
+        let openapi = r##"openapi: "3.1.0"
+info:
+  title: shapes
+  version: "1"
+paths:
+  /shapes:
+    get:
+      operationId: get-shapes
+      parameters:
+        - name: kind
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Root"
+components:
+  schemas:
+    Root:
+      type: object
+      additionalProperties: false
+      properties:
+        arr: { $ref: "#/components/schemas/WithArray" }
+        tup: { $ref: "#/components/schemas/WithTuple" }
+        all: { $ref: "#/components/schemas/WithAllOf" }
+        any: { $ref: "#/components/schemas/WithAnyOf" }
+        one: { $ref: "#/components/schemas/WithOneOf" }
+        ext: { $ref: "./schemas/part.yaml#/External" }
+    WithArray:
+      type: array
+      items: { $ref: "#/components/schemas/Leaf" }
+    WithTuple:
+      type: array
+      prefixItems:
+        - { type: string }
+      items: { type: number }
+    WithAllOf:
+      allOf:
+        - $ref: "#/components/schemas/Leaf"
+    WithAnyOf:
+      anyOf:
+        - { type: string }
+        - { type: number }
+    WithOneOf:
+      oneOf:
+        - { type: string }
+        - { type: integer }
+    Leaf:
+      type: string
+"##;
+        let part = "External:\n  type: object\n  properties:\n    name: { type: string }\n";
+        let (sink, files) = compile_multifile(
+            &[("openapi.yaml", openapi), ("schemas/part.yaml", part)],
+            true,
+        );
+        assert!(!sink.has_errors(), "diagnostics: {:?}", sink.as_slice());
+        let names: Vec<&str> = files
+            .as_deref()
+            .expect("emission succeeds")
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        assert!(
+            names.contains(&"types/components/external.ts"),
+            "external schema must materialize: {names:?}"
+        );
+    }
+
+    #[test]
+    fn external_ref_to_missing_pointer_is_a_reference_diagnostic() {
+        let openapi = r##"openapi: "3.1.0"
+info:
+  title: dangling
+  version: "1"
+paths:
+  /gone:
+    get:
+      operationId: get-gone
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "./schemas/part.yaml#/Missing"
+"##;
+        let part = "Present:\n  type: string\n";
+        let (sink, files) = compile_multifile(
+            &[("openapi.yaml", openapi), ("schemas/part.yaml", part)],
+            true,
+        );
+        assert!(sink.has_errors(), "dangling external ref must not emit");
+        assert!(files.is_none(), "no files for a dangling external ref");
+    }
+
+    #[test]
+    fn fragment_less_external_ref_is_diagnosed_clearly() {
+        let openapi = r##"openapi: "3.1.0"
+info:
+  title: nofrag
+  version: "1"
+paths:
+  /x:
+    get:
+      operationId: get-x
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "./schemas/part.yaml"
+"##;
+        let part = "Pet:\n  type: object\n  properties:\n    id: { type: string }\n";
+        let (sink, files) = compile_multifile(
+            &[("openapi.yaml", openapi), ("schemas/part.yaml", part)],
+            true,
+        );
+        assert!(files.is_none(), "fragment-less external ref must not emit");
+        let emitted = format!("{:?}", sink.as_slice());
+        let diagnosed = sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == "OASTS1106" && diagnostic.message.contains("fragment")
+        });
+        assert!(diagnosed, "expected fragment guidance: {emitted}");
+    }
+
     #[test]
     fn client_showcase_fixture_compiles_with_aggregate() {
         let fixture =

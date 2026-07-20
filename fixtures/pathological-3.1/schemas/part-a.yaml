@@ -1,0 +1,14 @@
+CrossFileRoot:
+  type: object
+  properties:
+    toB:
+      $ref: './part-b.yaml#/FromB'
+    cycleStart:
+      $ref: '#/CrossFileA'
+CrossFileA:
+  type: object
+  properties:
+    label:
+      type: string
+    toB:
+      $ref: './part-b.yaml#/CrossFileB'

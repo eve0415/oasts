@@ -1,0 +1,14 @@
+FromB:
+  type: object
+  properties:
+    note:
+      type: string
+    backToA:
+      $ref: './part-a.yaml#/CrossFileA'
+CrossFileB:
+  type: object
+  properties:
+    count:
+      type: integer
+    backToA:
+      $ref: './part-a.yaml#/CrossFileA'

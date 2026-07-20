@@ -1,0 +1,23 @@
+[package]
+name = "oasts-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Corpus fetch, conformance, and benchmark harness for the oasts generator."
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+clap = { version = "=4.6.2", features = ["derive"] }
+libc = "=0.2.186"
+oxc_allocator = "=0.140.0"
+oxc_parser = "=0.140.0"
+oxc_span = "=0.140.0"
+sha2 = "=0.10.9"
+tempfile = "=3.23.0"
+yaml-rust2 = "=0.11.0"
+
+[dev-dependencies]

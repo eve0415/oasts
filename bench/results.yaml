@@ -1,0 +1,175 @@
+schemaVersion: 1
+metadata:
+  runnerLabel: "baseline"
+  envFingerprint:
+    arch: "aarch64"
+    nproc: "18"
+    memTotalKb: "65796816"
+    osId: "debian"
+    osVersionId: "13"
+    rustc: "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+    node: "v24.18.0"
+    tsc: "Version 7.0.2"
+  manifestCommit: "a744d25ba08800fb99ff8724f5ac2cf0e736da7b"
+  measuredAt: "2026-07-20T13:37:23Z"
+results:
+  - fixture: "github-3.0"
+    config: "oasts.yaml"
+    class: "large"
+    coldMs: 461.526539
+    warmP50MsRound1: 437.191633
+    warmP50MsRound2: 430.278946
+    warmP50MsGated: 437.191633
+    peakRssBytes: 207872000
+    tscMs: 600.101409
+    outputBytes: 5294997
+    outputFiles: 1430
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "stripe-3.0"
+    config: "oasts.yaml"
+    class: "large"
+    coldMs: 299.010722
+    warmP50MsRound1: 317.39636
+    warmP50MsRound2: 318.587364
+    warmP50MsGated: 318.587364
+    peakRssBytes: 109305856
+    tscMs: 538.6679349999999
+    outputBytes: 3596947
+    outputFiles: 2019
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "kubernetes-core-v1-3.0"
+    config: "oasts.yaml"
+    class: "large"
+    coldMs: 101.383885
+    warmP50MsRound1: 107.528736
+    warmP50MsRound2: 108.872907
+    warmP50MsGated: 108.872907
+    peakRssBytes: 36749312
+    tscMs: 507.191675
+    outputBytes: 6169091
+    outputFiles: 500
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "kubernetes-apps-v1-3.0"
+    config: "oasts.yaml"
+    class: "large"
+    coldMs: 72.354424
+    warmP50MsRound1: 77.557439
+    warmP50MsRound2: 77.935899
+    warmP50MsGated: 77.935899
+    peakRssBytes: 23441408
+    tscMs: 517.454913
+    outputBytes: 6098688
+    outputFiles: 241
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "kubernetes-apiextensions-v1-3.0"
+    config: "oasts.yaml"
+    class: "large"
+    coldMs: 9.538361
+    warmP50MsRound1: 9.450862
+    warmP50MsRound2: 9.205903
+    warmP50MsGated: 9.450862
+    peakRssBytes: 6586368
+    tscMs: 493.644342
+    outputBytes: 465883
+    outputFiles: 55
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "petstore-3.0"
+    config: "oasts.yaml"
+    class: "small"
+    coldMs: 1.055337
+    warmP50MsRound1: 0.912961
+    warmP50MsRound2: 0.854169
+    warmP50MsGated: 0.912961
+    peakRssBytes: 5701632
+    tscMs: 501.78532499999994
+    outputBytes: 4326
+    outputFiles: 7
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "petstore-3.0-client"
+    config: "oasts-client.yaml"
+    class: "small"
+    coldMs: 1.4042130000000002
+    warmP50MsRound1: 1.2337120000000001
+    warmP50MsRound2: 1.250295
+    warmP50MsGated: 1.250295
+    peakRssBytes: 5701632
+    tscMs: 490.48512500000004
+    outputBytes: 74906
+    outputFiles: 14
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "tictactoe-3.1"
+    config: "oasts.yaml"
+    class: "small"
+    coldMs: 1.359713
+    warmP50MsRound1: 1.195712
+    warmP50MsRound2: 1.122545
+    warmP50MsGated: 1.195712
+    peakRssBytes: 5701632
+    tscMs: 503.671831
+    outputBytes: 7268
+    outputFiles: 10
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "client-showcase-3.1"
+    config: "oasts.yaml"
+    class: "small"
+    coldMs: 2.08159
+    warmP50MsRound1: 1.923506
+    warmP50MsRound2: 1.993005
+    warmP50MsGated: 1.993005
+    peakRssBytes: 4374528
+    tscMs: 511.69548
+    outputBytes: 102997
+    outputFiles: 26
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "pathological-3.1"
+    config: "oasts.yaml"
+    class: "small"
+    coldMs: 4.382763
+    warmP50MsRound1: 5.217015
+    warmP50MsRound2: 5.112973
+    warmP50MsGated: 5.217015
+    peakRssBytes: 6139904
+    tscMs: 495.134972
+    outputBytes: 35266
+    outputFiles: 55
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true

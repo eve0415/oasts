@@ -20,6 +20,7 @@ docs/
 
 # Generated
 schemas/
+!fixtures/*/schemas/
 packages/oasts/config.ts
 
 # Generated fixture output (oasts generate writes here; scratch, never committed)
@@ -34,3 +35,11 @@ packages/oasts/dist/
 
 # Local git worktrees for delegated work
 .worktrees/
+
+# Fetched corpus specs (pinned by URL+SHA-256 in bench/manifest.yaml; fetched by oasts-bench fetch)
+fixtures/github-3.0/openapi.json
+fixtures/stripe-3.0/openapi.json
+fixtures/cloudflare-3.0/openapi.json
+fixtures/kubernetes-core-v1-3.0/openapi.json
+fixtures/kubernetes-apps-v1-3.0/openapi.json
+fixtures/kubernetes-apiextensions-v1-3.0/openapi.json

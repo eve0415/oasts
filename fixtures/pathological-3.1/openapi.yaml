@@ -1,0 +1,1337 @@
+openapi: 3.1.0
+info:
+  title: Pathological Composition
+  description: |
+    A hand-authored OpenAPI 3.1 fixture that exercises pathological schema
+    composition: deep allOf chains, wide oneOf unions, mutual and self
+    recursion, combinatorial products, deep property nesting, large enums,
+    cross-file reference cycles, 3.1 nullable variants, and const bounds.
+  version: 1.0.0
+paths:
+  /deep-all-of-chain:
+    get:
+      summary: One allOf chain 32 levels deep.
+      operationId: get-deep-all-of-chain
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeepAllOfChainL32'
+  /wide-one-of:
+    get:
+      summary: A oneOf union with 64 inline variants.
+      operationId: get-wide-one-of
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WideOneOf'
+  /mutual-recursion:
+    get:
+      summary: Mutually recursive tree plus a self-recursive linked node.
+      operationId: get-mutual-recursion
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TreeNode'
+  /combinatorial-product:
+    get:
+      summary: An allOf of three 4-branch oneOfs (4x4x4).
+      operationId: get-combinatorial-product
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CombinatorialProduct'
+  /deep-nesting:
+    get:
+      summary: An object whose properties nest 32 levels deep.
+      operationId: get-deep-nesting
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeepNesting'
+  /big-enum:
+    get:
+      summary: A string enum with 256 members.
+      operationId: get-big-enum
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BigEnum'
+  /cross-file-refs:
+    get:
+      summary: Schemas split across two files with a cross-file cycle.
+      operationId: get-cross-file-refs
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: './schemas/part-a.yaml#/CrossFileRoot'
+  /nullable-mix:
+    get:
+      summary: The three 3.1 nullable spellings composed with allOf.
+      operationId: get-nullable-mix
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NullableMix'
+  /const-and-bounds:
+    get:
+      summary: Const-valued properties at RFC 8785 numeric cutovers.
+      operationId: get-const-and-bounds
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConstAndBounds'
+components:
+  schemas:
+    DeepAllOfChainL1:
+      type: object
+      properties:
+        prop1:
+          type: string
+    DeepAllOfChainL2:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL1'
+        - type: object
+          properties:
+            prop2:
+              type: string
+    DeepAllOfChainL3:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL2'
+        - type: object
+          properties:
+            prop3:
+              type: string
+    DeepAllOfChainL4:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL3'
+        - type: object
+          properties:
+            prop4:
+              type: string
+    DeepAllOfChainL5:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL4'
+        - type: object
+          properties:
+            prop5:
+              type: string
+    DeepAllOfChainL6:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL5'
+        - type: object
+          properties:
+            prop6:
+              type: string
+    DeepAllOfChainL7:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL6'
+        - type: object
+          properties:
+            prop7:
+              type: string
+    DeepAllOfChainL8:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL7'
+        - type: object
+          properties:
+            prop8:
+              type: string
+    DeepAllOfChainL9:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL8'
+        - type: object
+          properties:
+            prop9:
+              type: string
+    DeepAllOfChainL10:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL9'
+        - type: object
+          properties:
+            prop10:
+              type: string
+    DeepAllOfChainL11:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL10'
+        - type: object
+          properties:
+            prop11:
+              type: string
+    DeepAllOfChainL12:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL11'
+        - type: object
+          properties:
+            prop12:
+              type: string
+    DeepAllOfChainL13:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL12'
+        - type: object
+          properties:
+            prop13:
+              type: string
+    DeepAllOfChainL14:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL13'
+        - type: object
+          properties:
+            prop14:
+              type: string
+    DeepAllOfChainL15:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL14'
+        - type: object
+          properties:
+            prop15:
+              type: string
+    DeepAllOfChainL16:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL15'
+        - type: object
+          properties:
+            prop16:
+              type: string
+    DeepAllOfChainL17:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL16'
+        - type: object
+          properties:
+            prop17:
+              type: string
+    DeepAllOfChainL18:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL17'
+        - type: object
+          properties:
+            prop18:
+              type: string
+    DeepAllOfChainL19:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL18'
+        - type: object
+          properties:
+            prop19:
+              type: string
+    DeepAllOfChainL20:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL19'
+        - type: object
+          properties:
+            prop20:
+              type: string
+    DeepAllOfChainL21:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL20'
+        - type: object
+          properties:
+            prop21:
+              type: string
+    DeepAllOfChainL22:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL21'
+        - type: object
+          properties:
+            prop22:
+              type: string
+    DeepAllOfChainL23:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL22'
+        - type: object
+          properties:
+            prop23:
+              type: string
+    DeepAllOfChainL24:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL23'
+        - type: object
+          properties:
+            prop24:
+              type: string
+    DeepAllOfChainL25:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL24'
+        - type: object
+          properties:
+            prop25:
+              type: string
+    DeepAllOfChainL26:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL25'
+        - type: object
+          properties:
+            prop26:
+              type: string
+    DeepAllOfChainL27:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL26'
+        - type: object
+          properties:
+            prop27:
+              type: string
+    DeepAllOfChainL28:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL27'
+        - type: object
+          properties:
+            prop28:
+              type: string
+    DeepAllOfChainL29:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL28'
+        - type: object
+          properties:
+            prop29:
+              type: string
+    DeepAllOfChainL30:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL29'
+        - type: object
+          properties:
+            prop30:
+              type: string
+    DeepAllOfChainL31:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL30'
+        - type: object
+          properties:
+            prop31:
+              type: string
+    DeepAllOfChainL32:
+      allOf:
+        - $ref: '#/components/schemas/DeepAllOfChainL31'
+        - type: object
+          properties:
+            prop32:
+              type: string
+    WideOneOf:
+      oneOf:
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v01
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v02
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v03
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v04
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v05
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v06
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v07
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v08
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v09
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v10
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v11
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v12
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v13
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v14
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v15
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v16
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v17
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v18
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v19
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v20
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v21
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v22
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v23
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v24
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v25
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v26
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v27
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v28
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v29
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v30
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v31
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v32
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v33
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v34
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v35
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v36
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v37
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v38
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v39
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v40
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v41
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v42
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v43
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v44
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v45
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v46
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v47
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v48
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v49
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v50
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v51
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v52
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v53
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v54
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v55
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v56
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v57
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v58
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v59
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v60
+            payload:
+              type: boolean
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v61
+            payload:
+              type: string
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v62
+            payload:
+              type: number
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v63
+            payload:
+              type: integer
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              const: v64
+            payload:
+              type: boolean
+    TreeNode:
+      type: object
+      properties:
+        value:
+          type: string
+        children:
+          $ref: '#/components/schemas/TreeNodeList'
+        linked:
+          $ref: '#/components/schemas/LinkedNode'
+    TreeNodeList:
+      type: array
+      items:
+        $ref: '#/components/schemas/TreeNode'
+    LinkedNode:
+      type: object
+      properties:
+        payload:
+          type: integer
+        next:
+          $ref: '#/components/schemas/LinkedNode'
+    CombinatorialProduct:
+      allOf:
+        - oneOf:
+            - type: object
+              required:
+                - a1
+              properties:
+                a1:
+                  type: string
+            - type: object
+              required:
+                - a2
+              properties:
+                a2:
+                  type: string
+            - type: object
+              required:
+                - a3
+              properties:
+                a3:
+                  type: string
+            - type: object
+              required:
+                - a4
+              properties:
+                a4:
+                  type: string
+        - oneOf:
+            - type: object
+              required:
+                - b1
+              properties:
+                b1:
+                  type: string
+            - type: object
+              required:
+                - b2
+              properties:
+                b2:
+                  type: string
+            - type: object
+              required:
+                - b3
+              properties:
+                b3:
+                  type: string
+            - type: object
+              required:
+                - b4
+              properties:
+                b4:
+                  type: string
+        - oneOf:
+            - type: object
+              required:
+                - c1
+              properties:
+                c1:
+                  type: string
+            - type: object
+              required:
+                - c2
+              properties:
+                c2:
+                  type: string
+            - type: object
+              required:
+                - c3
+              properties:
+                c3:
+                  type: string
+            - type: object
+              required:
+                - c4
+              properties:
+                c4:
+                  type: string
+    DeepNesting:
+      type: object
+      properties:
+        level1:
+          type: object
+          properties:
+            level2:
+              type: object
+              properties:
+                level3:
+                  type: object
+                  properties:
+                    level4:
+                      type: object
+                      properties:
+                        level5:
+                          type: object
+                          properties:
+                            level6:
+                              type: object
+                              properties:
+                                level7:
+                                  type: object
+                                  properties:
+                                    level8:
+                                      type: object
+                                      properties:
+                                        level9:
+                                          type: object
+                                          properties:
+                                            level10:
+                                              type: object
+                                              properties:
+                                                level11:
+                                                  type: object
+                                                  properties:
+                                                    level12:
+                                                      type: object
+                                                      properties:
+                                                        level13:
+                                                          type: object
+                                                          properties:
+                                                            level14:
+                                                              type: object
+                                                              properties:
+                                                                level15:
+                                                                  type: object
+                                                                  properties:
+                                                                    level16:
+                                                                      type: object
+                                                                      properties:
+                                                                        level17:
+                                                                          type: object
+                                                                          properties:
+                                                                            level18:
+                                                                              type: object
+                                                                              properties:
+                                                                                level19:
+                                                                                  type: object
+                                                                                  properties:
+                                                                                    level20:
+                                                                                      type: object
+                                                                                      properties:
+                                                                                        level21:
+                                                                                          type: object
+                                                                                          properties:
+                                                                                            level22:
+                                                                                              type: object
+                                                                                              properties:
+                                                                                                level23:
+                                                                                                  type: object
+                                                                                                  properties:
+                                                                                                    level24:
+                                                                                                      type: object
+                                                                                                      properties:
+                                                                                                        level25:
+                                                                                                          type: object
+                                                                                                          properties:
+                                                                                                            level26:
+                                                                                                              type: object
+                                                                                                              properties:
+                                                                                                                level27:
+                                                                                                                  type: object
+                                                                                                                  properties:
+                                                                                                                    level28:
+                                                                                                                      type: object
+                                                                                                                      properties:
+                                                                                                                        level29:
+                                                                                                                          type: object
+                                                                                                                          properties:
+                                                                                                                            level30:
+                                                                                                                              type: object
+                                                                                                                              properties:
+                                                                                                                                level31:
+                                                                                                                                  type: object
+                                                                                                                                  properties:
+                                                                                                                                    level32:
+                                                                                                                                      type: array
+                                                                                                                                      items:
+                                                                                                                                        oneOf:
+                                                                                                                                          - type: string
+                                                                                                                                          - type: number
+                                                                                                                                          - type: 'null'
+    BigEnum:
+      type: string
+      enum:
+        - kebab-case-value
+        - snake_case_value
+        - '1st-value'
+        - 'café'
+        - ' '
+        - kebab-item-001
+        - snake_item_002
+        - camelItem003
+        - '004-digit-lead'
+        - kebab-item-005
+        - snake_item_006
+        - camelItem007
+        - '008-digit-lead'
+        - kebab-item-009
+        - snake_item_010
+        - camelItem011
+        - '012-digit-lead'
+        - kebab-item-013
+        - snake_item_014
+        - camelItem015
+        - '016-digit-lead'
+        - kebab-item-017
+        - snake_item_018
+        - camelItem019
+        - '020-digit-lead'
+        - kebab-item-021
+        - snake_item_022
+        - camelItem023
+        - '024-digit-lead'
+        - kebab-item-025
+        - snake_item_026
+        - camelItem027
+        - '028-digit-lead'
+        - kebab-item-029
+        - snake_item_030
+        - camelItem031
+        - '032-digit-lead'
+        - kebab-item-033
+        - snake_item_034
+        - camelItem035
+        - '036-digit-lead'
+        - kebab-item-037
+        - snake_item_038
+        - camelItem039
+        - '040-digit-lead'
+        - kebab-item-041
+        - snake_item_042
+        - camelItem043
+        - '044-digit-lead'
+        - kebab-item-045
+        - snake_item_046
+        - camelItem047
+        - '048-digit-lead'
+        - kebab-item-049
+        - snake_item_050
+        - camelItem051
+        - '052-digit-lead'
+        - kebab-item-053
+        - snake_item_054
+        - camelItem055
+        - '056-digit-lead'
+        - kebab-item-057
+        - snake_item_058
+        - camelItem059
+        - '060-digit-lead'
+        - kebab-item-061
+        - snake_item_062
+        - camelItem063
+        - '064-digit-lead'
+        - kebab-item-065
+        - snake_item_066
+        - camelItem067
+        - '068-digit-lead'
+        - kebab-item-069
+        - snake_item_070
+        - camelItem071
+        - '072-digit-lead'
+        - kebab-item-073
+        - snake_item_074
+        - camelItem075
+        - '076-digit-lead'
+        - kebab-item-077
+        - snake_item_078
+        - camelItem079
+        - '080-digit-lead'
+        - kebab-item-081
+        - snake_item_082
+        - camelItem083
+        - '084-digit-lead'
+        - kebab-item-085
+        - snake_item_086
+        - camelItem087
+        - '088-digit-lead'
+        - kebab-item-089
+        - snake_item_090
+        - camelItem091
+        - '092-digit-lead'
+        - kebab-item-093
+        - snake_item_094
+        - camelItem095
+        - '096-digit-lead'
+        - kebab-item-097
+        - snake_item_098
+        - camelItem099
+        - '100-digit-lead'
+        - kebab-item-101
+        - snake_item_102
+        - camelItem103
+        - '104-digit-lead'
+        - kebab-item-105
+        - snake_item_106
+        - camelItem107
+        - '108-digit-lead'
+        - kebab-item-109
+        - snake_item_110
+        - camelItem111
+        - '112-digit-lead'
+        - kebab-item-113
+        - snake_item_114
+        - camelItem115
+        - '116-digit-lead'
+        - kebab-item-117
+        - snake_item_118
+        - camelItem119
+        - '120-digit-lead'
+        - kebab-item-121
+        - snake_item_122
+        - camelItem123
+        - '124-digit-lead'
+        - kebab-item-125
+        - snake_item_126
+        - camelItem127
+        - '128-digit-lead'
+        - kebab-item-129
+        - snake_item_130
+        - camelItem131
+        - '132-digit-lead'
+        - kebab-item-133
+        - snake_item_134
+        - camelItem135
+        - '136-digit-lead'
+        - kebab-item-137
+        - snake_item_138
+        - camelItem139
+        - '140-digit-lead'
+        - kebab-item-141
+        - snake_item_142
+        - camelItem143
+        - '144-digit-lead'
+        - kebab-item-145
+        - snake_item_146
+        - camelItem147
+        - '148-digit-lead'
+        - kebab-item-149
+        - snake_item_150
+        - camelItem151
+        - '152-digit-lead'
+        - kebab-item-153
+        - snake_item_154
+        - camelItem155
+        - '156-digit-lead'
+        - kebab-item-157
+        - snake_item_158
+        - camelItem159
+        - '160-digit-lead'
+        - kebab-item-161
+        - snake_item_162
+        - camelItem163
+        - '164-digit-lead'
+        - kebab-item-165
+        - snake_item_166
+        - camelItem167
+        - '168-digit-lead'
+        - kebab-item-169
+        - snake_item_170
+        - camelItem171
+        - '172-digit-lead'
+        - kebab-item-173
+        - snake_item_174
+        - camelItem175
+        - '176-digit-lead'
+        - kebab-item-177
+        - snake_item_178
+        - camelItem179
+        - '180-digit-lead'
+        - kebab-item-181
+        - snake_item_182
+        - camelItem183
+        - '184-digit-lead'
+        - kebab-item-185
+        - snake_item_186
+        - camelItem187
+        - '188-digit-lead'
+        - kebab-item-189
+        - snake_item_190
+        - camelItem191
+        - '192-digit-lead'
+        - kebab-item-193
+        - snake_item_194
+        - camelItem195
+        - '196-digit-lead'
+        - kebab-item-197
+        - snake_item_198
+        - camelItem199
+        - '200-digit-lead'
+        - kebab-item-201
+        - snake_item_202
+        - camelItem203
+        - '204-digit-lead'
+        - kebab-item-205
+        - snake_item_206
+        - camelItem207
+        - '208-digit-lead'
+        - kebab-item-209
+        - snake_item_210
+        - camelItem211
+        - '212-digit-lead'
+        - kebab-item-213
+        - snake_item_214
+        - camelItem215
+        - '216-digit-lead'
+        - kebab-item-217
+        - snake_item_218
+        - camelItem219
+        - '220-digit-lead'
+        - kebab-item-221
+        - snake_item_222
+        - camelItem223
+        - '224-digit-lead'
+        - kebab-item-225
+        - snake_item_226
+        - camelItem227
+        - '228-digit-lead'
+        - kebab-item-229
+        - snake_item_230
+        - camelItem231
+        - '232-digit-lead'
+        - kebab-item-233
+        - snake_item_234
+        - camelItem235
+        - '236-digit-lead'
+        - kebab-item-237
+        - snake_item_238
+        - camelItem239
+        - '240-digit-lead'
+        - kebab-item-241
+        - snake_item_242
+        - camelItem243
+        - '244-digit-lead'
+        - kebab-item-245
+        - snake_item_246
+        - camelItem247
+        - '248-digit-lead'
+        - kebab-item-249
+        - snake_item_250
+        - camelItem251
+    NullableMix:
+      allOf:
+        - type: object
+          properties:
+            nullableString:
+              type:
+                - string
+                - 'null'
+        - type: object
+          properties:
+            anyOfNullable:
+              anyOf:
+                - type: string
+                - type: 'null'
+            oneOfNullable:
+              oneOf:
+                - type: integer
+                - type: 'null'
+    ConstAndBounds:
+      type: object
+      properties:
+        stringConst:
+          const: fixed-value
+        numberConst:
+          const: 42
+        zeroConst:
+          const: 0
+        tinyMagnitude:
+          const: 1.0e-6
+        hugeMagnitude:
+          const: 1.0e+21

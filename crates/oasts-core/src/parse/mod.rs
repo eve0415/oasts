@@ -144,13 +144,114 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             })
         });
         let security_schemes = self.parse_security_schemes(&root);
+        let operations = self.parse_operations(root.clone());
+        let mut schemas = self.parse_named_schemas(root);
+        self.materialize_external_schemas(&mut schemas, &operations);
         Ir {
-            operations: self.parse_operations(root.clone()),
-            schemas: self.parse_named_schemas(root),
+            operations,
+            schemas,
             root_servers,
             root_security,
             security_schemes,
         }
+    }
+
+    /// Lowers external-file schema definitions reached through `$ref` into
+    /// `NamedSchema` entries so they receive component types ("local
+    /// or external references").
+    ///
+    /// The entry document's `components.schemas` are already lowered; a `$ref`
+    /// into another file resolves to that file's `source_id` + pointer but has
+    /// no matching `NamedSchema`, so emission's `schema_target` lookup fails.
+    /// This walks references transitively (cross-file cycles included) and
+    /// materializes every reachable external target. Discovered schemas are
+    /// appended in `(source_id, json_pointer)` order so double-generation is
+    /// byte-identical regardless of reference traversal order.
+    fn materialize_external_schemas(
+        &mut self,
+        schemas: &mut Vec<NamedSchema>,
+        operations: &[Operation],
+    ) {
+        // The loader only loads a document when a `$ref` targets it, so a graph with a single
+        // document has no external targets and every reference is entry-internal. Materialization
+        // would then walk the whole IR only to skip every ref, so skip it wholesale — this is the
+        // common case (every single-file spec).
+        if self.graph.documents().len() == 1 {
+            return;
+        }
+        let entry_source = self.source_id(self.graph.entry().id).to_owned();
+        // Index documents by source id once so the worklist reverses each ref
+        // target to its document by lookup instead of a linear scan per ref.
+        let documents_by_source: HashMap<&str, DocId> = self
+            .graph
+            .documents()
+            .iter()
+            .map(|document| (document.source_id.as_str(), document.id))
+            .collect();
+        let mut materialized: HashSet<(String, String)> = schemas
+            .iter()
+            .map(|schema| {
+                (
+                    schema.source.source_id.clone(),
+                    schema.source.json_pointer.clone(),
+                )
+            })
+            .collect();
+
+        let mut queue: Vec<SchemaRef> = Vec::new();
+        for schema in schemas.iter() {
+            collect_schema_refs(&schema.schema, &mut queue);
+        }
+        for operation in operations {
+            collect_operation_refs(operation, &mut queue);
+        }
+
+        let mut discovered = Vec::new();
+        let mut cursor = 0;
+        while cursor < queue.len() {
+            let index = cursor;
+            cursor += 1;
+            // Skip root-internal references on a borrow, before any clone: a non-component pointer
+            // into the entry document is a separate concern, left to fail its own reference
+            // diagnostic. The queue is appended to below, so the borrow ends before the clone.
+            if queue[index].source_id == entry_source {
+                continue;
+            }
+            let key = {
+                let target = &queue[index];
+                (target.source_id.clone(), target.json_pointer.clone())
+            };
+            if materialized.contains(&key) {
+                continue;
+            }
+            let node = documents_by_source
+                .get(key.0.as_str())
+                .and_then(|&doc_id| self.graph.node_at(doc_id, &key.1))
+                .expect("the loader validated every reference target before parsing");
+            let doc_id = node.doc_id;
+            let name = external_schema_name(&key.1);
+            let source = self.source(doc_id, &key.1);
+            let view = NodeView {
+                doc_id,
+                pointer: key.1.clone(),
+                value: node.value,
+            };
+            // Mark before parsing so a cross-file cycle terminates.
+            materialized.insert(key);
+            let schema = self.parse_schema(view);
+            collect_schema_refs(&schema, &mut queue);
+            discovered.push(NamedSchema {
+                name,
+                schema,
+                source,
+            });
+        }
+
+        discovered.sort_by(|left, right| {
+            (&left.source.source_id, &left.source.json_pointer)
+                .cmp(&(&right.source.source_id, &right.source.json_pointer))
+        });
+        schemas.extend(discovered);
     }
 
     fn parse_named_schemas(&mut self, root: NodeView<'graph>) -> Vec<NamedSchema> {
@@ -402,16 +503,14 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 .iter()
                 .any(|reserved| name.eq_ignore_ascii_case(reserved))
         {
-            let mut diagnostic = self.input_diagnostic(
+            self.sink.push(self.warning_diagnostic(
                 CODE_RESERVED_HEADER_PARAMETER,
                 node.doc_id,
                 &node.pointer,
                 format!(
                     "header parameter '{name}' is ignored because OpenAPI reserves Accept, Content-Type, and Authorization"
                 ),
-            );
-            diagnostic.severity = Severity::Warning;
-            self.sink.push(diagnostic);
+            ));
             return None;
         }
         let schema = match object.get("schema") {
@@ -550,7 +649,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             let canonical_name = match canonical_media_type(raw_name) {
                 Ok(name) => name,
                 Err(MediaKeyError::Parameterized) => {
-                    self.sink.push(self.input_diagnostic(
+                    // Unsupported construct, not invalid input: warn and drop the entry
+                    // The key never forms a branch; an emptied content map
+                    // degrades to the no-content branch. Generation continues.
+                    self.sink.push(self.warning_diagnostic(
                         CODE_MEDIA_TYPE,
                         node.doc_id,
                         &pointer,
@@ -1077,6 +1179,25 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         meta: SchemaMeta,
     ) -> SchemaNode {
         match self.graph.resolve(node.doc_id, reference) {
+            Ok(target) if target.json_pointer.is_empty() => {
+                // A reference with no fragment resolves to a whole document, which names no schema.
+                // Left alone it would flow to materialization as an empty schema name and surface as
+                // an empty-identifier error pointing at nothing; diagnose it at the ref instead.
+                self.sink.push(
+                    Diagnostic::input(
+                        CODE_REFERENCE,
+                        format!(
+                            "schema reference '{reference}' points at a whole document, which names no schema; add a fragment naming the schema (e.g. '{reference}#/SchemaName')"
+                        ),
+                    )
+                    .with_source(self.source_id(node.doc_id))
+                    .with_json_pointer(&node.pointer),
+                );
+                SchemaNode::Unknown {
+                    reason: format!("reference {reference} has no schema fragment"),
+                    meta,
+                }
+            }
             Ok(target) => SchemaNode::Ref {
                 target: SchemaRef {
                     source_id: self.source_id(target.doc_id).to_owned(),
@@ -1615,17 +1736,28 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             .with_json_pointer(&source.json_pointer)
     }
 
+    /// An input diagnostic downgraded to warning severity. Warnings report
+    /// unsupported-but-tolerated constructs that drop out of generation without
+    /// failing it; the severity downgrade lives here so every such site is identical.
+    fn warning_diagnostic(
+        &self,
+        code: &'static str,
+        doc_id: DocId,
+        pointer: &str,
+        message: impl Into<String>,
+    ) -> Diagnostic {
+        let mut diagnostic = self.input_diagnostic(code, doc_id, pointer, message);
+        diagnostic.severity = Severity::Warning;
+        diagnostic
+    }
+
     fn unsupported_diagnostic(
         &self,
         doc_id: DocId,
         pointer: &str,
         message: impl Into<String>,
     ) -> Diagnostic {
-        let mut diagnostic = Diagnostic::input(CODE_UNSUPPORTED, message)
-            .with_source(self.source_id(doc_id))
-            .with_json_pointer(pointer);
-        diagnostic.severity = Severity::Warning;
-        diagnostic
+        self.warning_diagnostic(CODE_UNSUPPORTED, doc_id, pointer, message)
     }
 
     fn source(&self, doc_id: DocId, pointer: &str) -> SourceRef {
@@ -1639,6 +1771,88 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             .source_id
             .as_str()
     }
+}
+
+/// Collects every `$ref` target reachable inside one schema tree.
+fn collect_schema_refs(schema: &SchemaNode, out: &mut Vec<SchemaRef>) {
+    match schema {
+        SchemaNode::Ref { target, .. } => out.push(target.clone()),
+        SchemaNode::Object {
+            properties,
+            additional_properties,
+            ..
+        } => {
+            for (_, property, _) in properties {
+                collect_schema_refs(property, out);
+            }
+            match additional_properties {
+                AdditionalProperties::Schema(schema) => collect_schema_refs(schema, out),
+                AdditionalProperties::Allowed(inner) => {
+                    // The parser never builds Allowed(Some(..)) — that shape only appears
+                    // in post-parse merge results, after this collection pass has run.
+                    debug_assert!(inner.is_none(), "parse-stage Allowed carries no schema");
+                }
+                AdditionalProperties::Forbidden => {}
+            }
+        }
+        SchemaNode::Array { items, .. } => collect_schema_refs(items, out),
+        SchemaNode::Tuple {
+            prefix_items, rest, ..
+        } => {
+            for item in prefix_items {
+                collect_schema_refs(item, out);
+            }
+            if let TupleRest::Schema(schema) = rest {
+                collect_schema_refs(schema, out);
+            }
+        }
+        SchemaNode::AllOf { branches, .. }
+        | SchemaNode::AnyOf { branches, .. }
+        | SchemaNode::OneOf { branches, .. } => {
+            for branch in branches {
+                collect_schema_refs(branch, out);
+            }
+        }
+        SchemaNode::Primitive { .. }
+        | SchemaNode::Finite { .. }
+        | SchemaNode::Any { .. }
+        | SchemaNode::Never { .. }
+        | SchemaNode::Unknown { .. } => {}
+    }
+}
+
+/// Collects `$ref` targets from the operation schemas that emission renders and
+/// validates: parameters, request-body media types (including every request
+/// encoding header schema), and response media types. Encoding headers are
+/// emitted by the client but were previously not collected, so an external
+/// `$ref` there silently degraded to `unknown` with no import or diagnostic.
+fn collect_operation_refs(operation: &Operation, out: &mut Vec<SchemaRef>) {
+    for parameter in &operation.parameters {
+        collect_schema_refs(&parameter.schema, out);
+    }
+    if let Some(body) = &operation.request_body {
+        for media_type in &body.media_types {
+            collect_schema_refs(&media_type.schema, out);
+            for (_, encoding) in &media_type.encodings {
+                for (_, header) in &encoding.headers {
+                    collect_schema_refs(&header.schema, out);
+                }
+            }
+        }
+    }
+    for response in &operation.responses {
+        for media_type in &response.media_types {
+            collect_schema_refs(&media_type.schema, out);
+        }
+    }
+}
+
+/// Names an external schema from its defining pointer's final segment, so it
+/// flows through the same identifier normalization and collision checks as a root
+/// component. The segment is JSON-Pointer unescaped (`~1` → `/`, `~0` → `~`).
+fn external_schema_name(json_pointer: &str) -> String {
+    let segment = json_pointer.rsplit('/').next().unwrap_or(json_pointer);
+    segment.replace("~1", "/").replace("~0", "~")
 }
 
 fn merge_parameters(path_parameters: &[Param], operation_parameters: Vec<Param>) -> Vec<Param> {
@@ -1947,6 +2161,19 @@ mod tests {
             .join(name)
     }
 
+    #[test]
+    fn external_schema_name_takes_the_last_segment_and_unescapes_it() {
+        // Plain final segment.
+        assert_eq!(external_schema_name("/components/schemas/Pet"), "Pet");
+        // `~1` decodes to `/`.
+        assert_eq!(external_schema_name("/defs/foo~1bar"), "foo/bar");
+        // `~0` decodes to `~`.
+        assert_eq!(external_schema_name("/defs/foo~0bar"), "foo~bar");
+        // Order matters: `~1` is substituted before `~0`, so `~01` decodes to the literal `~1`
+        // (the `~1` pass finds nothing, then `~0`→`~` leaves the trailing `1`) rather than `/`.
+        assert_eq!(external_schema_name("/defs/~01"), "~1");
+    }
+
     fn load_fixture(name: &str) -> (ResolvedConfig, DocumentGraph) {
         let directory = fixture(name);
         let config_path = directory.join("oasts.yaml");
@@ -2185,23 +2412,68 @@ mod tests {
             .filter(|diagnostic| diagnostic.code == "OASTS1107")
             .collect::<Vec<_>>();
         assert_eq!(invalid.len(), 5);
-        assert_eq!(
-            invalid
+        let parameterized = invalid
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("parameterized"))
+            .collect::<Vec<_>>();
+        assert_eq!(parameterized.len(), 2);
+        assert!(
+            parameterized
                 .iter()
-                .filter(|diagnostic| diagnostic.message.contains("parameterized"))
-                .count(),
-            2
+                .all(|diagnostic| diagnostic.severity == Severity::Warning),
+            "parameterized content keys are an unsupported construct, not invalid input"
         );
-        assert_eq!(
-            invalid
+        let malformed = invalid
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("malformed"))
+            .collect::<Vec<_>>();
+        assert_eq!(malformed.len(), 3);
+        assert!(
+            malformed
                 .iter()
-                .filter(|diagnostic| diagnostic.message.contains("malformed"))
-                .count(),
-            3
+                .all(|diagnostic| diagnostic.severity == Severity::Error),
+            "malformed content keys are invalid input and stay fatal"
         );
         assert!(invalid.iter().all(|diagnostic| {
             diagnostic.source_id.is_some() && diagnostic.json_pointer.is_some()
         }));
+    }
+
+    #[test]
+    fn parameterized_content_key_warns_and_drops_the_entry_without_erroring() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/watch": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json;stream=watch": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        // The only content key is parameterized: it is dropped, leaving a no-content
+        // branch exactly as if the content map were absent.
+        assert!(ir.operations[0].responses[0].media_types.is_empty());
+
+        let warnings = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1107")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert!(warnings[0].message.contains("parameterized"));
+        // Generation continues: no Error-severity diagnostic, so exit 0.
+        assert!(!sink.has_errors());
     }
 
     #[test]

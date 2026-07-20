@@ -8,6 +8,7 @@
 //! narrower value if that signature ever changed, so it does not faithfully
 //! describe the declared members.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 
@@ -22,7 +23,7 @@ use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
     AdditionalProperties, ExclusiveBound, MediaType, NumericConstraints, Operation, Param,
     ParamLocation, PrimitiveType, PropMeta, ResponseEntry, ResponseStatus, SchemaDocs, SchemaNode,
-    SourceRef, TupleRest,
+    SchemaRef, SourceRef, TupleRest,
 };
 use crate::num::render_number;
 use crate::semantic::{AllocatedSchemaName, Analyzed, EnumMember};
@@ -109,14 +110,13 @@ impl fmt::Display for FileNameError {
 
 impl std::error::Error for FileNameError {}
 
-/// Derives a safe base name from an already-approved declaration identifier.
+/// Derives a safe base name from a source declaration name.
+///
+/// The raw name never reaches the file system: it is split into ASCII token
+/// runs and only the joined candidate is validated, so a
+/// path-shaped source name like `actions/add-labels` derives a safe flat name
+/// instead of being rejected.
 pub fn file_base_name(name: &str, case: FileCase) -> Result<String, FileNameError> {
-    if has_unsafe_path(name) {
-        return Err(FileNameError::UnsafePath);
-    }
-    if is_reserved_device(name) {
-        return Err(FileNameError::ReservedDevice);
-    }
     let tokens = source_name_tokens(name)?;
     if tokens.is_empty() {
         return Err(FileNameError::Empty);
@@ -283,6 +283,12 @@ enum SchemaChildMode {
 pub(super) struct Emitter<'model, 'input, 'sink> {
     model: &'model mut EmissionModel<'input, 'sink>,
     enum_member_indices: BTreeMap<(String, String), usize>,
+    /// Refs whose targets `merge_all_of` is currently inlining, along the active
+    /// render ancestry. A recursive schema whose `allOf` branch points
+    /// back to an ancestor would otherwise inline forever; the branch renders as a
+    /// bare named reference instead. Balanced push/pop keeps this empty between
+    /// top-level declarations, so acyclic output is byte-identical.
+    inlining_refs: RefCell<Vec<SchemaRef>>,
 }
 
 impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
@@ -299,6 +305,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         Self {
             model,
             enum_member_indices,
+            inlining_refs: RefCell::new(Vec::new()),
         }
     }
 
@@ -337,6 +344,11 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             if let Some(body) = &operation.request_body {
                 for media_type in &body.media_types {
                     self.validate_schema(&media_type.schema, &mut diagnostics);
+                    for (_, encoding) in &media_type.encodings {
+                        for (_, header) in &encoding.headers {
+                            self.validate_schema(&header.schema, &mut diagnostics);
+                        }
+                    }
                 }
             }
             for response in &operation.responses {
@@ -906,14 +918,22 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 format!("[{}]", items.join(", "))
             }
             SchemaNode::AllOf { branches, .. } => {
-                if let Some((properties, additional_properties)) = self.merge_all_of(branches) {
-                    self.render_object_parts(
-                        &properties,
-                        &additional_properties,
-                        position,
-                        indent,
-                        false,
-                    )
+                // Inlining a branch that resolves back to an ancestor being inlined
+                // would recurse forever on a recursive schema. The guard falls through
+                // to intersection rendering, where the ref becomes a bare named
+                // reference that terminates the cycle.
+                if let Some(rendered) =
+                    self.merge_all_of_guarded(branches, |properties, additional_properties| {
+                        self.render_object_parts(
+                            properties,
+                            additional_properties,
+                            position,
+                            indent,
+                            false,
+                        )
+                    })
+                {
+                    rendered
                 } else if branches.is_empty() {
                     "unknown".to_owned()
                 } else {
@@ -1009,6 +1029,48 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 }
             }
         }
+    }
+
+    /// Target keys of the `allOf` branches that are direct `$ref`s — the branches
+    /// `merge_all_of` would inline by resolving. Used to detect a ref that points
+    /// back to an ancestor already being inlined (the recursive-schema cycle).
+    fn inlineable_ref_keys(&self, branches: &[SchemaNode]) -> Vec<SchemaRef> {
+        branches
+            .iter()
+            .filter_map(|branch| match branch {
+                SchemaNode::Ref { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Runs `body` over the merged `allOf` shape while the branches' inlineable ref
+    /// targets sit on the cycle-guard stack, then restores the stack. Returns `None`
+    /// without running `body` when a branch resolves back to an ancestor already being
+    /// inlined (the recursive-schema cycle) or when the branches do not merge into a
+    /// single object shape. The stack borrow is released before `body` runs so the body
+    /// can recurse and push its own guards.
+    fn merge_all_of_guarded<R>(
+        &self,
+        branches: &[SchemaNode],
+        body: impl FnOnce(&OwnedProperties, &AdditionalProperties) -> R,
+    ) -> Option<R> {
+        let inline_keys = self.inlineable_ref_keys(branches);
+        let would_cycle = {
+            let stack = self.inlining_refs.borrow();
+            inline_keys.iter().any(|key| stack.contains(key))
+        };
+        if would_cycle {
+            return None;
+        }
+        let (properties, additional_properties) = self.merge_all_of(branches)?;
+        let pushed = inline_keys.len();
+        self.inlining_refs.borrow_mut().extend(inline_keys);
+        let result = body(&properties, &additional_properties);
+        let mut stack = self.inlining_refs.borrow_mut();
+        let kept = stack.len() - pushed;
+        stack.truncate(kept);
+        Some(result)
     }
 
     fn merge_all_of(
@@ -1135,20 +1197,27 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 }
             }
             SchemaNode::AllOf { branches, .. } => {
-                if let SchemaChildMode::References(position) = mode
-                    && let Some((properties, additional_properties)) = self.merge_all_of(branches)
-                {
-                    for (_, property, meta) in &properties {
-                        if property_in_position(meta, position) {
-                            visit(property);
+                // Mirror render_type's cycle guard: a branch resolving back to an
+                // ancestor being inlined must not inline again, or this walk recurses
+                // forever on a recursive schema. Fall through to visiting the raw
+                // branches, where a `$ref` branch records its import and terminates.
+                let handled = if let SchemaChildMode::References(position) = mode {
+                    self.merge_all_of_guarded(branches, |properties, additional_properties| {
+                        for (_, property, meta) in properties {
+                            if property_in_position(meta, position) {
+                                visit(property);
+                            }
                         }
-                    }
-                    if let AdditionalProperties::Allowed(Some(schema))
-                    | AdditionalProperties::Schema(schema) = &additional_properties
-                    {
-                        visit(schema);
-                    }
+                        if let AdditionalProperties::Allowed(Some(schema))
+                        | AdditionalProperties::Schema(schema) = additional_properties
+                        {
+                            visit(schema);
+                        }
+                    })
                 } else {
+                    None
+                };
+                if handled.is_none() {
                     for branch in branches {
                         visit(branch);
                     }
@@ -2367,6 +2436,25 @@ mod tests {
     }
 
     #[test]
+    fn path_shaped_source_names_derive_from_token_runs() {
+        assert_eq!(
+            file_base_name(
+                "actions/add-custom-labels-to-self-hosted-runner-for-org",
+                FileCase::Kebab
+            ),
+            Ok("actions-add-custom-labels-to-self-hosted-runner-for-org".to_owned())
+        );
+        assert_eq!(
+            file_base_name("../../etc/passwd", FileCase::Kebab),
+            Ok("etc-passwd".to_owned())
+        );
+        assert_eq!(
+            file_base_name("lpt9.txt", FileCase::Preserve),
+            Ok("lpt9-txt".to_owned())
+        );
+    }
+
+    #[test]
     fn file_case_modes_and_unsafe_names_are_frozen() {
         assert_eq!(
             file_base_name("PetHTTPStatus", FileCase::Kebab),
@@ -2419,12 +2507,8 @@ mod tests {
             Err(FileNameError::ReservedDevice)
         );
         assert_eq!(
-            file_base_name("lpt9.txt", FileCase::Preserve),
+            file_base_name("lpt9", FileCase::Preserve),
             Err(FileNameError::ReservedDevice)
-        );
-        assert_eq!(
-            file_base_name("../pet", FileCase::Preserve),
-            Err(FileNameError::UnsafePath)
         );
 
         let (_, diagnostics) = compile(
@@ -2812,6 +2896,61 @@ mod tests {
             &source("/fallback-enum"),
         );
         assert!(declaration.contains("Value1: \"fallback\""));
+    }
+
+    #[test]
+    fn recursive_all_of_ref_terminates_as_named_reference() {
+        // Regression: a schema whose member is `allOf: [{$ref: self}]` — the Kubernetes
+        // JSONSchemaProps idiom — must not inline forever. merge_all_of inlines the ref
+        // once, then the self-referential branch renders as the bare named type instead
+        // of recursing. Before the render cycle guard this overflowed the stack (
+        // cycles are legal when they form recursive schemas).
+        let recursive = SchemaNode::Object {
+            properties: vec![(
+                "child".to_owned(),
+                SchemaNode::AllOf {
+                    branches: vec![schema_ref(
+                        "/components/schemas/Loop/properties/child",
+                        "/components/schemas/Loop",
+                    )],
+                    meta: meta("/components/schemas/Loop/properties/child"),
+                },
+                prop_meta("/components/schemas/Loop/properties/child"),
+            )],
+            additional_properties: AdditionalProperties::Forbidden,
+            meta: meta("/components/schemas/Loop"),
+        };
+        let analyzed = Analyzed {
+            ir: Ir {
+                operations: Vec::new(),
+                schemas: vec![NamedSchema {
+                    name: "Loop".to_owned(),
+                    schema: recursive.clone(),
+                    source: source("/components/schemas/Loop"),
+                }],
+                ..Ir::default()
+            },
+            operation_names: Vec::new(),
+            schema_names: vec![AllocatedSchemaName {
+                schema_index: 0,
+                wire_name: "Loop".to_owned(),
+                name: "Loop".to_owned(),
+                source: source("/components/schemas/Loop"),
+            }],
+            enum_members: Vec::new(),
+        };
+        let (_temp, config) = resolved_config(json!({}));
+        let mut sink = DiagnosticSink::new();
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&mut model);
+
+        // Terminates (no stack overflow) and the recursive branch is the bare named type.
+        let rendered = emitter.render_type(&recursive, TypePosition::Neutral, 0);
+        assert!(rendered.contains("child"));
+        assert!(
+            rendered.contains("Loop"),
+            "recursive branch must render as the named type: {rendered}"
+        );
     }
 
     #[test]

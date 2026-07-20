@@ -115,6 +115,19 @@ impl DocumentGraph {
         &self.documents
     }
 
+    /// Returns the node at `json_pointer` inside `doc_id` without re-resolving
+    /// a reference URI, for callers that already hold a resolved target.
+    #[must_use]
+    pub fn node_at(&self, doc_id: DocId, json_pointer: &str) -> Option<Node<'_>> {
+        let document = self.document(doc_id)?;
+        let value = evaluate_pointer(&document.value, json_pointer).ok()?;
+        Some(Node {
+            doc_id,
+            json_pointer: json_pointer.to_owned(),
+            value,
+        })
+    }
+
     /// Returns retained reference edges.
     #[must_use]
     pub fn edges(&self) -> &[ReferenceEdge] {

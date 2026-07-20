@@ -1,0 +1,103 @@
+# bench/manifest.yaml — frozen entry-gate benchmark manifest.
+# Every field in this file is frozen: the harness reads it and appends results to bench/results.yaml only.
+# Changing any field after a measurement exists requires a recorded decision and a clean rerun.
+schemaVersion: 1
+runners:
+  reference: # CI gate runner; activates when GitHub Actions workflows land
+    kind: github-actions
+    image: ubuntu-24.04
+  baseline: # local measurement environment for pre-CI baselines
+    kind: devcontainer
+    image: mcr.microsoft.com/devcontainers/rust:2.0.13-trixie
+toolchain:
+  rust: "1.97.1"
+  node: "24.18.0"
+  pnpm: "11.15.1"
+  typescript: "7.0.2"
+typescriptVersions: # the pinned TS version set; minimum/floor 7.0
+  - "7.0.2"
+commands:
+  generate: "target/release/oasts generate --config <configFile>" # cwd = the copied fixture directory
+  tsc: "pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler <emitted .ts files>"
+procedure:
+  cold: "first generate invocation of a fresh process on a freshly copied fixture directory, no prior invocation of that key in the harness session; recorded, not gated"
+  warm: "a generate process invocation of a key after warmupRuns completed invocations of the same key in the same harness session (OS page cache warm); process spawn and exit included in the timed window"
+  warmupRuns: 3
+  samples: 10
+  rounds: 2 # two full sample sets back-to-back per key
+  percentile: nearest-rank # p50 over n ascending samples = value at 1-based index ceil(0.50 * n)
+  repeatabilityBound: 0.10 # |p50_r1 - p50_r2| / min(p50_r1, p50_r2) <= bound; the gated value is max(p50_r1, p50_r2)
+  rssMethod: wait4-rusage # child peak RSS = ru_maxrss from wait4(2) on the generate process
+thresholds:
+  warmGenerateP50Ms:
+    "github-3.0/oasts.yaml": 1000 # warm types-only generation of the pinned GitHub fixture < 1 s at p50
+  rssCeilingBytes:
+    large: 2147483648 # 2 GiB
+    small: 536870912 # 512 MiB
+  tscCeilingMs:
+    large: 300000
+    small: 60000
+fixtures:
+  - name: github-3.0
+    class: large
+    config: oasts.yaml
+    spec:
+      path: openapi.json
+      url: "https://raw.githubusercontent.com/github/rest-api-description/v2.1.0/descriptions/api.github.com/api.github.com.json"
+      sha256: "b138e9cdcf4ac29a23fea1f6579d2840668a5f3d41fe7f160b263bec590d2e3f"
+  - name: stripe-3.0
+    class: large
+    config: oasts.yaml
+    spec:
+      path: openapi.json
+      url: "https://raw.githubusercontent.com/stripe/openapi/v2344/openapi/spec3.json"
+      sha256: "e24a26de4188fd64dec4c043d5d3726277fdcb07556a493ea481c305b0a223d8"
+  - name: cloudflare-3.0
+    class: large
+    config: oasts.yaml
+    spec:
+      path: openapi.json
+      url: "https://raw.githubusercontent.com/cloudflare/api-schemas/a6e46cc8adea07dc729584cddfa54326803c590b/openapi.json" # repo has no tags; the commit SHA a6e46cc8adea07dc729584cddfa54326803c590b is the only identity
+      sha256: "fef3b6b08e25fad3038c9b56b326fd2f546512a8d9bf3f894e72b95699d41223"
+  - name: kubernetes-core-v1-3.0
+    class: large
+    config: oasts.yaml
+    spec:
+      path: openapi.json
+      url: "https://raw.githubusercontent.com/kubernetes/kubernetes/v1.36.2/api/openapi-spec/v3/api__v1_openapi.json"
+      sha256: "a3cbb14c08e7832e80776e717a5658a178dccb3562cc5c1238193634b6985ff8"
+  - name: kubernetes-apps-v1-3.0
+    class: large
+    config: oasts.yaml
+    spec:
+      path: openapi.json
+      url: "https://raw.githubusercontent.com/kubernetes/kubernetes/v1.36.2/api/openapi-spec/v3/apis__apps__v1_openapi.json"
+      sha256: "4e190f85e4d9bcea04ee9a4a1501205fd4d1902766426c0e3de7efdeaa7395dc"
+  - name: kubernetes-apiextensions-v1-3.0
+    class: large
+    config: oasts.yaml
+    spec:
+      path: openapi.json
+      url: "https://raw.githubusercontent.com/kubernetes/kubernetes/v1.36.2/api/openapi-spec/v3/apis__apiextensions.k8s.io__v1_openapi.json"
+      sha256: "1c7dd621bece6661867bcc29471f774a46b36c02567d59815c7c72f6d08aa512"
+  - name: petstore-3.0
+    class: small
+    config: oasts.yaml
+    committed: true
+  - name: petstore-3.0-client
+    class: small
+    dir: petstore-3.0
+    config: oasts-client.yaml
+    committed: true
+  - name: tictactoe-3.1
+    class: small
+    config: oasts.yaml
+    committed: true
+  - name: client-showcase-3.1
+    class: small
+    config: oasts.yaml
+    committed: true
+  - name: pathological-3.1
+    class: small
+    config: oasts.yaml
+    committed: true
