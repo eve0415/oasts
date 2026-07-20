@@ -1,15 +1,16 @@
 //! OpenAPI 3.0/3.1 parsing into the version-neutral IR.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
-    AdditionalProperties, Body, Discriminator, EnumExtensionData, ExclusiveBound, Ir, MediaType,
-    NamedSchema, NumericConstraints, Operation, Param, ParamLocation, PrimitiveType, PropMeta,
-    ResponseEntry, ResponseStatus, SchemaDocs, SchemaMeta, SchemaNode, SchemaRef, Segment,
-    SegmentPart, SourceRef, TupleRest,
+    AdditionalProperties, Body, Discriminator, EncodingHeader, EncodingObject, EnumExtensionData,
+    ExclusiveBound, Ir, MediaType, NamedSchema, NamedSecurityScheme, NumericConstraints,
+    OasVersion, Operation, Param, ParamLocation, ParamStyle, PrimitiveType, PropMeta,
+    ResponseEntry, ResponseStatus, SchemaDocs, SchemaMeta, SchemaNode, SchemaRef, SecKind,
+    SecurityRequirement, Segment, SegmentPart, ServerEntry, ServerVariable, SourceRef, TupleRest,
 };
 use crate::loader::{DocId, DocumentGraph, append_pointer};
 
@@ -19,6 +20,9 @@ const CODE_UNSUPPORTED: &str = "OASTS1103";
 const CODE_RESPONSE_STATUS: &str = "OASTS1104";
 const CODE_PATH_PARAMETER: &str = "OASTS1105";
 const CODE_REFERENCE: &str = "OASTS1106";
+const CODE_MEDIA_TYPE: &str = "OASTS1107";
+const CODE_DUPLICATE_MEDIA_TYPE: &str = "OASTS1108";
+const CODE_RESERVED_HEADER_PARAMETER: &str = "OASTS1109";
 
 const METHODS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
@@ -41,12 +45,6 @@ const UNSUPPORTED_SCHEMA_KEYWORDS: [&str; 16] = [
     "$dynamicRef",
     "$recursiveRef",
 ];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OasVersion {
-    V3_0,
-    V3_1,
-}
 
 /// Detects the entry document's supported OpenAPI line.
 pub fn detect_version(graph: &DocumentGraph, sink: &mut DiagnosticSink) -> Option<OasVersion> {
@@ -131,9 +129,27 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             pointer: String::new(),
             value: &entry.value,
         };
+        let root_servers = root.value.get("servers").map_or_else(Vec::new, |value| {
+            self.parse_servers(NodeView {
+                doc_id: root.doc_id,
+                pointer: "/servers".to_owned(),
+                value,
+            })
+        });
+        let root_security = root.value.get("security").map_or_else(Vec::new, |value| {
+            self.parse_security_requirements(NodeView {
+                doc_id: root.doc_id,
+                pointer: "/security".to_owned(),
+                value,
+            })
+        });
+        let security_schemes = self.parse_security_schemes(&root);
         Ir {
             operations: self.parse_operations(root.clone()),
             schemas: self.parse_named_schemas(root),
+            root_servers,
+            root_security,
+            security_schemes,
         }
     }
 
@@ -199,6 +215,17 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                             value,
                         })
                     });
+            let path_servers = path_item
+                .value
+                .get("servers")
+                .map_or_else(Vec::new, |value| {
+                    let pointer = append_pointer(&path_item.pointer, "servers");
+                    self.parse_servers(NodeView {
+                        doc_id: path_item.doc_id,
+                        pointer,
+                        value,
+                    })
+                });
             for method in METHODS {
                 let Some(value) = path_item.value.get(method) else {
                     continue;
@@ -223,6 +250,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     operation_node,
                     operation_object,
                     &path_parameters,
+                    &path_servers,
                 ));
             }
         }
@@ -236,6 +264,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         node: NodeView<'graph>,
         object: &'graph Map<String, Value>,
         path_parameters: &[Param],
+        path_servers: &[ServerEntry],
     ) -> Operation {
         let operation_parameters = object.get("parameters").map_or_else(Vec::new, |value| {
             let pointer = append_pointer(&node.pointer, "parameters");
@@ -270,6 +299,25 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 })
             }
         };
+        let servers = object.get("servers").map_or_else(
+            || path_servers.to_vec(),
+            |value| {
+                let pointer = append_pointer(&node.pointer, "servers");
+                self.parse_servers(NodeView {
+                    doc_id: node.doc_id,
+                    pointer,
+                    value,
+                })
+            },
+        );
+        let security = object.get("security").map(|value| {
+            let pointer = append_pointer(&node.pointer, "security");
+            self.parse_security_requirements(NodeView {
+                doc_id: node.doc_id,
+                pointer,
+                value,
+            })
+        });
         Operation {
             method: method.to_owned(),
             path_template,
@@ -281,6 +329,8 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             parameters,
             request_body,
             responses,
+            servers,
+            security,
             source: self.source(node.doc_id, &node.pointer),
         }
     }
@@ -347,6 +397,23 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 return None;
             }
         };
+        if location == ParamLocation::Header
+            && ["accept", "content-type", "authorization"]
+                .iter()
+                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        {
+            let mut diagnostic = self.input_diagnostic(
+                CODE_RESERVED_HEADER_PARAMETER,
+                node.doc_id,
+                &node.pointer,
+                format!(
+                    "header parameter '{name}' is ignored because OpenAPI reserves Accept, Content-Type, and Authorization"
+                ),
+            );
+            diagnostic.severity = Severity::Warning;
+            self.sink.push(diagnostic);
+            return None;
+        }
         let schema = match object.get("schema") {
             None => {
                 let pointer = append_pointer(&node.pointer, "schema");
@@ -365,6 +432,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 })
             }
         };
+        let style = self.parse_param_style(&node, object, "parameter");
         Some(Param {
             name: name.to_owned(),
             location,
@@ -372,6 +440,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             deprecated: bool_field(object, "deprecated"),
             description: string_field(object, "description"),
             schema,
+            style,
+            explode: object.get("explode").and_then(Value::as_bool),
+            allow_reserved: bool_field(object, "allowReserved"),
             source: self.source(node.doc_id, &node.pointer),
         })
     }
@@ -384,11 +455,14 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             description: string_field(object, "description"),
             media_types: object.get("content").map_or_else(Vec::new, |value| {
                 let pointer = append_pointer(&node.pointer, "content");
-                self.parse_media_types(NodeView {
-                    doc_id: node.doc_id,
-                    pointer,
-                    value,
-                })
+                self.parse_media_types(
+                    NodeView {
+                        doc_id: node.doc_id,
+                        pointer,
+                        value,
+                    },
+                    true,
+                )
             }),
             source: self.source(node.doc_id, &node.pointer),
         })
@@ -445,11 +519,14 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     description,
                     media_types: response.get("content").map_or_else(Vec::new, |content| {
                         let content_pointer = append_pointer(&response_node.pointer, "content");
-                        self.parse_media_types(NodeView {
-                            doc_id: response_node.doc_id,
-                            pointer: content_pointer,
-                            value: content,
-                        })
+                        self.parse_media_types(
+                            NodeView {
+                                doc_id: response_node.doc_id,
+                                pointer: content_pointer,
+                                value: content,
+                            },
+                            false,
+                        )
                     }),
                     source: self.source(response_node.doc_id, &response_node.pointer),
                 })
@@ -457,34 +534,445 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             .collect()
     }
 
-    fn parse_media_types(&mut self, node: NodeView<'graph>) -> Vec<MediaType> {
+    fn parse_media_types(
+        &mut self,
+        node: NodeView<'graph>,
+        parse_encodings: bool,
+    ) -> Vec<MediaType> {
         let Some(object) = node.value.as_object() else {
             self.shape_error(node.doc_id, &node.pointer, "content must be an object");
             return Vec::new();
         };
-        object
-            .iter()
-            .map(|(name, value)| {
-                let pointer = append_pointer(&node.pointer, name);
-                let schema_pointer = append_pointer(&pointer, "schema");
-                let schema = match value.get("schema") {
-                    None => self.unsupported_schema(
+        let mut parsed = Vec::new();
+        let mut canonical_keys = HashMap::new();
+        for (raw_name, value) in object {
+            let pointer = append_pointer(&node.pointer, raw_name);
+            let canonical_name = match canonical_media_type(raw_name) {
+                Ok(name) => name,
+                Err(MediaKeyError::Parameterized) => {
+                    self.sink.push(self.input_diagnostic(
+                        CODE_MEDIA_TYPE,
                         node.doc_id,
-                        &schema_pointer,
-                        "media type without a schema",
+                        &pointer,
+                        format!(
+                            "parameterized content key '{raw_name}' is not supported; content keys must omit media-type parameters"
+                        ),
+                    ));
+                    continue;
+                }
+                Err(MediaKeyError::Malformed) => {
+                    self.sink.push(self.input_diagnostic(
+                        CODE_MEDIA_TYPE,
+                        node.doc_id,
+                        &pointer,
+                        format!(
+                            "malformed content key '{raw_name}'; expected an RFC 9110 type/subtype media type or wildcard range"
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            if let Some((first_index, first_raw_name)) = canonical_keys.get(&canonical_name) {
+                parsed[*first_index] = None;
+                self.sink.push(self.input_diagnostic(
+                    CODE_DUPLICATE_MEDIA_TYPE,
+                    node.doc_id,
+                    &pointer,
+                    format!(
+                        "duplicate content keys '{first_raw_name}' and '{raw_name}' canonicalize to '{canonical_name}'"
                     ),
-                    Some(schema) => self.parse_schema(NodeView {
+                ));
+                continue;
+            }
+            canonical_keys.insert(canonical_name.clone(), (parsed.len(), raw_name.clone()));
+            let schema_pointer = append_pointer(&pointer, "schema");
+            let (schema, schema_present) = match value.get("schema") {
+                None => (
+                    SchemaNode::Any {
+                        meta: SchemaMeta {
+                            source: self.source(node.doc_id, &schema_pointer),
+                            ..SchemaMeta::default()
+                        },
+                    },
+                    false,
+                ),
+                Some(schema) => (
+                    self.parse_schema(NodeView {
                         doc_id: node.doc_id,
-                        pointer: schema_pointer.clone(),
+                        pointer: schema_pointer,
                         value: schema,
                     }),
+                    true,
+                ),
+            };
+            let encodings = if parse_encodings
+                && (canonical_name == "application/x-www-form-urlencoded"
+                    || canonical_name.starts_with("multipart/"))
+            {
+                value.get("encoding").map_or_else(Vec::new, |encoding| {
+                    self.parse_encodings(NodeView {
+                        doc_id: node.doc_id,
+                        pointer: append_pointer(&pointer, "encoding"),
+                        value: encoding,
+                    })
+                })
+            } else {
+                Vec::new()
+            };
+            parsed.push(Some(MediaType {
+                name: canonical_name,
+                raw_name: raw_name.clone(),
+                schema,
+                schema_present,
+                examples: media_type_examples(value),
+                encodings,
+                streaming_marked: value
+                    .get("x-oasts-streaming")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                oas_version: self.version,
+                source: self.source(node.doc_id, &pointer),
+            }));
+        }
+        parsed.into_iter().flatten().collect()
+    }
+
+    fn parse_encodings(&mut self, node: NodeView<'graph>) -> Vec<(String, EncodingObject)> {
+        let Some(object) = node.value.as_object() else {
+            self.shape_error(node.doc_id, &node.pointer, "encoding must be an object");
+            return Vec::new();
+        };
+        object
+            .iter()
+            .filter_map(|(name, value)| {
+                let pointer = append_pointer(&node.pointer, name);
+                let Some(encoding) = value.as_object() else {
+                    self.shape_error(node.doc_id, &pointer, "encoding value must be an object");
+                    return None;
                 };
-                MediaType {
-                    name: name.clone(),
-                    schema,
-                    examples: media_type_examples(value),
+                let encoding_node = NodeView {
+                    doc_id: node.doc_id,
+                    pointer,
+                    value,
+                };
+                let content_type = encoding
+                    .get("contentType")
+                    .and_then(Value::as_str)
+                    .map(|value| value.split(',').map(str::trim).map(str::to_owned).collect());
+                let headers = encoding.get("headers").map_or_else(Vec::new, |headers| {
+                    self.parse_encoding_headers(NodeView {
+                        doc_id: node.doc_id,
+                        pointer: append_pointer(&encoding_node.pointer, "headers"),
+                        value: headers,
+                    })
+                });
+                let style = self.parse_param_style(&encoding_node, encoding, "encoding");
+                Some((
+                    name.clone(),
+                    EncodingObject {
+                        content_type,
+                        headers,
+                        style,
+                        explode: encoding.get("explode").and_then(Value::as_bool),
+                        allow_reserved: bool_field(encoding, "allowReserved"),
+                        allow_reserved_explicit: encoding
+                            .get("allowReserved")
+                            .is_some_and(Value::is_boolean),
+                        source: self.source(encoding_node.doc_id, &encoding_node.pointer),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn parse_encoding_headers(&mut self, node: NodeView<'graph>) -> Vec<(String, EncodingHeader)> {
+        let Some(object) = node.value.as_object() else {
+            self.shape_error(
+                node.doc_id,
+                &node.pointer,
+                "encoding headers must be an object",
+            );
+            return Vec::new();
+        };
+        object
+            .iter()
+            .filter_map(|(name, value)| {
+                let pointer = append_pointer(&node.pointer, name);
+                let header_node = self.resolve_object(
+                    NodeView {
+                        doc_id: node.doc_id,
+                        pointer,
+                        value,
+                    },
+                    "encoding header",
+                )?;
+                let header = header_node.value.as_object()?;
+                let schema_pointer = append_pointer(&header_node.pointer, "schema");
+                let schema = match header.get("schema") {
+                    Some(schema) => self.parse_schema(NodeView {
+                        doc_id: header_node.doc_id,
+                        pointer: schema_pointer,
+                        value: schema,
+                    }),
+                    None => self.unsupported_schema(
+                        header_node.doc_id,
+                        &schema_pointer,
+                        "encoding header content or missing schema is not supported",
+                    ),
+                };
+                Some((
+                    name.clone(),
+                    EncodingHeader {
+                        required: bool_field(header, "required"),
+                        schema,
+                        source: self.source(header_node.doc_id, &header_node.pointer),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn parse_param_style(
+        &mut self,
+        node: &NodeView<'graph>,
+        object: &Map<String, Value>,
+        kind: &str,
+    ) -> Option<ParamStyle> {
+        let value = object.get("style")?;
+        let style = match value.as_str() {
+            Some("form") => ParamStyle::Form,
+            Some("simple") => ParamStyle::Simple,
+            Some("label") => ParamStyle::Label,
+            Some("matrix") => ParamStyle::Matrix,
+            Some("spaceDelimited") => ParamStyle::SpaceDelimited,
+            Some("pipeDelimited") => ParamStyle::PipeDelimited,
+            Some("deepObject") => ParamStyle::DeepObject,
+            _ => {
+                self.shape_error(
+                    node.doc_id,
+                    &append_pointer(&node.pointer, "style"),
+                    format!(
+                        "{kind}.style must be form, simple, label, matrix, spaceDelimited, pipeDelimited, or deepObject"
+                    ),
+                );
+                return None;
+            }
+        };
+        Some(style)
+    }
+
+    fn parse_servers(&mut self, node: NodeView<'graph>) -> Vec<ServerEntry> {
+        let Some(values) = node.value.as_array() else {
+            self.shape_error(node.doc_id, &node.pointer, "servers must be an array");
+            return Vec::new();
+        };
+        values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                let pointer = append_pointer(&node.pointer, &index.to_string());
+                let Some(server) = value.as_object() else {
+                    self.shape_error(node.doc_id, &pointer, "server must be an object");
+                    return None;
+                };
+                let Some(url) = server.get("url").and_then(Value::as_str) else {
+                    self.shape_error(
+                        node.doc_id,
+                        &append_pointer(&pointer, "url"),
+                        "server.url must be a string",
+                    );
+                    return None;
+                };
+                let variables = server.get("variables").map_or_else(Vec::new, |variables| {
+                    self.parse_server_variables(NodeView {
+                        doc_id: node.doc_id,
+                        pointer: append_pointer(&pointer, "variables"),
+                        value: variables,
+                    })
+                });
+                Some(ServerEntry {
+                    url: url.to_owned(),
+                    variables,
                     source: self.source(node.doc_id, &pointer),
+                })
+            })
+            .collect()
+    }
+
+    fn parse_server_variables(&mut self, node: NodeView<'graph>) -> Vec<(String, ServerVariable)> {
+        let Some(object) = node.value.as_object() else {
+            self.shape_error(
+                node.doc_id,
+                &node.pointer,
+                "server variables must be an object",
+            );
+            return Vec::new();
+        };
+        object
+            .iter()
+            .filter_map(|(name, value)| {
+                let pointer = append_pointer(&node.pointer, name);
+                let Some(variable) = value.as_object() else {
+                    self.shape_error(node.doc_id, &pointer, "server variable must be an object");
+                    return None;
+                };
+                let Some(default) = variable.get("default").and_then(Value::as_str) else {
+                    self.shape_error(
+                        node.doc_id,
+                        &append_pointer(&pointer, "default"),
+                        "server variable default must be a string",
+                    );
+                    return None;
+                };
+                let enum_values = match variable.get("enum") {
+                    None => Vec::new(),
+                    Some(Value::Array(values)) => values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, value)| {
+                            value.as_str().map(str::to_owned).or_else(|| {
+                                self.shape_error(
+                                    node.doc_id,
+                                    &append_pointer(
+                                        &append_pointer(&pointer, "enum"),
+                                        &index.to_string(),
+                                    ),
+                                    "server variable enum values must be strings",
+                                );
+                                None
+                            })
+                        })
+                        .collect(),
+                    Some(_) => {
+                        self.shape_error(
+                            node.doc_id,
+                            &append_pointer(&pointer, "enum"),
+                            "server variable enum must be an array",
+                        );
+                        Vec::new()
+                    }
+                };
+                Some((
+                    name.clone(),
+                    ServerVariable {
+                        default: default.to_owned(),
+                        enum_values,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn parse_security_requirements(&mut self, node: NodeView<'graph>) -> Vec<SecurityRequirement> {
+        let Some(values) = node.value.as_array() else {
+            self.shape_error(node.doc_id, &node.pointer, "security must be an array");
+            return Vec::new();
+        };
+        values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                let pointer = append_pointer(&node.pointer, &index.to_string());
+                let Some(requirement) = value.as_object() else {
+                    self.shape_error(
+                        node.doc_id,
+                        &pointer,
+                        "security requirement must be an object",
+                    );
+                    return None;
+                };
+                let mut parsed = Vec::new();
+                let mut valid = true;
+                for (name, value) in requirement {
+                    let scopes_pointer = append_pointer(&pointer, name);
+                    let Some(scopes) = value.as_array() else {
+                        self.shape_error(
+                            node.doc_id,
+                            &scopes_pointer,
+                            "security requirement scopes must be an array",
+                        );
+                        valid = false;
+                        continue;
+                    };
+                    let mut parsed_scopes = Vec::new();
+                    for (index, value) in scopes.iter().enumerate() {
+                        match value.as_str() {
+                            Some(scope) => parsed_scopes.push(scope.to_owned()),
+                            None => {
+                                self.shape_error(
+                                    node.doc_id,
+                                    &append_pointer(&scopes_pointer, &index.to_string()),
+                                    "security requirement scopes must be strings",
+                                );
+                                valid = false;
+                            }
+                        }
+                    }
+                    parsed.push((name.clone(), parsed_scopes));
                 }
+                valid.then_some(parsed)
+            })
+            .collect()
+    }
+
+    fn parse_security_schemes(&mut self, root: &NodeView<'graph>) -> Vec<NamedSecurityScheme> {
+        let Some(value) = root
+            .value
+            .get("components")
+            .and_then(|components| components.get("securitySchemes"))
+        else {
+            return Vec::new();
+        };
+        let pointer = "/components/securitySchemes";
+        let Some(object) = value.as_object() else {
+            self.shape_error(
+                root.doc_id,
+                pointer,
+                "components.securitySchemes must be an object",
+            );
+            return Vec::new();
+        };
+        object
+            .iter()
+            .filter_map(|(name, value)| {
+                let scheme_node = self.resolve_object(
+                    NodeView {
+                        doc_id: root.doc_id,
+                        pointer: append_pointer(pointer, name),
+                        value,
+                    },
+                    "security scheme",
+                )?;
+                let scheme = scheme_node.value.as_object()?;
+                let kind = match scheme.get("type").and_then(Value::as_str) {
+                    Some("http") => SecKind::Http {
+                        scheme: string_field(scheme, "scheme").unwrap_or_default(),
+                    },
+                    Some("apiKey") => match scheme.get("in").and_then(Value::as_str) {
+                        Some("query") => SecKind::ApiKey {
+                            location: ParamLocation::Query,
+                            name: string_field(scheme, "name").unwrap_or_default(),
+                        },
+                        Some("header") => SecKind::ApiKey {
+                            location: ParamLocation::Header,
+                            name: string_field(scheme, "name").unwrap_or_default(),
+                        },
+                        Some("cookie") => SecKind::ApiKey {
+                            location: ParamLocation::Cookie,
+                            name: string_field(scheme, "name").unwrap_or_default(),
+                        },
+                        _ => SecKind::Other,
+                    },
+                    Some("oauth2") => SecKind::OAuth2,
+                    Some("openIdConnect") => SecKind::OpenIdConnect,
+                    Some("mutualTLS") => SecKind::MutualTls,
+                    _ => SecKind::Other,
+                };
+                Some(NamedSecurityScheme {
+                    name: name.clone(),
+                    kind,
+                    source: self.source(scheme_node.doc_id, &scheme_node.pointer),
+                })
             })
             .collect()
     }
@@ -1001,6 +1489,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     .get("nullable")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+            content_encoding: (self.version == OasVersion::V3_1)
+                .then(|| string_field(object, "contentEncoding"))
+                .flatten(),
             docs: SchemaDocs {
                 title: string_field(object, "title"),
                 description: string_field(object, "description"),
@@ -1111,6 +1602,19 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         );
     }
 
+    fn input_diagnostic(
+        &self,
+        code: &'static str,
+        doc_id: DocId,
+        pointer: &str,
+        message: impl Into<String>,
+    ) -> Diagnostic {
+        let source = self.source(doc_id, pointer);
+        Diagnostic::input(code, message)
+            .with_source(&source.source_id)
+            .with_json_pointer(&source.json_pointer)
+    }
+
     fn unsupported_diagnostic(
         &self,
         doc_id: DocId,
@@ -1148,6 +1652,57 @@ fn merge_parameters(path_parameters: &[Param], operation_parameters: Vec<Param>)
         .cloned()
         .chain(operation_parameters)
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaKeyError {
+    Parameterized,
+    Malformed,
+}
+
+fn canonical_media_type(raw: &str) -> Result<String, MediaKeyError> {
+    if raw.contains(';') {
+        return Err(MediaKeyError::Parameterized);
+    }
+    let Some((media_type, subtype)) = raw.split_once('/') else {
+        return Err(MediaKeyError::Malformed);
+    };
+    if subtype.contains('/')
+        || !is_rfc_9110_token(media_type)
+        || !is_rfc_9110_token(subtype)
+        || (media_type == "*" && subtype != "*")
+    {
+        return Err(MediaKeyError::Malformed);
+    }
+    Ok(format!(
+        "{}/{}",
+        media_type.to_ascii_lowercase(),
+        subtype.to_ascii_lowercase()
+    ))
+}
+
+fn is_rfc_9110_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn parse_path_template(path: &str) -> Vec<Segment> {
@@ -1383,6 +1938,7 @@ mod tests {
 
     use super::*;
     use crate::config::{ResolvedConfig, load_config};
+    use crate::ir::{ParamStyle, SecKind};
     use crate::loader::load_graph;
 
     fn fixture(name: &str) -> PathBuf {
@@ -1509,6 +2065,798 @@ mod tests {
                 ResponseStatus::Default,
             ]
         );
+    }
+
+    #[test]
+    fn drops_reserved_header_parameters_before_path_operation_merging() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/headers": {
+                    "parameters": [
+                        { "name": "Content-TYPE", "in": "header", "schema": { "type": "string" } },
+                        { "name": "keep-path", "in": "header", "schema": { "type": "string" } }
+                    ],
+                    "get": {
+                        "parameters": [
+                            { "name": "authorization", "in": "header", "schema": { "type": "string" } },
+                            { "name": "AcCePt", "in": "header", "schema": { "type": "string" } },
+                            { "name": "keep-operation", "in": "header", "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "empty" } }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert_eq!(
+            ir.operations[0]
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>(),
+            ["keep-path", "keep-operation"]
+        );
+        let diagnostics = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1109")
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 3);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity == Severity::Warning)
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.json_pointer.as_deref() == Some("/paths/~1headers/parameters/0")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.json_pointer.as_deref() == Some("/paths/~1headers/get/parameters/0")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.json_pointer.as_deref() == Some("/paths/~1headers/get/parameters/1")
+        }));
+        assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn canonicalizes_valid_media_keys_and_rejects_parameterized_or_malformed_keys() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/media": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "Application/JSON": { "schema": { "type": "string" } },
+                                "TEXT/*": { "schema": { "type": "string" } },
+                                "*/*": { "schema": { "type": "string" } },
+                                "application/json; charset=utf-8": { "schema": { "type": "string" } },
+                                "*/json": { "schema": { "type": "string" } },
+                                "missing-slash": { "schema": { "type": "string" } }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "IMAGE/PNG": { "schema": { "type": "string" } },
+                                    "image/png;quality=high": { "schema": { "type": "string" } },
+                                    "image/(png)": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let operation = &ir.operations[0];
+        let request_media = &operation
+            .request_body
+            .as_ref()
+            .expect("request body")
+            .media_types;
+        assert_eq!(
+            request_media
+                .iter()
+                .map(|media| (media.name.as_str(), media.raw_name.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("application/json", "Application/JSON"),
+                ("text/*", "TEXT/*"),
+                ("*/*", "*/*")
+            ]
+        );
+        assert_eq!(
+            operation.responses[0]
+                .media_types
+                .iter()
+                .map(|media| (media.name.as_str(), media.raw_name.as_str()))
+                .collect::<Vec<_>>(),
+            [("image/png", "IMAGE/PNG")]
+        );
+
+        let invalid = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1107")
+            .collect::<Vec<_>>();
+        assert_eq!(invalid.len(), 5);
+        assert_eq!(
+            invalid
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("parameterized"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            invalid
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("malformed"))
+                .count(),
+            3
+        );
+        assert!(invalid.iter().all(|diagnostic| {
+            diagnostic.source_id.is_some() && diagnostic.json_pointer.is_some()
+        }));
+    }
+
+    #[test]
+    fn duplicate_canonical_media_keys_diagnose_the_second_and_drop_both() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/duplicate": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "Application/JSON": { "schema": { "type": "string" } },
+                                "application/json": { "schema": { "type": "integer" } },
+                                "text/plain": { "schema": { "type": "string" } }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "TEXT/*": { "schema": { "type": "string" } },
+                                    "text/*": { "schema": { "type": "integer" } },
+                                    "image/*": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let operation = &ir.operations[0];
+        assert_eq!(
+            operation
+                .request_body
+                .as_ref()
+                .expect("request body")
+                .media_types[0]
+                .name,
+            "text/plain"
+        );
+        assert_eq!(operation.responses[0].media_types[0].name, "image/*");
+
+        let duplicates = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1108")
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 2);
+        assert!(duplicates.iter().any(|diagnostic| {
+            diagnostic.json_pointer.as_deref()
+                == Some("/paths/~1duplicate/post/requestBody/content/application~1json")
+                && diagnostic.message.contains("Application/JSON")
+                && diagnostic.message.contains("application/json")
+        }));
+        assert!(duplicates.iter().any(|diagnostic| {
+            diagnostic.json_pointer.as_deref()
+                == Some("/paths/~1duplicate/post/responses/200/content/text~1*")
+                && diagnostic.message.contains("TEXT/*")
+                && diagnostic.message.contains("text/*")
+        }));
+    }
+
+    #[test]
+    fn parses_streaming_media_type_extension_only_from_boolean_true() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/streaming": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/marked": {
+                                    "x-oasts-streaming": true,
+                                    "schema": { "type": "string" }
+                                },
+                                "application/unmarked": {
+                                    "x-oasts-streaming": false,
+                                    "schema": { "type": "string" }
+                                },
+                                "application/non-boolean": {
+                                    "x-oasts-streaming": "true",
+                                    "schema": { "type": "string" }
+                                },
+                                "application/absent": {
+                                    "schema": { "type": "string" }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "empty" } }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let media_types = &ir.operations[0]
+            .request_body
+            .as_ref()
+            .expect("request body")
+            .media_types;
+
+        assert!(media_types[0].streaming_marked);
+        assert!(!media_types[1].streaming_marked);
+        assert!(!media_types[2].streaming_marked);
+        assert!(!media_types[3].streaming_marked);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn preserves_client_media_and_schema_facts_needed_after_parsing() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/facts": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "encoded": {
+                                                "type": "string",
+                                                "contentEncoding": "8bit"
+                                            }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "encoded": { "allowReserved": false }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "schema optional",
+                                "content": { "text/plain": {} }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let operation = &ir.operations[0];
+        let request_media = &operation
+            .request_body
+            .as_ref()
+            .expect("request body")
+            .media_types[0];
+        let first_property_content_encoding = |schema: &SchemaNode| match schema {
+            SchemaNode::Object { properties, .. } => {
+                properties[0].1.meta().content_encoding.clone()
+            }
+            _ => None,
+        };
+        assert_eq!(
+            first_property_content_encoding(&request_media.schema),
+            Some("8bit".to_owned())
+        );
+        assert_eq!(
+            first_property_content_encoding(&operation.responses[0].media_types[0].schema),
+            None
+        );
+        assert!(request_media.encodings[0].1.allow_reserved_explicit);
+        assert!(request_media.schema_present);
+        assert!(!operation.responses[0].media_types[0].schema_present);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn parses_all_parameter_serialization_styles_without_applying_defaults() {
+        let styles = [
+            "form",
+            "simple",
+            "label",
+            "matrix",
+            "spaceDelimited",
+            "pipeDelimited",
+            "deepObject",
+            "invalid",
+        ];
+        let parameters = styles
+            .iter()
+            .enumerate()
+            .map(|(index, style)| {
+                json!({
+                    "name": format!("parameter-{index}"),
+                    "in": "query",
+                    "style": style,
+                    "explode": index == 0,
+                    "allowReserved": index == 0,
+                    "schema": { "type": "string" }
+                })
+            })
+            .chain([json!({
+                "name": "defaults",
+                "in": "query",
+                "schema": { "type": "string" }
+            })])
+            .collect::<Vec<_>>();
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/styles": {
+                    "get": {
+                        "parameters": parameters,
+                        "responses": { "204": { "description": "empty" } }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let parameters = &ir.operations[0].parameters;
+        assert_eq!(
+            parameters
+                .iter()
+                .take(8)
+                .map(|parameter| parameter.style)
+                .collect::<Vec<_>>(),
+            [
+                Some(ParamStyle::Form),
+                Some(ParamStyle::Simple),
+                Some(ParamStyle::Label),
+                Some(ParamStyle::Matrix),
+                Some(ParamStyle::SpaceDelimited),
+                Some(ParamStyle::PipeDelimited),
+                Some(ParamStyle::DeepObject),
+                None,
+            ]
+        );
+        assert_eq!(parameters[0].explode, Some(true));
+        assert!(parameters[0].allow_reserved);
+        assert_eq!(parameters[1].explode, Some(false));
+        assert!(!parameters[1].allow_reserved);
+        assert_eq!(parameters[8].explode, None);
+        assert!(!parameters[8].allow_reserved);
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_SHAPE
+                && diagnostic.json_pointer.as_deref()
+                    == Some("/paths/~1styles/get/parameters/7/style")
+                && diagnostic.message.contains("parameter.style")
+        }));
+    }
+
+    #[test]
+    fn parses_applicable_request_encoding_objects_and_resolves_headers() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/encoding": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "APPLICATION/X-WWW-FORM-URLENCODED": {
+                                    "schema": { "type": "object" },
+                                    "encoding": {
+                                        "field-a": {
+                                            "contentType": "text/plain, application/json",
+                                            "headers": {
+                                                "X-Required": { "$ref": "#/components/headers/Required" },
+                                                "X-Optional": { "schema": { "type": "integer" } }
+                                            },
+                                            "style": "deepObject",
+                                            "explode": true,
+                                            "allowReserved": true
+                                        },
+                                        "field-b": {}
+                                    }
+                                },
+                                "MULTIPART/FORM-DATA": {
+                                    "schema": { "type": "object" },
+                                    "encoding": { "upload": { "style": "form" } }
+                                },
+                                "application/json": {
+                                    "schema": { "type": "object" },
+                                    "encoding": { "ignored": { "style": "simple" } }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "multipart/mixed": {
+                                        "schema": { "type": "object" },
+                                        "encoding": { "ignored-response": { "style": "form" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "headers": {
+                    "Required": { "required": true, "schema": { "type": "string" } }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let media_types = &ir.operations[0]
+            .request_body
+            .as_ref()
+            .expect("request body")
+            .media_types;
+        let form = media_types
+            .iter()
+            .find(|media| media.name == "application/x-www-form-urlencoded")
+            .expect("form media type");
+        assert_eq!(
+            form.encodings
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["field-a", "field-b"]
+        );
+        let encoding = &form.encodings[0].1;
+        assert_eq!(
+            encoding.content_type,
+            Some(vec!["text/plain".to_owned(), "application/json".to_owned()])
+        );
+        assert_eq!(encoding.style, Some(ParamStyle::DeepObject));
+        assert_eq!(encoding.explode, Some(true));
+        assert!(encoding.allow_reserved);
+        assert_eq!(
+            encoding
+                .headers
+                .iter()
+                .map(|(name, header)| (name.as_str(), header.required))
+                .collect::<Vec<_>>(),
+            [("X-Required", true), ("X-Optional", false)]
+        );
+        assert_eq!(
+            encoding.headers[0].1.source.json_pointer,
+            "/components/headers/Required"
+        );
+        assert!(matches!(
+            encoding.headers[0].1.schema,
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            }
+        ));
+        assert_eq!(form.encodings[1].1.content_type, None);
+        assert_eq!(form.encodings[1].1.explode, None);
+        assert!(!form.encodings[1].1.allow_reserved);
+
+        let multipart = media_types
+            .iter()
+            .find(|media| media.name == "multipart/form-data")
+            .expect("multipart media type");
+        assert_eq!(multipart.encodings[0].1.style, Some(ParamStyle::Form));
+        assert!(
+            media_types
+                .iter()
+                .find(|media| media.name == "application/json")
+                .expect("JSON media type")
+                .encodings
+                .is_empty()
+        );
+        assert!(
+            ir.operations[0].responses[0].media_types[0]
+                .encodings
+                .is_empty()
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn parses_root_servers_and_operation_over_path_server_inheritance() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "servers": [
+                {
+                    "url": "https://{region}.example.test/{version}",
+                    "variables": {
+                        "region": { "default": "us", "enum": ["us", "eu"] },
+                        "version": { "default": "v1" }
+                    }
+                }
+            ],
+            "paths": {
+                "/inherited": {
+                    "servers": [{ "url": "https://path.example.test" }],
+                    "get": { "responses": { "204": { "description": "empty" } } },
+                    "post": {
+                        "servers": [],
+                        "responses": { "204": { "description": "empty" } }
+                    },
+                    "put": {
+                        "servers": [{ "url": "https://operation.example.test" }],
+                        "responses": { "204": { "description": "empty" } }
+                    }
+                },
+                "/root-fallback-later": {
+                    "get": { "responses": { "204": { "description": "empty" } } }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        assert_eq!(
+            ir.root_servers[0].url,
+            "https://{region}.example.test/{version}"
+        );
+        assert_eq!(
+            ir.root_servers[0]
+                .variables
+                .iter()
+                .map(|(name, variable)| (name.as_str(), variable.default.as_str()))
+                .collect::<Vec<_>>(),
+            [("region", "us"), ("version", "v1")]
+        );
+        assert_eq!(ir.root_servers[0].variables[0].1.enum_values, ["us", "eu"]);
+        let operation = |method: &str| {
+            ir.operations
+                .iter()
+                .find(|operation| operation.method == method)
+                .expect("operation")
+        };
+        assert_eq!(operation("get").servers[0].url, "https://path.example.test");
+        assert!(operation("post").servers.is_empty());
+        assert_eq!(
+            operation("put").servers[0].url,
+            "https://operation.example.test"
+        );
+        let root_fallback = ir
+            .operations
+            .iter()
+            .find(|operation| {
+                operation.method == "get"
+                    && operation
+                        .source
+                        .json_pointer
+                        .contains("root-fallback-later")
+            })
+            .expect("root fallback operation");
+        assert!(root_fallback.servers.is_empty());
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn parses_security_requirements_and_every_security_scheme_kind() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "security": [
+                { "oauth": ["read", "write"], "queryKey": [] },
+                {}
+            ],
+            "x-http": { "type": "http", "scheme": "digest" },
+            "paths": {
+                "/security": {
+                    "get": { "responses": { "204": { "description": "empty" } } },
+                    "post": {
+                        "security": [],
+                        "responses": { "204": { "description": "empty" } }
+                    },
+                    "put": {
+                        "security": [{ "mutual": [] }, {}],
+                        "responses": { "204": { "description": "empty" } }
+                    }
+                }
+            },
+            "components": {
+                "securitySchemes": {
+                    "http": { "type": "http", "scheme": "bearer" },
+                    "httpDefault": { "type": "http" },
+                    "queryKey": { "type": "apiKey", "in": "query", "name": "key" },
+                    "headerKey": { "type": "apiKey", "in": "header", "name": "X-Key" },
+                    "cookieKey": { "type": "apiKey", "in": "cookie", "name": "session" },
+                    "badKey": { "type": "apiKey", "in": "path", "name": "bad" },
+                    "oauth": { "type": "oauth2" },
+                    "openid": { "type": "openIdConnect" },
+                    "mutual": { "type": "mutualTLS" },
+                    "other": { "type": "custom" },
+                    "referenced": { "$ref": "#/x-http" }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        assert_eq!(
+            ir.root_security,
+            vec![
+                vec![
+                    (
+                        "oauth".to_owned(),
+                        vec!["read".to_owned(), "write".to_owned()]
+                    ),
+                    ("queryKey".to_owned(), Vec::new())
+                ],
+                Vec::new()
+            ]
+        );
+        let operation = |method: &str| {
+            ir.operations
+                .iter()
+                .find(|operation| operation.method == method)
+                .expect("operation")
+        };
+        assert_eq!(operation("get").security, None);
+        assert_eq!(operation("post").security, Some(Vec::new()));
+        assert_eq!(
+            operation("put").security,
+            Some(vec![vec![("mutual".to_owned(), Vec::new())], Vec::new()])
+        );
+        assert_eq!(
+            ir.security_schemes
+                .iter()
+                .map(|scheme| scheme.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "http",
+                "httpDefault",
+                "queryKey",
+                "headerKey",
+                "cookieKey",
+                "badKey",
+                "oauth",
+                "openid",
+                "mutual",
+                "other",
+                "referenced"
+            ]
+        );
+        assert_eq!(
+            ir.security_schemes
+                .iter()
+                .map(|scheme| scheme.kind.clone())
+                .collect::<Vec<_>>(),
+            [
+                SecKind::Http {
+                    scheme: "bearer".to_owned()
+                },
+                SecKind::Http {
+                    scheme: String::new()
+                },
+                SecKind::ApiKey {
+                    location: ParamLocation::Query,
+                    name: "key".to_owned()
+                },
+                SecKind::ApiKey {
+                    location: ParamLocation::Header,
+                    name: "X-Key".to_owned()
+                },
+                SecKind::ApiKey {
+                    location: ParamLocation::Cookie,
+                    name: "session".to_owned()
+                },
+                SecKind::Other,
+                SecKind::OAuth2,
+                SecKind::OpenIdConnect,
+                SecKind::MutualTls,
+                SecKind::Other,
+                SecKind::Http {
+                    scheme: "digest".to_owned()
+                }
+            ]
+        );
+        assert_eq!(ir.security_schemes[10].source.json_pointer, "/x-http");
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn malformed_client_metadata_shapes_are_diagnosed_without_blocking_ir() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "servers": {},
+            "security": {},
+            "paths": {
+                "/malformed": {
+                    "servers": [
+                        7,
+                        {},
+                        { "url": "https://variables-array.example.test", "variables": [] },
+                        {
+                            "url": "https://variables.example.test",
+                            "variables": {
+                                "scalar": 7,
+                                "missing-default": {},
+                                "enum-scalar": { "default": "x", "enum": "x" },
+                                "enum-member": { "default": "x", "enum": ["x", 7] }
+                            }
+                        }
+                    ],
+                    "get": {
+                        "parameters": [{
+                            "name": "raw-booleans",
+                            "in": "query",
+                            "explode": "yes",
+                            "allowReserved": "yes",
+                            "schema": { "type": "string" }
+                        }],
+                        "security": [7, { "scalar-scopes": "read" }, { "mixed-scopes": ["read", 7] }],
+                        "requestBody": {
+                            "content": {
+                                "application/x-www-form-urlencoded": {
+                                    "schema": { "type": "object" },
+                                    "encoding": []
+                                },
+                                "multipart/form-data": {
+                                    "schema": { "type": "object" },
+                                    "encoding": {
+                                        "scalar": 7,
+                                        "headers-array": { "headers": [] },
+                                        "header-scalar": { "headers": { "X-Scalar": 7 } },
+                                        "header-schema": { "headers": { "X-Missing": {} } },
+                                        "style": { "style": "invalid" }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "empty" } }
+                    }
+                }
+            },
+            "components": { "securitySchemes": [] }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let operation = &ir.operations[0];
+
+        assert!(ir.root_servers.is_empty());
+        assert!(ir.root_security.is_empty());
+        assert!(ir.security_schemes.is_empty());
+        assert_eq!(operation.servers.len(), 2);
+        assert_eq!(operation.servers[1].variables.len(), 2);
+        assert!(operation.servers[1].variables[0].1.enum_values.is_empty());
+        assert_eq!(operation.servers[1].variables[1].1.enum_values, ["x"]);
+        assert_eq!(operation.parameters[0].explode, None);
+        assert!(!operation.parameters[0].allow_reserved);
+        assert_eq!(operation.security, Some(Vec::new()));
+        let multipart = operation
+            .request_body
+            .as_ref()
+            .expect("request body")
+            .media_types
+            .iter()
+            .find(|media| media.name == "multipart/form-data")
+            .expect("multipart");
+        assert_eq!(multipart.encodings.len(), 4);
+        assert!(multipart.encodings[0].1.headers.is_empty());
+        assert!(multipart.encodings[1].1.headers.is_empty());
+        assert_eq!(multipart.encodings[2].1.headers.len(), 1);
+        assert_eq!(multipart.encodings[3].1.style, None);
+        assert!(sink.has_errors());
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_UNSUPPORTED && diagnostic.message.contains("encoding header")
+        }));
+
+        let scalar_scheme_document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": { "scalar": 7 } }
+        });
+        let (_temp, ir, sink) = parse_value(&scalar_scheme_document);
+        assert!(ir.security_schemes.is_empty());
+        assert!(sink.has_errors());
     }
 
     #[test]
@@ -1908,6 +3256,20 @@ mod tests {
         for invalid in ["", "099", "600", "20X", "2000"] {
             assert_eq!(parse_response_status(invalid), None);
         }
+        assert_eq!(
+            canonical_media_type("!#$%&'*+-.^_`|~/!#$%&'*+-.^_`|~"),
+            Ok("!#$%&'*+-.^_`|~/!#$%&'*+-.^_`|~".to_owned())
+        );
+        for malformed in ["type/", "/subtype", "type/subtype/extra", "type /subtype"] {
+            assert_eq!(
+                canonical_media_type(malformed),
+                Err(MediaKeyError::Malformed)
+            );
+        }
+        assert_eq!(
+            canonical_media_type("type/subtype;parameter=value"),
+            Err(MediaKeyError::Parameterized)
+        );
 
         for (value, ty, expected) in [
             (json!("x"), PrimitiveType::String, true),
@@ -1999,6 +3361,9 @@ mod tests {
             deprecated: false,
             description: None,
             schema: schema.clone(),
+            style: None,
+            explode: None,
+            allow_reserved: false,
             source: source.clone(),
         };
         let path = vec![

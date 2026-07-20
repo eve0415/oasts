@@ -1127,6 +1127,8 @@ mod tests {
             parameters: Vec::new(),
             request_body: None,
             responses: Vec::new(),
+            servers: Vec::new(),
+            security: None,
             source: source("/paths/~1test/get"),
         }
     }
@@ -1228,6 +1230,7 @@ mod tests {
                     source: source("/components/schemas/pet"),
                 },
             ],
+            ..Ir::default()
         };
         let mut sink = DiagnosticSink::new();
         let _analyzed = analyze_with_options(
@@ -1312,6 +1315,7 @@ mod tests {
             Ir {
                 operations: Vec::new(),
                 schemas,
+                ..Ir::default()
             },
             &NamingConfig::default(),
             &const_types(),
@@ -1352,6 +1356,7 @@ mod tests {
             Ir {
                 operations: Vec::new(),
                 schemas: vec![schema],
+                ..Ir::default()
             },
             &NamingConfig::default(),
             &const_types(),
@@ -1387,6 +1392,7 @@ mod tests {
             Ir {
                 operations: Vec::new(),
                 schemas,
+                ..Ir::default()
             },
             &NamingConfig::default(),
             &const_types(),
@@ -1419,6 +1425,7 @@ mod tests {
             Ir {
                 operations: Vec::new(),
                 schemas: vec![mismatch, nullable],
+                ..Ir::default()
             },
             &NamingConfig::default(),
             &const_types(),
@@ -1458,6 +1465,7 @@ mod tests {
                 Ir {
                     operations: Vec::new(),
                     schemas: vec![schema],
+                    ..Ir::default()
                 },
                 &NamingConfig::default(),
                 &const_types(),
@@ -1510,6 +1518,7 @@ mod tests {
                 schema: any_schema("/invalid"),
                 source: source("/invalid"),
             }],
+            ..Ir::default()
         };
         let mut sink = DiagnosticSink::new();
         let analyzed = analyze_with_options(
@@ -1545,6 +1554,7 @@ mod tests {
             Ir {
                 operations: vec![named],
                 schemas: Vec::new(),
+                ..Ir::default()
             },
             &naming,
             &TypesConfig::default(),
@@ -1619,6 +1629,7 @@ mod tests {
             Ir {
                 operations: Vec::new(),
                 schemas: named,
+                ..Ir::default()
             },
             &NamingConfig::default(),
             &TypesConfig::default(),
@@ -1698,6 +1709,7 @@ mod tests {
             Ir {
                 operations: Vec::new(),
                 schemas: vec![empty, collision, contradiction],
+                ..Ir::default()
             },
             &NamingConfig::default(),
             &const_types(),

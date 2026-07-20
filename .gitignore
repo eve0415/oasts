@@ -27,3 +27,6 @@ node_modules/
 packages/oasts/napi/
 packages/oasts/dist/
 .pnpm-store/
+
+# Local git worktrees for delegated work
+.worktrees/

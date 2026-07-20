@@ -1,0 +1,275 @@
+openapi: 3.1.0
+info:
+  title: Oasts client showcase
+  version: 1.0.0
+servers:
+  - url: https://{region}.api.example.test/v1
+    variables:
+      region:
+        default: us
+        enum:
+          - us
+          - eu
+paths:
+  /pets/{petId}:
+    get:
+      operationId: getPetShowcase
+      summary: Read a pet with every parameter family.
+      parameters:
+        - name: petId
+          in: path
+          required: true
+          description: The pet identifier.
+          style: simple
+          explode: false
+          schema:
+            type: string
+        - name: tags
+          in: query
+          description: Tags emitted by exploded form serialization.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: fields
+          in: query
+          description: Fields emitted by compact form serialization.
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+        - name: spaces
+          in: query
+          style: spaceDelimited
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+        - name: pipes
+          in: query
+          style: pipeDelimited
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+        - name: filter
+          in: query
+          style: deepObject
+          explode: true
+          schema:
+            type: object
+            properties:
+              owner:
+                type: string
+              active:
+                type: boolean
+              R:
+                type: integer
+              G:
+                type: integer
+        - name: X-Trace
+          in: header
+          description: Caller trace identifier.
+          style: simple
+          explode: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The matching pet as JSON or text.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+            text/plain:
+              schema:
+                type: string
+        4XX:
+          description: A documented client error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        default:
+          description: An unexpected response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      servers:
+        - url: https://pets-override.example.test/v2
+  /labels/{labelId}:
+    get:
+      operationId: getLabelShowcase
+      parameters:
+        - name: labelId
+          in: path
+          required: true
+          style: label
+          explode: false
+          schema:
+            type: string
+      responses:
+        '204':
+          description: The label exists and has no response body.
+  /matrix/{matrixId}:
+    get:
+      operationId: getMatrixShowcase
+      parameters:
+        - name: matrixId
+          in: path
+          required: true
+          style: matrix
+          explode: true
+          schema:
+            type: object
+            required:
+              - row
+            properties:
+              row:
+                type: integer
+              column:
+                type: integer
+      responses:
+        '204':
+          description: The matrix coordinate exists.
+  /uploads:
+    post:
+      operationId: uploadShowcase
+      summary: Upload metadata, text, and a binary file.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - metadata
+                - title
+                - file
+              properties:
+                metadata:
+                  type: object
+                  properties:
+                    category:
+                      type: string
+                title:
+                  type: string
+                file: {}
+            encoding:
+              metadata:
+                contentType: application/json, application/cbor
+      responses:
+        '204':
+          description: The upload was stored without a response body.
+  /forms:
+    post:
+      operationId: submitFormShowcase
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                labels:
+                  type: array
+                  items:
+                    type: string
+            encoding:
+              labels:
+                style: form
+                explode: false
+      responses:
+        '204':
+          description: The form was accepted.
+  /text:
+    post:
+      operationId: sendTextShowcase
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+      responses:
+        '204':
+          description: The text was accepted.
+  /binary:
+    post:
+      operationId: sendBinaryShowcase
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '204':
+          description: The bytes were accepted.
+  /health:
+    head:
+      operationId: headHealthShowcase
+      responses:
+        '200':
+          description: The service is healthy and HEAD returns no body.
+          content:
+            application/json:
+              schema:
+                type: object
+            text/plain:
+              schema:
+                type: string
+  /media-selection:
+    get:
+      operationId: selectMediaShowcase
+      responses:
+        '200':
+          description: A payload selected by exact or ranged media type.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - value
+                properties:
+                  value:
+                    type: string
+            text/*:
+              schema:
+                type: string
+components:
+  schemas:
+    Pet:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        tag:
+          type: string
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: integer
+        message:
+          type: string

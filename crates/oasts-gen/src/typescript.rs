@@ -327,6 +327,9 @@ fn emit_jsdoc(out: &mut String, schema: &Value) {
 }
 
 fn primitive_type(schema: &Value) -> String {
+    if let Some(value) = schema.get("const") {
+        return const_to_ts(value);
+    }
     match schema.get("type").and_then(Value::as_str) {
         Some("string") => "string".into(),
         Some("boolean") => "boolean".into(),
@@ -610,20 +613,25 @@ mod tests {
     fn deferred_blocks_are_unknown() {
         let schema = crate::schema::config_schema();
         let ts = emit_config_ts(&schema).unwrap();
-        for key in [
-            "specs",
-            "shared",
-            "client",
-            "validation",
-            "remote",
-            "watch",
-            "ci",
-        ] {
+        for key in ["specs", "shared", "remote", "watch", "ci"] {
             assert!(
                 ts.contains(&format!("{key}?: unknown")),
                 "deferred block {key} should be optional unknown"
             );
         }
+    }
+
+    #[test]
+    fn client_and_validation_blocks_are_typed() {
+        let schema = crate::schema::config_schema();
+        let ts = emit_config_ts(&schema).unwrap();
+        assert!(ts.contains("client?: RawClient;"));
+        assert!(ts.contains("validation?: RawValidation;"));
+        assert!(ts.contains("export interface FetchDefaults"));
+        assert!(ts.contains("credentials?: \"omit\" | \"same-origin\" | \"include\";"));
+        assert!(ts.contains("source: \"runtime\""));
+        assert!(ts.contains("source: \"server\""));
+        assert!(ts.contains("source: \"literal\""));
     }
 
     #[test]

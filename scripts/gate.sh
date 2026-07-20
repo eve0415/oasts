@@ -12,6 +12,7 @@ rust_gate() {
 
 ts_gate() {
   cd packages/oasts && pnpm exec oxfmt --check . && pnpm exec oxlint
+  cd ../../crates/oasts-core/runtime && pnpm exec oxfmt --check . && pnpm exec oxlint
 }
 
 rust_gate &

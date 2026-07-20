@@ -34,6 +34,18 @@ pub struct Ir {
     pub operations: Vec<Operation>,
     /// Entry-document `components.schemas`, in source insertion order.
     pub schemas: Vec<NamedSchema>,
+    /// Entry-document server defaults, in source insertion order.
+    pub root_servers: Vec<ServerEntry>,
+    /// Entry-document security alternatives; an empty requirement is anonymous access.
+    pub root_security: Vec<SecurityRequirement>,
+    /// Entry-document named security schemes, in source insertion order.
+    pub security_schemes: Vec<NamedSecurityScheme>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OasVersion {
+    V3_0,
+    V3_1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +67,10 @@ pub struct Operation {
     pub parameters: Vec<Param>,
     pub request_body: Option<Body>,
     pub responses: Vec<ResponseEntry>,
+    /// Operation-then-path-item effective servers; an empty array defers root fallback.
+    pub servers: Vec<ServerEntry>,
+    /// Operation-level security override; `None` preserves the document default.
+    pub security: Option<Vec<SecurityRequirement>>,
     pub source: SourceRef,
 }
 
@@ -78,6 +94,18 @@ pub enum ParamLocation {
     Cookie,
 }
 
+/// Raw OpenAPI parameter serialization style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParamStyle {
+    Form,
+    Simple,
+    Label,
+    Matrix,
+    SpaceDelimited,
+    PipeDelimited,
+    DeepObject,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Param {
     pub name: String,
@@ -86,6 +114,12 @@ pub struct Param {
     pub deprecated: bool,
     pub description: Option<String>,
     pub schema: SchemaNode,
+    /// Explicit serialization style; location-dependent defaults remain unresolved.
+    pub style: Option<ParamStyle>,
+    /// Explicit explode value; style-dependent defaults remain unresolved.
+    pub explode: Option<bool>,
+    /// Explicit `allowReserved`, defaulting to false when absent.
+    pub allow_reserved: bool,
     pub source: SourceRef,
 }
 
@@ -99,11 +133,100 @@ pub struct Body {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaType {
+    /// Canonical parameter-free media type or range.
     pub name: String,
+    /// Content-map key exactly as written in the source document.
+    pub raw_name: String,
     pub schema: SchemaNode,
+    /// Whether the Media Type Object declared a schema rather than leaving it unconstrained.
+    pub schema_present: bool,
     /// Media-type examples paired with a stable source label.
     pub examples: Vec<(String, Value)>,
+    /// Applicable request-body Encoding Objects, in source insertion order.
+    pub encodings: Vec<(String, EncodingObject)>,
+    /// Whether the Media Type Object explicitly opts into streaming semantics.
+    pub streaming_marked: bool,
+    /// Source document line, retained for version-indexed Encoding Object rules.
+    pub oas_version: OasVersion,
     pub source: SourceRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodingObject {
+    /// Comma-separated `contentType` alternatives, or `None` when absent.
+    pub content_type: Option<Vec<String>>,
+    /// Named per-part headers, in source insertion order.
+    pub headers: Vec<(String, EncodingHeader)>,
+    /// Explicit serialization style; media/version defaults remain unresolved.
+    pub style: Option<ParamStyle>,
+    /// Explicit explode value; style-dependent defaults remain unresolved.
+    pub explode: Option<bool>,
+    /// Explicit `allowReserved`, defaulting to false when absent.
+    pub allow_reserved: bool,
+    /// Whether a boolean `allowReserved` was explicitly declared, including `false`.
+    pub allow_reserved_explicit: bool,
+    /// Source identity of this Encoding Object.
+    pub source: SourceRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodingHeader {
+    /// Whether callers must supply this header.
+    pub required: bool,
+    /// Header value schema.
+    pub schema: SchemaNode,
+    /// Source identity of this Header Object.
+    pub source: SourceRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerEntry {
+    /// Server URL template exactly as declared.
+    pub url: String,
+    /// Server template variables, in source insertion order.
+    pub variables: Vec<(String, ServerVariable)>,
+    /// Source identity of this Server Object.
+    pub source: SourceRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerVariable {
+    /// Required default substitution value.
+    pub default: String,
+    /// Optional allowed substitutions, in source insertion order.
+    pub enum_values: Vec<String>,
+}
+
+/// One security alternative, preserving scheme and scope insertion order.
+pub type SecurityRequirement = Vec<(String, Vec<String>)>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedSecurityScheme {
+    /// Component-map key exactly as declared.
+    pub name: String,
+    /// Supported security scheme classification.
+    pub kind: SecKind,
+    /// Source identity of this Security Scheme Object.
+    pub source: SourceRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SecKind {
+    /// HTTP authentication using the declared scheme token.
+    Http { scheme: String },
+    /// API key serialized at the declared parameter location and name.
+    ApiKey {
+        location: ParamLocation,
+        name: String,
+    },
+    /// OAuth 2.0 flows; detailed flow parsing is deferred.
+    OAuth2,
+    /// OpenID Connect discovery; URL parsing is deferred.
+    OpenIdConnect,
+    /// Mutual TLS authentication.
+    MutualTls,
+    /// Unknown or unsupported security scheme shape.
+    Other,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,6 +290,8 @@ pub struct NumericConstraints {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SchemaMeta {
     pub nullable: bool,
+    /// OpenAPI 3.1 `contentEncoding`, retained for multipart composition.
+    pub content_encoding: Option<String>,
     pub docs: SchemaDocs,
     pub enum_extensions: EnumExtensionData,
     pub numeric_constraints: NumericConstraints,

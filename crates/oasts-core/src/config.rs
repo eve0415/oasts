@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Number, Value};
 
-use crate::diag::{Diagnostic, DiagnosticSink};
+use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::syntax::parse_yaml_value;
 
 const CODE_IO: &str = "OASTS0001";
@@ -28,8 +28,20 @@ const CODE_NO_ARTIFACT: &str = "OASTS0101";
 const CODE_ARTIFACT_DIRECTORY: &str = "OASTS0102";
 const CODE_DISABLED_ARTIFACT_OPTIONS: &str = "OASTS0103";
 const CODE_UNSUPPORTED_ARTIFACT: &str = "OASTS0111";
+const CODE_CLIENT_REQUIRES_TYPES: &str = "OASTS0112";
 const CODE_DISABLED_OPTIONS: &str = "OASTS0121";
 const CODE_DATE_REPRESENTATION: &str = "OASTS0131";
+const CODE_DATE_TRANSFORM_UNSUPPORTED: &str = "OASTS0132";
+const CODE_VALIDATION_REQUIRED: &str = "OASTS0151";
+const CODE_VALIDATION_ENGINE_REQUIRED: &str = "OASTS0152";
+const CODE_AUTH_ENFORCEMENT_REQUIRED: &str = "OASTS0153";
+const CODE_VALIDATION_WITHOUT_CLIENT: &str = "OASTS0161";
+const CODE_OFF_VALIDATION_DIRECTIONS: &str = "OASTS0162";
+const CODE_VALIDATION_DIRECTION_REQUIRED: &str = "OASTS0163";
+const CODE_VALIDATION_ENGINE_UNSUPPORTED: &str = "OASTS0164";
+const CODE_UNCHECKED_RESPONSE: &str = "OASTS0171";
+const CODE_UNCHECKED_RESPONSE_WARNING: &str = "OASTS0172";
+const CODE_BASE_URL: &str = "OASTS0181";
 const CODE_NAMING: &str = "OASTS0201";
 const CODE_EMIT: &str = "OASTS0211";
 const CODE_TRUST_LIMITS: &str = "OASTS0221";
@@ -106,9 +118,9 @@ pub struct RawConfig {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub types: Option<TypesConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    pub client: Option<Value>,
+    pub client: Option<RawClient>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    pub validation: Option<Value>,
+    pub validation: Option<RawValidation>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub naming: Option<NamingConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
@@ -217,6 +229,279 @@ pub struct ArtifactsConfig {
     pub tanstack: Option<ArtifactSetting>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub msw: Option<ArtifactSetting>,
+}
+
+/// Client options before defaults and cross-field validation are applied.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "Fetch client generation options."
+    )
+)]
+pub struct RawClient {
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub transport: Option<ClientTransport>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub auth_enforcement: Option<AuthEnforcement>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub aggregate: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub base_url: Option<BaseUrlConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub fetch_options: Option<FetchDefaults>,
+}
+
+/// The schema-version 1 client transport.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum ClientTransport {
+    Fetch,
+}
+
+/// Whether generated auth requirements are enforced by types or only at runtime.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum AuthEnforcement {
+    Types,
+    Runtime,
+}
+
+/// Initial client base URL selection. Resolve-time validation enforces the source-specific shape.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BaseUrlConfig {
+    pub source: BaseUrlSource,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub index: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub value: Option<String>,
+}
+
+#[cfg(feature = "json-schema")]
+impl schemars::JsonSchema for BaseUrlConfig {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "BaseUrlConfig".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "Exactly one runtime, OpenAPI server, or literal base URL source.",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string", "const": "runtime" }
+                    },
+                    "required": ["source"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string", "const": "server" },
+                        "index": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["source"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string", "const": "literal" },
+                        "value": { "type": "string" }
+                    },
+                    "required": ["source", "value"],
+                    "additionalProperties": false
+                }
+            ]
+        })
+    }
+}
+
+/// The source used for a generated client's initial base URL.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum BaseUrlSource {
+    Runtime,
+    Server,
+    Literal,
+}
+
+/// Safe static Fetch defaults merged into each generated request.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "Safe static defaults from the Fetch RequestInit surface."
+    )
+)]
+pub struct FetchDefaults {
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub credentials: Option<CredentialsMode>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub cache: Option<CacheMode>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub redirect: Option<RedirectMode>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub referrer_policy: Option<ReferrerPolicyValue>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub mode: Option<RequestModeValue>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub keepalive: Option<bool>,
+}
+
+/// Fetch request credential behavior accepted by generated defaults.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum CredentialsMode {
+    Omit,
+    #[serde(rename = "same-origin")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "same-origin"))]
+    SameOrigin,
+    Include,
+}
+
+/// Fetch cache behavior accepted by generated defaults.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum CacheMode {
+    Default,
+    #[serde(rename = "no-store")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "no-store"))]
+    NoStore,
+    Reload,
+    #[serde(rename = "no-cache")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "no-cache"))]
+    NoCache,
+    #[serde(rename = "force-cache")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "force-cache"))]
+    ForceCache,
+    #[serde(rename = "only-if-cached")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "only-if-cached"))]
+    OnlyIfCached,
+}
+
+/// Fetch redirect behavior accepted by generated defaults.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum RedirectMode {
+    Follow,
+    Error,
+    Manual,
+}
+
+/// Fetch referrer policy accepted by generated defaults.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum ReferrerPolicyValue {
+    #[serde(rename = "no-referrer")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "no-referrer"))]
+    NoReferrer,
+    #[serde(rename = "no-referrer-when-downgrade")]
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(rename = "no-referrer-when-downgrade")
+    )]
+    NoReferrerWhenDowngrade,
+    #[serde(rename = "same-origin")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "same-origin"))]
+    SameOrigin,
+    Origin,
+    #[serde(rename = "strict-origin")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "strict-origin"))]
+    StrictOrigin,
+    #[serde(rename = "origin-when-cross-origin")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "origin-when-cross-origin"))]
+    OriginWhenCrossOrigin,
+    #[serde(rename = "strict-origin-when-cross-origin")]
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(rename = "strict-origin-when-cross-origin")
+    )]
+    StrictOriginWhenCrossOrigin,
+    #[serde(rename = "unsafe-url")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "unsafe-url"))]
+    UnsafeUrl,
+}
+
+/// Fetch request mode accepted by generated defaults.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum RequestModeValue {
+    Cors,
+    #[serde(rename = "no-cors")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "no-cors"))]
+    NoCors,
+    #[serde(rename = "same-origin")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "same-origin"))]
+    SameOrigin,
+}
+
+/// Runtime validation options before defaults and combination checks are applied.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "Runtime validation selection and unchecked-response policy."
+    )
+)]
+pub struct RawValidation {
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub engine: Option<ValidationEngine>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub request: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub response: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub unchecked: Option<UncheckedPolicy>,
+}
+
+/// Runtime validation implementation selected for client traffic.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum ValidationEngine {
+    Off,
+    Zod,
+    Generated,
+}
+
+/// Policy for successful response data not checked against the OpenAPI schema.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum UncheckedPolicy {
+    Warn,
+    Error,
+    Allow,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -466,9 +751,36 @@ pub struct ResolvedArtifactsConfig {
     pub msw: ResolvedArtifact,
 }
 
+/// Fully resolved Fetch client options.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientConfig {
+    pub auth_enforcement: AuthEnforcement,
+    pub aggregate: bool,
+    pub base_url: ResolvedBaseUrl,
+    pub fetch_options: FetchDefaults,
+}
+
+/// Fully resolved initial base URL selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedBaseUrl {
+    Runtime,
+    Server { index: u32 },
+    Literal { value: String },
+}
+
+/// Fully resolved runtime validation options.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationConfig {
+    pub engine: ValidationEngine,
+    pub request: bool,
+    pub response: bool,
+    pub unchecked: UncheckedPolicy,
+}
+
 /// The fully-defaulted, absolute-path configuration consumed by the core.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedConfig {
+    pub diagnostics: Vec<Diagnostic>,
     pub config_path: PathBuf,
     pub config_dir: PathBuf,
     pub schema: Option<String>,
@@ -479,6 +791,8 @@ pub struct ResolvedConfig {
     pub namespace: String,
     pub artifacts: ResolvedArtifactsConfig,
     pub types: TypesConfig,
+    pub client: Option<ClientConfig>,
+    pub validation: Option<ValidationConfig>,
     pub naming: NamingConfig,
     pub documentation: DocumentationConfig,
     pub emit: EmitConfig,
@@ -784,32 +1098,48 @@ pub fn resolve_config(
             Some("/types"),
         ));
     }
-    if raw.client.is_some() {
+    if raw.client.is_some() && !artifact_states.client.enabled {
         sink.push(config_error(
             CODE_DISABLED_OPTIONS,
-            "client options are not supported because the client artifact is unavailable in this build",
+            "client options are invalid while the client artifact is disabled",
             Some(source_path),
             Some("/client"),
         ));
     }
-    if raw.validation.is_some() {
+    if raw.validation.is_some() && !artifact_states.client.enabled {
         sink.push(config_error(
-            CODE_DISABLED_OPTIONS,
-            "validation options are not supported because the client artifact is unavailable in this build",
+            CODE_VALIDATION_WITHOUT_CLIENT,
+            "validation options require the client artifact to be enabled",
             Some(source_path),
             Some("/validation"),
         ));
     }
+    validate_client_combinations(
+        &artifact_states,
+        raw.client.as_ref(),
+        raw.validation.as_ref(),
+        source_path,
+        &mut sink,
+    );
 
     let types = raw.types.unwrap_or_default();
     if types.date_time != DateTimeRepresentation::String || types.date != DateRepresentation::String
     {
-        sink.push(config_error(
-            CODE_DATE_REPRESENTATION,
-            "non-string dateTime/date representations require the client artifact",
-            Some(source_path),
-            Some("/types"),
-        ));
+        if artifact_states.client.enabled {
+            sink.push(config_error(
+                CODE_DATE_TRANSFORM_UNSUPPORTED,
+                "non-string dateTime/date representations require the transform layer, which is not yet supported in this build",
+                Some(source_path),
+                Some("/types"),
+            ));
+        } else {
+            sink.push(config_error(
+                CODE_DATE_REPRESENTATION,
+                "non-string dateTime/date representations require the client artifact",
+                Some(source_path),
+                Some("/types"),
+            ));
+        }
     }
 
     let naming = raw.naming.unwrap_or_default();
@@ -817,6 +1147,7 @@ pub fn resolve_config(
     let documentation = raw.documentation.unwrap_or_default();
     let emit = raw.emit.unwrap_or_default();
     validate_emit(&emit, source_path, &mut sink);
+    validate_directory_overlaps(&artifact_states, &emit, source_path, &mut sink);
 
     let local = raw.local.unwrap_or_default();
     let local_allow_paths = resolve_local_paths(&local, &config_dir, source_path, &mut sink);
@@ -838,16 +1169,21 @@ pub fn resolve_config(
         }
     }
 
+    let has_errors = sink.has_errors();
     let diagnostics = sink.into_sorted_vec();
-    if !diagnostics.is_empty() {
+    if has_errors {
         return Err(diagnostics);
     }
 
     let input = input.expect("an unresolved input always emits a diagnostic");
     let output = output.expect("an unresolved output always emits a diagnostic");
+    let client = resolve_client_config(raw.client.as_ref(), artifact_states.client.enabled);
+    let validation =
+        resolve_validation_config(raw.validation.as_ref(), artifact_states.client.enabled);
     let artifacts = artifact_states.with_output(&output);
 
     Ok(ResolvedConfig {
+        diagnostics,
         config_path,
         config_dir,
         schema: raw.schema,
@@ -858,6 +1194,8 @@ pub fn resolve_config(
         namespace,
         artifacts,
         types,
+        client,
+        validation,
         naming,
         documentation,
         emit,
@@ -982,6 +1320,270 @@ fn resolved_artifact(state: ArtifactState, output: &Path) -> ResolvedArtifact {
     }
 }
 
+fn resolve_client_config(raw: Option<&RawClient>, enabled: bool) -> Option<ClientConfig> {
+    if !enabled {
+        return None;
+    }
+    let raw = raw?;
+    let auth_enforcement = raw.auth_enforcement?;
+    Some(ClientConfig {
+        auth_enforcement,
+        aggregate: raw.aggregate.unwrap_or(false),
+        base_url: resolve_base_url(raw.base_url.as_ref()),
+        fetch_options: raw.fetch_options.clone().unwrap_or_default(),
+    })
+}
+
+fn resolve_base_url(raw: Option<&BaseUrlConfig>) -> ResolvedBaseUrl {
+    match raw {
+        None
+        | Some(BaseUrlConfig {
+            source: BaseUrlSource::Runtime,
+            ..
+        }) => ResolvedBaseUrl::Runtime,
+        Some(BaseUrlConfig {
+            source: BaseUrlSource::Server,
+            index,
+            ..
+        }) => ResolvedBaseUrl::Server {
+            index: index.unwrap_or(0),
+        },
+        Some(BaseUrlConfig {
+            source: BaseUrlSource::Literal,
+            value,
+            ..
+        }) => ResolvedBaseUrl::Literal {
+            value: value.clone().unwrap_or_default(),
+        },
+    }
+}
+
+fn resolve_validation_config(
+    raw: Option<&RawValidation>,
+    client_enabled: bool,
+) -> Option<ValidationConfig> {
+    if !client_enabled {
+        return None;
+    }
+    let raw = raw?;
+    let engine = raw.engine?;
+    Some(ValidationConfig {
+        engine,
+        request: raw.request.unwrap_or(false),
+        response: raw.response.unwrap_or(false),
+        unchecked: raw.unchecked.unwrap_or(UncheckedPolicy::Warn),
+    })
+}
+
+fn validate_client_combinations(
+    artifacts: &ArtifactStates,
+    client: Option<&RawClient>,
+    validation: Option<&RawValidation>,
+    source: &Path,
+    sink: &mut DiagnosticSink,
+) {
+    if !artifacts.client.enabled {
+        if let Some(base_url) = client.and_then(|options| options.base_url.as_ref()) {
+            validate_base_url(base_url, source, sink);
+        }
+        return;
+    }
+
+    if !artifacts.types.enabled {
+        sink.push(config_error(
+            CODE_CLIENT_REQUIRES_TYPES,
+            "the client artifact requires the types artifact to be enabled",
+            Some(source),
+            Some("/artifacts/client"),
+        ));
+    }
+    if validation.is_none() {
+        sink.push(config_error(
+            CODE_VALIDATION_REQUIRED,
+            "the client artifact requires an explicit validation object",
+            Some(source),
+            Some("/validation"),
+        ));
+    } else if validation.and_then(|options| options.engine).is_none() {
+        sink.push(config_error(
+            CODE_VALIDATION_ENGINE_REQUIRED,
+            "validation.engine is required when the client artifact is enabled",
+            Some(source),
+            Some("/validation/engine"),
+        ));
+    }
+    if client
+        .and_then(|options| options.auth_enforcement)
+        .is_none()
+    {
+        sink.push(config_error(
+            CODE_AUTH_ENFORCEMENT_REQUIRED,
+            "client.authEnforcement is required when the client artifact is enabled; an explicit choice is required",
+            Some(source),
+            Some("/client/authEnforcement"),
+        ));
+    }
+
+    if let Some(base_url) = client.and_then(|options| options.base_url.as_ref()) {
+        validate_base_url(base_url, source, sink);
+    }
+    validate_validation_options(validation, source, sink);
+}
+
+fn validate_validation_options(
+    validation: Option<&RawValidation>,
+    source: &Path,
+    sink: &mut DiagnosticSink,
+) {
+    if let Some(options) = validation
+        && let Some(engine) = options.engine
+    {
+        let request = options.request.unwrap_or(false);
+        let response = options.response.unwrap_or(false);
+        match engine {
+            ValidationEngine::Off => {
+                if request || response {
+                    sink.push(config_error(
+                        CODE_OFF_VALIDATION_DIRECTIONS,
+                        "validation engine 'off' requires request and response to be false",
+                        Some(source),
+                        Some("/validation"),
+                    ));
+                }
+            }
+            ValidationEngine::Zod => {
+                validate_non_off_engine("zod", request, response, source, sink);
+            }
+            ValidationEngine::Generated => {
+                validate_non_off_engine("generated", request, response, source, sink);
+            }
+        }
+    }
+
+    let response = validation
+        .and_then(|options| options.response)
+        .unwrap_or(false);
+    if response {
+        return;
+    }
+    match validation
+        .and_then(|options| options.unchecked)
+        .unwrap_or(UncheckedPolicy::Warn)
+    {
+        UncheckedPolicy::Error => sink.push(config_error(
+            CODE_UNCHECKED_RESPONSE,
+            "successful response data would be decoded but unchecked against the OpenAPI schema",
+            Some(source),
+            Some("/validation/unchecked"),
+        )),
+        UncheckedPolicy::Warn => sink.push(config_warning(
+            CODE_UNCHECKED_RESPONSE_WARNING,
+            "successful response data is decoded but unchecked against the OpenAPI schema; validation.unchecked: \"allow\" acknowledges it",
+            Some(source),
+            Some("/validation/unchecked"),
+        )),
+        UncheckedPolicy::Allow => {}
+    }
+}
+
+fn validate_non_off_engine(
+    name: &str,
+    request: bool,
+    response: bool,
+    source: &Path,
+    sink: &mut DiagnosticSink,
+) {
+    if !request && !response {
+        sink.push(config_error(
+            CODE_VALIDATION_DIRECTION_REQUIRED,
+            "a non-off validation engine requires request or response validation",
+            Some(source),
+            Some("/validation"),
+        ));
+    }
+    sink.push(config_error(
+        CODE_VALIDATION_ENGINE_UNSUPPORTED,
+        format!("validation engine '{name}' is not supported in this build"),
+        Some(source),
+        Some("/validation/engine"),
+    ));
+}
+
+fn validate_base_url(base_url: &BaseUrlConfig, source: &Path, sink: &mut DiagnosticSink) {
+    let valid = match base_url.source {
+        BaseUrlSource::Runtime => base_url.index.is_none() && base_url.value.is_none(),
+        BaseUrlSource::Server => base_url.value.is_none(),
+        BaseUrlSource::Literal => {
+            base_url.index.is_none()
+                && base_url
+                    .value
+                    .as_deref()
+                    .is_some_and(is_valid_literal_base_url)
+        }
+    };
+    if !valid {
+        sink.push(config_error(
+            CODE_BASE_URL,
+            "client.baseUrl must match its source shape, and literal values must be absolute HTTP(S) URLs without credentials",
+            Some(source),
+            Some("/client/baseUrl"),
+        ));
+    }
+}
+
+fn is_valid_literal_base_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.has_host()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
+fn validate_directory_overlaps(
+    artifacts: &ArtifactStates,
+    emit: &EmitConfig,
+    source: &Path,
+    sink: &mut DiagnosticSink,
+) {
+    let mut entries = [
+        ("types", &artifacts.types),
+        ("client", &artifacts.client),
+        ("zod", &artifacts.zod),
+        ("validators", &artifacts.validators),
+        ("tanstack", &artifacts.tanstack),
+        ("msw", &artifacts.msw),
+    ]
+    .into_iter()
+    .filter(|(_, state)| state.enabled)
+    .map(|(name, state)| (name, state.directory.as_str()))
+    .collect::<Vec<_>>();
+    if artifacts.client.enabled {
+        entries.push(("emit.runtimeDirectory", emit.runtime_directory.as_str()));
+    }
+
+    for (index, (left_name, left_directory)) in entries.iter().enumerate() {
+        for (right_name, right_directory) in entries.iter().skip(index + 1) {
+            if directories_overlap(left_directory, right_directory) {
+                sink.push(config_error(
+                    CODE_ARTIFACT_DIRECTORY,
+                    format!(
+                        "enabled output directories '{left_name}' ({left_directory}) and '{right_name}' ({right_directory}) overlap"
+                    ),
+                    Some(source),
+                    Some("/artifacts"),
+                ));
+            }
+        }
+    }
+}
+
+fn directories_overlap(left: &str, right: &str) -> bool {
+    let left = Path::new(left);
+    let right = Path::new(right);
+    left.starts_with(right) || right.starts_with(left)
+}
+
 fn resolve_artifacts(
     raw: ArtifactsConfig,
     source: &Path,
@@ -1026,7 +1628,7 @@ fn resolve_artifacts(
             Some("/artifacts"),
         ));
     }
-    for (name, state) in entries.into_iter().skip(1) {
+    for (name, state) in entries.into_iter().skip(2) {
         if state.enabled {
             sink.push(config_error(
                 CODE_UNSUPPORTED_ARTIFACT,
@@ -1235,6 +1837,17 @@ fn config_error(
     diagnostic
 }
 
+fn config_warning(
+    code: &'static str,
+    message: impl Into<String>,
+    source: Option<&Path>,
+    pointer: Option<&str>,
+) -> Diagnostic {
+    let mut diagnostic = config_error(code, message, source, pointer);
+    diagnostic.severity = Severity::Warning;
+    diagnostic
+}
+
 fn is_uri(value: &str) -> bool {
     let Some((scheme, remainder)) = value.split_once(':') else {
         return false;
@@ -1415,6 +2028,17 @@ mod tests {
             "schemaVersion": 1,
             "input": { "path": "openapi.yaml" },
             "output": "generated"
+        })
+    }
+
+    fn valid_client_json_value() -> Value {
+        json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.yaml" },
+            "output": "generated",
+            "artifacts": { "types": true, "client": true },
+            "client": { "authEnforcement": "types" },
+            "validation": { "engine": "off", "unchecked": "allow" }
         })
     }
 
@@ -1981,8 +2605,8 @@ mod tests {
     }
 
     #[test]
-    fn every_non_types_artifact_reports_named_unsupported_error() {
-        for artifact in ["client", "zod", "validators", "tanstack", "msw"] {
+    fn unavailable_framework_artifacts_report_named_unsupported_error() {
+        for artifact in ["zod", "validators", "tanstack", "msw"] {
             let mut value = valid_json_value();
             value["artifacts"] = json!({ (artifact): true });
             let diagnostics = assert_code(load_json(&value), CODE_UNSUPPORTED_ARTIFACT);
@@ -2031,17 +2655,146 @@ mod tests {
     }
 
     #[test]
-    fn client_block_is_rule_12_in_types_only_build() {
-        let mut value = valid_json_value();
-        value["client"] = json!({});
-        assert_code(load_json(&value), CODE_DISABLED_OPTIONS);
+    fn client_and_validation_blocks_deserialize_typed_domains() {
+        for (key, values) in [
+            ("credentials", &["omit", "same-origin", "include"] as &[_]),
+            (
+                "cache",
+                &[
+                    "default",
+                    "no-store",
+                    "reload",
+                    "no-cache",
+                    "force-cache",
+                    "only-if-cached",
+                ],
+            ),
+            ("redirect", &["follow", "error", "manual"]),
+            (
+                "referrerPolicy",
+                &[
+                    "no-referrer",
+                    "no-referrer-when-downgrade",
+                    "same-origin",
+                    "origin",
+                    "strict-origin",
+                    "origin-when-cross-origin",
+                    "strict-origin-when-cross-origin",
+                    "unsafe-url",
+                ],
+            ),
+            ("mode", &["cors", "no-cors", "same-origin"]),
+        ] {
+            for value in values {
+                serde_json::from_value::<FetchDefaults>(json!({ (key): value }))
+                    .expect("standard Fetch value should deserialize");
+            }
+        }
+
+        let raw = serde_json::from_value::<RawConfig>(json!({
+            "schemaVersion": 1,
+            "client": {
+                "transport": "fetch",
+                "authEnforcement": "runtime",
+                "aggregate": true,
+                "baseUrl": { "source": "server", "index": 2 },
+                "fetchOptions": { "keepalive": true }
+            },
+            "validation": {
+                "engine": "generated",
+                "request": true,
+                "response": true,
+                "unchecked": "error"
+            }
+        }))
+        .expect("typed client and validation blocks should deserialize");
+        let client = raw.client.expect("client block");
+        assert_eq!(client.transport, Some(ClientTransport::Fetch));
+        assert_eq!(client.auth_enforcement, Some(AuthEnforcement::Runtime));
+        assert_eq!(
+            client.base_url,
+            Some(BaseUrlConfig {
+                source: BaseUrlSource::Server,
+                index: Some(2),
+                value: None,
+            })
+        );
+        assert_eq!(
+            raw.validation.and_then(|validation| validation.engine),
+            Some(ValidationEngine::Generated)
+        );
     }
 
     #[test]
-    fn validation_block_is_rule_12_in_types_only_build() {
+    fn client_and_validation_blocks_reject_unknown_invalid_and_null_values() {
+        for value in [
+            json!({ "client": { "fetchOptions": { "method": "GET" } } }),
+            json!({ "client": { "fetchOptions": { "mode": "navigate" } } }),
+            json!({ "client": { "transport": "axios" } }),
+            json!({ "client": { "aggregate": null } }),
+            json!({ "validation": { "engine": "valibot" } }),
+        ] {
+            serde_json::from_value::<RawConfig>(value)
+                .expect_err("invalid typed config value should be rejected");
+        }
+    }
+
+    #[test]
+    fn resolved_client_and_validation_defaults_are_typed() {
+        let client = RawClient {
+            auth_enforcement: Some(AuthEnforcement::Types),
+            ..RawClient::default()
+        };
+        let resolved = resolve_client_config(Some(&client), true).expect("client config");
+        assert_eq!(resolved.auth_enforcement, AuthEnforcement::Types);
+        assert!(!resolved.aggregate);
+        assert_eq!(resolved.base_url, ResolvedBaseUrl::Runtime);
+        assert_eq!(resolved.fetch_options, FetchDefaults::default());
+        assert!(resolve_client_config(Some(&client), false).is_none());
+        assert!(resolve_client_config(None, true).is_none());
+
+        let validation = RawValidation {
+            engine: Some(ValidationEngine::Off),
+            ..RawValidation::default()
+        };
+        assert_eq!(
+            resolve_validation_config(Some(&validation), true),
+            Some(ValidationConfig {
+                engine: ValidationEngine::Off,
+                request: false,
+                response: false,
+                unchecked: UncheckedPolicy::Warn,
+            })
+        );
+        assert!(resolve_validation_config(Some(&validation), false).is_none());
+        assert!(resolve_validation_config(None, true).is_none());
+    }
+
+    #[test]
+    fn client_block_is_rule_12_in_types_only_build() {
+        let mut value = valid_json_value();
+        value["client"] = json!({});
+        let diagnostics = assert_code(load_json(&value), CODE_DISABLED_OPTIONS);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message == "client options are invalid while the client artifact is disabled"
+        }));
+
+        value["client"] = json!({
+            "baseUrl": { "source": "runtime", "value": "https://example.com" }
+        });
+        let diagnostics = assert_code(load_json(&value), CODE_DISABLED_OPTIONS);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_BASE_URL)
+        );
+    }
+
+    #[test]
+    fn validation_block_without_client_is_rule_16() {
         let mut value = valid_json_value();
         value["validation"] = json!({});
-        assert_code(load_json(&value), CODE_DISABLED_OPTIONS);
+        assert_code(load_json(&value), CODE_VALIDATION_WITHOUT_CLIENT);
     }
 
     #[test]
@@ -2062,6 +2815,227 @@ mod tests {
     }
 
     #[test]
+    fn minimal_client_config_resolves_typed_defaults() {
+        let resolved =
+            load_json(&valid_client_json_value()).expect("minimal client config should resolve");
+        assert!(resolved.diagnostics.is_empty());
+        assert!(resolved.artifacts.client.enabled);
+        assert_eq!(
+            resolved.client,
+            Some(ClientConfig {
+                auth_enforcement: AuthEnforcement::Types,
+                aggregate: false,
+                base_url: ResolvedBaseUrl::Runtime,
+                fetch_options: FetchDefaults::default(),
+            })
+        );
+        assert_eq!(
+            resolved.validation,
+            Some(ValidationConfig {
+                engine: ValidationEngine::Off,
+                request: false,
+                response: false,
+                unchecked: UncheckedPolicy::Allow,
+            })
+        );
+    }
+
+    #[test]
+    fn client_requires_types_as_rule_11() {
+        let mut value = valid_client_json_value();
+        value["artifacts"]["types"] = json!(false);
+        let diagnostics = assert_code(load_json(&value), CODE_CLIENT_REQUIRES_TYPES);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("client artifact requires the types artifact")
+        }));
+    }
+
+    #[test]
+    fn client_requires_validation_object_engine_and_auth_as_rule_15() {
+        let mut missing_validation = valid_client_json_value();
+        missing_validation
+            .as_object_mut()
+            .expect("config object")
+            .remove("validation");
+        assert_code(load_json(&missing_validation), CODE_VALIDATION_REQUIRED);
+
+        let mut missing_engine = valid_client_json_value();
+        missing_engine["validation"] = json!({ "unchecked": "allow" });
+        assert_code(load_json(&missing_engine), CODE_VALIDATION_ENGINE_REQUIRED);
+
+        let mut missing_auth = valid_client_json_value();
+        missing_auth["client"] = json!({});
+        assert_code(load_json(&missing_auth), CODE_AUTH_ENFORCEMENT_REQUIRED);
+
+        let mut missing_both = valid_client_json_value();
+        let object = missing_both.as_object_mut().expect("config object");
+        object.remove("client");
+        object.remove("validation");
+        let diagnostics = assert_code(load_json(&missing_both), CODE_VALIDATION_REQUIRED);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_AUTH_ENFORCEMENT_REQUIRED)
+        );
+    }
+
+    #[test]
+    fn validation_engine_combinations_are_rule_16() {
+        for direction in ["request", "response"] {
+            let mut value = valid_client_json_value();
+            value["validation"][direction] = json!(true);
+            assert_code(load_json(&value), CODE_OFF_VALIDATION_DIRECTIONS);
+        }
+
+        for engine in ["zod", "generated"] {
+            let mut no_direction = valid_client_json_value();
+            no_direction["validation"] = json!({
+                "engine": engine,
+                "unchecked": "allow"
+            });
+            let diagnostics =
+                assert_code(load_json(&no_direction), CODE_VALIDATION_DIRECTION_REQUIRED);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == CODE_VALIDATION_ENGINE_UNSUPPORTED)
+            );
+
+            let mut with_direction = valid_client_json_value();
+            with_direction["validation"] = json!({
+                "engine": engine,
+                "request": true,
+                "unchecked": "allow"
+            });
+            let diagnostics = assert_code(
+                load_json(&with_direction),
+                CODE_VALIDATION_ENGINE_UNSUPPORTED,
+            );
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == CODE_VALIDATION_DIRECTION_REQUIRED)
+            );
+        }
+    }
+
+    #[test]
+    fn unchecked_response_policies_are_rule_17() {
+        let mut rejected = valid_client_json_value();
+        rejected["validation"]["unchecked"] = json!("error");
+        assert_code(load_json(&rejected), CODE_UNCHECKED_RESPONSE);
+
+        let allowed =
+            load_json(&valid_client_json_value()).expect("unchecked allow should resolve");
+        assert!(allowed.diagnostics.is_empty());
+
+        let mut warned = valid_client_json_value();
+        warned["validation"] = json!({ "engine": "off" });
+        let resolved = load_json(&warned).expect("default unchecked warn should preserve success");
+        assert!(resolved.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CODE_UNCHECKED_RESPONSE_WARNING
+                && diagnostic.severity == Severity::Warning
+                && diagnostic
+                    .message
+                    .contains("decoded but unchecked against the OpenAPI schema")
+                && diagnostic
+                    .message
+                    .contains("validation.unchecked: \"allow\"")
+        }));
+    }
+
+    #[test]
+    fn base_url_shapes_and_literal_urls_are_rule_18() {
+        for base_url in [
+            json!({ "source": "literal" }),
+            json!({ "source": "literal", "value": "/api" }),
+            json!({ "source": "literal", "value": "ftp://example.com/api" }),
+            json!({ "source": "literal", "value": "http://[" }),
+            json!({ "source": "literal", "value": "https://user:secret@example.com/api" }),
+            json!({ "source": "runtime", "value": "https://example.com" }),
+            json!({ "source": "server", "value": "https://example.com" }),
+            json!({ "source": "runtime", "index": 0 }),
+            json!({ "source": "literal", "value": "https://example.com", "index": 0 }),
+        ] {
+            let mut value = valid_client_json_value();
+            value["client"]["baseUrl"] = base_url;
+            assert_code(load_json(&value), CODE_BASE_URL);
+        }
+
+        for base_url in [
+            json!({ "source": "runtime" }),
+            json!({ "source": "server" }),
+            json!({ "source": "server", "index": 3 }),
+            json!({ "source": "literal", "value": "https://example.com/api" }),
+            json!({ "source": "literal", "value": "http://example.com/api" }),
+        ] {
+            let mut value = valid_client_json_value();
+            value["client"]["baseUrl"] = base_url;
+            load_json(&value).expect("valid base URL shape should resolve");
+        }
+
+        let mut server_default = valid_client_json_value();
+        server_default["client"]["baseUrl"] = json!({ "source": "server" });
+        assert_eq!(
+            load_json(&server_default)
+                .expect("server base URL should resolve")
+                .client
+                .map(|client| client.base_url),
+            Some(ResolvedBaseUrl::Server { index: 0 })
+        );
+    }
+
+    #[test]
+    fn fetch_defaults_enforce_rule_18_at_deserialization() {
+        for fetch_options in [
+            json!({ "method": "GET" }),
+            json!({ "headers": {} }),
+            json!({ "body": "secret" }),
+            json!({ "signal": "abort" }),
+            json!({ "integrity": "sha256-value" }),
+            json!({ "arbitrary": true }),
+            json!({ "credentials": "credentialless" }),
+            json!({ "cache": "stale-while-revalidate" }),
+            json!({ "redirect": "same-origin" }),
+            json!({ "referrerPolicy": "" }),
+            json!({ "mode": "navigate" }),
+        ] {
+            let mut value = valid_client_json_value();
+            value["client"]["fetchOptions"] = fetch_options;
+            assert_code(load_json(&value), CODE_PARSE);
+        }
+
+        let mut value = valid_client_json_value();
+        value["client"]["fetchOptions"] = json!({
+            "credentials": "include",
+            "cache": "no-store",
+            "redirect": "manual",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "mode": "cors",
+            "keepalive": true
+        });
+        load_json(&value).expect("safe Fetch defaults should resolve");
+    }
+
+    #[test]
+    fn enabled_artifact_and_runtime_directories_must_not_overlap() {
+        for client_directory in ["types", "types/sub"] {
+            let mut value = valid_client_json_value();
+            value["artifacts"]["client"] = json!({ "directory": client_directory });
+            assert_code(load_json(&value), CODE_ARTIFACT_DIRECTORY);
+        }
+
+        let mut runtime_collision = valid_client_json_value();
+        runtime_collision["emit"] = json!({ "runtimeDirectory": "client" });
+        assert_code(load_json(&runtime_collision), CODE_ARTIFACT_DIRECTORY);
+
+        load_json(&valid_client_json_value())
+            .expect("distinct client, types, and runtime directories should resolve");
+    }
+
+    #[test]
     fn object_date_time_without_client_is_rule_13() {
         let mut value = valid_json_value();
         value["types"] = json!({ "dateTime": "date" });
@@ -2073,6 +3047,23 @@ mod tests {
         let mut value = valid_json_value();
         value["types"] = json!({ "date": "temporal" });
         assert_code(load_json(&value), CODE_DATE_REPRESENTATION);
+    }
+
+    #[test]
+    fn non_string_dates_with_client_report_the_m3_build_limit() {
+        for types in [
+            json!({ "dateTime": "date" }),
+            json!({ "dateTime": "temporal" }),
+            json!({ "date": "temporal" }),
+        ] {
+            let mut value = valid_client_json_value();
+            value["types"] = types;
+            let diagnostics = assert_code(load_json(&value), CODE_DATE_TRANSFORM_UNSUPPORTED);
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.message
+                    == "non-string dateTime/date representations require the transform layer, which is not yet supported in this build"
+            }));
+        }
     }
 
     #[test]
@@ -2383,6 +3374,78 @@ mod schema_tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(keys, ["path", "url"]);
+    }
+
+    #[test]
+    fn base_url_is_three_branch_one_of() {
+        let base_url = &schema()["$defs"]["BaseUrlConfig"];
+        let branches = base_url["oneOf"]
+            .as_array()
+            .expect("BaseUrlConfig should be oneOf");
+        assert_eq!(branches.len(), 3);
+        assert_eq!(branches[0]["properties"]["source"]["const"], "runtime");
+        assert_eq!(branches[1]["properties"]["source"]["const"], "server");
+        assert_eq!(branches[1]["properties"]["index"]["minimum"], 0);
+        assert_eq!(branches[2]["properties"]["source"]["const"], "literal");
+        assert_eq!(branches[2]["required"], json!(["source", "value"]));
+        assert!(
+            branches
+                .iter()
+                .all(|branch| branch["additionalProperties"] == json!(false))
+        );
+    }
+
+    #[test]
+    fn fetch_defaults_schema_has_the_fetch_domains() {
+        let schema = schema();
+        let fetch = &schema["$defs"]["FetchDefaults"]["properties"];
+        let definition = |name: &str| {
+            let property = &fetch[name];
+            property["$ref"]
+                .as_str()
+                .or_else(|| {
+                    property["anyOf"].as_array().and_then(|branches| {
+                        branches.iter().find_map(|branch| branch["$ref"].as_str())
+                    })
+                })
+                .and_then(|reference| reference.strip_prefix("#/$defs/"))
+                .and_then(|name| schema["$defs"].get(name))
+                .map(|definition| definition["enum"].clone())
+                .expect("Fetch option should reference an enum")
+        };
+        assert_eq!(
+            definition("credentials"),
+            json!(["omit", "same-origin", "include"])
+        );
+        assert_eq!(
+            definition("cache"),
+            json!([
+                "default",
+                "no-store",
+                "reload",
+                "no-cache",
+                "force-cache",
+                "only-if-cached"
+            ])
+        );
+        assert_eq!(definition("redirect"), json!(["follow", "error", "manual"]));
+        assert_eq!(
+            definition("referrerPolicy"),
+            json!([
+                "no-referrer",
+                "no-referrer-when-downgrade",
+                "same-origin",
+                "origin",
+                "strict-origin",
+                "origin-when-cross-origin",
+                "strict-origin-when-cross-origin",
+                "unsafe-url"
+            ])
+        );
+        assert_eq!(
+            definition("mode"),
+            json!(["cors", "no-cors", "same-origin"])
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! narrower value if that signature ever changed, so it does not faithfully
 //! describe the declared members.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 
 use serde_json::Value;
@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::client_model::ClientModel;
 use crate::config::{DocumentationConfig, EnumRepresentation, FileCase, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
@@ -25,6 +26,12 @@ use crate::ir::{
 };
 use crate::num::render_number;
 use crate::semantic::{AllocatedSchemaName, Analyzed, EnumMember};
+
+mod client;
+mod model;
+pub(crate) mod runtime_assets;
+
+use model::{EmissionModel, SchemaTarget};
 
 const CODE_FILE_NAME: &str = "OASTS1301";
 const CODE_PATH_COLLISION: &str = "OASTS1302";
@@ -162,7 +169,7 @@ fn lowercase_first(token: &str) -> String {
     change_first_ascii_letter(token, u8::to_ascii_lowercase)
 }
 
-fn uppercase_first(token: &str) -> String {
+pub(super) fn uppercase_first(token: &str) -> String {
     change_first_ascii_letter(token, u8::to_ascii_uppercase)
 }
 
@@ -224,7 +231,14 @@ pub fn emit_types(
     source_tuples: &[(String, [u8; 32])],
     sink: &mut DiagnosticSink,
 ) -> Vec<GeneratedFile> {
-    Emitter::new(analyzed, config, source_digest(source_tuples), sink).emit()
+    let mut model = EmissionModel::new(analyzed, config, source_digest(source_tuples), sink);
+    emit_types_from_model(&mut model)
+}
+
+pub(crate) fn emit_types_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
+    let _client_artifact_emitter = client::emit_client_from_model;
+    let _runtime_asset_emitter = runtime_assets::emit_runtime_files;
+    Emitter::new(model).emit()
 }
 
 /// Short alias used by artifact pipelines that already selected `types`.
@@ -234,11 +248,27 @@ pub fn emit(
     source_tuples: &[(String, [u8; 32])],
     sink: &mut DiagnosticSink,
 ) -> Vec<GeneratedFile> {
-    emit_types(analyzed, config, source_tuples, sink)
+    emit_artifacts(analyzed, config, source_tuples, None, sink)
+}
+
+pub(crate) fn emit_artifacts(
+    analyzed: &Analyzed,
+    config: &ResolvedConfig,
+    source_tuples: &[(String, [u8; 32])],
+    client_model: Option<&ClientModel>,
+    sink: &mut DiagnosticSink,
+) -> Vec<GeneratedFile> {
+    let mut model = EmissionModel::new(analyzed, config, source_digest(source_tuples), sink);
+    let mut files = emit_types_from_model(&mut model);
+    if let Some(client_model) = client_model {
+        files.extend(client::emit_client_from_model(&mut model, client_model));
+    }
+    files.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    files
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TypePosition {
+pub(super) enum TypePosition {
     Neutral,
     Request,
     Response,
@@ -250,35 +280,15 @@ enum SchemaChildMode {
     References(TypePosition),
 }
 
-#[derive(Clone, Debug)]
-struct SchemaTarget {
-    index: usize,
-    name: String,
-    file_base: String,
-    request_differs: bool,
-    response_differs: bool,
-}
-
-struct Emitter<'model, 'sink> {
-    analyzed: &'model Analyzed,
-    config: &'model ResolvedConfig,
-    digest: String,
-    schema_targets: HashMap<String, HashMap<String, SchemaTarget>>,
+pub(super) struct Emitter<'model, 'input, 'sink> {
+    model: &'model mut EmissionModel<'input, 'sink>,
     enum_member_indices: BTreeMap<(String, String), usize>,
-    component_files: Vec<Option<String>>,
-    operation_files: Vec<Option<String>>,
-    sink: &'sink mut DiagnosticSink,
 }
 
-impl<'model, 'sink> Emitter<'model, 'sink> {
-    fn new(
-        analyzed: &'model Analyzed,
-        config: &'model ResolvedConfig,
-        digest: String,
-        sink: &'sink mut DiagnosticSink,
-    ) -> Self {
+impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
+    pub(super) fn new(model: &'model mut EmissionModel<'input, 'sink>) -> Self {
         let mut enum_member_indices = BTreeMap::new();
-        for (index, table) in analyzed.enum_members.iter().enumerate() {
+        for (index, table) in model.analyzed.enum_members.iter().enumerate() {
             enum_member_indices
                 .entry((
                     table.source.source_id.clone(),
@@ -286,109 +296,23 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
                 ))
                 .or_insert(index);
         }
-        let mut emitter = Self {
-            analyzed,
-            config,
-            digest,
-            schema_targets: HashMap::new(),
+        Self {
+            model,
             enum_member_indices,
-            component_files: vec![None; analyzed.ir.schemas.len()],
-            operation_files: vec![None; analyzed.ir.operations.len()],
-            sink,
-        };
-        emitter.allocate_paths();
-        emitter
-    }
-
-    fn allocate_paths(&mut self) {
-        let mut seen = HashMap::<String, (String, SourceRef)>::new();
-        for allocated in &self.analyzed.schema_names {
-            let schema = &self.analyzed.ir.schemas[allocated.schema_index];
-            let Some(file_base) = self.allocate_file_base(&allocated.wire_name, &schema.source)
-            else {
-                continue;
-            };
-            let relative = format!("types/components/{file_base}.ts");
-            self.report_path_collision(&relative, &schema.source, &mut seen);
-            self.component_files[allocated.schema_index] = Some(file_base.clone());
-            let (request_differs, response_differs) = shape_variants(&schema.schema);
-            self.schema_targets
-                .entry(schema.source.source_id.clone())
-                .or_default()
-                .insert(
-                    schema.source.json_pointer.clone(),
-                    SchemaTarget {
-                        index: allocated.schema_index,
-                        name: allocated.name.clone(),
-                        file_base,
-                        request_differs,
-                        response_differs,
-                    },
-                );
         }
-        for allocated in &self.analyzed.operation_names {
-            let operation = &self.analyzed.ir.operations[allocated.operation_index];
-            let source_name = operation.operation_id.as_deref().unwrap_or(&allocated.name);
-            let Some(file_base) = self.allocate_file_base(source_name, &operation.source) else {
-                continue;
-            };
-            let relative = format!("types/operations/{file_base}.ts");
-            self.report_path_collision(&relative, &operation.source, &mut seen);
-            self.operation_files[allocated.operation_index] = Some(file_base);
-        }
-    }
-
-    fn allocate_file_base(&mut self, name: &str, source: &SourceRef) -> Option<String> {
-        match file_base_name(name, self.config.naming.file_case) {
-            Ok(file_base) => Some(file_base),
-            Err(error) => {
-                self.sink.push(source_diagnostic(
-                    CODE_FILE_NAME,
-                    format!("invalid generated file name for '{name}': {error}"),
-                    source,
-                ));
-                None
-            }
-        }
-    }
-
-    fn report_path_collision(
-        &mut self,
-        path: &str,
-        source: &SourceRef,
-        seen: &mut HashMap<String, (String, SourceRef)>,
-    ) {
-        let folded = path.to_ascii_lowercase();
-        if let Some((previous, previous_source)) = seen.get(&folded) {
-            self.sink.push(source_diagnostic(
-                CODE_PATH_COLLISION,
-                format!(
-                    "generated path collision after case folding: '{previous}' at {} and '{path}' at {}",
-                    previous_source.display(),
-                    source.display()
-                ),
-                source,
-            ));
-        } else {
-            seen.insert(folded, (path.to_owned(), source.clone()));
-        }
-    }
-
-    fn schema_target(&self, source_id: &str, json_pointer: &str) -> Option<&SchemaTarget> {
-        self.schema_targets.get(source_id)?.get(json_pointer)
     }
 
     fn emit(mut self) -> Vec<GeneratedFile> {
         self.validate_model();
         let mut files = Vec::new();
-        for allocated in &self.analyzed.schema_names {
-            if self.component_files[allocated.schema_index].is_none() {
+        for allocated in &self.model.analyzed.schema_names {
+            if self.model.component_files[allocated.schema_index].is_none() {
                 continue;
             }
             files.push(self.emit_component(allocated));
         }
-        for allocated in &self.analyzed.operation_names {
-            if self.operation_files[allocated.operation_index].is_none() {
+        for allocated in &self.model.analyzed.operation_names {
+            if self.model.operation_files[allocated.operation_index].is_none() {
                 continue;
             }
             files.push(self.emit_operation(allocated.operation_index, &allocated.name));
@@ -398,26 +322,15 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
     }
 
     fn header(&self) -> String {
-        let mut output = format!(
-            "// Generated by Oasts {}. Do not edit.\n// Config schema version: 1\n// Source digest: {}\n",
-            crate::version(),
-            self.digest
-        );
-        for line in &self.config.emit.banner {
-            output.push_str("// ");
-            output.push_str(line);
-            output.push('\n');
-        }
-        output.push('\n');
-        output
+        self.model.header()
     }
 
     fn validate_model(&mut self) {
         let mut diagnostics = Vec::new();
-        for schema in &self.analyzed.ir.schemas {
+        for schema in &self.model.analyzed.ir.schemas {
             self.validate_schema(&schema.schema, &mut diagnostics);
         }
-        for operation in &self.analyzed.ir.operations {
+        for operation in &self.model.analyzed.ir.operations {
             for parameter in &operation.parameters {
                 self.validate_schema(&parameter.schema, &mut diagnostics);
             }
@@ -432,13 +345,14 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
                 }
             }
         }
-        self.sink.extend(diagnostics);
+        self.model.sink.extend(diagnostics);
     }
 
     fn validate_schema(&self, schema: &SchemaNode, diagnostics: &mut Vec<Diagnostic>) {
         match schema {
             SchemaNode::Ref { target, meta } => {
                 if self
+                    .model
                     .schema_target(&target.source_id, &target.json_pointer)
                     .is_none()
                 {
@@ -603,8 +517,10 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
             return None;
         }
         visited.insert(key);
-        let target = self.schema_target(&target.source_id, &target.json_pointer)?;
-        let resolved = &self.analyzed.ir.schemas.get(target.index)?.schema;
+        let target = self
+            .model
+            .schema_target(&target.source_id, &target.json_pointer)?;
+        let resolved = &self.model.analyzed.ir.schemas.get(target.index)?.schema;
         self.resolve_ref(resolved, visited)
     }
 
@@ -719,8 +635,8 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
     }
 
     fn emit_component(&self, allocated: &AllocatedSchemaName) -> GeneratedFile {
-        let schema = &self.analyzed.ir.schemas[allocated.schema_index];
-        let file_base = self.component_files[allocated.schema_index]
+        let schema = &self.model.analyzed.ir.schemas[allocated.schema_index];
+        let file_base = self.model.component_files[allocated.schema_index]
             .as_deref()
             .unwrap_or_default();
         let mut content = self.header();
@@ -732,6 +648,7 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
             &mut imports,
         );
         let target = self
+            .model
             .schema_target(&schema.source.source_id, &schema.source.json_pointer)
             .expect("an allocated component file has a schema target");
         let request_differs = target.request_differs;
@@ -793,7 +710,7 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
         source: &SourceRef,
     ) {
         if let Some(values) = schema_finite_values(schema)
-            && self.config.types.enum_representation == EnumRepresentation::Const
+            && self.model.config.types.enum_representation == EnumRepresentation::Const
         {
             let fallback_members;
             let members = if let Some(members) = self.enum_members(schema) {
@@ -815,7 +732,7 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
                 output,
                 &schema.meta().docs,
                 DocKind::Schema,
-                &self.config.documentation,
+                &self.model.config.documentation,
                 0,
                 false,
             );
@@ -832,7 +749,7 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
                         output,
                         &docs,
                         DocKind::Property,
-                        &self.config.documentation,
+                        &self.model.config.documentation,
                         2,
                         false,
                     );
@@ -849,7 +766,7 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
                 output,
                 &schema.meta().docs,
                 DocKind::Schema,
-                &self.config.documentation,
+                &self.model.config.documentation,
                 0,
                 false,
             );
@@ -868,7 +785,7 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
             output,
             &schema.meta().docs,
             DocKind::Schema,
-            &self.config.documentation,
+            &self.model.config.documentation,
             0,
             false,
         );
@@ -902,7 +819,8 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
         let index = self
             .enum_member_indices
             .get(&(source.source_id.clone(), source.json_pointer.clone()))?;
-        self.analyzed
+        self.model
+            .analyzed
             .enum_members
             .get(*index)
             .map(|table| table.members.as_slice())
@@ -923,9 +841,15 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
         )
     }
 
-    fn render_type(&self, schema: &SchemaNode, position: TypePosition, indent: usize) -> String {
+    pub(super) fn render_type(
+        &self,
+        schema: &SchemaNode,
+        position: TypePosition,
+        indent: usize,
+    ) -> String {
         let rendered = match schema {
             SchemaNode::Ref { target, .. } => self
+                .model
                 .schema_target(&target.source_id, &target.json_pointer)
                 .map_or_else(
                     || "unknown".to_owned(),
@@ -1054,12 +978,12 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
                     &mut output,
                     &docs,
                     DocKind::Property,
-                    &self.config.documentation,
+                    &self.model.config.documentation,
                     member_indent,
                     interface_members,
                 );
                 output.push_str(&" ".repeat(member_indent));
-                if self.config.types.readonly {
+                if self.model.config.types.readonly {
                     output.push_str("readonly ");
                 }
                 output.push_str(&render_property_key(name));
@@ -1159,7 +1083,9 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
         visit: &mut dyn FnMut(&SchemaTarget),
     ) {
         if let SchemaNode::Ref { target, .. } = schema
-            && let Some(target) = self.schema_target(&target.source_id, &target.json_pointer)
+            && let Some(target) = self
+                .model
+                .schema_target(&target.source_id, &target.json_pointer)
         {
             visit(target);
         }
@@ -1251,10 +1177,10 @@ impl<'model, 'sink> Emitter<'model, 'sink> {
         if imports.is_empty() {
             return;
         }
-        let extension = if self.config.emit.import_extension == "none" {
+        let extension = if self.model.config.emit.import_extension == "none" {
             ""
         } else {
-            self.config.emit.import_extension.as_str()
+            self.model.config.emit.import_extension.as_str()
         };
         for (file, names) in imports {
             output.push_str("import type { ");
@@ -1279,11 +1205,11 @@ impl SchemaTarget {
     }
 }
 
-impl Emitter<'_, '_> {
+impl Emitter<'_, '_, '_> {
     fn emit_operation(&self, operation_index: usize, allocated_name: &str) -> GeneratedFile {
-        let operation = &self.analyzed.ir.operations[operation_index];
+        let operation = &self.model.analyzed.ir.operations[operation_index];
         let stem = uppercase_first(allocated_name);
-        let file_base = self.operation_files[operation_index]
+        let file_base = self.model.operation_files[operation_index]
             .as_deref()
             .unwrap_or_default();
         let mut content = self.header();
@@ -1311,7 +1237,7 @@ impl Emitter<'_, '_> {
         self.write_imports(&mut content, imports, "../components/");
 
         write_source_metadata(&mut content, &operation.source, 0);
-        write_operation_tsdoc(&mut content, operation, &self.config.documentation, 0);
+        write_operation_tsdoc(&mut content, operation, &self.model.config.documentation, 0);
         content.push_str("export type ");
         content.push_str(&stem);
         content.push_str("Request = ");
@@ -1344,7 +1270,7 @@ impl Emitter<'_, '_> {
             content.push_str(";\n\n");
         }
         write_source_metadata(&mut content, &operation.source, 0);
-        write_operation_tsdoc(&mut content, operation, &self.config.documentation, 0);
+        write_operation_tsdoc(&mut content, operation, &self.model.config.documentation, 0);
         content.push_str("export type ");
         content.push_str(&stem);
         content.push_str("Response = ");
@@ -1383,7 +1309,7 @@ impl Emitter<'_, '_> {
             let group_required = parameters.iter().any(|parameter| parameter.required);
             let group = self.render_parameter_group(&parameters, indent + 2);
             output.push_str(&" ".repeat(indent + 2));
-            if self.config.types.readonly {
+            if self.model.config.types.readonly {
                 output.push_str("readonly ");
             }
             output.push_str(group_name);
@@ -1408,13 +1334,13 @@ impl Emitter<'_, '_> {
                     &mut output,
                     &docs,
                     DocKind::Property,
-                    &self.config.documentation,
+                    &self.model.config.documentation,
                     indent + 2,
                     false,
                 );
             }
             output.push_str(&" ".repeat(indent + 2));
-            if self.config.types.readonly {
+            if self.model.config.types.readonly {
                 output.push_str("readonly ");
             }
             output.push_str("body");
@@ -1449,12 +1375,12 @@ impl Emitter<'_, '_> {
                 &mut output,
                 &docs,
                 DocKind::Parameter,
-                &self.config.documentation,
+                &self.model.config.documentation,
                 indent + 2,
                 false,
             );
             output.push_str(&" ".repeat(indent + 2));
-            if self.config.types.readonly {
+            if self.model.config.types.readonly {
                 output.push_str("readonly ");
             }
             output.push_str(&render_property_key(&parameter.name));
@@ -1504,7 +1430,7 @@ impl Emitter<'_, '_> {
         }
     }
 
-    fn collect_operation_imports(
+    pub(super) fn collect_operation_imports(
         &self,
         schema: &SchemaNode,
         position: TypePosition,
@@ -1695,6 +1621,8 @@ struct TsDoc {
     summary: Option<String>,
     remarks: Vec<String>,
     deprecated: Option<&'static str>,
+    params: Vec<(String, String)>,
+    returns: Option<&'static str>,
     default_value: Option<String>,
     examples: Vec<DocExample>,
     private_remarks: Option<String>,
@@ -1881,6 +1809,85 @@ fn write_operation_tsdoc(
     write_tsdoc(output, &tsdoc, indent);
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ClientDocKind {
+    Declaration,
+    ResultFunction,
+    ThrowFunction,
+}
+
+pub(super) fn write_client_operation_tsdoc(
+    output: &mut String,
+    operation: &Operation,
+    config: &DocumentationConfig,
+    kind: ClientDocKind,
+    unchecked_response: bool,
+) {
+    if !config.enabled && matches!(kind, ClientDocKind::Declaration) {
+        return;
+    }
+    let mut tsdoc = TsDoc::default();
+    if config.enabled {
+        map_summary_description(
+            &mut tsdoc,
+            operation.summary.as_deref(),
+            operation.description.as_deref(),
+            config,
+        );
+        if config.description && !operation.responses.is_empty() {
+            tsdoc.remarks.push(format!(
+                "Responses\n\n{}",
+                operation
+                    .responses
+                    .iter()
+                    .map(|response| format!(
+                        "- {}: {}",
+                        response_status_label(&response.status),
+                        response.description
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        if config.deprecated && operation.deprecated {
+            tsdoc.deprecated = Some("This operation is deprecated.");
+        }
+        if let Some((url, description)) = &operation.external_docs {
+            tsdoc.see.push((url.clone(), description.clone()));
+        }
+    }
+    match kind {
+        ClientDocKind::Declaration => {}
+        ClientDocKind::ResultFunction | ClientDocKind::ThrowFunction => {
+            if unchecked_response {
+                tsdoc.remarks.insert(
+                    0,
+                    "Successful response data is decoded but unchecked against the OpenAPI schema."
+                        .to_owned(),
+                );
+            }
+            if config.enabled && config.description {
+                tsdoc.params = operation
+                    .parameters
+                    .iter()
+                    .filter_map(|parameter| {
+                        parameter
+                            .description
+                            .as_ref()
+                            .map(|description| (parameter.name.clone(), description.clone()))
+                    })
+                    .collect();
+            }
+            tsdoc.returns = Some(if matches!(kind, ClientDocKind::ResultFunction) {
+                "A result discriminated by HTTP status."
+            } else {
+                "The successful response data."
+            });
+        }
+    }
+    write_tsdoc(output, &tsdoc, 0);
+}
+
 fn push_media_examples(examples: &mut Vec<DocExample>, media_type: &MediaType, source: &str) {
     for (label, value) in &media_type.examples {
         examples.push(DocExample {
@@ -1900,6 +1907,8 @@ fn write_tsdoc(output: &mut String, docs: &TsDoc, indent: usize) {
     if docs.summary.is_none()
         && docs.remarks.is_empty()
         && docs.deprecated.is_none()
+        && docs.params.is_empty()
+        && docs.returns.is_none()
         && docs.default_value.is_none()
         && docs.examples.is_empty()
         && docs.private_remarks.is_none()
@@ -1921,6 +1930,23 @@ fn write_tsdoc(output: &mut String, docs: &TsDoc, indent: usize) {
     }
     if let Some(deprecated) = docs.deprecated {
         sections.push(vec![format!("@deprecated {deprecated}")]);
+    }
+    if !docs.params.is_empty() {
+        sections.push(
+            docs.params
+                .iter()
+                .map(|(name, description)| {
+                    format!(
+                        "@param {} - {}",
+                        encode_comment_fragment(name),
+                        encode_comment_fragment(description)
+                    )
+                })
+                .collect(),
+        );
+    }
+    if let Some(returns) = docs.returns {
+        sections.push(vec![format!("@returns {returns}")]);
     }
     if let Some(default) = &docs.default_value {
         sections.push(vec![format!(
@@ -2074,7 +2100,7 @@ fn encode_link_part(value: &str) -> String {
     encoded.replace(['\n', '\r'], " ")
 }
 
-fn write_source_metadata(output: &mut String, source: &SourceRef, indent: usize) {
+pub(super) fn write_source_metadata(output: &mut String, source: &SourceRef, indent: usize) {
     output.push_str(&" ".repeat(indent));
     output.push_str("// Source: ");
     output.push_str(&encode_line_comment(&source.display()));
@@ -2571,7 +2597,8 @@ mod tests {
         };
         let (_temp, config) = resolved_config(json!({}));
         let mut sink = DiagnosticSink::new();
-        let emitter = Emitter::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&mut model);
         let missing = schema_ref("/missing", "/components/schemas/Missing");
         let nested = SchemaNode::AnyOf {
             branches: vec![
@@ -2675,6 +2702,7 @@ mod tests {
                     schema: self_ref.clone(),
                     source: source("/components/schemas/Loop"),
                 }],
+                ..Ir::default()
             },
             operation_names: Vec::new(),
             schema_names: vec![AllocatedSchemaName {
@@ -2689,7 +2717,8 @@ mod tests {
             "types": { "enum": "const" }
         }));
         let mut sink = DiagnosticSink::new();
-        let emitter = Emitter::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&mut model);
         assert!(
             emitter
                 .primitive_domain(&self_ref, &mut HashSet::new())
@@ -2808,6 +2837,7 @@ mod tests {
                     schema: primitive(PrimitiveType::String, "/components/schemas/Target"),
                     source: target_source.clone(),
                 }],
+                ..Ir::default()
             },
             operation_names: Vec::new(),
             schema_names: vec![AllocatedSchemaName {
@@ -2830,7 +2860,8 @@ mod tests {
             "emit": { "importExtension": "none" }
         }));
         let mut sink = DiagnosticSink::new();
-        let emitter = Emitter::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&mut model);
 
         let first = object(
             "/closed-one",
@@ -3027,6 +3058,9 @@ mod tests {
                 deprecated: false,
                 description: Some("Optional filter.".to_owned()),
                 schema: primitive(PrimitiveType::Boolean, "/parameter/filter"),
+                style: None,
+                explode: None,
+                allow_reserved: false,
                 source: source("/parameter/filter"),
             }],
             request_body: Some(Body {
@@ -3034,8 +3068,13 @@ mod tests {
                 description: Some("Opaque body.".to_owned()),
                 media_types: vec![MediaType {
                     name: "application/octet-stream".to_owned(),
+                    raw_name: String::new(),
                     schema: request_schema,
+                    schema_present: true,
                     examples: vec![("sample".to_owned(), json!({ "bytes": 2 }))],
+                    encodings: Vec::new(),
+                    streaming_marked: false,
+                    oas_version: crate::ir::OasVersion::V3_1,
                     source: source("/request/media"),
                 }],
                 source: source("/request"),
@@ -3046,8 +3085,13 @@ mod tests {
                     description: "Opaque response.".to_owned(),
                     media_types: vec![MediaType {
                         name: "application/octet-stream".to_owned(),
+                        raw_name: String::new(),
                         schema: response_schema,
+                        schema_present: true,
                         examples: vec![("sample".to_owned(), json!({ "bytes": 3 }))],
+                        encodings: Vec::new(),
+                        streaming_marked: false,
+                        oas_version: crate::ir::OasVersion::V3_1,
                         source: source("/response/media"),
                     }],
                     source: source("/response"),
@@ -3059,6 +3103,8 @@ mod tests {
                     source: source("/response/empty"),
                 },
             ],
+            servers: Vec::new(),
+            security: None,
             source: source("/operation/rich"),
         };
         let empty = Operation {
@@ -3072,12 +3118,15 @@ mod tests {
             parameters: Vec::new(),
             request_body: None,
             responses: Vec::new(),
+            servers: Vec::new(),
+            security: None,
             source: source("/operation/empty"),
         };
         let analyzed = Analyzed {
             ir: Ir {
                 operations: vec![rich, empty],
                 schemas: Vec::new(),
+                ..Ir::default()
             },
             operation_names: vec![
                 AllocatedOperationName {
@@ -3099,7 +3148,9 @@ mod tests {
             "documentation": { "summary": false, "description": true }
         }));
         let mut sink = DiagnosticSink::new();
-        let files = Emitter::new(&analyzed, &config, "digest".to_owned(), &mut sink).emit();
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let files = Emitter::new(&mut model).emit();
+        drop(model);
         assert!(sink.as_slice().is_empty());
         let rich = files
             .iter()
@@ -3857,7 +3908,7 @@ fn shape_variants(schema: &SchemaNode) -> (bool, bool) {
     )
 }
 
-fn source_diagnostic(
+pub(super) fn source_diagnostic(
     code: &'static str,
     message: impl Into<String>,
     source: &SourceRef,

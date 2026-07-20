@@ -1,0 +1,145 @@
+use std::collections::HashMap;
+
+use crate::config::ResolvedConfig;
+use crate::diag::DiagnosticSink;
+use crate::ir::SourceRef;
+use crate::semantic::Analyzed;
+
+use super::{
+    CODE_FILE_NAME, CODE_PATH_COLLISION, file_base_name, shape_variants, source_diagnostic,
+};
+
+#[derive(Clone, Debug)]
+pub(crate) struct SchemaTarget {
+    pub(crate) index: usize,
+    pub(crate) name: String,
+    pub(crate) file_base: String,
+    pub(crate) request_differs: bool,
+    pub(crate) response_differs: bool,
+}
+
+/// Shared deterministic allocation product for all emitters.
+pub(crate) struct EmissionModel<'input, 'sink> {
+    pub(crate) analyzed: &'input Analyzed,
+    pub(crate) config: &'input ResolvedConfig,
+    digest: String,
+    schema_targets: HashMap<String, HashMap<String, SchemaTarget>>,
+    pub(crate) component_files: Vec<Option<String>>,
+    pub(crate) operation_files: Vec<Option<String>>,
+    seen: HashMap<String, (String, SourceRef)>,
+    pub(crate) sink: &'sink mut DiagnosticSink,
+}
+
+impl<'input, 'sink> EmissionModel<'input, 'sink> {
+    pub(crate) fn new(
+        analyzed: &'input Analyzed,
+        config: &'input ResolvedConfig,
+        digest: String,
+        sink: &'sink mut DiagnosticSink,
+    ) -> Self {
+        let mut model = Self {
+            analyzed,
+            config,
+            digest,
+            schema_targets: HashMap::new(),
+            component_files: vec![None; analyzed.ir.schemas.len()],
+            operation_files: vec![None; analyzed.ir.operations.len()],
+            seen: HashMap::new(),
+            sink,
+        };
+        model.allocate_paths();
+        model
+    }
+
+    fn allocate_paths(&mut self) {
+        for allocated in &self.analyzed.schema_names {
+            let schema = &self.analyzed.ir.schemas[allocated.schema_index];
+            let Some(file_base) = self.allocate_file_base(&allocated.wire_name, &schema.source)
+            else {
+                continue;
+            };
+            let relative = format!("types/components/{file_base}.ts");
+            self.register_path(&relative, &schema.source);
+            self.component_files[allocated.schema_index] = Some(file_base.clone());
+            let (request_differs, response_differs) = shape_variants(&schema.schema);
+            self.schema_targets
+                .entry(schema.source.source_id.clone())
+                .or_default()
+                .insert(
+                    schema.source.json_pointer.clone(),
+                    SchemaTarget {
+                        index: allocated.schema_index,
+                        name: allocated.name.clone(),
+                        file_base,
+                        request_differs,
+                        response_differs,
+                    },
+                );
+        }
+        for allocated in &self.analyzed.operation_names {
+            let operation = &self.analyzed.ir.operations[allocated.operation_index];
+            let source_name = operation.operation_id.as_deref().unwrap_or(&allocated.name);
+            let Some(file_base) = self.allocate_file_base(source_name, &operation.source) else {
+                continue;
+            };
+            let relative = format!("types/operations/{file_base}.ts");
+            self.register_path(&relative, &operation.source);
+            self.operation_files[allocated.operation_index] = Some(file_base);
+        }
+    }
+
+    fn allocate_file_base(&mut self, name: &str, source: &SourceRef) -> Option<String> {
+        match file_base_name(name, self.config.naming.file_case) {
+            Ok(file_base) => Some(file_base),
+            Err(error) => {
+                self.sink.push(source_diagnostic(
+                    CODE_FILE_NAME,
+                    format!("invalid generated file name for '{name}': {error}"),
+                    source,
+                ));
+                None
+            }
+        }
+    }
+
+    /// Registers an artifact path in the shared case-folded collision namespace.
+    pub(crate) fn register_path(&mut self, path: &str, source: &SourceRef) {
+        let folded = path.to_ascii_lowercase();
+        if let Some((previous, previous_source)) = self.seen.get(&folded) {
+            self.sink.push(source_diagnostic(
+                CODE_PATH_COLLISION,
+                format!(
+                    "generated path collision after case folding: '{previous}' at {} and '{path}' at {}",
+                    previous_source.display(),
+                    source.display()
+                ),
+                source,
+            ));
+        } else {
+            self.seen.insert(folded, (path.to_owned(), source.clone()));
+        }
+    }
+
+    pub(crate) fn schema_target(
+        &self,
+        source_id: &str,
+        json_pointer: &str,
+    ) -> Option<&SchemaTarget> {
+        self.schema_targets.get(source_id)?.get(json_pointer)
+    }
+
+    pub(crate) fn header(&self) -> String {
+        let mut output = format!(
+            "// Generated by Oasts {}. Do not edit.\n// Config schema version: 1\n// Source digest: {}\n",
+            crate::version(),
+            self.digest
+        );
+        for line in &self.config.emit.banner {
+            output.push_str("// ");
+            output.push_str(line);
+            output.push('\n');
+        }
+        output.push('\n');
+        output
+    }
+}

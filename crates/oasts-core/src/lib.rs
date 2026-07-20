@@ -1,3 +1,4 @@
+pub mod client_model;
 pub mod config;
 pub mod diag;
 pub mod emit;
