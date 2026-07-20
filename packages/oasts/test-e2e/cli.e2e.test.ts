@@ -1,9 +1,9 @@
 /**
  * End-to-end parity suite, run OUTSIDE the coverage gate
  * (`scripts/coverage-ts.sh` covers `test/`; child processes are not
- * instrumented, so spawned-binary tests live here): the Node CLI driven
- * through `bin/oasts.mjs` must produce output byte-identical to the Rust
- * binary run against the equivalent YAML config.
+ * instrumented, so spawned-binary tests live here): the Node CLI, driven
+ * through the built `dist/cli.js` bundle, must produce output byte-identical
+ * to the Rust binary run against the equivalent YAML config.
  */
 
 import assert from "node:assert/strict";
@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REPO_ROOT = join(PACKAGE_ROOT, "../..");
 const FIXTURE = join(REPO_ROOT, "fixtures/petstore-3.0");
-const BIN = join(PACKAGE_ROOT, "bin/oasts.mjs");
+const BIN = join(PACKAGE_ROOT, "dist/cli.js");
 const RUST_BIN = join(REPO_ROOT, "target/debug/oasts");
 
 // The repo's Rust toolchain pin only applies inside the repo, so build there

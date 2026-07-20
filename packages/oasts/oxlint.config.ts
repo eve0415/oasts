@@ -29,5 +29,5 @@ export default defineConfig({
       },
     },
   ],
-  ignorePatterns: ["node_modules/**", "napi/**"],
+  ignorePatterns: ["node_modules/**", "napi/**", "dist/**"],
 });

@@ -25,4 +25,5 @@ packages/oasts/config.ts
 # Node
 node_modules/
 packages/oasts/napi/
+packages/oasts/dist/
 .pnpm-store/
