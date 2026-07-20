@@ -22,6 +22,10 @@ docs/
 schemas/
 packages/oasts/config.ts
 
+# Generated fixture output (oasts generate writes here; scratch, never committed)
+fixtures/*/generated/
+fixtures/*/generated-client/
+
 # Node
 node_modules/
 packages/oasts/napi/
