@@ -1,0 +1,156 @@
+<div align="center">
+
+# oasts
+
+**Compile OpenAPI 3.0/3.1 into TypeScript types and a zero-dependency typed client — deterministic, fast, Rust-powered.**
+
+[![npm version](https://img.shields.io/npm/v/oasts)](https://www.npmjs.com/package/oasts)
+[![npm downloads](https://img.shields.io/npm/dm/oasts)](https://www.npmjs.com/package/oasts)
+[![license: MIT](https://img.shields.io/npm/l/oasts)](./LICENSE)
+
+</div>
+
+---
+
+## Why oasts
+
+Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtime dependency into your bundle, or approximates the parts of the spec that are hard to get right. oasts is a compiler, not a platform:
+
+- **Failure-complete result types.** Every call returns a discriminated union covering documented responses, undocumented HTTP responses, network failures, and decode failures — not just the 2xx happy path. Exhaustive `switch` over an API call is a type error away from correct.
+- **Deterministic, byte-identical output.** Same input, same config, same version ⇒ the same bytes on every machine and OS. Generated code is meant to be committed and reviewed; `--check` makes drift a CI failure.
+- **The full parameter serialization matrix.** style/explode for path, query, and header parameters (form, spaceDelimited, pipeDelimited, deepObject, label, matrix, simple), multipart encoding with per-part content types — implemented to the letter of the spec, not approximated.
+- **Zero-dependency generated client.** The typed fetch client is emitted next to your types. No runtime package to version-match, nothing in your dependency tree.
+- **Rust-powered.** Cold starts in milliseconds; full specs the size of GitHub's compile in well under a second.
+
+## Features
+
+| Artifact | Status |
+| --- | --- |
+| TypeScript types | ✅ |
+| Typed fetch client | ✅ |
+| Zod schemas | Planned |
+| Standalone validators | Planned |
+| TanStack Query hooks | Planned |
+| MSW handlers | Planned |
+
+## Quick start
+
+```sh
+pnpm add -D oasts
+```
+
+Drop an `oasts.yaml` next to your spec:
+
+```yaml
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+```
+
+Generate:
+
+```sh
+pnpm exec oasts generate
+```
+
+Every schema becomes a plain, readable interface (`generated/types/components/pet.ts`, verbatim):
+
+```ts
+export interface Pet {
+  id: number;
+  name: string;
+  tag?: string;
+}
+```
+
+Enable the client artifact and every operation becomes a typed call returning a failure-complete result — documented responses, undocumented statuses, network and decode failures are all in the union, so handling them is exhaustiveness-checking, not guesswork:
+
+```ts
+import { createTransport } from "./generated/runtime/transport.js";
+import { getPetShowcase } from "./generated/client/operations/getpetshowcase.js";
+
+const transport = createTransport({ baseUrl: "https://api.example.com/v1" });
+
+const result = await getPetShowcase(transport, { petId: "42", tags: ["indoor"] });
+
+if (result.ok && result.match === "200" && typeof result.data !== "string") {
+  console.log(result.data.name); // Pet — this 200 declares both JSON and text bodies, and the type makes you handle it
+} else if (result.kind === "response" && !result.ok) {
+  console.error(result.status, result.error.message); // the documented error schema
+} else if (result.kind === "request-failure") {
+  console.error(result.error); // network/serialization failure — a value, not a throw
+}
+```
+
+In CI, fail on drift instead of writing files:
+
+```sh
+pnpm exec oasts generate --check
+```
+
+## Comparison
+
+| | oasts | openapi-typescript | orval / hey-api | openapi-generator |
+| --- | --- | --- | --- | --- |
+| Types | ✅ | ✅ | ✅ | ✅ |
+| Typed client | ✅ zero-dependency | — | ✅ needs runtime deps | ✅ heavyweight templates |
+| Failure-complete results | ✅ | — | — | — |
+| Serialization matrix (style/explode, multipart) | ✅ full | n/a | partial | partial |
+| Deterministic committed output | ✅ byte-identical, `--check` gated | — | — | — |
+| Toolchain | native binary via npm | Node | Node | Java |
+
+Performance is measured, not promised: the in-repo benchmark harness compiles GitHub's full OpenAPI spec to types in ~437 ms warm (p50, reference container) with every run gated on repeatability. Reproduce it with `cargo run -p oasts-bench` — the harness, corpus manifest, and recorded baseline live in [`bench/`](./bench).
+
+## Configuration
+
+`oasts.yaml` (or `.json`) is validated against a published JSON Schema, so typos fail loudly with a rule ID instead of silently doing nothing. A typed TypeScript config is supported too (`oasts.config.ts`).
+
+```yaml
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+artifacts:
+  types: true
+  client: true
+client:
+  authEnforcement: types
+  baseUrl:
+    source: server
+    index: 0
+validation:
+  engine: off
+  unchecked: allow
+```
+
+## Determinism
+
+Generated output is a build artifact you can commit: given the same input document, config, and oasts version, output is byte-identical across machines and operating systems. The repo's own gates generate everything twice and diff the bytes; `oasts generate --check` gives your CI the same guarantee.
+
+That also means oasts never reformats your project and you never reformat oasts's output — emitted code has one canonical shape.
+
+## Development
+
+Toolchain pins are picked up automatically (`rust-toolchain.toml`, `devEngines` in `package.json` — pnpm only; npm will refuse to run).
+
+```sh
+pnpm install --frozen-lockfile
+cargo run -p oasts-gen                  # generate config schema + TS config types
+pnpm -C packages/oasts build:napi       # build the native Node binding
+pnpm -C packages/oasts build            # bundle the npm package
+```
+
+`scripts/*.sh` are the gates: `gate.sh` (lint + tests), `coverage.sh` / `coverage-ts.sh`, and `verify-ts.sh` (typechecks generated fixture output under `tsc --strict`; run `cargo build` first).
+
+## Roadmap
+
+- Typed auth providers with runtime enforcement
+- Streaming request/response bodies
+- Transform layer (e.g. `date-time` → `Date`)
+- Zod schemas and standalone validators
+- TanStack Query hooks and MSW handlers
+
+## License
+
+[MIT](./LICENSE)

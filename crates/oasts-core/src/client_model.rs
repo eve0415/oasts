@@ -1371,10 +1371,7 @@ fn diagnose_response(
             )),
             DecoderClass::Multipart => sink.push(source_diagnostic(
                 "OASTS1404",
-                format!(
-                    "multipart response media '{}' is not supported",
-                    media.name
-                ),
+                format!("multipart response media '{}' is not supported", media.name),
                 &media.source,
                 Severity::Error,
             )),

@@ -10,7 +10,7 @@ metadata:
     rustc: "rustc 1.97.1 (8bab26f4f 2026-07-14)"
     node: "v24.18.0"
     tsc: "Version 7.0.2"
-  manifestCommit: "a744d25ba08800fb99ff8724f5ac2cf0e736da7b"
+  manifestCommit: "a8af3c29d55b81711b57daac944cd3accf34c4be"
   measuredAt: "2026-07-20T13:37:23Z"
 results:
   - fixture: "github-3.0"
