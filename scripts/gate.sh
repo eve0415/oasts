@@ -4,6 +4,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+cargo run --quiet -p oasts-gen || { echo "gate: config generation failed" >&2; exit 1; }
+
 rust_gate() {
   cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 }

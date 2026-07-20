@@ -58,17 +58,36 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
+#[cfg(feature = "json-schema")]
+pub fn config_json_schema() -> serde_json::Value {
+    schemars::schema_for!(RawConfig).to_value()
+}
+
 /// The unvalidated schema-version 1 root object.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "json-schema",
+    derive(schemars::JsonSchema),
+    schemars(
+        rename = "UserConfig",
+        rename_all = "camelCase",
+        description = "The schema-version-1 single-spec configuration."
+    )
+)]
 pub struct RawConfig {
     #[serde(
         default,
         rename = "$schema",
         deserialize_with = "deserialize_optional_non_null"
     )]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "$schema"))]
     pub schema: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(schema_with = "schema_version_literal")
+    )]
     pub schema_version: Option<Number>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub workspace_root: Option<String>,
@@ -118,9 +137,49 @@ pub struct Input {
     pub url: Option<String>,
 }
 
+#[cfg(feature = "json-schema")]
+impl schemars::JsonSchema for Input {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Input".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "Exactly one local path or HTTP(S) URL.",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string" }
+                    },
+                    "required": ["url"],
+                    "additionalProperties": false
+                }
+            ]
+        })
+    }
+}
+
+#[cfg(feature = "json-schema")]
+fn schema_version_literal(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "const": 1
+    })
+}
+
 /// Boolean shorthand or an artifact option block.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(untagged)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum ArtifactSetting {
     Enabled(bool),
     Options(ArtifactOptions),
@@ -129,6 +188,7 @@ pub enum ArtifactSetting {
 /// Options accepted by every artifact selector.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ArtifactOptions {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub enabled: Option<bool>,
@@ -139,6 +199,11 @@ pub struct ArtifactOptions {
 /// Artifact selectors before defaults are applied.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(description = "Artifact selectors. Types default on; everything else defaults off.")
+)]
 pub struct ArtifactsConfig {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub types: Option<ArtifactSetting>,
@@ -156,6 +221,8 @@ pub struct ArtifactsConfig {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
 pub enum EnumRepresentation {
     #[default]
     Literal,
@@ -164,6 +231,8 @@ pub enum EnumRepresentation {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
 pub enum EnumExtensions {
     #[default]
     Accept,
@@ -172,6 +241,8 @@ pub enum EnumExtensions {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
 pub enum DateTimeRepresentation {
     #[default]
     String,
@@ -181,6 +252,8 @@ pub enum DateTimeRepresentation {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
 pub enum DateRepresentation {
     #[default]
     String,
@@ -190,8 +263,14 @@ pub enum DateRepresentation {
 /// Type artifact options with schema defaults applied during deserialization.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(rename_all = "camelCase", description = "Type representation options.")
+)]
 pub struct TypesConfig {
     #[serde(rename = "enum")]
+    #[cfg_attr(feature = "json-schema", schemars(rename = "enum"))]
     pub enum_representation: EnumRepresentation,
     pub enum_extensions: EnumExtensions,
     pub date_time: DateTimeRepresentation,
@@ -201,6 +280,8 @@ pub struct TypesConfig {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
 pub enum FileCase {
     #[default]
     Kebab,
@@ -212,6 +293,8 @@ pub enum FileCase {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
 pub enum OperationCase {
     #[default]
     Camel,
@@ -220,6 +303,8 @@ pub enum OperationCase {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
 pub enum EnumMemberCase {
     #[default]
     Pascal,
@@ -231,6 +316,14 @@ pub enum EnumMemberCase {
 /// Naming options. Fixed casing keys remain strings so rule 20 can name them.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "Declaration and file naming options."
+    )
+)]
 pub struct NamingConfig {
     pub file_case: FileCase,
     pub type_case: String,
@@ -258,6 +351,11 @@ impl Default for NamingConfig {
 /// Documentation switches.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(description = "Schema-derived TSDoc switches.")
+)]
 pub struct DocumentationConfig {
     pub enabled: bool,
     pub summary: bool,
@@ -283,6 +381,11 @@ impl Default for DocumentationConfig {
 /// Emission options. Literal-valued strings are validated as rule 21.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(rename_all = "camelCase", description = "Generated module mechanics.")
+)]
 pub struct EmitConfig {
     pub runtime_directory: String,
     pub import_extension: String,
@@ -304,6 +407,14 @@ impl Default for EmitConfig {
 /// Local file trust options.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "Local document/ref trust boundary."
+    )
+)]
 pub struct LocalTrustConfig {
     pub allow_paths: Vec<String>,
 }
@@ -311,6 +422,14 @@ pub struct LocalTrustConfig {
 /// Document graph bounds.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "Document-graph size and depth bounds."
+    )
+)]
 pub struct LimitsConfig {
     pub max_document_bytes: u64,
     pub max_total_bytes: u64,
@@ -2228,5 +2347,51 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == CODE_IO)
         );
+    }
+}
+
+#[cfg(all(test, feature = "json-schema"))]
+mod schema_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn schema() -> serde_json::Value {
+        config_json_schema()
+    }
+
+    #[test]
+    fn root_title_is_user_config() {
+        assert_eq!(schema()["title"], json!("UserConfig"));
+    }
+
+    #[test]
+    fn schema_version_is_const_integer_1() {
+        let sv = &schema()["properties"]["schemaVersion"];
+        assert_eq!(sv["const"], json!(1));
+        assert_eq!(sv["type"], json!("integer"));
+    }
+
+    #[test]
+    fn input_is_two_branch_one_of() {
+        let input = &schema()["$defs"]["Input"];
+        let branches = input["oneOf"].as_array().expect("Input should be oneOf");
+        assert_eq!(branches.len(), 2);
+        let keys: Vec<&str> = branches
+            .iter()
+            .flat_map(|b| b["required"].as_array().unwrap())
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(keys, ["path", "url"]);
+    }
+
+    #[test]
+    fn schema_field_is_present() {
+        assert!(schema()["properties"]["$schema"].is_object());
+    }
+
+    #[test]
+    fn root_has_additional_properties_false() {
+        assert_eq!(schema()["additionalProperties"], json!(false));
     }
 }

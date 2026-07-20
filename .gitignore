@@ -18,6 +18,10 @@ target/
 
 docs/
 
+# Generated
+schemas/
+packages/oasts/config.ts
+
 # Node
 node_modules/
 packages/oasts/napi/

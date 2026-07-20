@@ -1,0 +1,15 @@
+[package]
+name = "oasts-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Generates JSON Schema and TypeScript types from the oasts config model."
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+oasts-core = { path = "../oasts-core", features = ["json-schema"] }
+serde_json = { version = "=1.0.150", features = ["arbitrary_precision", "preserve_order"] }

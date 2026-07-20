@@ -9,7 +9,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd /workspaces/oasts && bash scripts/gate.sh"
+            "command": "bash scripts/gate.sh"
           }
         ]
       }
