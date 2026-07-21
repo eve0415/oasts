@@ -17,31 +17,25 @@ for f in petstore-3.0 tictactoe-3.1; do
 done
 
 shopt -s globstar
-for f in client-showcase-3.1 petstore-3.0; do
-  cp -r "fixtures/$f" "$work/client-$f"
+for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1; do
+  # A fixture whose client config lives in a separate file says so on disk.
   fixture_config=oasts.yaml
-  if [[ "$f" == petstore-3.0 ]]; then
+  if [[ -f "fixtures/$f/oasts-client.yaml" ]]; then
     fixture_config=oasts-client.yaml
   fi
+  cp -r "fixtures/$f" "$work/client-$f"
+  rm -rf "$work/client-$f"/generated "$work/client-$f"/generated-client
   (cd "$work/client-$f" && "$OLDPWD/$bin" generate --config "$fixture_config")
   pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-$f"/generated*/**/*.ts
   echo "tsc --strict client ok: $f"
+  cp -r "fixtures/$f" "$work/client-$f-repeat"
+  rm -rf "$work/client-$f-repeat"/generated "$work/client-$f-repeat"/generated-client
+  (cd "$work/client-$f-repeat" && "$OLDPWD/$bin" generate --config "$fixture_config")
+  diff -r "$work/client-$f"/generated* "$work/client-$f-repeat"/generated*
+  echo "double-generation byte identity ok: $f"
 done
 
-cp -r fixtures/tictactoe-3.1 "$work/client-tictactoe-3.1"
-if (cd "$work/client-tictactoe-3.1" && "$OLDPWD/$bin" generate --config oasts-client.yaml) 2>"$work/tictactoe-client.stderr"; then
-  echo "client-enabled tictactoe unexpectedly generated" >&2
-  exit 1
-fi
-if ! grep -q 'OASTS1430' "$work/tictactoe-client.stderr"; then
-  echo "client-enabled tictactoe did not report OASTS1430" >&2
-  exit 1
-fi
-echo "client rejection ok: tictactoe-3.1 OASTS1430"
-
-cp -r fixtures/client-showcase-3.1 "$work/client-showcase-repeat"
-(cd "$work/client-showcase-repeat" && "$OLDPWD/$bin" generate --config oasts.yaml)
-diff -r "$work/client-client-showcase-3.1/generated" "$work/client-showcase-repeat/generated"
-echo "double-generation byte identity ok: client-showcase-3.1"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-auth-showcase-3.1/compile-assert/cases.ts"
+echo "compile-assert matrix ok: auth-showcase-3.1"
 
 node --test crates/oasts-core/runtime/test-e2e/

@@ -9,7 +9,6 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, cp, mkdtemp, rm } from "node:fs/promises";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { register } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -18,21 +17,15 @@ import { pathToFileURL } from "node:url";
 
 import { MULTIPART_BODY_VECTORS, type MultipartBodyVector } from "../test/vectors-multipart.ts";
 import { STYLE_VECTORS, type StyleVector } from "../test/vectors-styles.ts";
+import {
+  createScriptedServer,
+  requiredFunction,
+  requiredRecord,
+  requestHeader,
+  type ExportedFunction,
+  type HeaderEntry,
+} from "./harness.ts";
 
-type ExportedFunction = (...arguments_: unknown[]) => unknown;
-type HeaderEntry = readonly [string, string];
-type CapturedRequest = {
-  readonly method: string;
-  readonly url: string;
-  readonly rawHeaderEntries: readonly HeaderEntry[];
-  readonly body: Buffer;
-};
-type ScriptedResponse = {
-  readonly status: number;
-  readonly headers?: readonly HeaderEntry[];
-  readonly body?: Uint8Array;
-  readonly delayBodyMs?: number;
-};
 type ExpectedMultipartPart = {
   readonly name: string;
   readonly filename?: string;
@@ -43,10 +36,10 @@ type ExpectedMultipartPart = {
 const repoRoot = path.resolve(import.meta.dirname, "../../../..");
 const binary = path.join(repoRoot, "target/debug/oasts");
 const fixtureSource = path.join(repoRoot, "fixtures/client-showcase-3.1");
-const routes = new Map<string, ScriptedResponse>();
-const requests: CapturedRequest[] = [];
 
-let server: Server;
+const harness = createScriptedServer();
+const { routes, requests, scriptRoute, requiredRequest } = harness;
+
 let baseUrl: string;
 let temporaryRoot: string;
 let generatedRoot: string;
@@ -62,65 +55,6 @@ let selectMediaShowcase: ExportedFunction;
 let submitFormShowcase: ExportedFunction;
 let uploadShowcase: ExportedFunction;
 let ApiError: ExportedFunction;
-
-function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function requiredRecord(value: unknown, label: string): Readonly<Record<string, unknown>> {
-  if (!isRecord(value)) {
-    throw new TypeError(`${label} must be an object`);
-  }
-  return value;
-}
-
-function isExportedFunction(value: unknown): value is ExportedFunction {
-  return typeof value === "function";
-}
-
-function requiredFunction(module: unknown, name: string): ExportedFunction {
-  const value = requiredRecord(module, "generated module")[name];
-  if (!isExportedFunction(value)) {
-    throw new TypeError(`generated export ${name} must be a function`);
-  }
-  return value;
-}
-
-function headerEntries(rawHeaders: readonly string[]): readonly HeaderEntry[] {
-  const entries: HeaderEntry[] = [];
-  for (let index = 0; index < rawHeaders.length; index += 2) {
-    const name = rawHeaders[index];
-    const value = rawHeaders[index + 1];
-    if (name === undefined || value === undefined) {
-      throw new TypeError("node:http produced an incomplete raw header entry");
-    }
-    entries.push([name, value]);
-  }
-  return entries;
-}
-
-function routeKey(method: string, url: string): string {
-  return `${method} ${url}`;
-}
-
-function scriptRoute(method: string, url: string, response: ScriptedResponse): void {
-  routes.set(routeKey(method, url), response);
-}
-
-function requestHeader(request: CapturedRequest, name: string): string | undefined {
-  const normalized = name.toLowerCase();
-  return request.rawHeaderEntries.find(
-    ([headerName]) => headerName.toLowerCase() === normalized,
-  )?.[1];
-}
-
-function requiredRequest(index: number): CapturedRequest {
-  const request = requests[index];
-  if (request === undefined) {
-    throw new TypeError(`captured request ${String(index)} is missing`);
-  }
-  return request;
-}
 
 function localTransport(config: Readonly<Record<string, unknown>> = {}): unknown {
   return createTransport({ ...config, baseUrl });
@@ -177,19 +111,6 @@ function multipartExpectation(parts: readonly ExpectedMultipartPart[]): {
   return { boundary, body: Buffer.concat(body) };
 }
 
-async function captureRequest(request: IncomingMessage): Promise<CapturedRequest> {
-  const chunks: Uint8Array[] = [];
-  for await (const chunk of request) {
-    chunks.push(chunk);
-  }
-  return {
-    method: request.method ?? "",
-    url: request.url ?? "",
-    rawHeaderEntries: headerEntries(request.rawHeaders),
-    body: Buffer.concat(chunks),
-  };
-}
-
 before(async () => {
   try {
     await access(binary, constants.X_OK);
@@ -240,43 +161,7 @@ before(async () => {
   submitFormShowcase = requiredFunction(aggregateApi, "submitFormShowcase");
   uploadShowcase = requiredFunction(aggregateApi, "uploadShowcase");
 
-  server = createServer((request: IncomingMessage, response: ServerResponse) => {
-    captureRequest(request)
-      .then((captured) => {
-        requests.push(captured);
-        const scripted = routes.get(routeKey(captured.method, captured.url));
-        if (scripted === undefined) {
-          response.writeHead(500, { "Content-Type": "text/plain" });
-          response.end(`No scripted response for ${captured.method} ${captured.url}`);
-          return;
-        }
-        for (const [name, value] of scripted.headers ?? []) {
-          response.setHeader(name, value);
-        }
-        response.writeHead(scripted.status);
-        const end = (): void => {
-          response.end(scripted.body);
-        };
-        if (scripted.delayBodyMs === undefined) {
-          end();
-        } else {
-          response.flushHeaders();
-          setTimeout(end, scripted.delayBodyMs);
-        }
-      })
-      .catch((error: unknown) => {
-        response.destroy(error instanceof Error ? error : new Error("request capture failed"));
-      });
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  if (address === null || typeof address === "string") {
-    throw new TypeError("node:http did not bind an IP socket");
-  }
-  baseUrl = `http://127.0.0.1:${String(address.port)}`;
+  baseUrl = await harness.start();
 });
 
 beforeEach(() => {
@@ -285,9 +170,7 @@ beforeEach(() => {
 });
 
 after(async () => {
-  await new Promise<void>((resolve, reject) => {
-    server.close((error) => (error === undefined ? resolve() : reject(error)));
-  });
+  await harness.stop();
   await rm(temporaryRoot, { recursive: true, force: true });
 });
 

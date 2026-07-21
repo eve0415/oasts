@@ -26,8 +26,40 @@ pub struct OperationPlan {
     pub response_table: Vec<ResponsePlan>,
     pub accept: Option<String>,
     pub base_url: BaseUrlPlan,
-    pub effective_security: Vec<SecurityRequirement>,
+    /// Effective security as an ordered list of OR alternatives; an empty inner
+    /// alternative is the anonymous `{}` option and is preserved in place.
+    pub auth_plan: Vec<AuthAlternative>,
     pub credential_headers: Vec<String>,
+}
+
+/// One security OR alternative: the AND-set of scheme uses a caller satisfies together.
+/// Empty represents the anonymous `{}` alternative.
+pub type AuthAlternative = Vec<AuthSchemeUse>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthSchemeUse {
+    pub name: String,
+    pub kind: AuthKind,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthKind {
+    Basic,
+    Bearer,
+    ApiKeyHeader {
+        name: String,
+    },
+    ApiKeyQuery {
+        name: String,
+    },
+    ApiKeyCookie {
+        name: String,
+    },
+    /// OAuth2 and OpenIdConnect both serialize as a bearer token at runtime but keep
+    /// distinct kinds so the emitted descriptor preserves provider context.
+    OAuth2,
+    OpenIdConnect,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,6 +314,7 @@ pub fn build_client_model(
             };
             diagnose_parameters(operation, &projector, sink);
             diagnose_security(operation, &effective_security, &analyzed.ir, sink);
+            let auth_plan = plan_auth(operation, &effective_security, &analyzed.ir, sink);
             diagnose_base_url(operation, &base_url, sink);
             if let Some(body) = &operation.request_body {
                 diagnose_request_media(&body.media_types, &projector, sink);
@@ -312,7 +345,7 @@ pub fn build_client_model(
                 accept,
                 base_url,
                 credential_headers: credential_headers(&effective_security, &analyzed.ir),
-                effective_security,
+                auth_plan,
             }
         })
         .collect();
@@ -879,26 +912,134 @@ fn diagnose_security(
             }
         }
     }
-    if security.iter().any(|alternative| !alternative.is_empty()) {
-        let name = operation.operation_id.as_deref().map_or_else(
-            || {
-                format!(
-                    "{} {}",
-                    operation.method.to_ascii_uppercase(),
-                    operation.source.display()
-                )
-            },
-            str::to_owned,
-        );
-        sink.push(source_diagnostic(
-            "OASTS1430",
+}
+
+/// Operation label for auth diagnostics: `operationId`, else `METHOD source`.
+fn operation_label(operation: &Operation) -> String {
+    operation.operation_id.as_deref().map_or_else(
+        || {
             format!(
-                "operation '{name}' requires authentication, which is not yet supported in this build"
+                "{} {}",
+                operation.method.to_ascii_uppercase(),
+                operation.source.display()
+            )
+        },
+        str::to_owned,
+    )
+}
+
+/// Resolves effective security into ordered OR alternatives, emitting a hard
+/// error for every scheme use the fetch client cannot serialize. Fail-closed:
+/// one unsupported member sinks the build even when a sibling alternative is
+/// fully supported, so a client never silently drops a documented auth path.
+fn plan_auth(
+    operation: &Operation,
+    security: &[SecurityRequirement],
+    ir: &Ir,
+    sink: &mut DiagnosticSink,
+) -> Vec<AuthAlternative> {
+    security
+        .iter()
+        .map(|alternative| {
+            alternative
+                .iter()
+                .filter_map(|(name, scopes)| auth_scheme_use(operation, name, scopes, ir, sink))
+                .collect()
+        })
+        .collect()
+}
+
+fn auth_scheme_use(
+    operation: &Operation,
+    name: &str,
+    scopes: &[String],
+    ir: &Ir,
+    sink: &mut DiagnosticSink,
+) -> Option<AuthSchemeUse> {
+    let Some(scheme) = ir
+        .security_schemes
+        .iter()
+        .find(|scheme| scheme.name == name)
+    else {
+        sink.push(source_diagnostic(
+            "OASTS1434",
+            format!(
+                "operation '{}' security requirement references security scheme '{name}', which is not declared in components.securitySchemes",
+                operation_label(operation)
             ),
             &operation.source,
             Severity::Error,
         ));
-    }
+        return None;
+    };
+    let kind = match &scheme.kind {
+        SecKind::Http { scheme: raw } => match raw.to_ascii_lowercase().as_str() {
+            "basic" => Some(AuthKind::Basic),
+            "bearer" => Some(AuthKind::Bearer),
+            _ => {
+                sink.push(source_diagnostic(
+                    "OASTS1431",
+                    format!(
+                        "operation '{}' security scheme '{}' uses HTTP authentication scheme '{raw}', which the fetch client cannot serialize (only 'basic' and 'bearer' are supported)",
+                        operation_label(operation),
+                        scheme.name
+                    ),
+                    &scheme.source,
+                    Severity::Error,
+                ));
+                None
+            }
+        },
+        SecKind::ApiKey {
+            location: ParamLocation::Header,
+            name,
+        } => Some(AuthKind::ApiKeyHeader { name: name.clone() }),
+        SecKind::ApiKey {
+            location: ParamLocation::Query,
+            name,
+        } => Some(AuthKind::ApiKeyQuery { name: name.clone() }),
+        SecKind::ApiKey {
+            location: ParamLocation::Cookie,
+            name,
+        } => Some(AuthKind::ApiKeyCookie { name: name.clone() }),
+        SecKind::OAuth2 => Some(AuthKind::OAuth2),
+        SecKind::OpenIdConnect => Some(AuthKind::OpenIdConnect),
+        SecKind::MutualTls => {
+            sink.push(source_diagnostic(
+                "OASTS1432",
+                format!(
+                    "operation '{}' security scheme '{}' uses mutualTLS authentication, for which the fetch client cannot configure client certificates",
+                    operation_label(operation),
+                    scheme.name
+                ),
+                &scheme.source,
+                Severity::Error,
+            ));
+            None
+        }
+        SecKind::ApiKey {
+            location: ParamLocation::Path,
+            ..
+        }
+        | SecKind::Other => {
+            sink.push(source_diagnostic(
+                "OASTS1433",
+                format!(
+                    "operation '{}' security scheme '{}' uses an unrecognized security scheme kind, which the fetch client cannot serialize",
+                    operation_label(operation),
+                    scheme.name
+                ),
+                &scheme.source,
+                Severity::Error,
+            ));
+            None
+        }
+    };
+    kind.map(|kind| AuthSchemeUse {
+        name: scheme.name.clone(),
+        kind,
+        scopes: scopes.to_vec(),
+    })
 }
 
 fn reachable_schemes<'ir>(
@@ -2137,7 +2278,7 @@ mod tests {
             &first.base_url,
             BaseUrlPlan::Server { index: 0, servers } if servers[0].url == "https://{host}/v1"
         ));
-        assert_eq!(first.effective_security, vec![Vec::new()]);
+        assert_eq!(first.auth_plan, vec![Vec::new()]);
         assert_eq!(first.credential_headers, ["authorization"]);
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
     }
@@ -2439,11 +2580,7 @@ mod tests {
             model.operations[0].credential_headers,
             ["authorization", "x-key"]
         );
-        assert!(
-            sink.as_slice()
-                .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1430")
-        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
     }
 
     #[test]
@@ -2817,11 +2954,31 @@ mod tests {
             ],
         ];
         let mut sink = DiagnosticSink::new();
-        diagnose_security(&operation, &security, &ir, &mut sink);
-        assert!(
+        let plan = plan_auth(&operation, &security, &ir, &mut sink);
+        assert_eq!(
+            plan,
+            vec![
+                Vec::new(),
+                vec![AuthSchemeUse {
+                    name: "http".to_owned(),
+                    kind: AuthKind::Bearer,
+                    scopes: Vec::new(),
+                }],
+            ]
+        );
+        assert_eq!(
             sink.as_slice()
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1430")
+                .filter(|diagnostic| diagnostic.code == "OASTS1432")
+                .count(),
+            2
+        );
+        assert_eq!(
+            sink.as_slice()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS1433")
+                .count(),
+            1
         );
     }
 
@@ -3902,7 +4059,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1430_rejects_only_operations_with_non_anonymous_security() {
+    fn auth_plan_distinguishes_secured_anonymous_and_empty_security() {
         let document = json!({
             "openapi": "3.1.0",
             "components": {
@@ -3934,15 +4091,497 @@ mod tests {
                 }
             }
         });
-        let diagnostics = client_diagnostics(&document);
-        let seam = diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1430")
-            .collect::<Vec<_>>();
+        let (analyzed, model, sink) = runtime_plan(&document);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let plan_for = |id: &str| {
+            let index = analyzed
+                .ir
+                .operations
+                .iter()
+                .position(|operation| operation.operation_id.as_deref() == Some(id))
+                .expect("operation");
+            model
+                .operations
+                .iter()
+                .find(|plan| plan.operation_index == index)
+                .expect("plan")
+                .auth_plan
+                .clone()
+        };
+        assert_eq!(
+            plan_for("securedOperation"),
+            vec![
+                vec![AuthSchemeUse {
+                    name: "key".to_owned(),
+                    kind: AuthKind::ApiKeyQuery {
+                        name: "key".to_owned(),
+                    },
+                    scopes: Vec::new(),
+                }],
+                Vec::new(),
+            ]
+        );
+        assert_eq!(plan_for("anonymousOperation"), vec![Vec::new()]);
+        assert!(plan_for("emptyOperation").is_empty());
+    }
 
-        assert_eq!(seam.len(), 1);
-        assert!(seam[0].message.contains("securedOperation"));
-        assert!(!seam[0].message.contains("anonymousOperation"));
-        assert!(!seam[0].message.contains("emptyOperation"));
+    fn runtime_plan(document: &Value) -> (Analyzed, ClientModel, DiagnosticSink) {
+        let (_temp, analyzed, config) = analyzed(
+            document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        (analyzed, model, sink)
+    }
+
+    #[test]
+    fn auth_plan_preserves_alternative_member_and_scope_order() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "securitySchemes": {
+                    "defaultApiKey": { "type": "apiKey", "in": "header", "name": "api-key" },
+                    "app2AppOauth": {
+                        "type": "oauth2",
+                        "flows": {
+                            "clientCredentials": {
+                                "tokenUrl": "https://example.test/token",
+                                "scopes": { "board:read": "Read the board" }
+                            }
+                        }
+                    }
+                }
+            },
+            "paths": {
+                "/board": {
+                    "get": {
+                        "operationId": "get-board",
+                        "security": [
+                            { "defaultApiKey": [] },
+                            { "app2AppOauth": ["board:read"] }
+                        ],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_analyzed, model, sink) = runtime_plan(&document);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            model.operations[0].auth_plan,
+            vec![
+                vec![AuthSchemeUse {
+                    name: "defaultApiKey".to_owned(),
+                    kind: AuthKind::ApiKeyHeader {
+                        name: "api-key".to_owned(),
+                    },
+                    scopes: Vec::new(),
+                }],
+                vec![AuthSchemeUse {
+                    name: "app2AppOauth".to_owned(),
+                    kind: AuthKind::OAuth2,
+                    scopes: vec!["board:read".to_owned()],
+                }],
+            ]
+        );
+    }
+
+    #[test]
+    fn http_scheme_token_matching_is_case_insensitive() {
+        for (token, expected) in [
+            ("Basic", AuthKind::Basic),
+            ("BASIC", AuthKind::Basic),
+            ("basic", AuthKind::Basic),
+            ("Bearer", AuthKind::Bearer),
+            ("bearer", AuthKind::Bearer),
+        ] {
+            let document = json!({
+                "openapi": "3.1.0",
+                "components": {
+                    "securitySchemes": { "h": { "type": "http", "scheme": token } }
+                },
+                "paths": {
+                    "/p": {
+                        "get": {
+                            "operationId": "op",
+                            "security": [{ "h": [] }],
+                            "responses": { "200": { "description": "ok" } }
+                        }
+                    }
+                }
+            });
+            let (_analyzed, model, sink) = runtime_plan(&document);
+            assert!(!sink.has_errors(), "token {token}: {:#?}", sink.as_slice());
+            assert_eq!(
+                model.operations[0].auth_plan,
+                vec![vec![AuthSchemeUse {
+                    name: "h".to_owned(),
+                    kind: expected.clone(),
+                    scopes: Vec::new(),
+                }]],
+                "token {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_http_scheme_reports_oxs1431() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "securitySchemes": { "digestScheme": { "type": "http", "scheme": "digest" } }
+            },
+            "paths": {
+                "/p": {
+                    "get": {
+                        "operationId": "op",
+                        "security": [{ "digestScheme": [] }],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_analyzed, _model, sink) = runtime_plan(&document);
+        let hits = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1431")
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].message,
+            "operation 'op' security scheme 'digestScheme' uses HTTP authentication scheme 'digest', which the fetch client cannot serialize (only 'basic' and 'bearer' are supported)"
+        );
+    }
+
+    #[test]
+    fn auth_plan_maps_cookie_and_oauth_scheme_kinds() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "securitySchemes": {
+                    "cookieKey": { "type": "apiKey", "in": "cookie", "name": "session" },
+                    "oidc": {
+                        "type": "openIdConnect",
+                        "openIdConnectUrl": "https://auth.example/.well-known/openid-configuration"
+                    },
+                    "oauthFlow": {
+                        "type": "oauth2",
+                        "flows": {
+                            "clientCredentials": {
+                                "tokenUrl": "https://auth.example/token",
+                                "scopes": { "scope.a": "a" }
+                            }
+                        }
+                    }
+                }
+            },
+            "paths": {
+                "/p": {
+                    "get": {
+                        "operationId": "op",
+                        "security": [{ "cookieKey": [] }, { "oauthFlow": ["scope.a"] }, { "oidc": [] }],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_analyzed, model, sink) = runtime_plan(&document);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            model.operations[0].auth_plan,
+            vec![
+                vec![AuthSchemeUse {
+                    name: "cookieKey".to_owned(),
+                    kind: AuthKind::ApiKeyCookie {
+                        name: "session".to_owned(),
+                    },
+                    scopes: Vec::new(),
+                }],
+                vec![AuthSchemeUse {
+                    name: "oauthFlow".to_owned(),
+                    kind: AuthKind::OAuth2,
+                    scopes: vec!["scope.a".to_owned()],
+                }],
+                vec![AuthSchemeUse {
+                    name: "oidc".to_owned(),
+                    kind: AuthKind::OpenIdConnect,
+                    scopes: Vec::new(),
+                }],
+            ]
+        );
+    }
+
+    #[test]
+    fn wire_key_pairing_skips_a_keyless_member() {
+        // An AND alternative pairing a keyed scheme with mutualTLS: the wire-key collision scan
+        // skips the keyless member instead of colliding, while mutualTLS still errors fail-closed.
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "securitySchemes": {
+                    "bearerAuth": { "type": "http", "scheme": "bearer" },
+                    "mtls": { "type": "mutualTLS" }
+                }
+            },
+            "paths": {
+                "/p": {
+                    "get": {
+                        "operationId": "op",
+                        "security": [{ "bearerAuth": [], "mtls": [] }],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_analyzed, _model, sink) = runtime_plan(&document);
+        assert_eq!(
+            sink.as_slice()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS1432")
+                .count(),
+            1
+        );
+        assert!(
+            sink.as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.code != "OASTS1413")
+        );
+    }
+
+    #[test]
+    fn mutual_tls_scheme_reports_oxs1432() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "securitySchemes": { "mtls": { "type": "mutualTLS" } }
+            },
+            "paths": {
+                "/p": {
+                    "get": {
+                        "operationId": "op",
+                        "security": [{ "mtls": [] }],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_analyzed, _model, sink) = runtime_plan(&document);
+        let hits = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1432")
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].message.contains("mtls"));
+        assert!(hits[0].message.contains("client certificate"));
+    }
+
+    #[test]
+    fn unknown_scheme_kind_reports_oxs1433() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "securitySchemes": { "weird": { "type": "quantum" } }
+            },
+            "paths": {
+                "/p": {
+                    "get": {
+                        "operationId": "op",
+                        "security": [{ "weird": [] }],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_analyzed, _model, sink) = runtime_plan(&document);
+        let hits = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1433")
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].message.contains("weird"));
+    }
+
+    #[test]
+    fn undeclared_scheme_name_reports_oxs1434() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "securitySchemes": { "known": { "type": "apiKey", "in": "header", "name": "X-Key" } }
+            },
+            "paths": {
+                "/p": {
+                    "get": {
+                        "operationId": "op",
+                        "security": [{ "ghost": [] }],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_analyzed, _model, sink) = runtime_plan(&document);
+        let hits = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1434")
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].message.contains("ghost"));
+        assert!(hits[0].message.contains("op"));
+    }
+
+    #[test]
+    fn auth_plan_preserves_anonymous_alternative_in_place() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "securitySchemes": { "k": { "type": "apiKey", "in": "query", "name": "key" } }
+            },
+            "paths": {
+                "/p": {
+                    "get": {
+                        "operationId": "op",
+                        "security": [{ "k": [] }, {}],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_analyzed, model, sink) = runtime_plan(&document);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            model.operations[0].auth_plan,
+            vec![
+                vec![AuthSchemeUse {
+                    name: "k".to_owned(),
+                    kind: AuthKind::ApiKeyQuery {
+                        name: "key".to_owned(),
+                    },
+                    scopes: Vec::new(),
+                }],
+                Vec::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_empty_security_overrides_root_to_empty_plan() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "security": [{ "k": [] }],
+            "components": {
+                "securitySchemes": { "k": { "type": "apiKey", "in": "header", "name": "X-Key" } }
+            },
+            "paths": {
+                "/p": {
+                    "get": {
+                        "operationId": "op",
+                        "security": [],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_analyzed, model, sink) = runtime_plan(&document);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert!(model.operations[0].auth_plan.is_empty());
+    }
+
+    #[test]
+    fn operation_security_overrides_root_default() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "security": [{ "rootKey": [] }],
+            "components": {
+                "securitySchemes": {
+                    "rootKey": { "type": "apiKey", "in": "header", "name": "X-Root" },
+                    "opKey": { "type": "apiKey", "in": "query", "name": "op-key" }
+                }
+            },
+            "paths": {
+                "/overridden": {
+                    "get": {
+                        "operationId": "overridden",
+                        "security": [{ "opKey": [] }],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                },
+                "/inherits": {
+                    "get": {
+                        "operationId": "inherits",
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (analyzed, model, sink) = runtime_plan(&document);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let plan_for = |id: &str| {
+            let index = analyzed
+                .ir
+                .operations
+                .iter()
+                .position(|operation| operation.operation_id.as_deref() == Some(id))
+                .expect("operation");
+            model
+                .operations
+                .iter()
+                .find(|plan| plan.operation_index == index)
+                .expect("plan")
+                .auth_plan
+                .clone()
+        };
+        assert_eq!(
+            plan_for("overridden"),
+            vec![vec![AuthSchemeUse {
+                name: "opKey".to_owned(),
+                kind: AuthKind::ApiKeyQuery {
+                    name: "op-key".to_owned(),
+                },
+                scopes: Vec::new(),
+            }]]
+        );
+        assert_eq!(
+            plan_for("inherits"),
+            vec![vec![AuthSchemeUse {
+                name: "rootKey".to_owned(),
+                kind: AuthKind::ApiKeyHeader {
+                    name: "X-Root".to_owned(),
+                },
+                scopes: Vec::new(),
+            }]]
+        );
+    }
+
+    #[test]
+    fn unsupported_alternative_fails_closed_beside_supported() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "securitySchemes": {
+                    "bearerScheme": { "type": "http", "scheme": "bearer" },
+                    "digestScheme": { "type": "http", "scheme": "digest" }
+                }
+            },
+            "paths": {
+                "/p": {
+                    "get": {
+                        "operationId": "op",
+                        "security": [{ "bearerScheme": [] }, { "digestScheme": [] }],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_analyzed, _model, sink) = runtime_plan(&document);
+        assert!(sink.has_errors());
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "OASTS1431")
+        );
     }
 }

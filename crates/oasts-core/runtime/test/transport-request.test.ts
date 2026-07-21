@@ -22,6 +22,7 @@ function operation(overrides: Partial<OperationDescriptor> = {}): OperationDescr
     body: null,
     accept: null,
     credentialHeaders: ["Authorization"],
+    security: [],
     responses: [],
     baseUrl: { kind: "literal", value: "https://descriptor.example/api" },
     fetchDefaults: {},

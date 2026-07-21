@@ -13,6 +13,7 @@ import {
   encodeMultipart,
   parseMediaType,
   serializeMediaType,
+  serializeQueryFormExplode,
   type MultipartPart,
   type ParamPrimitive,
   type ParamValue,
@@ -21,8 +22,13 @@ import {
 } from './serialize.ts';
 
 //#region oxs:auth
-export type AuthProviders<S extends string = never> = Readonly<Record<S, unknown>>;
-export type AuthOverrides = never;
+export type AuthContext = { readonly operationId: string; readonly scheme: string; readonly scopes: readonly string[]; readonly url: string };
+export type BasicCredential = { readonly username: string; readonly password: string };
+export const AmbientCookieCredential: unique symbol = Symbol('AmbientCookieCredential');
+export type AuthCredential = string | BasicCredential | typeof AmbientCookieCredential;
+export type AuthProvider = (context: AuthContext) => AuthCredential | null | Promise<AuthCredential | null>;
+export type AuthProviders<S extends string = never> = Readonly<Record<S, AuthProvider>>;
+export type AuthOverrides = 'anonymous' | Readonly<Record<string, AuthCredential>>;
 //#endregion
 
 export type TransportConfig<S extends string = never> = {
@@ -179,6 +185,12 @@ export type OperationDescriptor = {
   readonly body: BodyPlan | null;
   readonly accept: string | null;
   readonly credentialHeaders: readonly string[];
+  readonly security: readonly (readonly {
+    readonly name: string;
+    readonly kind: 'basic' | 'bearer' | 'apiKeyHeader' | 'apiKeyQuery' | 'apiKeyCookie' | 'oauth2' | 'openIdConnect';
+    readonly param?: string;
+    readonly scopes: readonly string[];
+  }[])[];
   readonly responses: readonly ResponsePlan[];
   readonly baseUrl:
     | { readonly kind: 'runtime' }
@@ -291,6 +303,332 @@ const FORBIDDEN_OVERRIDE_VALUES = new Set(['connect', 'trace', 'track']);
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+type SecurityUse = OperationDescriptor['security'][number][number];
+
+type SelectedAuthMember = {
+  readonly use: SecurityUse;
+  readonly credential: unknown;
+};
+
+type AuthSelection =
+  | {
+      readonly kind: 'selected';
+      readonly members: readonly SelectedAuthMember[];
+      readonly triedAlternatives: readonly (readonly string[])[];
+    }
+  | {
+      readonly kind: 'anonymous';
+      readonly triedAlternatives: readonly (readonly string[])[];
+    }
+  | {
+      readonly kind: 'failure';
+      readonly result: Extract<ExecutionResult, { readonly kind: 'request-failure' }>;
+    };
+
+type AuthSource =
+  | { readonly kind: 'per-call'; readonly use: SecurityUse; readonly credential: unknown }
+  | { readonly kind: 'provider'; readonly use: SecurityUse; readonly provider: unknown }
+  | { readonly kind: 'missing'; readonly use: SecurityUse };
+
+type AvailableAuthSource = Exclude<AuthSource, { readonly kind: 'missing' }>;
+
+function authFailureResult(
+  message: string,
+  triedAlternatives: readonly (readonly string[])[],
+): Extract<ExecutionResult, { readonly kind: 'request-failure' }> {
+  return {
+    kind: 'request-failure',
+    ok: false,
+    match: null,
+    status: null,
+    error: { kind: 'auth', message, triedAlternatives },
+  };
+}
+
+function providerAuthFailureResult(
+  message: string,
+  triedAlternatives: readonly (readonly string[])[],
+  cause: unknown,
+): Extract<ExecutionResult, { readonly kind: 'request-failure' }> {
+  return {
+    kind: 'request-failure',
+    ok: false,
+    match: null,
+    status: null,
+    error: { kind: 'auth', message, triedAlternatives, cause },
+  };
+}
+
+function isAuthProvider(value: unknown): value is AuthProvider {
+  return typeof value === 'function';
+}
+
+function configuredProvider<S extends string>(
+  providers: AuthProviders<S> | undefined,
+  name: string,
+): { readonly found: false } | { readonly found: true; readonly provider: unknown } {
+  if (providers === undefined || !Object.hasOwn(providers, name)) {
+    return { found: false };
+  }
+  return { found: true, provider: Reflect.get(providers, name) };
+}
+
+function perCallAuth(options: CallOptions | undefined): Readonly<Record<string, unknown>> | undefined {
+  return isRecord(options?.auth) ? options.auth : undefined;
+}
+
+function alternativeNames(alternative: readonly SecurityUse[]): readonly string[] {
+  return alternative.map((use) => use.name);
+}
+
+function authSource<S extends string>(
+  transport: Transport<S>,
+  perCall: Readonly<Record<string, unknown>> | undefined,
+  use: SecurityUse,
+): AuthSource {
+  if (perCall !== undefined && Object.hasOwn(perCall, use.name)) {
+    return { kind: 'per-call', use, credential: perCall[use.name] };
+  }
+  const provider = configuredProvider(transport.auth, use.name);
+  return !provider.found
+    ? { kind: 'missing', use }
+    : { kind: 'provider', use, provider: provider.provider };
+}
+
+async function selectAuth<S extends string>(
+  transport: Transport<S>,
+  descriptor: OperationDescriptor,
+  options: CallOptions | undefined,
+  url: URL,
+): Promise<AuthSelection> {
+  if (descriptor.security.length === 0) {
+    return { kind: 'anonymous', triedAlternatives: [] };
+  }
+
+  const perCall = perCallAuth(options);
+  for (const [index, alternative] of descriptor.security.entries()) {
+    if (
+      alternative.length !== 0 &&
+      perCall !== undefined &&
+      alternative.every((use) => Object.hasOwn(perCall, use.name))
+    ) {
+      return {
+        kind: 'selected',
+        members: alternative.map((use) => ({ use, credential: perCall[use.name] })),
+        triedAlternatives: descriptor.security
+          .slice(0, index + 1)
+          .filter((candidate) => candidate.length !== 0)
+          .map(alternativeNames),
+      };
+    }
+  }
+
+  const triedAlternatives: (readonly string[])[] = [];
+  // The anonymous fallback needs to know whether ANY member of ANY credentialed alternative had
+  // a source — including members after a missing one — so a missing member marks the alternative
+  // ineligible without ending the presence scan.
+  let sawAnySource = false;
+  for (const alternative of descriptor.security) {
+    if (alternative.length === 0) {
+      continue;
+    }
+    triedAlternatives.push(alternativeNames(alternative));
+    const sources: AvailableAuthSource[] = [];
+    let eligible = true;
+    for (const use of alternative) {
+      const source = authSource(transport, perCall, use);
+      if (source.kind === 'missing') {
+        eligible = false;
+        continue;
+      }
+      sawAnySource = true;
+      sources.push(source);
+    }
+    if (!eligible) {
+      continue;
+    }
+    const members: SelectedAuthMember[] = [];
+    let satisfied = true;
+    for (const source of sources) {
+      if (source.kind === 'per-call') {
+        members.push({ use: source.use, credential: source.credential });
+        continue;
+      }
+      if (!isAuthProvider(source.provider)) {
+        return {
+          kind: 'failure',
+          result: authFailureResult(
+            `Authentication provider for ${source.use.name} is not callable`,
+            triedAlternatives,
+          ),
+        };
+      }
+      const context: AuthContext = Object.freeze({
+        operationId: descriptor.operationId,
+        scheme: source.use.name,
+        scopes: source.use.scopes,
+        url: url.toString(),
+      });
+      let credential: unknown;
+      try {
+        credential = await source.provider(context);
+      } catch (cause) {
+        return {
+          kind: 'failure',
+          result: providerAuthFailureResult(
+            `Authentication provider for ${source.use.name} failed`,
+            triedAlternatives,
+            cause,
+          ),
+        };
+      }
+      if (credential === null) {
+        satisfied = false;
+        break;
+      }
+      members.push({ use: source.use, credential });
+    }
+    if (satisfied) {
+      return { kind: 'selected', members, triedAlternatives };
+    }
+  }
+
+  const anonymousCount = descriptor.security.filter(
+    (alternative) => alternative.length === 0,
+  ).length;
+  if (anonymousCount > 0 && (!sawAnySource || options?.auth === 'anonymous')) {
+    return { kind: 'anonymous', triedAlternatives };
+  }
+  return {
+    kind: 'failure',
+    result: authFailureResult('No security alternative could be satisfied', triedAlternatives),
+  };
+}
+
+function isBasicCredential(value: unknown): value is BasicCredential {
+  return isRecord(value) &&
+    typeof value.username === 'string' &&
+    typeof value.password === 'string';
+}
+
+function utf8Base64(value: string): string {
+  let bytes = '';
+  for (const byte of UTF8_ENCODER.encode(value)) {
+    bytes += String.fromCharCode(byte);
+  }
+  return btoa(bytes);
+}
+
+function containsBasicControl(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function containsHeaderControl(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 0 || code === 0x0a || code === 0x0d) {
+      return true;
+    }
+  }
+  return false;
+}
+
+type SerializedAuth = {
+  readonly headers: readonly (readonly [string, string])[];
+};
+
+function serializeSelectedAuth(
+  url: URL,
+  members: readonly SelectedAuthMember[],
+): SerializedAuth | string {
+  const headers: (readonly [string, string])[] = [];
+  const query: string[] = [];
+  let occupiedQueryNames: Set<string> | undefined;
+  for (const { use, credential } of members) {
+    if (use.kind === 'bearer' || use.kind === 'oauth2' || use.kind === 'openIdConnect') {
+      if (
+        typeof credential !== 'string' ||
+        !/^[A-Za-z0-9._~+/-]+=*$/u.test(credential)
+      ) {
+        return `Authentication scheme ${use.name} requires an RFC 6750 b64token`;
+      }
+      headers.push(['Authorization', `Bearer ${credential}`]);
+      continue;
+    }
+    if (use.kind === 'basic') {
+      if (!isBasicCredential(credential)) {
+        return `Authentication scheme ${use.name} requires a basic username and password credential`;
+      }
+      const username = credential.username.normalize('NFC');
+      const password = credential.password.normalize('NFC');
+      if (containsBasicControl(username) || containsBasicControl(password)) {
+        return `Authentication scheme ${use.name} basic credential contains a control character`;
+      }
+      if (username.includes(':')) {
+        return `Authentication scheme ${use.name} basic username contains a colon`;
+      }
+      headers.push(['Authorization', `Basic ${utf8Base64(`${username}:${password}`)}`]);
+      continue;
+    }
+    if (use.kind === 'apiKeyHeader') {
+      if (typeof credential !== 'string') {
+        return `Authentication scheme ${use.name} header API key must be a string`;
+      }
+      if (containsHeaderControl(credential)) {
+        return `Authentication scheme ${use.name} header API key contains a control character`;
+      }
+      for (let index = 0; index < credential.length; index += 1) {
+        if (credential.charCodeAt(index) > 0xff) {
+          return `Authentication scheme ${use.name} header API key violates ByteString`;
+        }
+      }
+      if (/^[ \t]|[ \t]$/u.test(credential)) {
+        return `Authentication scheme ${use.name} header API key has edge whitespace`;
+      }
+      if (use.param === undefined) {
+        return `Authentication scheme ${use.name} has no declared header name`;
+      }
+      headers.push([use.param, credential]);
+      continue;
+    }
+    if (use.kind === 'apiKeyQuery') {
+      if (typeof credential !== 'string') {
+        return `Authentication scheme ${use.name} query API key must be a string`;
+      }
+      if (use.param === undefined) {
+        return `Authentication scheme ${use.name} has no declared query name`;
+      }
+      occupiedQueryNames ??= new Set(url.searchParams.keys());
+      if (occupiedQueryNames.has(use.param)) {
+        return `Authentication query parameter ${use.param} is already present`;
+      }
+      query.push(serializeQueryFormExplode(use.param, credential, false));
+      occupiedQueryNames.add(use.param);
+      continue;
+    }
+    if (use.kind === 'apiKeyCookie') {
+      if (credential !== AmbientCookieCredential) {
+        return `Authentication scheme ${use.name} requires the ambient cookie credential`;
+      }
+      continue;
+    }
+    // The kind union is closed at generation time; a hand-built or drifted descriptor must
+    // fail closed rather than silently send the request without this member's credential.
+    return `Authentication scheme ${use.name} uses an unrecognized security scheme kind`;
+  }
+  if (query.length !== 0) {
+    const prefix = url.search.length === 0 ? '' : `${url.search.slice(1)}&`;
+    url.search = `${prefix}${query.join('&')}`;
+  }
+  return { headers };
 }
 
 function isParamPrimitive(value: unknown): value is ParamPrimitive {
@@ -783,6 +1121,7 @@ function mergedHeaders(
   input: Readonly<Record<string, unknown>>,
   options: CallOptions | undefined,
   bodyContentType: string | null,
+  authHeaders: readonly (readonly [string, string])[],
 ): Headers {
   const layers = declarativeHeaders(transport, descriptor, options);
   const headers = new Headers(layers.defaults);
@@ -803,6 +1142,9 @@ function mergedHeaders(
   }
   if (descriptor.accept !== null) {
     headers.set('Accept', descriptor.accept);
+  }
+  for (const [name, value] of authHeaders) {
+    headers.set(name, value);
   }
   assertAllowedHeaders(headers, 'a generated request header is forbidden');
   return headers;
@@ -1183,13 +1525,36 @@ export async function execute<S extends string = never>(
   input: Readonly<Record<string, unknown>>,
   options?: CallOptions,
 ): Promise<ExecutionResult> {
+  let url: URL;
+  try {
+    url = operationUrl(transport, descriptor, input);
+  } catch (cause) {
+    return encodeFailure(cause);
+  }
+
+  const selection = await selectAuth(transport, descriptor, options, url);
+  if (selection.kind === 'failure') {
+    return selection.result;
+  }
+  const members = selection.kind === 'selected' ? selection.members : [];
+  const serializedAuth = serializeSelectedAuth(url, members);
+  if (typeof serializedAuth === 'string') {
+    return authFailureResult(serializedAuth, selection.triedAlternatives);
+  }
+
   let finalRequest: Request;
   let sidecar: Readonly<Record<string, unknown>>;
   let context: OperationContext;
   try {
-    const url = operationUrl(transport, descriptor, input);
     const serialized = await serializeBody(descriptor.body, input.body);
-    const headers = mergedHeaders(transport, descriptor, input, options, serialized.contentType);
+    const headers = mergedHeaders(
+      transport,
+      descriptor,
+      input,
+      options,
+      serialized.contentType,
+      serializedAuth.headers,
+    );
     const splitOptions = fetchOptions(transport, descriptor, options);
     sidecar = splitOptions.sidecar;
     finalRequest = new Request(url, {
@@ -1206,7 +1571,9 @@ export async function execute<S extends string = never>(
       operationId: descriptor.operationId,
       method: descriptor.method,
       url: new URL(finalRequest.url),
-      selectedAuth: null,
+      selectedAuth: selection.kind === 'selected'
+        ? selection.members.map((member) => member.use.name)
+        : null,
     });
   } catch (cause) {
     return encodeFailure(cause);

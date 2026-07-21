@@ -10,8 +10,8 @@ metadata:
     rustc: "rustc 1.97.1 (8bab26f4f 2026-07-14)"
     node: "v24.18.0"
     tsc: "Version 7.0.2"
-  manifestCommit: "a8af3c29d55b81711b57daac944cd3accf34c4be"
-  measuredAt: "2026-07-20T13:37:23Z"
+  manifestCommit: "edf3b8c837edd7635d0fb19a6ffde5b8df8544cb"
+  measuredAt: "2026-07-21T01:01:09Z"
 results:
   - fixture: "github-3.0"
     config: "oasts.yaml"
@@ -112,13 +112,13 @@ results:
   - fixture: "petstore-3.0-client"
     config: "oasts-client.yaml"
     class: "small"
-    coldMs: 1.4042130000000002
-    warmP50MsRound1: 1.2337120000000001
-    warmP50MsRound2: 1.250295
-    warmP50MsGated: 1.250295
-    peakRssBytes: 5701632
-    tscMs: 490.48512500000004
-    outputBytes: 74906
+    coldMs: 1.3684960000000002
+    warmP50MsRound1: 1.3042880000000001
+    warmP50MsRound2: 1.2401630000000001
+    warmP50MsGated: 1.3042880000000001
+    peakRssBytes: 4075520
+    tscMs: 512.077948
+    outputBytes: 87598
     outputFiles: 14
     gates:
       warmP50: true
@@ -144,14 +144,30 @@ results:
   - fixture: "client-showcase-3.1"
     config: "oasts.yaml"
     class: "small"
-    coldMs: 2.08159
-    warmP50MsRound1: 1.923506
-    warmP50MsRound2: 1.993005
-    warmP50MsGated: 1.993005
-    peakRssBytes: 4374528
-    tscMs: 511.69548
-    outputBytes: 102997
+    coldMs: 2.131494
+    warmP50MsRound1: 2.070827
+    warmP50MsRound2: 2.056035
+    warmP50MsGated: 2.070827
+    peakRssBytes: 4370432
+    tscMs: 515.278604
+    outputBytes: 116886
     outputFiles: 26
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "auth-showcase-3.1"
+    config: "oasts.yaml"
+    class: "small"
+    coldMs: 1.876911
+    warmP50MsRound1: 1.801078
+    warmP50MsRound2: 1.821453
+    warmP50MsGated: 1.821453
+    peakRssBytes: 4075520
+    tscMs: 600.168181
+    outputBytes: 104439
+    outputFiles: 22
     gates:
       warmP50: true
       peakRss: true

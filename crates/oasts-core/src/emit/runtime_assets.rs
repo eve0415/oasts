@@ -264,13 +264,15 @@ fn render_serialize(
     if transport_dependencies {
         // transport.ts imports these serialize helpers unconditionally, so they must
         // survive helper subsetting whenever transport is emitted — including cte-check,
-        // which the caller-supplied Content-Transfer-Encoding validation depends on.
+        // which the caller-supplied Content-Transfer-Encoding validation depends on, and
+        // query-form-explode, which auth serialization uses to place an apiKey query credential.
         selected.extend(
             [
                 "cte-check",
                 "form-urlencoded-body",
                 "media-canonical",
                 "multipart",
+                "query-form-explode",
             ]
             .map(str::to_owned),
         );
@@ -625,6 +627,11 @@ mod tests {
         // transport.ts imports checkCteDomain unconditionally, so cte-check must survive
         // even when no descriptor references a serialize helper.
         assert!(content(&core, "serialize.ts").contains("export function checkCteDomain"));
+        // transport.ts's auth serialization imports serializeQueryFormExplode unconditionally,
+        // so query-form-explode must survive even when no descriptor references it.
+        assert!(
+            content(&core, "serialize.ts").contains("export function serializeQueryFormExplode")
+        );
         assert!(!content(&core, "serialize.ts").contains("export function serializePathSimple"));
     }
 

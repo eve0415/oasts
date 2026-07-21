@@ -3,12 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::client_model::{
-    BaseUrlPlan, BodyPlan, ClientModel, DecoderClass, FieldSerializationPlan, FormFieldPlan,
-    HeaderInputRequirement, HelperId, OperationPlan, PartMediaPlan, PayloadDisposition,
-    ResponseMatchKind, ResponsePlan,
+    AuthAlternative, AuthKind, AuthSchemeUse, BaseUrlPlan, BodyPlan, ClientModel, DecoderClass,
+    FieldSerializationPlan, FormFieldPlan, HeaderInputRequirement, HelperId, OperationPlan,
+    PartMediaPlan, PayloadDisposition, ResponseMatchKind, ResponsePlan,
 };
 use crate::config::{
-    CacheMode, CredentialsMode, DocumentationConfig, FetchDefaults, RedirectMode,
+    AuthEnforcement, CacheMode, CredentialsMode, DocumentationConfig, FetchDefaults, RedirectMode,
     ReferrerPolicyValue, RequestModeValue,
 };
 use crate::ir::{
@@ -209,6 +209,14 @@ fn emit_operation(
     }
 
     let extension = import_extension(model);
+    let auth_enforcement = model
+        .config
+        .client
+        .as_ref()
+        .expect("client emission requires client config")
+        .auth_enforcement;
+    let (imports_basic_credential, imports_cookie_credential) =
+        call_args_credentials(plan, auth_enforcement);
     let runtime_directory = &model.config.emit.runtime_directory;
     let unchecked_response = model
         .config
@@ -253,9 +261,14 @@ fn emit_operation(
         )));
         output.push_str(";\n");
     }
-    output.push_str(
-        "import { execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport } from ",
-    );
+    output.push_str("import { execute, executeOrThrow");
+    if imports_cookie_credential {
+        output.push_str(", type AmbientCookieCredential");
+    }
+    if imports_basic_credential {
+        output.push_str(", type BasicCredential");
+    }
+    output.push_str(", type CallOptions, type OperationDescriptor, type Transport } from ");
     output.push_str(&render_ts_string(&format!(
         "../../{runtime_directory}/transport{extension}"
     )));
@@ -286,6 +299,9 @@ fn emit_operation(
     write_result_type(&mut output, plan, &stem);
     output.push('\n');
 
+    output.push_str(&render_call_args(&plan.auth_plan, auth_enforcement, &stem));
+    output.push('\n');
+
     write_source_metadata(&mut output, &operation.source, 0);
     write_descriptor(&mut output, model, operation, plan, allocated_name);
     output.push('\n');
@@ -300,13 +316,15 @@ fn emit_operation(
     );
     output.push_str("export async function ");
     output.push_str(allocated_name);
-    output.push_str("(transport: Transport, input: ");
+    output.push_str("<S extends string = never>(transport: Transport<S>, input: ");
     output.push_str(&stem);
-    output.push_str("Input, options?: CallOptions): Promise<");
+    output.push_str("Input, ...args: ");
+    output.push_str(&stem);
+    output.push_str("CallArgs<S>): Promise<");
     output.push_str(&stem);
     output.push_str("Result> {\n  return execute<");
     output.push_str(&stem);
-    output.push_str("Result>(transport, descriptor, input, options);\n}\n\n");
+    output.push_str("Result>(transport, descriptor, input, args[0]);\n}\n\n");
 
     write_source_metadata(&mut output, &operation.source, 0);
     write_client_operation_tsdoc(
@@ -318,13 +336,15 @@ fn emit_operation(
     );
     output.push_str("export async function ");
     output.push_str(allocated_name);
-    output.push_str("OrThrow(transport: Transport, input: ");
+    output.push_str("OrThrow<S extends string = never>(transport: Transport<S>, input: ");
     output.push_str(&stem);
-    output.push_str("Input, options?: CallOptions): Promise<");
+    output.push_str("Input, ...args: ");
+    output.push_str(&stem);
+    output.push_str("CallArgs<S>): Promise<");
     output.push_str(&successful_payload_union(plan, &stem));
     output.push_str("> {\n  return executeOrThrow<");
     output.push_str(&stem);
-    output.push_str("Result>(transport, descriptor, input, options);\n}\n");
+    output.push_str("Result>(transport, descriptor, input, args[0]);\n}\n");
     output
 }
 
@@ -835,7 +855,9 @@ fn write_descriptor(
             .collect::<Vec<_>>()
             .join(", "),
     );
-    output.push_str("],\n  responses: [\n");
+    output.push_str("],\n  security: ");
+    output.push_str(&security_field(&plan.auth_plan));
+    output.push_str(",\n  responses: [\n");
     for response in &plan.response_table {
         output.push_str("    { match: ");
         output.push_str(&render_ts_string(&response.match_key));
@@ -895,6 +917,250 @@ fn write_descriptor(
             .fetch_options,
     );
     output.push_str(",\n};\n");
+}
+
+/// Whether the alias is the unconditional `[options?: CallOptions]` form: `runtime` mode, an
+/// unsecured operation, or an anonymous alternative present. The complement drives both the
+/// conditional alias emission and the extra runtime-type imports.
+fn call_args_is_unconditional(auth_plan: &[AuthAlternative], enforcement: AuthEnforcement) -> bool {
+    enforcement != AuthEnforcement::Types
+        || auth_plan.is_empty()
+        || auth_plan.iter().any(|alternative| alternative.is_empty())
+}
+
+/// The `<Op>CallArgs<S>` alias plus any helper type it needs, terminated by a newline. In `types`
+/// mode a secured operation with no anonymous alternative narrows the trailing options element by
+/// whether `S` proves an alternative satisfied; every other case — `runtime` mode, unsecured, or an
+/// anonymous alternative present — leaves the options element optional.
+///
+/// The satisfied fall-throughs and the widened branch resolve to a NAMED tuple, never an inlined
+/// one: TypeScript will not accept a call argument against the deferred conditional under an
+/// unconstrained `S` unless those outcomes share a named alias. A pure function of the plan for
+/// byte-identical reruns.
+fn render_call_args(
+    auth_plan: &[AuthAlternative],
+    enforcement: AuthEnforcement,
+    stem: &str,
+) -> String {
+    if call_args_is_unconditional(auth_plan, enforcement) {
+        return format!(
+            "export type {stem}CallArgs<S extends string> = [options?: CallOptions];\n"
+        );
+    }
+    let widened_tuple = auth_options_tuple(auth_plan, full_rec);
+    let mut out = String::new();
+    let widened_branch;
+    let required_terminal;
+    if auth_plan.iter().all(|alternative| alternative.len() == 1) {
+        // Single-member alternatives make the missing record identical to the full record, so one
+        // S-independent `Req` tuple serves both the widened branch and every satisfied fall-through.
+        out.push_str(&format!("type Req = {widened_tuple};\n"));
+        widened_branch = "Req".to_owned();
+        required_terminal = "Req".to_owned();
+    } else {
+        // A multi-member alternative makes the missing record depend on `S`, so it is factored into
+        // a parameterized `Missing<S>`; the widened branch stays the concrete full record.
+        let missing = auth_record_union(auth_plan, missing_rec);
+        out.push_str(&format!("type Missing<S extends string> = {missing};\n"));
+        widened_branch = widened_tuple;
+        required_terminal = "[options: CallOptions & { auth: Missing<S> }]".to_owned();
+    }
+    let chain = call_args_chain(auth_plan, 0, &required_terminal);
+    out.push_str(&format!(
+        "export type {stem}CallArgs<S extends string> = [string] extends [S] ? {widened_branch} : {chain};\n"
+    ));
+    out
+}
+
+/// `[options: CallOptions & { auth: <render(A1)> | <render(A2)> | ... }]` over the alternatives.
+fn auth_options_tuple(
+    auth_plan: &[AuthAlternative],
+    render: fn(&[AuthSchemeUse]) -> String,
+) -> String {
+    format!(
+        "[options: CallOptions & {{ auth: {} }}]",
+        auth_record_union(auth_plan, render)
+    )
+}
+
+/// `<render(A1)> | <render(A2)> | ...` — the per-alternative auth record union.
+fn auth_record_union(
+    auth_plan: &[AuthAlternative],
+    render: fn(&[AuthSchemeUse]) -> String,
+) -> String {
+    auth_plan
+        .iter()
+        .map(|alternative| render(alternative))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Every member required: `{ readonly <m1>: <Cred1>; readonly <m2>: <Cred2>; ... }`.
+fn full_rec(alternative: &[AuthSchemeUse]) -> String {
+    let properties = alternative
+        .iter()
+        .map(|scheme| {
+            format!(
+                "readonly {}: {}",
+                render_property_key(&scheme.name),
+                member_credential(&scheme.kind)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{{ {properties} }}")
+}
+
+/// The minimal record `S` has not yet proven. A single member stays concrete (`full_rec`) — a
+/// nested conditional there breaks assignability under an unconstrained `S`. Multiple members
+/// intersect a per-member conditional so each name already in `S` becomes optional.
+fn missing_rec(alternative: &[AuthSchemeUse]) -> String {
+    if alternative.len() == 1 {
+        return full_rec(alternative);
+    }
+    alternative
+        .iter()
+        .map(|scheme| {
+            let credential = member_credential(&scheme.kind);
+            format!(
+                "([{literal} & S] extends [never] ? {{ readonly {key}: {credential} }} : {{ readonly {key}?: {credential} }})",
+                literal = render_ts_string(&scheme.name),
+                key = render_property_key(&scheme.name),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" & ")
+}
+
+/// The credential type a caller supplies for one scheme in the per-call `auth` record.
+fn member_credential(kind: &AuthKind) -> &'static str {
+    match kind {
+        AuthKind::Basic => "BasicCredential",
+        AuthKind::ApiKeyCookie { .. } => "typeof AmbientCookieCredential",
+        AuthKind::Bearer
+        | AuthKind::ApiKeyHeader { .. }
+        | AuthKind::ApiKeyQuery { .. }
+        | AuthKind::OAuth2
+        | AuthKind::OpenIdConnect => "string",
+    }
+}
+
+/// Fold the alternatives first-to-last: each unproven member of `A[index]` falls through to the
+/// check of `A[index + 1]`, an all-proven alternative yields optional options, and the final
+/// fall-through past the last alternative is `required`.
+fn call_args_chain(auth_plan: &[AuthAlternative], index: usize, required: &str) -> String {
+    if index == auth_plan.len() {
+        return required.to_owned();
+    }
+    let next = call_args_chain(auth_plan, index + 1, required);
+    let next_is_conditional = index + 1 < auth_plan.len();
+    call_args_member_chain(&auth_plan[index], 0, &next, next_is_conditional)
+}
+
+fn call_args_member_chain(
+    members: &[AuthSchemeUse],
+    index: usize,
+    next: &str,
+    next_is_conditional: bool,
+) -> String {
+    if index == members.len() {
+        return "[options?: CallOptions]".to_owned();
+    }
+    let rest = call_args_member_chain(members, index + 1, next, next_is_conditional);
+    let rendered_next = if next_is_conditional {
+        format!("({next})")
+    } else {
+        next.to_owned()
+    };
+    format!(
+        "[{} & S] extends [never] ? {rendered_next} : {rest}",
+        render_ts_string(&members[index].name),
+    )
+}
+
+/// Whether this module's `CallArgs` alias references the `BasicCredential` and/or
+/// `AmbientCookieCredential` runtime types, deciding which runtime imports the module needs.
+fn call_args_credentials(plan: &OperationPlan, enforcement: AuthEnforcement) -> (bool, bool) {
+    if call_args_is_unconditional(&plan.auth_plan, enforcement) {
+        return (false, false);
+    }
+    let mut basic = false;
+    let mut cookie = false;
+    for alternative in &plan.auth_plan {
+        for scheme in alternative {
+            if matches!(scheme.kind, AuthKind::Basic) {
+                basic = true;
+            }
+            if matches!(scheme.kind, AuthKind::ApiKeyCookie { .. }) {
+                cookie = true;
+            }
+        }
+    }
+    (basic, cookie)
+}
+
+/// The descriptor `security` value: `[]` when unsecured, else a multi-line array whose entries are
+/// the alternatives — `[]` for the anonymous option, else the ordered member objects.
+fn security_field(auth_plan: &[AuthAlternative]) -> String {
+    if auth_plan.is_empty() {
+        return "[]".to_owned();
+    }
+    let mut output = String::from("[\n");
+    for alternative in auth_plan {
+        output.push_str("    [");
+        let members = alternative
+            .iter()
+            .map(render_security_member)
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&members);
+        output.push_str("],\n");
+    }
+    output.push_str("  ]");
+    output
+}
+
+fn render_security_member(scheme: &AuthSchemeUse) -> String {
+    let mut member = String::from("{ name: ");
+    member.push_str(&render_ts_string(&scheme.name));
+    member.push_str(", kind: ");
+    member.push_str(&render_ts_string(auth_kind_tag(&scheme.kind)));
+    if let Some(param) = auth_kind_param(&scheme.kind) {
+        member.push_str(", param: ");
+        member.push_str(&render_ts_string(param));
+    }
+    member.push_str(", scopes: [");
+    member.push_str(
+        &scheme
+            .scopes
+            .iter()
+            .map(|scope| render_ts_string(scope))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    member.push_str("] }");
+    member
+}
+
+fn auth_kind_tag(kind: &AuthKind) -> &'static str {
+    match kind {
+        AuthKind::Basic => "basic",
+        AuthKind::Bearer => "bearer",
+        AuthKind::ApiKeyHeader { .. } => "apiKeyHeader",
+        AuthKind::ApiKeyQuery { .. } => "apiKeyQuery",
+        AuthKind::ApiKeyCookie { .. } => "apiKeyCookie",
+        AuthKind::OAuth2 => "oauth2",
+        AuthKind::OpenIdConnect => "openIdConnect",
+    }
+}
+
+fn auth_kind_param(kind: &AuthKind) -> Option<&str> {
+    match kind {
+        AuthKind::ApiKeyHeader { name }
+        | AuthKind::ApiKeyQuery { name }
+        | AuthKind::ApiKeyCookie { name } => Some(name),
+        AuthKind::Basic | AuthKind::Bearer | AuthKind::OAuth2 | AuthKind::OpenIdConnect => None,
+    }
 }
 
 fn write_body_descriptor(
@@ -1431,7 +1697,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ GetPetResponse200, GetPetResponseDefault }} from \"../../types/operations/getpet.js\";\nimport type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ serializePathSimple, serializeQueryFormExplode }} from \"../../runtime/serialize.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetInput = {{\n  /**\n   * The pet identifier.\n   */\n  petId: string;\n  /**\n   * The result limit.\n   */\n  limit?: number;\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetResult =\n  | {{ kind: \"response\"; ok: true; match: \"200\"; status: 200; data: GetPetResponse200; meta: ResponseMeta }}\n  | {{ kind: \"response\"; ok: true; match: \"default\"; status: number; data: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ kind: \"response\"; ok: false; match: \"default\"; status: number; error: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"200\" | \"default\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"getPet\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"pets\" }}],\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"param\", name: \"petId\" }}],\n  ],\n  params: [\n    {{ name: \"petId\", location: \"path\", required: true, serialize: serializePathSimple, allowReserved: false }},\n    {{ name: \"limit\", location: \"query\", required: false, serialize: serializeQueryFormExplode, allowReserved: false }},\n  ],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n    {{ match: \"default\", kind: \"default\", status: null, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function getPet(transport: Transport, input: GetPetInput, options?: CallOptions): Promise<GetPetResult> {{\n  return execute<GetPetResult>(transport, descriptor, input, options);\n}}\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns The successful response data.\n */\nexport async function getPetOrThrow(transport: Transport, input: GetPetInput, options?: CallOptions): Promise<GetPetResponse200 | GetPetResponseDefault> {{\n  return executeOrThrow<GetPetResult>(transport, descriptor, input, options);\n}}\n"
+            "{HEADER}import type {{ GetPetResponse200, GetPetResponseDefault }} from \"../../types/operations/getpet.js\";\nimport type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ serializePathSimple, serializeQueryFormExplode }} from \"../../runtime/serialize.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetInput = {{\n  /**\n   * The pet identifier.\n   */\n  petId: string;\n  /**\n   * The result limit.\n   */\n  limit?: number;\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetResult =\n  | {{ kind: \"response\"; ok: true; match: \"200\"; status: 200; data: GetPetResponse200; meta: ResponseMeta }}\n  | {{ kind: \"response\"; ok: true; match: \"default\"; status: number; data: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ kind: \"response\"; ok: false; match: \"default\"; status: number; error: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"200\" | \"default\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type GetPetCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"getPet\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"pets\" }}],\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"param\", name: \"petId\" }}],\n  ],\n  params: [\n    {{ name: \"petId\", location: \"path\", required: true, serialize: serializePathSimple, allowReserved: false }},\n    {{ name: \"limit\", location: \"query\", required: false, serialize: serializeQueryFormExplode, allowReserved: false }},\n  ],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n    {{ match: \"default\", kind: \"default\", status: null, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function getPet<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<GetPetResult> {{\n  return execute<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns The successful response data.\n */\nexport async function getPetOrThrow<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<GetPetResponse200 | GetPetResponseDefault> {{\n  return executeOrThrow<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation_with_documentation(document, "getpet", true);
         assert_eq!(actual, expected);
@@ -1472,7 +1738,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetInput = {{\n  body: {{\n    meta: {{ body: {{\n      tag?: string;\n    }}; contentType: \"application/json\" | \"application/cbor\" }};\n    title: string;\n    file: Blob | File;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetResult =\n  | {{ kind: \"response\"; ok: true; match: \"204\"; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"204\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadAsset\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"uploads\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"multipart\", fields: [\n    {{ name: \"meta\", required: true, repeated: false, wrapper: true, payload: \"json\", contentType: {{ kind: \"selected\", admitted: [\"application/json\", \"application/cbor\"] }}, filename: false }},\n    {{ name: \"title\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"text/plain\" }}, filename: false }},\n    {{ name: \"file\", required: true, repeated: false, wrapper: false, payload: \"binary\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: true }},\n  ] }},\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function uploadAsset(transport: Transport, input: UploadAssetInput, options?: CallOptions): Promise<UploadAssetResult> {{\n  return execute<UploadAssetResult>(transport, descriptor, input, options);\n}}\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function uploadAssetOrThrow(transport: Transport, input: UploadAssetInput, options?: CallOptions): Promise<undefined> {{\n  return executeOrThrow<UploadAssetResult>(transport, descriptor, input, options);\n}}\n"
+            "{HEADER}import type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetInput = {{\n  body: {{\n    meta: {{ body: {{\n      tag?: string;\n    }}; contentType: \"application/json\" | \"application/cbor\" }};\n    title: string;\n    file: Blob | File;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetResult =\n  | {{ kind: \"response\"; ok: true; match: \"204\"; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"204\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type UploadAssetCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadAsset\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"uploads\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"multipart\", fields: [\n    {{ name: \"meta\", required: true, repeated: false, wrapper: true, payload: \"json\", contentType: {{ kind: \"selected\", admitted: [\"application/json\", \"application/cbor\"] }}, filename: false }},\n    {{ name: \"title\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"text/plain\" }}, filename: false }},\n    {{ name: \"file\", required: true, repeated: false, wrapper: false, payload: \"binary\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: true }},\n  ] }},\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function uploadAsset<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<UploadAssetResult> {{\n  return execute<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function uploadAssetOrThrow<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<undefined> {{\n  return executeOrThrow<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "uploadasset");
         assert_eq!(actual, expected);
@@ -1503,7 +1769,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ SendMessageRequest, SendMessageResponse200 }} from \"../../types/operations/sendmessage.js\";\nimport type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageInput = {{\n  body: {{ contentType: \"application/json\"; body: SendMessageRequest[\"body\"] }} | {{ contentType: \"text/plain\"; body: string }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageResult =\n  | {{ kind: \"response\"; ok: true; match: \"200\"; status: 200; data: SendMessageResponse200; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"200\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"sendMessage\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"messages\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"content-discriminated\", arms: [\n    [\"application/json\", {{ kind: \"json\", contentType: \"application/json\" }}],\n    [\"text/plain\", {{ kind: \"text\", contentType: \"text/plain\" }}],\n  ] }},\n  accept: \"text/plain\",\n  credentialHeaders: [\"authorization\"],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"text/plain\", \"text\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function sendMessage(transport: Transport, input: SendMessageInput, options?: CallOptions): Promise<SendMessageResult> {{\n  return execute<SendMessageResult>(transport, descriptor, input, options);\n}}\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function sendMessageOrThrow(transport: Transport, input: SendMessageInput, options?: CallOptions): Promise<SendMessageResponse200> {{\n  return executeOrThrow<SendMessageResult>(transport, descriptor, input, options);\n}}\n"
+            "{HEADER}import type {{ SendMessageRequest, SendMessageResponse200 }} from \"../../types/operations/sendmessage.js\";\nimport type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageInput = {{\n  body: {{ contentType: \"application/json\"; body: SendMessageRequest[\"body\"] }} | {{ contentType: \"text/plain\"; body: string }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageResult =\n  | {{ kind: \"response\"; ok: true; match: \"200\"; status: 200; data: SendMessageResponse200; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"200\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type SendMessageCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"sendMessage\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"messages\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"content-discriminated\", arms: [\n    [\"application/json\", {{ kind: \"json\", contentType: \"application/json\" }}],\n    [\"text/plain\", {{ kind: \"text\", contentType: \"text/plain\" }}],\n  ] }},\n  accept: \"text/plain\",\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"text/plain\", \"text\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function sendMessage<S extends string = never>(transport: Transport<S>, input: SendMessageInput, ...args: SendMessageCallArgs<S>): Promise<SendMessageResult> {{\n  return execute<SendMessageResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function sendMessageOrThrow<S extends string = never>(transport: Transport<S>, input: SendMessageInput, ...args: SendMessageCallArgs<S>): Promise<SendMessageResponse200> {{\n  return executeOrThrow<SendMessageResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "sendmessage");
         assert_eq!(actual, expected);
@@ -2192,7 +2458,7 @@ mod tests {
             response_table: responses,
             accept: None,
             base_url: BaseUrlPlan::Runtime,
-            effective_security: Vec::new(),
+            auth_plan: Vec::new(),
             credential_headers: Vec::new(),
         };
         let mut output = String::new();
@@ -2233,7 +2499,7 @@ mod tests {
             )],
             accept: None,
             base_url: BaseUrlPlan::Runtime,
-            effective_security: Vec::new(),
+            auth_plan: Vec::new(),
             credential_headers: Vec::new(),
         };
         let mut actual = String::new();
@@ -2606,5 +2872,282 @@ mod tests {
         assert!(output.contains("allowReserved: true"));
         assert!(output.contains("bodyless: true"));
         assert!(output.contains("hasContentTypeDiscriminant: true"));
+    }
+
+    fn auth_scheme(name: &str, kind: AuthKind, scopes: &[&str]) -> AuthSchemeUse {
+        AuthSchemeUse {
+            name: name.to_owned(),
+            kind,
+            scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn security_field_renders_representative_plans() {
+        assert_eq!(security_field(&[]), "[]");
+
+        let or_with_scopes: Vec<AuthAlternative> = vec![
+            vec![auth_scheme(
+                "headerKey",
+                AuthKind::ApiKeyHeader {
+                    name: "X-Api-Key".to_owned(),
+                },
+                &[],
+            )],
+            vec![auth_scheme("oauthFlow", AuthKind::OAuth2, &["scope.a"])],
+        ];
+        assert_eq!(
+            security_field(&or_with_scopes),
+            "[\n    [{ name: \"headerKey\", kind: \"apiKeyHeader\", param: \"X-Api-Key\", scopes: [] }],\n    [{ name: \"oauthFlow\", kind: \"oauth2\", scopes: [\"scope.a\"] }],\n  ]"
+        );
+
+        let and_plan: Vec<AuthAlternative> = vec![vec![
+            auth_scheme("basicAuth", AuthKind::Basic, &[]),
+            auth_scheme(
+                "headerKey",
+                AuthKind::ApiKeyHeader {
+                    name: "X-Api-Key".to_owned(),
+                },
+                &[],
+            ),
+        ]];
+        assert_eq!(
+            security_field(&and_plan),
+            "[\n    [{ name: \"basicAuth\", kind: \"basic\", scopes: [] }, { name: \"headerKey\", kind: \"apiKeyHeader\", param: \"X-Api-Key\", scopes: [] }],\n  ]"
+        );
+
+        let anonymous_included: Vec<AuthAlternative> = vec![
+            vec![auth_scheme("bearerAuth", AuthKind::Bearer, &[])],
+            vec![],
+        ];
+        assert_eq!(
+            security_field(&anonymous_included),
+            "[\n    [{ name: \"bearerAuth\", kind: \"bearer\", scopes: [] }],\n    [],\n  ]"
+        );
+    }
+
+    #[test]
+    fn call_args_alias_types_mode() {
+        // Single-member single-alternative: one named, S-independent `Req` tuple.
+        let single_member: Vec<AuthAlternative> =
+            vec![vec![auth_scheme("bearerAuth", AuthKind::Bearer, &[])]];
+        assert_eq!(
+            render_call_args(&single_member, AuthEnforcement::Types, "InheritedRootOnly"),
+            "type Req = [options: CallOptions & { auth: { readonly bearerAuth: string } }];\nexport type InheritedRootOnlyCallArgs<S extends string> = [string] extends [S] ? Req : [\"bearerAuth\" & S] extends [never] ? Req : [options?: CallOptions];\n"
+        );
+
+        // Multi-alternative single-member each: `Req` is the union of both records; the chain nests
+        // the second alternative's check in parentheses.
+        let or_plan: Vec<AuthAlternative> = vec![
+            vec![auth_scheme(
+                "headerKey",
+                AuthKind::ApiKeyHeader {
+                    name: "X-Api-Key".to_owned(),
+                },
+                &[],
+            )],
+            vec![auth_scheme("oauthFlow", AuthKind::OAuth2, &["scope.a"])],
+        ];
+        assert_eq!(
+            render_call_args(&or_plan, AuthEnforcement::Types, "OrHeaderOauth"),
+            "type Req = [options: CallOptions & { auth: { readonly headerKey: string } | { readonly oauthFlow: string } }];\nexport type OrHeaderOauthCallArgs<S extends string> = [string] extends [S] ? Req : [\"headerKey\" & S] extends [never] ? ([\"oauthFlow\" & S] extends [never] ? Req : [options?: CallOptions]) : [options?: CallOptions];\n"
+        );
+
+        // AND (multi-member): the missing record depends on S, factored into `Missing<S>`.
+        let and_plan: Vec<AuthAlternative> = vec![vec![
+            auth_scheme("basicAuth", AuthKind::Basic, &[]),
+            auth_scheme(
+                "headerKey",
+                AuthKind::ApiKeyHeader {
+                    name: "X-Api-Key".to_owned(),
+                },
+                &[],
+            ),
+        ]];
+        assert_eq!(
+            render_call_args(&and_plan, AuthEnforcement::Types, "AndBasicHeader"),
+            "type Missing<S extends string> = ([\"basicAuth\" & S] extends [never] ? { readonly basicAuth: BasicCredential } : { readonly basicAuth?: BasicCredential }) & ([\"headerKey\" & S] extends [never] ? { readonly headerKey: string } : { readonly headerKey?: string });\nexport type AndBasicHeaderCallArgs<S extends string> = [string] extends [S] ? [options: CallOptions & { auth: { readonly basicAuth: BasicCredential; readonly headerKey: string } }] : [\"basicAuth\" & S] extends [never] ? [options: CallOptions & { auth: Missing<S> }] : [\"headerKey\" & S] extends [never] ? [options: CallOptions & { auth: Missing<S> }] : [options?: CallOptions];\n"
+        );
+
+        // Anonymous alternative present: options always optional.
+        let anonymous_included: Vec<AuthAlternative> = vec![
+            vec![auth_scheme("bearerAuth", AuthKind::Bearer, &[])],
+            vec![],
+        ];
+        assert_eq!(
+            render_call_args(
+                &anonymous_included,
+                AuthEnforcement::Types,
+                "AnonymousIncluded"
+            ),
+            "export type AnonymousIncludedCallArgs<S extends string> = [options?: CallOptions];\n"
+        );
+    }
+
+    #[test]
+    fn call_args_mixes_single_and_multi_member_alternatives() {
+        // A single-member alternative alongside an AND alternative: the single member's missing
+        // record stays the concrete full record inside the `Missing<S>` union, and the chain
+        // parenthesizes the second alternative's member checks.
+        let mixed: Vec<AuthAlternative> = vec![
+            vec![auth_scheme(
+                "cookieKey",
+                AuthKind::ApiKeyCookie {
+                    name: "session".to_owned(),
+                },
+                &[],
+            )],
+            vec![
+                auth_scheme("basicAuth", AuthKind::Basic, &[]),
+                auth_scheme(
+                    "queryKey",
+                    AuthKind::ApiKeyQuery {
+                        name: "api_key".to_owned(),
+                    },
+                    &[],
+                ),
+            ],
+        ];
+        assert_eq!(
+            render_call_args(&mixed, AuthEnforcement::Types, "Mixed"),
+            "type Missing<S extends string> = { readonly cookieKey: typeof AmbientCookieCredential } | ([\"basicAuth\" & S] extends [never] ? { readonly basicAuth: BasicCredential } : { readonly basicAuth?: BasicCredential }) & ([\"queryKey\" & S] extends [never] ? { readonly queryKey: string } : { readonly queryKey?: string });\nexport type MixedCallArgs<S extends string> = [string] extends [S] ? [options: CallOptions & { auth: { readonly cookieKey: typeof AmbientCookieCredential } | { readonly basicAuth: BasicCredential; readonly queryKey: string } }] : [\"cookieKey\" & S] extends [never] ? ([\"basicAuth\" & S] extends [never] ? [options: CallOptions & { auth: Missing<S> }] : [\"queryKey\" & S] extends [never] ? [options: CallOptions & { auth: Missing<S> }] : [options?: CallOptions]) : [options?: CallOptions];\n"
+        );
+    }
+
+    #[test]
+    fn security_field_covers_every_scheme_kind() {
+        let plan: Vec<AuthAlternative> = vec![
+            vec![
+                auth_scheme("basicAuth", AuthKind::Basic, &[]),
+                auth_scheme("bearerAuth", AuthKind::Bearer, &[]),
+            ],
+            vec![
+                auth_scheme(
+                    "headerKey",
+                    AuthKind::ApiKeyHeader {
+                        name: "X-Api-Key".to_owned(),
+                    },
+                    &[],
+                ),
+                auth_scheme(
+                    "queryKey",
+                    AuthKind::ApiKeyQuery {
+                        name: "api_key".to_owned(),
+                    },
+                    &[],
+                ),
+                auth_scheme(
+                    "cookieKey",
+                    AuthKind::ApiKeyCookie {
+                        name: "session".to_owned(),
+                    },
+                    &[],
+                ),
+            ],
+            vec![auth_scheme("oauthFlow", AuthKind::OAuth2, &["scope.a"])],
+            vec![auth_scheme("oidc", AuthKind::OpenIdConnect, &[])],
+            vec![],
+        ];
+        assert_eq!(
+            security_field(&plan),
+            "[\n    [{ name: \"basicAuth\", kind: \"basic\", scopes: [] }, { name: \"bearerAuth\", kind: \"bearer\", scopes: [] }],\n    [{ name: \"headerKey\", kind: \"apiKeyHeader\", param: \"X-Api-Key\", scopes: [] }, { name: \"queryKey\", kind: \"apiKeyQuery\", param: \"api_key\", scopes: [] }, { name: \"cookieKey\", kind: \"apiKeyCookie\", param: \"session\", scopes: [] }],\n    [{ name: \"oauthFlow\", kind: \"oauth2\", scopes: [\"scope.a\"] }],\n    [{ name: \"oidc\", kind: \"openIdConnect\", scopes: [] }],\n    [],\n  ]"
+        );
+    }
+
+    #[test]
+    fn basic_and_cookie_schemes_extend_the_runtime_import() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "components": {
+                "securitySchemes": {
+                    "basicAuth": { "type": "http", "scheme": "basic" },
+                    "cookieKey": { "type": "apiKey", "in": "cookie", "name": "session" }
+                }
+            },
+            "paths": {
+                "/ping": {
+                    "get": {
+                        "operationId": "ping",
+                        "security": [{ "basicAuth": [], "cookieKey": [] }],
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": { "application/json": { "schema": { "type": "object" } } }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "ping");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(actual.contains(
+            "import { execute, executeOrThrow, type AmbientCookieCredential, type BasicCredential, type CallOptions, type OperationDescriptor, type Transport } from"
+        ));
+    }
+
+    #[test]
+    fn call_args_quotes_non_identifier_scheme_names() {
+        // Security scheme names are arbitrary component-map keys: a kebab-case name must emit a
+        // quoted property key and a correctly escaped string-literal type, in both the concrete
+        // and the per-member conditional record shapes.
+        let kebab: Vec<AuthAlternative> = vec![vec![auth_scheme("api-key", AuthKind::Bearer, &[])]];
+        assert_eq!(
+            render_call_args(&kebab, AuthEnforcement::Types, "Kebab"),
+            "type Req = [options: CallOptions & { auth: { readonly \"api-key\": string } }];\nexport type KebabCallArgs<S extends string> = [string] extends [S] ? Req : [\"api-key\" & S] extends [never] ? Req : [options?: CallOptions];\n"
+        );
+
+        let mixed_and: Vec<AuthAlternative> = vec![vec![
+            auth_scheme("api-key", AuthKind::Bearer, &[]),
+            auth_scheme("plain", AuthKind::Basic, &[]),
+        ]];
+        assert_eq!(
+            render_call_args(&mixed_and, AuthEnforcement::Types, "KebabAnd"),
+            "type Missing<S extends string> = ([\"api-key\" & S] extends [never] ? { readonly \"api-key\": string } : { readonly \"api-key\"?: string }) & ([\"plain\" & S] extends [never] ? { readonly plain: BasicCredential } : { readonly plain?: BasicCredential });\nexport type KebabAndCallArgs<S extends string> = [string] extends [S] ? [options: CallOptions & { auth: { readonly \"api-key\": string; readonly plain: BasicCredential } }] : [\"api-key\" & S] extends [never] ? [options: CallOptions & { auth: Missing<S> }] : [\"plain\" & S] extends [never] ? [options: CallOptions & { auth: Missing<S> }] : [options?: CallOptions];\n"
+        );
+    }
+
+    #[test]
+    fn call_args_alias_runtime_mode_is_unconditional() {
+        let secured: Vec<AuthAlternative> =
+            vec![vec![auth_scheme("bearerAuth", AuthKind::Bearer, &[])]];
+        assert_eq!(
+            render_call_args(&secured, AuthEnforcement::Runtime, "InheritedRootOnly"),
+            "export type InheritedRootOnlyCallArgs<S extends string> = [options?: CallOptions];\n"
+        );
+    }
+
+    #[test]
+    fn generic_wrapper_signature_threads_transport_and_call_args() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/ping": {
+                    "get": {
+                        "operationId": "ping",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": { "application/json": { "schema": { "type": "object" } } }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "ping");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(actual.contains(
+            "export async function ping<S extends string = never>(transport: Transport<S>, input: PingInput, ...args: PingCallArgs<S>): Promise<PingResult> {\n  return execute<PingResult>(transport, descriptor, input, args[0]);\n}"
+        ));
+        assert!(actual.contains(
+            "export async function pingOrThrow<S extends string = never>(transport: Transport<S>, input: PingInput, ...args: PingCallArgs<S>): Promise<"
+        ));
+        assert!(
+            actual
+                .contains("export type PingCallArgs<S extends string> = [options?: CallOptions];")
+        );
     }
 }

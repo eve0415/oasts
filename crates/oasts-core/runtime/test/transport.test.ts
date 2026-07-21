@@ -20,7 +20,7 @@ test("transport declarations preserve frozen source blocks", () => {
 describe("createTransport", () => {
   test("copies, normalizes, and freezes every owned config container", () => {
     const serverVariables = { region: "east" };
-    const auth = { bearer: { token: "secret" } };
+    const auth = { bearer: () => "secret" };
     const middleware = [{}];
     const headers: [string, string][] = [["X-Default", "  value  "]];
     const transport = createTransport({

@@ -172,7 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn client_enabled_tictactoe_fails_at_m1_auth_seam_with_operation_names() {
+    fn client_enabled_tictactoe_plans_operation_auth() {
+        use crate::client_model::{AuthKind, AuthSchemeUse};
+
         let temp = tempfile::tempdir().expect("tempdir");
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tictactoe-3.1");
         fs::copy(
@@ -194,23 +196,48 @@ mod tests {
         )
         .expect("resolved config");
 
+        // The auth seam is gone: the same compile now succeeds with no diagnostics.
         let mut sink = DiagnosticSink::new();
-        assert!(compile(&config, true, &mut sink).is_none());
-        let auth_seams = sink
-            .as_slice()
-            .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1430")
-            .collect::<Vec<_>>();
+        assert!(compile(&config, true, &mut sink).is_some());
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
 
-        assert_eq!(auth_seams.len(), 3);
-        for operation in ["get-board", "get-square", "put-square"] {
-            assert!(
-                auth_seams
-                    .iter()
-                    .any(|diagnostic| diagnostic.message.contains(operation)),
-                "missing {operation}: {auth_seams:#?}"
-            );
-        }
+        // Re-run the stages to inspect the planned auth for get-board, whose security is
+        // `[{ defaultApiKey: [] }, { app2AppOauth: [board:read] }]` in the fixture.
+        let mut sink = DiagnosticSink::new();
+        let graph = load_graph(&config, &mut sink).expect("graph");
+        let ir = parse(&graph, &mut sink).expect("IR");
+        let analyzed = analyze(ir, &config, &mut sink);
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+
+        let index = analyzed
+            .ir
+            .operations
+            .iter()
+            .position(|operation| operation.operation_id.as_deref() == Some("get-board"))
+            .expect("get-board operation");
+        let board = model
+            .operations
+            .iter()
+            .find(|plan| plan.operation_index == index)
+            .expect("get-board plan");
+        assert_eq!(
+            board.auth_plan,
+            vec![
+                vec![AuthSchemeUse {
+                    name: "defaultApiKey".to_owned(),
+                    kind: AuthKind::ApiKeyHeader {
+                        name: "api-key".to_owned(),
+                    },
+                    scopes: Vec::new(),
+                }],
+                vec![AuthSchemeUse {
+                    name: "app2AppOauth".to_owned(),
+                    kind: AuthKind::OAuth2,
+                    scopes: vec!["board:read".to_owned()],
+                }],
+            ]
+        );
     }
 
     fn compile_multifile(

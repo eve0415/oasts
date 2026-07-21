@@ -34,7 +34,6 @@ const CODE_DATE_REPRESENTATION: &str = "OASTS0131";
 const CODE_DATE_TRANSFORM_UNSUPPORTED: &str = "OASTS0132";
 const CODE_VALIDATION_REQUIRED: &str = "OASTS0151";
 const CODE_VALIDATION_ENGINE_REQUIRED: &str = "OASTS0152";
-const CODE_AUTH_ENFORCEMENT_REQUIRED: &str = "OASTS0153";
 const CODE_VALIDATION_WITHOUT_CLIENT: &str = "OASTS0161";
 const CODE_OFF_VALIDATION_DIRECTIONS: &str = "OASTS0162";
 const CODE_VALIDATION_DIRECTION_REQUIRED: &str = "OASTS0163";
@@ -265,6 +264,8 @@ pub enum ClientTransport {
 }
 
 /// Whether generated auth requirements are enforced by types or only at runtime.
+/// Defaults to `Types`: the conditional call signatures hold the typecheck budget
+/// on the benchmark baseline, so compile-time enforcement ships unless opted out.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -1324,13 +1325,15 @@ fn resolve_client_config(raw: Option<&RawClient>, enabled: bool) -> Option<Clien
     if !enabled {
         return None;
     }
-    let raw = raw?;
-    let auth_enforcement = raw.auth_enforcement?;
     Some(ClientConfig {
-        auth_enforcement,
-        aggregate: raw.aggregate.unwrap_or(false),
-        base_url: resolve_base_url(raw.base_url.as_ref()),
-        fetch_options: raw.fetch_options.clone().unwrap_or_default(),
+        auth_enforcement: raw
+            .and_then(|raw| raw.auth_enforcement)
+            .unwrap_or(AuthEnforcement::Types),
+        aggregate: raw.and_then(|raw| raw.aggregate).unwrap_or(false),
+        base_url: resolve_base_url(raw.and_then(|raw| raw.base_url.as_ref())),
+        fetch_options: raw
+            .and_then(|raw| raw.fetch_options.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -1412,18 +1415,6 @@ fn validate_client_combinations(
             Some("/validation/engine"),
         ));
     }
-    if client
-        .and_then(|options| options.auth_enforcement)
-        .is_none()
-    {
-        sink.push(config_error(
-            CODE_AUTH_ENFORCEMENT_REQUIRED,
-            "client.authEnforcement is required when the client artifact is enabled; an explicit choice is required",
-            Some(source),
-            Some("/client/authEnforcement"),
-        ));
-    }
-
     if let Some(base_url) = client.and_then(|options| options.base_url.as_ref()) {
         validate_base_url(base_url, source, sink);
     }
@@ -2741,17 +2732,22 @@ mod tests {
 
     #[test]
     fn resolved_client_and_validation_defaults_are_typed() {
-        let client = RawClient {
-            auth_enforcement: Some(AuthEnforcement::Types),
-            ..RawClient::default()
-        };
+        let client = RawClient::default();
         let resolved = resolve_client_config(Some(&client), true).expect("client config");
         assert_eq!(resolved.auth_enforcement, AuthEnforcement::Types);
         assert!(!resolved.aggregate);
         assert_eq!(resolved.base_url, ResolvedBaseUrl::Runtime);
         assert_eq!(resolved.fetch_options, FetchDefaults::default());
         assert!(resolve_client_config(Some(&client), false).is_none());
-        assert!(resolve_client_config(None, true).is_none());
+        let absent = resolve_client_config(None, true).expect("defaulted client config");
+        assert_eq!(absent.auth_enforcement, AuthEnforcement::Types);
+        let explicit = RawClient {
+            auth_enforcement: Some(AuthEnforcement::Runtime),
+            ..RawClient::default()
+        };
+        let resolved_explicit =
+            resolve_client_config(Some(&explicit), true).expect("client config");
+        assert_eq!(resolved_explicit.auth_enforcement, AuthEnforcement::Runtime);
 
         let validation = RawValidation {
             engine: Some(ValidationEngine::Off),
@@ -2853,7 +2849,7 @@ mod tests {
     }
 
     #[test]
-    fn client_requires_validation_object_engine_and_auth_as_rule_15() {
+    fn client_requires_validation_object_and_engine_as_rule_15() {
         let mut missing_validation = valid_client_json_value();
         missing_validation
             .as_object_mut()
@@ -2865,20 +2861,11 @@ mod tests {
         missing_engine["validation"] = json!({ "unchecked": "allow" });
         assert_code(load_json(&missing_engine), CODE_VALIDATION_ENGINE_REQUIRED);
 
-        let mut missing_auth = valid_client_json_value();
-        missing_auth["client"] = json!({});
-        assert_code(load_json(&missing_auth), CODE_AUTH_ENFORCEMENT_REQUIRED);
-
         let mut missing_both = valid_client_json_value();
         let object = missing_both.as_object_mut().expect("config object");
         object.remove("client");
         object.remove("validation");
-        let diagnostics = assert_code(load_json(&missing_both), CODE_VALIDATION_REQUIRED);
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == CODE_AUTH_ENFORCEMENT_REQUIRED)
-        );
+        assert_code(load_json(&missing_both), CODE_VALIDATION_REQUIRED);
     }
 
     #[test]

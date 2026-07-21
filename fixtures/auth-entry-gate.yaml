@@ -1,0 +1,14 @@
+# SHA-256 manifest of the typed-auth frozen entry-gate files; scripts/auth-gate.sh verifies it.
+# These files were authored from the pinned auth contract before any implementation existed
+# and are never edited afterward — the implementation is written to satisfy them.
+files:
+  - path: crates/oasts-core/runtime/test/vectors-auth-serialization.ts
+    sha256: 2556cde52703a36366d000597b7d5d3581218d05b8bc4cf7685b900cf4379dd1
+  - path: crates/oasts-core/runtime/test/vectors-auth-selection.ts
+    sha256: ea23faaccac59981300acfb1655c6e22b943ad5d4fcff3563205c54d677b0430
+  - path: fixtures/auth-showcase-3.1/openapi.yaml
+    sha256: 5bb48091320ad7677c3d80d861f6f446b5f35c33f6c64379ad862cc0e33f5f0a
+  - path: fixtures/auth-showcase-3.1/oasts.yaml
+    sha256: e7fc4a8671319da62d89eeb00801ee1d578e6469f426cba6352b09ad353807e5
+  - path: fixtures/auth-showcase-3.1/compile-assert/cases.ts
+    sha256: 23902fc1dbf02b4575edb0578a28abbf2cb08004c2f3dc5d92da0744918bc854

@@ -347,8 +347,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_eleven_fixtures() {
-        assert_eq!(load_real().fixtures.len(), 11);
+    fn parses_all_twelve_fixtures() {
+        assert_eq!(load_real().fixtures.len(), 12);
     }
 
     #[test]

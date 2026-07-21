@@ -97,6 +97,10 @@ fixtures:
     class: small
     config: oasts.yaml
     committed: true
+  - name: auth-showcase-3.1
+    class: small
+    config: oasts.yaml
+    committed: true
   - name: pathological-3.1
     class: small
     config: oasts.yaml

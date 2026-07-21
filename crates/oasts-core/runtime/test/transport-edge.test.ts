@@ -25,6 +25,7 @@ function operation(overrides: Partial<OperationDescriptor> = {}): OperationDescr
     body: null,
     accept: null,
     credentialHeaders: [],
+    security: [],
     responses: [],
     baseUrl: { kind: "literal", value: "https://example.com/api" },
     fetchDefaults: {},

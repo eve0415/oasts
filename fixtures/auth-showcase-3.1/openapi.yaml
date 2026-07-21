@@ -1,0 +1,140 @@
+openapi: 3.1.0
+info:
+  title: Oasts auth showcase
+  version: 1.0.0
+servers:
+  - url: https://auth.api.example.test/v1
+security:
+  - bearerAuth: []
+paths:
+  /inherited:
+    get:
+      operationId: inheritedRootOnly
+      responses:
+        '200':
+          description: A JSON object.
+          content:
+            application/json:
+              schema:
+                type: object
+  /or:
+    get:
+      operationId: orHeaderOauth
+      security:
+        - headerKey: []
+        - oauthFlow:
+            - scope.a
+      responses:
+        '200':
+          description: A JSON object.
+          content:
+            application/json:
+              schema:
+                type: object
+  /and:
+    get:
+      operationId: andBasicHeader
+      security:
+        - basicAuth: []
+          headerKey: []
+      responses:
+        '200':
+          description: A JSON object.
+          content:
+            application/json:
+              schema:
+                type: object
+  /anonymous:
+    get:
+      operationId: anonymousIncluded
+      security:
+        - bearerAuth: []
+        - {}
+      responses:
+        '200':
+          description: A JSON object.
+          content:
+            application/json:
+              schema:
+                type: object
+  /unsecured:
+    get:
+      operationId: unsecured
+      security: []
+      responses:
+        '200':
+          description: A JSON object.
+          content:
+            application/json:
+              schema:
+                type: object
+  /same-kind:
+    get:
+      operationId: sameKindOr
+      security:
+        - bearerAuth: []
+        - bearerAlt: []
+      responses:
+        '200':
+          description: A JSON object.
+          content:
+            application/json:
+              schema:
+                type: object
+  /query-key:
+    get:
+      operationId: queryKeyOp
+      security:
+        - queryKey: []
+      responses:
+        '200':
+          description: A JSON object.
+          content:
+            application/json:
+              schema:
+                type: object
+  /cookie-key:
+    get:
+      operationId: cookieKeyOp
+      security:
+        - cookieKey: []
+      responses:
+        '200':
+          description: A JSON object.
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+    bearerAuth:
+      type: http
+      scheme: bearer
+    bearerAlt:
+      type: http
+      scheme: bearer
+    headerKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+    queryKey:
+      type: apiKey
+      in: query
+      name: api_key
+    cookieKey:
+      type: apiKey
+      in: cookie
+      name: session
+    oauthFlow:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.api.example.test/oauth/token
+          scopes:
+            scope.a: Access scope A.
+    oidc:
+      type: openIdConnect
+      openIdConnectUrl: https://auth.api.example.test/.well-known/openid-configuration
