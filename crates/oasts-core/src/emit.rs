@@ -25,12 +25,13 @@ use crate::ir::{
     ParamLocation, PrimitiveType, PropMeta, ResponseEntry, ResponseStatus, SchemaDocs, SchemaNode,
     SchemaRef, SourceRef, TupleRest,
 };
-use crate::num::render_number;
+use crate::num::render_number_value;
 use crate::semantic::{AllocatedSchemaName, Analyzed, EnumMember};
 
 mod client;
 mod model;
 pub(crate) mod runtime_assets;
+mod validators;
 
 use model::{EmissionModel, SchemaTarget};
 
@@ -181,6 +182,16 @@ fn change_first_ascii_letter(token: &str, transform: fn(&u8) -> u8) -> String {
     String::from_utf8(bytes).expect("transforming ASCII letters preserves UTF-8")
 }
 
+/// The import specifier suffix for generated cross-file imports: the configured extension, or the
+/// empty string for the `"none"` policy that emits extensionless specifiers.
+pub(super) fn import_extension(model: &EmissionModel<'_, '_>) -> String {
+    if model.config.emit.import_extension == "none" {
+        String::new()
+    } else {
+        model.config.emit.import_extension.clone()
+    }
+}
+
 fn validate_file_base(candidate: &str) -> Result<(), FileNameError> {
     if candidate.is_empty() {
         return Err(FileNameError::Empty);
@@ -262,6 +273,9 @@ pub(crate) fn emit_artifacts(
     let mut files = emit_types_from_model(&mut model);
     if let Some(client_model) = client_model {
         files.extend(client::emit_client_from_model(&mut model, client_model));
+    }
+    if config.artifacts.validators.enabled {
+        files.extend(validators::emit_validators_from_model(&mut model));
     }
     files.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
     files
@@ -643,7 +657,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             .iter()
             .find(|(name, _, _)| name == property_name)?;
         let values = self.finite_constraint(property, &mut HashSet::new())?;
-        (values.len() == 1).then(|| render_json_compact(&values[0]))
+        (values.len() == 1).then(|| render_json_compact(&values[0], ObjectKeyMode::Plain))
     }
 
     fn emit_component(&self, allocated: &AllocatedSchemaName) -> GeneratedFile {
@@ -713,7 +727,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         }
     }
 
-    fn write_schema_declaration(
+    pub(super) fn write_schema_declaration(
         &self,
         output: &mut String,
         name: &str,
@@ -1138,7 +1152,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         });
     }
 
-    fn walk_refs(
+    pub(super) fn walk_refs(
         &self,
         schema: &SchemaNode,
         position: TypePosition,
@@ -1246,11 +1260,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         if imports.is_empty() {
             return;
         }
-        let extension = if self.model.config.emit.import_extension == "none" {
-            ""
-        } else {
-            self.model.config.emit.import_extension.as_str()
-        };
+        let extension = import_extension(self.model);
         for (file, names) in imports {
             output.push_str("import type { ");
             output.push_str(&names.into_iter().collect::<Vec<_>>().join(", "));
@@ -1263,7 +1273,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
 }
 
 impl SchemaTarget {
-    fn variant_name(&self, position: TypePosition) -> String {
+    pub(super) fn variant_name(&self, position: TypePosition) -> String {
         match position {
             TypePosition::Request if self.request_differs => format!("{}Request", self.name),
             TypePosition::Response if self.response_differs => format!("{}Response", self.name),
@@ -1521,7 +1531,7 @@ fn select_request_media(media_types: &[crate::ir::MediaType]) -> Option<&crate::
         .or_else(|| media_types.first())
 }
 
-fn media_is_json(name: &str) -> bool {
+pub(super) fn media_is_json(name: &str) -> bool {
     name == "application/json" || name.ends_with("+json")
 }
 
@@ -1529,14 +1539,14 @@ fn media_is_unknown(name: &str) -> bool {
     !media_is_json(name) && !name.starts_with("text/")
 }
 
-fn response_status_type_suffix(status: &ResponseStatus) -> String {
+pub(super) fn response_status_type_suffix(status: &ResponseStatus) -> String {
     match status {
         ResponseStatus::Exact(value) | ResponseStatus::Range(value) => value.to_ascii_uppercase(),
         ResponseStatus::Default => "Default".to_owned(),
     }
 }
 
-fn property_in_position(meta: &PropMeta, position: TypePosition) -> bool {
+pub(super) fn property_in_position(meta: &PropMeta, position: TypePosition) -> bool {
     match position {
         TypePosition::Neutral => true,
         TypePosition::Request => !meta.read_only,
@@ -1610,16 +1620,13 @@ fn render_literal_union(values: &[Value]) -> String {
     }
 }
 
-fn render_ts_value(value: &Value) -> String {
+pub(super) fn render_ts_value(value: &Value) -> String {
     match value {
         Value::Null => "null".to_owned(),
         Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value
-            .as_f64()
-            .filter(|value| value.is_finite())
-            .map_or_else(|| value.to_string(), render_number),
+        Value::Number(value) => render_number_value(value),
         Value::String(value) => render_ts_string(value),
-        Value::Array(_) | Value::Object(_) => render_json_compact(value),
+        Value::Array(_) | Value::Object(_) => render_json_compact(value, ObjectKeyMode::Plain),
     }
 }
 
@@ -1742,7 +1749,7 @@ fn write_schema_tsdoc(
         });
     }
     if let Some(default) = docs.default.as_ref() {
-        let rendered = render_json_compact(default);
+        let rendered = render_json_compact(default, ObjectKeyMode::Plain);
         if kind == DocKind::Property && interface_member {
             tsdoc.default_value = Some(rendered);
         } else if kind == DocKind::Schema {
@@ -2185,20 +2192,30 @@ fn encode_line_comment(value: &str) -> String {
         .replace("sourceMappingURL=", "sourceMappingURL\\=")
 }
 
-fn render_json_compact(value: &Value) -> String {
+/// How `render_json_compact` renders object keys. `Plain` emits a bare string key, correct for type
+/// positions. `ProtoSafe` emits a computed key (`["__proto__"]:`) for a key named `__proto__` — in
+/// an executable object literal a bare `__proto__` key *sets the prototype* instead of creating an
+/// own data property, so the built value would be wrong; a computed key always creates an own data
+/// property. Every other key renders identically in both modes. Executable value positions
+/// (validator `deepEqual` arguments) use `ProtoSafe`; type positions keep `Plain`, so the type
+/// artifacts stay byte-identical.
+#[derive(Clone, Copy)]
+pub(super) enum ObjectKeyMode {
+    Plain,
+    ProtoSafe,
+}
+
+pub(super) fn render_json_compact(value: &Value, mode: ObjectKeyMode) -> String {
     match value {
         Value::Null => "null".to_owned(),
         Value::Bool(value) => value.to_string(),
-        Value::Number(number) => number
-            .as_f64()
-            .filter(|value| value.is_finite())
-            .map_or_else(|| number.to_string(), render_number),
+        Value::Number(number) => render_number_value(number),
         Value::String(value) => render_ts_string(value),
         Value::Array(values) => format!(
             "[{}]",
             values
                 .iter()
-                .map(render_json_compact)
+                .map(|value| render_json_compact(value, mode))
                 .collect::<Vec<_>>()
                 .join(",")
         ),
@@ -2208,12 +2225,19 @@ fn render_json_compact(value: &Value) -> String {
                 .iter()
                 .map(|(key, value)| format!(
                     "{}:{}",
-                    render_ts_string(key),
-                    render_json_compact(value)
+                    render_object_key(key, mode),
+                    render_json_compact(value, mode)
                 ))
                 .collect::<Vec<_>>()
                 .join(",")
         ),
+    }
+}
+
+fn render_object_key(key: &str, mode: ObjectKeyMode) -> String {
+    match mode {
+        ObjectKeyMode::ProtoSafe if key == "__proto__" => format!("[{}]", render_ts_string(key)),
+        _ => render_ts_string(key),
     }
 }
 
@@ -2256,7 +2280,7 @@ fn render_json_pretty_at(value: &Value, indent: usize) -> String {
                 " ".repeat(indent)
             )
         }
-        _ => render_json_compact(value),
+        _ => render_json_compact(value, ObjectKeyMode::Plain),
     }
 }
 
@@ -2669,6 +2693,7 @@ mod tests {
                     prop_meta(&format!("{pointer}/kind")),
                 )],
                 additional_properties: AdditionalProperties::Allowed(None),
+                dependent_required: Vec::new(),
                 meta: meta(pointer),
             }
         }
@@ -2691,6 +2716,7 @@ mod tests {
                     additional_properties: AdditionalProperties::Allowed(Some(Box::new(
                         missing.clone(),
                     ))),
+                    dependent_required: Vec::new(),
                     meta: meta("/object"),
                 },
                 SchemaNode::Tuple {
@@ -2918,6 +2944,7 @@ mod tests {
                 prop_meta("/components/schemas/Loop/properties/child"),
             )],
             additional_properties: AdditionalProperties::Forbidden,
+            dependent_required: Vec::new(),
             meta: meta("/components/schemas/Loop"),
         };
         let analyzed = Analyzed {
@@ -2963,6 +2990,7 @@ mod tests {
             SchemaNode::Object {
                 properties,
                 additional_properties,
+                dependent_required: Vec::new(),
                 meta: meta(pointer),
             }
         }

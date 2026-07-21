@@ -1,0 +1,7 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-validators
+artifacts:
+  types: true
+  validators: true

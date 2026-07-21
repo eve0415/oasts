@@ -9,7 +9,7 @@ use crate::client_model::{
 };
 use crate::config::{
     AuthEnforcement, CacheMode, CredentialsMode, DocumentationConfig, FetchDefaults, RedirectMode,
-    ReferrerPolicyValue, RequestModeValue,
+    ReferrerPolicyValue, RequestModeValue, ValidationEngine,
 };
 use crate::ir::{
     Operation, Param, ParamLocation, ParamStyle, PrimitiveType, SchemaNode, SegmentPart,
@@ -17,10 +17,11 @@ use crate::ir::{
 
 use super::model::EmissionModel;
 use super::runtime_assets::{RuntimeSelection, emit_runtime_files};
+use super::validators::operation_parameter_validator_names;
 use super::{
     ClientDocKind, Emitter as TypesEmitter, GeneratedFile, TypePosition, encode_comment_text,
-    render_property_key, render_ts_string, source_diagnostic, uppercase_first,
-    write_client_operation_tsdoc, write_source_metadata,
+    import_extension, media_is_json, render_property_key, render_ts_string, source_diagnostic,
+    uppercase_first, write_client_operation_tsdoc, write_source_metadata,
 };
 
 pub(crate) fn emit_client_from_model(
@@ -223,6 +224,10 @@ fn emit_operation(
         .validation
         .as_ref()
         .is_some_and(|validation| !validation.response);
+    let (validate_request, validate_response) = validation_flags(model);
+    let request_checks = request_validation_checks(operation, plan, &stem, validate_request);
+    let response_checks = response_validation_checks(plan, &stem, validate_response);
+    let validation_binding = !request_checks.is_empty() || !response_checks.is_empty();
     let mut output = model.header();
     write_component_imports(&mut output, component_imports, &extension);
     if !operation_type_names.is_empty() {
@@ -247,6 +252,15 @@ fn emit_operation(
         "../../{runtime_directory}/result{extension}"
     )));
     output.push_str(";\n");
+    if validation_binding {
+        // `unwrap` reuses the result module's failed-branch throw so the orThrow variant delegates
+        // to the validated base function instead of the runtime's unvalidated executeOrThrow.
+        output.push_str("import { unwrap } from ");
+        output.push_str(&render_ts_string(&format!(
+            "../../{runtime_directory}/result{extension}"
+        )));
+        output.push_str(";\n");
+    }
     let helper_names = plan
         .param_plans
         .iter()
@@ -272,7 +286,17 @@ fn emit_operation(
     output.push_str(&render_ts_string(&format!(
         "../../{runtime_directory}/transport{extension}"
     )));
-    output.push_str(";\n\n");
+    output.push_str(";\n");
+    if validation_binding {
+        write_validator_imports(
+            &mut output,
+            &request_checks,
+            &response_checks,
+            file_base,
+            &extension,
+        );
+    }
+    output.push('\n');
 
     write_source_metadata(&mut output, &operation.source, 0);
     write_client_operation_tsdoc(
@@ -322,9 +346,13 @@ fn emit_operation(
     output.push_str(&stem);
     output.push_str("CallArgs<S>): Promise<");
     output.push_str(&stem);
-    output.push_str("Result> {\n  return execute<");
-    output.push_str(&stem);
-    output.push_str("Result>(transport, descriptor, input, args[0]);\n}\n\n");
+    output.push_str("Result> {\n");
+    output.push_str(&result_function_body(
+        &stem,
+        &request_checks,
+        &response_checks,
+    ));
+    output.push_str("}\n\n");
 
     write_source_metadata(&mut output, &operation.source, 0);
     write_client_operation_tsdoc(
@@ -342,17 +370,277 @@ fn emit_operation(
     output.push_str(&stem);
     output.push_str("CallArgs<S>): Promise<");
     output.push_str(&successful_payload_union(plan, &stem));
-    output.push_str("> {\n  return executeOrThrow<");
-    output.push_str(&stem);
-    output.push_str("Result>(transport, descriptor, input, args[0]);\n}\n");
+    output.push_str("> {\n");
+    output.push_str(&throw_function_body(
+        allocated_name,
+        &stem,
+        validation_binding,
+    ));
+    output.push_str("}\n");
     output
 }
 
-fn import_extension(model: &EmissionModel<'_, '_>) -> String {
-    if model.config.emit.import_extension == "none" {
-        String::new()
+// --- generated validation binding --------------------------------------------------------------
+
+/// One request-position value the operation checks before dispatch: its `input` accessor, the
+/// per-operation validator to call, and the wire-rooted base path issues carry.
+struct RequestCheck {
+    access: String,
+    validator: String,
+    base_path: String,
+    /// Skip the call when the value is `undefined`, mirroring the transport's serialization
+    /// presence test (`input[name] === undefined` is never serialized, so it is never validated).
+    guarded: bool,
+}
+
+/// Which side of a documented `response` branch carries the decoded JSON body to validate.
+enum ResponseBody {
+    /// A 2xx branch: the body lives in `result.data`.
+    Data,
+    /// A documented non-2xx branch: the body lives in `result.error`.
+    Error,
+    /// A `default` branch spans both, so `result.ok` selects the field at runtime.
+    Both,
+}
+
+/// One documented response branch the operation checks after dispatch.
+struct ResponseCheck {
+    match_key: String,
+    validator: String,
+    body: ResponseBody,
+}
+
+/// `(validate_request, validate_response)` — both false unless the resolved engine is `generated`,
+/// which keeps the emitted client bytes identical to today for `engine: off`.
+fn validation_flags(model: &EmissionModel<'_, '_>) -> (bool, bool) {
+    match model.config.validation.as_ref() {
+        Some(validation) if validation.engine == ValidationEngine::Generated => {
+            (validation.request, validation.response)
+        }
+        _ => (false, false),
+    }
+}
+
+/// The request-side checks: every non-cookie parameter (cookies never reach the fetch client) in
+/// declared order, then the JSON request body. Empty unless request validation is enabled.
+fn request_validation_checks(
+    operation: &Operation,
+    plan: &OperationPlan,
+    stem: &str,
+    enabled: bool,
+) -> Vec<RequestCheck> {
+    if !enabled {
+        return Vec::new();
+    }
+    let mut checks = Vec::new();
+    let names = operation_parameter_validator_names(operation, stem);
+    for (parameter, type_name) in operation.parameters.iter().zip(&names) {
+        if parameter.location == ParamLocation::Cookie {
+            continue;
+        }
+        checks.push(RequestCheck {
+            access: input_member(&parameter.name),
+            validator: format!("validate{type_name}"),
+            base_path: format!(
+                "[{}, {}]",
+                render_ts_string(location_name(parameter.location)),
+                render_ts_string(&parameter.name)
+            ),
+            guarded: true,
+        });
+    }
+    if let Some(BodyPlan::Json { .. }) = &plan.body_plan {
+        // A required body is always sent, so it is validated unconditionally; an optional body is
+        // skipped when absent, matching the parameter presence rule.
+        let required = operation
+            .request_body
+            .as_ref()
+            .is_some_and(|body| body.required);
+        checks.push(RequestCheck {
+            access: "input.body".to_owned(),
+            validator: format!("validate{stem}RequestBody"),
+            base_path: "[\"body\"]".to_owned(),
+            guarded: !required,
+        });
+    }
+    checks
+}
+
+/// The response-side checks: each documented branch whose decoded body is JSON and carries an
+/// emitted validator. Content-type-discriminated branches are skipped — their decoded body is not
+/// unconditionally JSON. Empty unless response validation is enabled.
+fn response_validation_checks(
+    plan: &OperationPlan,
+    stem: &str,
+    enabled: bool,
+) -> Vec<ResponseCheck> {
+    if !enabled {
+        return Vec::new();
+    }
+    plan.response_table
+        .iter()
+        .filter_map(|response| {
+            if !matches!(response.payload, PayloadDisposition::Payload { .. })
+                || response.content_type_discriminated
+                || !response
+                    .media
+                    .iter()
+                    .any(|media| media_is_json(&media.media))
+            {
+                return None;
+            }
+            let body = match response.kind {
+                ResponseMatchKind::Default => ResponseBody::Both,
+                _ => {
+                    if is_successful_response(response.kind, &response.match_key) {
+                        ResponseBody::Data
+                    } else {
+                        ResponseBody::Error
+                    }
+                }
+            };
+            Some(ResponseCheck {
+                match_key: response.match_key.clone(),
+                validator: format!("validate{}", response_type_name(stem, response)),
+                body,
+            })
+        })
+        .collect()
+}
+
+/// `input.<name>` for an identifier, `input["<name>"]` otherwise — the accessor for one input
+/// property, reused by both the presence guard and the validator call.
+fn input_member(name: &str) -> String {
+    let key = render_property_key(name);
+    if key == name {
+        format!("input.{name}")
     } else {
-        model.config.emit.import_extension.clone()
+        format!("input[{key}]")
+    }
+}
+
+/// The `Issue` type import plus the per-operation validators pulled from the validators artifact.
+fn write_validator_imports(
+    output: &mut String,
+    request: &[RequestCheck],
+    response: &[ResponseCheck],
+    file_base: &str,
+    extension: &str,
+) {
+    output.push_str("import type { Issue } from ");
+    output.push_str(&render_ts_string(&format!(
+        "../../validators/runtime{extension}"
+    )));
+    output.push_str(";\n");
+    let validators = request
+        .iter()
+        .map(|check| check.validator.as_str())
+        .chain(response.iter().map(|check| check.validator.as_str()))
+        .collect::<BTreeSet<_>>();
+    output.push_str("import { ");
+    output.push_str(&validators.into_iter().collect::<Vec<_>>().join(", "));
+    output.push_str(" } from ");
+    output.push_str(&render_ts_string(&format!(
+        "../../validators/operations/{file_base}{extension}"
+    )));
+    output.push_str(";\n");
+}
+
+/// The result-returning function body: today's single `execute` call when nothing is bound, else a
+/// pre-dispatch request check and a post-dispatch response check around it.
+fn result_function_body(
+    stem: &str,
+    request: &[RequestCheck],
+    response: &[ResponseCheck],
+) -> String {
+    if request.is_empty() && response.is_empty() {
+        return format!("  return execute<{stem}Result>(transport, descriptor, input, args[0]);\n");
+    }
+    let mut body = String::new();
+    if !request.is_empty() {
+        body.push_str("  const requestIssues: Issue[] = [];\n");
+        for check in request {
+            if check.guarded {
+                body.push_str(&format!("  if ({} !== undefined) {{\n", check.access));
+                body.push_str(&format!(
+                    "    {}({}, {}, requestIssues);\n",
+                    check.validator, check.access, check.base_path
+                ));
+                body.push_str("  }\n");
+            } else {
+                body.push_str(&format!(
+                    "  {}({}, {}, requestIssues);\n",
+                    check.validator, check.access, check.base_path
+                ));
+            }
+        }
+        body.push_str("  if (requestIssues.length > 0) {\n");
+        body.push_str("    return { kind: \"request-failure\", ok: false, match: null, status: null, error: { kind: \"request-validation\", issues: requestIssues } };\n");
+        body.push_str("  }\n");
+    }
+    if response.is_empty() {
+        body.push_str(&format!(
+            "  return execute<{stem}Result>(transport, descriptor, input, args[0]);\n"
+        ));
+        return body;
+    }
+    body.push_str(&format!(
+        "  const result = await execute<{stem}Result>(transport, descriptor, input, args[0]);\n"
+    ));
+    body.push_str("  if (result.kind === \"response\") {\n");
+    body.push_str("    const responseIssues: Issue[] = [];\n");
+    for (index, check) in response.iter().enumerate() {
+        if index == 0 {
+            body.push_str(&format!(
+                "    if (result.match === {}) {{\n",
+                render_ts_string(&check.match_key)
+            ));
+        } else {
+            body.push_str(&format!(
+                "    }} else if (result.match === {}) {{\n",
+                render_ts_string(&check.match_key)
+            ));
+        }
+        match check.body {
+            ResponseBody::Data => body.push_str(&format!(
+                "      {}(result.data, [], responseIssues);\n",
+                check.validator
+            )),
+            ResponseBody::Error => body.push_str(&format!(
+                "      {}(result.error, [], responseIssues);\n",
+                check.validator
+            )),
+            ResponseBody::Both => {
+                body.push_str("      if (result.ok) {\n");
+                body.push_str(&format!(
+                    "        {}(result.data, [], responseIssues);\n",
+                    check.validator
+                ));
+                body.push_str("      } else {\n");
+                body.push_str(&format!(
+                    "        {}(result.error, [], responseIssues);\n",
+                    check.validator
+                ));
+                body.push_str("      }\n");
+            }
+        }
+    }
+    body.push_str("    }\n");
+    body.push_str("    if (responseIssues.length > 0) {\n");
+    body.push_str("      return { kind: \"response-failure\", ok: false, match: result.match, status: result.status, error: { kind: \"response-validation\", issues: responseIssues }, meta: result.meta };\n");
+    body.push_str("    }\n");
+    body.push_str("  }\n");
+    body.push_str("  return result;\n");
+    body
+}
+
+/// The orThrow function body: today's direct `executeOrThrow` when nothing is bound, else `unwrap`
+/// over the validated base function so request and response checks apply before the throw.
+fn throw_function_body(name: &str, stem: &str, binding: bool) -> String {
+    if binding {
+        format!("  return unwrap(await {name}(transport, input, ...args));\n")
+    } else {
+        format!("  return executeOrThrow<{stem}Result>(transport, descriptor, input, args[0]);\n")
     }
 }
 
@@ -744,18 +1032,24 @@ fn response_type_name(stem: &str, response: &ResponsePlan) -> String {
     format!("{stem}Response{suffix}")
 }
 
+/// Whether a response branch carries a 2xx (success) payload: an exact status in 200-299, a range
+/// beginning with `2`, or the catch-all `default` (which the successful-union path treats as
+/// success). `response_validation_checks` handles `default` on its own before calling, so there the
+/// helper only classifies the exact/range branches.
+fn is_successful_response(kind: ResponseMatchKind, match_key: &str) -> bool {
+    match kind {
+        ResponseMatchKind::Exact => match_key
+            .parse::<u16>()
+            .is_ok_and(|status| (200..=299).contains(&status)),
+        ResponseMatchKind::Range => match_key.starts_with('2'),
+        ResponseMatchKind::Default => true,
+    }
+}
+
 fn successful_payload_union(plan: &OperationPlan, stem: &str) -> String {
     let mut payloads = Vec::new();
     for response in &plan.response_table {
-        let successful = match response.kind {
-            ResponseMatchKind::Exact => response
-                .match_key
-                .parse::<u16>()
-                .is_ok_and(|status| (200..=299).contains(&status)),
-            ResponseMatchKind::Range => response.match_key.starts_with('2'),
-            ResponseMatchKind::Default => true,
-        };
-        if successful {
+        if is_successful_response(response.kind, &response.match_key) {
             let payload = response_payload_type(response, stem);
             if !payloads.contains(&payload) {
                 payloads.push(payload);
@@ -2144,6 +2438,7 @@ mod tests {
         SchemaNode::Object {
             properties: Vec::new(),
             additional_properties: AdditionalProperties::Allowed(None),
+            dependent_required: Vec::new(),
             meta: SchemaMeta::default(),
         }
     }
@@ -3148,6 +3443,388 @@ mod tests {
         assert!(
             actual
                 .contains("export type PingCallArgs<S extends string> = [options?: CallOptions];")
+        );
+    }
+
+    // --- generated validation binding ----------------------------------------------------------
+
+    /// Emits every client file with the validators artifact enabled and the generated engine bound
+    /// to the given request/response directions, returning the files and sorted diagnostics. Errors
+    /// are not asserted away, so callers can cover diagnosed-but-still-emitted shapes.
+    fn emit_validated_files(
+        document: &Value,
+        request: bool,
+        response: bool,
+    ) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("openapi.json"),
+            serde_json::to_vec_pretty(document).expect("document JSON"),
+        )
+        .expect("document");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.json" },
+            "output": "generated",
+            "artifacts": { "types": true, "client": true, "validators": true },
+            "client": {
+                "authEnforcement": "types",
+                "baseUrl": { "source": "literal", "value": "https://api.example.test/v1" }
+            },
+            "validation": {
+                "engine": "generated",
+                "request": request,
+                "response": response,
+                "unchecked": "allow"
+            }
+        });
+        let config = load_config_from_json(
+            &temp.path().join("oasts.json"),
+            &serde_json::to_vec(&config).expect("config JSON"),
+        )
+        .expect("resolved config");
+        let mut sink = DiagnosticSink::new();
+        let graph = load_graph(&config, &mut sink).expect("graph");
+        let ir = parse(&graph, &mut sink).expect("IR");
+        let analyzed = analyze(ir, &config, &mut sink);
+        let client = build_client_model(&analyzed, &config, &mut sink);
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let files = emit_client_from_model(&mut model, &client);
+        drop(model);
+        (files, sink.into_sorted_vec())
+    }
+
+    /// Emits one client operation file with generated validation bound, asserting a clean compile.
+    fn emit_validated_operation(
+        document: Value,
+        suffix: &str,
+        request: bool,
+        response: bool,
+    ) -> String {
+        let (files, diagnostics) = emit_validated_files(&document, request, response);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        operation_file(&files, suffix)
+    }
+
+    fn operation_file(files: &[GeneratedFile], suffix: &str) -> String {
+        files
+            .iter()
+            .find(|file| file.relative_path == format!("client/operations/{suffix}.ts"))
+            .expect("operation file")
+            .content
+            .clone()
+    }
+
+    fn parameter_operation_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/things/{id}": {
+                    "get": {
+                        "operationId": "readthing",
+                        "parameters": [
+                            { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+                            { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1 } },
+                            { "name": "X-Tag", "in": "header", "required": false, "schema": { "type": "string" } }
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": { "application/json": { "schema": { "type": "object", "properties": { "value": { "type": "string" } } } } }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn body_and_branches_document(body_required: bool) -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/make": {
+                    "post": {
+                        "operationId": "makething",
+                        "requestBody": {
+                            "required": body_required,
+                            "content": { "application/json": { "schema": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } } } }
+                        },
+                        "responses": {
+                            "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "object", "properties": { "id": { "type": "string" } } } } } },
+                            "4XX": { "description": "client error", "content": { "application/json": { "schema": { "type": "object", "properties": { "code": { "type": "integer" } } } } } },
+                            "default": { "description": "unexpected", "content": { "application/json": { "schema": { "type": "object", "properties": { "code": { "type": "integer" } } } } } }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn optional_body_bodyless_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/save": {
+                    "put": {
+                        "operationId": "savething",
+                        "requestBody": {
+                            "required": false,
+                            "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string" } } } } }
+                        },
+                        "responses": { "204": { "description": "saved" } }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn engine_off_leaves_the_operation_bytes_unwrapped() {
+        // With the engine off the client is byte-identical to today: no validator imports, no issue
+        // buffers, and both functions delegate straight to the runtime.
+        let (content, diagnostics) = emit_operation(parameter_operation_document(), "readthing");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(content.contains(
+            "export async function readthing<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<ReadthingResult> {\n  return execute<ReadthingResult>(transport, descriptor, input, args[0]);\n}"
+        ));
+        assert!(content.contains(
+            "export async function readthingOrThrow<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<ReadthingResponse200> {\n  return executeOrThrow<ReadthingResult>(transport, descriptor, input, args[0]);\n}"
+        ));
+        assert!(!content.contains("Issue"));
+        assert!(!content.contains("validators/"));
+        assert!(!content.contains("requestIssues"));
+        assert!(!content.contains("unwrap"));
+    }
+
+    #[test]
+    fn request_validation_guards_parameters_across_locations_and_omits_the_response_block() {
+        let content =
+            emit_validated_operation(parameter_operation_document(), "readthing", true, false);
+        assert!(content.contains(
+            r#"export async function readthing<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<ReadthingResult> {
+  const requestIssues: Issue[] = [];
+  if (input.id !== undefined) {
+    validateReadthingPathId(input.id, ["path", "id"], requestIssues);
+  }
+  if (input.limit !== undefined) {
+    validateReadthingQueryLimit(input.limit, ["query", "limit"], requestIssues);
+  }
+  if (input["X-Tag"] !== undefined) {
+    validateReadthingHeaderXTag(input["X-Tag"], ["header", "X-Tag"], requestIssues);
+  }
+  if (requestIssues.length > 0) {
+    return { kind: "request-failure", ok: false, match: null, status: null, error: { kind: "request-validation", issues: requestIssues } };
+  }
+  return execute<ReadthingResult>(transport, descriptor, input, args[0]);
+}"#
+        ), "base function mismatch:\n{content}");
+        // Response validation is off: no post-dispatch block, and the response validator stays unimported.
+        assert!(!content.contains("const result = await execute"));
+        assert!(!content.contains("validateReadthingResponse200"));
+        assert!(content.contains("import type { Issue } from \"../../validators/runtime.js\";"));
+        assert!(content.contains("import { unwrap } from \"../../runtime/result.js\";"));
+        assert!(content.contains(
+            "import { validateReadthingHeaderXTag, validateReadthingPathId, validateReadthingQueryLimit } from \"../../validators/operations/readthing.js\";"
+        ));
+        assert!(content.contains(
+            "export async function readthingOrThrow<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<ReadthingResponse200> {\n  return unwrap(await readthing(transport, input, ...args));\n}"
+        ));
+    }
+
+    #[test]
+    fn response_validation_wraps_the_documented_branch_and_omits_the_request_block() {
+        let content =
+            emit_validated_operation(parameter_operation_document(), "readthing", false, true);
+        assert!(content.contains(
+            r#"export async function readthing<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<ReadthingResult> {
+  const result = await execute<ReadthingResult>(transport, descriptor, input, args[0]);
+  if (result.kind === "response") {
+    const responseIssues: Issue[] = [];
+    if (result.match === "200") {
+      validateReadthingResponse200(result.data, [], responseIssues);
+    }
+    if (responseIssues.length > 0) {
+      return { kind: "response-failure", ok: false, match: result.match, status: result.status, error: { kind: "response-validation", issues: responseIssues }, meta: result.meta };
+    }
+  }
+  return result;
+}"#
+        ), "base function mismatch:\n{content}");
+        // Request validation is off: no pre-dispatch block, and no parameter validators are imported.
+        assert!(!content.contains("requestIssues"));
+        assert!(!content.contains("validateReadthingPathId"));
+        assert!(content.contains(
+            "import { validateReadthingResponse200 } from \"../../validators/operations/readthing.js\";"
+        ));
+    }
+
+    #[test]
+    fn request_and_response_validation_wrap_parameters_and_the_response_together() {
+        let content =
+            emit_validated_operation(parameter_operation_document(), "readthing", true, true);
+        assert!(
+            content.contains(
+                r#"  const requestIssues: Issue[] = [];
+  if (input.id !== undefined) {
+    validateReadthingPathId(input.id, ["path", "id"], requestIssues);
+  }"#
+            ),
+            "request block mismatch:\n{content}"
+        );
+        assert!(content.contains(
+            r#"  const result = await execute<ReadthingResult>(transport, descriptor, input, args[0]);
+  if (result.kind === "response") {
+    const responseIssues: Issue[] = [];
+    if (result.match === "200") {
+      validateReadthingResponse200(result.data, [], responseIssues);
+    }"#
+        ), "response block mismatch:\n{content}");
+        assert!(content.contains(
+            "import { validateReadthingHeaderXTag, validateReadthingPathId, validateReadthingQueryLimit, validateReadthingResponse200 } from \"../../validators/operations/readthing.js\";"
+        ));
+    }
+
+    #[test]
+    fn request_and_response_validation_wrap_a_required_body_and_a_default_branch() {
+        let content =
+            emit_validated_operation(body_and_branches_document(true), "makething", true, true);
+        // A required body is validated unconditionally; the default branch selects data vs error on ok.
+        assert!(content.contains(
+            r#"export async function makething<S extends string = never>(transport: Transport<S>, input: MakethingInput, ...args: MakethingCallArgs<S>): Promise<MakethingResult> {
+  const requestIssues: Issue[] = [];
+  validateMakethingRequestBody(input.body, ["body"], requestIssues);
+  if (requestIssues.length > 0) {
+    return { kind: "request-failure", ok: false, match: null, status: null, error: { kind: "request-validation", issues: requestIssues } };
+  }
+  const result = await execute<MakethingResult>(transport, descriptor, input, args[0]);
+  if (result.kind === "response") {
+    const responseIssues: Issue[] = [];
+    if (result.match === "200") {
+      validateMakethingResponse200(result.data, [], responseIssues);
+    } else if (result.match === "4XX") {
+      validateMakethingResponse4XX(result.error, [], responseIssues);
+    } else if (result.match === "default") {
+      if (result.ok) {
+        validateMakethingResponseDefault(result.data, [], responseIssues);
+      } else {
+        validateMakethingResponseDefault(result.error, [], responseIssues);
+      }
+    }
+    if (responseIssues.length > 0) {
+      return { kind: "response-failure", ok: false, match: result.match, status: result.status, error: { kind: "response-validation", issues: responseIssues }, meta: result.meta };
+    }
+  }
+  return result;
+}"#
+        ), "base function mismatch:\n{content}");
+        assert!(content.contains(
+            "export async function makethingOrThrow<S extends string = never>(transport: Transport<S>, input: MakethingInput, ...args: MakethingCallArgs<S>): Promise<MakethingResponse200 | MakethingResponseDefault> {\n  return unwrap(await makething(transport, input, ...args));\n}"
+        ));
+    }
+
+    #[test]
+    fn an_optional_body_is_presence_guarded_and_a_bodyless_response_is_skipped() {
+        let content =
+            emit_validated_operation(optional_body_bodyless_document(), "savething", true, true);
+        // Optional body → presence guard; the 204 branch carries no JSON body, so response validation
+        // adds nothing and the function returns the raw execute result.
+        assert!(content.contains(
+            r#"export async function savething<S extends string = never>(transport: Transport<S>, input: SavethingInput, ...args: SavethingCallArgs<S>): Promise<SavethingResult> {
+  const requestIssues: Issue[] = [];
+  if (input.body !== undefined) {
+    validateSavethingRequestBody(input.body, ["body"], requestIssues);
+  }
+  if (requestIssues.length > 0) {
+    return { kind: "request-failure", ok: false, match: null, status: null, error: { kind: "request-validation", issues: requestIssues } };
+  }
+  return execute<SavethingResult>(transport, descriptor, input, args[0]);
+}"#
+        ), "base function mismatch:\n{content}");
+        assert!(!content.contains("const result = await execute"));
+        assert!(content.contains(
+            "import { validateSavethingRequestBody } from \"../../validators/operations/savething.js\";"
+        ));
+    }
+
+    #[test]
+    fn request_validation_skips_a_cookie_parameter_and_never_calls_its_validator() {
+        // A cookie parameter is diagnosed as unsupported for the fetch client, yet emission still runs;
+        // its request binding validates only the non-cookie parameter and never references the cookie
+        // parameter's validator.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/things": {
+                    "get": {
+                        "operationId": "listthing",
+                        "parameters": [
+                            { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1 } },
+                            { "name": "session", "in": "cookie", "required": false, "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = emit_validated_files(&document, true, false);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "OASTS1410"),
+            "expected the cookie parameter to be diagnosed: {diagnostics:#?}"
+        );
+        let content = operation_file(&files, "listthing");
+        assert!(
+            content.contains(
+                r#"  const requestIssues: Issue[] = [];
+  if (input.limit !== undefined) {
+    validateListthingQueryLimit(input.limit, ["query", "limit"], requestIssues);
+  }
+  if (requestIssues.length > 0) {
+    return { kind: "request-failure", ok: false, match: null, status: null, error: { kind: "request-validation", issues: requestIssues } };
+  }
+  return execute<ListthingResult>(transport, descriptor, input, args[0]);"#
+            ),
+            "request block mismatch:\n{content}"
+        );
+        assert!(!content.contains("validateListthingCookieSession"));
+        assert!(!content.contains("session"));
+    }
+
+    #[test]
+    fn response_validation_covers_a_two_xx_range_and_an_exact_error_branch() {
+        // A 2XX range branch is a success, so it validates result.data; an exact non-2xx branch is a
+        // documented error, so it validates result.error.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/poll": {
+                    "get": {
+                        "operationId": "pollthing",
+                        "responses": {
+                            "2XX": { "description": "range success", "content": { "application/json": { "schema": { "type": "object", "properties": { "value": { "type": "string" } } } } } },
+                            "500": { "description": "server error", "content": { "application/json": { "schema": { "type": "object", "properties": { "code": { "type": "integer" } } } } } }
+                        }
+                    }
+                }
+            }
+        });
+        let content = emit_validated_operation(document, "pollthing", false, true);
+        assert!(
+            content.contains(
+                r#"    if (result.match === "500") {
+      validatePollthingResponse500(result.error, [], responseIssues);
+    } else if (result.match === "2XX") {
+      validatePollthingResponse2XX(result.data, [], responseIssues);
+    }"#
+            ),
+            "response block mismatch:\n{content}"
         );
     }
 }

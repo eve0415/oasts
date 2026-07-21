@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::config::ResolvedConfig;
 use crate::diag::DiagnosticSink;
@@ -126,6 +126,47 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         json_pointer: &str,
     ) -> Option<&SchemaTarget> {
         self.schema_targets.get(source_id)?.get(json_pointer)
+    }
+
+    /// Renames component target names that collide with identifiers a terminal emitter injects into
+    /// every one of its files (e.g. the validators kernel imports and helpers), so an exported type
+    /// never shadows an imported one (TS2440). All name usages — the component's own export, its
+    /// self/cross references, sibling imports, and the rendered structural type — read the target
+    /// name, so mutating it here keeps every site consistent. Only exact (case-sensitive) matches
+    /// are renamed, since that is what actually conflicts in a TypeScript module scope; colliding
+    /// names get the lowest free numeric suffix, deterministically across runs. Call this only from
+    /// the last emitter to run: it mutates the shared allocation, and any emitter reading target
+    /// names afterward would see the renamed set.
+    pub(crate) fn reserve_names(&mut self, reserved: &[&str]) {
+        let analyzed = self.analyzed;
+        let mut taken: HashSet<String> = reserved.iter().map(|name| (*name).to_owned()).collect();
+        for targets in self.schema_targets.values() {
+            for target in targets.values() {
+                taken.insert(target.name.clone());
+            }
+        }
+        for allocated in &analyzed.schema_names {
+            let schema = &analyzed.ir.schemas[allocated.schema_index];
+            let Some(target) = self
+                .schema_targets
+                .get_mut(&schema.source.source_id)
+                .and_then(|by_pointer| by_pointer.get_mut(&schema.source.json_pointer))
+            else {
+                continue;
+            };
+            if !reserved.contains(&target.name.as_str()) {
+                continue;
+            }
+            let base = target.name.clone();
+            let mut suffix = 2u32;
+            let mut candidate = format!("{base}{suffix}");
+            while taken.contains(&candidate) {
+                suffix += 1;
+                candidate = format!("{base}{suffix}");
+            }
+            taken.insert(candidate.clone());
+            target.name = candidate;
+        }
     }
 
     pub(crate) fn header(&self) -> String {

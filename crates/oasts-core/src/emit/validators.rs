@@ -1,0 +1,2887 @@
+//! Deterministic standalone validators artifact emission.
+//!
+//! Emits, under the output root when the validators artifact is enabled:
+//!   - `validators/standard-schema.ts` and `validators/runtime.ts` (embedded assets, verbatim);
+//!   - `validators/components/<base>.ts`, one per component;
+//!   - `validators/operations/<base>.ts`, one per operation.
+//!
+//! Standalone contract: emitted validator files import ONLY from `../standard-schema.ts`,
+//! `../runtime.ts`, and each other — never from the types artifact. Each file re-exports its own
+//! structural type through the shared `render_type` path, so the shape is byte-identical to the
+//! types artifact's for the same wire variant, and every validator const is annotated
+//! `SyncStandardSchemaV1<T>` (never the bare async `StandardSchemaV1<T>`) so the frozen
+//! compile-asserts keep their sync guarantee and typed phantom.
+//!
+//! Reject handling: a schema reachable from an emitted validator that carries an unsupported
+//! validation keyword, or that degraded to an unknown leaf, fails the run with a diagnostic naming
+//! the keyword/construct and its source pointer. The writer never commits a failed run, so the
+//! types/client artifacts stay byte-identical when validators is disabled.
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use serde_json::{Number, Value};
+
+use crate::diag::Diagnostic;
+use crate::ir::{
+    AdditionalProperties, ExclusiveBound, Operation, ParamLocation, PrimitiveType, PropMeta,
+    SchemaMeta, SchemaNode, TupleRest,
+};
+use crate::num::render_number_value;
+use crate::semantic::{TargetCase, normalize_identifier};
+
+use super::model::EmissionModel;
+use super::runtime_assets::rewrite_relative_ts_imports;
+use super::{
+    Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypePosition, import_extension,
+    lowercase_first, media_is_json, property_in_position, render_json_compact, render_ts_string,
+    response_status_type_suffix, source_diagnostic, uppercase_first,
+};
+
+/// Emitted verbatim as `validators/runtime.ts`; the generated-validator call ABI is fixed to it.
+const VALIDATORS_RUNTIME_TS: &str = include_str!("../../runtime/validators-runtime.ts");
+/// Emitted verbatim as `validators/standard-schema.ts`; the vendored Standard Schema declaration.
+const VALIDATORS_STANDARD_SCHEMA_TS: &str =
+    include_str!("../../runtime/validators-standard-schema.ts");
+
+/// A schema carries a validation keyword the validators artifact does not implement.
+const CODE_REJECTED_KEYWORD: &str = "OASTS1501";
+/// A schema degraded to an unknown leaf, so no faithful validator can be emitted for it.
+const CODE_UNKNOWN_LEAF: &str = "OASTS1502";
+
+/// Identifiers the validators emitter injects into every generated file: the runtime kernel imports
+/// (`type Issue` is always imported; the rest are pulled in on demand), the Standard Schema types,
+/// and the per-file local helpers. A component whose exported type name equals one of these would
+/// shadow the imported identifier (TS2440), so these names are reserved in the validators
+/// name-allocation scope and any colliding component type is renamed.
+const VALIDATOR_RESERVED_NAMES: &[&str] = &[
+    "Issue",
+    "issue",
+    "appendKey",
+    "deepEqual",
+    "isMultipleOf",
+    "codePointLength",
+    "isDateTime",
+    "isDate",
+    "isTime",
+    "isUuid",
+    "isInt32",
+    "StandardSchemaV1",
+    "SyncStandardSchemaV1",
+    "isRecord",
+    "isArray",
+];
+
+pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
+    let analyzed = model.analyzed;
+
+    // Reject-handling walk: reachable schemas with unsupported keywords or unknown-leaf degradation
+    // fail the run. Every component and every operation position is emitted, so walking the
+    // component schemas and operation schemas (into their children, never through `$ref` — the
+    // target is itself a walked component) covers exactly the reachable set once.
+    let mut rejects = Vec::new();
+    {
+        // The reject walk reuses the types emitter's child-walk (`SchemaChildMode::Validation`
+        // visits exactly the schemas a validator would descend into), so this borrows `model`
+        // read-only through an emitter that is dropped before `reserve_names` needs it back.
+        let emitter = Emitter::new(model);
+        for schema in &analyzed.ir.schemas {
+            collect_rejects(&emitter, &schema.schema, &mut rejects);
+        }
+        for operation in &analyzed.ir.operations {
+            for parameter in &operation.parameters {
+                collect_rejects(&emitter, &parameter.schema, &mut rejects);
+            }
+            if let Some(body) = &operation.request_body {
+                for media in &body.media_types {
+                    collect_rejects(&emitter, &media.schema, &mut rejects);
+                }
+            }
+            for response in &operation.responses {
+                for media in &response.media_types {
+                    collect_rejects(&emitter, &media.schema, &mut rejects);
+                }
+            }
+        }
+    }
+    model.sink.extend(rejects);
+
+    // Validators is the terminal emitter, so renaming component targets that collide with the
+    // injected kernel identifiers here is safe — no later emitter reads the allocation.
+    model.reserve_names(VALIDATOR_RESERVED_NAMES);
+
+    let mut files = Vec::new();
+    files.push(embedded_asset(model, "runtime.ts", VALIDATORS_RUNTIME_TS));
+    files.push(embedded_asset(
+        model,
+        "standard-schema.ts",
+        VALIDATORS_STANDARD_SCHEMA_TS,
+    ));
+
+    for allocated in &analyzed.schema_names {
+        if model.component_files[allocated.schema_index].is_none() {
+            continue;
+        }
+        // The export name is the (possibly reserved-renamed) target name, so it agrees with the
+        // structural type, self/cross references, and sibling imports — all of which read the target.
+        // An allocated file always has a registered target (allocate_paths sets both together).
+        let schema = &analyzed.ir.schemas[allocated.schema_index];
+        let name = model
+            .schema_target(&schema.source.source_id, &schema.source.json_pointer)
+            .map(|target| target.name.clone())
+            .expect("a component with an allocated file has a registered target");
+        if let Some(file) = emit_component(model, allocated.schema_index, &name) {
+            files.push(file);
+        }
+    }
+    for allocated in &analyzed.operation_names {
+        if model.operation_files[allocated.operation_index].is_none() {
+            continue;
+        }
+        if let Some(file) = emit_operation(model, allocated.operation_index, &allocated.name) {
+            files.push(file);
+        }
+    }
+    files
+}
+
+/// Embeds a validators runtime asset verbatim (no generated header) with `.ts` import specifiers
+/// rewritten to the configured extension, and registers its path in the collision namespace.
+fn embedded_asset(
+    model: &mut EmissionModel<'_, '_>,
+    file_name: &str,
+    source: &str,
+) -> GeneratedFile {
+    let content = rewrite_relative_ts_imports(source, &model.config.emit.import_extension);
+    let relative_path = format!("validators/{file_name}");
+    let asset_source = model
+        .analyzed
+        .ir
+        .schemas
+        .first()
+        .map(|schema| schema.source.clone())
+        .unwrap_or_default();
+    model.register_path(&relative_path, &asset_source);
+    GeneratedFile {
+        relative_path,
+        content,
+    }
+}
+
+// --- reject-handling walk ----------------------------------------------------------------------
+
+fn collect_rejects(emitter: &Emitter<'_, '_, '_>, schema: &SchemaNode, out: &mut Vec<Diagnostic>) {
+    let meta = schema.meta();
+    // One rejected keyword is one root cause: it drives OASTS1501, and the same parse degrades the
+    // node to an unknown leaf. Surfacing OASTS1502 as well would double-report it against the frozen
+    // matrix's single-diagnostic contract, so the unknown-leaf code fires only for nodes that
+    // reached Unknown without carrying a rejected keyword (e.g. `$dynamicRef`, an unknown `type`).
+    if meta.rejected_validation_keywords.is_empty() {
+        if let SchemaNode::Unknown { reason, meta } = schema {
+            out.push(source_diagnostic(
+                CODE_UNKNOWN_LEAF,
+                format!("validators cannot emit a check for an unsupported schema ({reason})"),
+                &meta.source,
+            ));
+        }
+    } else {
+        for keyword in &meta.rejected_validation_keywords {
+            out.push(source_diagnostic(
+                CODE_REJECTED_KEYWORD,
+                format!(
+                    "validators cannot emit a check for unsupported validation keyword '{keyword}'"
+                ),
+                &meta.source,
+            ));
+        }
+    }
+    // Validation mode visits the same direct children (no `$ref` following) a validator descends,
+    // so the reachable set the reject walk covers matches the emitted checks exactly.
+    emitter.for_each_schema_child(schema, SchemaChildMode::Validation, &mut |child| {
+        collect_rejects(emitter, child, out);
+    });
+}
+
+// --- per-file scope ----------------------------------------------------------------------------
+
+/// File-scoped state accumulated while generating a file's validate bodies: the runtime value
+/// imports actually used, whether the record/array narrowing guards are needed, and the lazily
+/// cached regex patterns (slot = index).
+#[derive(Default)]
+struct FileScope {
+    runtime_values: BTreeSet<&'static str>,
+    needs_is_record: bool,
+    needs_is_array: bool,
+    patterns: Vec<String>,
+}
+
+impl FileScope {
+    /// Returns the module-scope cache slot for a pattern string, deduplicating equal patterns.
+    fn pattern_slot(&mut self, pattern: &str) -> usize {
+        if let Some(index) = self
+            .patterns
+            .iter()
+            .position(|existing| existing == pattern)
+        {
+            return index;
+        }
+        self.patterns.push(pattern.to_owned());
+        self.patterns.len() - 1
+    }
+}
+
+// --- validate-body code generation -------------------------------------------------------------
+
+/// One validate-function body under construction: indented output plus a monotonic counter that
+/// names locals uniquely across the whole function so nested scopes never shadow. Borrows the
+/// file-scoped `FileScope` (imports/guards/patterns accumulate across the file's declarations) and
+/// the immutable emission `model` (for `$ref` target resolution); `position` is the fixed wire
+/// variant of the declaration being generated.
+struct FnBody<'scope, 'model, 'input, 'sink> {
+    out: String,
+    indent: usize,
+    counter: usize,
+    scope: &'scope mut FileScope,
+    model: &'model EmissionModel<'input, 'sink>,
+    position: TypePosition,
+}
+
+impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
+    fn new(
+        scope: &'scope mut FileScope,
+        model: &'model EmissionModel<'input, 'sink>,
+        position: TypePosition,
+    ) -> Self {
+        Self {
+            out: String::new(),
+            indent: 1,
+            counter: 0,
+            scope,
+            model,
+            position,
+        }
+    }
+
+    fn line(&mut self, text: &str) {
+        for _ in 0..self.indent {
+            self.out.push_str("  ");
+        }
+        self.out.push_str(text);
+        self.out.push('\n');
+    }
+
+    fn open(&mut self, text: &str) {
+        self.line(text);
+        self.indent += 1;
+    }
+
+    fn close(&mut self, text: &str) {
+        self.indent -= 1;
+        self.line(text);
+    }
+
+    fn fresh(&mut self) -> usize {
+        let value = self.counter;
+        self.counter += 1;
+        value
+    }
+
+    /// Emits a single `if (condition) { issues.push(issue(path, message)); }` check.
+    fn push_issue(&mut self, condition: &str, path: &str, iss: &str, message: &str) {
+        self.scope.runtime_values.insert("issue");
+        self.open(&format!("if ({condition}) {{"));
+        self.line(&format!(
+            "{iss}.push(issue({path}, {}));",
+            render_ts_string(message)
+        ));
+        self.close("}");
+    }
+
+    /// Emits the `else`/`else if (value !== null)` type-mismatch arm shared by every primitive and
+    /// container gate, then closes the block. Takes the base expected-type name and widens the
+    /// mismatch message with `, null` exactly when the gate is nullable — the same flag that selects
+    /// the `!== null` arm. (Tuples are never nullable — `nullable` is a 3.0-only keyword and 3.1
+    /// tuples take the `prefixItems` path before any type-array `null` widening — so they always
+    /// take the non-nullable arm.)
+    fn close_type_gate(&mut self, nullable: bool, val: &str, path: &str, iss: &str, base: &str) {
+        let type_list = if nullable {
+            format!("{base}, null")
+        } else {
+            base.to_owned()
+        };
+        self.indent -= 1;
+        if nullable {
+            self.open(&format!("}} else if ({val} !== null) {{"));
+        } else {
+            self.open("} else {");
+        }
+        self.scope.runtime_values.insert("issue");
+        self.line(&format!(
+            "{iss}.push(issue({path}, {}));",
+            render_ts_string(&format!("expected type {type_list}"))
+        ));
+        self.close("}");
+    }
+
+    fn gen_schema(&mut self, schema: &SchemaNode, val: &str, path: &str, iss: &str) {
+        match schema {
+            SchemaNode::Ref { target, .. } => {
+                if let Some(resolved) = self
+                    .model
+                    .schema_target(&target.source_id, &target.json_pointer)
+                {
+                    self.line(&format!("validate{}({val}, {path}, {iss});", resolved.name));
+                }
+                // An unresolved reference is already reported as OASTS1305 by the types pass.
+            }
+            SchemaNode::Primitive {
+                ty,
+                format,
+                enum_values,
+                const_value,
+                meta,
+            } => {
+                self.gen_primitive(*ty, format.as_deref(), meta, val, path, iss);
+                self.gen_finite(enum_values.as_deref(), const_value.as_ref(), val, path, iss);
+            }
+            SchemaNode::Finite {
+                enum_values,
+                const_value,
+                ..
+            } => {
+                self.gen_finite(enum_values.as_deref(), const_value.as_ref(), val, path, iss);
+            }
+            SchemaNode::Object {
+                properties,
+                additional_properties,
+                dependent_required,
+                meta,
+            } => self.gen_object(
+                ObjectParts {
+                    properties,
+                    additional_properties,
+                    dependent_required,
+                    meta,
+                },
+                val,
+                path,
+                iss,
+            ),
+            SchemaNode::Array { items, meta } => self.gen_array(items, meta, val, path, iss),
+            SchemaNode::Tuple {
+                prefix_items,
+                rest,
+                meta,
+            } => self.gen_tuple(prefix_items, rest, meta, val, path, iss),
+            SchemaNode::AllOf { branches, .. } => {
+                for branch in branches {
+                    self.gen_schema(branch, val, path, iss);
+                }
+            }
+            SchemaNode::AnyOf { branches, .. } => {
+                self.gen_composition(branches, val, path, iss, Composition::AnyOf);
+            }
+            SchemaNode::OneOf { branches, .. } => {
+                self.gen_composition(branches, val, path, iss, Composition::OneOf);
+            }
+            SchemaNode::Never { .. } => {
+                // A `false` schema admits nothing; an empty body would accept every input. Reject
+                // unconditionally. `Any` accepts all (empty body is correct); `Unknown` is already
+                // rejected at generation by the reject walk.
+                self.scope.runtime_values.insert("issue");
+                self.line(&format!(
+                    "{iss}.push(issue({path}, {}));",
+                    render_ts_string("value not allowed")
+                ));
+            }
+            SchemaNode::Any { .. } | SchemaNode::Unknown { .. } => {}
+        }
+    }
+
+    fn gen_primitive(
+        &mut self,
+        ty: PrimitiveType,
+        format: Option<&str>,
+        meta: &SchemaMeta,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        let (type_condition, type_name) = match ty {
+            PrimitiveType::String => (format!("typeof {val} === \"string\""), "string"),
+            PrimitiveType::Number => (
+                format!("typeof {val} === \"number\" && Number.isFinite({val})"),
+                "number",
+            ),
+            PrimitiveType::Integer => (
+                format!("typeof {val} === \"number\" && Number.isInteger({val})"),
+                "integer",
+            ),
+            PrimitiveType::Boolean => (format!("typeof {val} === \"boolean\""), "boolean"),
+            PrimitiveType::Null => (format!("{val} === null"), "null"),
+        };
+        let widen_null = meta.nullable && !matches!(ty, PrimitiveType::Null);
+
+        self.open(&format!("if ({type_condition}) {{"));
+        match ty {
+            PrimitiveType::String => self.gen_string_constraints(format, meta, val, path, iss),
+            PrimitiveType::Number | PrimitiveType::Integer => {
+                self.gen_number_constraints(ty, format, meta, val, path, iss);
+            }
+            PrimitiveType::Boolean | PrimitiveType::Null => {}
+        }
+        self.close_type_gate(widen_null, val, path, iss, type_name);
+    }
+
+    fn gen_string_constraints(
+        &mut self,
+        format: Option<&str>,
+        meta: &SchemaMeta,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        let constraints = &meta.string_constraints;
+        if constraints.min_length.is_some() || constraints.max_length.is_some() {
+            self.scope.runtime_values.insert("codePointLength");
+        }
+        // When both bounds are present the code-point length is compared twice; compute it once
+        // into a local so the O(n) scan runs a single time. A single bound stays inline.
+        let length_expr = if constraints.min_length.is_some() && constraints.max_length.is_some() {
+            let index = self.fresh();
+            let name = format!("length{index}");
+            self.line(&format!("const {name} = codePointLength({val});"));
+            name
+        } else {
+            format!("codePointLength({val})")
+        };
+        if let Some(min) = constraints.min_length {
+            self.push_issue(
+                &format!("{length_expr} < {min}"),
+                path,
+                iss,
+                &format!("shorter than minLength {min}"),
+            );
+        }
+        if let Some(max) = constraints.max_length {
+            self.push_issue(
+                &format!("{length_expr} > {max}"),
+                path,
+                iss,
+                &format!("longer than maxLength {max}"),
+            );
+        }
+        if let Some(pattern) = &constraints.pattern {
+            let slot = self.scope.pattern_slot(pattern);
+            self.push_issue(
+                &format!("!pattern{slot}Regex().test({val})"),
+                path,
+                iss,
+                "does not match pattern",
+            );
+        }
+        if let Some(format) = format
+            && let Some((predicate, message)) = string_format_predicate(format)
+        {
+            self.scope.runtime_values.insert(predicate);
+            self.push_issue(&format!("!{predicate}({val})"), path, iss, message);
+        }
+    }
+
+    fn gen_number_constraints(
+        &mut self,
+        ty: PrimitiveType,
+        format: Option<&str>,
+        meta: &SchemaMeta,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        let constraints = &meta.numeric_constraints;
+        self.gen_bound(constraints, BoundDirection::Lower, val, path, iss);
+        self.gen_bound(constraints, BoundDirection::Upper, val, path, iss);
+        if let Some(multiple) = &constraints.multiple_of {
+            let literal = render_number_value(multiple);
+            self.scope.runtime_values.insert("isMultipleOf");
+            self.push_issue(
+                &format!("!isMultipleOf({val}, {literal})"),
+                path,
+                iss,
+                &format!("not a multiple of {literal}"),
+            );
+        }
+        if matches!(ty, PrimitiveType::Integer) && format == Some("int32") {
+            self.scope.runtime_values.insert("isInt32");
+            self.push_issue(&format!("!isInt32({val})"), path, iss, "out of int32 range");
+        }
+    }
+
+    /// Emits the inclusive/exclusive comparison checks for one direction of a numeric range.
+    /// Direction supplies the comparators and message vocabulary; the OpenAPI dialect split lives in
+    /// `exclusive`: 3.1 carries the threshold as a `Number` (its own check plus any inclusive bound),
+    /// while 3.0 carries a `Boolean` toggle that only strengthens the inclusive bound's comparator.
+    fn gen_bound(
+        &mut self,
+        constraints: &crate::ir::NumericConstraints,
+        direction: BoundDirection,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        let bound = direction.resolve(constraints);
+        match bound.exclusive {
+            Some(ExclusiveBound::Number(value)) => {
+                self.emit_threshold(
+                    val,
+                    bound.exclusive_comparator,
+                    bound.exclusive_message,
+                    value,
+                    path,
+                    iss,
+                );
+                if let Some(value) = bound.inclusive {
+                    self.emit_threshold(
+                        val,
+                        bound.inclusive_comparator,
+                        bound.inclusive_message,
+                        value,
+                        path,
+                        iss,
+                    );
+                }
+            }
+            // A 3.0 `exclusiveMinimum/Maximum: true` only strengthens the inclusive bound's
+            // comparator, so it reuses the inclusive threshold value with the exclusive vocabulary.
+            Some(ExclusiveBound::Boolean(true)) => {
+                if let Some(value) = bound.inclusive {
+                    self.emit_threshold(
+                        val,
+                        bound.exclusive_comparator,
+                        bound.exclusive_message,
+                        value,
+                        path,
+                        iss,
+                    );
+                }
+            }
+            Some(ExclusiveBound::Boolean(false)) | None => {
+                if let Some(value) = bound.inclusive {
+                    self.emit_threshold(
+                        val,
+                        bound.inclusive_comparator,
+                        bound.inclusive_message,
+                        value,
+                        path,
+                        iss,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Emits one `{val} {comparator} {literal}` range check whose message ends with the rendered
+    /// threshold literal. The comparator/message vocabulary and the threshold vary per call; this is
+    /// the single construction shared by both inclusive and exclusive bounds in either direction.
+    fn emit_threshold(
+        &mut self,
+        val: &str,
+        comparator: &str,
+        message: &str,
+        value: &Number,
+        path: &str,
+        iss: &str,
+    ) {
+        let literal = render_number_value(value);
+        self.push_issue(
+            &format!("{val} {comparator} {literal}"),
+            path,
+            iss,
+            &format!("{message} {literal}"),
+        );
+    }
+
+    fn gen_finite(
+        &mut self,
+        enum_values: Option<&[Value]>,
+        const_value: Option<&Value>,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        if let Some(values) = enum_values {
+            self.scope.runtime_values.insert("deepEqual");
+            let condition = if values.is_empty() {
+                "true".to_owned()
+            } else {
+                let members = values
+                    .iter()
+                    .map(|value| {
+                        format!(
+                            "deepEqual({val}, {})",
+                            render_json_compact(value, ObjectKeyMode::ProtoSafe)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" || ");
+                format!("!({members})")
+            };
+            self.push_issue(&condition, path, iss, "value not in enum");
+        }
+        if let Some(value) = const_value {
+            self.scope.runtime_values.insert("deepEqual");
+            self.push_issue(
+                &format!(
+                    "!deepEqual({val}, {})",
+                    render_json_compact(value, ObjectKeyMode::ProtoSafe)
+                ),
+                path,
+                iss,
+                "value not equal to const",
+            );
+        }
+    }
+
+    fn gen_object(&mut self, parts: ObjectParts<'_>, val: &str, path: &str, iss: &str) {
+        let ObjectParts {
+            properties,
+            additional_properties,
+            dependent_required,
+            meta,
+        } = parts;
+        self.scope.needs_is_record = true;
+        self.open(&format!("if (isRecord({val})) {{"));
+
+        for (name, property, property_meta) in properties {
+            if !property_in_position(property_meta, self.position) {
+                continue;
+            }
+            let key = render_ts_string(name);
+            // A no-op child (a free-form `{}`/`true` schema) validates nothing, so the whole
+            // value-descent scaffold — the own-key read, the path append, the empty body — is dead.
+            // A required such property still needs its presence enforced, which reduces to the bare
+            // own-key test; a non-required one contributes no check at all.
+            if is_noop_schema(property) {
+                if property_meta.required {
+                    self.scope.runtime_values.insert("issue");
+                    self.open(&format!("if (!Object.hasOwn({val}, {key})) {{"));
+                    self.line(&format!(
+                        "{iss}.push(issue({path}, {}));",
+                        render_ts_string(&format!("missing required property {name}"))
+                    ));
+                    self.close("}");
+                }
+                continue;
+            }
+            // Own-property presence, never `in`: `in` walks the prototype chain, so inherited names
+            // like `toString`/`constructor` would spuriously appear present. JSON wire objects only
+            // carry own keys, so this matches the frozen conformance behavior exactly.
+            self.open(&format!("if (Object.hasOwn({val}, {key})) {{"));
+            let index = self.fresh();
+            let child = format!("value{index}");
+            let child_path = format!("path{index}");
+            self.line(&format!("const {child}: unknown = {val}[{key}];"));
+            self.scope.runtime_values.insert("appendKey");
+            self.line(&format!("const {child_path} = appendKey({path}, {key});"));
+            self.gen_schema(property, &child, &child_path, iss);
+            if property_meta.required {
+                self.indent -= 1;
+                self.open("} else {");
+                self.scope.runtime_values.insert("issue");
+                self.line(&format!(
+                    "{iss}.push(issue({path}, {}));",
+                    render_ts_string(&format!("missing required property {name}"))
+                ));
+                self.close("}");
+            } else {
+                self.close("}");
+            }
+        }
+
+        for (trigger, dependents) in dependent_required {
+            // Own-property presence (see the property-presence site): `in` would let an inherited
+            // trigger/dependent name forge or defeat a dependentRequired constraint.
+            self.open(&format!(
+                "if (Object.hasOwn({val}, {})) {{",
+                render_ts_string(trigger)
+            ));
+            for dependent in dependents {
+                self.scope.runtime_values.insert("issue");
+                self.open(&format!(
+                    "if (!Object.hasOwn({val}, {})) {{",
+                    render_ts_string(dependent)
+                ));
+                self.line(&format!(
+                    "{iss}.push(issue({path}, {}));",
+                    render_ts_string(&format!("missing required property {dependent}"))
+                ));
+                self.close("}");
+            }
+            self.close("}");
+        }
+
+        // `Object.keys(value)` backs the additional-properties iteration and each of
+        // minProperties/maxProperties. When at least two of those consume it, evaluate it once into
+        // a local and reuse; a lone consumer keeps the inline call to avoid a needless binding.
+        let keys_iteration = match additional_properties {
+            AdditionalProperties::Forbidden => true,
+            AdditionalProperties::Schema(sub) => !is_noop_schema(sub),
+            AdditionalProperties::Allowed(_) => false,
+        };
+        let min = meta.object_constraints.min_properties;
+        let max = meta.object_constraints.max_properties;
+        let keys_uses = keys_iteration as usize + min.is_some() as usize + max.is_some() as usize;
+        let keys_expr = if keys_uses >= 2 {
+            let index = self.fresh();
+            let name = format!("keys{index}");
+            self.line(&format!("const {name} = Object.keys({val});"));
+            name
+        } else {
+            format!("Object.keys({val})")
+        };
+
+        self.gen_additional_properties(
+            additional_properties,
+            properties,
+            val,
+            path,
+            iss,
+            &keys_expr,
+        );
+
+        if let Some(min) = min {
+            self.push_issue(
+                &format!("{keys_expr}.length < {min}"),
+                path,
+                iss,
+                &format!("fewer properties than minProperties {min}"),
+            );
+        }
+        if let Some(max) = max {
+            self.push_issue(
+                &format!("{keys_expr}.length > {max}"),
+                path,
+                iss,
+                &format!("more properties than maxProperties {max}"),
+            );
+        }
+
+        self.close_type_gate(meta.nullable, val, path, iss, "object");
+    }
+
+    fn gen_additional_properties(
+        &mut self,
+        additional: &AdditionalProperties,
+        properties: &[(String, SchemaNode, PropMeta)],
+        val: &str,
+        path: &str,
+        iss: &str,
+        keys_expr: &str,
+    ) {
+        match additional {
+            AdditionalProperties::Forbidden => {
+                let condition = unknown_key_condition(properties);
+                self.open(&format!("for (const key of {keys_expr}) {{"));
+                self.scope.runtime_values.insert("issue");
+                self.scope.runtime_values.insert("appendKey");
+                self.open(&format!("if ({condition}) {{"));
+                self.line(&format!(
+                    "{iss}.push(issue(appendKey({path}, key), \"unexpected property\"));"
+                ));
+                self.close("}");
+                self.close("}");
+            }
+            // A no-op additional schema (`additionalProperties: {}`) validates every extra key
+            // against nothing, so the whole iteration is dead — treat it like the permissive default.
+            AdditionalProperties::Schema(sub) if !is_noop_schema(sub) => {
+                let condition = unknown_key_condition(properties);
+                self.open(&format!("for (const key of {keys_expr}) {{"));
+                self.open(&format!("if ({condition}) {{"));
+                let index = self.fresh();
+                let child = format!("value{index}");
+                let child_path = format!("path{index}");
+                self.line(&format!("const {child}: unknown = {val}[key];"));
+                self.scope.runtime_values.insert("appendKey");
+                self.line(&format!("const {child_path} = appendKey({path}, key);"));
+                self.gen_schema(sub, &child, &child_path, iss);
+                self.close("}");
+                self.close("}");
+            }
+            AdditionalProperties::Schema(_) | AdditionalProperties::Allowed(_) => {}
+        }
+    }
+
+    fn gen_array(
+        &mut self,
+        items: &SchemaNode,
+        meta: &SchemaMeta,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        self.scope.needs_is_array = true;
+        self.open(&format!("if (isArray({val})) {{"));
+        // A no-op element schema (`items: {}`/`true`) validates every element against nothing, so
+        // the per-element loop and its path scaffold are dead; the length/uniqueness constraints
+        // and the array type gate still apply.
+        if !is_noop_schema(items) {
+            let index = self.fresh();
+            let element = format!("value{index}");
+            let element_path = format!("path{index}");
+            self.open(&format!(
+                "for (let index{index} = 0; index{index} < {val}.length; index{index} += 1) {{"
+            ));
+            self.line(&format!("const {element}: unknown = {val}[index{index}];"));
+            self.scope.runtime_values.insert("appendKey");
+            self.line(&format!(
+                "const {element_path} = appendKey({path}, index{index});"
+            ));
+            self.gen_schema(items, &element, &element_path, iss);
+            self.close("}");
+        }
+        self.gen_array_constraints(meta, val, path, iss);
+        self.close_type_gate(meta.nullable, val, path, iss, "array");
+    }
+
+    fn gen_tuple(
+        &mut self,
+        prefix_items: &[SchemaNode],
+        rest: &TupleRest,
+        meta: &SchemaMeta,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        self.scope.needs_is_array = true;
+        self.open(&format!("if (isArray({val})) {{"));
+        for (position_index, prefix) in prefix_items.iter().enumerate() {
+            // A no-op prefix schema validates its position against nothing, so both the
+            // length-guard block and its value/path scaffold are dead — skip the whole position.
+            if is_noop_schema(prefix) {
+                continue;
+            }
+            self.open(&format!("if ({val}.length > {position_index}) {{"));
+            let index = self.fresh();
+            let element = format!("value{index}");
+            let element_path = format!("path{index}");
+            self.line(&format!(
+                "const {element}: unknown = {val}[{position_index}];"
+            ));
+            self.scope.runtime_values.insert("appendKey");
+            self.line(&format!(
+                "const {element_path} = appendKey({path}, {position_index});"
+            ));
+            self.gen_schema(prefix, &element, &element_path, iss);
+            self.close("}");
+        }
+        let prefix_len = prefix_items.len();
+        match rest {
+            // A no-op rest schema validates trailing elements against nothing, so the rest loop is
+            // dead; the length/uniqueness constraints below still apply.
+            TupleRest::Schema(sub) if !is_noop_schema(sub) => {
+                let index = self.fresh();
+                let element = format!("value{index}");
+                let element_path = format!("path{index}");
+                self.open(&format!(
+                    "for (let index{index} = {prefix_len}; index{index} < {val}.length; index{index} += 1) {{"
+                ));
+                self.line(&format!("const {element}: unknown = {val}[index{index}];"));
+                self.scope.runtime_values.insert("appendKey");
+                self.line(&format!(
+                    "const {element_path} = appendKey({path}, index{index});"
+                ));
+                self.gen_schema(sub, &element, &element_path, iss);
+                self.close("}");
+            }
+            TupleRest::Schema(_) => {}
+            TupleRest::Forbidden => {
+                // The types artifact caps the tuple length; reject any element past the fixed
+                // prefix, reusing the length-bound message vocabulary.
+                self.push_issue(
+                    &format!("{val}.length > {prefix_len}"),
+                    path,
+                    iss,
+                    &format!("more items than maxItems {prefix_len}"),
+                );
+            }
+            TupleRest::Allowed => {}
+        }
+        // minItems/maxItems/uniqueItems apply to tuples too (the parser populates
+        // meta.array_constraints for tuple nodes); emit them after the element checks, matching
+        // gen_array's relative order so issue order stays consistent between the two array shapes.
+        self.gen_array_constraints(meta, val, path, iss);
+        self.close_type_gate(meta.nullable, val, path, iss, "array");
+    }
+
+    fn gen_array_constraints(&mut self, meta: &SchemaMeta, val: &str, path: &str, iss: &str) {
+        let constraints = &meta.array_constraints;
+        if let Some(min) = constraints.min_items {
+            self.push_issue(
+                &format!("{val}.length < {min}"),
+                path,
+                iss,
+                &format!("fewer items than minItems {min}"),
+            );
+        }
+        if let Some(max) = constraints.max_items {
+            self.push_issue(
+                &format!("{val}.length > {max}"),
+                path,
+                iss,
+                &format!("more items than maxItems {max}"),
+            );
+        }
+        if constraints.unique_items {
+            self.scope.runtime_values.insert("deepEqual");
+            self.scope.runtime_values.insert("issue");
+            let index = self.fresh();
+            let unique = format!("unique{index}");
+            self.line(&format!("let {unique} = true;"));
+            self.open(&format!(
+                "for (let i{index} = 0; {unique} && i{index} < {val}.length; i{index} += 1) {{"
+            ));
+            self.open(&format!(
+                "for (let j{index} = i{index} + 1; {unique} && j{index} < {val}.length; j{index} += 1) {{"
+            ));
+            self.open(&format!(
+                "if (deepEqual({val}[i{index}], {val}[j{index}])) {{"
+            ));
+            self.line(&format!("{unique} = false;"));
+            self.close("}");
+            self.close("}");
+            self.close("}");
+            self.open(&format!("if (!{unique}) {{"));
+            self.line(&format!("{iss}.push(issue({path}, \"items not unique\"));"));
+            self.close("}");
+        }
+    }
+
+    fn gen_composition(
+        &mut self,
+        branches: &[SchemaNode],
+        val: &str,
+        path: &str,
+        iss: &str,
+        kind: Composition,
+    ) {
+        self.scope.runtime_values.insert("issue");
+        let index = self.fresh();
+        let counter = format!("matches{index}");
+        self.line(&format!("let {counter} = 0;"));
+        // Once the verdict is decided, stop probing: anyOf passes at the first match, and oneOf
+        // fails as soon as a second match appears. The guard limit is that decisive count. This is
+        // semantics-neutral — branch issues go to discarded scratch arrays, and the surfaced verdict
+        // and single composition issue depend only on whether `matches` is 0 / exactly 1 / >= 2,
+        // which the early exit preserves.
+        let limit = match kind {
+            Composition::AnyOf => 1,
+            Composition::OneOf => 2,
+        };
+        for branch in branches {
+            self.open(&format!("if ({counter} < {limit}) {{"));
+            let scratch_index = self.fresh();
+            let scratch = format!("issues{scratch_index}");
+            self.line(&format!("const {scratch}: Issue[] = [];"));
+            self.gen_schema(branch, val, path, &scratch);
+            self.open(&format!("if ({scratch}.length === 0) {{"));
+            self.line(&format!("{counter} += 1;"));
+            self.close("}");
+            self.close("}");
+        }
+        let (condition, message) = match kind {
+            Composition::AnyOf => (format!("{counter} === 0"), "no anyOf branch matched"),
+            Composition::OneOf => (
+                format!("{counter} !== 1"),
+                "expected exactly one oneOf branch to match",
+            ),
+        };
+        self.open(&format!("if ({condition}) {{"));
+        self.line(&format!(
+            "{iss}.push(issue({path}, {}));",
+            render_ts_string(message)
+        ));
+        self.close("}");
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Composition {
+    AnyOf,
+    OneOf,
+}
+
+/// The borrowed pieces of a `SchemaNode::Object`, grouped so object generation takes one argument.
+struct ObjectParts<'a> {
+    properties: &'a [(String, SchemaNode, PropMeta)],
+    additional_properties: &'a AdditionalProperties,
+    dependent_required: &'a [(String, Vec<String>)],
+    meta: &'a SchemaMeta,
+}
+
+/// A schema whose validate body is empty, so descending into it emits only dead scaffold. These
+/// are exactly the nodes `gen_schema` handles as a no-op: a free-form `{}`/`true` schema (`Any`)
+/// and an unknown leaf (`Unknown`, which additionally fails the run via the reject walk, so it never
+/// reaches committed output). Callers skip the value/path bindings and loops around such children.
+fn is_noop_schema(schema: &SchemaNode) -> bool {
+    matches!(schema, SchemaNode::Any { .. } | SchemaNode::Unknown { .. })
+}
+
+fn unknown_key_condition(properties: &[(String, SchemaNode, PropMeta)]) -> String {
+    if properties.is_empty() {
+        return "true".to_owned();
+    }
+    properties
+        .iter()
+        .map(|(name, _, _)| format!("key !== {}", render_ts_string(name)))
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+fn string_format_predicate(format: &str) -> Option<(&'static str, &'static str)> {
+    match format {
+        "date-time" => Some(("isDateTime", "invalid date-time format")),
+        "date" => Some(("isDate", "invalid date format")),
+        "time" => Some(("isTime", "invalid time format")),
+        "uuid" => Some(("isUuid", "invalid uuid format")),
+        _ => None,
+    }
+}
+
+/// One direction (lower or upper) of a numeric range. Carries the comparators and message
+/// vocabulary that differ between the two directions while `gen_bound` owns the shared control flow.
+#[derive(Clone, Copy)]
+enum BoundDirection {
+    Lower,
+    Upper,
+}
+
+/// The direction-specific pieces `gen_bound` consumes: this direction's threshold fields on the
+/// schema plus the comparator and message text used to render each check.
+struct Bound<'a> {
+    inclusive: &'a Option<Number>,
+    exclusive: &'a Option<ExclusiveBound>,
+    inclusive_comparator: &'static str,
+    exclusive_comparator: &'static str,
+    inclusive_message: &'static str,
+    exclusive_message: &'static str,
+}
+
+impl BoundDirection {
+    fn resolve(self, constraints: &crate::ir::NumericConstraints) -> Bound<'_> {
+        match self {
+            BoundDirection::Lower => Bound {
+                inclusive: &constraints.minimum,
+                exclusive: &constraints.exclusive_minimum,
+                inclusive_comparator: "<",
+                exclusive_comparator: "<=",
+                inclusive_message: "less than minimum",
+                exclusive_message: "not greater than exclusiveMinimum",
+            },
+            BoundDirection::Upper => Bound {
+                inclusive: &constraints.maximum,
+                exclusive: &constraints.exclusive_maximum,
+                inclusive_comparator: ">",
+                exclusive_comparator: ">=",
+                inclusive_message: "greater than maximum",
+                exclusive_message: "not less than exclusiveMaximum",
+            },
+        }
+    }
+}
+
+// --- component and operation emission ----------------------------------------------------------
+
+/// One emitted validator: its exported structural type declaration plus the validate/checked/const
+/// trio built from an already-generated validate body.
+struct Decl {
+    type_declaration: String,
+    validator: String,
+}
+
+fn emit_component(
+    model: &mut EmissionModel<'_, '_>,
+    schema_index: usize,
+    name: &str,
+) -> Option<GeneratedFile> {
+    let analyzed = model.analyzed;
+    let file_base = model.component_files[schema_index].clone()?;
+    let schema = &analyzed.ir.schemas[schema_index];
+
+    let mut scope = FileScope::default();
+    let mut imports = SiblingImports::default();
+
+    // Phase 1: render the structural type and collect sibling imports through the shared emitter.
+    let type_declaration = {
+        let emitter = Emitter::new(model);
+        let mut declaration = String::new();
+        emitter.write_schema_declaration(
+            &mut declaration,
+            name,
+            &schema.schema,
+            TypePosition::Neutral,
+            &schema.source,
+        );
+        imports.collect(
+            &emitter,
+            &schema.schema,
+            TypePosition::Neutral,
+            Some(schema_index),
+        );
+        declaration
+    };
+
+    // Phase 2: generate the validate body (needs schema_target lookups; the emitter is dropped).
+    let mut body = FnBody::new(&mut scope, model, TypePosition::Neutral);
+    body.gen_schema(&schema.schema, "value", "path", "issues");
+    let validator = render_validator(name, &body.out);
+    let declarations = vec![Decl {
+        type_declaration,
+        validator,
+    }];
+
+    let content = assemble_file(model, "./", &imports, &scope, &declarations);
+    let relative_path = format!("validators/components/{file_base}.ts");
+    model.register_path(&relative_path, &schema.source);
+    Some(GeneratedFile {
+        relative_path,
+        content,
+    })
+}
+
+fn emit_operation(
+    model: &mut EmissionModel<'_, '_>,
+    operation_index: usize,
+    allocated_name: &str,
+) -> Option<GeneratedFile> {
+    let analyzed = model.analyzed;
+    let file_base = model.operation_files[operation_index].clone()?;
+    let operation = &analyzed.ir.operations[operation_index];
+    let stem = uppercase_first(allocated_name);
+
+    // Deterministic list of (export type name, schema, wire position) to validate: every parameter,
+    // the JSON request body, and every JSON response branch (4XX/default included).
+    let mut positions: Vec<(String, &SchemaNode, TypePosition)> = Vec::new();
+    for (export_type, parameter) in operation_parameter_validator_names(operation, &stem)
+        .into_iter()
+        .zip(&operation.parameters)
+    {
+        positions.push((export_type, &parameter.schema, TypePosition::Request));
+    }
+    if let Some(body) = &operation.request_body
+        && let Some(media) = body
+            .media_types
+            .iter()
+            .find(|media| media_is_json(&media.name))
+    {
+        positions.push((
+            format!("{stem}RequestBody"),
+            &media.schema,
+            TypePosition::Request,
+        ));
+    }
+    let mut responses: Vec<(String, &SchemaNode)> = Vec::new();
+    for response in &operation.responses {
+        if let Some(media) = response
+            .media_types
+            .iter()
+            .find(|media| media_is_json(&media.name))
+        {
+            let suffix = response_status_type_suffix(&response.status);
+            responses.push((format!("{stem}Response{suffix}"), &media.schema));
+        }
+    }
+    responses.sort_by(|left, right| left.0.cmp(&right.0));
+    for (export_type, schema) in responses {
+        positions.push((export_type, schema, TypePosition::Response));
+    }
+
+    if positions.is_empty() {
+        return None;
+    }
+
+    let mut scope = FileScope::default();
+    let mut imports = SiblingImports::default();
+
+    // Phase 1: render each position's type alias and collect sibling imports.
+    let type_declarations: Vec<String> = {
+        let emitter = Emitter::new(model);
+        positions
+            .iter()
+            .map(|(export_type, schema, position)| {
+                imports.collect(&emitter, schema, *position, None);
+                format!(
+                    "export type {export_type} = {};\n",
+                    emitter.render_type(schema, *position, 0)
+                )
+            })
+            .collect()
+    };
+
+    // Phase 2: generate validate bodies.
+    let mut declarations = Vec::with_capacity(positions.len());
+    for ((export_type, schema, position), type_declaration) in
+        positions.iter().zip(type_declarations)
+    {
+        let mut body = FnBody::new(&mut scope, model, *position);
+        body.gen_schema(schema, "value", "path", "issues");
+        declarations.push(Decl {
+            type_declaration,
+            validator: render_validator(export_type, &body.out),
+        });
+    }
+
+    let content = assemble_file(model, "../components/", &imports, &scope, &declarations);
+    let relative_path = format!("validators/operations/{file_base}.ts");
+    model.register_path(&relative_path, &operation.source);
+    Some(GeneratedFile {
+        relative_path,
+        content,
+    })
+}
+
+/// The validator export-type name for each of `operation`'s parameters, aligned 1:1 with
+/// `operation.parameters` (cookie parameters included — they carry a validator in the standalone
+/// artifact even though the fetch client rejects them). The validators emitter and the client
+/// request binding both derive their per-parameter check names here, so the imported call names
+/// stay in lockstep with the exported ones.
+pub(super) fn operation_parameter_validator_names(
+    operation: &Operation,
+    stem: &str,
+) -> Vec<String> {
+    let mut names = Vec::with_capacity(operation.parameters.len());
+    let mut used: HashSet<String> = HashSet::new();
+    for (index, parameter) in operation.parameters.iter().enumerate() {
+        let location = location_title(parameter.location);
+        let name_part = normalize_identifier(&parameter.name, TargetCase::Pascal)
+            .unwrap_or_else(|_| format!("Param{index}"));
+        let base = format!("{stem}{location}{name_part}");
+        let mut export_type = base.clone();
+        // The disambiguation suffix must vary per attempt: a fixed `{base}{index}` can itself
+        // collide with another parameter's base name (case-only names collapse under Pascal
+        // normalization), and re-inserting an already-taken name never terminates. Start at this
+        // parameter's index — preserving the single-collision name — and bump until a name is free.
+        let mut suffix = index;
+        while !used.insert(export_type.clone()) {
+            export_type = format!("{base}{suffix}");
+            suffix += 1;
+        }
+        names.push(export_type);
+    }
+    names
+}
+
+fn location_title(location: ParamLocation) -> &'static str {
+    match location {
+        ParamLocation::Path => "Path",
+        ParamLocation::Query => "Query",
+        ParamLocation::Header => "Header",
+        ParamLocation::Cookie => "Cookie",
+    }
+}
+
+/// The `validate`/`checked`/const trio for one export, given its already-generated validate body.
+fn render_validator(export_type: &str, body: &str) -> String {
+    let const_name = format!("{}Validator", lowercase_first(export_type));
+    let mut output = String::new();
+    output.push_str(&format!(
+        "export function validate{export_type}(value: unknown, path: readonly (string | number)[], issues: Issue[]): void {{\n"
+    ));
+    output.push_str(body);
+    output.push_str("}\n\n");
+    output.push_str(&format!(
+        "function checked{export_type}(value: unknown, issues: Issue[]): value is {export_type} {{\n  validate{export_type}(value, [], issues);\n  return issues.length === 0;\n}}\n\n"
+    ));
+    output.push_str(&format!(
+        "export const {const_name}: SyncStandardSchemaV1<{export_type}> = {{\n"
+    ));
+    output.push_str("  \"~standard\": {\n");
+    output.push_str("    version: 1,\n");
+    output.push_str("    vendor: \"oasts\",\n");
+    output.push_str("    validate(value) {\n");
+    output.push_str("      const issues: Issue[] = [];\n");
+    output.push_str(&format!(
+        "      return checked{export_type}(value, issues) ? {{ value }} : {{ issues }};\n"
+    ));
+    output.push_str("    },\n");
+    output.push_str("    types: undefined,\n");
+    output.push_str("  },\n");
+    output.push_str("};\n");
+    output
+}
+
+// --- sibling import collection -----------------------------------------------------------------
+
+/// Per-file-base type names and validate-function names imported from sibling validator files.
+#[derive(Default)]
+struct SiblingImports {
+    files: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>,
+}
+
+impl SiblingImports {
+    /// Records the type + validate imports for every `$ref` reachable from `schema` in `position`.
+    /// `skip_self` excludes a component's self-reference (its own type and validate live locally).
+    fn collect(
+        &mut self,
+        emitter: &Emitter<'_, '_, '_>,
+        schema: &SchemaNode,
+        position: TypePosition,
+        skip_self: Option<usize>,
+    ) {
+        emitter.walk_refs(schema, position, &mut |target| {
+            if Some(target.index) == skip_self {
+                return;
+            }
+            let entry = self.files.entry(target.file_base.clone()).or_default();
+            entry.0.insert(target.variant_name(position));
+            entry.1.insert(format!("validate{}", target.name));
+        });
+    }
+}
+
+// --- file assembly -----------------------------------------------------------------------------
+
+fn assemble_file(
+    model: &EmissionModel<'_, '_>,
+    sibling_prefix: &str,
+    imports: &SiblingImports,
+    scope: &FileScope,
+    declarations: &[Decl],
+) -> String {
+    let extension = import_extension(model);
+    let mut output = model.header();
+
+    output.push_str(&format!(
+        "import type {{ SyncStandardSchemaV1 }} from {};\n",
+        render_ts_string(&format!("../standard-schema{extension}"))
+    ));
+    let runtime_values = std::iter::once("type Issue".to_owned())
+        .chain(scope.runtime_values.iter().map(|value| (*value).to_owned()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    output.push_str(&format!(
+        "import {{ {runtime_values} }} from {};\n",
+        render_ts_string(&format!("../runtime{extension}"))
+    ));
+    for (file_base, (type_names, value_names)) in &imports.files {
+        let specifiers = type_names
+            .iter()
+            .map(|name| format!("type {name}"))
+            .chain(value_names.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(
+            "import {{ {specifiers} }} from {};\n",
+            render_ts_string(&format!("{sibling_prefix}{file_base}{extension}"))
+        ));
+    }
+    output.push('\n');
+
+    if scope.needs_is_record {
+        output.push_str(
+            "function isRecord(value: unknown): value is Record<string, unknown> {\n  return typeof value === \"object\" && value !== null && !Array.isArray(value);\n}\n\n",
+        );
+    }
+    if scope.needs_is_array {
+        output.push_str(
+            "function isArray(value: unknown): value is readonly unknown[] {\n  return Array.isArray(value);\n}\n\n",
+        );
+    }
+    for (slot, pattern) in scope.patterns.iter().enumerate() {
+        output.push_str(&format!("let pattern{slot}: RegExp | undefined;\n"));
+        output.push_str(&format!("function pattern{slot}Regex(): RegExp {{\n"));
+        output.push_str(&format!(
+            "  return (pattern{slot} ??= new RegExp({}));\n",
+            render_ts_string(pattern)
+        ));
+        output.push_str("}\n\n");
+    }
+
+    for (index, declaration) in declarations.iter().enumerate() {
+        output.push_str(&declaration.type_declaration);
+        output.push('\n');
+        output.push_str(&declaration.validator);
+        if index + 1 < declarations.len() {
+            output.push('\n');
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::config::load_config;
+    use crate::diag::{Diagnostic, DiagnosticSink, Severity};
+    use crate::emit::emit_artifacts;
+    use crate::loader::load_graph;
+    use crate::parse::parse;
+    use crate::semantic::analyze;
+
+    /// Compiles an OpenAPI document with the validators artifact enabled, returning the emitted
+    /// files and the sorted diagnostics. Mirrors the pipeline stages so the reject walk runs.
+    fn compile(document: Value) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
+        let temp = TempDir::new().expect("temp directory");
+        let input = temp.path().join("openapi.json");
+        let config_path = temp.path().join("oasts.json");
+        fs::write(
+            &input,
+            serde_json::to_vec(&document).expect("document JSON"),
+        )
+        .expect("write document");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "./openapi.json" },
+            "output": "./generated",
+            "artifacts": { "types": true, "validators": true }
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&config).expect("config JSON"),
+        )
+        .expect("write config");
+        let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let mut sink = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let ir = parse(&graph, &mut sink).expect("input parses");
+        let analyzed = analyze(ir, &resolved, &mut sink);
+        let files = emit_artifacts(
+            &analyzed,
+            &resolved,
+            &graph.source_tuples(),
+            None,
+            &mut sink,
+        );
+        (files, sink.into_sorted_vec())
+    }
+
+    fn doc_31(schemas: Value) -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "components": { "schemas": schemas }
+        })
+    }
+
+    fn doc_30(schemas: Value) -> Value {
+        json!({
+            "openapi": "3.0.3",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "components": { "schemas": schemas }
+        })
+    }
+
+    fn component(files: &[GeneratedFile], base: &str) -> String {
+        files
+            .iter()
+            .find(|file| file.relative_path == format!("validators/components/{base}.ts"))
+            .expect("component validator file")
+            .content
+            .clone()
+    }
+
+    fn assert_clean(diagnostics: &[Diagnostic]) {
+        assert!(
+            !diagnostics.iter().any(|d| d.severity == Severity::Error),
+            "unexpected errors: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn runtime_and_standard_schema_assets_emit_verbatim_without_a_header() {
+        let (files, diagnostics) = compile(doc_31(json!({ "Thing": { "type": "string" } })));
+        assert_clean(&diagnostics);
+        let runtime = files
+            .iter()
+            .find(|f| f.relative_path == "validators/runtime.ts")
+            .expect("runtime.ts");
+        // Verbatim kernel: exported ABI helpers present, and no generated header banner.
+        assert!(runtime.content.contains("export function isMultipleOf"));
+        assert!(runtime.content.contains("export function codePointLength"));
+        assert!(!runtime.content.contains("Generated by Oasts"));
+        let standard = files
+            .iter()
+            .find(|f| f.relative_path == "validators/standard-schema.ts")
+            .expect("standard-schema.ts");
+        assert!(
+            standard
+                .content
+                .contains("export interface SyncStandardSchemaV1")
+        );
+        assert!(!standard.content.contains("Generated by Oasts"));
+    }
+
+    #[test]
+    fn primitive_domains_render_each_type_condition_and_message() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Prims": {
+                "type": "object",
+                "properties": {
+                    "s": { "type": "string" },
+                    "n": { "type": "number" },
+                    "i": { "type": "integer" },
+                    "b": { "type": "boolean" }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "prims");
+        assert!(content.contains("if (typeof value0 === \"string\") {"));
+        assert!(content.contains("issues.push(issue(path0, \"expected type string\"));"));
+        assert!(content.contains("if (typeof value1 === \"number\" && Number.isFinite(value1)) {"));
+        assert!(content.contains("issues.push(issue(path1, \"expected type number\"));"));
+        assert!(
+            content.contains("if (typeof value2 === \"number\" && Number.isInteger(value2)) {")
+        );
+        assert!(content.contains("issues.push(issue(path2, \"expected type integer\"));"));
+        assert!(content.contains("if (typeof value3 === \"boolean\") {"));
+        assert!(content.contains("issues.push(issue(path3, \"expected type boolean\"));"));
+    }
+
+    #[test]
+    fn non_object_root_reports_object_mismatch_at_root_path() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": { "type": "object", "properties": { "a": { "type": "string" } } }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (isRecord(value)) {"));
+        assert!(content.contains("issues.push(issue(path, \"expected type object\"));"));
+    }
+
+    #[test]
+    fn type_array_null_widens_the_type_message() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": { "nickname": { "type": ["string", "null"] } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (typeof value0 === \"string\") {"));
+        assert!(content.contains("} else if (value0 !== null) {"));
+        assert!(content.contains("issues.push(issue(path0, \"expected type string, null\"));"));
+    }
+
+    #[test]
+    fn oas30_nullable_widens_the_type_message() {
+        let (files, diagnostics) = compile(doc_30(json!({
+            "Thing": {
+                "type": "object",
+                "properties": { "nickname": { "type": "string", "nullable": true } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("} else if (value0 !== null) {"));
+        assert!(content.contains("issues.push(issue(path0, \"expected type string, null\"));"));
+    }
+
+    #[test]
+    fn oas30_boolean_exclusive_bounds_use_the_coupled_minimum_and_maximum() {
+        let (files, diagnostics) = compile(doc_30(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "v": {
+                        "type": "number",
+                        "minimum": 5,
+                        "exclusiveMinimum": true,
+                        "maximum": 10,
+                        "exclusiveMaximum": true
+                    }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (value0 <= 5) {"));
+        assert!(
+            content.contains("issues.push(issue(path0, \"not greater than exclusiveMinimum 5\"));")
+        );
+        assert!(content.contains("if (value0 >= 10) {"));
+        assert!(
+            content.contains("issues.push(issue(path0, \"not less than exclusiveMaximum 10\"));")
+        );
+        // The boolean modifier replaces the inclusive bound; the plain minimum/maximum must not fire.
+        assert!(!content.contains("less than minimum"));
+        assert!(!content.contains("greater than maximum"));
+    }
+
+    #[test]
+    fn numeric_31_exclusive_bounds_and_multiple_of_render_the_schema_literal() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "r": { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
+                    "t": { "type": "number", "multipleOf": 0.1 }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (value0 <= 0) {"));
+        assert!(
+            content.contains("issues.push(issue(path0, \"not greater than exclusiveMinimum 0\"));")
+        );
+        assert!(content.contains("if (value0 >= 1) {"));
+        assert!(
+            content.contains("issues.push(issue(path0, \"not less than exclusiveMaximum 1\"));")
+        );
+        assert!(content.contains("if (!isMultipleOf(value1, 0.1)) {"));
+        assert!(content.contains("issues.push(issue(path1, \"not a multiple of 0.1\"));"));
+    }
+
+    #[test]
+    fn numeric_31_inclusive_and_numeric_exclusive_bounds_both_emit() {
+        // In 3.1 `minimum`/`exclusiveMinimum` (and the maximum pair) are independent keywords, so a
+        // schema carrying both emits the exclusive check alongside the inclusive one in each
+        // direction — the exclusive-Number arm still emits the inclusive bound after its own.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "v": {
+                        "type": "number",
+                        "minimum": 0,
+                        "exclusiveMinimum": 2,
+                        "maximum": 10,
+                        "exclusiveMaximum": 8
+                    }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (value0 <= 2) {"));
+        assert!(
+            content.contains("issues.push(issue(path0, \"not greater than exclusiveMinimum 2\"));")
+        );
+        assert!(content.contains("if (value0 < 0) {"));
+        assert!(content.contains("issues.push(issue(path0, \"less than minimum 0\"));"));
+        assert!(content.contains("if (value0 >= 8) {"));
+        assert!(
+            content.contains("issues.push(issue(path0, \"not less than exclusiveMaximum 8\"));")
+        );
+        assert!(content.contains("if (value0 > 10) {"));
+        assert!(content.contains("issues.push(issue(path0, \"greater than maximum 10\"));"));
+    }
+
+    #[test]
+    fn string_length_and_pattern_constraints_render() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "s": { "type": "string", "minLength": 1, "maxLength": 20, "pattern": "[0-9]" }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        // Both length bounds present: the code-point length is scanned once into a local reused by
+        // each comparison, never recomputed per bound.
+        assert!(content.contains("const length1 = codePointLength(value0);"));
+        assert!(content.contains("if (length1 < 1) {"));
+        assert!(content.contains("issues.push(issue(path0, \"shorter than minLength 1\"));"));
+        assert!(content.contains("if (length1 > 20) {"));
+        assert!(content.contains("issues.push(issue(path0, \"longer than maxLength 20\"));"));
+        assert_eq!(content.matches("codePointLength(value0)").count(), 1);
+        assert!(content.contains("if (!pattern0Regex().test(value0)) {"));
+        assert!(content.contains("issues.push(issue(path0, \"does not match pattern\"));"));
+    }
+
+    #[test]
+    fn a_single_length_bound_stays_inline_without_a_hoisted_local() {
+        // A lone bound is computed once already, so hoisting would only add a needless binding.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": { "s": { "type": "string", "minLength": 1 } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (codePointLength(value0) < 1) {"));
+        assert!(!content.contains("const length"));
+    }
+
+    #[test]
+    fn lazy_regex_cache_is_module_scoped_with_no_top_level_construction() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": { "s": { "type": "string", "pattern": "^[A-Za-z0-9-]+$" } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("let pattern0: RegExp | undefined;"));
+        assert!(content.contains(
+            "function pattern0Regex(): RegExp {\n  return (pattern0 ??= new RegExp(\"^[A-Za-z0-9-]+$\"));\n}"
+        ));
+        // The only `new RegExp` is inside the lazy getter — never at module top level.
+        assert_eq!(content.matches("new RegExp").count(), 1);
+    }
+
+    #[test]
+    fn asserted_formats_call_the_kernel_predicate() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string", "format": "date-time" },
+                    "b": { "type": "string", "format": "date" },
+                    "c": { "type": "string", "format": "time" },
+                    "d": { "type": "string", "format": "uuid" },
+                    "e": { "type": "integer", "format": "int32" }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (!isDateTime(value0)) {"));
+        assert!(content.contains("\"invalid date-time format\""));
+        assert!(content.contains("if (!isDate(value1)) {"));
+        assert!(content.contains("\"invalid date format\""));
+        assert!(content.contains("if (!isTime(value2)) {"));
+        assert!(content.contains("\"invalid time format\""));
+        assert!(content.contains("if (!isUuid(value3)) {"));
+        assert!(content.contains("\"invalid uuid format\""));
+        assert!(content.contains("if (!isInt32(value4)) {"));
+        assert!(content.contains("\"out of int32 range\""));
+    }
+
+    #[test]
+    fn annotation_only_formats_assert_nothing_beyond_type() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "e": { "type": "string", "format": "email" },
+                    "u": { "type": "string", "format": "uri" }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(!content.contains("isEmail"));
+        assert!(!content.contains("format"));
+        // Both string properties still type-check but carry no format assertion.
+        assert_eq!(content.matches("=== \"string\"").count(), 2);
+    }
+
+    #[test]
+    fn enum_and_const_use_deep_equality() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string", "enum": ["a", "b"] },
+                    "species": { "type": "string", "const": "canis" }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (!(deepEqual(value0, \"a\") || deepEqual(value0, \"b\"))) {"));
+        assert!(content.contains("issues.push(issue(path0, \"value not in enum\"));"));
+        assert!(content.contains("if (!deepEqual(value1, \"canis\")) {"));
+        assert!(content.contains("issues.push(issue(path1, \"value not equal to const\"));"));
+    }
+
+    #[test]
+    fn open_closed_and_schema_valued_objects_handle_additional_properties() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Open": {
+                "type": "object",
+                "properties": { "a": { "type": "string" } }
+            },
+            "Closed": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["label"],
+                "properties": { "label": { "type": "string" } }
+            },
+            "Bag": {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 3,
+                "additionalProperties": { "type": "integer" },
+                "properties": { "kind": { "type": "string" } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let open = component(&files, "open");
+        assert!(!open.contains("unexpected property"));
+        assert!(!open.contains("Object.keys(value)"));
+        let closed = component(&files, "closed");
+        assert!(closed.contains("for (const key of Object.keys(value)) {"));
+        assert!(closed.contains("if (key !== \"label\") {"));
+        assert!(
+            closed.contains("issues.push(issue(appendKey(path, key), \"unexpected property\"));")
+        );
+        assert!(closed.contains("issues.push(issue(path, \"missing required property label\"));"));
+        let bag = component(&files, "bag");
+        // The additional-properties iteration and both property-count bounds share `Object.keys`, so
+        // it is evaluated once into a local and reused; it never recurs inline.
+        assert!(bag.contains("const keys1 = Object.keys(value);"));
+        assert!(bag.contains("for (const key of keys1) {"));
+        assert!(bag.contains("if (key !== \"kind\") {"));
+        assert!(bag.contains("const value2: unknown = value[key];"));
+        assert!(bag.contains("if (keys1.length < 1) {"));
+        assert!(
+            bag.contains("issues.push(issue(path, \"fewer properties than minProperties 1\"));")
+        );
+        assert!(bag.contains("if (keys1.length > 3) {"));
+        assert_eq!(bag.matches("Object.keys(value)").count(), 1);
+        assert!(
+            bag.contains("issues.push(issue(path, \"more properties than maxProperties 3\"));")
+        );
+    }
+
+    #[test]
+    fn dependent_required_fires_only_when_the_trigger_is_present() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Account": {
+                "type": "object",
+                "properties": {
+                    "creditCard": { "type": "string" },
+                    "billingAddress": { "type": "string" }
+                },
+                "dependentRequired": { "creditCard": ["billingAddress"] }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "account");
+        assert!(content.contains("if (Object.hasOwn(value, \"creditCard\")) {"));
+        assert!(content.contains("if (!Object.hasOwn(value, \"billingAddress\")) {"));
+        assert!(
+            content.contains(
+                "issues.push(issue(path, \"missing required property billingAddress\"));"
+            )
+        );
+    }
+
+    #[test]
+    fn arrays_validate_items_then_length_and_uniqueness() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "list": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "uniqueItems": true
+                    }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (isArray(value0)) {"));
+        assert!(content.contains("for (let index1 = 0; index1 < value0.length; index1 += 1) {"));
+        assert!(content.contains("if (value0.length < 1) {"));
+        assert!(content.contains("\"fewer items than minItems 1\""));
+        assert!(content.contains("if (value0.length > 3) {"));
+        assert!(content.contains("\"more items than maxItems 3\""));
+        assert!(content.contains("if (deepEqual(value0[i2], value0[j2])) {"));
+        assert!(content.contains("\"items not unique\""));
+        assert!(content.contains("issues.push(issue(path0, \"expected type array\"));"));
+    }
+
+    #[test]
+    fn tuples_validate_prefix_and_rest_schema() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Pair": {
+                "type": "array",
+                "prefixItems": [{ "type": "string" }, { "type": "integer" }],
+                "items": { "type": "boolean" }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "pair");
+        assert!(content.contains("if (value.length > 0) {"));
+        assert!(content.contains("const value0: unknown = value[0];"));
+        assert!(content.contains("if (value.length > 1) {"));
+        assert!(content.contains("const value1: unknown = value[1];"));
+        assert!(content.contains("for (let index2 = 2; index2 < value.length; index2 += 1) {"));
+    }
+
+    #[test]
+    fn forbidden_tuple_rest_caps_the_length() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Pair": {
+                "type": "array",
+                "prefixItems": [{ "type": "string" }, { "type": "integer" }],
+                "items": false
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "pair");
+        assert!(content.contains("if (value.length > 2) {"));
+        assert!(content.contains("issues.push(issue(path, \"more items than maxItems 2\"));"));
+    }
+
+    #[test]
+    fn self_reference_recurses_without_an_import() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "TreeNode": {
+                "type": "object",
+                "required": ["value"],
+                "properties": {
+                    "value": { "type": "string" },
+                    "children": {
+                        "type": "array",
+                        "items": { "$ref": "#/components/schemas/TreeNode" }
+                    }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "treenode");
+        assert!(content.contains("validateTreeNode(value2, path2, issues);"));
+        // A self-reference imports neither its own type nor its own validate function.
+        assert!(!content.contains("from \"./treenode"));
+    }
+
+    #[test]
+    fn mutual_recursion_imports_each_sibling_type_and_validator() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "A": {
+                "type": "object",
+                "properties": { "b": { "$ref": "#/components/schemas/B" } }
+            },
+            "B": {
+                "type": "object",
+                "properties": { "a": { "$ref": "#/components/schemas/A" } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let a = component(&files, "a");
+        assert!(a.contains("import { type B, validateB } from \"./b.js\";"));
+        assert!(a.contains("validateB(value0, path0, issues);"));
+        let b = component(&files, "b");
+        assert!(b.contains("import { type A, validateA } from \"./a.js\";"));
+        assert!(b.contains("validateA(value0, path0, issues);"));
+    }
+
+    #[test]
+    fn all_of_aggregates_each_branch_at_the_same_path() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Combined": {
+                "allOf": [
+                    { "type": "object", "required": ["a"], "properties": { "a": { "type": "string" } } },
+                    { "type": "object", "required": ["b"], "properties": { "b": { "type": "integer" } } }
+                ]
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "combined");
+        assert!(content.contains("\"missing required property a\""));
+        assert!(content.contains("\"missing required property b\""));
+        let a = content
+            .find("missing required property a")
+            .expect("branch a");
+        let b = content
+            .find("missing required property b")
+            .expect("branch b");
+        assert!(a < b, "allOf branches aggregate in declaration order");
+    }
+
+    #[test]
+    fn any_of_probes_branches_into_scratch_arrays() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Scalar": {
+                "anyOf": [{ "type": "string" }, { "type": "integer" }]
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "scalar");
+        assert!(content.contains("let matches0 = 0;"));
+        // Each branch probe is guarded so anyOf stops once a branch has matched (matches0 >= 1).
+        assert_eq!(content.matches("if (matches0 < 1) {").count(), 2);
+        assert!(content.contains("const issues1: Issue[] = [];"));
+        assert!(content.contains("if (issues1.length === 0) {"));
+        assert!(content.contains("if (matches0 === 0) {"));
+        assert!(content.contains("issues.push(issue(path, \"no anyOf branch matched\"));"));
+    }
+
+    #[test]
+    fn one_of_counts_matches_and_ignores_the_discriminator() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Shape": {
+                "oneOf": [
+                    { "$ref": "#/components/schemas/Circle" },
+                    { "$ref": "#/components/schemas/Square" }
+                ],
+                "discriminator": { "propertyName": "kind" }
+            },
+            "Circle": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "const": "circle" } }
+            },
+            "Square": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "const": "square" } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "shape");
+        assert!(content.contains("let matches0 = 0;"));
+        // Each branch probe is guarded so oneOf stops once a second match makes the verdict fail
+        // (matches0 >= 2); the count still ends at exactly 0, 1, or 2, so `!== 1` is unchanged.
+        assert_eq!(content.matches("if (matches0 < 2) {").count(), 2);
+        assert!(content.contains("if (matches0 !== 1) {"));
+        assert!(
+            content.contains(
+                "issues.push(issue(path, \"expected exactly one oneOf branch to match\"));"
+            )
+        );
+        // The discriminator is never consulted: no property-name routing appears in the validator.
+        assert!(!content.contains("kind"));
+        assert!(content.contains("validateCircle(value, path, issues1);"));
+        assert!(content.contains("validateSquare(value, path, issues2);"));
+    }
+
+    #[test]
+    fn every_validator_const_is_the_sync_specialization_with_no_escape_hatches() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string" },
+                    "b": { "type": "array", "items": { "type": "integer" } }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        for file in files
+            .iter()
+            .filter(|f| f.relative_path.starts_with("validators/components/"))
+        {
+            assert!(
+                file.content.contains("SyncStandardSchemaV1<"),
+                "{} annotates its const with the sync specialization",
+                file.relative_path
+            );
+            // The async base type would erase the sync guarantee and the typed phantom.
+            assert!(
+                !file.content.contains(": StandardSchemaV1<"),
+                "{} must not fall back to the bare StandardSchemaV1",
+                file.relative_path
+            );
+            // No escape hatches in emitted code: no casts and no `any`.
+            assert!(
+                !file.content.contains(" as "),
+                "{} has an `as` cast",
+                file.relative_path
+            );
+            assert!(
+                !file.content.contains("any"),
+                "{} has an `any`",
+                file.relative_path
+            );
+        }
+    }
+
+    #[test]
+    fn validator_files_import_only_from_the_standalone_surface() {
+        // Includes an operation whose response references a component, so an operation file carries
+        // a `../components/` import alongside the component files' `./` sibling imports.
+        let (files, diagnostics) = compile(json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/a": { "get": { "operationId": "getA", "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A" } } } } } } }
+            },
+            "components": {
+                "schemas": {
+                    "A": { "type": "object", "properties": { "b": { "$ref": "#/components/schemas/B" } } },
+                    "B": { "type": "string" }
+                }
+            }
+        }));
+        assert_clean(&diagnostics);
+        for file in files.iter().filter(|f| {
+            f.relative_path.starts_with("validators/components/")
+                || f.relative_path.starts_with("validators/operations/")
+        }) {
+            for line in file.content.lines().filter(|line| line.contains(" from ")) {
+                assert!(
+                    line.contains("\"../standard-schema")
+                        || line.contains("\"../runtime")
+                        || line.contains("\"./")
+                        || line.contains("\"../components/"),
+                    "{} imports outside the standalone surface: {line}",
+                    file.relative_path
+                );
+                assert!(
+                    !line.contains("types/") && !line.contains("/runtime/"),
+                    "{} imports from the types or client runtime: {line}",
+                    file.relative_path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generation_is_deterministic_across_runs() {
+        let document = doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                    "id": { "type": "string", "format": "uuid" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+                }
+            }
+        }));
+        let (first, _) = compile(document.clone());
+        let (second, _) = compile(document);
+        assert_eq!(
+            component(&first, "thing"),
+            component(&second, "thing"),
+            "validator emission must be byte-identical across runs"
+        );
+    }
+
+    #[test]
+    fn property_checks_follow_declaration_order() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": { "id": { "type": "string" }, "name": { "type": "string" } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        let id = content.find("value[\"id\"]").expect("id property");
+        let name = content.find("value[\"name\"]").expect("name property");
+        assert!(id < name, "properties are checked in declaration order");
+    }
+
+    #[test]
+    fn every_rejected_validation_keyword_fails_the_run_naming_keyword_and_pointer() {
+        for keyword in [
+            "if",
+            "then",
+            "else",
+            "not",
+            "dependentSchemas",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "contains",
+            "minContains",
+            "maxContains",
+            "patternProperties",
+            "propertyNames",
+        ] {
+            let (_files, diagnostics) = compile(doc_31(json!({
+                "Rejected": { (keyword): true }
+            })));
+            let rejected = diagnostics
+                .iter()
+                .find(|d| d.code == "OASTS1501" && d.message.contains(keyword))
+                .expect("rejected keyword fails with OASTS1501");
+            assert_eq!(rejected.severity, Severity::Error);
+            assert_eq!(
+                rejected.json_pointer.as_deref(),
+                Some("/components/schemas/Rejected")
+            );
+            // Exactly one validators-side diagnostic per rejected keyword: the same parse also
+            // degrades the node to an unknown leaf, but OASTS1502 must not double-report it. (The
+            // parse-time unsupported-keyword warning is a separate category and still fires.)
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|d| d.code == "OASTS1501" || d.code == "OASTS1502")
+                    .count(),
+                1,
+                "rejected keyword '{keyword}' must raise exactly one validators diagnostic",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_leaf_degradation_fails_the_run_naming_the_construct_and_pointer() {
+        let (_files, diagnostics) = compile(doc_31(json!({
+            "Degraded": { "$dynamicRef": "#thing" }
+        })));
+        let unknown = diagnostics
+            .iter()
+            .find(|d| d.code == "OASTS1502")
+            .expect("unknown leaf fails with OASTS1502");
+        assert_eq!(unknown.severity, Severity::Error);
+        assert!(unknown.message.contains("$dynamicRef"));
+        assert_eq!(
+            unknown.json_pointer.as_deref(),
+            Some("/components/schemas/Degraded")
+        );
+    }
+
+    #[test]
+    fn disabling_validators_emits_no_validators_directory() {
+        // The reject walk and validator files exist only when the artifact is enabled; a
+        // types-only build of the very same rejected input still generates cleanly.
+        let temp = TempDir::new().expect("temp directory");
+        let input = temp.path().join("openapi.json");
+        let config_path = temp.path().join("oasts.json");
+        let document = doc_31(json!({ "Rejected": { "not": true } }));
+        fs::write(
+            &input,
+            serde_json::to_vec(&document).expect("document JSON"),
+        )
+        .expect("write");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "./openapi.json" },
+            "output": "./generated",
+            "artifacts": { "types": true }
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&config).expect("config JSON"),
+        )
+        .expect("write");
+        let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let mut sink = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut sink).expect("graph");
+        let ir = parse(&graph, &mut sink).expect("ir");
+        let analyzed = analyze(ir, &resolved, &mut sink);
+        let files = emit_artifacts(
+            &analyzed,
+            &resolved,
+            &graph.source_tuples(),
+            None,
+            &mut sink,
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.relative_path.starts_with("validators/"))
+        );
+        assert!(
+            !sink.has_errors(),
+            "types-only build of rejected input stays clean"
+        );
+    }
+
+    fn operation(files: &[GeneratedFile], base: &str) -> String {
+        files
+            .iter()
+            .find(|file| file.relative_path == format!("validators/operations/{base}.ts"))
+            .expect("operation validator file")
+            .content
+            .clone()
+    }
+
+    #[test]
+    fn operations_emit_per_parameter_body_and_response_validators() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/things/{id}": {
+                    "get": {
+                        "operationId": "getThing",
+                        "parameters": [
+                            { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+                            { "name": "a-b", "in": "query", "schema": { "type": "string" } },
+                            { "name": "a.b", "in": "query", "schema": { "type": "string" } },
+                            { "name": "X-Trace", "in": "header", "schema": { "type": "string" } },
+                            { "name": "sid", "in": "cookie", "schema": { "type": "string" } },
+                            { "name": "---", "in": "query", "schema": { "type": "string" } }
+                        ],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "w": { "type": "string", "readOnly": true },
+                                            "v": { "type": "integer" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } } } },
+                            "4XX": { "description": "err", "content": { "application/json": { "schema": { "type": "string" } } } },
+                            "default": { "description": "def", "content": { "application/json": { "schema": { "type": "integer" } } } }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document);
+        assert_clean(&diagnostics);
+        let content = operation(&files, "getthing");
+        // One validator per parameter, keyed by capitalized location + Pascal-cased name.
+        assert!(content.contains(
+            "export const getThingPathIdValidator: SyncStandardSchemaV1<GetThingPathId>"
+        ));
+        assert!(content.contains(
+            "export const getThingHeaderXTraceValidator: SyncStandardSchemaV1<GetThingHeaderXTrace>"
+        ));
+        assert!(content.contains(
+            "export const getThingCookieSidValidator: SyncStandardSchemaV1<GetThingCookieSid>"
+        ));
+        // Two query names that Pascal-collapse to the same identifier are disambiguated by index.
+        assert!(content.contains("export type GetThingQueryAB = string;"));
+        assert!(content.contains("export type GetThingQueryAB2 = string;"));
+        // A parameter name that has no identifier form falls back to its positional index.
+        assert!(content.contains("export type GetThingQueryParam5 = string;"));
+        // Request body validator; the readOnly property is excluded in the request wire position.
+        assert!(content.contains(
+            "export const getThingRequestBodyValidator: SyncStandardSchemaV1<GetThingRequestBody>"
+        ));
+        assert!(!content.contains("Object.hasOwn(value, \"w\")"));
+        assert!(content.contains("Object.hasOwn(value, \"v\")"));
+        // Response branch validators, including the range and default branches.
+        assert!(content.contains("export const getThingResponse200Validator"));
+        assert!(content.contains("export const getThingResponse4XXValidator"));
+        assert!(content.contains("export const getThingResponseDefaultValidator"));
+        assert!(content.contains("from \"../standard-schema.js\""));
+        assert!(content.contains("from \"../runtime.js\""));
+    }
+
+    #[test]
+    fn operation_with_no_json_positions_emits_no_file() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/ping": {
+                    "get": {
+                        "operationId": "ping",
+                        "responses": { "204": { "description": "no content" } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document);
+        assert_clean(&diagnostics);
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.relative_path.starts_with("validators/operations/")),
+            "an operation with nothing to validate emits no file"
+        );
+    }
+
+    #[test]
+    fn null_type_renders_the_null_domain() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": { "n": { "type": "null" } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (value0 === null) {"));
+        assert!(content.contains("issues.push(issue(path0, \"expected type null\"));"));
+    }
+
+    #[test]
+    fn empty_enum_membership_is_unconditional() {
+        // The parser rejects empty enums, so this defensive branch is exercised directly: an empty
+        // allowed set admits nothing, so the membership check must be unconditionally true.
+        let temp = TempDir::new().expect("temp directory");
+        fs::write(temp.path().join("openapi.json"), "{}").expect("write input");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "./openapi.json" },
+            "output": "./generated",
+            "artifacts": { "validators": true }
+        });
+        fs::write(
+            temp.path().join("oasts.json"),
+            serde_json::to_vec(&config).expect("config JSON"),
+        )
+        .expect("write config");
+        let resolved =
+            load_config(Some(&temp.path().join("oasts.json")), temp.path()).expect("config");
+        let analyzed = crate::semantic::Analyzed {
+            ir: crate::ir::Ir::default(),
+            operation_names: Vec::new(),
+            schema_names: Vec::new(),
+            enum_members: Vec::new(),
+        };
+        let mut sink = DiagnosticSink::new();
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let mut scope = FileScope::default();
+        let mut body = FnBody::new(&mut scope, &model, TypePosition::Neutral);
+        body.gen_finite(Some(&[]), None, "value", "path", "issues");
+        assert!(body.out.contains("if (true) {"));
+        assert!(
+            body.out
+                .contains("issues.push(issue(path, \"value not in enum\"));")
+        );
+    }
+
+    #[test]
+    fn plain_bounds_and_out_of_f64_range_literals_render() {
+        // Built through the parser (not a Rust literal) so the out-of-f64-range bound survives as a
+        // preserved arbitrary-precision number.
+        let big: Value = serde_json::from_str("1e400").expect("number parses");
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "age": { "type": "integer", "minimum": 0, "maximum": 200 },
+                    "big": { "type": "number", "minimum": big }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (value0 < 0) {"));
+        assert!(content.contains("issues.push(issue(path0, \"less than minimum 0\"));"));
+        assert!(content.contains("if (value0 > 200) {"));
+        assert!(content.contains("issues.push(issue(path0, \"greater than maximum 200\"));"));
+        // A bound outside the f64 range is rendered from the preserved number's own string form.
+        assert!(content.contains("less than minimum 1e+400"));
+    }
+
+    #[test]
+    fn nullable_object_and_array_widen_the_container_message() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Obj": { "type": ["object", "null"], "properties": { "a": { "type": "string" } } },
+            "Arr": { "type": ["array", "null"], "items": { "type": "string" } }
+        })));
+        assert_clean(&diagnostics);
+        assert!(component(&files, "obj").contains("} else if (value !== null) {"));
+        assert!(component(&files, "obj").contains("\"expected type object, null\""));
+        assert!(component(&files, "arr").contains("} else if (value !== null) {"));
+        assert!(component(&files, "arr").contains("\"expected type array, null\""));
+    }
+
+    #[test]
+    fn closed_empty_object_and_allowed_tuple_rest_render() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Empty": { "type": "object", "additionalProperties": false },
+            "OpenTuple": { "type": "array", "prefixItems": [{ "type": "string" }], "items": true }
+        })));
+        assert_clean(&diagnostics);
+        // A closed object with no declared properties rejects every key.
+        let empty = component(&files, "empty");
+        assert!(empty.contains("for (const key of Object.keys(value)) {"));
+        assert!(empty.contains("if (true) {"));
+        assert!(empty.contains("\"unexpected property\""));
+        // A tuple whose rest is unconstrained validates only the prefix positions.
+        let open = component(&files, "opentuple");
+        assert!(open.contains("if (value.length > 0) {"));
+        assert!(!open.contains("more items than maxItems"));
+    }
+
+    #[test]
+    fn a_non_error_warning_does_not_fail_a_clean_validators_build() {
+        // A discriminator whose branches prove no per-branch literal emits a structural-union
+        // warning (not an error), so a validators build over the same input is still clean.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Shape": {
+                "oneOf": [
+                    { "$ref": "#/components/schemas/A" },
+                    { "$ref": "#/components/schemas/B" }
+                ],
+                "discriminator": { "propertyName": "kind" }
+            },
+            "A": { "type": "object", "properties": { "kind": { "type": "string" } } },
+            "B": { "type": "object", "properties": { "kind": { "type": "string" } } }
+        })));
+        assert!(
+            diagnostics.iter().any(|d| d.severity == Severity::Warning),
+            "the ambiguous discriminator should warn: {diagnostics:#?}"
+        );
+        assert_clean(&diagnostics);
+        assert!(!component(&files, "shape").is_empty());
+    }
+
+    #[test]
+    fn a_repeated_pattern_shares_one_lazy_cache_slot() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string", "pattern": "[0-9]" },
+                    "b": { "type": "string", "pattern": "[0-9]" }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        // Equal patterns deduplicate to a single module-scope cache slot used by both checks.
+        assert_eq!(content.matches("let pattern0: RegExp").count(), 1);
+        assert!(!content.contains("pattern1"));
+        assert_eq!(content.matches("pattern0Regex().test(").count(), 2);
+    }
+
+    #[test]
+    fn components_and_operations_with_unfileable_names_are_skipped() {
+        // A Windows reserved device name cannot become a safe file base, so the artifact skips the
+        // component/operation (the invalid-file-name diagnostic still fails the run).
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/x": { "get": { "operationId": "aux", "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "string" } } } } } } }
+            },
+            "components": { "schemas": { "CON": { "type": "string" } } }
+        });
+        let (files, diagnostics) = compile(document);
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.relative_path.starts_with("validators/components/con")),
+            "a reserved component name allocates no validator file"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.relative_path.starts_with("validators/operations/aux")),
+            "a reserved operation name allocates no validator file"
+        );
+        // Skipping is not silent: the reserved component (`CON`) and operation (`aux`) each fail the
+        // run with the invalid-file-name diagnostic, so the writer never commits partial output.
+        let file_name_errors: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == crate::emit::CODE_FILE_NAME)
+            .collect();
+        assert_eq!(file_name_errors.len(), 2);
+        assert!(
+            file_name_errors
+                .iter()
+                .all(|diagnostic| diagnostic.severity == Severity::Error)
+        );
+    }
+
+    #[test]
+    fn import_extension_none_drops_the_suffix() {
+        let temp = TempDir::new().expect("temp directory");
+        let input = temp.path().join("openapi.json");
+        let config_path = temp.path().join("oasts.json");
+        let document = doc_31(json!({
+            "A": { "type": "object", "properties": { "b": { "$ref": "#/components/schemas/B" } } },
+            "B": { "type": "string" }
+        }));
+        fs::write(
+            &input,
+            serde_json::to_vec(&document).expect("document JSON"),
+        )
+        .expect("write");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "./openapi.json" },
+            "output": "./generated",
+            "artifacts": { "types": true, "validators": true },
+            "emit": { "importExtension": "none" }
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&config).expect("config JSON"),
+        )
+        .expect("write");
+        let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let mut sink = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut sink).expect("graph");
+        let ir = parse(&graph, &mut sink).expect("ir");
+        let analyzed = analyze(ir, &resolved, &mut sink);
+        let files = emit_artifacts(
+            &analyzed,
+            &resolved,
+            &graph.source_tuples(),
+            None,
+            &mut sink,
+        );
+        assert_clean(&sink.into_sorted_vec());
+        let a = component(&files, "a");
+        assert!(a.contains("from \"../standard-schema\";"));
+        assert!(a.contains("from \"../runtime\";"));
+        assert!(a.contains("from \"./b\";"));
+    }
+
+    #[test]
+    fn property_presence_uses_own_property_not_prototype_walk() {
+        // Fix A: `in` walks the prototype chain, so inherited names (`toString`, `constructor`)
+        // read as present. All three presence sites — property presence, dependentRequired trigger,
+        // dependentRequired dependent — must use Object.hasOwn instead.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Account": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                    "id": { "type": "string" },
+                    "creditCard": { "type": "string" },
+                    "billingAddress": { "type": "string" }
+                },
+                "dependentRequired": { "creditCard": ["billingAddress"] }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "account");
+        // (1) property-presence site
+        assert!(content.contains("if (Object.hasOwn(value, \"id\")) {"));
+        // (2) dependentRequired trigger site
+        assert!(content.contains("if (Object.hasOwn(value, \"creditCard\")) {"));
+        // (3) dependentRequired dependent site
+        assert!(content.contains("if (!Object.hasOwn(value, \"billingAddress\")) {"));
+        // No prototype-walking `in` anywhere.
+        assert!(!content.contains(" in value"));
+    }
+
+    #[test]
+    fn proto_object_const_uses_computed_key_not_a_prototype_setter() {
+        // Fix B: a literal `__proto__` key in an object literal sets the prototype; the comparison
+        // object must instead carry an own `__proto__` data property via computed-key syntax.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "p": { "const": { "__proto__": { "a": 1 }, "b": 2 } }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        // Executable position (deepEqual argument): the reserved key uses computed-key syntax so it
+        // creates an own data property; the plain sibling key stays a normal key.
+        assert!(content.contains("if (!deepEqual(value0, {[\"__proto__\"]:{\"a\":1},\"b\":2})) {"));
+        // Type position stays byte-identical: a `__proto__` property type is not a prototype setter,
+        // so the shared renderer's plain-key literal is left untouched.
+        assert!(content.contains("p?: {\"__proto__\":{\"a\":1},\"b\":2};"));
+    }
+
+    #[test]
+    fn nested_proto_key_uses_computed_key_at_every_depth() {
+        // Fix B: the rewrite reaches every nesting level, including inside arrays.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "p": { "const": { "outer": [{ "__proto__": { "x": 1 } }] } }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        // Computed-key rewrite reaches a `__proto__` nested inside an array element (executable
+        // position); the type position keeps the plain-key literal.
+        assert!(
+            content
+                .contains("if (!deepEqual(value0, {\"outer\":[{[\"__proto__\"]:{\"x\":1}}]})) {")
+        );
+        assert!(content.contains("p?: {\"outer\":[{\"__proto__\":{\"x\":1}}]};"));
+    }
+
+    #[test]
+    fn component_named_after_an_injected_identifier_is_renamed() {
+        // Fix C: a component named `Issue` would emit `export interface Issue` alongside the
+        // always-present `import { type Issue }` (TS2440). Its export is renamed to the lowest free
+        // numeric suffix; the kernel import keeps its name. A sibling component literally named
+        // `Issue2` is already taken, so the rename skips it and lands on `Issue3`. A component named
+        // `deepEqual` (Pascal-cased to `DeepEqual`) does not collide case-sensitively with the value
+        // import `deepEqual`, so it is left unchanged.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Issue": {
+                "type": "object",
+                "required": ["id"],
+                "properties": { "id": { "type": "string" } }
+            },
+            "Issue2": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            },
+            "deepEqual": {
+                "type": "string",
+                "enum": ["x", "y"]
+            }
+        })));
+        assert_clean(&diagnostics);
+        let issue = component(&files, "issue");
+        // The kernel type import is present and keeps its name.
+        assert!(issue.contains("import { type Issue,"));
+        // The bump loop skips the taken `Issue2`; export, self trio, and const use `Issue3`.
+        assert!(issue.contains("export interface Issue3 {"));
+        assert!(issue.contains("export function validateIssue3("));
+        assert!(issue.contains("checkedIssue3("));
+        assert!(issue.contains("export const issue3Validator:"));
+        // No bare `Issue` export shadows the import, and it did not reuse the taken `Issue2`.
+        assert!(!issue.contains("export interface Issue {"));
+        assert!(!issue.contains("export interface Issue2 {"));
+        // The unrelated `Issue2` component keeps its own name (not a reserved identifier).
+        let issue2 = component(&files, "issue2");
+        assert!(issue2.contains("export interface Issue2 {"));
+        // The `deepEqual` component collides only in casing, so it is not renamed: import name
+        // (`deepEqual`, value) and export name (`DeepEqual`, type) differ and coexist.
+        let dq = component(&files, "deepequal");
+        assert!(dq.contains("export type DeepEqual ="));
+        assert!(!dq.contains("DeepEqual2"));
+    }
+
+    #[test]
+    fn never_schema_rejects_every_value() {
+        // Fix D: a `false` schema (SchemaNode::Never) previously emitted an empty body, accepting
+        // everything. It must reject unconditionally.
+        let (files, diagnostics) = compile(doc_31(json!({ "Nope": false })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "nope");
+        assert!(content.contains("issues.push(issue(path, \"value not allowed\"));"));
+        // The empty-body acceptance must be gone: the push is unconditional (no `if (` guarding it).
+        assert!(!content.contains("if (true) {"));
+    }
+
+    #[test]
+    fn tuple_emits_array_constraints_like_a_plain_array() {
+        // Fix F: gen_tuple dropped minItems/maxItems/uniqueItems even though the parser populates
+        // them for tuple nodes. A plain tuple emits none.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Constrained": {
+                "type": "array",
+                "prefixItems": [{ "type": "string" }],
+                "items": { "type": "integer" },
+                "minItems": 1,
+                "maxItems": 5,
+                "uniqueItems": true
+            },
+            "Plain": {
+                "type": "array",
+                "prefixItems": [{ "type": "string" }],
+                "items": { "type": "integer" }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let constrained = component(&files, "constrained");
+        assert!(constrained.contains("if (value.length < 1) {"));
+        assert!(constrained.contains("\"fewer items than minItems 1\""));
+        assert!(constrained.contains("if (value.length > 5) {"));
+        assert!(constrained.contains("\"more items than maxItems 5\""));
+        assert!(constrained.contains("\"items not unique\""));
+        let plain = component(&files, "plain");
+        assert!(!plain.contains("fewer items than minItems"));
+        assert!(!plain.contains("more items than maxItems"));
+        assert!(!plain.contains("items not unique"));
+    }
+
+    #[test]
+    fn colliding_parameter_validator_names_terminate_with_distinct_deterministic_names() {
+        // Three same-location parameters whose Pascal forms collide: `foo`/`Foo` both normalize to
+        // `Foo`, and `Foo`'s fixed-suffix fallback (`Foo` + its index 2) equals `foo2`'s own base
+        // name. The old invariant fallback re-inserted an already-taken name forever; the per-attempt
+        // bump terminates. This test hangs against the pre-fix generator, so its completion is the
+        // termination proof.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/x": {
+                    "get": {
+                        "operationId": "getThing",
+                        "parameters": [
+                            { "name": "foo", "in": "query", "schema": { "type": "string" } },
+                            { "name": "foo2", "in": "query", "schema": { "type": "string" } },
+                            { "name": "Foo", "in": "query", "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "no content" } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document);
+        assert_clean(&diagnostics);
+        let content = operation(&files, "getthing");
+        // Deterministic disambiguation: base, base+2 (already a real base), then base+3.
+        assert!(content.contains("export type GetThingQueryFoo = string;"));
+        assert!(content.contains("export type GetThingQueryFoo2 = string;"));
+        assert!(content.contains("export type GetThingQueryFoo3 = string;"));
+    }
+
+    #[test]
+    fn free_form_children_emit_no_dead_scaffold() {
+        // A no-op child (`Any`, from a free-form `{}`/`true` schema) has an empty validate body, so
+        // every value-descent binding and loop around it is dead and must be skipped.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Freeform": {
+                "type": "object",
+                "properties": { "anything": {} }
+            },
+            "AnyItems": {
+                "type": "array",
+                "items": {}
+            },
+            "OpenBag": {
+                "type": "object",
+                "additionalProperties": {}
+            }
+        })));
+        assert_clean(&diagnostics);
+        // A non-required free-form property contributes no check at all: no own-key read, path
+        // append, or descent, and no allocated value/path index.
+        let freeform = component(&files, "freeform");
+        assert!(!freeform.contains("Object.hasOwn(value, \"anything\")"));
+        assert!(!freeform.contains("value0"));
+        assert!(!freeform.contains("appendKey"));
+        // A free-form array element keeps the array type gate but emits no per-element loop.
+        let any_items = component(&files, "anyitems");
+        assert!(any_items.contains("if (isArray(value)) {"));
+        assert!(!any_items.contains("for (let index"));
+        assert!(!any_items.contains("value0"));
+        // A free-form additionalProperties schema emits no key iteration.
+        let open_bag = component(&files, "openbag");
+        assert!(open_bag.contains("if (isRecord(value)) {"));
+        assert!(!open_bag.contains("Object.keys(value)"));
+        assert!(!open_bag.contains("for (const key"));
+    }
+
+    #[test]
+    fn required_free_form_property_keeps_only_its_presence_check() {
+        // Only the value-descent scaffold is skippable: a required no-op property still enforces
+        // presence, which reduces to the bare own-key test with no value/path binding.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "required": ["meta"],
+                "properties": { "meta": {} }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (!Object.hasOwn(value, \"meta\")) {"));
+        assert!(content.contains("issues.push(issue(path, \"missing required property meta\"));"));
+        assert!(!content.contains("value[\"meta\"]"));
+        assert!(!content.contains("const value0"));
+    }
+
+    #[test]
+    fn free_form_tuple_positions_skip_their_dead_scaffold() {
+        // A no-op prefix position and a no-op rest schema each validate against nothing, so both the
+        // length-guard block and the rest loop are dead; the surviving position is still checked.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "PrefixAny": {
+                "type": "array",
+                "prefixItems": [{}, { "type": "string" }],
+                "items": {}
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "prefixany");
+        // Position 0 (free-form) is skipped; position 1 (string) is validated at index 1.
+        assert!(!content.contains("if (value.length > 0) {"));
+        assert!(content.contains("if (value.length > 1) {"));
+        assert!(content.contains("const value0: unknown = value[1];"));
+        // The free-form rest schema emits no trailing-element loop.
+        assert!(!content.contains("for (let index"));
+    }
+}

@@ -1,0 +1,303 @@
+openapi: 3.1.0
+info:
+  title: Oasts validators showcase
+  version: 1.0.0
+servers:
+  - url: https://validators.api.example.test/v1
+paths:
+  /pets:
+    post:
+      operationId: createPet
+      summary: Create a pet from a composite envelope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Envelope'
+      responses:
+        '200':
+          description: The created pet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+        '4XX':
+          description: A documented client error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        default:
+          description: An unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /tree/{nodeId}:
+    get:
+      operationId: getTree
+      summary: Read a tree, exercising path, query, and header parameters.
+      parameters:
+        - name: nodeId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: maxDepth
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 10
+        - name: labels
+          in: query
+          required: false
+          schema:
+            type: array
+            items:
+              type: string
+            minItems: 1
+            maxItems: 5
+            uniqueItems: true
+        - name: X-Trace
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+            pattern: '^[A-Za-z0-9-]+$'
+      responses:
+        '200':
+          description: The matching tree node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TreeNode'
+        '4XX':
+          description: A documented client error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+components:
+  schemas:
+    Pet:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 20
+        status:
+          type: string
+          enum:
+            - available
+            - pending
+            - sold
+        species:
+          type: string
+          const: canis
+        createdAt:
+          type: string
+          format: date-time
+        birthday:
+          type: string
+          format: date
+        checkupTime:
+          type: string
+          format: time
+        slug:
+          type: string
+          pattern: '[0-9]'
+        emoji:
+          type: string
+          maxLength: 1
+        code:
+          type: string
+          minLength: 2
+        nickname:
+          type:
+            - string
+            - "null"
+        tags:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tag'
+          minItems: 1
+          maxItems: 3
+          uniqueItems: true
+        home:
+          $ref: '#/components/schemas/Shape'
+        vaccinated:
+          type: boolean
+    Tag:
+      type: object
+      additionalProperties: false
+      required:
+        - label
+      properties:
+        label:
+          type: string
+        color:
+          type: string
+    Numeric:
+      type: object
+      properties:
+        age:
+          type: integer
+          minimum: 0
+          maximum: 200
+        bigId:
+          type: integer
+          format: int32
+        score:
+          type: number
+          multipleOf: 0.25
+        tenths:
+          type: number
+          multipleOf: 0.1
+        fives:
+          type: integer
+          multipleOf: 5
+        ratio:
+          type: number
+          exclusiveMinimum: 0
+          exclusiveMaximum: 1
+        zero:
+          enum:
+            - 0
+    Bag:
+      type: object
+      minProperties: 1
+      maxProperties: 3
+      additionalProperties:
+        type: integer
+      properties:
+        kind:
+          type: string
+    Pair:
+      type: array
+      prefixItems:
+        - type: string
+        - type: integer
+      items:
+        type: boolean
+    TreeNode:
+      type: object
+      required:
+        - value
+      properties:
+        value:
+          type: string
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/TreeNode'
+    Shape:
+      oneOf:
+        - $ref: '#/components/schemas/Circle'
+        - $ref: '#/components/schemas/Square'
+      discriminator:
+        propertyName: kind
+    Circle:
+      type: object
+      required:
+        - kind
+        - radius
+      properties:
+        kind:
+          const: circle
+        radius:
+          type: number
+    Square:
+      type: object
+      required:
+        - kind
+        - side
+      properties:
+        kind:
+          const: square
+        side:
+          type: number
+    Token:
+      oneOf:
+        - type: integer
+          multipleOf: 2
+        - type: integer
+          multipleOf: 3
+    Scalar:
+      anyOf:
+        - type: string
+          minLength: 3
+        - type: integer
+    Combined:
+      allOf:
+        - type: object
+          required:
+            - a
+          properties:
+            a:
+              type: string
+        - type: object
+          required:
+            - b
+          properties:
+            b:
+              type: integer
+    Account:
+      type: object
+      properties:
+        creditCard:
+          type: string
+        billingAddress:
+          type: string
+      dependentRequired:
+        creditCard:
+          - billingAddress
+    Problem:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: integer
+        message:
+          type: string
+    Envelope:
+      type: object
+      properties:
+        pet:
+          $ref: '#/components/schemas/Pet'
+        tag:
+          $ref: '#/components/schemas/Tag'
+        numeric:
+          $ref: '#/components/schemas/Numeric'
+        bag:
+          $ref: '#/components/schemas/Bag'
+        pair:
+          $ref: '#/components/schemas/Pair'
+        tree:
+          $ref: '#/components/schemas/TreeNode'
+        shape:
+          $ref: '#/components/schemas/Shape'
+        token:
+          $ref: '#/components/schemas/Token'
+        scalar:
+          $ref: '#/components/schemas/Scalar'
+        combined:
+          $ref: '#/components/schemas/Combined'
+        account:
+          $ref: '#/components/schemas/Account'
+        problem:
+          $ref: '#/components/schemas/Problem'

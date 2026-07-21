@@ -285,6 +285,27 @@ pub struct NumericConstraints {
     pub maximum: Option<Number>,
     pub exclusive_minimum: Option<ExclusiveBound>,
     pub exclusive_maximum: Option<ExclusiveBound>,
+    pub multiple_of: Option<Number>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StringConstraints {
+    pub min_length: Option<u64>,
+    pub max_length: Option<u64>,
+    pub pattern: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ArrayConstraints {
+    pub min_items: Option<u64>,
+    pub max_items: Option<u64>,
+    pub unique_items: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ObjectConstraints {
+    pub min_properties: Option<u64>,
+    pub max_properties: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -295,6 +316,10 @@ pub struct SchemaMeta {
     pub docs: SchemaDocs,
     pub enum_extensions: EnumExtensionData,
     pub numeric_constraints: NumericConstraints,
+    pub string_constraints: StringConstraints,
+    pub array_constraints: ArrayConstraints,
+    pub object_constraints: ObjectConstraints,
+    pub rejected_validation_keywords: Vec<String>,
     pub source: SourceRef,
 }
 
@@ -362,6 +387,7 @@ pub enum SchemaNode {
     Object {
         properties: Vec<(String, SchemaNode, PropMeta)>,
         additional_properties: AdditionalProperties,
+        dependent_required: Vec<(String, Vec<String>)>,
         meta: SchemaMeta,
     },
     Array {

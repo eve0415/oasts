@@ -1,0 +1,405 @@
+# Keyword capability matrix for the validators artifact. This file is the row-coverage source
+# for the conformance runner: the runner parses these rows, and asserts that every row whose
+# disposition is `exact` is exercised by at least one passing and one failing conformance vector.
+# disposition meanings:
+#   exact      — the generated validator enforces this keyword; conformance vectors pin its verdicts.
+#   annotation — recognized but never consulted at runtime; it may not change any verdict.
+#   reject     — validators generation fails with a diagnostic; the keyword never reaches a validator.
+# dialects records the OpenAPI line(s) in which the keyword is a recognized schema keyword.
+rows:
+  - keyword: type
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Structural type check; 3.1 type arrays and 3.0 nullable both widen the accepted domain.
+  - keyword: enum
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Membership by deep JSON equality against the allowed set.
+  - keyword: const
+    dialects:
+      - "3.1"
+    disposition: exact
+    notes: Deep JSON equality against a single value; 3.1 only.
+  - keyword: properties
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Each declared property value is validated in declaration order when present.
+  - keyword: required
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: One issue per missing key at the object path; the key is named in the message.
+  - keyword: additionalProperties
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: false rejects unknown keys; a schema validates them; the permissive default passes them through.
+  - keyword: items
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Each array element is validated against the item schema at its index.
+  - keyword: prefixItems
+    dialects:
+      - "3.1"
+    disposition: exact
+    notes: Positional tuple validation; 3.1 only.
+  - keyword: minLength
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Lower bound on Unicode code-point length, not UTF-16 units.
+  - keyword: maxLength
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Upper bound on Unicode code-point length, not UTF-16 units.
+  - keyword: pattern
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Unanchored ECMA-262 partial match with no flags.
+  - keyword: minimum
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Inclusive numeric lower bound.
+  - keyword: maximum
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Inclusive numeric upper bound.
+  - keyword: exclusiveMinimum
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: 3.0 boolean modifier of minimum; 3.1 numeric exclusive lower bound.
+  - keyword: exclusiveMaximum
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: 3.0 boolean modifier of maximum; 3.1 numeric exclusive upper bound.
+  - keyword: multipleOf
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Exact IEEE-754 divisibility via scaled integer arithmetic, never floating modulo.
+  - keyword: minItems
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Array length lower bound.
+  - keyword: maxItems
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Array length upper bound.
+  - keyword: uniqueItems
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Pairwise deep JSON equality across elements.
+  - keyword: minProperties
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Own-property count lower bound.
+  - keyword: maxProperties
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Own-property count upper bound.
+  - keyword: dependentRequired
+    dialects:
+      - "3.1"
+    disposition: exact
+    notes: A present trigger key requires its dependent keys; 3.1 only.
+  - keyword: allOf
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Every branch validates and issues aggregate at their own paths.
+  - keyword: anyOf
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Zero passing branches yields exactly one issue at the composition path.
+  - keyword: oneOf
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Exactly one passing branch; zero or more than one yields exactly one issue at the composition path.
+  - keyword: "$ref"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Delegates to the referenced schema's validator, including recursive self-references.
+  - keyword: "format:date-time"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: RFC 3339 date-time on string values; leap second and case-insensitive markers accepted.
+  - keyword: "format:date"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: RFC 3339 full-date on string values with real calendar validation.
+  - keyword: "format:time"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: RFC 3339 full-time on string values; a numeric or Z offset is required.
+  - keyword: "format:uuid"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: 8-4-4-4-12 hex on string values, any version, case-insensitive.
+  - keyword: "format:int32"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: exact
+    notes: Integer within the signed 32-bit range, applied on integer schemas.
+  - keyword: title
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Human-readable label; never consulted at runtime.
+  - keyword: description
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Human-readable prose; never consulted at runtime.
+  - keyword: example
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Illustrative value; never consulted at runtime.
+  - keyword: examples
+    dialects:
+      - "3.1"
+    disposition: annotation
+    notes: Illustrative values; 3.1 schema keyword, never consulted at runtime.
+  - keyword: default
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: No default injection; assert-only validators never mutate the value.
+  - keyword: deprecated
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Lifecycle marker; never consulted at runtime.
+  - keyword: readOnly
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Wire-variant direction handled by the request/response type split, not by the validator.
+  - keyword: writeOnly
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Wire-variant direction handled by the request/response type split, not by the validator.
+  - keyword: contentEncoding
+    dialects:
+      - "3.1"
+    disposition: annotation
+    notes: String content annotation; never consulted at runtime.
+  - keyword: contentMediaType
+    dialects:
+      - "3.1"
+    disposition: annotation
+    notes: String content annotation; never consulted at runtime.
+  - keyword: contentSchema
+    dialects:
+      - "3.1"
+    disposition: annotation
+    notes: String content annotation; never consulted at runtime.
+  - keyword: discriminator
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Never consulted at runtime; it may not alter any oneOf or anyOf verdict or issue set.
+  - keyword: "format:email"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only.
+  - keyword: "format:uri"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only.
+  - keyword: "format:uri-reference"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only.
+  - keyword: "format:hostname"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only.
+  - keyword: "format:ipv4"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only.
+  - keyword: "format:ipv6"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only.
+  - keyword: "format:int64"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only; a 64-bit integer exceeds the safe double range.
+  - keyword: "format:float"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only.
+  - keyword: "format:double"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only.
+  - keyword: "format:byte"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only.
+  - keyword: "format:binary"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only.
+  - keyword: "format:password"
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: Not asserted; annotation only.
+  - keyword: xml
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: XML serialization metadata; out of scope for JSON validation, never consulted at runtime.
+  - keyword: externalDocs
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: annotation
+    notes: External documentation link; never consulted at runtime.
+  - keyword: if
+    dialects:
+      - "3.1"
+    disposition: reject
+    notes: Conditional application; validators generation fails with a diagnostic.
+  - keyword: then
+    dialects:
+      - "3.1"
+    disposition: reject
+    notes: Conditional application; validators generation fails with a diagnostic.
+  - keyword: else
+    dialects:
+      - "3.1"
+    disposition: reject
+    notes: Conditional application; validators generation fails with a diagnostic.
+  - keyword: not
+    dialects:
+      - "3.0"
+      - "3.1"
+    disposition: reject
+    notes: Negation; validators generation fails with a diagnostic.
+  - keyword: dependentSchemas
+    dialects:
+      - "3.1"
+    disposition: reject
+    notes: Schema-valued dependencies; validators generation fails with a diagnostic.
+  - keyword: unevaluatedProperties
+    dialects:
+      - "3.1"
+    disposition: reject
+    notes: Annotation-dependent evaluation; validators generation fails with a diagnostic.
+  - keyword: unevaluatedItems
+    dialects:
+      - "3.1"
+    disposition: reject
+    notes: Annotation-dependent evaluation; validators generation fails with a diagnostic.
+  - keyword: contains
+    dialects:
+      - "3.1"
+    disposition: reject
+    notes: Existential array constraint; validators generation fails with a diagnostic.
+  - keyword: minContains
+    dialects:
+      - "3.1"
+    disposition: reject
+    notes: Existential array constraint; validators generation fails with a diagnostic.
+  - keyword: maxContains
+    dialects:
+      - "3.1"
+    disposition: reject
+    notes: Existential array constraint; validators generation fails with a diagnostic.
+  - keyword: patternProperties
+    dialects:
+      - "3.1"
+    disposition: reject
+    notes: Regex-keyed property schemas; validators generation fails with a diagnostic.
+  - keyword: propertyNames
+    dialects:
+      - "3.1"
+    disposition: reject
+    notes: Key-name schema; validators generation fails with a diagnostic.

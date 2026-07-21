@@ -2696,6 +2696,7 @@ mod tests {
                 SchemaNode::Object {
                     properties: Vec::new(),
                     additional_properties: crate::ir::AdditionalProperties::Allowed(None),
+                    dependent_required: Vec::new(),
                     meta: test_meta("/object"),
                 },
             ],
@@ -2834,6 +2835,7 @@ mod tests {
         let nullable_object = SchemaNode::Object {
             properties: Vec::new(),
             additional_properties: crate::ir::AdditionalProperties::Allowed(None),
+            dependent_required: Vec::new(),
             meta: SchemaMeta {
                 nullable: true,
                 ..test_meta("/nullable-object")

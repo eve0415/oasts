@@ -338,7 +338,7 @@ fn render_regions(asset: &ParsedAsset<'_>, include: impl Fn(&RegionId) -> bool) 
     output
 }
 
-fn rewrite_relative_ts_imports(source: &str, extension: &str) -> String {
+pub(super) fn rewrite_relative_ts_imports(source: &str, extension: &str) -> String {
     let extension = if extension == "none" { "" } else { extension };
     let mut output = String::with_capacity(source.len());
     for line in source.split_inclusive('\n') {

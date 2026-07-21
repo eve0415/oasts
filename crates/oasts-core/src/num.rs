@@ -1,5 +1,7 @@
 //! ECMAScript-compatible decimal rendering used by enum-name allocation.
 
+use serde_json::Number;
+
 /// Renders a finite binary64 value using ECMAScript's decimal/exponent cutovers.
 ///
 /// Ryū supplies the shortest round-tripping digits. This function only changes
@@ -23,6 +25,18 @@ pub fn render_number(value: f64) -> String {
         parts.scientific()
     };
     if negative { format!("-{body}") } else { body }
+}
+
+/// Renders a JSON number as the string a JavaScript `number` would print: the shortest ECMAScript
+/// decimal when the value is a finite f64, otherwise the preserved source literal. Both an emitted
+/// comparison and its message reproduce the schema's literal without an f64 round-trip surprise, and
+/// a non-finite or arbitrary-precision number keeps serde's literal so no precision is lost.
+#[must_use]
+pub fn render_number_value(number: &Number) -> String {
+    number
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .map_or_else(|| number.to_string(), render_number)
 }
 
 struct DecimalParts {

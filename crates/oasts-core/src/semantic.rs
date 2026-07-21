@@ -405,6 +405,7 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
             properties,
             additional_properties,
             meta,
+            ..
         } => {
             validate_enum_extensions(None, meta, analysis.types, analysis.sink);
             for (_, property, _) in properties {
@@ -1582,6 +1583,7 @@ mod tests {
             SchemaNode::Object {
                 properties: Vec::new(),
                 additional_properties: AdditionalProperties::Allowed(Some(Box::new(leaf.clone()))),
+                dependent_required: Vec::new(),
                 meta: meta.clone(),
             },
             SchemaNode::Tuple {

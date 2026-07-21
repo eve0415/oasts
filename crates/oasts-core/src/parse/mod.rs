@@ -6,11 +6,12 @@ use serde_json::{Map, Value};
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
-    AdditionalProperties, Body, Discriminator, EncodingHeader, EncodingObject, EnumExtensionData,
-    ExclusiveBound, Ir, MediaType, NamedSchema, NamedSecurityScheme, NumericConstraints,
-    OasVersion, Operation, Param, ParamLocation, ParamStyle, PrimitiveType, PropMeta,
-    ResponseEntry, ResponseStatus, SchemaDocs, SchemaMeta, SchemaNode, SchemaRef, SecKind,
-    SecurityRequirement, Segment, SegmentPart, ServerEntry, ServerVariable, SourceRef, TupleRest,
+    AdditionalProperties, ArrayConstraints, Body, Discriminator, EncodingHeader, EncodingObject,
+    EnumExtensionData, ExclusiveBound, Ir, MediaType, NamedSchema, NamedSecurityScheme,
+    NumericConstraints, OasVersion, ObjectConstraints, Operation, Param, ParamLocation, ParamStyle,
+    PrimitiveType, PropMeta, ResponseEntry, ResponseStatus, SchemaDocs, SchemaMeta, SchemaNode,
+    SchemaRef, SecKind, SecurityRequirement, Segment, SegmentPart, ServerEntry, ServerVariable,
+    SourceRef, StringConstraints, TupleRest,
 };
 use crate::loader::{DocId, DocumentGraph, append_pointer};
 
@@ -27,7 +28,7 @@ const CODE_RESERVED_HEADER_PARAMETER: &str = "OASTS1109";
 const METHODS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
 ];
-const UNSUPPORTED_SCHEMA_KEYWORDS: [&str; 16] = [
+const UNSUPPORTED_SCHEMA_KEYWORDS: [&str; 15] = [
     "if",
     "then",
     "else",
@@ -39,11 +40,24 @@ const UNSUPPORTED_SCHEMA_KEYWORDS: [&str; 16] = [
     "minContains",
     "maxContains",
     "dependentSchemas",
-    "dependentRequired",
     "propertyNames",
     "additionalItems",
     "$dynamicRef",
     "$recursiveRef",
+];
+const REJECTED_VALIDATION_KEYWORDS: [&str; 12] = [
+    "if",
+    "then",
+    "else",
+    "not",
+    "dependentSchemas",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "contains",
+    "minContains",
+    "maxContains",
+    "patternProperties",
+    "propertyNames",
 ];
 
 /// Detects the entry document's supported OpenAPI line.
@@ -1104,7 +1118,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         };
         let meta = self.schema_meta(&node, Some(object));
         let dialect_unsupported = if self.version == OasVersion::V3_0 {
-            ["const", "prefixItems"]
+            ["const", "prefixItems", "dependentRequired"]
                 .into_iter()
                 .find(|keyword| object.contains_key(*keyword))
                 .map(|keyword| (keyword, keyword))
@@ -1316,6 +1330,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     let branch_meta = SchemaMeta {
                         source: meta.source.clone(),
                         numeric_constraints: meta.numeric_constraints.clone(),
+                        string_constraints: meta.string_constraints.clone(),
+                        array_constraints: meta.array_constraints.clone(),
+                        object_constraints: meta.object_constraints.clone(),
                         ..SchemaMeta::default()
                     };
                     let ty = match name {
@@ -1363,7 +1380,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         if let Some(ty) = object.get("type").and_then(Value::as_str) {
             return self.parse_type_name(node, object, ty, meta);
         }
-        if object.contains_key("properties") || object.contains_key("additionalProperties") {
+        if object.contains_key("properties")
+            || object.contains_key("additionalProperties")
+            || (self.version == OasVersion::V3_1 && object.contains_key("dependentRequired"))
+        {
             return self.parse_object(node, object, meta);
         }
         if object.contains_key("items") {
@@ -1496,9 +1516,15 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 })))
             }
         };
+        let dependent_required = if self.version == OasVersion::V3_1 {
+            collect_dependent_required(object)
+        } else {
+            Vec::new()
+        };
         SchemaNode::Object {
             properties,
             additional_properties,
+            dependent_required,
             meta,
         }
     }
@@ -1603,6 +1629,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             },
         };
         let numeric_constraints = collect_numeric_constraints(object, self.version);
+        let string_constraints = collect_string_constraints(object);
+        let array_constraints = collect_array_constraints(object);
+        let object_constraints = collect_object_constraints(object);
         let constraints = collect_constraints(object, &numeric_constraints);
         SchemaMeta {
             nullable: self.version == OasVersion::V3_0
@@ -1629,6 +1658,14 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 enum_descriptions_camel: object.get("x-enumDescriptions").cloned(),
             },
             numeric_constraints,
+            string_constraints,
+            array_constraints,
+            object_constraints,
+            rejected_validation_keywords: object
+                .keys()
+                .filter(|key| REJECTED_VALIDATION_KEYWORDS.contains(&key.as_str()))
+                .cloned()
+                .collect(),
             source: self.source(node.doc_id, &node.pointer),
         }
     }
@@ -2040,7 +2077,67 @@ fn collect_numeric_constraints(
         maximum: object.get("maximum").and_then(Value::as_number).cloned(),
         exclusive_minimum: exclusive("exclusiveMinimum"),
         exclusive_maximum: exclusive("exclusiveMaximum"),
+        // JSON Schema requires multipleOf > 0; a zero or negative divisor reaches the kernel's
+        // BigInt `%` and throws RangeError at validate time. Retain only strictly-positive values,
+        // matching the parser's other malformed-value tolerance (drop to None). An
+        // arbitrary-precision giant that overflows f64 makes `as_f64` return None (serde_json
+        // filters non-finite results), so it is dropped here too — intended, since no representable
+        // value could be a multiple of it. collect_constraints renders the raw value independently
+        // for the doc string, so this drop does not touch that output.
+        multiple_of: object
+            .get("multipleOf")
+            .and_then(Value::as_number)
+            .filter(|number| number.as_f64().is_some_and(|value| value > 0.0))
+            .cloned(),
     }
+}
+
+fn collect_string_constraints(object: &Map<String, Value>) -> StringConstraints {
+    StringConstraints {
+        min_length: object.get("minLength").and_then(Value::as_u64),
+        max_length: object.get("maxLength").and_then(Value::as_u64),
+        pattern: string_field(object, "pattern"),
+    }
+}
+
+fn collect_array_constraints(object: &Map<String, Value>) -> ArrayConstraints {
+    ArrayConstraints {
+        min_items: object.get("minItems").and_then(Value::as_u64),
+        max_items: object.get("maxItems").and_then(Value::as_u64),
+        unique_items: bool_field(object, "uniqueItems"),
+    }
+}
+
+fn collect_object_constraints(object: &Map<String, Value>) -> ObjectConstraints {
+    ObjectConstraints {
+        min_properties: object.get("minProperties").and_then(Value::as_u64),
+        max_properties: object.get("maxProperties").and_then(Value::as_u64),
+    }
+}
+
+fn collect_dependent_required(object: &Map<String, Value>) -> Vec<(String, Vec<String>)> {
+    object
+        .get("dependentRequired")
+        .and_then(Value::as_object)
+        .map(|dependencies| {
+            dependencies
+                .iter()
+                .map(|(name, required)| {
+                    let required = required
+                        .as_array()
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (name.clone(), required)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn collect_constraints(object: &Map<String, Value>, numeric: &NumericConstraints) -> Vec<String> {
@@ -3231,6 +3328,267 @@ mod tests {
                 .exclusive_minimum,
             Some(crate::ir::ExclusiveBound::Boolean(true))
         );
+    }
+
+    #[test]
+    fn schema_metadata_carries_structured_validation_constraints() {
+        let document: Value = serde_json::from_str(
+            r#"{
+                "openapi": "3.1.0",
+                "components": {
+                    "schemas": {
+                        "Constrained": {
+                            "type": "object",
+                            "minLength": 1,
+                            "maxLength": 2,
+                            "pattern": "^[a-z]+$",
+                            "multipleOf": 1.2300,
+                            "minItems": 3,
+                            "maxItems": 4,
+                            "uniqueItems": true,
+                            "minProperties": 5,
+                            "maxProperties": 6
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("valid OpenAPI document");
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+        let meta = ir.schemas[0].schema.meta();
+
+        assert_eq!(meta.string_constraints.min_length, Some(1));
+        assert_eq!(meta.string_constraints.max_length, Some(2));
+        assert_eq!(meta.string_constraints.pattern.as_deref(), Some("^[a-z]+$"));
+        assert_eq!(
+            meta.numeric_constraints
+                .multiple_of
+                .as_ref()
+                .map(ToString::to_string),
+            Some("1.2300".to_owned())
+        );
+        assert_eq!(meta.array_constraints.min_items, Some(3));
+        assert_eq!(meta.array_constraints.max_items, Some(4));
+        assert!(meta.array_constraints.unique_items);
+        assert_eq!(meta.object_constraints.min_properties, Some(5));
+        assert_eq!(meta.object_constraints.max_properties, Some(6));
+    }
+
+    #[test]
+    fn multiple_of_and_exclusive_bounds_follow_dialect_spelling() {
+        for (version, multiple_of, exclusive_minimum) in [
+            ("3.0.3", "2.500", json!(true)),
+            ("3.1.0", "2.500", json!(1.25)),
+        ] {
+            let document: Value = serde_json::from_str(&format!(
+                r#"{{
+                    "openapi": "{version}",
+                    "components": {{
+                        "schemas": {{
+                            "Constrained": {{
+                                "type": "number",
+                                "exclusiveMinimum": {exclusive_minimum},
+                                "multipleOf": {multiple_of}
+                            }}
+                        }}
+                    }}
+                }}"#
+            ))
+            .expect("valid OpenAPI document");
+            let (_temp, ir, sink) = parse_value(&document);
+            assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+            let numeric = &ir.schemas[0].schema.meta().numeric_constraints;
+
+            assert_eq!(
+                numeric.multiple_of.as_ref().map(ToString::to_string),
+                Some(multiple_of.to_owned())
+            );
+            if version == "3.0.3" {
+                assert_eq!(
+                    numeric.exclusive_minimum,
+                    Some(crate::ir::ExclusiveBound::Boolean(true))
+                );
+            } else {
+                assert_eq!(version, "3.1.0");
+                assert_eq!(
+                    numeric.exclusive_minimum,
+                    Some(crate::ir::ExclusiveBound::Number(
+                        "1.25".parse().expect("number")
+                    ))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dependent_required_preserves_document_order() {
+        let document: Value = serde_json::from_str(
+            r#"{
+                "openapi": "3.1.0",
+                "components": {
+                    "schemas": {
+                        "Address": {
+                            "type": "object",
+                            "dependentRequired": {
+                                "billing_address": ["credit_card", "name"],
+                                "shipping_address": ["name"]
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("valid OpenAPI document");
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+
+        assert!(
+            matches!(
+                &ir.schemas[0].schema,
+                SchemaNode::Object { dependent_required, .. }
+                    if *dependent_required
+                        == vec![
+                            (
+                                "billing_address".to_owned(),
+                                vec!["credit_card".to_owned(), "name".to_owned()]
+                            ),
+                            ("shipping_address".to_owned(), vec!["name".to_owned()]),
+                        ]
+            ),
+            "dependentRequired schema should retain its object shape and document order"
+        );
+    }
+
+    #[test]
+    fn rejected_validation_keywords_preserve_document_order() {
+        let document: Value = serde_json::from_str(
+            r#"{
+                "openapi": "3.1.0",
+                "components": {
+                    "schemas": {
+                        "Rejected": {
+                            "propertyNames": {},
+                            "if": {},
+                            "maxContains": 2,
+                            "dependentSchemas": {},
+                            "then": {},
+                            "patternProperties": {},
+                            "contains": {},
+                            "else": {},
+                            "minContains": 1,
+                            "unevaluatedItems": false,
+                            "not": {},
+                            "unevaluatedProperties": false
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("valid OpenAPI document");
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+        assert!(matches!(ir.schemas[0].schema, SchemaNode::Unknown { .. }));
+        assert_eq!(
+            ir.schemas[0].schema.meta().rejected_validation_keywords,
+            [
+                "propertyNames",
+                "if",
+                "maxContains",
+                "dependentSchemas",
+                "then",
+                "patternProperties",
+                "contains",
+                "else",
+                "minContains",
+                "unevaluatedItems",
+                "not",
+                "unevaluatedProperties"
+            ]
+        );
+    }
+
+    #[test]
+    fn structural_validation_constraints_default_for_absent_and_malformed_values() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "schemas": {
+                    "Absent": { "type": "object" },
+                    "Malformed": {
+                        "type": "object",
+                        "minLength": "one",
+                        "maxLength": -1,
+                        "pattern": 7,
+                        "multipleOf": "two",
+                        "minItems": "three",
+                        "maxItems": -4,
+                        "uniqueItems": "yes",
+                        "minProperties": "five",
+                        "maxProperties": -6,
+                        "dependentRequired": []
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+
+        for schema in &ir.schemas {
+            let meta = schema.schema.meta();
+            assert_eq!(meta.string_constraints.min_length, None);
+            assert_eq!(meta.string_constraints.max_length, None);
+            assert_eq!(meta.string_constraints.pattern, None);
+            assert_eq!(meta.numeric_constraints.multiple_of, None);
+            assert_eq!(meta.array_constraints.min_items, None);
+            assert_eq!(meta.array_constraints.max_items, None);
+            assert!(!meta.array_constraints.unique_items);
+            assert_eq!(meta.object_constraints.min_properties, None);
+            assert_eq!(meta.object_constraints.max_properties, None);
+            assert!(meta.rejected_validation_keywords.is_empty());
+            assert!(
+                matches!(
+                    &schema.schema,
+                    SchemaNode::Object { dependent_required, .. } if dependent_required.is_empty()
+                ),
+                "test schemas should retain their object shape with empty dependentRequired"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_of_retains_only_strictly_positive_divisors() {
+        // multipleOf must be > 0; a zero or negative divisor would crash the validator kernel's
+        // BigInt modulo, so the parser drops it to None. A positive divisor is retained. Both
+        // dialects share the numeric collection path.
+        for version in ["3.0.3", "3.1.0"] {
+            for (literal, expected) in [("0", None), ("-2", None), ("2.5", Some("2.5"))] {
+                let document: Value = serde_json::from_str(&format!(
+                    r#"{{
+                        "openapi": "{version}",
+                        "components": {{
+                            "schemas": {{
+                                "N": {{ "type": "number", "multipleOf": {literal} }}
+                            }}
+                        }}
+                    }}"#
+                ))
+                .expect("valid OpenAPI document");
+                let (_temp, ir, sink) = parse_value(&document);
+                assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+                assert_eq!(
+                    ir.schemas[0]
+                        .schema
+                        .meta()
+                        .numeric_constraints
+                        .multiple_of
+                        .as_ref()
+                        .map(ToString::to_string),
+                    expected.map(str::to_owned),
+                    "{version} multipleOf {literal}"
+                );
+            }
+        }
     }
 
     #[test]

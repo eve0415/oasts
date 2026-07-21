@@ -1,0 +1,20 @@
+# SHA-256 manifest of the generated-validators frozen entry-gate files; scripts/validators-gate.sh verifies it.
+# These files were authored from the pinned validator contract before any implementation existed
+# and are never edited afterward — the implementation is written to satisfy them.
+files:
+  - path: fixtures/validators-keyword-matrix.yaml
+    sha256: 2eaebe80af84fad4c4057568c8ef8e1a9a7a649abe0c6d8b9e8cb59fa5f87811
+  - path: crates/oasts-core/runtime/test-conformance/vectors-validators-conformance.ts
+    sha256: a78b4b3f4ea22ebfc2a358b28eb3be305e88d8c1a521ca61c362a06d72eb9191
+  - path: fixtures/validators-showcase-3.1/openapi.yaml
+    sha256: 778a5c9f6598dbef0d665d7dcc64f26b87eda5c3b228897bb3f8d6e0d8a6707e
+  - path: fixtures/validators-showcase-3.1/oasts.yaml
+    sha256: d45f0c75a2e5b163b6d86e676d72091a9fb3122b70adefd3f2dcacd004886ecd
+  - path: fixtures/validators-showcase-3.1/oasts-client.yaml
+    sha256: 1516a8f13dc55f66a2b215176816b5be360bb8fbe7d070cd838767048a56b773
+  - path: fixtures/petstore-3.0/oasts-validators.yaml
+    sha256: cfd853905fcff3c04816e1ea2124c2f5a78d9752935eafb24c3cc8f957805f23
+  - path: fixtures/validators-showcase-3.1/compile-assert/cases.ts
+    sha256: ed30babee9042ddf9847dfc99eb02af4645d09a5fc4db7c676d626a6d123b2d9
+  - path: crates/oasts-core/runtime/validators-standard-schema.ts
+    sha256: e1e419cf6cd9b3583aaa9ef87026e3d4f6c3cbd124b06275b4364d8dd1643ad1
