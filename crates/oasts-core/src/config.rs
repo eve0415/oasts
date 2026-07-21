@@ -1,5 +1,6 @@
 //! Schema-version 1 configuration loading for the local, single-spec wedge.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -619,6 +620,7 @@ pub struct NamingConfig {
     pub enum_member_case: EnumMemberCase,
     pub type_prefix: String,
     pub type_suffix: String,
+    pub overrides: NameOverrides,
 }
 
 impl Default for NamingConfig {
@@ -631,8 +633,36 @@ impl Default for NamingConfig {
             enum_member_case: EnumMemberCase::Pascal,
             type_prefix: String::new(),
             type_suffix: String::new(),
+            overrides: NameOverrides::default(),
         }
     }
+}
+
+/// Explicit final identifiers for named declarations, keyed by raw wire name.
+///
+/// The nested per-namespace shape stays additive: a future namespace is a new field, not a
+/// breaking reshape. A value is the complete TypeScript identifier — `typePrefix`/`typeSuffix`
+/// are not applied on top, because the user wrote the exact name they want and decorating it
+/// would defeat the point. Values are still validated and still participate in collision
+/// detection like any generated name, so an override resolves a collision only by naming a
+/// distinct identifier, never by bypassing the check. A key matching no declaration in the
+/// document is a config error (see identifier allocation), so a typo surfaces instead of
+/// silently leaving the original collision unexplained.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "Explicit final identifiers keyed by raw wire name, per namespace."
+    )
+)]
+pub struct NameOverrides {
+    /// Keyed by the `components/schemas` key; the value is the final type identifier.
+    pub schemas: BTreeMap<String, String>,
+    /// Keyed by the `operationId`; the value is the final operation identifier.
+    pub operations: BTreeMap<String, String>,
 }
 
 /// Documentation switches.
@@ -3207,6 +3237,43 @@ mod tests {
         let mut valid = valid_json_value();
         valid["naming"] = json!({ "typePrefix": "$Api_", "typeSuffix": "_2" });
         load_json(&valid).expect("identifier affixes should resolve");
+    }
+
+    #[test]
+    fn naming_overrides_deserialize_into_resolved_naming() {
+        let mut value = valid_json_value();
+        value["naming"] = json!({
+            "overrides": {
+                "schemas": { "stream_liveInput": "StreamLiveInputId" },
+                "operations": { "deleteWebhook": "DeleteRealtimeKitWebhook" }
+            }
+        });
+        let resolved = load_json(&value).expect("overrides should resolve");
+        assert_eq!(
+            resolved
+                .naming
+                .overrides
+                .schemas
+                .get("stream_liveInput")
+                .map(String::as_str),
+            Some("StreamLiveInputId")
+        );
+        assert_eq!(
+            resolved
+                .naming
+                .overrides
+                .operations
+                .get("deleteWebhook")
+                .map(String::as_str),
+            Some("DeleteRealtimeKitWebhook")
+        );
+    }
+
+    #[test]
+    fn naming_overrides_reject_unknown_namespace() {
+        let mut value = valid_json_value();
+        value["naming"] = json!({ "overrides": { "params": { "x": "Y" } } });
+        assert_code(load_json(&value), CODE_PARSE);
     }
 
     #[test]

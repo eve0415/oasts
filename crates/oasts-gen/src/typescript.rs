@@ -274,6 +274,13 @@ fn schema_to_ts(schema: &Value, defs: &Map<String, Value>) -> Result<String, Str
                         .collect::<Result<_, String>>()?;
                     return Ok(format!("{{ {} }}", fields.join("; ")));
                 }
+                // A map schema (additionalProperties is a value schema, not `false`) keeps its
+                // value type so `Record<string, string>` survives instead of collapsing to unknown.
+                if let Some(additional) = obj.get("additionalProperties").and_then(Value::as_object)
+                {
+                    let value_type = schema_to_ts(&Value::Object(additional.clone()), defs)?;
+                    return Ok(format!("Record<string, {value_type}>"));
+                }
                 return Ok("Record<string, unknown>".into());
             }
             _ => {}
@@ -553,6 +560,32 @@ mod tests {
     }
 
     #[test]
+    fn object_map_keeps_value_type() {
+        let defs = test_defs();
+        assert_eq!(
+            schema_to_ts(
+                &json!({"type": "object", "additionalProperties": {"type": "string"}}),
+                &defs
+            )
+            .unwrap(),
+            "Record<string, string>"
+        );
+    }
+
+    #[test]
+    fn object_closed_without_properties_is_unknown_record() {
+        let defs = test_defs();
+        assert_eq!(
+            schema_to_ts(
+                &json!({"type": "object", "additionalProperties": false}),
+                &defs
+            )
+            .unwrap(),
+            "Record<string, unknown>"
+        );
+    }
+
+    #[test]
     fn format_key_dollar_prefix_stays_bare() {
         assert_eq!(format_key("$schema"), "$schema");
     }
@@ -632,6 +665,16 @@ mod tests {
         assert!(ts.contains("source: \"runtime\""));
         assert!(ts.contains("source: \"server\""));
         assert!(ts.contains("source: \"literal\""));
+    }
+
+    #[test]
+    fn naming_overrides_render_as_string_records() {
+        let schema = crate::schema::config_schema();
+        let ts = emit_config_ts(&schema).unwrap();
+        assert!(ts.contains("export interface NameOverrides"));
+        assert!(ts.contains("schemas?: Record<string, string>;"));
+        assert!(ts.contains("operations?: Record<string, string>;"));
+        assert!(ts.contains("overrides?: NameOverrides;"));
     }
 
     #[test]

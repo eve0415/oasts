@@ -596,7 +596,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                         self.sink.push(
                             Diagnostic::input(
                                 CODE_RESPONSE_STATUS,
-                                format!("invalid response status key '{key}'"),
+                                format!(
+                                    "invalid response status key '{key}'; status keys are case-sensitive, use 'default', a three-digit code, or an uppercase range like '4XX'"
+                                ),
                             )
                             .with_source(self.source_id(node.doc_id))
                             .with_json_pointer(&pointer),
@@ -677,7 +679,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     continue;
                 }
                 Err(MediaKeyError::Malformed) => {
-                    self.sink.push(self.input_diagnostic(
+                    // Dropped rather than fatal, because an unusable content key cannot form a branch
+                    // and an emptied content map degrades to the no-content branch.
+                    self.sink.push(self.warning_diagnostic(
                         CODE_MEDIA_TYPE,
                         node.doc_id,
                         &pointer,
@@ -2531,8 +2535,8 @@ mod tests {
         assert!(
             malformed
                 .iter()
-                .all(|diagnostic| diagnostic.severity == Severity::Error),
-            "malformed content keys are invalid input and stay fatal"
+                .all(|diagnostic| diagnostic.severity == Severity::Warning),
+            "malformed content keys are unusable branches and are dropped"
         );
         assert!(invalid.iter().all(|diagnostic| {
             diagnostic.source_id.is_some() && diagnostic.json_pointer.is_some()
@@ -2573,6 +2577,41 @@ mod tests {
         assert_eq!(warnings[0].severity, Severity::Warning);
         assert!(warnings[0].message.contains("parameterized"));
         // Generation continues: no Error-severity diagnostic, so exit 0.
+        assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn malformed_content_key_warns_and_drops_the_entry_without_erroring() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/watch": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "string": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        // The unusable content key is dropped, leaving the no-content branch.
+        assert!(ir.operations[0].responses[0].media_types.is_empty());
+
+        let warnings = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1107")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert!(warnings[0].message.contains("malformed"));
         assert!(!sink.has_errors());
     }
 
@@ -2623,6 +2662,11 @@ mod tests {
             .filter(|diagnostic| diagnostic.code == "OASTS1108")
             .collect::<Vec<_>>();
         assert_eq!(duplicates.len(), 2);
+        assert!(
+            duplicates
+                .iter()
+                .all(|diagnostic| diagnostic.severity == Severity::Error)
+        );
         assert!(duplicates.iter().any(|diagnostic| {
             diagnostic.json_pointer.as_deref()
                 == Some("/paths/~1duplicate/post/requestBody/content/application~1json")
@@ -2635,6 +2679,7 @@ mod tests {
                 && diagnostic.message.contains("TEXT/*")
                 && diagnostic.message.contains("text/*")
         }));
+        assert!(sink.has_errors());
     }
 
     #[test]
@@ -3712,6 +3757,30 @@ mod tests {
                     .any(|diagnostic| diagnostic.code == code)
             );
         }
+    }
+
+    #[test]
+    fn lowercase_response_status_key_names_casing_as_the_cause() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "responses": {
+                            "200": { "description": "ok" },
+                            "4xx": { "description": "client error" }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, _ir, sink) = parse_value(&document);
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_RESPONSE_STATUS
+                && diagnostic.message.contains("'4xx'")
+                && diagnostic.message.contains("case-sensitive")
+                && diagnostic.message.contains("'4XX'")
+        }));
     }
 
     #[test]

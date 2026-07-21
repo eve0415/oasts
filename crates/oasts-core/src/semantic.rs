@@ -21,6 +21,8 @@ use crate::num::render_number;
 const CODE_OPERATION_NAME: &str = "OASTS1201";
 const CODE_TYPE_NAME: &str = "OASTS1202";
 const CODE_ENUM_RULE_14: &str = "OASTS1214";
+// Config-category (exit code 2): an override key that names no declaration in the document.
+const CODE_OVERRIDE_UNMATCHED: &str = "OASTS0202";
 
 const RESERVED_WORDS: [&str; 46] = [
     "break",
@@ -179,6 +181,7 @@ pub fn analyze_with_options(
 ) -> Analyzed {
     let operation_names = allocate_operation_names(&ir, naming, sink);
     let schema_names = allocate_schema_names(&ir, naming, sink);
+    report_unmatched_overrides(&ir, naming, sink);
     let mut enum_members = Vec::new();
     let mut enum_analysis = EnumAnalysis {
         naming,
@@ -250,7 +253,28 @@ fn allocate_operation_names(
     let mut names = Vec::new();
     let mut seen: HashMap<String, (String, SourceRef)> = HashMap::new();
     for (operation_index, operation) in ir.operations.iter().enumerate() {
-        match derive_operation_name(operation, case) {
+        // An override keyed on operationId supplies the final name verbatim: the case transform
+        // does not run on it and it must still validate and collide like any derived name.
+        let override_name = operation
+            .operation_id
+            .as_deref()
+            .and_then(|id| naming.overrides.operations.get(id));
+        let allocation = match override_name {
+            Some(name) => validate_final_identifier(name)
+                .map(|()| name.clone())
+                .map_err(|error| (name.clone(), error)),
+            None => derive_operation_name(operation, case).map_err(|error| {
+                (
+                    operation
+                        .operation_id
+                        .as_deref()
+                        .unwrap_or("derived name")
+                        .to_owned(),
+                    error,
+                )
+            }),
+        };
+        match allocation {
             Ok(name) => {
                 report_collision(
                     "operation",
@@ -266,10 +290,10 @@ fn allocate_operation_names(
                     source: operation.source.clone(),
                 });
             }
-            Err(error) => push_name_error(
+            Err((input, error)) => push_name_error(
                 CODE_OPERATION_NAME,
                 "operation",
-                operation.operation_id.as_deref().unwrap_or("derived name"),
+                &input,
                 error,
                 &operation.source,
                 sink,
@@ -287,11 +311,21 @@ fn allocate_schema_names(
     let mut names = Vec::new();
     let mut seen: HashMap<String, (String, SourceRef)> = HashMap::new();
     for (schema_index, schema) in ir.schemas.iter().enumerate() {
-        match normalize_identifier(&schema.name, TargetCase::Pascal).and_then(|base| {
-            let candidate = format!("{}{}{}", naming.type_prefix, base, naming.type_suffix);
-            validate_final_identifier(&candidate)?;
-            Ok(candidate)
-        }) {
+        // An override supplies the complete identifier: typePrefix/typeSuffix are not applied on
+        // top, but the value must still validate and collide like any generated name.
+        let allocation = match naming.overrides.schemas.get(&schema.name) {
+            Some(name) => validate_final_identifier(name)
+                .map(|()| name.clone())
+                .map_err(|error| (name.clone(), error)),
+            None => normalize_identifier(&schema.name, TargetCase::Pascal)
+                .and_then(|base| {
+                    let candidate = format!("{}{}{}", naming.type_prefix, base, naming.type_suffix);
+                    validate_final_identifier(&candidate)?;
+                    Ok(candidate)
+                })
+                .map_err(|error| (schema.name.clone(), error)),
+        };
+        match allocation {
             Ok(name) => {
                 report_collision(
                     "schema",
@@ -308,10 +342,10 @@ fn allocate_schema_names(
                     source: schema.source.clone(),
                 });
             }
-            Err(error) => push_name_error(
+            Err((input, error)) => push_name_error(
                 CODE_TYPE_NAME,
                 "schema",
-                &schema.name,
+                &input,
                 error,
                 &schema.source,
                 sink,
@@ -319,6 +353,49 @@ fn allocate_schema_names(
         }
     }
     names
+}
+
+/// Reports every override key that names no declaration in the document.
+///
+/// This is a config error (exit code 2): a typo that silently did nothing would leave the
+/// collision the override was meant to resolve still unexplained, sending the user hunting.
+/// The check needs the document, so it runs here rather than at config load. Keys are visited
+/// in the map's sorted order, so the diagnostics are deterministic.
+fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut DiagnosticSink) {
+    for key in naming.overrides.schemas.keys() {
+        if !ir.schemas.iter().any(|schema| &schema.name == key) {
+            sink.push(unmatched_override_diagnostic("schema", "schemas", key));
+        }
+    }
+    for key in naming.overrides.operations.keys() {
+        if !ir
+            .operations
+            .iter()
+            .any(|operation| operation.operation_id.as_deref() == Some(key.as_str()))
+        {
+            sink.push(unmatched_override_diagnostic(
+                "operation",
+                "operations",
+                key,
+            ));
+        }
+    }
+}
+
+fn unmatched_override_diagnostic(kind: &str, namespace: &str, key: &str) -> Diagnostic {
+    Diagnostic::config(
+        CODE_OVERRIDE_UNMATCHED,
+        format!("naming override key '{key}' matches no {kind} in the document"),
+    )
+    .with_json_pointer(format!(
+        "/naming/overrides/{namespace}/{}",
+        escape_json_pointer_token(key)
+    ))
+}
+
+/// Escapes a single JSON Pointer reference token per RFC 6901 (`~` -> `~0`, `/` -> `~1`).
+fn escape_json_pointer_token(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
 }
 
 fn report_collision(
@@ -329,17 +406,20 @@ fn report_collision(
     seen: &mut HashMap<String, (String, SourceRef)>,
     sink: &mut DiagnosticSink,
 ) {
-    let (folded, collision) = casefold_collision(name, seen, |(previous_name, previous_source)| {
-        format!(
-            "{kind} name collision after case folding: '{previous_name}' at {} and '{name}' at {}",
+    // Exact match over case-folded match at the identifier layer, because TypeScript
+    // identifiers are case-sensitive: two names differing only in case are two distinct,
+    // legal types. Filesystem safety on case-insensitive volumes is enforced separately
+    // by the path-collision check (`register_path` / OASTS1302 in `emit/model.rs`), so this
+    // layer must not also reject case-only differences.
+    if let Some((_, previous_source)) = seen.get(name) {
+        let message = format!(
+            "{kind} name collision: '{name}' allocated at {} and {}",
             previous_source.display(),
             source.display()
-        )
-    });
-    if let Some(message) = collision {
+        );
         sink.push(source_diagnostic(code, message, source));
     } else {
-        seen.insert(folded, (name.to_owned(), source.clone()));
+        seen.insert(name.to_owned(), (name.to_owned(), source.clone()));
     }
 }
 
@@ -719,14 +799,16 @@ fn validate_value_domain(
 ) {
     for value in values {
         if !value_in_domain(value, ty, meta.nullable) {
-            enum_error(
-                meta,
-                format!(
-                    "{keyword} member {} contradicts declared type {ty:?}",
-                    compact_json(value)
-                ),
-                sink,
+            let mut message = format!(
+                "{keyword} member {} contradicts declared type {ty:?}",
+                compact_json(value)
             );
+            if value.is_boolean() && ty == PrimitiveType::String {
+                message.push_str(
+                    "; likely a YAML 1.1 boolean coercion (bare off/on/yes/no), quote the value as a string",
+                );
+            }
+            enum_error(meta, message, sink);
         }
     }
 }
@@ -1094,9 +1176,42 @@ fn compact_json(value: &Value) -> String {
 mod tests {
     use serde_json::json;
 
+    use std::collections::BTreeMap;
+
     use super::*;
-    use crate::config::{EnumExtensions, EnumRepresentation};
+    use crate::config::{EnumExtensions, EnumRepresentation, NameOverrides};
+    use crate::diag::Category;
     use crate::ir::{NamedSchema, SchemaDocs, SchemaRef, Segment};
+
+    fn named_schema(name: &str) -> NamedSchema {
+        let pointer = format!("/components/schemas/{name}");
+        NamedSchema {
+            name: name.to_owned(),
+            schema: any_schema(&pointer),
+            source: source(&pointer),
+        }
+    }
+
+    fn schema_overrides(entries: &[(&str, &str)]) -> NamingConfig {
+        NamingConfig {
+            overrides: NameOverrides {
+                schemas: entries
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        }
+    }
+
+    fn schema_names(analyzed: &Analyzed) -> Vec<&str> {
+        analyzed
+            .schema_names
+            .iter()
+            .map(|allocated| allocated.name.as_str())
+            .collect()
+    }
 
     fn source(pointer: &str) -> SourceRef {
         SourceRef::new("openapi.yaml", pointer)
@@ -1247,6 +1362,244 @@ mod tests {
             message.contains("/components/schemas/Pet")
                 && message.contains("/components/schemas/pet")
         }));
+    }
+
+    #[test]
+    fn case_fold_only_identifiers_allocate_both_types() {
+        // `custom-hostname` -> `CustomHostname` and `customhostname` -> `Customhostname`
+        // differ only by the case of one letter, so they are two distinct, legal TypeScript
+        // types and both must allocate. Filesystem safety is the path layer's job, not this one.
+        let ir = Ir {
+            schemas: vec![
+                NamedSchema {
+                    name: "custom-hostname".to_owned(),
+                    schema: any_schema("/components/schemas/custom-hostname"),
+                    source: source("/components/schemas/custom-hostname"),
+                },
+                NamedSchema {
+                    name: "customhostname".to_owned(),
+                    schema: any_schema("/components/schemas/customhostname"),
+                    source: source("/components/schemas/customhostname"),
+                },
+            ],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let names = analyzed
+            .schema_names
+            .iter()
+            .map(|allocated| allocated.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["CustomHostname", "Customhostname"]);
+    }
+
+    #[test]
+    fn schema_override_resolves_a_real_collision_into_distinct_names() {
+        // `stream_liveInput` and `stream_live_input` both normalize to `StreamLiveInput`; the
+        // override on the first disambiguates so both declarations allocate.
+        let ir = Ir {
+            schemas: vec![
+                named_schema("stream_liveInput"),
+                named_schema("stream_live_input"),
+            ],
+            ..Ir::default()
+        };
+        let naming = schema_overrides(&[("stream_liveInput", "StreamLiveInputId")]);
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            schema_names(&analyzed),
+            ["StreamLiveInputId", "StreamLiveInput"]
+        );
+    }
+
+    #[test]
+    fn schema_override_value_is_validated_like_any_generated_name() {
+        let ir = Ir {
+            schemas: vec![named_schema("widget")],
+            ..Ir::default()
+        };
+        let naming = schema_overrides(&[("widget", "2Bad")]);
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+        assert!(analyzed.schema_names.is_empty());
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_TYPE_NAME)
+            .expect("override value rejection");
+        assert!(diagnostic.message.contains("2Bad"));
+        assert!(diagnostic.message.contains("begins with a digit"));
+    }
+
+    #[test]
+    fn two_overrides_colliding_with_each_other_still_report_a_collision() {
+        let ir = Ir {
+            schemas: vec![named_schema("alpha"), named_schema("beta")],
+            ..Ir::default()
+        };
+        let naming = schema_overrides(&[("alpha", "Same"), ("beta", "Same")]);
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_TYPE_NAME
+                && diagnostic.message.contains("collision")
+                && diagnostic.message.contains("'Same'")
+        }));
+    }
+
+    #[test]
+    fn override_colliding_with_an_untouched_generated_name_still_collides() {
+        // `widget` generates `Widget`; the override forces `other` onto the same identifier.
+        let ir = Ir {
+            schemas: vec![named_schema("widget"), named_schema("other")],
+            ..Ir::default()
+        };
+        let naming = schema_overrides(&[("other", "Widget")]);
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_TYPE_NAME
+                && diagnostic.message.contains("collision")
+                && diagnostic.message.contains("'Widget'")
+        }));
+    }
+
+    #[test]
+    fn override_suppresses_type_prefix_and_suffix() {
+        let ir = Ir {
+            schemas: vec![named_schema("widget"), named_schema("gadget")],
+            ..Ir::default()
+        };
+        let naming = NamingConfig {
+            type_prefix: "Api".to_owned(),
+            type_suffix: "Dto".to_owned(),
+            overrides: NameOverrides {
+                schemas: BTreeMap::from([("widget".to_owned(), "Widget".to_owned())]),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        // The override is the complete identifier; the non-overridden schema still gets affixes.
+        assert_eq!(schema_names(&analyzed), ["Widget", "ApiGadgetDto"]);
+    }
+
+    #[test]
+    fn unmatched_override_keys_are_config_errors_naming_the_key() {
+        let ir = Ir {
+            schemas: vec![named_schema("widget")],
+            ..Ir::default()
+        };
+        let naming = NamingConfig {
+            overrides: NameOverrides {
+                schemas: BTreeMap::from([("ghost".to_owned(), "Ghost".to_owned())]),
+                operations: BTreeMap::from([("phantomOp".to_owned(), "PhantomOp".to_owned())]),
+            },
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+
+        let schema_diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == CODE_OVERRIDE_UNMATCHED && diagnostic.message.contains("ghost")
+            })
+            .expect("unmatched schema override");
+        assert_eq!(schema_diagnostic.category, Category::Config);
+        assert_eq!(schema_diagnostic.category.exit_code(), 2);
+        assert!(schema_diagnostic.message.contains("schema"));
+        assert_eq!(
+            schema_diagnostic.json_pointer.as_deref(),
+            Some("/naming/overrides/schemas/ghost")
+        );
+
+        let operation_diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == CODE_OVERRIDE_UNMATCHED
+                    && diagnostic.message.contains("phantomOp")
+            })
+            .expect("unmatched operation override");
+        assert_eq!(operation_diagnostic.category, Category::Config);
+        assert!(operation_diagnostic.message.contains("operation"));
+        assert_eq!(
+            operation_diagnostic.json_pointer.as_deref(),
+            Some("/naming/overrides/operations/phantomOp")
+        );
+    }
+
+    #[test]
+    fn operation_override_replaces_the_derived_name_verbatim() {
+        let mut op = operation(Vec::new());
+        op.operation_id = Some("deleteWebhook".to_owned());
+        op.source = source("/paths/~1webhooks/delete");
+        let naming = NamingConfig {
+            overrides: NameOverrides {
+                operations: BTreeMap::from([(
+                    "deleteWebhook".to_owned(),
+                    "DeleteRealtimeKitWebhook".to_owned(),
+                )]),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            Ir {
+                operations: vec![op],
+                ..Ir::default()
+            },
+            &naming,
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(analyzed.operation_names[0].name, "DeleteRealtimeKitWebhook");
+    }
+
+    #[test]
+    fn operation_override_value_is_validated_like_any_generated_name() {
+        let mut op = operation(Vec::new());
+        op.operation_id = Some("deleteWebhook".to_owned());
+        let naming = NamingConfig {
+            overrides: NameOverrides {
+                operations: BTreeMap::from([("deleteWebhook".to_owned(), "class".to_owned())]),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            Ir {
+                operations: vec![op],
+                ..Ir::default()
+            },
+            &naming,
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(analyzed.operation_names.is_empty());
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_OPERATION_NAME)
+            .expect("override value rejection");
+        assert!(diagnostic.message.contains("class"));
+        assert!(diagnostic.message.contains("reserved word"));
     }
 
     fn enum_schema(
@@ -1764,6 +2117,38 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("contradicts"))
         );
+    }
+
+    #[test]
+    fn domain_violation_names_the_yaml_cause_only_for_booleans_under_string() {
+        let meta = SchemaMeta {
+            source: source("/yaml-bug"),
+            ..SchemaMeta::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        validate_value_domain(
+            &[json!(false), json!("redaction")],
+            PrimitiveType::String,
+            &meta,
+            "enum",
+            &mut sink,
+        );
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.message.contains("contradicts declared type")
+                && diagnostic.message.contains("YAML 1.1")
+                && diagnostic.message.contains("quote the value as a string")
+        }));
+
+        let meta = SchemaMeta {
+            source: source("/non-boolean"),
+            ..SchemaMeta::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        validate_value_domain(&[json!(1)], PrimitiveType::String, &meta, "enum", &mut sink);
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.message.contains("contradicts declared type")
+                && !diagnostic.message.contains("YAML")
+        }));
     }
 
     #[test]

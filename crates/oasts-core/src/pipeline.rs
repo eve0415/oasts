@@ -339,7 +339,10 @@ CrossFileB:
     }
 
     #[test]
-    fn external_schema_name_collides_with_root_component_under_casefold() {
+    fn external_schema_name_collides_with_root_component_exactly() {
+        // An external schema and a root component both named `Shared` produce the
+        // byte-identical identifier `Shared`. A genuine exact collision stays fatal:
+        // refusing to guess which shape wins is the whole point of the check.
         let openapi = r##"openapi: "3.1.0"
 info: { title: collide, version: "1" }
 paths:
@@ -367,7 +370,99 @@ components:
         let collided = sink.as_slice().iter().any(|diagnostic| {
             diagnostic.code == "OASTS1202" && diagnostic.message.contains("collision")
         });
-        assert!(collided, "expected case-fold collision diagnostic");
+        assert!(collided, "expected exact identifier collision diagnostic");
+    }
+
+    #[test]
+    fn external_schema_name_differing_only_by_case_allocates_both() {
+        // `custom-hostname` -> `CustomHostname` and `customhostname` -> `Customhostname`
+        // differ only by the case of one letter, so they are two distinct TypeScript types.
+        // The external name and the root component no longer collide, and both files emit
+        // (their kebab file bases `custom-hostname` / `customhostname` also differ).
+        let openapi = r##"openapi: "3.1.0"
+info: { title: casefold, version: "1" }
+paths:
+  /hostname:
+    get:
+      operationId: get-hostname
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "./schemas/part.yaml#/customhostname"
+components:
+  schemas:
+    custom-hostname:
+      type: object
+      properties:
+        value: { type: string }
+"##;
+        let part = "customhostname:\n  type: object\n  properties:\n    value: { type: string }\n";
+        let (sink, files) = compile_multifile(
+            &[("openapi.yaml", openapi), ("schemas/part.yaml", part)],
+            true,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let files = files.expect("emission succeeds");
+        let paths = files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            "types/components/custom-hostname.ts",
+            "types/components/customhostname.ts",
+        ] {
+            assert!(paths.contains(expected), "missing {expected}: {paths:#?}");
+        }
+    }
+
+    #[test]
+    fn case_fold_only_names_sharing_a_generated_path_collide() {
+        // `custom-hostname` -> `CustomHostname` and `custom-hostName` -> `CustomHostName`
+        // are distinct identifiers, so the identifier layer allocates both (no OASTS1202).
+        // Their kebab file bases both fold to `custom-hostname.ts`, so filesystem safety is
+        // still enforced — at the path layer, via OASTS1302.
+        let openapi = r##"openapi: "3.1.0"
+info: { title: pathcollide, version: "1" }
+paths:
+  /a:
+    get:
+      operationId: get-a
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/custom-hostname"
+  /b:
+    get:
+      operationId: get-b
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/custom-hostName"
+components:
+  schemas:
+    custom-hostname:
+      type: object
+      properties:
+        value: { type: string }
+    custom-hostName:
+      type: object
+      properties:
+        value: { type: string }
+"##;
+        let (sink, files) = compile_multifile(&[("openapi.yaml", openapi)], true);
+        assert!(files.is_none(), "path collision must be fatal");
+        let has_code = |code: &str| sink.as_slice().iter().any(|d| d.code == code);
+        assert!(!has_code("OASTS1202"), "case-only diff must not be fatal");
+        assert!(has_code("OASTS1302"), "path layer must still collide");
     }
 
     #[test]
