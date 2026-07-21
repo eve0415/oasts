@@ -1,5 +1,8 @@
 [package]
 name = "oasts-bench"
+# The harness stays the bare `cargo run -p oasts-bench` target; the allocs
+# tracker bin is invoked explicitly with `--bin allocs`.
+default-run = "oasts-bench"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +19,7 @@ libc = "=0.2.186"
 oxc_allocator = "=0.140.0"
 oxc_parser = "=0.140.0"
 oxc_span = "=0.140.0"
+oasts-core = { path = "../oasts-core" }
 sha2 = "=0.10.9"
 tempfile = "=3.23.0"
 yaml-rust2 = "=0.11.0"

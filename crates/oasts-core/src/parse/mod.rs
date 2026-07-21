@@ -11,7 +11,7 @@ use crate::ir::{
     NumericConstraints, OasVersion, ObjectConstraints, Operation, Param, ParamLocation, ParamStyle,
     PrimitiveType, PropMeta, ResponseEntry, ResponseStatus, SchemaDocs, SchemaMeta, SchemaNode,
     SchemaRef, SecKind, SecurityRequirement, Segment, SegmentPart, ServerEntry, ServerVariable,
-    SourceRef, StringConstraints, TupleRest,
+    SourceRef, StringConstraints, TupleRest, box_if_populated,
 };
 use crate::loader::{DocId, DocumentGraph, append_pointer};
 
@@ -1170,7 +1170,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         if let Some(branches) = object.get("oneOf") {
             return SchemaNode::OneOf {
                 branches: self.parse_schema_array(node.clone(), "oneOf", branches),
-                discriminator: self.parse_discriminator(node, object.get("discriminator")),
+                discriminator: self
+                    .parse_discriminator(node, object.get("discriminator"))
+                    .map(Box::new),
                 meta,
             };
         }
@@ -1651,16 +1653,16 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 comment: string_field(object, "$comment"),
                 constraints,
             },
-            enum_extensions: EnumExtensionData {
+            enum_extensions: box_if_populated(EnumExtensionData {
                 enum_varnames: object.get("x-enum-varnames").cloned(),
                 enum_names: object.get("x-enumNames").cloned(),
                 enum_descriptions: object.get("x-enum-descriptions").cloned(),
                 enum_descriptions_camel: object.get("x-enumDescriptions").cloned(),
-            },
-            numeric_constraints,
-            string_constraints,
-            array_constraints,
-            object_constraints,
+            }),
+            numeric_constraints: box_if_populated(numeric_constraints),
+            string_constraints: box_if_populated(string_constraints),
+            array_constraints: box_if_populated(array_constraints),
+            object_constraints: box_if_populated(object_constraints),
             rejected_validation_keywords: object
                 .keys()
                 .filter(|key| REJECTED_VALIDATION_KEYWORDS.contains(&key.as_str()))
@@ -1895,14 +1897,15 @@ fn external_schema_name(json_pointer: &str) -> String {
 fn merge_parameters(path_parameters: &[Param], operation_parameters: Vec<Param>) -> Vec<Param> {
     let overridden = operation_parameters
         .iter()
-        .map(|parameter| (parameter.name.clone(), parameter.location))
+        .map(|parameter| (parameter.name.as_str(), parameter.location))
         .collect::<HashSet<_>>();
-    path_parameters
+    let mut merged: Vec<Param> = path_parameters
         .iter()
-        .filter(|parameter| !overridden.contains(&(parameter.name.clone(), parameter.location)))
+        .filter(|parameter| !overridden.contains(&(parameter.name.as_str(), parameter.location)))
         .cloned()
-        .chain(operation_parameters)
-        .collect()
+        .collect();
+    merged.extend(operation_parameters);
+    merged
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3274,27 +3277,27 @@ mod tests {
         let meta = ir.schemas[0].schema.meta();
 
         assert_eq!(
-            meta.numeric_constraints
+            meta.numeric_constraints()
                 .minimum
                 .as_ref()
                 .map(ToString::to_string),
             Some("1".to_owned())
         );
         assert_eq!(
-            meta.numeric_constraints
+            meta.numeric_constraints()
                 .maximum
                 .as_ref()
                 .map(ToString::to_string),
             Some("9".to_owned())
         );
         assert_eq!(
-            meta.numeric_constraints.exclusive_minimum,
+            meta.numeric_constraints().exclusive_minimum,
             Some(crate::ir::ExclusiveBound::Number(serde_json::Number::from(
                 2
             )))
         );
         assert_eq!(
-            meta.numeric_constraints.exclusive_maximum,
+            meta.numeric_constraints().exclusive_maximum,
             Some(crate::ir::ExclusiveBound::Number(serde_json::Number::from(
                 8
             )))
@@ -3324,7 +3327,7 @@ mod tests {
             ir.schemas[0]
                 .schema
                 .meta()
-                .numeric_constraints
+                .numeric_constraints()
                 .exclusive_minimum,
             Some(crate::ir::ExclusiveBound::Boolean(true))
         );
@@ -3358,21 +3361,24 @@ mod tests {
         assert!(!sink.has_errors(), "{:?}", sink.as_slice());
         let meta = ir.schemas[0].schema.meta();
 
-        assert_eq!(meta.string_constraints.min_length, Some(1));
-        assert_eq!(meta.string_constraints.max_length, Some(2));
-        assert_eq!(meta.string_constraints.pattern.as_deref(), Some("^[a-z]+$"));
+        assert_eq!(meta.string_constraints().min_length, Some(1));
+        assert_eq!(meta.string_constraints().max_length, Some(2));
         assert_eq!(
-            meta.numeric_constraints
+            meta.string_constraints().pattern.as_deref(),
+            Some("^[a-z]+$")
+        );
+        assert_eq!(
+            meta.numeric_constraints()
                 .multiple_of
                 .as_ref()
                 .map(ToString::to_string),
             Some("1.2300".to_owned())
         );
-        assert_eq!(meta.array_constraints.min_items, Some(3));
-        assert_eq!(meta.array_constraints.max_items, Some(4));
-        assert!(meta.array_constraints.unique_items);
-        assert_eq!(meta.object_constraints.min_properties, Some(5));
-        assert_eq!(meta.object_constraints.max_properties, Some(6));
+        assert_eq!(meta.array_constraints().min_items, Some(3));
+        assert_eq!(meta.array_constraints().max_items, Some(4));
+        assert!(meta.array_constraints().unique_items);
+        assert_eq!(meta.object_constraints().min_properties, Some(5));
+        assert_eq!(meta.object_constraints().max_properties, Some(6));
     }
 
     #[test]
@@ -3398,7 +3404,7 @@ mod tests {
             .expect("valid OpenAPI document");
             let (_temp, ir, sink) = parse_value(&document);
             assert!(!sink.has_errors(), "{:?}", sink.as_slice());
-            let numeric = &ir.schemas[0].schema.meta().numeric_constraints;
+            let numeric = ir.schemas[0].schema.meta().numeric_constraints();
 
             assert_eq!(
                 numeric.multiple_of.as_ref().map(ToString::to_string),
@@ -3536,15 +3542,15 @@ mod tests {
 
         for schema in &ir.schemas {
             let meta = schema.schema.meta();
-            assert_eq!(meta.string_constraints.min_length, None);
-            assert_eq!(meta.string_constraints.max_length, None);
-            assert_eq!(meta.string_constraints.pattern, None);
-            assert_eq!(meta.numeric_constraints.multiple_of, None);
-            assert_eq!(meta.array_constraints.min_items, None);
-            assert_eq!(meta.array_constraints.max_items, None);
-            assert!(!meta.array_constraints.unique_items);
-            assert_eq!(meta.object_constraints.min_properties, None);
-            assert_eq!(meta.object_constraints.max_properties, None);
+            assert_eq!(meta.string_constraints().min_length, None);
+            assert_eq!(meta.string_constraints().max_length, None);
+            assert_eq!(meta.string_constraints().pattern, None);
+            assert_eq!(meta.numeric_constraints().multiple_of, None);
+            assert_eq!(meta.array_constraints().min_items, None);
+            assert_eq!(meta.array_constraints().max_items, None);
+            assert!(!meta.array_constraints().unique_items);
+            assert_eq!(meta.object_constraints().min_properties, None);
+            assert_eq!(meta.object_constraints().max_properties, None);
             assert!(meta.rejected_validation_keywords.is_empty());
             assert!(
                 matches!(
@@ -3580,7 +3586,7 @@ mod tests {
                     ir.schemas[0]
                         .schema
                         .meta()
-                        .numeric_constraints
+                        .numeric_constraints()
                         .multiple_of
                         .as_ref()
                         .map(ToString::to_string),
@@ -4003,5 +4009,96 @@ mod tests {
         let merged = merge_parameters(&path, vec![parameter("same", ParamLocation::Query)]);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].name, "keep");
+    }
+
+    #[test]
+    fn parsed_meta_boxes_are_canonical() {
+        // The boxed sparse groups' invariant: `Some(boxed)` always holds a non-default
+        // value (box_if_populated is the sanctioned constructor). Derived SchemaMeta
+        // equality feeds allOf merge decisions in the emitter, so a `Some(default)`
+        // escaping the parser would silently flip merges. Walk every node of the two
+        // constraint-heavy fixtures and assert canonical form throughout.
+        fn non_default<T: Default + PartialEq>(group: &Option<Box<T>>) -> bool {
+            group.as_deref().is_none_or(|value| *value != T::default())
+        }
+        fn assert_canonical(schema: &SchemaNode) {
+            let meta = schema.meta();
+            assert!(non_default(&meta.enum_extensions));
+            assert!(non_default(&meta.numeric_constraints));
+            assert!(non_default(&meta.string_constraints));
+            assert!(non_default(&meta.array_constraints));
+            assert!(non_default(&meta.object_constraints));
+            match schema {
+                SchemaNode::Object {
+                    properties,
+                    additional_properties,
+                    ..
+                } => {
+                    for (_, property, _) in properties {
+                        assert_canonical(property);
+                    }
+                    if let AdditionalProperties::Allowed(Some(schema))
+                    | AdditionalProperties::Schema(schema) = additional_properties
+                    {
+                        assert_canonical(schema);
+                    }
+                }
+                SchemaNode::Array { items, .. } => assert_canonical(items),
+                SchemaNode::Tuple {
+                    prefix_items, rest, ..
+                } => {
+                    for item in prefix_items {
+                        assert_canonical(item);
+                    }
+                    if let TupleRest::Schema(schema) = rest {
+                        assert_canonical(schema);
+                    }
+                }
+                SchemaNode::AllOf { branches, .. }
+                | SchemaNode::OneOf { branches, .. }
+                | SchemaNode::AnyOf { branches, .. } => {
+                    for branch in branches {
+                        assert_canonical(branch);
+                    }
+                }
+                SchemaNode::Ref { .. }
+                | SchemaNode::Primitive { .. }
+                | SchemaNode::Finite { .. }
+                | SchemaNode::Any { .. }
+                | SchemaNode::Never { .. }
+                | SchemaNode::Unknown { .. } => {}
+            }
+        }
+
+        for fixture_name in ["pathological-3.1", "validators-showcase-3.1"] {
+            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures")
+                .join(fixture_name);
+            let config = crate::config::load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+                .expect("fixture config loads");
+            let mut sink = DiagnosticSink::new();
+            let graph = crate::loader::load_graph(&config, &mut sink).expect("fixture graph loads");
+            let ir = parse(&graph, &mut sink).expect("fixture parses");
+            assert!(!sink.has_errors(), "{fixture_name}: {:#?}", sink.as_slice());
+            for schema in &ir.schemas {
+                assert_canonical(&schema.schema);
+            }
+            for operation in &ir.operations {
+                for parameter in &operation.parameters {
+                    assert_canonical(&parameter.schema);
+                }
+            }
+        }
+
+        // The corpus never produces `Allowed(Some(_))`; cover that walk arm directly.
+        let open = SchemaNode::Object {
+            properties: Vec::new(),
+            additional_properties: AdditionalProperties::Allowed(Some(Box::new(SchemaNode::Any {
+                meta: SchemaMeta::default(),
+            }))),
+            dependent_required: Vec::new(),
+            meta: SchemaMeta::default(),
+        };
+        assert_canonical(&open);
     }
 }

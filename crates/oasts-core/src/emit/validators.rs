@@ -440,7 +440,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         path: &str,
         iss: &str,
     ) {
-        let constraints = &meta.string_constraints;
+        let constraints = meta.string_constraints();
         if constraints.min_length.is_some() || constraints.max_length.is_some() {
             self.scope.runtime_values.insert("codePointLength");
         }
@@ -496,7 +496,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         path: &str,
         iss: &str,
     ) {
-        let constraints = &meta.numeric_constraints;
+        let constraints = meta.numeric_constraints();
         self.gen_bound(constraints, BoundDirection::Lower, val, path, iss);
         self.gen_bound(constraints, BoundDirection::Upper, val, path, iss);
         if let Some(multiple) = &constraints.multiple_of {
@@ -726,8 +726,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             AdditionalProperties::Schema(sub) => !is_noop_schema(sub),
             AdditionalProperties::Allowed(_) => false,
         };
-        let min = meta.object_constraints.min_properties;
-        let max = meta.object_constraints.max_properties;
+        let min = meta.object_constraints().min_properties;
+        let max = meta.object_constraints().max_properties;
         let keys_uses = keys_iteration as usize + min.is_some() as usize + max.is_some() as usize;
         let keys_expr = if keys_uses >= 2 {
             let index = self.fresh();
@@ -912,7 +912,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
     }
 
     fn gen_array_constraints(&mut self, meta: &SchemaMeta, val: &str, path: &str, iss: &str) {
-        let constraints = &meta.array_constraints;
+        let constraints = meta.array_constraints();
         if let Some(min) = constraints.min_items {
             self.push_issue(
                 &format!("{val}.length < {min}"),

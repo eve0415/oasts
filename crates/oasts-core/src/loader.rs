@@ -1,5 +1,6 @@
 //! Local OpenAPI document loading and reference resolution.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -44,8 +45,9 @@ pub struct Document {
     pub id: DocId,
     pub canonical_path: PathBuf,
     pub source_id: String,
-    pub raw: Vec<u8>,
     pub value: Value,
+    /// Digest of the source bytes, taken at load; the bytes themselves are not
+    /// retained — everything downstream needs only the parsed value and this hash.
     pub sha256: [u8; 32],
 }
 
@@ -401,12 +403,12 @@ impl<'a> GraphBuilder<'a> {
         })?;
         let value = parse_document(&canonical_path, &raw, &source_id)?;
         let sha256 = Sha256::digest(&raw).into();
+        drop(raw);
         let id = DocId(self.documents.len());
         self.documents.push(Document {
             id,
             canonical_path: canonical_path.clone(),
             source_id,
-            raw,
             value,
             sha256,
         });
@@ -435,76 +437,124 @@ impl<'a> GraphBuilder<'a> {
             return Ok(());
         }
 
-        let value = self
-            .documents
-            .get(location.doc_id.0)
-            .and_then(|document| evaluate_pointer(&document.value, &location.json_pointer).ok())
-            .cloned()
-            .ok_or_else(|| {
-                input_error(
-                    CODE_POINTER,
-                    format!("JSON Pointer '{}' does not resolve", location.json_pointer),
-                    self.source_id(location.doc_id),
-                    Some(&location.json_pointer),
-                )
-            })?;
-
-        state.stack.push(location.clone());
-        let mut effective_base = base;
-        if context == WalkContext::Schema
-            && let Value::Object(object) = &value
-            && let Some(id_value) = object.get("$id")
-        {
-            let Some(id) = id_value.as_str() else {
-                return Err(input_error(
-                    CODE_INVALID_REFERENCE,
-                    "Schema Object $id must be a string URI reference",
-                    self.source_id(location.doc_id),
-                    Some(&append_pointer(&location.json_pointer, "$id")),
-                ));
-            };
-            effective_base = resolve_uri(
-                &effective_base,
-                id,
-                self.source_id(location.doc_id),
-                Some(&append_pointer(&location.json_pointer, "$id")),
-            )?;
+        // Per-node summary extracted under a short immutable borrow of the resolved
+        // subtree, so the deep clone of the whole subtree is avoided. The mutating
+        // work (follow_reference / recursion, both &mut self) then runs from the
+        // owned summary once the borrow is dropped.
+        enum NodeSummary {
+            Object {
+                reference: Option<String>,
+                children: Vec<(String, WalkContext)>,
+            },
+            Array {
+                len: usize,
+            },
+            Leaf,
         }
 
-        match value {
-            Value::Object(object) => {
-                if matches!(context, WalkContext::Schema | WalkContext::NonSchema)
-                    && let Some(reference_value) = object.get("$ref")
-                {
-                    let Some(reference) = reference_value.as_str() else {
-                        return Err(input_error(
-                            CODE_INVALID_REFERENCE,
-                            "$ref must be a string URI reference",
-                            self.source_id(location.doc_id),
-                            Some(&append_pointer(&location.json_pointer, "$ref")),
-                        ));
-                    };
+        let (effective_base, summary) = {
+            let value = self
+                .documents
+                .get(location.doc_id.0)
+                .and_then(|document| {
+                    evaluate_pointer_trusted(&document.value, &location.json_pointer).ok()
+                })
+                .ok_or_else(|| {
+                    input_error(
+                        CODE_POINTER,
+                        format!("JSON Pointer '{}' does not resolve", location.json_pointer),
+                        self.source_id(location.doc_id),
+                        Some(&location.json_pointer),
+                    )
+                })?;
+
+            state.stack.push(location.clone());
+            let mut effective_base = base;
+            if context == WalkContext::Schema
+                && let Value::Object(object) = value
+                && let Some(id_value) = object.get("$id")
+            {
+                let Some(id) = id_value.as_str() else {
+                    return Err(input_error(
+                        CODE_INVALID_REFERENCE,
+                        "Schema Object $id must be a string URI reference",
+                        self.source_id(location.doc_id),
+                        Some(&append_pointer(&location.json_pointer, "$id")),
+                    ));
+                };
+                effective_base = resolve_uri(
+                    &effective_base,
+                    id,
+                    self.source_id(location.doc_id),
+                    Some(&append_pointer(&location.json_pointer, "$id")),
+                )?;
+            }
+
+            let summary = match value {
+                Value::Object(object) => {
+                    let reference =
+                        if matches!(context, WalkContext::Schema | WalkContext::NonSchema)
+                            && let Some(reference_value) = object.get("$ref")
+                        {
+                            let Some(reference) = reference_value.as_str() else {
+                                return Err(input_error(
+                                    CODE_INVALID_REFERENCE,
+                                    "$ref must be a string URI reference",
+                                    self.source_id(location.doc_id),
+                                    Some(&append_pointer(&location.json_pointer, "$ref")),
+                                ));
+                            };
+                            Some(reference.to_owned())
+                        } else {
+                            None
+                        };
+
+                    let mut children = Vec::new();
+                    for (name, child) in object {
+                        if matches!(context, WalkContext::Schema | WalkContext::NonSchema)
+                            && matches!(name.as_str(), "$ref" | "$id")
+                        {
+                            continue;
+                        }
+                        let child_context =
+                            child_context(context, &location.json_pointer, name, child);
+                        if child_context == WalkContext::Skip {
+                            continue;
+                        }
+                        children.push((name.clone(), child_context));
+                    }
+
+                    NodeSummary::Object {
+                        reference,
+                        children,
+                    }
+                }
+                Value::Array(values) => NodeSummary::Array { len: values.len() },
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+                    NodeSummary::Leaf
+                }
+            };
+
+            (effective_base, summary)
+        };
+
+        match summary {
+            NodeSummary::Object {
+                reference,
+                children,
+            } => {
+                if let Some(reference) = reference {
                     self.follow_reference(
                         &location,
                         context.position(),
                         &effective_base,
-                        reference,
+                        &reference,
                         ref_depth,
                         state,
                     )?;
                 }
 
-                for (name, child) in object {
-                    if matches!(context, WalkContext::Schema | WalkContext::NonSchema)
-                        && matches!(name.as_str(), "$ref" | "$id")
-                    {
-                        continue;
-                    }
-                    let child_context =
-                        child_context(context, &location.json_pointer, &name, &child);
-                    if child_context == WalkContext::Skip {
-                        continue;
-                    }
+                for (name, child_context) in children {
                     self.walk_node(
                         NodeLocation {
                             doc_id: location.doc_id,
@@ -517,11 +567,11 @@ impl<'a> GraphBuilder<'a> {
                     )?;
                 }
             }
-            Value::Array(values) => {
+            NodeSummary::Array { len } => {
                 let child_context = array_child_context(context);
                 if child_context != WalkContext::Skip {
-                    for (index, _) in values.iter().enumerate() {
-                        let result = self.walk_node(
+                    for index in 0..len {
+                        self.walk_node(
                             NodeLocation {
                                 doc_id: location.doc_id,
                                 json_pointer: append_pointer(
@@ -533,12 +583,11 @@ impl<'a> GraphBuilder<'a> {
                             effective_base.clone(),
                             ref_depth,
                             state,
-                        );
-                        result?;
+                        )?;
                     }
                 }
             }
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+            NodeSummary::Leaf => {}
         }
         state.stack.pop();
         Ok(())
@@ -688,7 +737,7 @@ impl<'a> GraphBuilder<'a> {
                 base = resolve_uri(&base, id, Some(&document.source_id), Some(&id_pointer))?;
             }
 
-            let token = unescape_pointer_token(encoded_token).map_err(|message| {
+            let token = unescape_pointer_token_borrowed(encoded_token).map_err(|message| {
                 input_error(
                     CODE_INVALID_REFERENCE,
                     message,
@@ -706,8 +755,11 @@ impl<'a> GraphBuilder<'a> {
             };
             let (child, next_context) = match value {
                 Value::Object(object) => {
-                    let child = object.get(&token).ok_or_else(pointer_error)?;
-                    (child, child_context(context, &pointer, &token, child))
+                    let child = object.get(token.as_ref()).ok_or_else(pointer_error)?;
+                    (
+                        child,
+                        child_context(context, &pointer, token.as_ref(), child),
+                    )
                 }
                 Value::Array(array) => {
                     let child = token
@@ -723,7 +775,7 @@ impl<'a> GraphBuilder<'a> {
                 }
             };
             context = next_context;
-            pointer = append_pointer(&pointer, &token);
+            pointer = append_pointer(&pointer, token.as_ref());
             value = child;
         }
         Ok(base)
@@ -1009,15 +1061,25 @@ const fn hex_value(byte: u8) -> Option<u8> {
 
 fn evaluate_pointer<'a>(value: &'a Value, pointer: &str) -> Result<&'a Value, String> {
     validate_pointer(pointer)?;
+    evaluate_pointer_trusted(value, pointer)
+}
+
+/// Resolves a pointer that is escaped-by-construction — built by `append_pointer`
+/// during the walk, or already validated at the `$ref`/external boundary — so it
+/// skips the standalone `validate_pointer` pass that the untrusted `evaluate_pointer`
+/// entry point keeps. Callers passing an externally supplied pointer MUST go through
+/// `evaluate_pointer`; this variant assumes a well-formed pointer and reports only
+/// resolution failures, not escape/format ones.
+fn evaluate_pointer_trusted<'a>(value: &'a Value, pointer: &str) -> Result<&'a Value, String> {
     if pointer.is_empty() {
         return Ok(value);
     }
     let mut current = value;
     for encoded_token in pointer[1..].split('/') {
-        let token = unescape_pointer_token(encoded_token)?;
+        let token = unescape_pointer_token_borrowed(encoded_token)?;
         current = match current {
             Value::Object(object) => object
-                .get(&token)
+                .get(token.as_ref())
                 .ok_or_else(|| format!("JSON Pointer '{pointer}' does not resolve"))?,
             Value::Array(array) => {
                 if token.is_empty()
@@ -1055,6 +1117,16 @@ fn validate_pointer(pointer: &str) -> Result<(), String> {
 }
 
 fn unescape_pointer_token(token: &str) -> Result<String, String> {
+    unescape_pointer_token_borrowed(token).map(Cow::into_owned)
+}
+
+/// Decodes a single JSON Pointer token, borrowing the input unchanged when it
+/// holds no `~` escape so the walk pays no allocation for the common token; only
+/// a genuinely escaped token allocates to expand `~0`/`~1`.
+fn unescape_pointer_token_borrowed(token: &str) -> Result<Cow<'_, str>, String> {
+    if !token.contains('~') {
+        return Ok(Cow::Borrowed(token));
+    }
     let mut result = String::with_capacity(token.len());
     let mut chars = token.chars();
     while let Some(character) = chars.next() {
@@ -1068,12 +1140,19 @@ fn unescape_pointer_token(token: &str) -> Result<String, String> {
             _ => return Err(format!("invalid JSON Pointer escape in token '{token}'")),
         }
     }
-    Ok(result)
+    Ok(Cow::Owned(result))
 }
 
 pub(crate) fn append_pointer(pointer: &str, token: &str) -> String {
-    let escaped = token.replace('~', "~0").replace('/', "~1");
-    format!("{pointer}/{escaped}")
+    let mut result = String::with_capacity(pointer.len() + 1 + token.len());
+    result.push_str(pointer);
+    result.push('/');
+    if token.contains(['~', '/']) {
+        result.push_str(&token.replace('~', "~0").replace('/', "~1"));
+    } else {
+        result.push_str(token);
+    }
+    result
 }
 
 fn array_child_context(context: WalkContext) -> WalkContext {
@@ -1854,6 +1933,12 @@ mod tests {
                 "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $id: https://example.invalid/schema.json\n      type: string\n",
                 CODE_REMOTE_UNSUPPORTED,
             ),
+            // Invalid $id inside an allOf element: the diagnostic propagates back
+            // through the array-child walk, not the object-child walk.
+            (
+                "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      allOf:\n        - $id: 7\n          type: string\n",
+                CODE_INVALID_REFERENCE,
+            ),
         ] {
             let directory = TempDir::new().expect("tempdir should be created");
             write(directory.path(), "workspace/entry.yaml", document);
@@ -2195,7 +2280,6 @@ mod tests {
             id: DocId(0),
             canonical_path: PathBuf::from("relative.yaml"),
             source_id: "workspace/relative.yaml".to_owned(),
-            raw: Vec::new(),
             value: json!({}),
             sha256: [0; 32],
         };

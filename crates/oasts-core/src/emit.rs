@@ -9,8 +9,9 @@
 //! describe the declared members.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::rc::Rc;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -41,7 +42,28 @@ const CODE_COMPOSITION: &str = "OASTS1303";
 const CODE_DISCRIMINATOR: &str = "OASTS1304";
 const CODE_REFERENCE: &str = "OASTS1305";
 
-type OwnedProperties = Vec<(String, SchemaNode, PropMeta)>;
+/// A merged `allOf` property borrowed straight from the model IR: name, schema,
+/// and metadata. Borrowed (not owned) so `merge_all_of` never deep-clones the
+/// `SchemaNode` payload it already has behind `&'a self` / the branch slice.
+type BorrowedProperty<'a> = (&'a str, &'a SchemaNode, &'a PropMeta);
+
+/// A cached `allOf` merge result, keyed in the emitter by the branch slice's IR address.
+/// `None` records a slice that does not merge into a single object shape (cached so the
+/// negative answer is not recomputed once per position per pass either). The merged
+/// properties are shared via `Rc` so a cache hit is a refcount bump, not a `Vec` clone,
+/// and are borrowed at the model lifetime because the IR outlives the emitter.
+type CachedAllOf<'a> = Option<(Rc<[BorrowedProperty<'a>]>, &'a AdditionalProperties)>;
+
+/// Views an owned property slice as `BorrowedProperty` tuples. The direct-object
+/// callers own their properties while the `allOf`-merge caller already holds
+/// borrowed ones; funnelling both through this keeps `render_object_parts` a
+/// single concrete instantiation for the coverage gate.
+fn borrow_properties(properties: &[(String, SchemaNode, PropMeta)]) -> Vec<BorrowedProperty<'_>> {
+    properties
+        .iter()
+        .map(|(name, schema, meta)| (name.as_str(), schema, meta))
+        .collect()
+}
 
 /// One deterministic, not-yet-written generated artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -252,17 +274,11 @@ pub(crate) fn emit_types_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Ge
     Emitter::new(model).emit()
 }
 
-/// Short alias used by artifact pipelines that already selected `types`.
-pub fn emit(
-    analyzed: &Analyzed,
-    config: &ResolvedConfig,
-    source_tuples: &[(String, [u8; 32])],
-    sink: &mut DiagnosticSink,
-) -> Vec<GeneratedFile> {
-    emit_artifacts(analyzed, config, source_tuples, None, sink)
-}
-
-pub(crate) fn emit_artifacts(
+/// Emits every enabled artifact (types, client, validators) for one compile.
+///
+/// Public so out-of-crate harnesses can run the emission stage exactly as
+/// `pipeline::compile` does, including a client model when one was built.
+pub fn emit_artifacts(
     analyzed: &Analyzed,
     config: &ResolvedConfig,
     source_tuples: &[(String, [u8; 32])],
@@ -303,6 +319,14 @@ pub(super) struct Emitter<'model, 'input, 'sink> {
     /// bare named reference instead. Balanced push/pop keeps this empty between
     /// top-level declarations, so acyclic output is byte-identical.
     inlining_refs: RefCell<Vec<SchemaRef>>,
+    /// Prewarmed `allOf` merges keyed by `(branch slice address, length)`. Populated
+    /// once per distinct IR node by `prewarm_all_of`, then read on every render/import
+    /// pass so the merge runs once instead of up to six times per node. Only IR-resident
+    /// non-empty slices are keyed here (their address is stable for the emission);
+    /// locally built branches miss and recompute, and no live non-empty IR slice can
+    /// share a local's address. Empty slices all share the dangling-pointer sentinel, so
+    /// `cache_merge_all_of` refuses to insert them.
+    merge_cache: RefCell<HashMap<(usize, usize), CachedAllOf<'input>>>,
 }
 
 impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
@@ -320,11 +344,52 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             model,
             enum_member_indices,
             inlining_refs: RefCell::new(Vec::new()),
+            merge_cache: RefCell::new(HashMap::new()),
         }
     }
 
     fn emit(mut self) -> Vec<GeneratedFile> {
         self.validate_model();
+        // Compute every component's `allOf` merges once up front. Each component is
+        // rendered for up to three positions and walked for imports for each, so a node's
+        // position-independent merge would otherwise run up to six times; the cache turns
+        // the later passes into refcount-cheap hits. All components are prewarmed before
+        // any is emitted, so a merge that resolves a `$ref` into a sibling component hits
+        // that sibling's prewarmed entry too.
+        for allocated in &self.model.analyzed.schema_names {
+            if self.model.component_files[allocated.schema_index].is_none() {
+                continue;
+            }
+            self.prewarm_all_of(&self.model.analyzed.ir.schemas[allocated.schema_index].schema);
+        }
+        // Operations carry inline schemas too (parameters, bodies, response payloads,
+        // encoding headers — the same set validate_model walks); an allOf embedded there
+        // never resolves through a component, so without its own prewarm it would fall
+        // back to the uncached recompute on every render pass.
+        for allocated in &self.model.analyzed.operation_names {
+            if self.model.operation_files[allocated.operation_index].is_none() {
+                continue;
+            }
+            let operation = &self.model.analyzed.ir.operations[allocated.operation_index];
+            for parameter in &operation.parameters {
+                self.prewarm_all_of(&parameter.schema);
+            }
+            if let Some(body) = &operation.request_body {
+                for media_type in &body.media_types {
+                    self.prewarm_all_of(&media_type.schema);
+                    for (_, encoding) in &media_type.encodings {
+                        for (_, header) in &encoding.headers {
+                            self.prewarm_all_of(&header.schema);
+                        }
+                    }
+                }
+            }
+            for response in &operation.responses {
+                for media_type in &response.media_types {
+                    self.prewarm_all_of(&media_type.schema);
+                }
+            }
+        }
         let mut files = Vec::new();
         for allocated in &self.model.analyzed.schema_names {
             if self.model.component_files[allocated.schema_index].is_none() {
@@ -533,12 +598,12 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     fn resolve_ref<'a>(
         &'a self,
         schema: &'a SchemaNode,
-        visited: &mut HashSet<(String, String)>,
+        visited: &mut HashSet<(&'a str, &'a str)>,
     ) -> Option<&'a SchemaNode> {
         let SchemaNode::Ref { target, .. } = schema else {
             return Some(schema);
         };
-        let key = (target.source_id.clone(), target.json_pointer.clone());
+        let key = (target.source_id.as_str(), target.json_pointer.as_str());
         if visited.contains(&key) {
             return None;
         }
@@ -550,10 +615,10 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         self.resolve_ref(resolved, visited)
     }
 
-    fn primitive_domain(
-        &self,
-        schema: &SchemaNode,
-        visited: &mut HashSet<(String, String)>,
+    fn primitive_domain<'a>(
+        &'a self,
+        schema: &'a SchemaNode,
+        visited: &mut HashSet<(&'a str, &'a str)>,
     ) -> Option<BTreeSet<PrimitiveAtom>> {
         let schema = self.resolve_ref(schema, visited)?;
         match schema {
@@ -593,10 +658,10 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         }
     }
 
-    fn finite_constraint(
-        &self,
-        schema: &SchemaNode,
-        visited: &mut HashSet<(String, String)>,
+    fn finite_constraint<'a>(
+        &'a self,
+        schema: &'a SchemaNode,
+        visited: &mut HashSet<(&'a str, &'a str)>,
     ) -> Option<Vec<Value>> {
         let schema = self.resolve_ref(schema, visited)?;
         let (enum_values, const_value) = match schema {
@@ -615,10 +680,10 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         finite_values(enum_values.as_deref(), const_value.as_ref())
     }
 
-    fn numeric_bounds(
-        &self,
-        schema: &SchemaNode,
-        visited: &mut HashSet<(String, String)>,
+    fn numeric_bounds<'a>(
+        &'a self,
+        schema: &'a SchemaNode,
+        visited: &mut HashSet<(&'a str, &'a str)>,
     ) -> Option<NumericBounds> {
         let schema = self.resolve_ref(schema, visited)?;
         let SchemaNode::Primitive { ty, meta, .. } = schema else {
@@ -627,13 +692,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         if !matches!(ty, PrimitiveType::Number | PrimitiveType::Integer) {
             return None;
         }
-        NumericBounds::from_constraints(&meta.numeric_constraints)
+        NumericBounds::from_constraints(meta.numeric_constraints())
     }
 
     fn object_shape<'a>(
         &'a self,
         schema: &'a SchemaNode,
-        visited: &mut HashSet<(String, String)>,
+        visited: &mut HashSet<(&'a str, &'a str)>,
     ) -> Option<ObjectShape<'a>> {
         let schema = self.resolve_ref(schema, visited)?;
         let SchemaNode::Object {
@@ -858,8 +923,9 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         position: TypePosition,
         indent: usize,
     ) -> String {
+        let borrowed = borrow_properties(properties);
         self.render_object_parts(
-            properties,
+            &borrowed,
             &AdditionalProperties::Forbidden,
             position,
             indent,
@@ -908,7 +974,8 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 additional_properties,
                 ..
             } => {
-                self.render_object_parts(properties, additional_properties, position, indent, false)
+                let borrowed = borrow_properties(properties);
+                self.render_object_parts(&borrowed, additional_properties, position, indent, false)
             }
             SchemaNode::Array { items, .. } => {
                 let item = self.render_type(items, position, indent);
@@ -988,24 +1055,31 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         }
     }
 
+    // Concrete slice (not `impl Iterator`) on purpose: a generic property source
+    // monomorphizes this per caller, and the 100%-line gate then measures each
+    // rarely-exercised instantiation separately. One concrete instantiation stays
+    // fully covered by the callers as a group, exactly as it was before borrowing.
+    // Two passes (`any` then `filter`) instead of collecting an `included` Vec so
+    // the borrowed callers add no allocation the owned form did not already pay.
     fn render_object_parts(
         &self,
-        properties: &[(String, SchemaNode, PropMeta)],
+        properties: &[BorrowedProperty<'_>],
         additional_properties: &AdditionalProperties,
         position: TypePosition,
         indent: usize,
         interface_members: bool,
     ) -> String {
-        let included = properties
+        let has_included_properties = properties
             .iter()
-            .filter(|(_, _, meta)| property_in_position(meta, position))
-            .collect::<Vec<_>>();
-        let has_included_properties = !included.is_empty();
-        let literal = if included.is_empty() {
+            .any(|&(_, _, meta)| property_in_position(meta, position));
+        let literal = if !has_included_properties {
             "{}".to_owned()
         } else {
             let mut output = String::from("{\n");
-            for (name, schema, meta) in included {
+            for &(name, schema, meta) in properties
+                .iter()
+                .filter(|&&(_, _, meta)| property_in_position(meta, position))
+            {
                 let member_indent = indent + 2;
                 let docs = property_docs(schema, meta);
                 write_schema_tsdoc(
@@ -1064,10 +1138,10 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     /// inlined (the recursive-schema cycle) or when the branches do not merge into a
     /// single object shape. The stack borrow is released before `body` runs so the body
     /// can recurse and push its own guards.
-    fn merge_all_of_guarded<R>(
-        &self,
-        branches: &[SchemaNode],
-        body: impl FnOnce(&OwnedProperties, &AdditionalProperties) -> R,
+    fn merge_all_of_guarded<'a, R>(
+        &'a self,
+        branches: &'a [SchemaNode],
+        body: impl FnOnce(&[BorrowedProperty<'a>], &AdditionalProperties) -> R,
     ) -> Option<R> {
         let inline_keys = self.inlineable_ref_keys(branches);
         let would_cycle = {
@@ -1077,26 +1151,94 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         if would_cycle {
             return None;
         }
-        let (properties, additional_properties) = self.merge_all_of(branches)?;
+        // The merge is position-independent and depends only on the branch slice, so a
+        // prewarmed entry (keyed by the slice's stable IR address) answers every render
+        // and import pass for this node. `None` here means the slice was not prewarmed —
+        // it is not IR-resident (a client plan or a test builds it), and its address is
+        // not stable to key on, so recompute it uncached. `Some(None)` is a prewarmed
+        // does-not-merge answer. Clone out of the cache in a tight scope: `body` re-enters
+        // this method, so the cache borrow must be released before it runs.
+        let key = (branches.as_ptr() as usize, branches.len());
+        let cached = self.merge_cache.borrow().get(&key).cloned();
+        let fresh;
+        let (properties, additional_properties): (&[BorrowedProperty<'a>], &AdditionalProperties) =
+            match &cached {
+                Some(Some((properties, additional_properties))) => {
+                    (&properties[..], *additional_properties)
+                }
+                Some(None) => return None,
+                None => {
+                    fresh = self.merge_all_of(branches)?;
+                    (&fresh.0, fresh.1)
+                }
+            };
         let pushed = inline_keys.len();
         self.inlining_refs.borrow_mut().extend(inline_keys);
-        let result = body(&properties, &additional_properties);
+        let result = body(properties, additional_properties);
         let mut stack = self.inlining_refs.borrow_mut();
         let kept = stack.len() - pushed;
         stack.truncate(kept);
         Some(result)
     }
 
-    fn merge_all_of(
-        &self,
-        branches: &[SchemaNode],
-    ) -> Option<(OwnedProperties, AdditionalProperties)> {
+    fn merge_all_of<'a>(
+        &'a self,
+        branches: &'a [SchemaNode],
+    ) -> Option<(Vec<BorrowedProperty<'a>>, &'a AdditionalProperties)> {
+        // One scratch set reused across branches; clearing before each call keeps
+        // today's per-call-fresh cycle-visited semantics without a fresh allocation
+        // per branch.
+        let mut visited = HashSet::new();
         let shapes = branches
             .iter()
-            .map(|branch| self.object_shape(branch, &mut HashSet::new()))
+            .map(|branch| {
+                visited.clear();
+                self.object_shape(branch, &mut visited)
+            })
             .collect::<Option<Vec<_>>>()?;
+        Self::merge_shapes(&shapes)
+    }
+
+    /// Model-lifetime `allOf` merge, used only to prewarm the cache. Identical result to
+    /// `merge_all_of` for the same branches, but the borrows are tied to the immutable IR
+    /// (`&'input`) rather than the `&self` borrow, so the properties outlive the emitter
+    /// and can be stored. Branches must be IR-resident; `merge_all_of` stays the fallback
+    /// for locally built schemas whose branch slices have no stable address to key on.
+    fn merge_all_of_ir(
+        &self,
+        branches: &'input [SchemaNode],
+    ) -> Option<(Vec<BorrowedProperty<'input>>, &'input AdditionalProperties)> {
+        let mut visited = HashSet::new();
+        let shapes = branches
+            .iter()
+            .map(|branch| {
+                visited.clear();
+                let resolved = self.resolve_ref_ir(branch, &mut visited)?;
+                let SchemaNode::Object {
+                    properties,
+                    additional_properties,
+                    ..
+                } = resolved
+                else {
+                    return None;
+                };
+                Some(ObjectShape {
+                    properties,
+                    additional_properties,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Self::merge_shapes(&shapes)
+    }
+
+    /// The `allOf` object merge over already-resolved branch shapes. Shared by the
+    /// `&'a self` fallback (`merge_all_of`) and the model-lifetime prewarm
+    /// (`merge_all_of_ir`) so both emit a byte-identical merged property list.
+    fn merge_shapes<'a>(
+        shapes: &[ObjectShape<'a>],
+    ) -> Option<(Vec<BorrowedProperty<'a>>, &'a AdditionalProperties)> {
         let first = shapes.first()?;
-        let merged_additional_properties = first.additional_properties.clone();
+        let merged_additional_properties = first.additional_properties;
         if shapes
             .iter()
             .any(|shape| shape.additional_properties != first.additional_properties)
@@ -1118,21 +1260,126 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         }) {
             return None;
         }
-        let mut merged = Vec::<(String, SchemaNode, PropMeta)>::new();
+        // `slot_of` gives O(1) duplicate-name lookup so the merge stays O(branches ×
+        // props) instead of O(branches × props²); `merged` still holds first-occurrence
+        // order because a name is only ever pushed on its first sighting.
+        let mut merged = Vec::<BorrowedProperty<'a>>::new();
+        let mut slot_of = HashMap::<&str, usize>::new();
         for shape in shapes {
             for (name, schema, meta) in shape.properties {
-                if let Some((_, previous_schema, previous_meta)) =
-                    merged.iter().find(|(previous, _, _)| previous == name)
-                {
+                if let Some(&slot) = slot_of.get(name.as_str()) {
+                    let (_, previous_schema, previous_meta) = merged[slot];
                     if previous_meta.required != meta.required || previous_schema != schema {
                         return None;
                     }
                 } else {
-                    merged.push((name.clone(), schema.clone(), meta.clone()));
+                    slot_of.insert(name.as_str(), merged.len());
+                    merged.push((name.as_str(), schema, meta));
                 }
             }
         }
         Some((merged, merged_additional_properties))
+    }
+
+    /// Resolves a `$ref` chain to its target node at the model lifetime. Mirrors
+    /// `resolve_ref`, but re-reads through `self.model.analyzed` (a `&'input` copy) so the
+    /// result is tied to the IR, not the `&self` borrow — required to cache a merge that
+    /// outlives the current call. Returns `None` on a ref cycle or unresolvable target,
+    /// exactly as `resolve_ref`, so a prewarmed merge equals the fallback merge.
+    fn resolve_ref_ir(
+        &self,
+        schema: &'input SchemaNode,
+        visited: &mut HashSet<(&'input str, &'input str)>,
+    ) -> Option<&'input SchemaNode> {
+        let SchemaNode::Ref { target, .. } = schema else {
+            return Some(schema);
+        };
+        let key = (target.source_id.as_str(), target.json_pointer.as_str());
+        if visited.contains(&key) {
+            return None;
+        }
+        visited.insert(key);
+        let index = self
+            .model
+            .schema_target(&target.source_id, &target.json_pointer)?
+            .index;
+        let resolved = &self.model.analyzed.ir.schemas.get(index)?.schema;
+        self.resolve_ref_ir(resolved, visited)
+    }
+
+    /// Populates the merge cache for every `allOf` node in one IR schema tree. Descends the
+    /// raw structure — never through a `$ref`, which is a leaf here, so the walk always
+    /// terminates — and computes each node's merge once, before the node is rendered and
+    /// walked for imports up to six times.
+    fn prewarm_all_of(&self, schema: &'input SchemaNode) {
+        match schema {
+            SchemaNode::Object {
+                properties,
+                additional_properties,
+                ..
+            } => {
+                for (_, property, _) in properties {
+                    self.prewarm_all_of(property);
+                }
+                if let AdditionalProperties::Allowed(Some(schema))
+                | AdditionalProperties::Schema(schema) = additional_properties
+                {
+                    self.prewarm_all_of(schema);
+                }
+            }
+            SchemaNode::Array { items, .. } => self.prewarm_all_of(items),
+            SchemaNode::Tuple {
+                prefix_items, rest, ..
+            } => {
+                for item in prefix_items {
+                    self.prewarm_all_of(item);
+                }
+                if let TupleRest::Schema(schema) = rest {
+                    self.prewarm_all_of(schema);
+                }
+            }
+            SchemaNode::AllOf { branches, .. } => {
+                self.cache_merge_all_of(branches);
+                for branch in branches {
+                    self.prewarm_all_of(branch);
+                }
+            }
+            SchemaNode::OneOf { branches, .. } | SchemaNode::AnyOf { branches, .. } => {
+                for branch in branches {
+                    self.prewarm_all_of(branch);
+                }
+            }
+            SchemaNode::Ref { .. }
+            | SchemaNode::Primitive { .. }
+            | SchemaNode::Finite { .. }
+            | SchemaNode::Any { .. }
+            | SchemaNode::Never { .. }
+            | SchemaNode::Unknown { .. } => {}
+        }
+    }
+
+    /// Computes and stores one IR branch slice's merge, keyed by the slice's stable
+    /// address and length. Caches the `None` (does-not-merge) answer too, since the
+    /// fallback would otherwise recompute it once per position per pass just the same.
+    /// The prewarm walk visits each distinct slice once, so this never overwrites.
+    ///
+    /// Empty slices are never inserted: every empty `Vec` shares Rust's dangling-pointer
+    /// sentinel, so an empty IR slice's key would also match every other empty slice,
+    /// IR-resident or not. Skipping them keeps the pointer key collision-free; the
+    /// fallback recomputes an empty merge to the same `None` answer either way.
+    fn cache_merge_all_of(&self, branches: &'input [SchemaNode]) {
+        if branches.is_empty() {
+            return;
+        }
+        let key = (branches.as_ptr() as usize, branches.len());
+        // Compute the entry before touching the cache — `merge_all_of_ir` never reads it,
+        // and this keeps the mutable borrow to the single `insert`.
+        let entry = self
+            .merge_all_of_ir(branches)
+            .map(|(properties, additional_properties)| {
+                (Rc::from(properties), additional_properties)
+            });
+        self.merge_cache.borrow_mut().insert(key, entry);
     }
 
     fn collect_component_imports(
@@ -1217,7 +1464,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 // branches, where a `$ref` branch records its import and terminates.
                 let handled = if let SchemaChildMode::References(position) = mode {
                     self.merge_all_of_guarded(branches, |properties, additional_properties| {
-                        for (_, property, meta) in properties {
+                        for &(_, property, meta) in properties {
                             if property_in_position(meta, position) {
                                 visit(property);
                             }
@@ -2726,11 +2973,11 @@ mod tests {
                 },
                 SchemaNode::OneOf {
                     branches: vec![tagged("/cat", "pet"), tagged("/dog", "pet")],
-                    discriminator: Some(Discriminator {
+                    discriminator: Some(Box::new(Discriminator {
                         property_name: "kind".to_owned(),
                         mapping: Vec::new(),
                         source: source("/discriminator"),
-                    }),
+                    })),
                     meta: meta("/union"),
                 },
             ],
@@ -2753,11 +3000,11 @@ mod tests {
 
         let unique = SchemaNode::OneOf {
             branches: vec![tagged("/one", "one"), tagged("/two", "two")],
-            discriminator: Some(Discriminator {
+            discriminator: Some(Box::new(Discriminator {
                 property_name: "kind".to_owned(),
                 mapping: Vec::new(),
                 source: source("/unique-discriminator"),
-            }),
+            })),
             meta: meta("/unique"),
         };
         let before = diagnostics.len();
@@ -3163,6 +3410,254 @@ mod tests {
             ),
             "unknown"
         );
+    }
+
+    #[test]
+    fn prewarm_covers_alias_cycle_and_schema_additional_properties() {
+        // Direct IR construction, since the analyzer never emits these shapes. An `allOf`
+        // whose ref branch chains through a ref-alias cycle (AliasA -> AliasB -> AliasA)
+        // drives `resolve_ref_ir`'s cycle guard during prewarm, and an object with a
+        // schema-valued `additionalProperties` drives the prewarm walk's recursion into
+        // it. `emit()` prewarms both before rendering, so this also reads back the cached
+        // does-not-merge answer.
+        let alias_a = source("/components/schemas/AliasA");
+        let alias_b = source("/components/schemas/AliasB");
+        let uses = source("/components/schemas/UsesAlias");
+        let dict = source("/components/schemas/Dict");
+        let open_dict = source("/components/schemas/OpenDict");
+        let analyzed = Analyzed {
+            ir: Ir {
+                operations: Vec::new(),
+                schemas: vec![
+                    NamedSchema {
+                        name: "AliasA".to_owned(),
+                        schema: schema_ref(
+                            "/components/schemas/AliasA",
+                            "/components/schemas/AliasB",
+                        ),
+                        source: alias_a.clone(),
+                    },
+                    NamedSchema {
+                        name: "AliasB".to_owned(),
+                        schema: schema_ref(
+                            "/components/schemas/AliasB",
+                            "/components/schemas/AliasA",
+                        ),
+                        source: alias_b.clone(),
+                    },
+                    NamedSchema {
+                        name: "UsesAlias".to_owned(),
+                        schema: SchemaNode::AllOf {
+                            branches: vec![schema_ref(
+                                "/components/schemas/UsesAlias/allOf/0",
+                                "/components/schemas/AliasA",
+                            )],
+                            meta: meta("/components/schemas/UsesAlias"),
+                        },
+                        source: uses.clone(),
+                    },
+                    NamedSchema {
+                        name: "Dict".to_owned(),
+                        schema: SchemaNode::Object {
+                            properties: Vec::new(),
+                            additional_properties: AdditionalProperties::Schema(Box::new(
+                                primitive(
+                                    PrimitiveType::String,
+                                    "/components/schemas/Dict/additionalProperties",
+                                ),
+                            )),
+                            dependent_required: Vec::new(),
+                            meta: meta("/components/schemas/Dict"),
+                        },
+                        source: dict.clone(),
+                    },
+                    NamedSchema {
+                        name: "OpenDict".to_owned(),
+                        // `Allowed(Some(_))` is the other schema-valued form the prewarm
+                        // walk descends into; `Schema(_)` above covers the sibling arm.
+                        schema: SchemaNode::Object {
+                            properties: Vec::new(),
+                            additional_properties: AdditionalProperties::Allowed(Some(Box::new(
+                                primitive(
+                                    PrimitiveType::Number,
+                                    "/components/schemas/OpenDict/additionalProperties",
+                                ),
+                            ))),
+                            dependent_required: Vec::new(),
+                            meta: meta("/components/schemas/OpenDict"),
+                        },
+                        source: open_dict.clone(),
+                    },
+                ],
+                ..Ir::default()
+            },
+            operation_names: Vec::new(),
+            schema_names: vec![
+                AllocatedSchemaName {
+                    schema_index: 0,
+                    wire_name: "AliasA".to_owned(),
+                    name: "AliasA".to_owned(),
+                    source: alias_a,
+                },
+                AllocatedSchemaName {
+                    schema_index: 1,
+                    wire_name: "AliasB".to_owned(),
+                    name: "AliasB".to_owned(),
+                    source: alias_b,
+                },
+                AllocatedSchemaName {
+                    schema_index: 2,
+                    wire_name: "UsesAlias".to_owned(),
+                    name: "UsesAlias".to_owned(),
+                    source: uses,
+                },
+                AllocatedSchemaName {
+                    schema_index: 3,
+                    wire_name: "Dict".to_owned(),
+                    name: "Dict".to_owned(),
+                    source: dict,
+                },
+                AllocatedSchemaName {
+                    schema_index: 4,
+                    wire_name: "OpenDict".to_owned(),
+                    name: "OpenDict".to_owned(),
+                    source: open_dict,
+                },
+            ],
+            enum_members: Vec::new(),
+        };
+        let (_temp, config) = resolved_config(json!({ "emit": { "importExtension": "none" } }));
+        let mut sink = DiagnosticSink::new();
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let files = Emitter::new(&mut model).emit();
+        // The cyclic `allOf` does not merge, so `UsesAlias` renders as its raw branch ref.
+        assert!(
+            files
+                .iter()
+                .any(|file| file.content.contains("export type UsesAlias = AliasA;"))
+        );
+        // The schema-valued `additionalProperties` keeps its index signature.
+        assert!(
+            files
+                .iter()
+                .any(|file| file.content.contains("[key: string]: string"))
+        );
+    }
+
+    #[test]
+    fn prewarmed_merges_match_the_fallback_path() {
+        // Differential guard for the mirrored resolve_ref/resolve_ref_ir pair: for every
+        // IR-resident allOf slice in the composition-stressor fixture, the model-lifetime
+        // prewarm path and the &self fallback path must produce the identical merge. An
+        // edit that desynchronizes the mirrors makes the cached answer win silently in
+        // production, so this asserts equivalence over real analyzer output, not one
+        // hand-picked shape.
+        fn collect_all_of<'i>(schema: &'i SchemaNode, out: &mut Vec<&'i [SchemaNode]>) {
+            match schema {
+                SchemaNode::Object {
+                    properties,
+                    additional_properties,
+                    ..
+                } => {
+                    for (_, property, _) in properties {
+                        collect_all_of(property, out);
+                    }
+                    if let AdditionalProperties::Allowed(Some(schema))
+                    | AdditionalProperties::Schema(schema) = additional_properties
+                    {
+                        collect_all_of(schema, out);
+                    }
+                }
+                SchemaNode::Array { items, .. } => collect_all_of(items, out),
+                SchemaNode::Tuple {
+                    prefix_items, rest, ..
+                } => {
+                    for item in prefix_items {
+                        collect_all_of(item, out);
+                    }
+                    if let TupleRest::Schema(schema) = rest {
+                        collect_all_of(schema, out);
+                    }
+                }
+                SchemaNode::AllOf { branches, .. } => {
+                    out.push(branches);
+                    for branch in branches {
+                        collect_all_of(branch, out);
+                    }
+                }
+                SchemaNode::OneOf { branches, .. } | SchemaNode::AnyOf { branches, .. } => {
+                    for branch in branches {
+                        collect_all_of(branch, out);
+                    }
+                }
+                SchemaNode::Ref { .. }
+                | SchemaNode::Primitive { .. }
+                | SchemaNode::Finite { .. }
+                | SchemaNode::Any { .. }
+                | SchemaNode::Never { .. }
+                | SchemaNode::Unknown { .. } => {}
+            }
+        }
+
+        // pathological-3.1 stresses allOf composition; validators-showcase-3.1 carries
+        // the tuple and schema-valued additionalProperties shapes the walk descends into.
+        let mut compared = 0usize;
+        for fixture_name in ["pathological-3.1", "validators-showcase-3.1"] {
+            let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures")
+                .join(fixture_name);
+            let config = crate::config::load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+                .expect("fixture config loads");
+            let mut sink = DiagnosticSink::new();
+            let graph = crate::loader::load_graph(&config, &mut sink).expect("fixture graph loads");
+            let ir = crate::parse::parse(&graph, &mut sink).expect("fixture parses");
+            let analyzed = crate::semantic::analyze(ir, &config, &mut sink);
+            assert!(!sink.has_errors(), "{fixture_name}: {:#?}", sink.as_slice());
+
+            let mut sink = DiagnosticSink::new();
+            let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+            let emitter = Emitter::new(&mut model);
+            let mut slices = Vec::new();
+            for schema in &analyzed.ir.schemas {
+                collect_all_of(&schema.schema, &mut slices);
+            }
+            compared += slices.len();
+            for branches in slices {
+                let prewarm = emitter
+                    .merge_all_of_ir(branches)
+                    .map(|(properties, additional)| (properties, additional.clone()));
+                let fallback = emitter
+                    .merge_all_of(branches)
+                    .map(|(properties, additional)| (properties, additional.clone()));
+                assert_eq!(prewarm, fallback);
+            }
+
+            // The empty slice shares the dangling-pointer sentinel with every other empty
+            // Vec, so cache_merge_all_of must refuse to key it.
+            emitter.cache_merge_all_of(&[]);
+            assert!(emitter.merge_cache.borrow().is_empty());
+        }
+        assert!(
+            compared > 0,
+            "the walked fixtures must contain allOf slices for this guard to bite"
+        );
+
+        // The corpus never emits `Allowed(Some(_))` — cover that walk arm with direct IR,
+        // the same way the prewarm test covers it in production code.
+        let open_dict = SchemaNode::Object {
+            properties: Vec::new(),
+            additional_properties: AdditionalProperties::Allowed(Some(Box::new(
+                SchemaNode::AllOf {
+                    branches: vec![primitive(PrimitiveType::String, "/open/allOf/0")],
+                    meta: meta("/open"),
+                },
+            ))),
+            dependent_required: Vec::new(),
+            meta: meta("/open"),
+        };
+        let mut extra = Vec::new();
+        collect_all_of(&open_dict, &mut extra);
+        assert_eq!(extra.len(), 1);
     }
 
     #[test]
@@ -3938,7 +4433,8 @@ mod tests {
             let analyzed = analyze(ir, &config, &mut sink);
             let first = emit_types(&analyzed, &config, &graph.source_tuples(), &mut sink);
             let second = emit_types(&analyzed, &config, &graph.source_tuples(), &mut sink);
-            let aliased = emit(&analyzed, &config, &graph.source_tuples(), &mut sink);
+            let aliased =
+                emit_artifacts(&analyzed, &config, &graph.source_tuples(), None, &mut sink);
             assert!(!first.is_empty());
             assert_eq!(first, second);
             assert_eq!(first, aliased);

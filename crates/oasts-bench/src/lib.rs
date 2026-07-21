@@ -4,6 +4,7 @@
 //! process-spawning pipeline is exercised by running the harness itself rather than by line
 //! coverage (see `scripts/coverage.sh`).
 
+pub mod alloc_track;
 pub mod conformance;
 pub mod fetch;
 pub mod manifest;

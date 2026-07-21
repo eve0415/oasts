@@ -308,19 +308,109 @@ pub struct ObjectConstraints {
     pub max_properties: Option<u64>,
 }
 
+/// Per-node metadata carried by every [`SchemaNode`] variant.
+///
+/// The five constraint/extension groups below are boxed because real specs populate them on well
+/// under 1% of nodes (measured on github/stripe/kubernetes corpora), yet each is large inline
+/// (`EnumExtensionData` 288 B, `NumericConstraints` 120 B, `StringConstraints` 56 B,
+/// `ArrayConstraints` 40 B, `ObjectConstraints` 32 B). Storing them as `Option<Box<…>>` keeps an
+/// unpopulated group at 8 bytes, so the common node stays small and the whole IR's peak heap drops
+/// — without adding an allocation to the overwhelmingly common empty case. Read them through the
+/// accessors ([`SchemaMeta::numeric_constraints`] etc.), which hand back a shared empty default
+/// when the box is absent; the raw fields stay public for construction. `docs` stays inline: it is
+/// populated on a large minority of nodes, so boxing it would add allocations without a matching
+/// resident-size win.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SchemaMeta {
     pub nullable: bool,
     /// OpenAPI 3.1 `contentEncoding`, retained for multipart composition.
     pub content_encoding: Option<String>,
     pub docs: SchemaDocs,
-    pub enum_extensions: EnumExtensionData,
-    pub numeric_constraints: NumericConstraints,
-    pub string_constraints: StringConstraints,
-    pub array_constraints: ArrayConstraints,
-    pub object_constraints: ObjectConstraints,
+    pub enum_extensions: Option<Box<EnumExtensionData>>,
+    pub numeric_constraints: Option<Box<NumericConstraints>>,
+    pub string_constraints: Option<Box<StringConstraints>>,
+    pub array_constraints: Option<Box<ArrayConstraints>>,
+    pub object_constraints: Option<Box<ObjectConstraints>>,
     pub rejected_validation_keywords: Vec<String>,
     pub source: SourceRef,
+}
+
+static EMPTY_ENUM_EXTENSIONS: EnumExtensionData = EnumExtensionData {
+    enum_varnames: None,
+    enum_names: None,
+    enum_descriptions: None,
+    enum_descriptions_camel: None,
+};
+static EMPTY_NUMERIC_CONSTRAINTS: NumericConstraints = NumericConstraints {
+    minimum: None,
+    maximum: None,
+    exclusive_minimum: None,
+    exclusive_maximum: None,
+    multiple_of: None,
+};
+static EMPTY_STRING_CONSTRAINTS: StringConstraints = StringConstraints {
+    min_length: None,
+    max_length: None,
+    pattern: None,
+};
+static EMPTY_ARRAY_CONSTRAINTS: ArrayConstraints = ArrayConstraints {
+    min_items: None,
+    max_items: None,
+    unique_items: false,
+};
+static EMPTY_OBJECT_CONSTRAINTS: ObjectConstraints = ObjectConstraints {
+    min_properties: None,
+    max_properties: None,
+};
+
+impl SchemaMeta {
+    #[must_use]
+    pub fn enum_extensions(&self) -> &EnumExtensionData {
+        self.enum_extensions
+            .as_deref()
+            .unwrap_or(&EMPTY_ENUM_EXTENSIONS)
+    }
+
+    #[must_use]
+    pub fn numeric_constraints(&self) -> &NumericConstraints {
+        self.numeric_constraints
+            .as_deref()
+            .unwrap_or(&EMPTY_NUMERIC_CONSTRAINTS)
+    }
+
+    #[must_use]
+    pub fn string_constraints(&self) -> &StringConstraints {
+        self.string_constraints
+            .as_deref()
+            .unwrap_or(&EMPTY_STRING_CONSTRAINTS)
+    }
+
+    #[must_use]
+    pub fn array_constraints(&self) -> &ArrayConstraints {
+        self.array_constraints
+            .as_deref()
+            .unwrap_or(&EMPTY_ARRAY_CONSTRAINTS)
+    }
+
+    #[must_use]
+    pub fn object_constraints(&self) -> &ObjectConstraints {
+        self.object_constraints
+            .as_deref()
+            .unwrap_or(&EMPTY_OBJECT_CONSTRAINTS)
+    }
+}
+
+/// Boxes `value` only when it differs from its default, so an unpopulated constraint/extension
+/// group costs 8 bytes (a null `Option<Box<…>>`) and no allocation, while a populated one moves off
+/// the inline `SchemaMeta` footprint. Used at IR construction; reads go through the accessors.
+///
+/// This is the sanctioned constructor for the boxed groups: the invariant `Some(boxed)` ⟺
+/// non-default is load-bearing, because `SchemaMeta`'s derived `PartialEq` feeds allOf merge
+/// equality in the emitter — a hand-built `Some(Box::new(T::default()))` would compare unequal
+/// to the canonical `None` and silently flip merge decisions.
+#[must_use]
+pub fn box_if_populated<T: Default + PartialEq>(value: T) -> Option<Box<T>> {
+    (value != T::default()).then(|| Box::new(value))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -405,7 +495,9 @@ pub enum SchemaNode {
     },
     OneOf {
         branches: Vec<SchemaNode>,
-        discriminator: Option<Discriminator>,
+        /// Boxed: a discriminator is present on a small fraction of `oneOf` nodes, so the 112-byte
+        /// `Discriminator` is kept off the common `SchemaNode` footprint.
+        discriminator: Option<Box<Discriminator>>,
         meta: SchemaMeta,
     },
     AnyOf {
@@ -453,7 +545,69 @@ impl SchemaNode {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
     use super::*;
+
+    #[test]
+    fn schema_node_and_meta_stay_small() {
+        // Guards the T3.9 layout win: boxing the five sparse constraint/extension groups (and
+        // `OneOf`'s discriminator) keeps `SchemaNode` far below its former 992 bytes. A regression
+        // here means a large field was added inline again, re-inflating every stored node.
+        assert_eq!(size_of::<SchemaNode>(), 488);
+        assert_eq!(size_of::<SchemaMeta>(), 360);
+
+        // The boxed groups must each be an 8-byte null-optimized pointer inline.
+        assert_eq!(size_of::<Option<Box<EnumExtensionData>>>(), 8);
+        assert_eq!(size_of::<Option<Box<NumericConstraints>>>(), 8);
+        assert_eq!(size_of::<Option<Box<StringConstraints>>>(), 8);
+        assert_eq!(size_of::<Option<Box<ArrayConstraints>>>(), 8);
+        assert_eq!(size_of::<Option<Box<ObjectConstraints>>>(), 8);
+        assert_eq!(size_of::<Option<Box<Discriminator>>>(), 8);
+
+        // The unboxed component sizes the design reasons about; a change here should be a
+        // deliberate re-measure, not a silent drift.
+        assert_eq!(size_of::<SchemaDocs>(), 200);
+        assert_eq!(size_of::<EnumExtensionData>(), 288);
+        assert_eq!(size_of::<NumericConstraints>(), 120);
+        assert_eq!(size_of::<Discriminator>(), 112);
+        assert_eq!(size_of::<SourceRef>(), 64);
+    }
+
+    #[test]
+    fn box_if_populated_boxes_only_non_default_values() {
+        assert!(box_if_populated(NumericConstraints::default()).is_none());
+        let populated = NumericConstraints {
+            minimum: Some(Number::from(1)),
+            ..NumericConstraints::default()
+        };
+        assert_eq!(
+            box_if_populated(populated.clone()).as_deref(),
+            Some(&populated)
+        );
+    }
+
+    #[test]
+    fn constraint_accessors_return_the_shared_empty_default_when_absent() {
+        let meta = SchemaMeta::default();
+        assert_eq!(meta.enum_extensions(), &EnumExtensionData::default());
+        assert_eq!(meta.numeric_constraints(), &NumericConstraints::default());
+        assert_eq!(meta.string_constraints(), &StringConstraints::default());
+        assert_eq!(meta.array_constraints(), &ArrayConstraints::default());
+        assert_eq!(meta.object_constraints(), &ObjectConstraints::default());
+
+        let populated = SchemaMeta {
+            numeric_constraints: box_if_populated(NumericConstraints {
+                minimum: Some(Number::from(2)),
+                ..NumericConstraints::default()
+            }),
+            ..SchemaMeta::default()
+        };
+        assert_eq!(
+            populated.numeric_constraints().minimum,
+            Some(Number::from(2))
+        );
+    }
 
     #[test]
     fn any_of_exposes_its_metadata() {

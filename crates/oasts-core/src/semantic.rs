@@ -568,19 +568,14 @@ fn validate_enum_extensions(
     types: &TypesConfig,
     sink: &mut DiagnosticSink,
 ) -> ValidatedExtensions {
+    let enum_ext = meta.enum_extensions();
     let extensions = [
-        (
-            "x-enum-varnames",
-            meta.enum_extensions.enum_varnames.as_ref(),
-        ),
-        ("x-enumNames", meta.enum_extensions.enum_names.as_ref()),
-        (
-            "x-enum-descriptions",
-            meta.enum_extensions.enum_descriptions.as_ref(),
-        ),
+        ("x-enum-varnames", enum_ext.enum_varnames.as_ref()),
+        ("x-enumNames", enum_ext.enum_names.as_ref()),
+        ("x-enum-descriptions", enum_ext.enum_descriptions.as_ref()),
         (
             "x-enumDescriptions",
-            meta.enum_extensions.enum_descriptions_camel.as_ref(),
+            enum_ext.enum_descriptions_camel.as_ref(),
         ),
     ];
     if types.enum_extensions == EnumExtensions::Reject {
@@ -599,28 +594,28 @@ fn validate_enum_extensions(
     let expected_len = enum_values.map_or(0, <[Value]>::len);
     let first_names = validate_extension_array(
         "x-enum-varnames",
-        meta.enum_extensions.enum_varnames.as_ref(),
+        enum_ext.enum_varnames.as_ref(),
         expected_len,
         meta,
         sink,
     );
     let second_names = validate_extension_array(
         "x-enumNames",
-        meta.enum_extensions.enum_names.as_ref(),
+        enum_ext.enum_names.as_ref(),
         expected_len,
         meta,
         sink,
     );
     let first_descriptions = validate_extension_array(
         "x-enum-descriptions",
-        meta.enum_extensions.enum_descriptions.as_ref(),
+        enum_ext.enum_descriptions.as_ref(),
         expected_len,
         meta,
         sink,
     );
     let second_descriptions = validate_extension_array(
         "x-enumDescriptions",
-        meta.enum_extensions.enum_descriptions_camel.as_ref(),
+        enum_ext.enum_descriptions_camel.as_ref(),
         expected_len,
         meta,
         sink,
@@ -1269,10 +1264,10 @@ mod tests {
                 const_value: None,
                 meta: SchemaMeta {
                     docs: SchemaDocs::default(),
-                    enum_extensions: crate::ir::EnumExtensionData {
+                    enum_extensions: crate::ir::box_if_populated(crate::ir::EnumExtensionData {
                         enum_varnames: extension,
                         ..crate::ir::EnumExtensionData::default()
-                    },
+                    }),
                     source: source(pointer),
                     ..SchemaMeta::default()
                 },
@@ -1350,7 +1345,11 @@ mod tests {
             "/competing",
         );
         if let SchemaNode::Primitive { meta, .. } = &mut schema.schema {
-            meta.enum_extensions.enum_names = Some(json!(["First", "Second"]));
+            meta.enum_extensions = crate::ir::box_if_populated(crate::ir::EnumExtensionData {
+                enum_varnames: Some(json!(["A", "B"])),
+                enum_names: Some(json!(["First", "Second"])),
+                ..Default::default()
+            });
         }
         let mut sink = DiagnosticSink::new();
         let _analyzed = analyze_with_options(
@@ -1647,7 +1646,16 @@ mod tests {
             source: source("/enum"),
             ..SchemaMeta::default()
         };
-        meta.enum_extensions.enum_varnames = Some(json!(["One"]));
+        let set_ext = |meta: &mut SchemaMeta, ext: crate::ir::EnumExtensionData| {
+            meta.enum_extensions = crate::ir::box_if_populated(ext);
+        };
+        set_ext(
+            &mut meta,
+            crate::ir::EnumExtensionData {
+                enum_varnames: Some(json!(["One"])),
+                ..Default::default()
+            },
+        );
         let mut rejected_types = const_types();
         rejected_types.enum_extensions = EnumExtensions::Reject;
         let mut sink = DiagnosticSink::new();
@@ -1655,16 +1663,33 @@ mod tests {
             validate_enum_extensions(Some(&[json!(1)]), &meta, &rejected_types, &mut sink);
         assert!(rejected.names.is_none());
 
-        meta.enum_extensions.enum_varnames = Some(json!("not-an-array"));
+        set_ext(
+            &mut meta,
+            crate::ir::EnumExtensionData {
+                enum_varnames: Some(json!("not-an-array")),
+                ..Default::default()
+            },
+        );
         let _invalid =
             validate_enum_extensions(Some(&[json!(1)]), &meta, &const_types(), &mut sink);
-        meta.enum_extensions.enum_varnames = Some(json!([7]));
+        set_ext(
+            &mut meta,
+            crate::ir::EnumExtensionData {
+                enum_varnames: Some(json!([7])),
+                ..Default::default()
+            },
+        );
         let _invalid =
             validate_enum_extensions(Some(&[json!(1)]), &meta, &const_types(), &mut sink);
-        meta.enum_extensions.enum_varnames = Some(json!(["Same", "same"]));
-        meta.enum_extensions.enum_names = Some(json!(["Same", "same"]));
-        meta.enum_extensions.enum_descriptions = Some(json!(["first", "second"]));
-        meta.enum_extensions.enum_descriptions_camel = Some(json!(["one", "two"]));
+        set_ext(
+            &mut meta,
+            crate::ir::EnumExtensionData {
+                enum_varnames: Some(json!(["Same", "same"])),
+                enum_names: Some(json!(["Same", "same"])),
+                enum_descriptions: Some(json!(["first", "second"])),
+                enum_descriptions_camel: Some(json!(["one", "two"])),
+            },
+        );
         let validated = validate_enum_extensions(
             Some(&[json!(1), json!(2)]),
             &meta,
@@ -1673,10 +1698,13 @@ mod tests {
         );
         assert_eq!(validated.names.expect("names").len(), 2);
 
-        meta.enum_extensions.enum_varnames = Some(json!(["bad-name"]));
-        meta.enum_extensions.enum_names = None;
-        meta.enum_extensions.enum_descriptions = None;
-        meta.enum_extensions.enum_descriptions_camel = None;
+        set_ext(
+            &mut meta,
+            crate::ir::EnumExtensionData {
+                enum_varnames: Some(json!(["bad-name"])),
+                ..Default::default()
+            },
+        );
         let _invalid =
             validate_enum_extensions(Some(&[json!(1)]), &meta, &const_types(), &mut sink);
         assert!(sink.as_slice().len() >= 6);
@@ -1692,7 +1720,10 @@ mod tests {
             "/collision",
         );
         if let SchemaNode::Primitive { meta, .. } = &mut collision.schema {
-            meta.enum_extensions.enum_descriptions = Some(json!(["first", "second"]));
+            meta.enum_extensions = crate::ir::box_if_populated(crate::ir::EnumExtensionData {
+                enum_descriptions: Some(json!(["first", "second"])),
+                ..Default::default()
+            });
         }
         let mut contradiction = enum_schema(
             vec![json!(1), Value::Null],
