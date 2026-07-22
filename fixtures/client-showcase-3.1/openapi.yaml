@@ -153,6 +153,7 @@ paths:
                 - metadata
                 - title
                 - file
+                - note
               properties:
                 metadata:
                   type: object
@@ -162,6 +163,9 @@ paths:
                 title:
                   type: string
                 file: {}
+                note:
+                  type: string
+                  contentEncoding: binary
             encoding:
               metadata:
                 contentType: application/json, application/cbor
@@ -186,10 +190,22 @@ paths:
                   type: array
                   items:
                     type: string
+                profile:
+                  type: object
+                  properties:
+                    nickname:
+                      type: string
+                    age:
+                      type: integer
+                icon:
+                  type: string
+                  contentEncoding: base64url
             encoding:
               labels:
                 style: form
                 explode: false
+              icon:
+                contentType: image/png, image/jpeg
       responses:
         '204':
           description: The form was accepted.

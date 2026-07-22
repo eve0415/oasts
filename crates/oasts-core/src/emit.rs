@@ -41,6 +41,7 @@ const CODE_PATH_COLLISION: &str = "OASTS1302";
 const CODE_COMPOSITION: &str = "OASTS1303";
 const CODE_DISCRIMINATOR: &str = "OASTS1304";
 const CODE_REFERENCE: &str = "OASTS1305";
+const CODE_VARIANT_COLLISION: &str = "OASTS1306";
 
 /// A merged `allOf` property borrowed straight from the model IR: name, schema,
 /// and metadata. Borrowed (not owned) so `merge_all_of` never deep-clones the
@@ -3990,6 +3991,341 @@ mod tests {
         assert!(generated_body(pair).ends_with("export type Pair = [string, number];\n"));
     }
 
+    /// The variant-need decision reaches read/write-only markers buried in an inline nested object,
+    /// so the top-level component splits into Request/Response variants that drop them per position.
+    /// A sibling with no such markers stays single. Regression: a shallow decision that only inspects
+    /// direct properties emits a Neutral-only type while the position-aware renderer drops the nested
+    /// property — a mismatch that surfaces as a dangling import or a dead export downstream.
+    #[test]
+    fn shape_variants_recurses_nested_inline() {
+        let document = openapi(json!({
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "meta": {
+                        "type": "object",
+                        "properties": {
+                            "serverId": { "type": "string", "readOnly": true },
+                            "secret": { "type": "string", "writeOnly": true }
+                        }
+                    }
+                }
+            },
+            "Plain": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pet = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("pet.ts"))
+            .expect("Pet file");
+        assert!(
+            pet.content.contains("export interface PetRequest {"),
+            "{}",
+            pet.content
+        );
+        assert!(
+            pet.content.contains("export interface PetResponse {"),
+            "{}",
+            pet.content
+        );
+        let plain = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("plain.ts"))
+            .expect("Plain file");
+        assert!(!plain.content.contains("PlainRequest"), "{}", plain.content);
+        assert!(
+            !plain.content.contains("PlainResponse"),
+            "{}",
+            plain.content
+        );
+    }
+
+    /// The decision recurses through the merged shape of an inline `allOf` branch, matching the
+    /// renderer, which drops the read/write-only member from the intersection per position.
+    #[test]
+    fn shape_variants_recurses_allof_inline() {
+        let document = openapi(json!({
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "combo": {
+                        "allOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "serverId": { "type": "string", "readOnly": true },
+                                    "secret": { "type": "string", "writeOnly": true }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pet = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("pet.ts"))
+            .expect("Pet file");
+        assert!(
+            pet.content.contains("export interface PetRequest {"),
+            "{}",
+            pet.content
+        );
+        assert!(
+            pet.content.contains("export interface PetResponse {"),
+            "{}",
+            pet.content
+        );
+    }
+
+    /// The decision descends into array items, matching the renderer, which drops the read/write-only
+    /// member from each element type per position.
+    #[test]
+    fn shape_variants_recurses_array_items() {
+        let document = openapi(json!({
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "tags": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "serverId": { "type": "string", "readOnly": true },
+                                "secret": { "type": "string", "writeOnly": true }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pet = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("pet.ts"))
+            .expect("Pet file");
+        assert!(
+            pet.content.contains("export interface PetRequest {"),
+            "{}",
+            pet.content
+        );
+        assert!(
+            pet.content.contains("export interface PetResponse {"),
+            "{}",
+            pet.content
+        );
+    }
+
+    /// The decision descends into an inline `additionalProperties` value schema, matching the
+    /// renderer, which drops the read/write-only member from the value type per position. Without
+    /// this recursion a read/write-only marker reachable only through `additionalProperties` is
+    /// missed and no variant is emitted (mutation gap: deleting the recursion survived the suite).
+    #[test]
+    fn shape_variants_recurses_additional_properties_inline() {
+        let document = openapi(json!({
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "attrs": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "serverId": { "type": "string", "readOnly": true },
+                                "secret": { "type": "string", "writeOnly": true }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pet = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("pet.ts"))
+            .expect("Pet file");
+        assert!(
+            pet.content.contains("export interface PetRequest {"),
+            "{}",
+            pet.content
+        );
+        assert!(
+            pet.content.contains("export interface PetResponse {"),
+            "{}",
+            pet.content
+        );
+    }
+
+    /// The decision descends into an inline `oneOf` branch, matching the renderer, which drops the
+    /// read/write-only member from each branch per position.
+    #[test]
+    fn shape_variants_recurses_oneof_inline() {
+        let document = openapi(json!({
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "choice": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "serverId": { "type": "string", "readOnly": true },
+                                    "secret": { "type": "string", "writeOnly": true }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pet = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("pet.ts"))
+            .expect("Pet file");
+        assert!(
+            pet.content.contains("export interface PetRequest {"),
+            "{}",
+            pet.content
+        );
+        assert!(
+            pet.content.contains("export interface PetResponse {"),
+            "{}",
+            pet.content
+        );
+    }
+
+    /// The decision descends into a tuple's rest-item schema (`items` alongside `prefixItems`),
+    /// matching the renderer, which drops the read/write-only member from elements beyond the
+    /// fixed prefix per position.
+    #[test]
+    fn shape_variants_recurses_tuple_rest() {
+        let document = openapi(json!({
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "coords": {
+                        "type": "array",
+                        "prefixItems": [{ "type": "number" }],
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "serverId": { "type": "string", "readOnly": true },
+                                "secret": { "type": "string", "writeOnly": true }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pet = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("pet.ts"))
+            .expect("Pet file");
+        assert!(
+            pet.content.contains("export interface PetRequest {"),
+            "{}",
+            pet.content
+        );
+        assert!(
+            pet.content.contains("export interface PetResponse {"),
+            "{}",
+            pet.content
+        );
+    }
+
+    /// Once both variants are known needed while walking a tuple's fixed-position elements, the
+    /// accumulator short-circuits without visiting the remaining prefix items or the rest-item
+    /// schema; the observable result is still both variants emitted.
+    #[test]
+    fn shape_variants_tuple_prefix_items_short_circuit() {
+        let document = openapi(json!({
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "coords": {
+                        "type": "array",
+                        "prefixItems": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "serverId": { "type": "string", "readOnly": true },
+                                    "secret": { "type": "string", "writeOnly": true }
+                                }
+                            },
+                            { "type": "string" }
+                        ],
+                        "items": { "type": "string" }
+                    }
+                }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pet = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("pet.ts"))
+            .expect("Pet file");
+        assert!(
+            pet.content.contains("export interface PetRequest {"),
+            "{}",
+            pet.content
+        );
+        assert!(
+            pet.content.contains("export interface PetResponse {"),
+            "{}",
+            pet.content
+        );
+    }
+
+    /// Once both variants are known needed, the accumulator short-circuits without visiting the rest
+    /// of the tree; the observable result is still both variants emitted.
+    #[test]
+    fn both_variants_short_circuit() {
+        let document = openapi(json!({
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "serverId": { "type": "string", "readOnly": true },
+                    "secret": { "type": "string", "writeOnly": true },
+                    "deep": {
+                        "type": "object",
+                        "properties": {
+                            "more": { "type": "string", "readOnly": true }
+                        }
+                    }
+                }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pet = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("pet.ts"))
+            .expect("Pet file");
+        assert!(
+            pet.content.contains("export interface PetRequest {"),
+            "{}",
+            pet.content
+        );
+        assert!(
+            pet.content.contains("export interface PetResponse {"),
+            "{}",
+            pet.content
+        );
+    }
+
     #[test]
     fn enum_literal_and_const_forms_snapshot() {
         let document = openapi(json!({
@@ -4561,14 +4897,78 @@ fn stricter_upper(left: Option<Bound>, right: Option<Bound>) -> Option<Bound> {
     }
 }
 
+/// Whether a component needs a Request variant (some reachable property is `readOnly`, dropped in
+/// request position) and/or a Response variant (some reachable property is `writeOnly`, dropped in
+/// response position). The traversal mirrors the position-aware renderer exactly: it descends every
+/// inline structure the renderer inlines — nested objects, `additionalProperties`, array items,
+/// tuple members, and `allOf`/`anyOf`/`oneOf` branches — so the decision agrees with what the
+/// renderer produces. A mismatch would emit a dead export or a dangling import.
+///
+/// A `$ref` is a graph edge, not crossed here: the referenced component renders as its own named
+/// (possibly variant) type, and variance flows across refs in a separate propagation pass. Stack-only
+/// with no heap allocation, so a marker-free component returns `(false, false)` doing zero
+/// allocation, exactly as the pre-recursion decision did.
 fn shape_variants(schema: &SchemaNode) -> (bool, bool) {
-    let SchemaNode::Object { properties, .. } = schema else {
-        return (false, false);
-    };
-    (
-        properties.iter().any(|(_, _, meta)| meta.read_only),
-        properties.iter().any(|(_, _, meta)| meta.write_only),
-    )
+    let mut acc = (false, false);
+    accumulate_shape_variants(schema, &mut acc);
+    acc
+}
+
+fn accumulate_shape_variants(schema: &SchemaNode, acc: &mut (bool, bool)) {
+    if acc.0 && acc.1 {
+        return;
+    }
+    match schema {
+        SchemaNode::Object {
+            properties,
+            additional_properties,
+            ..
+        } => {
+            for (_, property, meta) in properties {
+                acc.0 |= meta.read_only;
+                acc.1 |= meta.write_only;
+                accumulate_shape_variants(property, acc);
+                if acc.0 && acc.1 {
+                    return;
+                }
+            }
+            if let AdditionalProperties::Allowed(Some(schema))
+            | AdditionalProperties::Schema(schema) = additional_properties
+            {
+                accumulate_shape_variants(schema, acc);
+            }
+        }
+        SchemaNode::Array { items, .. } => accumulate_shape_variants(items, acc),
+        SchemaNode::Tuple {
+            prefix_items, rest, ..
+        } => {
+            for item in prefix_items {
+                accumulate_shape_variants(item, acc);
+                if acc.0 && acc.1 {
+                    return;
+                }
+            }
+            if let TupleRest::Schema(schema) = rest {
+                accumulate_shape_variants(schema, acc);
+            }
+        }
+        SchemaNode::AllOf { branches, .. }
+        | SchemaNode::AnyOf { branches, .. }
+        | SchemaNode::OneOf { branches, .. } => {
+            for branch in branches {
+                accumulate_shape_variants(branch, acc);
+                if acc.0 && acc.1 {
+                    return;
+                }
+            }
+        }
+        SchemaNode::Ref { .. }
+        | SchemaNode::Primitive { .. }
+        | SchemaNode::Finite { .. }
+        | SchemaNode::Any { .. }
+        | SchemaNode::Never { .. }
+        | SchemaNode::Unknown { .. } => {}
+    }
 }
 
 pub(super) fn source_diagnostic(

@@ -180,6 +180,29 @@ describe("form-urlencoded body", () => {
     );
   });
 
+  test("json fields serialize the JSON representation after percent-encoding", () => {
+    // OAS 3.1.1: urlencoded bodies encode complex objects after serializing them to a string, so a
+    // JSON object is JSON.stringify'd then RFC1866 percent-encoded — `{`→%7B, `"`→%22, `:`→%3A,
+    // ` `→%20, `}`→%7D.
+    assert.equal(
+      encodeFormUrlencodedBody([{ name: "address", json: { streetAddress: "123 Main St" } }]),
+      "address=%7B%22streetAddress%22%3A%22123%20Main%20St%22%7D",
+    );
+  });
+
+  test("json string fields keep their JSON quotes on the wire", () => {
+    // A JSON-serialized string keeps its quotes: JSON.stringify("u") === '"u"' → %22u%22.
+    assert.equal(encodeFormUrlencodedBody([{ name: "id", json: "u" }]), "id=%22u%22");
+  });
+
+  test("json fields reject values JSON cannot represent", () => {
+    assert.throws(() => encodeFormUrlencodedBody([{ name: "n", json: 10n }]), /BigInt/u);
+    assert.throws(
+      () => encodeFormUrlencodedBody([{ name: "n", json: () => 1 }]),
+      /not serializable/u,
+    );
+  });
+
   test("rejects styles paired with the wrong value shape", () => {
     assert.throws(
       () => encodeFormUrlencodedBody([{ name: "value", value: "x", style: "spaceDelimited" }]),

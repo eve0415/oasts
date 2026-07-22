@@ -1,6 +1,6 @@
 //! Client artifact planning over the normalized OpenAPI IR.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -189,9 +189,94 @@ impl FieldSerializationPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartMediaPlan {
     pub values: Vec<String>,
+    /// Wire payload kind per admitted media type, index-for-index with `values`. Consumed today
+    /// only by the urlencoded body descriptor's Content arm; multipart re-derives its single
+    /// payload through `media_payload`'s own media sniff. Folding multipart onto this field so one
+    /// classification feeds both formats is a follow-up.
+    pub payloads: Vec<PayloadKind>,
     pub all_concrete: bool,
     pub binary_upload: bool,
     pub declared: bool,
+}
+
+/// How a content-based form field is serialized onto the wire for one admitted media type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PayloadKind {
+    Json,
+    Text,
+    Binary,
+}
+
+impl PayloadKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Text => "text",
+            Self::Binary => "binary",
+        }
+    }
+}
+
+/// The media type essence — everything before the first `;` parameter separator, trailing
+/// whitespace trimmed — as isolated by `parse_declared_media`. The essence is what every wire
+/// classifier keys on: a parameterized value (`application/json; charset=utf-8`) must route by its
+/// base type, never fall through to a schema-shape fallback and corrupt the wire. The first `;`
+/// always precedes any parameter, and the essence itself can hold no quotes or `;`, so a plain
+/// `split_once` isolates it without the quoted-segment handling `parse_declared_media` needs.
+pub(crate) fn media_essence(media: &str) -> &str {
+    media
+        .split_once(';')
+        .map_or(media, |(essence, _)| essence)
+        .trim_end()
+}
+
+/// Records a step into an array's `items` for the media classifiers, guarding the cross-hop ref
+/// cycle that `resolve_schema`'s per-call seen-set cannot span. A schema-position cycle such as
+/// `Tree: {type: array, items: $ref Tree}` resolves one hop at a time, so without a set that
+/// outlives the recursion the classifiers descend until the stack overflows and aborts the host
+/// process (an uncatchable SIGABRT through napi). Returns `false` on a revisited ref target,
+/// routing the caller to its terminal fallback arm; a non-ref item never cycles and always
+/// proceeds. Mirrors the ref-target set threaded through `schema_is_array`.
+fn enter_array_items(items: &SchemaNode, visited: &mut HashSet<(String, String)>) -> bool {
+    match items {
+        SchemaNode::Ref { target, .. } => {
+            visited.insert((target.source_id.clone(), target.json_pointer.clone()))
+        }
+        _ => true,
+    }
+}
+
+/// Classifies the wire payload kind for one admitted media type of a content-based form field.
+///
+/// Follows the OAS 3.1.1 Encoding Object default `contentType` table: `object` → application/json,
+/// `string` + `contentEncoding` (and other binary defaults) → octet-stream, other primitives →
+/// text/plain. An explicitly declared media type overrides the default and is classified here by
+/// its essence: `application/json` and `+json` suffixes are JSON, `text/*` is text, and every other
+/// concrete or wildcard media falls back to the schema shape (object/tuple → JSON, arrays by their
+/// ref-resolved items — mirroring `default_part_media` — else text). The caller seeds `visited`; a
+/// ref-cyclic array bottoms out at the text fallback.
+fn content_payload_kind(
+    resolved: &SchemaNode,
+    media_value: &str,
+    projector: &PrimitiveDomainProjector<'_>,
+    visited: &mut HashSet<(String, String)>,
+) -> PayloadKind {
+    let essence = media_essence(media_value);
+    if essence == "application/json" || essence.ends_with("+json") {
+        return PayloadKind::Json;
+    }
+    if essence.starts_with("text/") {
+        return PayloadKind::Text;
+    }
+    match resolved {
+        SchemaNode::Object { .. } | SchemaNode::Tuple { .. } => PayloadKind::Json,
+        SchemaNode::Array { items, .. } if enter_array_items(items, visited) => {
+            let items = projector.resolve_schema(items).unwrap_or(items);
+            content_payload_kind(items, media_value, projector, visited)
+        }
+        _ => PayloadKind::Text,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -518,7 +603,7 @@ fn field_plan(
         )
     } else {
         let (part_media, caller_headers, implicit_cte, encoding_source) =
-            content_field_parts(schema, encoding, media.oas_version, projector);
+            content_field_parts(schema, encoding, media.oas_version, multipart, projector);
         let headers = if caller_headers.iter().any(|header| header.required) {
             HeaderInputRequirement::Required
         } else if caller_headers.is_empty() {
@@ -530,16 +615,17 @@ fn field_plan(
             || !part_media.all_concrete
             || headers != HeaderInputRequirement::None;
         let filename = part_media.binary_upload;
+        let all_concrete = part_media.all_concrete;
         (
             FieldSerializationPlan::Content {
-                media: part_media.clone(),
+                media: part_media,
                 caller_headers,
                 content_transfer_encoding: implicit_cte,
                 encoding_source,
             },
             FieldWrapperPlan {
                 wrapped,
-                content_type_literal: part_media.all_concrete,
+                content_type_literal: all_concrete,
                 headers,
                 filename,
             },
@@ -559,6 +645,7 @@ fn content_field_parts(
     schema: &SchemaNode,
     encoding: Option<&EncodingObject>,
     version: OasVersion,
+    multipart: bool,
     projector: &PrimitiveDomainProjector<'_>,
 ) -> (
     PartMediaPlan,
@@ -566,12 +653,14 @@ fn content_field_parts(
     Option<String>,
     Option<SourceRef>,
 ) {
+    let resolved = projector.resolve_schema(schema).unwrap_or(schema);
     let (values, binary_upload, declared) = encoding
         .and_then(|encoding| encoding.content_type.as_ref())
         .map_or_else(
             || {
-                let (media, binary) = default_part_media(schema, version, projector);
-                (vec![media], binary, false)
+                let (media, binary) =
+                    default_part_media(schema, version, projector, &mut HashSet::new());
+                (vec![media.to_owned()], binary, false)
             },
             |values| {
                 (
@@ -587,28 +676,61 @@ fn content_field_parts(
                 )
             },
         );
-    let implicit_cte = (version == OasVersion::V3_1)
-        .then(|| schema.meta().content_encoding.clone())
-        .flatten();
-    let caller_headers = encoding
-        .map(|encoding| {
-            encoding
-                .headers
-                .iter()
-                .filter(|(name, _)| {
-                    let lower = name.to_ascii_lowercase();
-                    lower == "content-transfer-encoding" && implicit_cte.is_none()
-                })
-                .map(|(name, header)| caller_header(name, header))
-                .collect()
-        })
-        .unwrap_or_default();
+    // A `contentEncoding` implies a contentTransferEncoding only for a multipart part whose payload
+    // transmits an already-encoded string — the `default_part_media` arms that honor it
+    // (string-shaped or schemaless). On any other shape it does not change the wire payload, so
+    // priming the CTE-implies-text override would mislabel the field (an object part emits
+    // `payload: "text"` and throws `multipartPayload('text', {...})` at runtime on a type-correct
+    // call). On a urlencoded body the annotation never applies at all.
+    let implicit_cte = (multipart
+        && version == OasVersion::V3_1
+        && matches!(
+            resolved,
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            } | SchemaNode::Any { .. }
+                | SchemaNode::Finite { .. }
+        ))
+    .then(|| schema.meta().content_encoding.clone())
+    .flatten();
+    // OAS 3.1.1 Encoding Object: `headers` SHALL be ignored when the body media type is not
+    // multipart, so a urlencoded field never exposes a caller header.
+    let caller_headers = if multipart {
+        encoding
+            .map(|encoding| {
+                encoding
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        let lower = name.to_ascii_lowercase();
+                        lower == "content-transfer-encoding" && implicit_cte.is_none()
+                    })
+                    .map(|(name, header)| caller_header(name, header))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let all_concrete = values
         .iter()
         .all(|value| parse_declared_media(value).is_ok_and(|parsed| parsed.concrete));
+    // A binary upload is binary for every admitted media, independent of the media string, so it
+    // short-circuits the per-value classification (which is only ever reached with `binary_upload`
+    // false). Each value gets a fresh cycle-guard set — a cycle is per-traversal.
+    let payloads = if binary_upload {
+        vec![PayloadKind::Binary; values.len()]
+    } else {
+        values
+            .iter()
+            .map(|value| content_payload_kind(resolved, value, projector, &mut HashSet::new()))
+            .collect()
+    };
     (
         PartMediaPlan {
             values,
+            payloads,
             all_concrete,
             binary_upload,
             declared,
@@ -628,47 +750,57 @@ fn caller_header(name: &str, header: &EncodingHeader) -> CallerHeaderPlan {
     }
 }
 
+// The media component is always a static literal, so it is returned borrowed: `diagnose_form_media`
+// reads only the binary-upload bool (no allocation on that path), while `content_field_parts`
+// `.to_owned()`s the media exactly where it stores it. The caller seeds `visited`; a ref-cyclic
+// array bottoms out at the text/plain fallback rather than overflowing the stack.
 fn default_part_media(
     schema: &SchemaNode,
     version: OasVersion,
     projector: &PrimitiveDomainProjector<'_>,
-) -> (String, bool) {
+    visited: &mut HashSet<(String, String)>,
+) -> (&'static str, bool) {
     let resolved = projector.resolve_schema(schema).unwrap_or(schema);
     match resolved {
-        SchemaNode::Ref { .. } => ("application/octet-stream".to_owned(), false),
+        SchemaNode::Ref { .. } => ("application/octet-stream", false),
         SchemaNode::Primitive {
             ty: PrimitiveType::String,
             format,
             meta,
             ..
         } if version == OasVersion::V3_1 && meta.content_encoding.is_some() => {
-            ("application/octet-stream".to_owned(), false)
+            ("application/octet-stream", false)
         }
         SchemaNode::Primitive {
             ty: PrimitiveType::String,
             format,
             ..
         } if version == OasVersion::V3_0 && format.as_deref() == Some("binary") => {
-            ("application/octet-stream".to_owned(), true)
+            ("application/octet-stream", true)
         }
         SchemaNode::Primitive {
             ty: PrimitiveType::String,
             format,
             ..
         } if version == OasVersion::V3_0 && format.as_deref() == Some("byte") => {
-            ("application/octet-stream".to_owned(), false)
+            ("application/octet-stream", false)
         }
-        SchemaNode::Object { .. } | SchemaNode::Tuple { .. } => {
-            ("application/json".to_owned(), false)
+        SchemaNode::Object { .. } | SchemaNode::Tuple { .. } => ("application/json", false),
+        SchemaNode::Array { items, .. } if enter_array_items(items, visited) => {
+            default_part_media(items, version, projector, visited)
         }
-        SchemaNode::Array { items, .. } => default_part_media(items, version, projector),
+        SchemaNode::Array { .. } => ("text/plain", false),
         SchemaNode::Any { .. } | SchemaNode::Finite { .. } if version == OasVersion::V3_1 => {
-            ("application/octet-stream".to_owned(), true)
+            // Mirror the `Primitive{String}` arm above: a schemaless 3.1 field carrying
+            // `contentEncoding` transmits the already-encoded string on the wire (OAS 3.1.1), so it
+            // is not a binary upload. Without the annotation the schemaless default stays binary.
+            let binary_upload = resolved.meta().content_encoding.is_none();
+            ("application/octet-stream", binary_upload)
         }
         _ if projector.project(resolved) == Projection::Known(Domain::OBJECT) => {
-            ("application/json".to_owned(), false)
+            ("application/json", false)
         }
-        _ => ("text/plain".to_owned(), false),
+        _ => ("text/plain", false),
     }
 }
 
@@ -1194,17 +1326,67 @@ fn diagnose_form_media(
                     Severity::Error,
                 ));
             }
-        } else if let Some(encoding) = encoding
-            && let Some(values) = &encoding.content_type
-        {
-            for value in values {
-                if parse_declared_media(value).is_err() {
+        } else {
+            if let Some(encoding) = encoding
+                && let Some(values) = &encoding.content_type
+            {
+                for value in values {
+                    if parse_declared_media(value).is_err() {
+                        sink.push(source_diagnostic(
+                            "OASTS1418",
+                            format!(
+                                "encoding contentType value {value:?} is malformed or has a control/non-ASCII parameter value"
+                            ),
+                            &encoding.source,
+                            Severity::Error,
+                        ));
+                    }
+                }
+            }
+            // A urlencoded body is a text format (OAS 3.1.1), so a field whose default part media is
+            // binary has no representation; require multipart or base64url instead of silently
+            // corrupting the wire. Independent of the content-type check above: an explicit
+            // `encoding.contentType` overrides the *declared* media but cannot make a binary schema
+            // representable in a text format, so the shape check runs on both content paths.
+            if !multipart
+                && default_part_media(schema, media.oas_version, projector, &mut HashSet::new()).1
+            {
+                sink.push(source_diagnostic(
+                    "OASTS1423",
+                    format!(
+                        "form field '{name}' has a binary payload that application/x-www-form-urlencoded cannot represent; use multipart/form-data for binary uploads or base64-encode the value (type: string, contentEncoding: base64url)"
+                    ),
+                    &property.source,
+                    Severity::Error,
+                ));
+            }
+            // A structured urlencoded field (object, or an array bottoming out at objects) under a
+            // text media type has no wire representation: the form-explode serializer drops an
+            // object's field name (`meta: {a:1}` → `a=1`) and throws on an array of objects — both
+            // silent corruption on a type-correct call. `default_part_media == application/json`
+            // (itself ref-cycle guarded) identifies the structured shapes, whose default media is
+            // already JSON, so only an explicitly declared text media can misroute them. For such a
+            // schema `content_payload_kind` returns Text exactly when the media essence is `text/*`,
+            // so match the essence case-insensitively (media types are case-insensitive) without
+            // re-parsing the value or re-walking the schema. Scope: urlencoded only — the multipart
+            // analog is pre-existing.
+            if !multipart
+                && default_part_media(schema, media.oas_version, projector, &mut HashSet::new()).0
+                    == "application/json"
+                && let Some(values) = encoding.and_then(|encoding| encoding.content_type.as_ref())
+            {
+                let declares_text = values.iter().any(|value| {
+                    media_essence(value)
+                        .to_ascii_lowercase()
+                        .starts_with("text/")
+                });
+                if declares_text {
                     sink.push(source_diagnostic(
-                        "OASTS1418",
+                        "OASTS1424",
                         format!(
-                            "encoding contentType value {value:?} is malformed or has a control/non-ASCII parameter value"
+                            "form field '{name}' declares a text media type but its schema is an object; use application/json (or a *+json media type) for structured urlencoded values"
                         ),
-                        &encoding.source,
+                        &property.source,
                         Severity::Error,
                     ));
                 }
@@ -1746,8 +1928,9 @@ fn is_tchar(byte: u8) -> bool {
 }
 
 fn is_json(media: &str) -> bool {
-    media == "application/json"
-        || media
+    let essence = media_essence(media);
+    essence == "application/json"
+        || essence
             .rsplit_once('/')
             .is_some_and(|(_, subtype)| subtype.ends_with("+json"))
 }
@@ -2322,6 +2505,7 @@ mod tests {
         let body = model.operations[0].body_plan.as_ref().expect("body plan");
         let fields = body.multipart_fields().expect("multipart body");
         assert!(body.discriminated_arms().is_none());
+        assert!(urlencoded_fields(body).is_none());
 
         assert_eq!(
             fields
@@ -2337,6 +2521,16 @@ mod tests {
             fields[0].serialization,
             FieldSerializationPlan::Content { .. }
         ));
+        // `application/json, application/*`: the object schema classifies the wildcard tier via the
+        // object fallback, so both admitted media types resolve to JSON payloads.
+        assert_eq!(
+            fields[0]
+                .serialization
+                .content_media()
+                .expect("content branch")
+                .payloads,
+            [PayloadKind::Json, PayloadKind::Json]
+        );
         assert!(matches!(
             fields[1].serialization,
             FieldSerializationPlan::Style {
@@ -2346,6 +2540,84 @@ mod tests {
             }
         ));
         assert!(fields[1].serialization.content_media().is_none());
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn multipart_content_encoding_implies_cte_only_for_string_shaped_parts() {
+        // A `contentEncoding` on a multipart part implies a contentTransferEncoding only when the
+        // part transmits an already-encoded string (the `default_part_media` arms that honor it).
+        // An object part keeps its JSON payload and no implied CTE — priming a `payload: "text"`
+        // override on an object throws `multipartPayload('text', {...})` at runtime on a
+        // type-correct call (regression vs main, which emitted "json").
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/upload": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "structured": { "type": "object", "contentEncoding": "binary" },
+                                            "raw": { "type": "string", "contentEncoding": "binary" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let fields = model.operations[0]
+            .body_plan
+            .as_ref()
+            .expect("body plan")
+            .multipart_fields()
+            .expect("multipart body");
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find(|field| field.name == name)
+                .expect("field")
+        };
+        // Object part: JSON payload, no implied CTE, object input preserved.
+        let structured = field("structured");
+        assert!(matches!(
+            &structured.serialization,
+            FieldSerializationPlan::Content {
+                content_transfer_encoding: None,
+                ..
+            }
+        ));
+        assert!(matches!(structured.schema, SchemaNode::Object { .. }));
+        assert_eq!(
+            structured
+                .serialization
+                .content_media()
+                .expect("content")
+                .values,
+            ["application/json"]
+        );
+        assert_eq!(field_payloads(structured), [PayloadKind::Json]);
+        // String part: still carries the implied CTE (unchanged).
+        assert!(matches!(
+            &field("raw").serialization,
+            FieldSerializationPlan::Content {
+                content_transfer_encoding: Some(cte),
+                ..
+            } if cte == "binary"
+        ));
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
     }
 
@@ -2438,11 +2710,16 @@ mod tests {
                                         "properties": {
                                             "typeless": {},
                                             "finiteTypeless": { "enum": ["value"] },
+                                            "encodedTypeless": { "contentEncoding": "binary" },
                                             "encoded": { "type": "string", "contentEncoding": "binary" },
                                             "object": { "type": "object" },
                                             "objects": { "type": "array", "items": { "type": "object" } },
-                                            "primitive": { "type": "boolean" }
+                                            "primitive": { "type": "boolean" },
+                                            "styled": { "type": "string" }
                                         }
+                                    },
+                                    "encoding": {
+                                        "styled": { "style": "form" }
                                     }
                                 }
                             }
@@ -2464,22 +2741,37 @@ mod tests {
             .expect("body plan")
             .multipart_fields()
             .expect("multipart body");
+        // `styled` is an OAS 3.1 multipart field with an explicit `style`, so it resolves to the
+        // `Style` variant rather than `Content` and is skipped here (its cte is always `None`,
+        // and it has no part media to report); the other properties stay Content-based and are
+        // asserted below.
         let media31 = fields
             .iter()
-            .map(|field| {
-                let media = field.serialization.content_media().expect("content branch");
-                (media.values[0].as_str(), media.binary_upload)
+            .filter_map(|field| {
+                let cte = match &field.serialization {
+                    FieldSerializationPlan::Content {
+                        content_transfer_encoding,
+                        ..
+                    } => content_transfer_encoding.as_deref(),
+                    FieldSerializationPlan::Style { .. } => None,
+                };
+                let media = field.serialization.content_media()?;
+                Some((media.values[0].as_str(), media.binary_upload, cte))
             })
             .collect::<Vec<_>>();
         assert_eq!(
             media31,
             [
-                ("application/octet-stream", true),
-                ("application/octet-stream", true),
-                ("application/octet-stream", false),
-                ("application/json", false),
-                ("application/json", false),
-                ("text/plain", false),
+                ("application/octet-stream", true, None),
+                ("application/octet-stream", true, None),
+                // Schemaless 3.1 field with `contentEncoding`: the instance is the already-encoded
+                // string (OAS 3.1.1), so it is text (binary_upload=false) with the CTE surfaced,
+                // matching the typed `encoded` row below.
+                ("application/octet-stream", false, Some("binary")),
+                ("application/octet-stream", false, Some("binary")),
+                ("application/json", false, None),
+                ("application/json", false, None),
+                ("text/plain", false, None),
             ]
         );
 
@@ -2545,6 +2837,380 @@ mod tests {
             ]
         );
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    // Mirrors `BodyPlan::multipart_fields`: returns `None` for a non-urlencoded body so the `else`
+    // arm is covered by a plain `is_none` assertion rather than a pipeline-running should_panic
+    // test. Call sites `.expect` the Some.
+    fn urlencoded_fields(body: &BodyPlan) -> Option<&[FormFieldPlan]> {
+        if let BodyPlan::FormUrlencoded { fields, .. } = body {
+            Some(fields)
+        } else {
+            None
+        }
+    }
+
+    fn field_payloads(field: &FormFieldPlan) -> &[PayloadKind] {
+        &field
+            .serialization
+            .content_media()
+            .expect("content-based field")
+            .payloads
+    }
+
+    #[test]
+    fn urlencoded_content_fields_plan_payloads_and_ignore_headers() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/forms": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/x-www-form-urlencoded": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "profile": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "nickname": { "type": "string" },
+                                                    "age": { "type": "integer" }
+                                                }
+                                            },
+                                            "icon": { "type": "string", "contentEncoding": "base64url" },
+                                            "apiField": { "type": "object" },
+                                            "leaky": { "type": "string" }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "icon": { "contentType": "image/png, image/jpeg" },
+                                        "apiField": { "contentType": "application/vnd.api+json" },
+                                        "leaky": {
+                                            "contentType": "text/plain",
+                                            "headers": {
+                                                "Content-Transfer-Encoding": { "schema": { "type": "string" } }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let body = model.operations[0].body_plan.as_ref().expect("body plan");
+        let fields = urlencoded_fields(body).expect("form-urlencoded body");
+        let by_name = |name: &str| {
+            fields
+                .iter()
+                .find(|field| field.name == name)
+                .expect("field present")
+        };
+
+        // Object default → application/json → one JSON payload, unwrapped.
+        let profile = by_name("profile");
+        assert_eq!(field_payloads(profile), [PayloadKind::Json]);
+        assert!(!profile.wrapper.wrapped);
+        assert_eq!(profile.wrapper.headers, HeaderInputRequirement::None);
+
+        // OAS icon shape: two admitted media types → two text payloads, wrapped. Its base64url
+        // `contentEncoding` implies no CTE on a urlencoded (non-multipart) body — the plan carries
+        // `None`, never an inert `Some(...)`.
+        let icon = by_name("icon");
+        assert_eq!(field_payloads(icon), [PayloadKind::Text, PayloadKind::Text]);
+        assert!(icon.wrapper.wrapped);
+        assert!(matches!(
+            &icon.serialization,
+            FieldSerializationPlan::Content {
+                content_transfer_encoding: None,
+                ..
+            }
+        ));
+
+        // `+json` suffix classifies as JSON.
+        assert_eq!(field_payloads(by_name("apiField")), [PayloadKind::Json]);
+
+        // Encoding Object `headers` SHALL be ignored for non-multipart bodies, so the caller
+        // Content-Transfer-Encoding header must not wrap the field or add a headers member.
+        let leaky = by_name("leaky");
+        assert_eq!(field_payloads(leaky), [PayloadKind::Text]);
+        assert_eq!(leaky.wrapper.headers, HeaderInputRequirement::None);
+        assert!(!leaky.wrapper.wrapped);
+        assert!(matches!(
+            &leaky.serialization,
+            FieldSerializationPlan::Content { caller_headers, .. } if caller_headers.is_empty()
+        ));
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn urlencoded_array_fields_classify_payload_by_items() {
+        // A urlencoded array field under a non-JSON, non-text explicit media falls back to the
+        // schema shape, which for an array is decided by its (ref-resolved) items — mirroring
+        // `default_part_media`. Misclassifying an array-of-objects as `text` would emit
+        // `payloads: ["text"]` and blow up in `isParamValue` at runtime on every call.
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/forms": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/x-www-form-urlencoded": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "objs": { "type": "array", "items": { "type": "object", "properties": { "tag": { "type": "string" } } } },
+                                            "strs": { "type": "array", "items": { "type": "string" } },
+                                            "refs": { "type": "array", "items": { "$ref": "#/components/schemas/Thing" } },
+                                            "nested": { "type": "array", "items": { "type": "array", "items": { "type": "object" } } }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "objs": { "contentType": "application/octet-stream" },
+                                        "strs": { "contentType": "application/octet-stream" },
+                                        "refs": { "contentType": "application/octet-stream" },
+                                        "nested": { "contentType": "application/octet-stream" }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Thing": { "type": "object", "properties": { "id": { "type": "string" } } }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let fields = urlencoded_fields(model.operations[0].body_plan.as_ref().expect("body plan"))
+            .expect("form-urlencoded body");
+        let payloads = |name: &str| -> Vec<PayloadKind> {
+            field_payloads(
+                fields
+                    .iter()
+                    .find(|field| field.name == name)
+                    .expect("field"),
+            )
+            .to_vec()
+        };
+        assert_eq!(payloads("objs"), [PayloadKind::Json]);
+        assert_eq!(payloads("strs"), [PayloadKind::Text]);
+        assert_eq!(payloads("refs"), [PayloadKind::Json]);
+        assert_eq!(payloads("nested"), [PayloadKind::Json]);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn urlencoded_json_id_field_is_json_payload() {
+        // A string field with `contentType: application/json` is JSON-serialized (quotes kept on the
+        // wire), so the JSON media branch wins over the string schema shape.
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/forms": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/x-www-form-urlencoded": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": { "type": "string" }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "id": { "contentType": "application/json" }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let fields = urlencoded_fields(model.operations[0].body_plan.as_ref().expect("body plan"))
+            .expect("form-urlencoded body");
+        assert_eq!(field_payloads(&fields[0]), [PayloadKind::Json]);
+        assert!(!fields[0].wrapper.wrapped);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn urlencoded_content_flows_for_3_0() {
+        // The content path is version-agnostic: a 3.0 object field defaults to application/json.
+        let document = json!({
+            "openapi": "3.0.3",
+            "paths": {
+                "/forms": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/x-www-form-urlencoded": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "profile": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "nickname": { "type": "string" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let fields = urlencoded_fields(model.operations[0].body_plan.as_ref().expect("body plan"))
+            .expect("form-urlencoded body");
+        assert_eq!(field_payloads(&fields[0]), [PayloadKind::Json]);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn urlencoded_media_classifies_by_essence_not_full_value() {
+        // A parameterized `application/json; charset=utf-8` is JSON on the wire; keying on the full
+        // canonical value would fall through to the string schema fallback and ship the field
+        // unquoted (silent wire corruption). Essence classification routes it to JSON.
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/forms": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/x-www-form-urlencoded": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "jsonish": { "type": "string" },
+                                            "textish": { "type": "string" }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "jsonish": { "contentType": "application/json; charset=utf-8" },
+                                        "textish": { "contentType": "text/plain; charset=utf-8" }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let fields = urlencoded_fields(model.operations[0].body_plan.as_ref().expect("body plan"))
+            .expect("form-urlencoded body");
+        let payloads = |name: &str| -> &[PayloadKind] {
+            field_payloads(
+                fields
+                    .iter()
+                    .find(|field| field.name == name)
+                    .expect("field"),
+            )
+        };
+        assert_eq!(payloads("jsonish"), [PayloadKind::Json]);
+        assert_eq!(payloads("textish"), [PayloadKind::Text]);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn form_media_classifiers_survive_ref_cyclic_array_schemas() {
+        // A schema-position ref cycle through array items is accepted by the loader; the media
+        // classifiers must not recurse it until the stack overflows and aborts the host process
+        // (SIGABRT). Both a self-cycle (`Tree`) and a two-hop cycle (`A`↔`B`) are placed in a
+        // urlencoded and a multipart body — every classifier path is exercised. A revisit resolves
+        // to the terminal fallback, so classification stays deterministic.
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "schemas": {
+                    "Tree": { "type": "array", "items": { "$ref": "#/components/schemas/Tree" } },
+                    "A": { "type": "array", "items": { "$ref": "#/components/schemas/B" } },
+                    "B": { "type": "array", "items": { "$ref": "#/components/schemas/A" } }
+                }
+            },
+            "paths": {
+                "/forms": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/x-www-form-urlencoded": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "tree": { "$ref": "#/components/schemas/Tree" },
+                                            "pair": { "$ref": "#/components/schemas/A" }
+                                        }
+                                    }
+                                },
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "tree": { "$ref": "#/components/schemas/Tree" },
+                                            "pair": { "$ref": "#/components/schemas/A" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config, _sink) = analyzed_with_diagnostics(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        // Reaching this line without a stack overflow is the assertion; the arms classify
+        // deterministically via the terminal fallback.
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        assert!(model.operations[0].body_plan.is_some());
     }
 
     #[test]
@@ -2685,8 +3351,13 @@ mod tests {
             meta: test_meta("/unresolved"),
         };
         assert_eq!(
-            default_part_media(&unresolved, OasVersion::V3_1, &projector),
-            ("application/octet-stream".to_owned(), false)
+            default_part_media(
+                &unresolved,
+                OasVersion::V3_1,
+                &projector,
+                &mut HashSet::new()
+            ),
+            ("application/octet-stream", false)
         );
         let object_composition = SchemaNode::AllOf {
             branches: vec![
@@ -2703,8 +3374,13 @@ mod tests {
             meta: test_meta("/composition"),
         };
         assert_eq!(
-            default_part_media(&object_composition, OasVersion::V3_1, &projector),
-            ("application/json".to_owned(), false)
+            default_part_media(
+                &object_composition,
+                OasVersion::V3_1,
+                &projector,
+                &mut HashSet::new()
+            ),
+            ("application/json", false)
         );
 
         assert_eq!(response_status_name(&ResponseStatus::Default), "default");
@@ -3898,6 +4574,172 @@ mod tests {
                 .filter(|diagnostic| diagnostic.code == "OASTS1418")
                 .count(),
             5
+        );
+    }
+
+    #[test]
+    fn oxs1423_rejects_binary_urlencoded_field() {
+        // A urlencoded body is text-only, so a field whose default part media is binary (3.0
+        // format:binary, 3.1 schemaless) cannot be represented; a base64url string can and must not
+        // fire. An explicit `encoding.contentType` does not make a binary schema representable in a
+        // text format, so the check fires on both content paths — the `*Explicit` fields below carry
+        // one and must still be flagged.
+        let document30 = json!({
+            "openapi": "3.0.3",
+            "paths": {
+                "/forms": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/x-www-form-urlencoded": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "raw": { "type": "string", "format": "binary" },
+                                            "rawExplicit": { "type": "string", "format": "binary" }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "rawExplicit": { "contentType": "application/octet-stream" }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let document31 = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/forms": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/x-www-form-urlencoded": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "anything": {},
+                                            "encoded": { "type": "string", "contentEncoding": "base64url" },
+                                            "anythingExplicit": {},
+                                            "iconExplicit": { "type": "string", "contentEncoding": "base64url" },
+                                            "encodedExplicit": { "contentEncoding": "base64url" }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "anythingExplicit": { "contentType": "application/octet-stream" },
+                                        "iconExplicit": { "contentType": "image/png" },
+                                        "encodedExplicit": { "contentType": "image/png" }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+
+        let flagged = |document: &Value| -> Vec<Diagnostic> {
+            client_diagnostics(document)
+                .into_iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS1423")
+                .collect()
+        };
+        let names = |diagnostics: &[Diagnostic]| -> Vec<String> {
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect()
+        };
+        // 3.0 `raw` + `rawExplicit`, 3.1 `anything` + `anythingExplicit`. The base64url string
+        // fields (`encoded`, `iconExplicit`) and the schemaless-with-contentEncoding field
+        // (`encodedExplicit`, admitted via Fix 1) are representable and must not fire. Asserting the
+        // per-document counts and the exact flagged field names — not just the total — pins that the
+        // check fires on the right fields, not merely the right number.
+        let doc30 = flagged(&document30);
+        let doc31 = flagged(&document31);
+        assert_eq!(doc30.len(), 2);
+        assert_eq!(doc31.len(), 2);
+        assert!(
+            doc30
+                .iter()
+                .chain(&doc31)
+                .all(|diagnostic| diagnostic.severity == Severity::Error)
+        );
+        for (name, messages) in [
+            ("'raw'", names(&doc30)),
+            ("'rawExplicit'", names(&doc30)),
+            ("'anything'", names(&doc31)),
+            ("'anythingExplicit'", names(&doc31)),
+        ] {
+            assert!(
+                messages.iter().any(|message| message.contains(name)),
+                "missing {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn oxs1424_rejects_text_media_on_structured_urlencoded_field() {
+        // A urlencoded object (or array of objects) under a text media type has no wire
+        // representation: the form-explode serializer drops an object's field name and throws on an
+        // array of objects. Only structured shapes fire; a string under text/plain and an object
+        // under a media that classifies JSON are both representable and must not.
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/forms": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/x-www-form-urlencoded": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "obj": { "type": "object" },
+                                            "arr": { "type": "array", "items": { "type": "object" } },
+                                            "objOctet": { "type": "object" },
+                                            "str": { "type": "string" }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "obj": { "contentType": "text/plain" },
+                                        "arr": { "contentType": "text/plain" },
+                                        "objOctet": { "contentType": "application/octet-stream" },
+                                        "str": { "contentType": "text/plain" }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let flagged = client_diagnostics(&document)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1424")
+            .collect::<Vec<_>>();
+        // Only `obj` and `arr` are structured-under-text; `objOctet` classifies JSON and `str` is
+        // text-representable.
+        assert_eq!(flagged.len(), 2);
+        assert!(
+            flagged
+                .iter()
+                .all(|diagnostic| diagnostic.severity == Severity::Error)
+        );
+        assert!(
+            flagged
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("'obj'"))
+        );
+        assert!(
+            flagged
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("'arr'"))
         );
     }
 

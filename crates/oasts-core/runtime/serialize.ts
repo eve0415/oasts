@@ -311,7 +311,7 @@ export function checkCteDomain(
 //#endregion
 
 //#region oxs:helper:form-urlencoded-body
-export type UrlencodedField = {
+export type UrlencodedStyleField = {
   readonly name: string;
   readonly value: ParamValue;
   readonly style?: "form" | "spaceDelimited" | "pipeDelimited" | "deepObject";
@@ -319,11 +319,31 @@ export type UrlencodedField = {
   readonly allowReserved?: boolean;
 };
 
+// Discriminated by property presence (`"json" in field`) rather than a `kind` tag like every other
+// descriptor union: a tag string would ship in the descriptor bytes of every generated client, and
+// these urlencoded field descriptors are emitted per field. Size over the tagging convention, on
+// purpose. `UrlencodedFieldPlan` in transport.ts makes the same tradeoff (`"payloads" in`).
+export type UrlencodedField =
+  | UrlencodedStyleField
+  | {
+      readonly name: string;
+      readonly json: unknown;
+    };
+
 export function encodeFormUrlencodedBody(
   fields: readonly UrlencodedField[],
 ): string {
   return fields
     .map((field) => {
+      if ("json" in field) {
+        // OAS 3.1.1: urlencoded bodies serialize complex objects to a string (JSON) before RFC1866
+        // percent-encoding; JSON.stringify returns undefined for values it cannot represent.
+        const serialized = JSON.stringify(field.json);
+        if (serialized === undefined) {
+          throw new TypeError(`json form field ${field.name} is not serializable`);
+        }
+        return `${renderName(field.name)}=${encodeComponent(serialized, false)}`;
+      }
       const style = field.style ?? "form";
       const explode = field.explode ?? true;
       const allowReserved = field.allowReserved ?? false;

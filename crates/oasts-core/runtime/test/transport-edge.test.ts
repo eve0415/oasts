@@ -285,6 +285,54 @@ describe("descriptor boundary validation", () => {
     assert.equal(encoded, "required=present");
   });
 
+  test("validates content-based urlencoded wrappers, media, and payload kinds", async () => {
+    const wrapped: BodyPlan = {
+      kind: "form-urlencoded",
+      contentType: "application/x-www-form-urlencoded",
+      fields: [
+        {
+          name: "icon",
+          required: false,
+          payloads: ["text", "text"],
+          contentType: { kind: "selected", admitted: ["image/png", "image/jpeg"] },
+        },
+      ],
+    };
+    // A non-object wrapper is rejected; a contentType outside the admitted list does not select.
+    for (const value of [
+      { icon: "not a wrapper" },
+      { icon: { body: "x", contentType: "image/gif" } },
+    ]) {
+      assert.equal(
+        requestFailure(await requestEncode(wrapped, value)).error.kind,
+        "request-encode",
+      );
+    }
+
+    // A plan whose payloads list has no entry for the selected media type has no payload kind.
+    const missingKind: BodyPlan = {
+      kind: "form-urlencoded",
+      contentType: "application/x-www-form-urlencoded",
+      fields: [{ name: "x", required: false, payloads: [] }],
+    };
+    assert.equal(
+      requestFailure(await requestEncode(missingKind, { x: "v" })).error.kind,
+      "request-encode",
+    );
+
+    // A text payload requires a ParamValue, and a required content field cannot be missing.
+    const text: BodyPlan = {
+      kind: "form-urlencoded",
+      contentType: "application/x-www-form-urlencoded",
+      fields: [{ name: "note", required: true, payloads: ["text"] }],
+    };
+    assert.equal(
+      requestFailure(await requestEncode(text, { note: { deep: { x: 1 } } })).error.kind,
+      "request-encode",
+    );
+    assert.equal(requestFailure(await requestEncode(text, {})).error.kind, "request-encode");
+  });
+
   test("validates primitive top-level body plans", async () => {
     const cases: readonly (readonly [BodyPlan, unknown])[] = [
       [{ kind: "json", contentType: "application/json" }, undefined],

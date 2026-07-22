@@ -19,7 +19,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
-import { cases, type ConformanceCase } from "./vectors-validators-conformance.ts";
+import type { ConformanceCase } from "./vectors-validators-conformance.ts";
 
 type MatrixRow = { readonly keyword: string; readonly disposition: string };
 
@@ -218,14 +218,16 @@ if (generatedRoot === undefined || validatorsDir === undefined || !existsSync(va
   });
 
   const validators = await loadValidatorExports(validatorsDir);
-  const repoRoot = resolve(import.meta.dirname, "../../../..");
-  const matrixRows = parseMatrixRows(
-    readFileSync(join(repoRoot, "fixtures/validators-keyword-matrix.yaml"), "utf8"),
-  );
-  const knownRows = new Set(matrixRows.map((row) => row.keyword));
-  const exactRows = matrixRows
-    .filter((row) => row.disposition === "exact")
-    .map((row) => row.keyword);
+
+  // The vector set is fixture-selected: the default showcase set is scoped to the keyword matrix,
+  // while the readonly set targets the readOnly/writeOnly request/response validator split (a
+  // variance the showcase schemas never carry). The matrix-coverage self-checks below therefore
+  // apply only to the showcase set.
+  const fixture = process.env.OASTS_VALIDATORS_CONFORMANCE_FIXTURE ?? "showcase";
+  const cases: readonly ConformanceCase[] =
+    fixture === "readonly"
+      ? (await import("./vectors-validators-readonly-conformance.ts")).cases
+      : (await import("./vectors-validators-conformance.ts")).cases;
 
   for (const testCase of cases) {
     test(testCase.id, () => {
@@ -233,30 +235,41 @@ if (generatedRoot === undefined || validatorsDir === undefined || !existsSync(va
     });
   }
 
-  test("every conformance case names a real matrix row", () => {
-    for (const testCase of cases) {
-      assert.ok(
-        knownRows.has(testCase.matrixRow),
-        `case '${testCase.id}' references unknown matrix row '${testCase.matrixRow}'`,
-      );
-    }
-  });
-
-  test("every exact matrix row has at least one pass and one fail case", () => {
-    const passRows = new Set<string>();
-    const failRows = new Set<string>();
-    for (const testCase of cases) {
-      if (testCase.expected.verdict === "pass") {
-        passRows.add(testCase.matrixRow);
-      } else {
-        failRows.add(testCase.matrixRow);
-      }
-    }
-    const uncovered = exactRows.filter((row) => !passRows.has(row) || !failRows.has(row));
-    assert.deepStrictEqual(
-      uncovered,
-      [],
-      `exact matrix rows missing a pass and/or fail case: ${uncovered.join(", ")}`,
+  if (fixture === "showcase") {
+    const repoRoot = resolve(import.meta.dirname, "../../../..");
+    const matrixRows = parseMatrixRows(
+      readFileSync(join(repoRoot, "fixtures/validators-keyword-matrix.yaml"), "utf8"),
     );
-  });
+    const knownRows = new Set(matrixRows.map((row) => row.keyword));
+    const exactRows = matrixRows
+      .filter((row) => row.disposition === "exact")
+      .map((row) => row.keyword);
+
+    test("every conformance case names a real matrix row", () => {
+      for (const testCase of cases) {
+        assert.ok(
+          knownRows.has(testCase.matrixRow),
+          `case '${testCase.id}' references unknown matrix row '${testCase.matrixRow}'`,
+        );
+      }
+    });
+
+    test("every exact matrix row has at least one pass and one fail case", () => {
+      const passRows = new Set<string>();
+      const failRows = new Set<string>();
+      for (const testCase of cases) {
+        if (testCase.expected.verdict === "pass") {
+          passRows.add(testCase.matrixRow);
+        } else {
+          failRows.add(testCase.matrixRow);
+        }
+      }
+      const uncovered = exactRows.filter((row) => !passRows.has(row) || !failRows.has(row));
+      assert.deepStrictEqual(
+        uncovered,
+        [],
+        `exact matrix rows missing a pass and/or fail case: ${uncovered.join(", ")}`,
+      );
+    });
+  }
 }

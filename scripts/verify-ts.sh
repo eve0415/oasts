@@ -54,6 +54,7 @@ echo "compile-assert matrix ok: auth-showcase-3.1"
 validators_runs=(
   "validators-showcase-3.1 oasts.yaml"
   "validators-showcase-3.1 oasts-client.yaml"
+  "validators-readonly-3.1 oasts.yaml"
   "petstore-3.0 oasts-validators.yaml"
 )
 for run in "${validators_runs[@]}"; do
@@ -65,7 +66,17 @@ done
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/validators-validators-showcase-3.1-oasts/compile-assert/cases.ts"
 echo "compile-assert matrix ok: validators-showcase-3.1"
 
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/validators-validators-readonly-3.1-oasts/compile-assert/cases.ts"
+echo "compile-assert matrix ok: validators-readonly-3.1"
+
 OASTS_VALIDATORS_GENERATED_ROOT="$work/validators-validators-showcase-3.1-oasts/generated" node --test crates/oasts-core/runtime/test-conformance/
 echo "validators conformance ok: validators-showcase-3.1"
+
+# The showcase schemas carry no readOnly/writeOnly, so its vectors never execute the
+# request/response position-variant validators. Run the same harness against validators-readonly-3.1
+# with the readonly vector set to exercise them (the request variant accepting a body that the
+# neutral validator rejects is the exact bug this guards).
+OASTS_VALIDATORS_GENERATED_ROOT="$work/validators-validators-readonly-3.1-oasts/generated" OASTS_VALIDATORS_CONFORMANCE_FIXTURE=readonly node --test crates/oasts-core/runtime/test-conformance/
+echo "validators conformance ok: validators-readonly-3.1"
 
 node --test crates/oasts-core/runtime/test-e2e/

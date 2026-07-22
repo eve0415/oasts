@@ -30,6 +30,7 @@ type ExpectedMultipartPart = {
   readonly name: string;
   readonly filename?: string;
   readonly contentType: string;
+  readonly cte?: string;
   readonly payload: Uint8Array;
 };
 
@@ -102,7 +103,8 @@ function multipartExpectation(parts: readonly ExpectedMultipartPart[]): {
         ? `Content-Disposition: form-data; name="${part.name}"`
         : `Content-Disposition: form-data; name="${part.name}"; filename="${part.filename}"`;
     const prefix = index === 0 ? `--${boundary}\r\n` : `\r\n--${boundary}\r\n`;
-    const encapsulated = `${disposition}\r\nContent-Type: ${part.contentType}\r\n\r\n`;
+    const cteLine = part.cte === undefined ? "" : `\r\nContent-Transfer-Encoding: ${part.cte}`;
+    const encapsulated = `${disposition}\r\nContent-Type: ${part.contentType}${cteLine}\r\n\r\n`;
     assert.equal(encapsulated.includes(boundary), false);
     assert.equal(Buffer.from(part.payload).includes(Buffer.from(boundary)), false);
     body.push(Buffer.from(prefix + encapsulated), Buffer.from(part.payload));
@@ -769,6 +771,14 @@ test("multipart upload bytes follow the pinned boundary and body grammar", async
   const metadataPayload = Buffer.from('{"category":"demo"}');
   const titlePayload = Buffer.from(textPart.payloadAscii);
   const filePayload = Buffer.from(filePart.payloadAscii);
+  // RFC 2045 section 6.1: Content-Transfer-Encoding "binary" performs no
+  // encoding — body octets are transmitted exactly as they are, with no
+  // restriction on octet values or line length. OAS 3.1.1 treats a
+  // `{ type: string, contentEncoding: binary }` schema's instance value as
+  // the already-encoded wire string, so the expected part body is simply
+  // the UTF-8 bytes of that string, and the part gains a
+  // `Content-Transfer-Encoding: binary` header line.
+  const notePayload = Buffer.from("unencoded-note", "utf8");
   const expected = multipartExpectation([
     {
       name: "metadata",
@@ -782,6 +792,12 @@ test("multipart upload bytes follow the pinned boundary and body grammar", async
       contentType: filePart.contentType,
       payload: filePayload,
     },
+    {
+      name: "note",
+      contentType: "application/octet-stream",
+      cte: "binary",
+      payload: notePayload,
+    },
   ]);
   scriptRoute("POST", "/uploads", { status: 204 });
   await uploadShowcase(localTransport(), {
@@ -789,6 +805,7 @@ test("multipart upload bytes follow the pinned boundary and body grammar", async
       metadata: { body: { category: "demo" }, contentType: "application/json" },
       title: textPart.payloadAscii,
       file: new File([filePayload], filePart.filename, { type: filePart.contentType }),
+      note: "unencoded-note",
     },
   });
   const received = requiredRequest(0);
@@ -812,6 +829,37 @@ test("form-urlencoded body is byte-exact on the wire", async () => {
   scriptRoute("POST", "/forms", { status: 204 });
   await submitFormShowcase(localTransport(), {
     body: { name: "Ada Lovelace", labels: labels.value },
+  });
+  assert.equal(requiredRequest(0).body.toString("utf8"), expected);
+});
+
+test("form-urlencoded content fields serialize per Encoding Object", async () => {
+  // Content-based fields follow the OAS 3.1.1 Encoding Object default table and serialization rules.
+  // profile (object, default application/json): JSON.stringify in input-key order, then RFC1866
+  //   percent-encoding — `{"nickname":"Ada","age":36}` → %7B%22nickname%22%3A%22Ada%22%2C%22age%22%3A36%7D.
+  // icon (string + contentEncoding base64url, contentType image/png,image/jpeg): the selected
+  //   image/png routes to text; base64url is entirely RFC3986-unreserved, so "iVBORw0KGgo" passes
+  //   through with no surrounding %22 — proving text, not JSON, routing.
+  const labels = requiredStyleVector(
+    "form-urlencoded compact array",
+    (vector) =>
+      vector.location === "query" &&
+      vector.style === "form" &&
+      !vector.explode &&
+      Array.isArray(vector.value),
+  );
+  const expected =
+    `name=Ada%20Lovelace&${renamedStyleExpected(labels, "labels")}` +
+    "&profile=%7B%22nickname%22%3A%22Ada%22%2C%22age%22%3A36%7D" +
+    "&icon=iVBORw0KGgo";
+  scriptRoute("POST", "/forms", { status: 204 });
+  await submitFormShowcase(localTransport(), {
+    body: {
+      name: "Ada Lovelace",
+      labels: labels.value,
+      profile: { nickname: "Ada", age: 36 },
+      icon: { body: "iVBORw0KGgo", contentType: "image/png" },
+    },
   });
   assert.equal(requiredRequest(0).body.toString("utf8"), expected);
 });

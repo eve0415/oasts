@@ -1,0 +1,146 @@
+openapi: 3.1.0
+info:
+  title: Oasts readOnly/writeOnly validator variants
+  version: 1.0.0
+  description: >-
+    Exercises request/response validator variants end to end: a component with a
+    readOnly REQUIRED property and a writeOnly property referenced from both a
+    request body and a response, transitive variance across a $ref, a nested
+    inline readOnly, and an inline-branch allOf readOnly. No allOf branch is a
+    $ref anywhere, deliberately.
+paths:
+  /pets:
+    post:
+      operationId: createPet
+      summary: Create a pet directly by its component shape.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Pet'
+      responses:
+        '200':
+          description: The created pet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+  /envelope:
+    post:
+      operationId: wrapEnvelope
+      summary: Wrap a pet in an envelope that only references Pet.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Envelope'
+      responses:
+        '200':
+          description: The stored envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+  /catalog:
+    post:
+      operationId: putCatalog
+      summary: Store a catalog carrying a nested inline readOnly field.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Catalog'
+      responses:
+        '200':
+          description: The stored catalog.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Catalog'
+  /audit:
+    post:
+      operationId: recordAudit
+      summary: Record an audit whose record is an inline-branch allOf.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Audit'
+      responses:
+        '200':
+          description: The stored audit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Audit'
+components:
+  schemas:
+    Pet:
+      type: object
+      description: A pet with a server-assigned id and a write-only intake secret.
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+        secret:
+          type: string
+          writeOnly: true
+    Envelope:
+      type: object
+      description: >-
+        Carries a Pet with no marker of its own; its variants exist only because
+        Pet has them (transitive variance across the $ref).
+      required:
+        - pet
+      properties:
+        pet:
+          $ref: '#/components/schemas/Pet'
+        note:
+          type: string
+    Catalog:
+      type: object
+      description: A catalog whose readOnly/writeOnly markers live in a nested inline object.
+      required:
+        - title
+      properties:
+        title:
+          type: string
+        meta:
+          type: object
+          properties:
+            generatedAt:
+              type: string
+              format: date-time
+              readOnly: true
+            draft:
+              type: boolean
+              writeOnly: true
+    Audit:
+      type: object
+      description: An audit whose record is an allOf of two inline object branches.
+      required:
+        - record
+      properties:
+        record:
+          allOf:
+            - type: object
+              required:
+                - createdBy
+              properties:
+                createdBy:
+                  type: string
+                  readOnly: true
+            - type: object
+              properties:
+                reason:
+                  type: string

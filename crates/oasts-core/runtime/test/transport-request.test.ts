@@ -197,6 +197,95 @@ describe("request serialization and fetch contract", () => {
     assert.deepEqual(new Uint8Array(await requests[1].arrayBuffer()), bytes);
   });
 
+  test("serializes content-based urlencoded fields per selected payload kind", async () => {
+    const requests: Request[] = [];
+    const transport = createTransport({
+      fetch: async (request) => {
+        requests.push(request);
+        return new Response();
+      },
+    });
+
+    await execute(
+      transport,
+      operation({
+        method: "POST",
+        body: {
+          kind: "form-urlencoded",
+          contentType: "application/x-www-form-urlencoded",
+          fields: [
+            { name: "profile", required: false, payloads: ["json"] },
+            {
+              name: "icon",
+              required: false,
+              payloads: ["text", "text"],
+              contentType: { kind: "selected", admitted: ["image/png", "image/jpeg"] },
+            },
+            { name: "f", required: false, payloads: ["text"] },
+            { name: "n", required: false, payloads: ["text"] },
+          ],
+        },
+      }),
+      {
+        body: {
+          profile: { nickname: "Ada", age: 36 },
+          icon: { body: "iVBORw0KGgo", contentType: "image/png" },
+          f: ["a", "b"],
+          n: 5,
+        },
+      },
+    );
+
+    // profile → JSON: keys serialize in insertion order, then RFC1866 percent-encoding.
+    // icon → wrapped text: the base64url alphabet is RFC3986-unreserved, so the selected value
+    //   passes through with no surrounding %22 (proving text routing, not JSON quoting).
+    // f → text array: one form pair per item (regression guard against comma-joining).
+    // n → text number: rendered as the decimal string.
+    assert.equal(
+      await requests[0].text(),
+      "profile=%7B%22nickname%22%3A%22Ada%22%2C%22age%22%3A36%7D&icon=iVBORw0KGgo&f=a&f=b&n=5",
+    );
+  });
+
+  test("indexes payload kind by the selected media, not payloads[0]", async () => {
+    // Heterogeneous payloads (`["json", "text"]`) prove the selected media type indexes into
+    // `payloads`: reading `payloads[0]` for every selection would quote the text variant as JSON.
+    // Selecting text/plain (index 1) yields the bare value; selecting application/json (index 0)
+    // yields the `%22`-quoted JSON — byte-different, so a wrong index fails.
+    const requests: Request[] = [];
+    const transport = createTransport({
+      fetch: async (request) => {
+        requests.push(request);
+        return new Response();
+      },
+    });
+    const wrapped = operation({
+      method: "POST",
+      body: {
+        kind: "form-urlencoded",
+        contentType: "application/x-www-form-urlencoded",
+        fields: [
+          {
+            name: "data",
+            required: true,
+            payloads: ["json", "text"],
+            contentType: { kind: "selected", admitted: ["application/json", "text/plain"] },
+          },
+        ],
+      },
+    });
+
+    await execute(transport, wrapped, {
+      body: { data: { body: "hi", contentType: "text/plain" } },
+    });
+    await execute(transport, wrapped, {
+      body: { data: { body: "hi", contentType: "application/json" } },
+    });
+
+    assert.equal(await requests[0].text(), "data=hi");
+    assert.equal(await requests[1].text(), "data=%22hi%22");
+  });
+
   test("expands multipart wrappers and repeated fields in plan order", async () => {
     let captured: Request | undefined;
     const transport = createTransport({

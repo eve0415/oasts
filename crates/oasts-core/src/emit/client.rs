@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use crate::client_model::{
     AuthAlternative, AuthKind, AuthSchemeUse, BaseUrlPlan, BodyPlan, ClientModel, DecoderClass,
     FieldSerializationPlan, FormFieldPlan, HeaderInputRequirement, HelperId, OperationPlan,
-    PartMediaPlan, PayloadDisposition, ResponseMatchKind, ResponsePlan,
+    PartMediaPlan, PayloadDisposition, ResponseMatchKind, ResponsePlan, media_essence,
 };
 use crate::config::{
     AuthEnforcement, CacheMode, CredentialsMode, DocumentationConfig, FetchDefaults, RedirectMode,
@@ -1477,19 +1477,42 @@ fn write_body_descriptor(
                 output.push_str(&render_ts_string(&field.name));
                 output.push_str(", required: ");
                 output.push_str(if field.required { "true" } else { "false" });
-                if let FieldSerializationPlan::Style {
-                    style,
-                    explode,
-                    allow_reserved,
-                    ..
-                } = &field.serialization
-                {
-                    output.push_str(", style: ");
-                    output.push_str(&render_ts_string(style_name(*style)));
-                    output.push_str(", explode: ");
-                    output.push_str(if *explode { "true" } else { "false" });
-                    output.push_str(", allowReserved: ");
-                    output.push_str(if *allow_reserved { "true" } else { "false" });
+                match &field.serialization {
+                    FieldSerializationPlan::Style {
+                        style,
+                        explode,
+                        allow_reserved,
+                        ..
+                    } => {
+                        output.push_str(", style: ");
+                        output.push_str(&render_ts_string(style_name(*style)));
+                        output.push_str(", explode: ");
+                        output.push_str(if *explode { "true" } else { "false" });
+                        output.push_str(", allowReserved: ");
+                        output.push_str(if *allow_reserved { "true" } else { "false" });
+                    }
+                    FieldSerializationPlan::Content {
+                        media: part_media, ..
+                    } => {
+                        // A wrapped field carries the caller-selected media set; every content field
+                        // carries per-media payload kinds so the descriptor is self-describing and
+                        // never silently falls back to style serialization. The inner binding is the
+                        // field's `PartMediaPlan`, distinct from the outer body-level `media` string.
+                        if field.wrapper.wrapped {
+                            output.push_str(", contentType: ");
+                            write_selected_content_type(output, part_media);
+                        }
+                        output.push_str(", payloads: [");
+                        output.push_str(
+                            &part_media
+                                .payloads
+                                .iter()
+                                .map(|payload| render_ts_string(payload.as_str()))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                        output.push(']');
+                    }
                 }
                 output.push_str(" },\n");
             }
@@ -1518,6 +1541,22 @@ fn write_body_descriptor(
             output.push_str("] }");
         }
     }
+}
+
+/// Renders `{ kind: "selected", admitted: [...] }` — the descriptor for a wrapped field whose
+/// caller may pick any of `media`'s content types at call time. The urlencoded body descriptor's
+/// Content arm and the multipart field descriptor's wrapped arm both need this exact rendering.
+fn write_selected_content_type(output: &mut String, media: &PartMediaPlan) {
+    output.push_str("{ kind: \"selected\", admitted: [");
+    output.push_str(
+        &media
+            .values
+            .iter()
+            .map(|value| render_ts_string(value))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    output.push_str("] }");
 }
 
 fn write_simple_body(output: &mut String, kind: &str, media: &str) {
@@ -1559,16 +1598,7 @@ fn write_multipart_field(
     match &field.serialization {
         FieldSerializationPlan::Style { .. } => output.push_str("{ kind: \"none\" }"),
         FieldSerializationPlan::Content { media, .. } if field.wrapper.wrapped => {
-            output.push_str("{ kind: \"selected\", admitted: [");
-            output.push_str(
-                &media
-                    .values
-                    .iter()
-                    .map(|value| render_ts_string(value))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-            output.push_str("] }");
+            write_selected_content_type(output, media);
         }
         FieldSerializationPlan::Content { media, .. } => {
             output.push_str("{ kind: \"fixed\", value: ");
@@ -1630,7 +1660,19 @@ fn schema_is_array(
 
 fn field_payload(field: &FormFieldPlan) -> &'static str {
     match &field.serialization {
-        FieldSerializationPlan::Content { media, .. } => media_payload(media),
+        FieldSerializationPlan::Content {
+            media,
+            content_transfer_encoding,
+            ..
+        } => {
+            // Plan build never pairs binary_upload=true with a contentTransferEncoding, so the
+            // binary route below always flows back through media_payload's own leading check.
+            if content_transfer_encoding.is_some() {
+                "text"
+            } else {
+                media_payload(media)
+            }
+        }
         FieldSerializationPlan::Style { .. } => match &field.schema {
             SchemaNode::Primitive {
                 ty: PrimitiveType::String,
@@ -1657,9 +1699,10 @@ fn media_payload(media: &PartMediaPlan) -> &'static str {
         return "binary";
     }
     let value = media.values.first().map_or("", String::as_str);
-    if value == "application/json" || value.ends_with("+json") {
+    let essence = media_essence(value);
+    if essence == "application/json" || essence.ends_with("+json") {
         "json"
-    } else if value.starts_with("text/") {
+    } else if essence.starts_with("text/") {
         "text"
     } else {
         "binary"
@@ -1856,7 +1899,7 @@ mod tests {
 
     use super::*;
     use crate::client_model::{
-        CallerHeaderPlan, FieldWrapperPlan, ResponseMediaPlan, build_client_model,
+        CallerHeaderPlan, FieldWrapperPlan, PayloadKind, ResponseMediaPlan, build_client_model,
     };
     use crate::config::{ResolvedConfig, load_config_from_json};
     use crate::diag::{Diagnostic, DiagnosticSink};
@@ -2040,6 +2083,87 @@ mod tests {
     }
 
     #[test]
+    fn multipart_content_encoding_operation_module_snapshot() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/notes": {
+                    "post": {
+                        "operationId": "uploadNote",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["note"],
+                                        "properties": {
+                                            "note": { "type": "string", "contentEncoding": "binary" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "stored" } }
+                    }
+                }
+            }
+        });
+        let expected = format!(
+            "{HEADER}import type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteInput = {{\n  body: {{\n    note: string;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteResult =\n  | {{ kind: \"response\"; ok: true; match: \"204\"; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"204\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type UploadNoteCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadNote\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"notes\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"multipart\", fields: [\n    {{ name: \"note\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: false, cte: \"binary\" }},\n  ] }},\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function uploadNote<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<UploadNoteResult> {{\n  return execute<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function uploadNoteOrThrow<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<undefined> {{\n  return executeOrThrow<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n"
+        );
+        let (actual, diagnostics) = emit_operation(document, "uploadnote");
+        assert_eq!(actual, expected);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    /// A schemaless 3.1 multipart field with `contentEncoding` (no `type`) carries the already-
+    /// encoded string on the wire, so its descriptor mirrors the typed `{ type: string,
+    /// contentEncoding }` case: `payload: "text"`, `cte: "binary"`, and no `filename` (not a binary
+    /// upload). Without the honoring in `default_part_media`, a schemaless field would emit
+    /// `payload: "binary"` and a `Blob | File` input instead.
+    #[test]
+    fn schemaless_content_encoding_multipart_field_emits_text_payload() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/notes": {
+                    "post": {
+                        "operationId": "uploadNote",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["note"],
+                                        "properties": {
+                                            "note": { "contentEncoding": "binary" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "uploadnote");
+
+        assert!(actual.contains(
+            "{ name: \"note\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: { kind: \"fixed\", value: \"application/octet-stream\" }, filename: false, cte: \"binary\" }"
+        ));
+        // The schemaless field's input type is its schema shape (`unknown`), not the `Blob | File`
+        // a binary upload would demand.
+        assert!(actual.contains("note: unknown;"));
+        assert!(!actual.contains("Blob | File"));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
     fn content_discriminated_request_body_module_snapshot() {
         let document = json!({
             "openapi": "3.1.0",
@@ -2212,6 +2336,50 @@ mod tests {
             diagnostic.json_pointer.as_deref(),
             Some("/paths/~1items~1{id}/get/parameters/1")
         );
+    }
+
+    /// A multipart field with an explicit `style` (an OAS 3.1-only combination) resolves to
+    /// `FieldSerializationPlan::Style`; when its schema is an object, `field_payload` classifies
+    /// it the same as a JSON content field rather than falling back to `text`.
+    #[test]
+    fn styled_object_multipart_field_emits_json_payload() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/styled-object": {
+                    "post": {
+                        "operationId": "styledObjectField",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["meta"],
+                                        "properties": {
+                                            "meta": {
+                                                "type": "object",
+                                                "properties": { "tag": { "type": "string" } }
+                                            }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "meta": { "style": "form" }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "styledobjectfield");
+
+        assert!(actual.contains("payload: \"json\""));
+        assert!(actual.contains("contentType: { kind: \"none\" }"));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
     #[test]
@@ -2561,9 +2729,51 @@ mod tests {
         assert_eq!(
             media_payload(&PartMediaPlan {
                 values: vec!["application/cbor".to_owned()],
+                payloads: vec![PayloadKind::Binary],
                 all_concrete: true,
                 binary_upload: false,
                 declared: true,
+            }),
+            "binary"
+        );
+        // A parameterized media essence classifies by its base type: `application/json;
+        // charset=utf-8` is JSON, not the schema-shape fallback. A multipart content field carries
+        // this straight into the descriptor's `payload`.
+        let json_charset = PartMediaPlan {
+            values: vec!["application/json; charset=utf-8".to_owned()],
+            payloads: vec![PayloadKind::Json],
+            all_concrete: true,
+            binary_upload: false,
+            declared: true,
+        };
+        assert_eq!(media_payload(&json_charset), "json");
+        assert_eq!(
+            field_payload(&content_field(
+                "meta",
+                object_schema(),
+                json_charset,
+                Vec::new(),
+                FieldWrapperPlan {
+                    wrapped: false,
+                    content_type_literal: true,
+                    headers: HeaderInputRequirement::None,
+                    filename: false,
+                },
+                None,
+            )),
+            "json"
+        );
+        // `media_payload`'s leading `binary_upload` check is exercised directly here; it is also
+        // the route `field_payload` takes in production for a 3.0 `format: binary` field (no
+        // contentTransferEncoding: `field_payload` forwards straight into `media_payload`, whose
+        // own check applies).
+        assert_eq!(
+            media_payload(&PartMediaPlan {
+                values: vec!["application/octet-stream".to_owned()],
+                payloads: vec![PayloadKind::Binary],
+                all_concrete: true,
+                binary_upload: true,
+                declared: false,
             }),
             "binary"
         );
@@ -2843,6 +3053,7 @@ mod tests {
             items_ref.clone(),
             PartMediaPlan {
                 values: vec!["application/json".to_owned(), "application/cbor".to_owned()],
+                payloads: vec![PayloadKind::Json, PayloadKind::Text],
                 all_concrete: true,
                 binary_upload: false,
                 declared: true,
@@ -2861,6 +3072,7 @@ mod tests {
             string_schema(None),
             PartMediaPlan {
                 values: vec!["text/*".to_owned()],
+                payloads: vec![PayloadKind::Text],
                 all_concrete: false,
                 binary_upload: false,
                 declared: true,
@@ -2882,6 +3094,7 @@ mod tests {
             string_schema(Some("binary")),
             PartMediaPlan {
                 values: vec!["application/octet-stream".to_owned()],
+                payloads: vec![PayloadKind::Binary],
                 all_concrete: true,
                 binary_upload: true,
                 declared: false,
@@ -2900,6 +3113,7 @@ mod tests {
             string_schema(None),
             PartMediaPlan {
                 values: vec!["text/plain".to_owned()],
+                payloads: vec![PayloadKind::Text],
                 all_concrete: true,
                 binary_upload: false,
                 declared: true,
@@ -2913,6 +3127,25 @@ mod tests {
             },
             None,
         );
+        let encoded = content_field(
+            "encoded",
+            string_schema(None),
+            PartMediaPlan {
+                values: vec!["application/octet-stream".to_owned()],
+                payloads: vec![PayloadKind::Text],
+                all_concrete: true,
+                binary_upload: false,
+                declared: false,
+            },
+            Vec::new(),
+            FieldWrapperPlan {
+                wrapped: false,
+                content_type_literal: true,
+                headers: HeaderInputRequirement::None,
+                filename: false,
+            },
+            Some("binary"),
+        );
         let styled_object = style_field("styled", object_schema());
         let styled_binary = style_field("styledBinary", string_schema(Some("binary")));
         let styled_text = style_field("styledText", string_schema(None));
@@ -2921,6 +3154,7 @@ mod tests {
             wildcard.clone(),
             binary,
             empty_headers,
+            encoded,
             styled_object,
             styled_binary,
             styled_text,
@@ -2966,7 +3200,66 @@ mod tests {
                     "application/x-www-form-urlencoded".to_owned(),
                     BodyPlan::FormUrlencoded {
                         media: "application/x-www-form-urlencoded".to_owned(),
-                        fields: vec![style_field("form", string_schema(None))],
+                        fields: vec![
+                            content_field(
+                                "profile",
+                                object_schema(),
+                                PartMediaPlan {
+                                    values: vec!["application/json".to_owned()],
+                                    payloads: vec![PayloadKind::Json],
+                                    all_concrete: true,
+                                    binary_upload: false,
+                                    declared: false,
+                                },
+                                Vec::new(),
+                                FieldWrapperPlan {
+                                    wrapped: false,
+                                    content_type_literal: true,
+                                    headers: HeaderInputRequirement::None,
+                                    filename: false,
+                                },
+                                None,
+                            ),
+                            content_field(
+                                "icon",
+                                string_schema(None),
+                                PartMediaPlan {
+                                    values: vec!["image/png".to_owned(), "image/jpeg".to_owned()],
+                                    payloads: vec![PayloadKind::Text, PayloadKind::Text],
+                                    all_concrete: true,
+                                    binary_upload: false,
+                                    declared: true,
+                                },
+                                Vec::new(),
+                                FieldWrapperPlan {
+                                    wrapped: true,
+                                    content_type_literal: true,
+                                    headers: HeaderInputRequirement::None,
+                                    filename: false,
+                                },
+                                None,
+                            ),
+                            content_field(
+                                "raw",
+                                string_schema(Some("binary")),
+                                PartMediaPlan {
+                                    values: vec!["application/octet-stream".to_owned()],
+                                    payloads: vec![PayloadKind::Binary],
+                                    all_concrete: true,
+                                    binary_upload: true,
+                                    declared: false,
+                                },
+                                Vec::new(),
+                                FieldWrapperPlan {
+                                    wrapped: false,
+                                    content_type_literal: true,
+                                    headers: HeaderInputRequirement::None,
+                                    filename: false,
+                                },
+                                None,
+                            ),
+                            style_field("form", string_schema(None)),
+                        ],
                         source: SourceRef::default(),
                     },
                 ),
@@ -3011,6 +3304,7 @@ mod tests {
             assert!(input.contains("headers?:"));
             assert!(input.contains("filename?: string"));
             assert!(input.contains("Blob | File"));
+            assert!(input.contains("encoded: string"));
             let mut imports = BTreeMap::new();
             collect_body_imports(&renderer, &body, &mut imports);
             let mut import_text = String::new();
@@ -3025,6 +3319,20 @@ mod tests {
         assert!(descriptor.contains("payload: \"json\""));
         assert!(descriptor.contains("payload: \"binary\""));
         assert!(descriptor.contains("payload: \"text\""));
+        assert!(descriptor.contains(
+            "{ name: \"encoded\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: { kind: \"fixed\", value: \"application/octet-stream\" }, filename: false, cte: \"binary\" }"
+        ));
+        // Urlencoded content fields: unwrapped fixed-json emits payloads only; a wrapped selected
+        // field emits the admitted media list and per-media payload kinds; the Style arm is intact.
+        assert!(descriptor.contains("{ name: \"profile\", required: true, payloads: [\"json\"] }"));
+        assert!(descriptor.contains(
+            "contentType: { kind: \"selected\", admitted: [\"image/png\", \"image/jpeg\"]"
+        ));
+        assert!(descriptor.contains("payloads: [\"text\", \"text\"]"));
+        // An urlencoded field whose default media classifies as a binary upload (`PayloadKind::
+        // Binary`) still renders through the same `payloads` array as the other content kinds.
+        assert!(descriptor.contains("{ name: \"raw\", required: true, payloads: [\"binary\"] }"));
+        assert!(descriptor.contains("style: \"deepObject\""));
     }
 
     #[test]

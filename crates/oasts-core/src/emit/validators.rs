@@ -329,7 +329,14 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                     .model
                     .schema_target(&target.source_id, &target.json_pointer)
                 {
-                    self.line(&format!("validate{}({val}, {path}, {iss});", resolved.name));
+                    // Delegate to the referent's position variant: a request-position body must call
+                    // `validate{Name}Request`, which does not demand the `readOnly` properties the
+                    // request shape drops. `variant_name(Neutral)` is the bare name, so neutral bodies
+                    // are unaffected.
+                    self.line(&format!(
+                        "validate{}({val}, {path}, {iss});",
+                        resolved.variant_name(self.position)
+                    ));
                 }
                 // An unresolved reference is already reported as OASTS1305 by the types pass.
             }
@@ -1105,37 +1112,95 @@ fn emit_component(
     let file_base = model.component_files[schema_index].clone()?;
     let schema = &analyzed.ir.schemas[schema_index];
 
+    // A `readOnly`/`writeOnly` property somewhere in this component (or a component it references)
+    // makes the request and/or response shape diverge from the neutral one, so this component gains
+    // first-class Request/Response validator variants mirroring the type artifact. The flags were
+    // resolved across the whole reference graph at model construction.
+    let (request_differs, response_differs) = {
+        let target = model
+            .schema_target(&schema.source.source_id, &schema.source.json_pointer)
+            .expect("a component with an allocated file has a registered target");
+        (target.request_differs, target.response_differs)
+    };
+
     let mut scope = FileScope::default();
     let mut imports = SiblingImports::default();
 
-    // Phase 1: render the structural type and collect sibling imports through the shared emitter.
-    let type_declaration = {
-        let emitter = Emitter::new(model);
-        let mut declaration = String::new();
-        emitter.write_schema_declaration(
-            &mut declaration,
-            name,
-            &schema.schema,
-            TypePosition::Neutral,
-            &schema.source,
-        );
-        imports.collect(
-            &emitter,
-            &schema.schema,
-            TypePosition::Neutral,
-            Some(schema_index),
-        );
-        declaration
-    };
+    let declarations = if request_differs || response_differs {
+        // One full validator triplet per needed position. Fixed order — Neutral, then Request, then
+        // Response — keeps the emitted file deterministic. The variant export name matches the type
+        // artifact's `{name}Request`/`{name}Response` and `SchemaTarget::variant_name`, so a sibling
+        // that imports this component by its position variant resolves the same name.
+        let mut variants: Vec<(String, TypePosition)> = Vec::with_capacity(3);
+        variants.push((name.to_owned(), TypePosition::Neutral));
+        if request_differs {
+            variants.push((format!("{name}Request"), TypePosition::Request));
+        }
+        if response_differs {
+            variants.push((format!("{name}Response"), TypePosition::Response));
+        }
 
-    // Phase 2: generate the validate body (needs schema_target lookups; the emitter is dropped).
-    let mut body = FnBody::new(&mut scope, model, TypePosition::Neutral);
-    body.gen_schema(&schema.schema, "value", "path", "issues");
-    let validator = render_validator(name, &body.out);
-    let declarations = vec![Decl {
-        type_declaration,
-        validator,
-    }];
+        // Phase 1: render each variant's structural type and collect its sibling imports through the
+        // shared emitter, position by position — the position selects which properties survive.
+        let type_declarations: Vec<String> = {
+            let emitter = Emitter::new(model);
+            variants
+                .iter()
+                .map(|(export, position)| {
+                    let mut declaration = String::new();
+                    emitter.write_schema_declaration(
+                        &mut declaration,
+                        export,
+                        &schema.schema,
+                        *position,
+                        &schema.source,
+                    );
+                    imports.collect(&emitter, &schema.schema, *position, Some(schema_index));
+                    declaration
+                })
+                .collect()
+        };
+
+        // Phase 2: generate each variant's validate body (needs schema_target lookups through a
+        // dropped emitter); the position drives which properties the body checks.
+        let mut declarations = Vec::with_capacity(variants.len());
+        for ((export, position), type_declaration) in variants.iter().zip(type_declarations) {
+            let mut body = FnBody::new(&mut scope, model, *position);
+            body.gen_schema(&schema.schema, "value", "path", "issues");
+            declarations.push(Decl {
+                type_declaration,
+                validator: render_validator(export, &body.out),
+            });
+        }
+        declarations
+    } else {
+        // Neutral-only common case: a single declaration, allocation-identical to a marker-free
+        // component before variants existed (the drift gate pins this shape).
+        let type_declaration = {
+            let emitter = Emitter::new(model);
+            let mut declaration = String::new();
+            emitter.write_schema_declaration(
+                &mut declaration,
+                name,
+                &schema.schema,
+                TypePosition::Neutral,
+                &schema.source,
+            );
+            imports.collect(
+                &emitter,
+                &schema.schema,
+                TypePosition::Neutral,
+                Some(schema_index),
+            );
+            declaration
+        };
+        let mut body = FnBody::new(&mut scope, model, TypePosition::Neutral);
+        body.gen_schema(&schema.schema, "value", "path", "issues");
+        vec![Decl {
+            type_declaration,
+            validator: render_validator(name, &body.out),
+        }]
+    };
 
     let content = assemble_file(model, "./", &imports, &scope, &declarations);
     let relative_path = format!("validators/components/{file_base}.ts");
@@ -1330,8 +1395,13 @@ impl SiblingImports {
                 return;
             }
             let entry = self.files.entry(target.file_base.clone()).or_default();
+            // Both the type name and the validate name resolve through the position variant, so the
+            // import matches the name the body calls and the export the component actually emits —
+            // `variant_name(Neutral)` is the bare name, leaving neutral imports unchanged.
             entry.0.insert(target.variant_name(position));
-            entry.1.insert(format!("validate{}", target.name));
+            entry
+                .1
+                .insert(format!("validate{}", target.variant_name(position)));
         });
     }
 }
@@ -2286,6 +2356,134 @@ mod tests {
             .clone()
     }
 
+    /// The reported bug: a `$ref` from a request body must delegate to the referent's Request-variant
+    /// validator, not the Neutral one, which would demand a `readOnly` property the request type
+    /// dropped. Symmetrically, a `$ref` from a response delegates to the Response variant.
+    #[test]
+    fn request_body_ref_calls_request_validator() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/pets": {
+                    "post": {
+                        "operationId": "createPet",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/Pet" }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": "#/components/schemas/Pet" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Pet": {
+                        "type": "object",
+                        "required": ["id"],
+                        "properties": {
+                            "id": { "type": "string", "readOnly": true },
+                            "secret": { "type": "string", "writeOnly": true }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document);
+        assert_clean(&diagnostics);
+        let content = operation(&files, "createpet");
+        // Request body position delegates to the Request variant; response to the Response variant.
+        assert!(
+            content.contains("validatePetRequest(value, path, issues);"),
+            "{content}"
+        );
+        assert!(
+            content.contains("validatePetResponse(value, path, issues);"),
+            "{content}"
+        );
+        // The Neutral validator is never called from a positioned body.
+        assert!(
+            !content.contains("validatePet(value, path, issues);"),
+            "{content}"
+        );
+    }
+
+    /// The value import must name the same position variant the body calls: the request body calls
+    /// `validatePetRequest`, so it must be imported. The type name was already position-aware. The
+    /// component (writeOnly-free) has no Response variant, so nothing Response-shaped is imported —
+    /// importing a name the component file does not export would be a TS2305 cross-file error.
+    #[test]
+    fn operation_imports_request_variant() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/pets": {
+                    "post": {
+                        "operationId": "createPet",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/Pet" }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": "#/components/schemas/Pet" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Pet": {
+                        "type": "object",
+                        "required": ["id"],
+                        "properties": {
+                            "id": { "type": "string", "readOnly": true },
+                            "name": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document);
+        assert_clean(&diagnostics);
+        let content = operation(&files, "createpet");
+        let import_line = content
+            .lines()
+            .find(|line| line.contains("components/pet"))
+            .expect("Pet component import line");
+        // Both the Neutral type (response position, which does not differ) and the Request variant.
+        assert!(import_line.contains("type Pet,"), "{import_line}");
+        assert!(import_line.contains("type PetRequest"), "{import_line}");
+        // The value import names the Request variant the request body calls.
+        assert!(import_line.contains("validatePetRequest"), "{import_line}");
+        // No Response variant exists on this component, so none is imported.
+        assert!(!import_line.contains("Response"), "{import_line}");
+    }
+
     #[test]
     fn operations_emit_per_parameter_body_and_response_validators() {
         let document = json!({
@@ -2883,5 +3081,129 @@ mod tests {
         assert!(content.contains("const value0: unknown = value[1];"));
         // The free-form rest schema emits no trailing-element loop.
         assert!(!content.contains("for (let index"));
+    }
+
+    /// A component whose request shape drops a `readOnly` property emits a full Request-variant
+    /// validator triplet (type + validate + checked + const) alongside the Neutral one, and the
+    /// Request body omits the dropped property's check. Without this, a `$ref` from a request body
+    /// would call the Neutral validator, which demands a property the request type does not carry.
+    #[test]
+    fn component_emits_request_variant_validator() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Pet": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                    "id": { "type": "string", "readOnly": true },
+                    "name": { "type": "string" }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "pet");
+        // The full Request-variant triplet.
+        assert!(
+            content.contains("export interface PetRequest {"),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "export function validatePetRequest(value: unknown, path: readonly (string | number)[], issues: Issue[]): void {"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "function checkedPetRequest(value: unknown, issues: Issue[]): value is PetRequest {"
+            ),
+            "{content}"
+        );
+        assert!(
+            content
+                .contains("export const petRequestValidator: SyncStandardSchemaV1<PetRequest> = {"),
+            "{content}"
+        );
+        // The Neutral validator is still emitted.
+        assert!(
+            content.contains("export function validatePet("),
+            "{content}"
+        );
+        // No spurious Response variant — nothing is writeOnly.
+        assert!(!content.contains("PetResponse"), "{content}");
+        // The Neutral body checks `id`; the Request body drops it.
+        let neutral_body = validate_body(&content, "validatePet");
+        assert!(neutral_body.contains("\"id\""), "neutral: {neutral_body}");
+        let request_body = validate_body(&content, "validatePetRequest");
+        assert!(
+            !request_body.contains("\"id\""),
+            "request body must not check the dropped readOnly property: {request_body}"
+        );
+    }
+
+    /// The Response variant is symmetric: a `writeOnly` property is dropped from the response shape,
+    /// so the Response validator omits its check.
+    #[test]
+    fn component_emits_response_variant_validator() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "secret": { "type": "string", "writeOnly": true },
+                    "name": { "type": "string" }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "pet");
+        assert!(
+            content.contains("export interface PetResponse {"),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "export function validatePetResponse(value: unknown, path: readonly (string | number)[], issues: Issue[]): void {"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("function checkedPetResponse(value: unknown, issues: Issue[]): value is PetResponse {"),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "export const petResponseValidator: SyncStandardSchemaV1<PetResponse> = {"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function validatePet("),
+            "{content}"
+        );
+        assert!(!content.contains("PetRequest"), "{content}");
+        let neutral_body = validate_body(&content, "validatePet");
+        assert!(
+            neutral_body.contains("\"secret\""),
+            "neutral: {neutral_body}"
+        );
+        let response_body = validate_body(&content, "validatePetResponse");
+        assert!(
+            !response_body.contains("\"secret\""),
+            "response body must not check the dropped writeOnly property: {response_body}"
+        );
+    }
+
+    /// Returns the `validate{Name}` function body region of `content` — the slice between its
+    /// `export function validate{Name}(` header and the following `function checked{Name}(` — so an
+    /// assertion targets one variant's body without matching sibling validators in the same file.
+    fn validate_body<'a>(content: &'a str, validate_name: &str) -> &'a str {
+        let after = content
+            .split_once(&format!("export function {validate_name}("))
+            .expect("validate function present")
+            .1;
+        let checked_name = validate_name.replacen("validate", "checked", 1);
+        after
+            .split_once(&format!("function {checked_name}("))
+            .expect("checked function present")
+            .0
     }
 }

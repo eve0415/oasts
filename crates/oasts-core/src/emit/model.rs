@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::config::ResolvedConfig;
 use crate::diag::DiagnosticSink;
-use crate::ir::SourceRef;
+use crate::ir::{AdditionalProperties, SchemaNode, SourceRef, TupleRest};
 use crate::semantic::Analyzed;
 
 use super::{
-    CODE_FILE_NAME, CODE_PATH_COLLISION, file_base_name, shape_variants, source_diagnostic,
+    CODE_FILE_NAME, CODE_PATH_COLLISION, CODE_VARIANT_COLLISION, file_base_name, shape_variants,
+    source_diagnostic,
 };
 
 #[derive(Clone, Debug)]
@@ -48,7 +49,206 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             sink,
         };
         model.allocate_paths();
+        model.resolve_variant_shapes();
         model
+    }
+
+    /// Propagates request/response variance across the component reference graph to a fixpoint.
+    ///
+    /// `shape_variants` decides variance from each component's own inline structure but stops at a
+    /// `$ref` — a graph edge, not crossed there. A component with no local read/write-only marker
+    /// still needs a variant when it references one that does: in that position its rendering names
+    /// the referent's variant type, so the neutral and variant renderings diverge. This pass closes
+    /// that gap. It seeds each component's flags from `shape_variants`, then repeatedly ORs a
+    /// referent's flags into every referrer until nothing changes. Monotone false->true, so the
+    /// fixpoint is order-independent and deterministic regardless of graph shape or cycles.
+    ///
+    /// Fast-reject: with no marker set anywhere, no variance can propagate, so the pass returns
+    /// before allocating any working buffer — the common marker-free input stays zero-heap, matching
+    /// the pre-pass allocation profile the drift gate pins.
+    fn resolve_variant_shapes(&mut self) {
+        let any_variance = self.schema_targets.values().any(|by_pointer| {
+            by_pointer
+                .values()
+                .any(|target| target.request_differs || target.response_differs)
+        });
+        if !any_variance {
+            return;
+        }
+
+        let count = self.analyzed.ir.schemas.len();
+        let mut request = vec![false; count];
+        let mut response = vec![false; count];
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for allocated in &self.analyzed.schema_names {
+            let index = allocated.schema_index;
+            let schema = &self.analyzed.ir.schemas[index];
+            let Some(target) =
+                self.schema_target(&schema.source.source_id, &schema.source.json_pointer)
+            else {
+                continue;
+            };
+            request[index] = target.request_differs;
+            response[index] = target.response_differs;
+            let mut referenced = Vec::new();
+            self.collect_ref_edges(&schema.schema, &mut referenced);
+            referenced.sort_unstable();
+            referenced.dedup();
+            edges[index] = referenced;
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for source in 0..count {
+                for &referent in &edges[source] {
+                    if request[referent] && !request[source] {
+                        request[source] = true;
+                        changed = true;
+                    }
+                    if response[referent] && !response[source] {
+                        response[source] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // `self.analyzed` is a Copy `&'input` reference, so writing back through it borrows the
+        // schema names disjointly from `self.schema_targets` — no cached key vector is needed to
+        // separate the read from the `get_mut`.
+        let analyzed = self.analyzed;
+        for allocated in &analyzed.schema_names {
+            let index = allocated.schema_index;
+            let source = &analyzed.ir.schemas[index].source;
+            if let Some(target) = self
+                .schema_targets
+                .get_mut(&source.source_id)
+                .and_then(|by_pointer| by_pointer.get_mut(&source.json_pointer))
+            {
+                target.request_differs = request[index];
+                target.response_differs = response[index];
+            }
+        }
+
+        self.detect_variant_collisions();
+    }
+
+    /// Rejects a generated `{Name}Request`/`{Name}Response` variant name that collides with a
+    /// component's own exported type name: both would import the same identifier from different
+    /// files, a load-time SyntaxError/TS2300 the semantic-stage exact-collision check (which runs
+    /// before variance is resolved) structurally cannot see.
+    ///
+    /// Reached only after the fast-reject above returns for variance-free input, so a document with
+    /// no read/write-only marker never runs this and stays allocation-identical (the allocs gate
+    /// pins committed fixtures, several of which carry variance). `schema_targets` is keyed by
+    /// source_id/json_pointer, not name, so resolving a suffix-stripped prefix against it directly
+    /// would mean a linear scan per suffixed component — O(suffixed components x all components).
+    /// Instead this builds one `name -> target` index up front (deterministic first-wins insertion,
+    /// walking `schema_names` in order so a duplicate-name input — already erroring elsewhere via
+    /// the semantic-stage exact-collision check — still indexes deterministically) and resolves
+    /// every suffix-strip against it in O(1), keeping the whole pass O(N). Two variant names can
+    /// never collide with each other (that needs equal base names, which the exact-collision check
+    /// already blocks), so a variant-vs-base scan against the index is complete.
+    ///
+    /// `schema_names` order fixes diagnostic order; one diagnostic per collision.
+    fn detect_variant_collisions(&mut self) {
+        let mut by_name: HashMap<&str, &SchemaTarget> = HashMap::new();
+        for allocated in &self.analyzed.schema_names {
+            let schema = &self.analyzed.ir.schemas[allocated.schema_index];
+            if let Some(target) =
+                self.schema_target(&schema.source.source_id, &schema.source.json_pointer)
+            {
+                by_name.entry(target.name.as_str()).or_insert(target);
+            }
+        }
+
+        let mut diagnostics = Vec::new();
+        for allocated in &self.analyzed.schema_names {
+            let schema = &self.analyzed.ir.schemas[allocated.schema_index];
+            let Some(shadowed) =
+                self.schema_target(&schema.source.source_id, &schema.source.json_pointer)
+            else {
+                continue;
+            };
+            for (suffix, request) in [("Request", true), ("Response", false)] {
+                let Some(prefix) = shadowed.name.strip_suffix(suffix) else {
+                    continue;
+                };
+                let owner = by_name.get(prefix).copied().filter(|candidate| {
+                    if request {
+                        candidate.request_differs
+                    } else {
+                        candidate.response_differs
+                    }
+                });
+                if let Some(owner) = owner {
+                    let source = &self.analyzed.ir.schemas[owner.index].source;
+                    diagnostics.push(source_diagnostic(
+                        CODE_VARIANT_COLLISION,
+                        format!(
+                            "generated variant name '{shadowed}' for component '{owner}' collides with component '{shadowed}'; rename one with naming.overrides",
+                            shadowed = shadowed.name,
+                            owner = owner.name,
+                        ),
+                        source,
+                    ));
+                }
+            }
+        }
+        for diagnostic in diagnostics {
+            self.sink.push(diagnostic);
+        }
+    }
+
+    /// Records the target index of every component `$ref` reachable from `schema` through the same
+    /// inline structure `shape_variants` walks. A `$ref` is terminal here — it records the edge and
+    /// stops; the referent's own edges are collected when it is visited as a source. Stack-only.
+    fn collect_ref_edges(&self, schema: &SchemaNode, edges: &mut Vec<usize>) {
+        match schema {
+            SchemaNode::Ref { target, .. } => {
+                if let Some(target) = self.schema_target(&target.source_id, &target.json_pointer) {
+                    edges.push(target.index);
+                }
+            }
+            SchemaNode::Object {
+                properties,
+                additional_properties,
+                ..
+            } => {
+                for (_, property, _) in properties {
+                    self.collect_ref_edges(property, edges);
+                }
+                if let AdditionalProperties::Allowed(Some(schema))
+                | AdditionalProperties::Schema(schema) = additional_properties
+                {
+                    self.collect_ref_edges(schema, edges);
+                }
+            }
+            SchemaNode::Array { items, .. } => self.collect_ref_edges(items, edges),
+            SchemaNode::Tuple {
+                prefix_items, rest, ..
+            } => {
+                for item in prefix_items {
+                    self.collect_ref_edges(item, edges);
+                }
+                if let TupleRest::Schema(schema) = rest {
+                    self.collect_ref_edges(schema, edges);
+                }
+            }
+            SchemaNode::AllOf { branches, .. }
+            | SchemaNode::AnyOf { branches, .. }
+            | SchemaNode::OneOf { branches, .. } => {
+                for branch in branches {
+                    self.collect_ref_edges(branch, edges);
+                }
+            }
+            SchemaNode::Primitive { .. }
+            | SchemaNode::Finite { .. }
+            | SchemaNode::Any { .. }
+            | SchemaNode::Never { .. }
+            | SchemaNode::Unknown { .. } => {}
+        }
     }
 
     fn allocate_paths(&mut self) {
@@ -182,5 +382,408 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         }
         output.push('\n');
         output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::config::load_config;
+    use crate::emit::source_digest;
+    use crate::ir::{SchemaMeta, SchemaRef};
+    use crate::loader::load_graph;
+    use crate::parse::parse;
+    use crate::semantic::analyze;
+
+    /// Runs the pipeline through analysis (config load, graph load, parse, semantic analyze) for
+    /// an inline `components.schemas` document, stopping short of `EmissionModel::new` so each
+    /// caller can construct its own model against its own `DiagnosticSink` — the model-affecting
+    /// diagnostics (e.g. OASTS1306 variant collisions) only exist after that call, so a shared sink
+    /// here would either hide them from `variant_collisions` or leak unrelated pipeline warnings
+    /// into it. Returns the owned outputs a caller needs for that call: the `TempDir` (kept alive
+    /// so the config's relative `input.path` still resolves), the resolved config, the analyzed
+    /// IR, and the source digest.
+    fn build_model_inputs(schemas: Value) -> (TempDir, ResolvedConfig, Analyzed, String) {
+        let temp = TempDir::new().expect("temp directory");
+        let input = temp.path().join("openapi.json");
+        let config_path = temp.path().join("oasts.json");
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "components": { "schemas": schemas }
+        });
+        fs::write(
+            &input,
+            serde_json::to_vec(&document).expect("document JSON"),
+        )
+        .expect("write document");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "./openapi.json" },
+            "output": "./generated"
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&config).expect("config JSON"),
+        )
+        .expect("write config");
+        let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let mut sink = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let ir = parse(&graph, &mut sink).expect("input parses");
+        let analyzed = analyze(ir, &resolved, &mut sink);
+        let digest = source_digest(&graph.source_tuples());
+        (temp, resolved, analyzed, digest)
+    }
+
+    /// Looks up the `SchemaTarget` allocated for the component named `name`. `schema_targets` is
+    /// keyed by source_id/json_pointer, not name, so every by-name lookup in this module's tests
+    /// scans the same way.
+    fn find_target<'a>(model: &'a EmissionModel<'_, '_>, name: &str) -> &'a SchemaTarget {
+        model
+            .schema_targets
+            .values()
+            .flat_map(|by_pointer| by_pointer.values())
+            .find(|target| target.name == name)
+            .expect("component target present")
+    }
+
+    /// Runs the pipeline through model construction and returns the resolved
+    /// `(request_differs, response_differs)` flags for the component whose allocated name is
+    /// `component`. The flags are what every emitter reads to decide whether to emit variants.
+    fn variant_flags(schemas: Value, component: &str) -> (bool, bool) {
+        let (_temp, resolved, analyzed, digest) = build_model_inputs(schemas);
+        let mut sink = DiagnosticSink::new();
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        let target = find_target(&model, component);
+        (target.request_differs, target.response_differs)
+    }
+
+    /// A component with no direct read/write-only marker still needs a Request variant when it
+    /// references a component that does: its request-position rendering names the referent's
+    /// variant, so the two positions diverge.
+    #[test]
+    fn ref_transitivity_request() {
+        let schemas = json!({
+            "Envelope": {
+                "type": "object",
+                "properties": { "pet": { "$ref": "#/components/schemas/Pet" } }
+            },
+            "Pet": {
+                "type": "object",
+                "required": ["id"],
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            }
+        });
+        assert_eq!(variant_flags(schemas.clone(), "Pet"), (true, false));
+        assert_eq!(variant_flags(schemas, "Envelope"), (true, false));
+    }
+
+    /// Variance flows the full length of a `A -> B -> Pet` reference chain, not just one hop.
+    #[test]
+    fn ref_transitivity_two_hop() {
+        let schemas = json!({
+            "A": {
+                "type": "object",
+                "properties": { "b": { "$ref": "#/components/schemas/B" } }
+            },
+            "B": {
+                "type": "object",
+                "properties": { "pet": { "$ref": "#/components/schemas/Pet" } }
+            },
+            "Pet": {
+                "type": "object",
+                "required": ["id"],
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            }
+        });
+        assert_eq!(variant_flags(schemas.clone(), "A"), (true, false));
+        assert_eq!(variant_flags(schemas.clone(), "B"), (true, false));
+        assert_eq!(variant_flags(schemas, "Pet"), (true, false));
+    }
+
+    /// Response variance propagates independently of request variance: a `writeOnly` referent forces
+    /// only the Response variant up the chain.
+    #[test]
+    fn ref_transitivity_response() {
+        let schemas = json!({
+            "Envelope": {
+                "type": "object",
+                "properties": { "pet": { "$ref": "#/components/schemas/Pet" } }
+            },
+            "Pet": {
+                "type": "object",
+                "properties": { "secret": { "type": "string", "writeOnly": true } }
+            }
+        });
+        assert_eq!(variant_flags(schemas.clone(), "Pet"), (false, true));
+        assert_eq!(variant_flags(schemas, "Envelope"), (false, true));
+    }
+
+    /// A reference graph with no read/write-only marker anywhere resolves to no variants — the
+    /// fast-reject path that keeps the pass zero-heap for the common case.
+    #[test]
+    fn fixpoint_no_differs_skips() {
+        let schemas = json!({
+            "A": {
+                "type": "object",
+                "properties": { "b": { "$ref": "#/components/schemas/B" } }
+            },
+            "B": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } }
+            }
+        });
+        assert_eq!(variant_flags(schemas.clone(), "A"), (false, false));
+        assert_eq!(variant_flags(schemas, "B"), (false, false));
+    }
+
+    /// A component whose generated file name is invalid (a Windows reserved device name) never
+    /// gets a `SchemaTarget`, so the fixpoint's seeding loop skips it via `continue` rather than
+    /// panicking on the missing lookup; every resolvable component's flags are unaffected.
+    #[test]
+    fn unresolvable_schema_target_skipped_in_fixpoint() {
+        let schemas = json!({
+            "CON": { "type": "string" },
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            }
+        });
+        assert_eq!(variant_flags(schemas, "Pet"), (true, false));
+    }
+
+    /// Variance flows through a `$ref` reached via `additionalProperties` holding a schema (not a
+    /// bare `true`/`false`), matching the renderer, which inlines the same map-value schema.
+    #[test]
+    fn ref_transitivity_through_additional_properties_schema() {
+        let schemas = json!({
+            "Registry": {
+                "type": "object",
+                "additionalProperties": { "$ref": "#/components/schemas/Pet" }
+            },
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            }
+        });
+        assert_eq!(variant_flags(schemas, "Registry"), (true, false));
+    }
+
+    /// Variance flows through a `$ref` reached via a tuple's rest-item schema (`items` alongside
+    /// `prefixItems`), matching the renderer, which inlines the same schema for elements beyond
+    /// the fixed prefix.
+    #[test]
+    fn ref_transitivity_through_tuple_rest() {
+        let schemas = json!({
+            "Coords": {
+                "type": "array",
+                "prefixItems": [{ "type": "number" }],
+                "items": { "$ref": "#/components/schemas/Pet" }
+            },
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            }
+        });
+        assert_eq!(variant_flags(schemas, "Coords"), (true, false));
+    }
+
+    /// Variance flows through a `$ref` reached via an `anyOf` or `oneOf` branch, matching the
+    /// renderer, which inlines each branch.
+    #[test]
+    fn ref_transitivity_through_any_of_and_one_of() {
+        let schemas = json!({
+            "AnyOfComponent": {
+                "anyOf": [
+                    { "$ref": "#/components/schemas/Pet" },
+                    { "type": "string" }
+                ]
+            },
+            "OneOfComponent": {
+                "oneOf": [
+                    { "$ref": "#/components/schemas/Pet" },
+                    { "type": "string" }
+                ]
+            },
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            }
+        });
+        assert_eq!(
+            variant_flags(schemas.clone(), "AnyOfComponent"),
+            (true, false)
+        );
+        assert_eq!(variant_flags(schemas, "OneOfComponent"), (true, false));
+    }
+
+    /// `additionalProperties: <schema>` from real input always parses to `AdditionalProperties::
+    /// Schema` (see `parse::mod`'s `additionalProperties` handling); `Allowed(Some(schema))` is a
+    /// construction-only variant no parser path ever emits, but `collect_ref_edges` treats it
+    /// identically via the shared match arm. A document-based test can never reach it through
+    /// parsing, so it is exercised directly against a hand-built schema, the same way
+    /// `semantic.rs`'s own enum-traversal test covers the same variant for its own consumer.
+    #[test]
+    fn collect_ref_edges_treats_allowed_some_like_schema() {
+        let (_temp, resolved, analyzed, digest) = build_model_inputs(json!({
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            }
+        }));
+        let mut sink = DiagnosticSink::new();
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+
+        let source_id = analyzed.ir.schemas[0].source.source_id.clone();
+        let pet_ref = SchemaNode::Ref {
+            target: SchemaRef {
+                source_id,
+                json_pointer: "/components/schemas/Pet".to_owned(),
+            },
+            meta: SchemaMeta::default(),
+        };
+        let synthetic = SchemaNode::Object {
+            properties: Vec::new(),
+            additional_properties: AdditionalProperties::Allowed(Some(Box::new(pet_ref))),
+            dependent_required: Vec::new(),
+            meta: SchemaMeta::default(),
+        };
+        let mut edges = Vec::new();
+        model.collect_ref_edges(&synthetic, &mut edges);
+        let pet_index = find_target(&model, "Pet").index;
+        assert_eq!(edges, vec![pet_index]);
+    }
+
+    /// Builds the model for `schemas` and returns the OASTS1306 variant-collision diagnostics the
+    /// emission model produced.
+    fn variant_collisions(schemas: Value) -> Vec<crate::diag::Diagnostic> {
+        let (_temp, resolved, analyzed, digest) = build_model_inputs(schemas);
+        let mut sink = DiagnosticSink::new();
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        drop(model);
+        sink.into_sorted_vec()
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1306")
+            .collect()
+    }
+
+    /// A component literally named `PetRequest` shadows the synthetic `PetRequest` that `Pet`'s
+    /// readOnly property forces: both would import the same identifier from different files, a
+    /// load-time error the semantic-stage exact-collision check cannot see (it runs before variance
+    /// is resolved). Fail closed with an actionable diagnostic naming both parties.
+    #[test]
+    fn variant_collision_request_flags_shadowing_component() {
+        let schemas = json!({
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            },
+            "PetRequest": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            }
+        });
+        let flagged = variant_collisions(schemas);
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].severity, crate::diag::Severity::Error);
+        assert_eq!(
+            flagged[0].message,
+            "generated variant name 'PetRequest' for component 'Pet' collides with component 'PetRequest'; rename one with naming.overrides"
+        );
+    }
+
+    /// The variant a component generates through transitive variance also collides: `Envelope`
+    /// gains a Request variant only because it references the readOnly `Pet`, and a component named
+    /// `EnvelopeRequest` shadows it.
+    #[test]
+    fn variant_collision_flags_transitive_variance() {
+        let schemas = json!({
+            "Envelope": {
+                "type": "object",
+                "properties": { "pet": { "$ref": "#/components/schemas/Pet" } }
+            },
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            },
+            "EnvelopeRequest": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            }
+        });
+        let flagged = variant_collisions(schemas);
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(
+            flagged[0].message,
+            "generated variant name 'EnvelopeRequest' for component 'Envelope' collides with component 'EnvelopeRequest'; rename one with naming.overrides"
+        );
+    }
+
+    /// A writeOnly-forced Response variant collides the same way, and a component ending in
+    /// `Request` whose stripped prefix names no varying component (`StrayRequest`) does not — the
+    /// suffix match must resolve to an actually-varying owner.
+    #[test]
+    fn variant_collision_flags_response_and_ignores_unmatched_suffix() {
+        let schemas = json!({
+            "Pet": {
+                "type": "object",
+                "properties": { "secret": { "type": "string", "writeOnly": true } }
+            },
+            "PetResponse": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            },
+            "StrayRequest": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            }
+        });
+        let flagged = variant_collisions(schemas);
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(
+            flagged[0].message,
+            "generated variant name 'PetResponse' for component 'Pet' collides with component 'PetResponse'; rename one with naming.overrides"
+        );
+    }
+
+    /// A component whose name merely contains a variant suffix without ending in it
+    /// (`PetResponsePlain`) does not collide with `Pet`'s Request variant.
+    #[test]
+    fn variant_collision_control_no_false_positive() {
+        let schemas = json!({
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            },
+            "PetResponsePlain": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            }
+        });
+        assert!(variant_collisions(schemas).is_empty());
+    }
+
+    /// With no variance anywhere the fixpoint fast-rejects before the collision check runs, so a
+    /// document with both `Pet` and `PetRequest` (neither varying) is clean.
+    #[test]
+    fn variant_collision_skipped_without_variance() {
+        let schemas = json!({
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } }
+            },
+            "PetRequest": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            }
+        });
+        assert!(variant_collisions(schemas).is_empty());
     }
 }

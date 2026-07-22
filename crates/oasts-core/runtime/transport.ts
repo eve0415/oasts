@@ -19,6 +19,7 @@ import {
   type ParamValue,
   type ParsedMediaType,
   type UrlencodedField,
+  type UrlencodedStyleField,
 } from './serialize.ts';
 
 //#region oxs:auth
@@ -124,13 +125,25 @@ export type ParamPlan = {
   readonly allowReserved: boolean;
 };
 
-export type UrlencodedFieldPlan = {
-  readonly name: string;
-  readonly required: boolean;
-  readonly style?: UrlencodedField['style'];
-  readonly explode?: UrlencodedField['explode'];
-  readonly allowReserved?: UrlencodedField['allowReserved'];
-};
+// Discriminated by property presence (`'payloads' in field`) rather than a `kind` tag like every
+// other descriptor union: a tag string would ship in the descriptor bytes of every generated
+// client, and these urlencoded field descriptors are emitted per field. Size over the tagging
+// convention, on purpose. `UrlencodedField` in serialize.ts makes the same tradeoff (`"json" in`).
+// The style member derives from serialize.ts's field so the union is spelled once.
+export type UrlencodedFieldPlan =
+  | {
+      readonly name: string;
+      readonly required: boolean;
+      readonly style?: UrlencodedStyleField['style'];
+      readonly explode?: boolean;
+      readonly allowReserved?: boolean;
+    }
+  | {
+      readonly name: string;
+      readonly required: boolean;
+      readonly payloads: readonly ('json' | 'text')[];
+      readonly contentType?: { readonly kind: 'selected'; readonly admitted: readonly string[] };
+    };
 
 export type MultipartContentTypePolicy =
   | { readonly kind: 'none' }
@@ -847,6 +860,43 @@ function urlencodedBody(
       }
       continue;
     }
+    if ('payloads' in field) {
+      // Content-based field: the OAS 3.1.1 Encoding Object contentType picks a payload kind, which
+      // decides between JSON serialization and the form-style text serializer.
+      let body: unknown;
+      let kind: 'json' | 'text' | undefined;
+      if (field.contentType === undefined) {
+        body = value;
+        kind = field.payloads[0];
+      } else {
+        const wrapper = urlencodedWrapper(value);
+        const selected = selectedMediaType(wrapper.contentType, field.contentType.admitted);
+        kind = field.payloads[selected.index];
+        body = wrapper.body;
+      }
+      if (kind === undefined) {
+        throw new TypeError(
+          `form field ${field.name} has no payload kind for the selected media type`,
+        );
+      }
+      if (kind === 'json') {
+        fields.push({ name: field.name, json: body });
+      } else {
+        if (!isParamValue(body)) {
+          throw new TypeError(`form field ${field.name} has an unsupported value`);
+        }
+        // Text delegates to the form-style serializer: byte-identical to plain strings and
+        // preserving arrays as repeated pairs.
+        fields.push({
+          name: field.name,
+          value: body,
+          style: 'form',
+          explode: true,
+          allowReserved: false,
+        });
+      }
+      continue;
+    }
     if (!isParamValue(value)) {
       throw new TypeError(`form field ${field.name} has an unsupported value`);
     }
@@ -859,6 +909,16 @@ function urlencodedBody(
     });
   }
   return { body: encodeFormUrlencodedBody(fields), contentType: plan.contentType };
+}
+
+function urlencodedWrapper(value: unknown): {
+  readonly body: unknown;
+  readonly contentType: unknown;
+} {
+  if (!isRecord(value)) {
+    throw new TypeError('urlencoded content wrapper must be an object');
+  }
+  return { body: value.body, contentType: value.contentType };
 }
 
 function multipartWrapper(value: unknown): MultipartWrapper {

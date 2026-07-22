@@ -19,10 +19,10 @@ keys:
         deallocs: 22794
         allocBytes: 1440717
       - stage: "emit"
-        allocs: 727754
-        reallocs: 176578
-        deallocs: 724895
-        allocBytes: 63627434
+        allocs: 728419
+        reallocs: 176902
+        deallocs: 725560
+        allocBytes: 63765477
     informational:
       peakBytes: 116773664
   - fixture: "stripe-3.0"
@@ -177,9 +177,9 @@ keys:
         allocs: 2019
         reallocs: 466
         deallocs: 1970
-        allocBytes: 285879
+        allocBytes: 290238
     informational:
-      peakBytes: 243492
+      peakBytes: 247851
   - fixture: "tictactoe-3.1"
     config: "oasts.yaml"
     stages:
@@ -209,32 +209,32 @@ keys:
     config: "oasts.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 4394
-        reallocs: 136
-        deallocs: 3708
-        allocBytes: 412033
+        allocs: 4612
+        reallocs: 138
+        deallocs: 3888
+        allocBytes: 424765
       - stage: "parse"
-        allocs: 768
+        allocs: 819
         reallocs: 74
-        deallocs: 347
-        allocBytes: 137400
+        deallocs: 364
+        allocBytes: 143492
       - stage: "analyze"
         allocs: 120
         reallocs: 16
         deallocs: 83
         allocBytes: 8622
       - stage: "clientModel"
-        allocs: 650
-        reallocs: 35
-        deallocs: 252
-        allocBytes: 72280
+        allocs: 744
+        reallocs: 44
+        deallocs: 301
+        allocBytes: 83002
       - stage: "emit"
-        allocs: 4532
-        reallocs: 1062
-        deallocs: 4481
-        allocBytes: 503458
+        allocs: 4673
+        reallocs: 1069
+        deallocs: 4622
+        allocBytes: 521234
     informational:
-      peakBytes: 423665
+      peakBytes: 441912
   - fixture: "auth-showcase-3.1"
     config: "oasts.yaml"
     stages:
@@ -262,9 +262,9 @@ keys:
         allocs: 3263
         reallocs: 787
         deallocs: 3220
-        allocBytes: 373446
+        allocBytes: 377805
     informational:
-      peakBytes: 288053
+      peakBytes: 292412
   - fixture: "pathological-3.1"
     config: "oasts.yaml"
     stages:
