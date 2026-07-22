@@ -3,9 +3,13 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -26,6 +30,7 @@ const CODE_MAX_REF_DEPTH: &str = "OASTS1009";
 const CODE_INVALID_REFERENCE: &str = "OASTS1010";
 const CODE_POINTER: &str = "OASTS1011";
 const CODE_NON_SCHEMA_CYCLE: &str = "OASTS1012";
+const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
 
 /// Stable index of a document within one graph.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -617,10 +622,9 @@ impl<'a> GraphBuilder<'a> {
             {
                 diagnostic = diagnostic.with_source(source_id);
             }
-            if diagnostic.json_pointer.is_none() {
-                diagnostic = diagnostic.with_json_pointer(&reference_pointer);
-            }
-            diagnostic
+            // load_document diagnostics identify the failing file, never a position inside the
+            // referencing document — the $ref location is always ours to stamp.
+            diagnostic.with_json_pointer(&reference_pointer)
         })?;
         let source_id = self.source_id(from.doc_id);
         let target_pointer = pointer_from_url(&target_url, source_id, Some(&reference_pointer))?;
@@ -836,15 +840,147 @@ fn configured_entry_path(path: &Path) -> Result<PathBuf, Diagnostic> {
 }
 
 fn parse_json(raw: &[u8], source_id: &str) -> Result<Value, Diagnostic> {
-    serde_json::from_slice(raw).map_err(|error| {
-        input_error(
-            CODE_PARSE,
-            format!("invalid JSON document: {error}"),
-            Some(source_id),
-            None,
-        )
-        .with_location(to_u32(error.line()), to_u32(error.column()))
-    })
+    serde_json::from_slice::<DedupValue>(raw)
+        .map(|value| value.0)
+        .map_err(|error| {
+            input_error(
+                CODE_PARSE,
+                format!("invalid JSON document: {error}"),
+                Some(source_id),
+                None,
+            )
+            .with_location(to_u32(error.line()), to_u32(error.column()))
+        })
+}
+
+struct DedupValue(Value);
+
+impl<'de> Deserialize<'de> for DedupValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DedupValueVisitor)
+    }
+}
+
+struct DedupValueVisitor;
+
+impl<'de> Visitor<'de> for DedupValueVisitor {
+    type Value = DedupValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(DedupValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(DedupValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DedupValue(Value::Number(value.into())))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(DedupValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DedupValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<DedupValue>()? {
+            values.push(value.0);
+        }
+        Ok(DedupValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mapping: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        // Delegate to `build_map_value`, which is generic over the error type but NOT over the
+        // `MapAccess` type. serde_json drives `visit_map` with two different concrete `MapAccess`
+        // implementations that share one `Error` type: `SliceRead` for real JSON objects and
+        // `NumberDeserializer` for the arbitrary-precision number token. Both collapse onto a
+        // single `build_map_value::<serde_json::Error>` instantiation whose runtime coverage is
+        // the union of the object and number paths — so no monomorphization leaves the
+        // number-token branch (or the object branch) permanently unexecuted, which is what makes
+        // the file's line coverage measurable at 100%.
+        let mut driver = MapAccessDriver(mapping);
+        build_map_value(&mut driver).map(DedupValue)
+    }
+}
+
+/// Type-erased view of a serde `MapAccess` over the exact key/value shapes `build_map_value`
+/// consumes: string keys, a raw string value for the number token, and recursive `DedupValue`
+/// values. Erasing the `MapAccess` type (keeping only its `Error`) is what lets `build_map_value`
+/// stay non-generic in the map access and thus be a single instantiation per error type.
+trait DedupMapAccess<E> {
+    fn next_key(&mut self) -> Result<Option<String>, E>;
+    fn next_value_string(&mut self) -> Result<String, E>;
+    fn next_value(&mut self) -> Result<Value, E>;
+}
+
+struct MapAccessDriver<A>(A);
+
+impl<'de, A> DedupMapAccess<A::Error> for MapAccessDriver<A>
+where
+    A: MapAccess<'de>,
+{
+    fn next_key(&mut self) -> Result<Option<String>, A::Error> {
+        self.0.next_key::<String>()
+    }
+
+    fn next_value_string(&mut self) -> Result<String, A::Error> {
+        self.0.next_value::<String>()
+    }
+
+    fn next_value(&mut self) -> Result<Value, A::Error> {
+        self.0.next_value::<DedupValue>().map(|value| value.0)
+    }
+}
+
+/// Builds a `Value` from a JSON map, rejecting duplicate object keys and decoding the
+/// arbitrary-precision number token. Generic over the error type only, so serde_json's
+/// object-parsing and number-token map accesses reuse one instantiation.
+fn build_map_value<E>(access: &mut dyn DedupMapAccess<E>) -> Result<Value, E>
+where
+    E: serde::de::Error,
+{
+    let Some(first_key) = access.next_key()? else {
+        return Ok(Value::Object(serde_json::Map::new()));
+    };
+    if first_key == SERDE_JSON_NUMBER_TOKEN {
+        let raw_token = access.next_value_string()?;
+        let number = serde_json::Number::from_str(&raw_token).map_err(E::custom)?;
+        return Ok(Value::Number(number));
+    }
+
+    let mut values = serde_json::Map::new();
+    let first_value = access.next_value()?;
+    values.insert(first_key, first_value);
+    while let Some(key) = access.next_key()? {
+        match values.entry(key) {
+            serde_json::map::Entry::Occupied(entry) => {
+                return Err(E::custom(format!("duplicate object key '{}'", entry.key())));
+            }
+            serde_json::map::Entry::Vacant(entry) => {
+                let value = access.next_value()?;
+                entry.insert(value);
+            }
+        }
+    }
+    Ok(Value::Object(values))
 }
 
 fn parse_yaml(raw: &[u8], source_id: &str) -> Result<Value, Diagnostic> {
@@ -1269,13 +1405,14 @@ mod tests {
 
     use super::*;
     use crate::config::{ResolvedConfig, load_config};
-    use crate::diag::Category;
+    use crate::diag::{Category, Severity};
 
     fn write(root: &Path, relative: &str, contents: &str) -> PathBuf {
         let path = root.join(relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("fixture parent should be created");
-        }
+        let parent = path
+            .parent()
+            .expect("joined fixture paths always have a parent");
+        fs::create_dir_all(parent).expect("fixture parent should be created");
         fs::write(&path, contents).expect("fixture should be written");
         path
     }
@@ -1286,6 +1423,16 @@ mod tests {
             "schemaVersion: 1\nworkspaceRoot: workspace\ninput: {{ path: entry.yaml }}\noutput: generated\n{extra}"
         );
         let path = write(root, "oasts.yaml", &config);
+        load_config(Some(&path), root).expect("fixture config should resolve")
+    }
+
+    fn resolved_json_config(root: &Path) -> ResolvedConfig {
+        fs::create_dir_all(root.join("workspace")).expect("workspace should be created");
+        let path = write(
+            root,
+            "oasts.yaml",
+            "schemaVersion: 1\nworkspaceRoot: workspace\ninput: { path: entry.json }\noutput: generated\n",
+        );
         load_config(Some(&path), root).expect("fixture config should resolve")
     }
 
@@ -1308,6 +1455,165 @@ mod tests {
         assert_eq!(diagnostic.category, Category::Input);
         assert_eq!(diagnostic.category.exit_code(), 1);
         diagnostic
+    }
+
+    #[test]
+    fn authorize_path_prefers_the_most_specific_allow_root() {
+        let file = Path::new("/allow/nested/doc.yaml");
+        let workspace = Path::new("/elsewhere");
+        for (roots, expected_index) in [
+            (["/allow", "/allow/nested"], 1),
+            (["/allow/nested", "/allow"], 0),
+        ] {
+            let roots = roots.map(|root| AllowRoot {
+                canonical_path: PathBuf::from(root),
+            });
+            let (prefix, suffix) =
+                authorize_path(file, workspace, &roots).expect("allow root should match");
+            assert_eq!(prefix, format!("allow/{expected_index}"));
+            assert_eq!(suffix, Path::new("doc.yaml"));
+        }
+    }
+
+    #[test]
+    fn dedup_value_deserializes_from_a_string_deserializer() {
+        // serde monomorphizes this instantiation from the magic-number plumbing even though
+        // from_slice never drives it; exercise it so the string path stays verified.
+        use serde::de::IntoDeserializer;
+        let deserializer: serde::de::value::StringDeserializer<serde_json::Error> =
+            "text".to_owned().into_deserializer();
+        let DedupValue(value) = DedupValue::deserialize(deserializer).expect("string input");
+        assert_eq!(value, Value::String("text".to_owned()));
+    }
+
+    #[test]
+    fn dedup_visitor_scalar_methods_build_values() {
+        // With arbitrary_precision every number reaches the visitor as the private-token map, so
+        // the plain scalar hooks are unreachable through from_slice — exercise them directly.
+        type E = serde_json::Error;
+        assert_eq!(
+            DedupValueVisitor.visit_bool::<E>(true).expect("bool").0,
+            Value::Bool(true)
+        );
+        assert_eq!(
+            DedupValueVisitor.visit_i64::<E>(-5).expect("i64").0,
+            Value::Number((-5i64).into())
+        );
+        assert_eq!(
+            DedupValueVisitor.visit_u64::<E>(7).expect("u64").0,
+            Value::Number(7u64.into())
+        );
+        assert_eq!(
+            DedupValueVisitor.visit_str::<E>("s").expect("str").0,
+            Value::String("s".to_owned())
+        );
+        assert_eq!(
+            DedupValueVisitor.visit_unit::<E>().expect("unit").0,
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn dedup_visitor_expecting_names_a_json_value() {
+        // serde only consults `expecting` on type-mismatch paths, and DedupValue accepts every
+        // JSON shape, so the deserializer can never reach it — exercise it directly.
+        struct Expecting;
+        impl fmt::Display for Expecting {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                DedupValueVisitor.expecting(formatter)
+            }
+        }
+        assert_eq!(Expecting.to_string(), "a JSON value");
+    }
+
+    #[test]
+    fn json_duplicate_object_key_is_fatal() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.json",
+            "{\n  \"a\": 1,\n  \"a\": 2\n}\n",
+        );
+        let config = resolved_json_config(directory.path());
+        let mut sink = DiagnosticSink::new();
+
+        assert!(load_graph(&config, &mut sink).is_none());
+        assert_eq!(sink.as_slice().len(), 1);
+        let diagnostic = &sink.as_slice()[0];
+        assert_eq!(diagnostic.code, CODE_PARSE);
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(diagnostic.message.contains("invalid JSON document"));
+        assert!(diagnostic.message.contains("duplicate object key 'a'"));
+        assert!(diagnostic.line.is_some());
+        assert!(diagnostic.col.is_some());
+    }
+
+    #[test]
+    fn json_duplicate_key_in_nested_object_is_fatal() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.json",
+            r#"{"outer":[{"nested":{"a":1,"a":2}}]}"#,
+        );
+        let config = resolved_json_config(directory.path());
+
+        let diagnostic = assert_load_code(&config, CODE_PARSE);
+
+        assert!(diagnostic.message.contains("invalid JSON document"));
+        assert!(diagnostic.message.contains("duplicate object key 'a'"));
+    }
+
+    #[test]
+    fn json_same_key_in_sibling_objects_is_fine() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.json",
+            r#"[{"a":1,"nested":{"a":3}},{"a":2,"nested":{"a":4}}]"#,
+        );
+        let config = resolved_json_config(directory.path());
+
+        let graph = load_ok(&config);
+
+        assert_eq!(graph.entry().value[0]["a"], 1);
+        assert_eq!(graph.entry().value[1]["nested"]["a"], 4);
+    }
+
+    #[test]
+    fn json_arbitrary_precision_number_roundtrips() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.json",
+            r#"{"hugeFloat":1e999,"hugeInteger":123456789012345678901234567890}"#,
+        );
+        let config = resolved_json_config(directory.path());
+
+        let graph = load_ok(&config);
+        let document = &graph.entry().value;
+
+        assert_eq!(
+            document["hugeFloat"].as_number().map(ToString::to_string),
+            Some("1e+999".to_owned())
+        );
+        assert_eq!(
+            document["hugeInteger"].as_number().map(ToString::to_string),
+            Some("123456789012345678901234567890".to_owned())
+        );
+    }
+
+    #[test]
+    fn json_value_visitor_describes_expected_input() {
+        let error = <serde::de::value::Error as serde::de::Error>::invalid_type(
+            serde::de::Unexpected::Other("non-JSON input"),
+            &DedupValueVisitor,
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "invalid type: non-JSON input, expected a JSON value"
+        );
     }
 
     #[test]

@@ -12,7 +12,8 @@ use crate::config::{
     ReferrerPolicyValue, RequestModeValue, ValidationEngine,
 };
 use crate::ir::{
-    Operation, Param, ParamLocation, ParamStyle, PrimitiveType, SchemaNode, SegmentPart,
+    Operation, Param, ParamLocation, ParamStyle, PrimitiveType, SchemaNode, SecKind, SegmentPart,
+    ServerVariable,
 };
 
 use super::model::EmissionModel;
@@ -126,6 +127,10 @@ pub(crate) fn emit_client_from_model(
             content: emit_aggregate(model, &namespace, &aggregate_entries),
         });
     }
+    if let Some(auth_file) = emit_document_auth(model, client) {
+        model.register_path(&auth_file.relative_path, &source);
+        files.push(auth_file);
+    }
     let base_url = model
         .config
         .client
@@ -133,12 +138,30 @@ pub(crate) fn emit_client_from_model(
         .expect("client emission requires resolved client config")
         .base_url
         .clone();
+    // Every server the client model exposes, across all operations (an operation-level `servers`
+    // override plans its own list rather than inheriting the root): the `serverVariables` transport
+    // config type must admit whatever any of them could require at the selected index.
+    let mut server_variables: Vec<(String, ServerVariable)> = Vec::new();
+    // Operations that resolve to the same server list (the common case: every operation inheriting
+    // the root servers) re-present identical server entries; collecting each distinct URL once folds
+    // those exact repeats out while leaving the first-seen variable union unchanged.
+    let mut seen_servers: HashSet<&str> = HashSet::new();
+    for plan in &client.operations {
+        if let BaseUrlPlan::Server { servers, .. } = &plan.base_url {
+            for server in servers {
+                if seen_servers.insert(server.url.as_str()) {
+                    server_variables.extend(server.variables.iter().cloned());
+                }
+            }
+        }
+    }
     files.extend(emit_runtime_files(RuntimeSelection {
         model,
         helper_ids: &helper_ids,
         serialize_needed: true,
         base_url: &base_url,
         source: &source,
+        server_variables: &server_variables,
     }));
     files.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
     files
@@ -179,6 +202,98 @@ fn emit_aggregate(
     output
 }
 
+/// The generated per-document `client/auth.ts`: a `DocumentAuthProviders` interface with one
+/// property per client-usable security scheme, in the document's scheme-declaration order. An
+/// oauth2 scheme's declared scopes become a string-literal union so a provider implementation typed
+/// against the property narrows `AuthContext.scopes` (empty declared set → plain `AuthProvider`);
+/// every other kind stays a plain `AuthProvider`, and an http scheme's `bearerFormat` is surfaced
+/// as a per-property `@remarks` — which is why this is a per-property interface, not a mapped type.
+///
+/// Type-only surface, no runtime constructor, by two independent reasons: the module is only
+/// typechecked (the conformance/e2e harness loads `runtime/transport.ts` and `client/api.ts`, never
+/// this file), and a scope-narrowed `AuthProvider<Scope>` is not assignable to the plain
+/// `AuthProvider` slot the shared `createTransport` exposes — so a generated delegator forwarding a
+/// scope-narrowed provider map to `createTransport` cannot typecheck without an escape hatch.
+/// Consumers apply this interface when authoring providers instead.
+///
+/// Returns `None` when the document has no client-usable scheme (nothing to type), so no empty
+/// module is emitted. Client-usability reuses `build_client_model`'s planning: a scheme is usable
+/// exactly when it survives into some operation's `auth_plan`, which already drops every scheme the
+/// fetch client cannot serialize.
+fn emit_document_auth(
+    model: &EmissionModel<'_, '_>,
+    client: &ClientModel,
+) -> Option<GeneratedFile> {
+    let mut usable: HashSet<&str> = HashSet::new();
+    for plan in &client.operations {
+        for alternative in &plan.auth_plan {
+            for scheme in alternative {
+                usable.insert(scheme.name.as_str());
+            }
+        }
+    }
+    if usable.is_empty() {
+        return None;
+    }
+
+    let mut body = String::new();
+    for scheme in &model.analyzed.ir.security_schemes {
+        if !usable.contains(scheme.name.as_str()) {
+            continue;
+        }
+        if let SecKind::Http {
+            bearer_format: Some(format),
+            ..
+        } = &scheme.kind
+        {
+            body.push_str("  /**\n   * @remarks\n   * Bearer token format: ");
+            body.push_str(&encode_comment_text(format));
+            body.push_str("\n   */\n");
+        }
+        body.push_str("  ");
+        body.push_str(&render_property_key(&scheme.name));
+        body.push_str(": ");
+        body.push_str(&document_auth_provider_type(&scheme.kind));
+        body.push_str(";\n");
+    }
+
+    let extension = import_extension(model);
+    let mut output = model.header();
+    output.push_str("import type { AuthProvider } from ");
+    output.push_str(&render_ts_string(&format!(
+        "../runtime/transport{extension}"
+    )));
+    output.push_str(";\n\nexport interface DocumentAuthProviders {\n");
+    output.push_str(&body);
+    output.push_str("}\n");
+    Some(GeneratedFile {
+        relative_path: "client/auth.ts".to_owned(),
+        content: output,
+    })
+}
+
+/// The `AuthProvider` type for one scheme property. Oauth2 carries its declared scopes as a
+/// first-seen string-literal union; every other kind (including openIdConnect, whose scopes are
+/// IdP-defined and invisible to the document) is a plain `AuthProvider`.
+fn document_auth_provider_type(kind: &SecKind) -> String {
+    match kind {
+        SecKind::OAuth2 { flows } => {
+            let scopes = flows.declared_scopes();
+            if scopes.is_empty() {
+                "AuthProvider".to_owned()
+            } else {
+                let union = scopes
+                    .iter()
+                    .map(|scope| render_ts_string(scope))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                format!("AuthProvider<{union}>")
+            }
+        }
+        _ => "AuthProvider".to_owned(),
+    }
+}
+
 fn emit_operation(
     model: &mut EmissionModel<'_, '_>,
     operation: &Operation,
@@ -188,6 +303,10 @@ fn emit_operation(
 ) -> String {
     let stem = uppercase_first(allocated_name);
     let operation_type_names = operation_type_imports(plan, &stem);
+    let uses_typed_headers = plan
+        .response_table
+        .iter()
+        .any(|response| response.has_headers);
     let mut component_imports = BTreeMap::<String, BTreeSet<String>>::new();
     let documentation = model.config.documentation.clone();
     let input = {
@@ -242,6 +361,13 @@ fn emit_operation(
         output.push_str(" } from ");
         output.push_str(&render_ts_string(&format!(
             "../../types/operations/{file_base}{extension}"
+        )));
+        output.push_str(";\n");
+    }
+    if uses_typed_headers {
+        output.push_str("import type { TypedHeaders } from ");
+        output.push_str(&render_ts_string(&format!(
+            "../../types/headers{extension}"
         )));
         output.push_str(";\n");
     }
@@ -403,11 +529,16 @@ enum ResponseBody {
     Both,
 }
 
-/// One documented response branch the operation checks after dispatch.
+/// One documented response branch the operation checks after dispatch: an optional JSON body
+/// validator call and/or an optional header validator call, both feeding the same
+/// `responseIssues` buffer inside the branch's `if (result.match === ...)` arm. At least one of
+/// the two is always present — a branch with neither never reaches the emitted checks.
 struct ResponseCheck {
     match_key: String,
-    validator: String,
-    body: ResponseBody,
+    body: Option<(String, ResponseBody)>,
+    /// The `<...>Headers` validator, called as `validator(result.meta.headers, [], responseIssues)`
+    /// after the body check — present exactly when the response declares a header.
+    headers_validator: Option<String>,
 }
 
 /// `(validate_request, validate_response)` — both false unless the resolved engine is `generated`,
@@ -467,8 +598,8 @@ fn request_validation_checks(
 }
 
 /// The response-side checks: each documented branch whose decoded body is JSON and carries an
-/// emitted validator. Content-type-discriminated branches are skipped — their decoded body is not
-/// unconditionally JSON. Empty unless response validation is enabled.
+/// emitted validator, plus — independently — every branch that declares a header. Empty unless
+/// response validation is enabled.
 fn response_validation_checks(
     plan: &OperationPlan,
     stem: &str,
@@ -480,32 +611,49 @@ fn response_validation_checks(
     plan.response_table
         .iter()
         .filter_map(|response| {
-            if !matches!(response.payload, PayloadDisposition::Payload { .. })
-                || response.content_type_discriminated
-                || !response
-                    .media
-                    .iter()
-                    .any(|media| media_is_json(&media.media))
-            {
+            let body = body_validation_check(response, stem);
+            let headers_validator = response
+                .has_headers
+                .then(|| format!("validate{}Headers", response_type_name(stem, response)));
+            if body.is_none() && headers_validator.is_none() {
                 return None;
             }
-            let body = match response.kind {
-                ResponseMatchKind::Default => ResponseBody::Both,
-                _ => {
-                    if is_successful_response(response.kind, &response.match_key) {
-                        ResponseBody::Data
-                    } else {
-                        ResponseBody::Error
-                    }
-                }
-            };
             Some(ResponseCheck {
                 match_key: response.match_key.clone(),
-                validator: format!("validate{}", response_type_name(stem, response)),
                 body,
+                headers_validator,
             })
         })
         .collect()
+}
+
+/// The JSON body validator call for one response branch — `None` when the decoded body is not
+/// unconditionally JSON: a content-type-discriminated branch, a non-JSON media, or a response
+/// with no payload at all.
+fn body_validation_check(response: &ResponsePlan, stem: &str) -> Option<(String, ResponseBody)> {
+    if !matches!(response.payload, PayloadDisposition::Payload { .. })
+        || response.content_type_discriminated
+        || !response
+            .media
+            .iter()
+            .any(|media| media_is_json(&media.media))
+    {
+        return None;
+    }
+    let body = match response.kind {
+        ResponseMatchKind::Default => ResponseBody::Both,
+        _ => {
+            if is_successful_response(response.kind, &response.match_key) {
+                ResponseBody::Data
+            } else {
+                ResponseBody::Error
+            }
+        }
+    };
+    Some((
+        format!("validate{}", response_type_name(stem, response)),
+        body,
+    ))
 }
 
 /// `input.<name>` for an identifier, `input["<name>"]` otherwise — the accessor for one input
@@ -535,7 +683,16 @@ fn write_validator_imports(
     let validators = request
         .iter()
         .map(|check| check.validator.as_str())
-        .chain(response.iter().map(|check| check.validator.as_str()))
+        .chain(
+            response
+                .iter()
+                .filter_map(|check| check.body.as_ref().map(|(validator, _)| validator.as_str())),
+        )
+        .chain(
+            response
+                .iter()
+                .filter_map(|check| check.headers_validator.as_deref()),
+        )
         .collect::<BTreeSet<_>>();
     output.push_str("import { ");
     output.push_str(&validators.into_iter().collect::<Vec<_>>().join(", "));
@@ -601,28 +758,31 @@ fn result_function_body(
                 render_ts_string(&check.match_key)
             ));
         }
-        match check.body {
-            ResponseBody::Data => body.push_str(&format!(
-                "      {}(result.data, [], responseIssues);\n",
-                check.validator
-            )),
-            ResponseBody::Error => body.push_str(&format!(
-                "      {}(result.error, [], responseIssues);\n",
-                check.validator
-            )),
-            ResponseBody::Both => {
-                body.push_str("      if (result.ok) {\n");
-                body.push_str(&format!(
-                    "        {}(result.data, [], responseIssues);\n",
-                    check.validator
-                ));
-                body.push_str("      } else {\n");
-                body.push_str(&format!(
-                    "        {}(result.error, [], responseIssues);\n",
-                    check.validator
-                ));
-                body.push_str("      }\n");
+        if let Some((validator, kind)) = &check.body {
+            match kind {
+                ResponseBody::Data => body.push_str(&format!(
+                    "      {validator}(result.data, [], responseIssues);\n"
+                )),
+                ResponseBody::Error => body.push_str(&format!(
+                    "      {validator}(result.error, [], responseIssues);\n"
+                )),
+                ResponseBody::Both => {
+                    body.push_str("      if (result.ok) {\n");
+                    body.push_str(&format!(
+                        "        {validator}(result.data, [], responseIssues);\n"
+                    ));
+                    body.push_str("      } else {\n");
+                    body.push_str(&format!(
+                        "        {validator}(result.error, [], responseIssues);\n"
+                    ));
+                    body.push_str("      }\n");
+                }
             }
+        }
+        if let Some(headers_validator) = &check.headers_validator {
+            body.push_str(&format!(
+                "      {headers_validator}(result.meta.headers, [], responseIssues);\n"
+            ));
         }
     }
     body.push_str("    }\n");
@@ -668,6 +828,9 @@ fn operation_type_imports(plan: &OperationPlan, stem: &str) -> BTreeSet<String> 
     for response in &plan.response_table {
         if matches!(response.payload, PayloadDisposition::Payload { .. }) {
             names.insert(response_type_name(stem, response));
+        }
+        if response.has_headers {
+            names.insert(format!("{}Headers", response_type_name(stem, response)));
         }
     }
     names
@@ -942,6 +1105,11 @@ fn write_response_result_arms(output: &mut String, response: &ResponsePlan, stem
         ResponseMatchKind::Range | ResponseMatchKind::Default => "number".to_owned(),
     };
     let payload = response_payload_type(response, stem);
+    // Only computed when the response declares a header, keeping a header-less response's arms
+    // free of any new allocation on this path.
+    let headers_interface = response
+        .has_headers
+        .then(|| format!("{}Headers", response_type_name(stem, response)));
     let media = if matches!(response.payload, PayloadDisposition::Payload { .. })
         && response.content_type_discriminated
     {
@@ -963,6 +1131,7 @@ fn write_response_result_arms(output: &mut String, response: &ResponsePlan, stem
                     &payload,
                     true,
                     *content_type,
+                    headers_interface.as_deref(),
                 );
                 write_response_result_arm(
                     output,
@@ -971,6 +1140,7 @@ fn write_response_result_arms(output: &mut String, response: &ResponsePlan, stem
                     &payload,
                     false,
                     *content_type,
+                    headers_interface.as_deref(),
                 );
             }
         }
@@ -984,7 +1154,15 @@ fn write_response_result_arms(output: &mut String, response: &ResponsePlan, stem
                 response.match_key.starts_with('2')
             };
             for content_type in media {
-                write_response_result_arm(output, response, &statuses, &payload, ok, content_type);
+                write_response_result_arm(
+                    output,
+                    response,
+                    &statuses,
+                    &payload,
+                    ok,
+                    content_type,
+                    headers_interface.as_deref(),
+                );
             }
         }
     }
@@ -997,6 +1175,7 @@ fn write_response_result_arm(
     payload: &str,
     ok: bool,
     content_type: Option<&str>,
+    headers_interface: Option<&str>,
 ) {
     output.push_str("  | { kind: \"response\"; ok: ");
     output.push_str(if ok { "true" } else { "false" });
@@ -1010,7 +1189,14 @@ fn write_response_result_arm(
         output.push_str("; contentType: ");
         output.push_str(&render_ts_string(content_type));
     }
-    output.push_str("; meta: ResponseMeta }\n");
+    match headers_interface {
+        Some(interface_name) => {
+            output.push_str("; meta: ResponseMeta & { readonly headers: TypedHeaders<keyof ");
+            output.push_str(interface_name);
+            output.push_str(" & string> } }\n");
+        }
+        None => output.push_str("; meta: ResponseMeta }\n"),
+    }
 }
 
 fn response_payload_type(response: &ResponsePlan, stem: &str) -> String {
@@ -1902,7 +2088,7 @@ mod tests {
         CallerHeaderPlan, FieldWrapperPlan, PayloadKind, ResponseMediaPlan, build_client_model,
     };
     use crate::config::{ResolvedConfig, load_config_from_json};
-    use crate::diag::{Diagnostic, DiagnosticSink};
+    use crate::diag::{Diagnostic, DiagnosticSink, Severity};
     use crate::ir::{
         AdditionalProperties, SchemaMeta, SchemaRef, ServerEntry, ServerVariable, SourceRef,
     };
@@ -2338,11 +2524,20 @@ mod tests {
         );
     }
 
-    /// A multipart field with an explicit `style` (an OAS 3.1-only combination) resolves to
-    /// `FieldSerializationPlan::Style`; when its schema is an object, `field_payload` classifies
-    /// it the same as a JSON content field rather than falling back to `text`.
+    /// A multipart field with an explicit `style` on an object-shaped schema has no OAS-defined
+    /// per-part serialization: OASTS1427 (`crates/oasts-core/src/client_model.rs`) rejects it
+    /// instead of the retired pinned behavior this test replaces, where `field_payload` silently
+    /// classified it the same as a JSON content field with no content-type header — a wire format
+    /// the spec never sanctions.
+    ///
+    /// The client-model plan is still produced (`FieldSerializationPlan::Style` on the object
+    /// schema, unchanged) so downstream planning has something to consult, but real generation
+    /// never reaches emission for it: `pipeline::compile` returns `None` as soon as
+    /// `sink.has_errors()`, before `emit_client_from_model` runs. This test stops at
+    /// `build_client_model` accordingly, rather than asserting on TS text that
+    /// `write_multipart_field` — deliberately unchanged — would still render verbatim.
     #[test]
-    fn styled_object_multipart_field_emits_json_payload() {
+    fn styled_object_multipart_field_is_rejected() {
         let document = json!({
             "openapi": "3.1.0",
             "info": { "title": "test", "version": "1" },
@@ -2375,10 +2570,123 @@ mod tests {
                 }
             }
         });
-        let (actual, diagnostics) = emit_operation(document, "styledobjectfield");
+        let (_temp, analyzed, config, _source_tuples) = analyzed(&document);
+        let mut sink = DiagnosticSink::new();
+        let client = build_client_model(&analyzed, &config, &mut sink);
 
-        assert!(actual.contains("payload: \"json\""));
-        assert!(actual.contains("contentType: { kind: \"none\" }"));
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == "OASTS1427")
+            .expect("OASTS1427 diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some(
+                "/paths/~1styled-object/post/requestBody/content/multipart~1form-data/encoding/meta"
+            )
+        );
+        assert_eq!(
+            diagnostic.message,
+            "multipart field 'meta' has no defined per-part serialization for Form/explode=true with this schema shape; use encoding.contentType instead"
+        );
+
+        let fields = client.operations[0]
+            .body_plan
+            .as_ref()
+            .expect("body plan")
+            .multipart_fields()
+            .expect("multipart fields");
+        assert!(matches!(
+            &fields[0].serialization,
+            FieldSerializationPlan::Style {
+                style: ParamStyle::Form,
+                ..
+            }
+        ));
+    }
+
+    /// A styled primitive field has a defined per-part serialization for any style/explode
+    /// combination (OASTS1427's SUPPORTED case): it keeps the exact `text` payload emission this
+    /// pins, unchanged from before the admission matrix landed.
+    #[test]
+    fn styled_primitive_multipart_field_emits_text_payload() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/styled-primitive": {
+                    "post": {
+                        "operationId": "styledPrimitiveField",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["note"],
+                                        "properties": {
+                                            "note": { "type": "string" }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "note": { "style": "form", "explode": false }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "styledprimitivefield");
+
+        assert!(actual.contains(
+            "{ name: \"note\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: { kind: \"none\" }, filename: false }"
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    /// An exploded `form`-style array of primitives has a defined per-part serialization (OASTS1427's
+    /// SUPPORTED array case): it keeps the `repeated` descriptor, unchanged from before the
+    /// admission matrix landed.
+    #[test]
+    fn styled_primitive_array_multipart_field_repeats_parts() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/styled-tags": {
+                    "post": {
+                        "operationId": "styledTagsArray",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["tags"],
+                                        "properties": {
+                                            "tags": { "type": "array", "items": { "type": "string" } }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "tags": { "style": "form", "explode": true }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "styledtagsarray");
+
+        assert!(actual.contains(
+            "{ name: \"tags\", required: true, repeated: true, wrapper: false, payload: \"text\", contentType: { kind: \"none\" }, filename: false }"
+        ));
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
@@ -2607,6 +2915,8 @@ mod tests {
             properties: Vec::new(),
             additional_properties: AdditionalProperties::Allowed(None),
             dependent_required: Vec::new(),
+            finite: None,
+            extra_required: Vec::new(),
             meta: SchemaMeta::default(),
         }
     }
@@ -2668,6 +2978,7 @@ mod tests {
             media,
             payload,
             content_type_discriminated,
+            has_headers: false,
             source: SourceRef::default(),
         }
     }
@@ -3176,6 +3487,7 @@ mod tests {
             &model,
             &SchemaNode::Array {
                 items: Box::new(string_schema(None)),
+                finite: None,
                 meta: SchemaMeta::default(),
             },
             &mut HashSet::new()
@@ -3690,6 +4002,164 @@ mod tests {
         ));
     }
 
+    fn emit_auth_module(document: Value) -> (Option<String>, Vec<Diagnostic>) {
+        let (_temp, analyzed, config, _source_tuples) =
+            analyzed_with_options(&document, false, false);
+        let mut sink = DiagnosticSink::new();
+        let client = build_client_model(&analyzed, &config, &mut sink);
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let files = emit_client_from_model(&mut model, &client);
+        drop(model);
+        let content = files
+            .iter()
+            .find(|file| file.relative_path == "client/auth.ts")
+            .map(|file| file.content.clone());
+        (content, sink.into_sorted_vec())
+    }
+
+    #[test]
+    fn document_auth_providers_renders_scoped_oauth2_and_plain_others() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "components": {
+                "securitySchemes": {
+                    "oauthScheme": { "type": "oauth2", "flows": { "authorizationCode": {
+                        "authorizationUrl": "https://auth.example.test/authorize",
+                        "tokenUrl": "https://auth.example.test/token",
+                        "scopes": { "scope.a": "A", "scope.b": "B" }
+                    } } },
+                    "bearerScheme": { "type": "http", "scheme": "bearer" },
+                    "keyScheme": { "type": "apiKey", "in": "header", "name": "X-Api-Key" },
+                    "oidcScheme": { "type": "openIdConnect", "openIdConnectUrl": "https://idp.example.test/.well-known/openid-configuration" }
+                }
+            },
+            "paths": { "/ping": { "get": {
+                "operationId": "ping",
+                "security": [
+                    { "oauthScheme": ["scope.a"] },
+                    { "bearerScheme": [] },
+                    { "keyScheme": [] },
+                    { "oidcScheme": [] }
+                ],
+                "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "object" } } } } }
+            } } }
+        });
+        let (actual, diagnostics) = emit_auth_module(document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            actual.expect("auth module"),
+            format!(
+                "{HEADER}import type {{ AuthProvider }} from \"../runtime/transport.js\";\n\nexport interface DocumentAuthProviders {{\n  oauthScheme: AuthProvider<\"scope.a\" | \"scope.b\">;\n  bearerScheme: AuthProvider;\n  keyScheme: AuthProvider;\n  oidcScheme: AuthProvider;\n}}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn bearer_format_renders_as_remarks_tsdoc() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "components": {
+                "securitySchemes": {
+                    "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT" }
+                }
+            },
+            "paths": { "/ping": { "get": {
+                "operationId": "ping",
+                "security": [{ "bearerAuth": [] }],
+                "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "object" } } } } }
+            } } }
+        });
+        let (actual, diagnostics) = emit_auth_module(document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            actual.expect("auth module"),
+            format!(
+                "{HEADER}import type {{ AuthProvider }} from \"../runtime/transport.js\";\n\nexport interface DocumentAuthProviders {{\n  /**\n   * @remarks\n   * Bearer token format: JWT\n   */\n  bearerAuth: AuthProvider;\n}}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn empty_declared_scopes_renders_plain_provider() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "components": {
+                "securitySchemes": {
+                    "oauthScheme": { "type": "oauth2", "flows": { "authorizationCode": {
+                        "authorizationUrl": "https://auth.example.test/authorize",
+                        "tokenUrl": "https://auth.example.test/token",
+                        "scopes": {}
+                    } } }
+                }
+            },
+            "paths": { "/ping": { "get": {
+                "operationId": "ping",
+                "security": [{ "oauthScheme": [] }],
+                "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "object" } } } } }
+            } } }
+        });
+        let (actual, diagnostics) = emit_auth_module(document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            actual.expect("auth module"),
+            format!(
+                "{HEADER}import type {{ AuthProvider }} from \"../runtime/transport.js\";\n\nexport interface DocumentAuthProviders {{\n  oauthScheme: AuthProvider;\n}}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn schemeless_document_emits_no_auth_module() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": { "/ping": { "get": {
+                "operationId": "ping",
+                "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "object" } } } } }
+            } } }
+        });
+        let (actual, diagnostics) = emit_auth_module(document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(
+            actual.is_none(),
+            "expected no client/auth.ts, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn auth_module_deterministic_order() {
+        // Declared in components as zulu, alpha, mike; referenced by the operation in a different
+        // order (mike, zulu, alpha). The module must follow scheme-declaration order, not
+        // reference order and not alphabetical order.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "components": {
+                "securitySchemes": {
+                    "zulu": { "type": "http", "scheme": "bearer" },
+                    "alpha": { "type": "apiKey", "in": "header", "name": "X-Alpha" },
+                    "mike": { "type": "apiKey", "in": "header", "name": "X-Mike" }
+                }
+            },
+            "paths": { "/ping": { "get": {
+                "operationId": "ping",
+                "security": [{ "mike": [] }, { "zulu": [] }, { "alpha": [] }],
+                "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "object" } } } } }
+            } } }
+        });
+        let (actual, diagnostics) = emit_auth_module(document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            actual.expect("auth module"),
+            format!(
+                "{HEADER}import type {{ AuthProvider }} from \"../runtime/transport.js\";\n\nexport interface DocumentAuthProviders {{\n  zulu: AuthProvider;\n  alpha: AuthProvider;\n  mike: AuthProvider;\n}}\n"
+            )
+        );
+    }
+
     #[test]
     fn call_args_quotes_non_identifier_scheme_names() {
         // Security scheme names are arbitrary component-map keys: a kebab-case name must emit a
@@ -4134,5 +4604,168 @@ mod tests {
             ),
             "response block mismatch:\n{content}"
         );
+    }
+
+    // --- typed response headers ------------------------------------------------------------
+
+    fn headered_operation_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/things": {
+                    "get": {
+                        "operationId": "fetchThing",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "headers": {
+                                    "X-Token": { "required": true, "schema": { "type": "string" } }
+                                },
+                                "content": { "application/json": { "schema": { "type": "string" } } }
+                            },
+                            "404": {
+                                "description": "missing",
+                                "content": { "application/json": { "schema": { "type": "string" } } }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn headered_response_arm_narrows_meta_headers() {
+        let (content, diagnostics) = emit_operation(headered_operation_document(), "fetchthing");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(
+            content.contains(
+                "import type { FetchThingResponse200, FetchThingResponse200Headers, FetchThingResponse404 } from \"../../types/operations/fetchthing.js\";"
+            ),
+            "operation type import must carry the headers interface name:\n{content}"
+        );
+        assert!(
+            content.contains("import type { TypedHeaders } from \"../../types/headers.js\";"),
+            "TypedHeaders must be imported when a response declares headers:\n{content}"
+        );
+        assert!(
+            content.contains(
+                "| { kind: \"response\"; ok: true; match: \"200\"; status: 200; data: FetchThingResponse200; meta: ResponseMeta & { readonly headers: TypedHeaders<keyof FetchThingResponse200Headers & string> } }"
+            ),
+            "the headered arm must narrow meta to the intersection type:\n{content}"
+        );
+        assert!(
+            content.contains(
+                "| { kind: \"response\"; ok: false; match: \"404\"; status: 404; error: FetchThingResponse404; meta: ResponseMeta }"
+            ),
+            "a sibling header-less arm must keep the plain meta type:\n{content}"
+        );
+    }
+
+    #[test]
+    fn headerless_client_output_unchanged() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/items": {
+                    "get": {
+                        "operationId": "listItems",
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": { "application/json": { "schema": { "type": "string" } } }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let expected = format!(
+            "{HEADER}import type {{ ListItemsResponse200 }} from \"../../types/operations/listitems.js\";\nimport type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1items/get\nexport type ListItemsInput = {{}};\n\n// Source: workspace/openapi.json#/paths/~1items/get\nexport type ListItemsResult =\n  | {{ kind: \"response\"; ok: true; match: \"200\"; status: 200; data: ListItemsResponse200; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"200\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type ListItemsCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1items/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"listItems\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"items\" }}],\n  ],\n  params: [],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function listItems<S extends string = never>(transport: Transport<S>, input: ListItemsInput, ...args: ListItemsCallArgs<S>): Promise<ListItemsResult> {{\n  return execute<ListItemsResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function listItemsOrThrow<S extends string = never>(transport: Transport<S>, input: ListItemsInput, ...args: ListItemsCallArgs<S>): Promise<ListItemsResponse200> {{\n  return executeOrThrow<ListItemsResult>(transport, descriptor, input, args[0]);\n}}\n"
+        );
+        let (actual, diagnostics) = emit_operation(document, "listitems");
+        assert_eq!(
+            actual, expected,
+            "a header-less document's client output must stay byte-identical to before response-header narrowing existed"
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn response_validation_binds_header_validator() {
+        // 200 carries both a validated JSON body and a header; 204 carries only a header, with no
+        // payload to validate at all — the header check must still bind on its own.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/things": {
+                    "get": {
+                        "operationId": "fetchThing",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "headers": {
+                                    "X-Token": { "required": true, "schema": { "type": "string" } }
+                                },
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "object", "properties": { "id": { "type": "string" } } }
+                                    }
+                                }
+                            },
+                            "204": {
+                                "description": "no content",
+                                "headers": {
+                                    "X-Trace": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let enabled = emit_validated_operation(document.clone(), "fetchthing", false, true);
+        assert!(
+            enabled.contains(
+                r#"    if (result.match === "200") {
+      validateFetchThingResponse200(result.data, [], responseIssues);
+      validateFetchThingResponse200Headers(result.meta.headers, [], responseIssues);
+    } else if (result.match === "204") {
+      validateFetchThingResponse204Headers(result.meta.headers, [], responseIssues);
+    }"#
+            ),
+            "response block mismatch:\n{enabled}"
+        );
+        assert!(
+            enabled.contains(
+                "import { validateFetchThingResponse200, validateFetchThingResponse200Headers, validateFetchThingResponse204Headers } from \"../../validators/operations/fetchthing.js\";"
+            ),
+            "{enabled}"
+        );
+
+        // The resolved config rejects a generated engine with both directions off, so request
+        // validation stays on here — only the response direction (and with it, header binding)
+        // is what this assertion cares about.
+        let disabled = emit_validated_operation(document, "fetchthing", true, false);
+        // The meta narrowing itself is unconditional (a types concern), but with response
+        // validation off there is no responseIssues buffer and no validator call at all.
+        assert!(
+            disabled.contains(
+                "meta: ResponseMeta & { readonly headers: TypedHeaders<keyof FetchThingResponse200Headers & string> } }"
+            ),
+            "{disabled}"
+        );
+        assert!(
+            !disabled.contains("validateFetchThingResponse200Headers("),
+            "response validation disabled must not call the header validator:\n{disabled}"
+        );
+        assert!(
+            !disabled.contains("validateFetchThingResponse204Headers("),
+            "{disabled}"
+        );
+        assert!(!disabled.contains("responseIssues"), "{disabled}");
     }
 }

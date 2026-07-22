@@ -172,6 +172,42 @@ paths:
       responses:
         '204':
           description: The upload was stored without a response body.
+  /uploads/styled:
+    post:
+      operationId: uploadStyledShowcase
+      summary: Upload fields whose multipart encoding declares an explicit style.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - caption
+                - asset
+                - tags
+              properties:
+                caption:
+                  type: string
+                asset:
+                  type: string
+                  format: binary
+                tags:
+                  type: array
+                  items:
+                    type: string
+            encoding:
+              caption:
+                style: form
+                explode: false
+              asset:
+                style: form
+              tags:
+                style: form
+                explode: true
+      responses:
+        '204':
+          description: The styled upload was stored without a response body.
   /forms:
     post:
       operationId: submitFormShowcase

@@ -32,6 +32,8 @@ impl SourceRef {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Ir {
     pub operations: Vec<Operation>,
+    /// Entry-document webhooks, in source insertion order.
+    pub webhooks: Vec<Webhook>,
     /// Entry-document `components.schemas`, in source insertion order.
     pub schemas: Vec<NamedSchema>,
     /// Entry-document server defaults, in source insertion order.
@@ -40,12 +42,24 @@ pub struct Ir {
     pub root_security: Vec<SecurityRequirement>,
     /// Entry-document named security schemes, in source insertion order.
     pub security_schemes: Vec<NamedSecurityScheme>,
+    /// The entry document's declared OpenAPI version, carried from the parser so version-dependent
+    /// rules read the document's own version rather than inferring it from the first media type —
+    /// media-less documents (204-only, header-only) have no media to infer from.
+    pub version: OasVersion,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OasVersion {
     V3_0,
     V3_1,
+}
+
+impl Default for OasVersion {
+    /// The constructor default for synthetic IRs built with `..Ir::default()`; real documents
+    /// always overwrite it with the parser's declared version.
+    fn default() -> Self {
+        Self::V3_1
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,10 +81,36 @@ pub struct Operation {
     pub parameters: Vec<Param>,
     pub request_body: Option<Body>,
     pub responses: Vec<ResponseEntry>,
+    /// Named callbacks, in source insertion order.
+    pub callbacks: Vec<Callback>,
     /// Operation-then-path-item effective servers; an empty array defers root fallback.
     pub servers: Vec<ServerEntry>,
     /// Operation-level security override; `None` preserves the document default.
     pub security: Option<Vec<SecurityRequirement>>,
+    pub source: SourceRef,
+}
+
+/// A named top-level webhook and its path-item operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Webhook {
+    pub name: String,
+    pub operations: Vec<Operation>,
+    pub source: SourceRef,
+}
+
+/// A named operation callback and its runtime expressions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Callback {
+    pub name: String,
+    pub expressions: Vec<CallbackExpression>,
+    pub source: SourceRef,
+}
+
+/// A callback runtime expression and its path-item operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallbackExpression {
+    pub expression: String,
+    pub operations: Vec<Operation>,
     pub source: SourceRef,
 }
 
@@ -211,22 +251,80 @@ pub struct NamedSecurityScheme {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "security schemes are few and their payloads intentionally remain inline"
+)]
 pub enum SecKind {
     /// HTTP authentication using the declared scheme token.
-    Http { scheme: String },
+    Http {
+        scheme: String,
+        bearer_format: Option<String>,
+    },
     /// API key serialized at the declared parameter location and name.
     ApiKey {
         location: ParamLocation,
         name: String,
     },
-    /// OAuth 2.0 flows; detailed flow parsing is deferred.
-    OAuth2,
-    /// OpenID Connect discovery; URL parsing is deferred.
-    OpenIdConnect,
+    /// OAuth 2.0 authentication with its declared flows.
+    OAuth2 { flows: OAuthFlows },
+    /// OpenID Connect discovery using the declared URL.
+    OpenIdConnect { url: String },
     /// Mutual TLS authentication.
     MutualTls,
     /// Unknown or unsupported security scheme shape.
     Other,
+}
+
+/// The four OAuth 2.0 flow kinds declared by OpenAPI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OAuthFlows {
+    pub implicit: Option<OAuthFlow>,
+    pub password: Option<OAuthFlow>,
+    pub client_credentials: Option<OAuthFlow>,
+    pub authorization_code: Option<OAuthFlow>,
+}
+
+impl OAuthFlows {
+    /// Returns whether no OAuth 2.0 flow is declared.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.implicit.is_none()
+            && self.password.is_none()
+            && self.client_credentials.is_none()
+            && self.authorization_code.is_none()
+    }
+
+    /// Returns declared scope names in first-seen order without duplicates.
+    #[must_use]
+    pub fn declared_scopes(&self) -> Vec<&str> {
+        let mut declared = Vec::new();
+        for flow in [
+            self.implicit.as_ref(),
+            self.password.as_ref(),
+            self.client_credentials.as_ref(),
+            self.authorization_code.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for (name, _) in &flow.scopes {
+                if !declared.contains(&name.as_str()) {
+                    declared.push(name.as_str());
+                }
+            }
+        }
+        declared
+    }
+}
+
+/// One OAuth 2.0 flow with source-ordered scope declarations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OAuthFlow {
+    pub authorization_url: Option<String>,
+    pub token_url: Option<String>,
+    pub refresh_url: Option<String>,
+    pub scopes: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,7 +332,50 @@ pub struct ResponseEntry {
     pub status: ResponseStatus,
     pub description: String,
     pub media_types: Vec<MediaType>,
+    /// Named response headers, in source insertion order.
+    pub headers: Vec<(String, ResponseHeader)>,
+    /// Named response links, in source insertion order.
+    pub links: Vec<Link>,
     pub source: SourceRef,
+}
+
+/// A response Header Object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResponseHeader {
+    /// Whether callers must receive this header.
+    pub required: bool,
+    /// Whether use of this header is discouraged.
+    pub deprecated: bool,
+    /// Human-readable header description.
+    pub description: Option<String>,
+    /// Header value schema.
+    pub schema: SchemaNode,
+    /// Source identity of this Header Object.
+    pub source: SourceRef,
+}
+
+/// A response Link Object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Link {
+    /// Link-map key exactly as declared.
+    pub name: String,
+    /// Target operation selector.
+    pub target: LinkTarget,
+    /// Operation parameters, in source insertion order.
+    pub parameters: Vec<(String, String)>,
+    /// Human-readable link description.
+    pub description: Option<String>,
+    /// Source identity of this Link Object.
+    pub source: SourceRef,
+}
+
+/// The operation selector declared by a response Link Object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LinkTarget {
+    /// An operation selected by its identifier.
+    OperationId(String),
+    /// An operation selected by a reference.
+    OperationRef(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -308,6 +449,22 @@ pub struct ObjectConstraints {
     pub max_properties: Option<u64>,
 }
 
+/// A finite `enum`/`const` value restriction shared by structural container schemas.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FiniteConstraint {
+    pub enum_values: Option<Vec<Value>>,
+    pub const_value: Option<Value>,
+}
+
+/// Splits a boxed [`FiniteConstraint`] into its parts, handing back `None`/`None` uniformly when
+/// the box is absent so callers don't special-case presence.
+#[must_use]
+pub fn finite_parts(finite: &Option<Box<FiniteConstraint>>) -> (Option<&[Value]>, Option<&Value>) {
+    finite.as_deref().map_or((None, None), |f| {
+        (f.enum_values.as_deref(), f.const_value.as_ref())
+    })
+}
+
 /// Per-node metadata carried by every [`SchemaNode`] variant.
 ///
 /// The five constraint/extension groups below are boxed because real specs populate them on well
@@ -323,6 +480,12 @@ pub struct ObjectConstraints {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SchemaMeta {
     pub nullable: bool,
+    /// OpenAPI `readOnly` on this schema node: the value is server-emitted only, never accepted
+    /// from the client.
+    pub read_only: bool,
+    /// OpenAPI `writeOnly` on this schema node: the value is client-supplied only, never emitted
+    /// by the server.
+    pub write_only: bool,
     /// OpenAPI 3.1 `contentEncoding`, retained for multipart composition.
     pub content_encoding: Option<String>,
     pub docs: SchemaDocs,
@@ -397,6 +560,38 @@ impl SchemaMeta {
         self.object_constraints
             .as_deref()
             .unwrap_or(&EMPTY_OBJECT_CONSTRAINTS)
+    }
+
+    /// Splits this meta for conjunction lowering, where an object that carries applicators
+    /// (`allOf`/`$ref`/`oneOf`/`anyOf`) alongside typed/constraint content is rewritten to a
+    /// synthetic `AllOf` wrapping a typed branch. The wrapper node keeps everything read once at
+    /// the conjunction — documentation, nullability, and read/write-only visibility — while the
+    /// typed branch takes the structured validation constraints it alone must enforce. The split is
+    /// what prevents double-application: TSDoc reads the wrapper's docs, validators walk the typed
+    /// branch's constraint groups, and no field lands on both sides. Both nodes point at the same
+    /// source. Returns `(wrapper, typed_branch)`.
+    #[must_use]
+    pub fn split_for_conjunction(self) -> (SchemaMeta, SchemaMeta) {
+        let typed = SchemaMeta {
+            content_encoding: self.content_encoding,
+            enum_extensions: self.enum_extensions,
+            numeric_constraints: self.numeric_constraints,
+            string_constraints: self.string_constraints,
+            array_constraints: self.array_constraints,
+            object_constraints: self.object_constraints,
+            rejected_validation_keywords: self.rejected_validation_keywords,
+            source: self.source.clone(),
+            ..SchemaMeta::default()
+        };
+        let wrapper = SchemaMeta {
+            nullable: self.nullable,
+            read_only: self.read_only,
+            write_only: self.write_only,
+            docs: self.docs,
+            source: self.source,
+            ..SchemaMeta::default()
+        };
+        (wrapper, typed)
     }
 }
 
@@ -478,15 +673,23 @@ pub enum SchemaNode {
         properties: Vec<(String, SchemaNode, PropMeta)>,
         additional_properties: AdditionalProperties,
         dependent_required: Vec<(String, Vec<String>)>,
+        /// Finite `enum`/`const` value restriction checked by validators; types stay structural.
+        finite: Option<Box<FiniteConstraint>>,
+        /// Required names asserted by the schema's `required` array but not declared in `properties`; enforced by validators only, invisible to the type surface.
+        extra_required: Vec<String>,
         meta: SchemaMeta,
     },
     Array {
         items: Box<SchemaNode>,
+        /// Finite `enum`/`const` value restriction checked by validators; types stay structural.
+        finite: Option<Box<FiniteConstraint>>,
         meta: SchemaMeta,
     },
     Tuple {
         prefix_items: Vec<SchemaNode>,
         rest: TupleRest,
+        /// Finite `enum`/`const` value restriction checked by validators; types stay structural.
+        finite: Option<Box<FiniteConstraint>>,
         meta: SchemaMeta,
     },
     AllOf {
@@ -502,6 +705,9 @@ pub enum SchemaNode {
     },
     AnyOf {
         branches: Vec<SchemaNode>,
+        /// Boxed: mirrors `OneOf`'s discriminator representation; present on a small fraction of
+        /// `anyOf` nodes, parsing deferred.
+        discriminator: Option<Box<Discriminator>>,
         meta: SchemaMeta,
     },
     /// The JSON Schema boolean schema `true`.
@@ -614,6 +820,7 @@ mod tests {
         for schema in [
             SchemaNode::AnyOf {
                 branches: Vec::new(),
+                discriminator: None,
                 meta: SchemaMeta {
                     nullable: true,
                     ..SchemaMeta::default()
@@ -628,5 +835,17 @@ mod tests {
         ] {
             assert_eq!(schema.is_nullable(), schema.meta().nullable);
         }
+    }
+
+    #[test]
+    fn finite_parts_splits_present_and_absent_boxes() {
+        assert_eq!(finite_parts(&None), (None, None));
+        let finite = Some(Box::new(FiniteConstraint {
+            enum_values: Some(vec![Value::from(1)]),
+            const_value: Some(Value::from(2)),
+        }));
+        let (enum_values, const_value) = finite_parts(&finite);
+        assert_eq!(enum_values, Some(&[Value::from(1)][..]));
+        assert_eq!(const_value, Some(&Value::from(2)));
     }
 }

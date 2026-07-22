@@ -7,11 +7,23 @@ use serde_json::Value;
 use crate::config::{ResolvedBaseUrl, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
-    EncodingHeader, EncodingObject, Ir, MediaType, NamedSecurityScheme, OasVersion, Operation,
-    ParamLocation, ParamStyle, PrimitiveType, ResponseStatus, SchemaNode, SecKind,
+    EncodingHeader, EncodingObject, Ir, MediaType, NamedSecurityScheme, OAuthFlow, OasVersion,
+    Operation, ParamLocation, ParamStyle, PrimitiveType, ResponseStatus, SchemaNode, SecKind,
     SecurityRequirement, ServerEntry, SourceRef,
 };
+use crate::loader::append_pointer;
 use crate::semantic::Analyzed;
+
+const CODE_OAUTH2_EMPTY_FLOWS: &str = "OASTS1435";
+const CODE_OAUTH2_FLOW_REQUIRED_URL: &str = "OASTS1436";
+const CODE_OAUTH2_FLOW_URL: &str = "OASTS1437";
+const CODE_OPENID_CONNECT_URL: &str = "OASTS1439";
+const CODE_OAUTH2_REQUIREMENT_SCOPE: &str = "OASTS1440";
+const CODE_NON_OAUTH_REQUIREMENT_SCOPES: &str = "OASTS1441";
+const CODE_URLENCODED_CONTENT_TYPE_IGNORED: &str = "OASTS1425";
+const CODE_MULTIPART_30_STYLE_IGNORED: &str = "OASTS1426";
+const CODE_MULTIPART_STYLE_UNDEFINED: &str = "OASTS1427";
+const JSON_PART_MEDIA: &str = "application/json";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientModel {
@@ -309,6 +321,11 @@ pub struct ResponsePlan {
     pub media: Vec<ResponseMediaPlan>,
     pub payload: PayloadDisposition,
     pub content_type_discriminated: bool,
+    /// Whether the response declares at least one header — independent of `payload`, since a
+    /// header applies to the response regardless of whether it carries a body. Drives the client
+    /// emitter's `meta.headers` narrowing and, when response validation is bound, its header
+    /// validator call.
+    pub has_headers: bool,
     pub source: SourceRef,
 }
 
@@ -371,6 +388,9 @@ pub fn build_client_model(
         .as_ref()
         .expect("the client model runs only when the client artifact is enabled");
     let projector = PrimitiveDomainProjector::new(&analyzed.ir);
+    let oas_version = analyzed.ir.version;
+    diagnose_security_schemes(&analyzed.ir, sink);
+    let security_schemes = index_security_schemes(&analyzed.ir);
     let operations = analyzed
         .ir
         .operations
@@ -399,7 +419,13 @@ pub fn build_client_model(
             };
             diagnose_parameters(operation, &projector, sink);
             diagnose_security(operation, &effective_security, &analyzed.ir, sink);
-            let auth_plan = plan_auth(operation, &effective_security, &analyzed.ir, sink);
+            let auth_plan = plan_auth(
+                operation,
+                &effective_security,
+                &security_schemes,
+                oas_version,
+                sink,
+            );
             diagnose_base_url(operation, &base_url, sink);
             if let Some(body) = &operation.request_body {
                 diagnose_request_media(&body.media_types, &projector, sink);
@@ -435,6 +461,128 @@ pub fn build_client_model(
         })
         .collect();
     ClientModel { operations }
+}
+
+fn diagnose_security_schemes(ir: &Ir, sink: &mut DiagnosticSink) {
+    for scheme in &ir.security_schemes {
+        match &scheme.kind {
+            SecKind::OAuth2 { flows } => {
+                if flows.is_empty() {
+                    sink.push(source_diagnostic(
+                        CODE_OAUTH2_EMPTY_FLOWS,
+                        "oauth2 scheme declares no flows",
+                        &scheme.source,
+                        Severity::Error,
+                    ));
+                }
+                diagnose_oauth_flow(
+                    scheme,
+                    "implicit",
+                    flows.implicit.as_ref(),
+                    &["authorizationUrl"],
+                    sink,
+                );
+                diagnose_oauth_flow(
+                    scheme,
+                    "password",
+                    flows.password.as_ref(),
+                    &["tokenUrl"],
+                    sink,
+                );
+                diagnose_oauth_flow(
+                    scheme,
+                    "clientCredentials",
+                    flows.client_credentials.as_ref(),
+                    &["tokenUrl"],
+                    sink,
+                );
+                diagnose_oauth_flow(
+                    scheme,
+                    "authorizationCode",
+                    flows.authorization_code.as_ref(),
+                    &["authorizationUrl", "tokenUrl"],
+                    sink,
+                );
+            }
+            SecKind::OpenIdConnect { url } => {
+                if url.is_empty() {
+                    sink.push(source_diagnostic(
+                        CODE_OPENID_CONNECT_URL,
+                        "openIdConnect scheme requires openIdConnectUrl",
+                        &scheme.source,
+                        Severity::Error,
+                    ));
+                } else if !is_absolute_url(url) {
+                    sink.push(source_diagnostic(
+                        CODE_OPENID_CONNECT_URL,
+                        format!("openIdConnectUrl '{url}' is not an absolute URL"),
+                        &scheme.source,
+                        Severity::Error,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn diagnose_oauth_flow(
+    scheme: &NamedSecurityScheme,
+    key: &str,
+    flow: Option<&OAuthFlow>,
+    required_fields: &[&str],
+    sink: &mut DiagnosticSink,
+) {
+    let Some(flow) = flow else {
+        return;
+    };
+    let source = oauth_flow_source(scheme, key);
+    // `refreshUrl` is never a required flow URL, so it carries a literal `false`; the other two ask
+    // the caller's list. Both the missing-required and non-absolute checks run per field — a field is
+    // never both (a missing URL cannot fail the absolute check) so a single pass over one table emits
+    // the same diagnostics the two separate passes did.
+    for (field, required, value) in [
+        (
+            "authorizationUrl",
+            required_fields.contains(&"authorizationUrl"),
+            flow.authorization_url.as_deref(),
+        ),
+        (
+            "tokenUrl",
+            required_fields.contains(&"tokenUrl"),
+            flow.token_url.as_deref(),
+        ),
+        ("refreshUrl", false, flow.refresh_url.as_deref()),
+    ] {
+        if required && value.is_none() {
+            sink.push(source_diagnostic(
+                CODE_OAUTH2_FLOW_REQUIRED_URL,
+                format!("{key} flow requires {field}"),
+                &source,
+                Severity::Error,
+            ));
+        }
+        if let Some(value) = value.filter(|value| !is_absolute_url(value)) {
+            sink.push(source_diagnostic(
+                CODE_OAUTH2_FLOW_URL,
+                format!("{key} {field} '{value}' is not an absolute URL"),
+                &source,
+                Severity::Error,
+            ));
+        }
+    }
+}
+
+fn oauth_flow_source(scheme: &NamedSecurityScheme, key: &str) -> SourceRef {
+    let flows_pointer = append_pointer(&scheme.source.json_pointer, "flows");
+    SourceRef {
+        json_pointer: append_pointer(&flows_pointer, key),
+        ..scheme.source.clone()
+    }
+}
+
+fn is_absolute_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| !url.cannot_be_a_base())
 }
 
 fn parameter_plan(parameter: &crate::ir::Param) -> ParameterPlan {
@@ -677,22 +825,18 @@ fn content_field_parts(
             },
         );
     // A `contentEncoding` implies a contentTransferEncoding only for a multipart part whose payload
-    // transmits an already-encoded string — the `default_part_media` arms that honor it
-    // (string-shaped or schemaless). On any other shape it does not change the wire payload, so
-    // priming the CTE-implies-text override would mislabel the field (an object part emits
-    // `payload: "text"` and throws `multipartPayload('text', {...})` at runtime on a type-correct
-    // call). On a urlencoded body the annotation never applies at all.
+    // transmits an already-encoded string — the string-or-schemaless shapes `default_part_media`
+    // honors. Both the shape check and the annotation resolve through a lowered conjunction's
+    // branches (`SchemaMeta::split_for_conjunction` moves `contentEncoding` onto the synthetic typed
+    // branch), so a `{$ref, contentEncoding}` part implies the same CTE as the un-lowered
+    // `{type: string, contentEncoding}` spelling. On any other shape the annotation does not change
+    // the wire payload, so priming the CTE-implies-text override would mislabel the field (an object
+    // part emits `payload: "text"` and throws `multipartPayload('text', {...})` at runtime on a
+    // type-correct call). On a urlencoded body the annotation never applies at all.
     let implicit_cte = (multipart
         && version == OasVersion::V3_1
-        && matches!(
-            resolved,
-            SchemaNode::Primitive {
-                ty: PrimitiveType::String,
-                ..
-            } | SchemaNode::Any { .. }
-                | SchemaNode::Finite { .. }
-        ))
-    .then(|| schema.meta().content_encoding.clone())
+        && part_encoding_is_string_shaped(schema, projector))
+    .then(|| resolved_content_encoding(schema, projector).map(str::to_owned))
     .flatten();
     // OAS 3.1.1 Encoding Object: `headers` SHALL be ignored when the body media type is not
     // multipart, so a urlencoded field never exposes a caller header.
@@ -750,6 +894,53 @@ fn caller_header(name: &str, header: &EncodingHeader) -> CallerHeaderPlan {
     }
 }
 
+/// The `contentEncoding` in effect for a part schema, resolved through `$ref` chains and the
+/// branches of a lowered conjunction. `SchemaMeta::split_for_conjunction` moves the annotation onto
+/// the synthetic typed branch, so a `{$ref, contentEncoding}` part carries it on a sibling of the
+/// shape branch; this reunites them the way the classifier folds a conjunction's shape.
+fn resolved_content_encoding<'a>(
+    schema: &'a SchemaNode,
+    projector: &'a PrimitiveDomainProjector<'_>,
+) -> Option<&'a str> {
+    let resolved = projector.resolve_schema(schema).unwrap_or(schema);
+    if let Some(encoding) = resolved.meta().content_encoding.as_deref() {
+        return Some(encoding);
+    }
+    match resolved {
+        SchemaNode::AllOf { branches, .. } => branches
+            .iter()
+            .find_map(|branch| resolved_content_encoding(branch, projector)),
+        _ => None,
+    }
+}
+
+/// Whether a part's effective shape is a string or schemaless — the shapes whose `contentEncoding`
+/// transmits an already-encoded string, so the annotation implies a contentTransferEncoding
+/// (`content_field_parts`). Resolves through `$ref` and a lowered conjunction's branches: every
+/// branch must itself be string-or-schemaless, so an object branch (which keeps a JSON payload)
+/// suppresses the implied CTE.
+fn part_encoding_is_string_shaped(
+    schema: &SchemaNode,
+    projector: &PrimitiveDomainProjector<'_>,
+) -> bool {
+    let resolved = projector.resolve_schema(schema).unwrap_or(schema);
+    match resolved {
+        SchemaNode::Primitive {
+            ty: PrimitiveType::String,
+            ..
+        }
+        | SchemaNode::Any { .. }
+        | SchemaNode::Finite { .. } => true,
+        SchemaNode::AllOf { branches, .. } => {
+            !branches.is_empty()
+                && branches
+                    .iter()
+                    .all(|branch| part_encoding_is_string_shaped(branch, projector))
+        }
+        _ => false,
+    }
+}
+
 // The media component is always a static literal, so it is returned borrowed: `diagnose_form_media`
 // reads only the binary-upload bool (no allocation on that path), while `content_field_parts`
 // `.to_owned()`s the media exactly where it stores it. The caller seeds `visited`; a ref-cyclic
@@ -760,15 +951,26 @@ fn default_part_media(
     projector: &PrimitiveDomainProjector<'_>,
     visited: &mut HashSet<(String, String)>,
 ) -> (&'static str, bool) {
+    let encoding = resolved_content_encoding(schema, projector);
+    default_part_media_impl(schema, version, encoding, projector, visited)
+}
+
+// `encoding` is the part's effective `contentEncoding`, resolved once through `$ref`/conjunction
+// branches so it reaches the shape branch even when `split_for_conjunction` moved it to a sibling.
+fn default_part_media_impl(
+    schema: &SchemaNode,
+    version: OasVersion,
+    encoding: Option<&str>,
+    projector: &PrimitiveDomainProjector<'_>,
+    visited: &mut HashSet<(String, String)>,
+) -> (&'static str, bool) {
     let resolved = projector.resolve_schema(schema).unwrap_or(schema);
     match resolved {
         SchemaNode::Ref { .. } => ("application/octet-stream", false),
         SchemaNode::Primitive {
             ty: PrimitiveType::String,
-            format,
-            meta,
             ..
-        } if version == OasVersion::V3_1 && meta.content_encoding.is_some() => {
+        } if version == OasVersion::V3_1 && encoding.is_some() => {
             ("application/octet-stream", false)
         }
         SchemaNode::Primitive {
@@ -787,15 +989,30 @@ fn default_part_media(
         }
         SchemaNode::Object { .. } | SchemaNode::Tuple { .. } => ("application/json", false),
         SchemaNode::Array { items, .. } if enter_array_items(items, visited) => {
-            default_part_media(items, version, projector, visited)
+            // An array's items carry their own encoding, not the array-level one.
+            let items_encoding = resolved_content_encoding(items, projector);
+            default_part_media_impl(items, version, items_encoding, projector, visited)
         }
         SchemaNode::Array { .. } => ("text/plain", false),
         SchemaNode::Any { .. } | SchemaNode::Finite { .. } if version == OasVersion::V3_1 => {
             // Mirror the `Primitive{String}` arm above: a schemaless 3.1 field carrying
             // `contentEncoding` transmits the already-encoded string on the wire (OAS 3.1.1), so it
             // is not a binary upload. Without the annotation the schemaless default stays binary.
-            let binary_upload = resolved.meta().content_encoding.is_none();
-            ("application/octet-stream", binary_upload)
+            ("application/octet-stream", encoding.is_none())
+        }
+        SchemaNode::AllOf { branches, .. } if version == OasVersion::V3_1 && encoding.is_some() => {
+            // A lowered conjunction (`SchemaMeta::split_for_conjunction`) scatters the original
+            // schema's shape and its `contentEncoding` across sibling branches. Classify through
+            // them with the reunited `encoding` so a `{$ref, contentEncoding}` part matches the
+            // un-lowered `{type, contentEncoding}` spelling; a branch's text/plain is the "no
+            // opinion" fallback, so the first branch with a concrete media wins.
+            branches
+                .iter()
+                .map(|branch| {
+                    default_part_media_impl(branch, version, encoding, projector, visited)
+                })
+                .find(|(media, _)| *media != "text/plain")
+                .unwrap_or(("text/plain", false))
         }
         _ if projector.project(resolved) == Projection::Known(Domain::OBJECT) => {
             ("application/json", false)
@@ -858,6 +1075,7 @@ fn response_table(
                 media,
                 payload,
                 content_type_discriminated,
+                has_headers: !response.headers.is_empty(),
                 source: response.source.clone(),
             }
         })
@@ -1060,6 +1278,32 @@ fn operation_label(operation: &Operation) -> String {
     )
 }
 
+/// A security scheme resolved by name, with its oauth2 declared scopes precomputed. Non-oauth2
+/// schemes carry an empty `declared_scopes`, which their planning never reads.
+struct SchemeLookup<'ir> {
+    scheme: &'ir NamedSecurityScheme,
+    declared_scopes: Vec<&'ir str>,
+}
+
+/// Indexes the document's security schemes by name once, so per-operation auth planning resolves a
+/// scheme in O(1) and never recomputes its declared scopes. Keeps the first scheme for a duplicated
+/// name, matching the earlier `Iterator::find` (first match).
+fn index_security_schemes(ir: &Ir) -> HashMap<&str, SchemeLookup<'_>> {
+    let mut index = HashMap::new();
+    for scheme in &ir.security_schemes {
+        index
+            .entry(scheme.name.as_str())
+            .or_insert_with(|| SchemeLookup {
+                scheme,
+                declared_scopes: match &scheme.kind {
+                    SecKind::OAuth2 { flows } => flows.declared_scopes(),
+                    _ => Vec::new(),
+                },
+            });
+    }
+    index
+}
+
 /// Resolves effective security into ordered OR alternatives, emitting a hard
 /// error for every scheme use the fetch client cannot serialize. Fail-closed:
 /// one unsupported member sinks the build even when a sibling alternative is
@@ -1067,7 +1311,8 @@ fn operation_label(operation: &Operation) -> String {
 fn plan_auth(
     operation: &Operation,
     security: &[SecurityRequirement],
-    ir: &Ir,
+    schemes: &HashMap<&str, SchemeLookup<'_>>,
+    oas_version: OasVersion,
     sink: &mut DiagnosticSink,
 ) -> Vec<AuthAlternative> {
     security
@@ -1075,7 +1320,9 @@ fn plan_auth(
         .map(|alternative| {
             alternative
                 .iter()
-                .filter_map(|(name, scopes)| auth_scheme_use(operation, name, scopes, ir, sink))
+                .filter_map(|(name, scopes)| {
+                    auth_scheme_use(operation, name, scopes, schemes, oas_version, sink)
+                })
                 .collect()
         })
         .collect()
@@ -1085,14 +1332,11 @@ fn auth_scheme_use(
     operation: &Operation,
     name: &str,
     scopes: &[String],
-    ir: &Ir,
+    schemes: &HashMap<&str, SchemeLookup<'_>>,
+    oas_version: OasVersion,
     sink: &mut DiagnosticSink,
 ) -> Option<AuthSchemeUse> {
-    let Some(scheme) = ir
-        .security_schemes
-        .iter()
-        .find(|scheme| scheme.name == name)
-    else {
+    let Some(lookup) = schemes.get(name) else {
         sink.push(source_diagnostic(
             "OASTS1434",
             format!(
@@ -1104,8 +1348,41 @@ fn auth_scheme_use(
         ));
         return None;
     };
+    let scheme = lookup.scheme;
+    match &scheme.kind {
+        SecKind::OAuth2 { .. } => {
+            for scope in scopes {
+                if !lookup.declared_scopes.contains(&scope.as_str()) {
+                    sink.push(source_diagnostic(
+                        CODE_OAUTH2_REQUIREMENT_SCOPE,
+                        format!(
+                            "security requirement scope '{scope}' is not declared by oauth2 scheme '{}'",
+                            scheme.name
+                        ),
+                        &operation.source,
+                        Severity::Error,
+                    ));
+                }
+            }
+        }
+        SecKind::OpenIdConnect { .. } => {
+            // OpenID Connect scopes are IdP-defined and invisible to the document.
+        }
+        _ if oas_version == OasVersion::V3_0 && !scopes.is_empty() => {
+            sink.push(source_diagnostic(
+                CODE_NON_OAUTH_REQUIREMENT_SCOPES,
+                format!(
+                    "security requirement for '{}' must not list scopes in OpenAPI 3.0",
+                    scheme.name
+                ),
+                &operation.source,
+                Severity::Error,
+            ));
+        }
+        _ => {}
+    }
     let kind = match &scheme.kind {
-        SecKind::Http { scheme: raw } => match raw.to_ascii_lowercase().as_str() {
+        SecKind::Http { scheme: raw, .. } => match raw.to_ascii_lowercase().as_str() {
             "basic" => Some(AuthKind::Basic),
             "bearer" => Some(AuthKind::Bearer),
             _ => {
@@ -1134,8 +1411,8 @@ fn auth_scheme_use(
             location: ParamLocation::Cookie,
             name,
         } => Some(AuthKind::ApiKeyCookie { name: name.clone() }),
-        SecKind::OAuth2 => Some(AuthKind::OAuth2),
-        SecKind::OpenIdConnect => Some(AuthKind::OpenIdConnect),
+        SecKind::OAuth2 { .. } => Some(AuthKind::OAuth2),
+        SecKind::OpenIdConnect { .. } => Some(AuthKind::OpenIdConnect),
         SecKind::MutualTls => {
             sink.push(source_diagnostic(
                 "OASTS1432",
@@ -1196,7 +1473,7 @@ fn reachable_schemes<'ir>(
 fn security_wire_key(scheme: &NamedSecurityScheme) -> Option<(ParamLocation, String)> {
     match &scheme.kind {
         SecKind::ApiKey { location, name } => Some((*location, name.clone())),
-        SecKind::Http { .. } | SecKind::OAuth2 | SecKind::OpenIdConnect => {
+        SecKind::Http { .. } | SecKind::OAuth2 { .. } | SecKind::OpenIdConnect { .. } => {
             Some((ParamLocation::Header, "authorization".to_owned()))
         }
         SecKind::MutualTls | SecKind::Other => None,
@@ -1259,7 +1536,7 @@ fn diagnose_base_url(operation: &Operation, base_url: &BaseUrlPlan, sink: &mut D
     for (name, variable) in &server.variables {
         substituted = substituted.replace(&format!("{{{name}}}"), &variable.default);
     }
-    if !url::Url::parse(&substituted).is_ok_and(|url| !url.cannot_be_a_base()) {
+    if !is_absolute_url(&substituted) {
         sink.push(source_diagnostic(
             "OASTS1420",
             format!(
@@ -1269,6 +1546,66 @@ fn diagnose_base_url(operation: &Operation, base_url: &BaseUrlPlan, sink: &mut D
             &server.source,
             Severity::Error,
         ));
+    }
+}
+
+/// Multipart-only admission matrix for an explicit encoding `style`/`explode` keyword (OASTS1427).
+///
+/// The OAS 3.1.1 Encoding Object defines per-part serialization for a narrow set of shapes: a
+/// primitive — text or binary alike, any style/explode — always maps to its existing scalar
+/// payload, and an array of primitives maps to `form`+`explode:true` repeated parts (the spec
+/// default, whether explicit or defaulted). Every other combination — `form`+`explode:false`, the
+/// delimited/deep styles at any explode, or any shape that resolves to a JSON part (an object, or
+/// an array whose items do) — has no defined per-part wire mapping, so it is rejected here rather
+/// than letting the emitter reuse the JSON-with-no-content-type shortcut it takes for unstyled
+/// object fields.
+///
+/// "Resolves to a JSON part" reuses `default_part_media` — the same classifier `content_field_parts`
+/// (field-payload planning) already applies to this field — rather than a raw domain-bit test, for
+/// two reasons that both matter here:
+///   - An allOf-of-objects schema lowers to a synthetic `AllOf` node, never a `SchemaNode::Object`;
+///     `default_part_media`'s catch-all (`projector.project(resolved) == Known(OBJECT)`) already
+///     handles it, so this stays caught as object-shaped instead of falling through as unclassified.
+///   - A schemaless 3.1 field (`SchemaNode::Any`/`Finite`) is the *only* way to express a binary
+///     upload in 3.1 (`default_part_media`'s dedicated arm), but projects to `Domain::FULL` — which
+///     includes the `OBJECT` bit. A domain-bit test would misclassify it as object-shaped and
+///     reject the binary-passthrough case the admission matrix must support; `default_part_media`
+///     resolves it to `application/octet-stream`, not JSON, so it correctly passes through here.
+fn multipart_style_admission_rejected(
+    style: ParamStyle,
+    explode: bool,
+    schema: &SchemaNode,
+    version: OasVersion,
+    projector: &PrimitiveDomainProjector<'_>,
+) -> bool {
+    let is_array = matches!(
+        projector.project(schema),
+        Projection::Known(domain) if domain.contains(Domain::ARRAY)
+    );
+    if is_array {
+        let items_are_object =
+            array_item_media(schema, version, projector) == Some(JSON_PART_MEDIA);
+        items_are_object || style != ParamStyle::Form || !explode
+    } else {
+        default_part_media(schema, version, projector, &mut HashSet::new()).0 == JSON_PART_MEDIA
+    }
+}
+
+/// The default part media of a resolved `Array` node's item schema, via the same
+/// `default_part_media` classifier. Anything else — a `Tuple`, or a shape the projector cannot
+/// resolve down to a concrete `Array` node — reports `None` so
+/// `multipart_style_admission_rejected` falls back to the array-of-primitives branch rather than
+/// guessing at item shape.
+fn array_item_media(
+    schema: &SchemaNode,
+    version: OasVersion,
+    projector: &PrimitiveDomainProjector<'_>,
+) -> Option<&'static str> {
+    match projector.resolve_schema(schema) {
+        Some(SchemaNode::Array { items, .. }) => {
+            Some(default_part_media(items, version, projector, &mut HashSet::new()).0)
+        }
+        _ => None,
     }
 }
 
@@ -1301,6 +1638,22 @@ fn diagnose_form_media(
             .iter()
             .find(|(field, _)| field == name)
             .map(|(_, encoding)| encoding);
+        if multipart
+            && media.oas_version == OasVersion::V3_0
+            && encoding.is_some_and(|encoding| {
+                encoding.style.is_some()
+                    || encoding.explode.is_some()
+                    || encoding.allow_reserved_explicit
+            })
+        {
+            let encoding = encoding.expect("multipart style keywords require an Encoding Object");
+            sink.push(source_diagnostic(
+                CODE_MULTIPART_30_STYLE_IGNORED,
+                "multipart encoding style keywords apply only to urlencoded bodies in OpenAPI 3.0 and are ignored",
+                &encoding.source,
+                Severity::Warning,
+            ));
+        }
         let style_applicable = encoding.is_some_and(|encoding| {
             (!multipart || media.oas_version == OasVersion::V3_1)
                 && (encoding.style.is_some()
@@ -1309,6 +1662,16 @@ fn diagnose_form_media(
         });
         if style_applicable {
             let encoding = encoding.expect("style applicability requires an Encoding Object");
+            if encoding.content_type.is_some() {
+                sink.push(source_diagnostic(
+                    CODE_URLENCODED_CONTENT_TYPE_IGNORED,
+                    format!(
+                        "urlencoded field '{name}' declares explicit serialization so encoding.contentType is ignored"
+                    ),
+                    &encoding.source,
+                    Severity::Warning,
+                ));
+            }
             let style = encoding.style.unwrap_or(ParamStyle::Form);
             let explode = encoding.explode.unwrap_or(style == ParamStyle::Form);
             if invalid_style_combination(
@@ -1321,6 +1684,29 @@ fn diagnose_form_media(
                     "OASTS1419",
                     format!(
                         "encoding for field '{name}' has an unsupported {style:?} serialization combination"
+                    ),
+                    &encoding.source,
+                    Severity::Error,
+                ));
+            }
+            // Multipart-only: 3.0 multipart style keywords never reach this branch (`style_applicable`
+            // requires `multipart => V3_1`), so `multipart` alone is the correct 3.1 gate. Independent
+            // of the query-legality check above — both can fire on the same field, since they test
+            // different things (is this a legal style/explode combination at all, vs. does multipart
+            // define any per-part wire mapping for it).
+            if multipart
+                && multipart_style_admission_rejected(
+                    style,
+                    explode,
+                    schema,
+                    media.oas_version,
+                    projector,
+                )
+            {
+                sink.push(source_diagnostic(
+                    CODE_MULTIPART_STYLE_UNDEFINED,
+                    format!(
+                        "multipart field '{name}' has no defined per-part serialization for {style:?}/explode={explode} with this schema shape; use encoding.contentType instead"
                     ),
                     &encoding.source,
                     Severity::Error,
@@ -2622,6 +3008,84 @@ mod tests {
     }
 
     #[test]
+    fn multipart_content_encoding_classifies_through_conjunction_branches() {
+        // A 3.1 part schema carrying `contentEncoding` beside a `$ref` lowers to a synthetic AllOf
+        // whose typed branch holds the annotation (SchemaMeta::split_for_conjunction). The part-media
+        // classifier must resolve the encoding through that branch exactly as it resolves the shape,
+        // so both spellings of a base64 string part classify identically as application/octet-stream
+        // — not text/plain for the lowered one.
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "schemas": { "Base": { "type": "string" } }
+            },
+            "paths": {
+                "/upload": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "direct": { "type": "string", "contentEncoding": "binary" },
+                                            "viaRef": {
+                                                "$ref": "#/components/schemas/Base",
+                                                "contentEncoding": "binary"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let fields = model.operations[0]
+            .body_plan
+            .as_ref()
+            .expect("body plan")
+            .multipart_fields()
+            .expect("multipart body");
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find(|field| field.name == name)
+                .expect("field")
+        };
+        let media = |name: &str| {
+            field(name)
+                .serialization
+                .content_media()
+                .expect("content")
+                .values
+                .clone()
+        };
+        assert_eq!(media("direct"), ["application/octet-stream"]);
+        assert_eq!(media("viaRef"), media("direct"));
+        // Both spellings imply the same contentTransferEncoding (the annotation resolved through the
+        // conjunction branch matches the un-lowered one).
+        for name in ["direct", "viaRef"] {
+            assert!(matches!(
+                &field(name).serialization,
+                FieldSerializationPlan::Content {
+                    content_transfer_encoding: Some(cte),
+                    ..
+                } if cte == "binary"
+            ));
+        }
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
     fn multipart_wrapper_headers_follow_admitted_caller_header_requiredness() {
         let document = json!({
             "openapi": "3.1.0",
@@ -3368,6 +3832,8 @@ mod tests {
                     properties: Vec::new(),
                     additional_properties: crate::ir::AdditionalProperties::Allowed(None),
                     dependent_required: Vec::new(),
+                    finite: None,
+                    extra_required: Vec::new(),
                     meta: test_meta("/object"),
                 },
             ],
@@ -3421,6 +3887,7 @@ mod tests {
         let tuple = SchemaNode::Tuple {
             prefix_items: Vec::new(),
             rest: crate::ir::TupleRest::Allowed,
+            finite: None,
             meta: test_meta("/tuple"),
         };
         assert_eq!(schema_admits_string(&tuple, "x", &projector), Some(false));
@@ -3453,6 +3920,7 @@ mod tests {
                 test_primitive(PrimitiveType::Integer, "/integer"),
                 string.clone(),
             ],
+            discriminator: None,
             meta: test_meta("/any-of"),
         };
         let all_of = SchemaNode::AllOf {
@@ -3512,6 +3980,8 @@ mod tests {
             properties: Vec::new(),
             additional_properties: crate::ir::AdditionalProperties::Allowed(None),
             dependent_required: Vec::new(),
+            finite: None,
+            extra_required: Vec::new(),
             meta: SchemaMeta {
                 nullable: true,
                 ..test_meta("/nullable-object")
@@ -3587,6 +4057,7 @@ mod tests {
                 name: "http".to_owned(),
                 kind: SecKind::Http {
                     scheme: "bearer".to_owned(),
+                    bearer_format: None,
                 },
                 source: SourceRef::new("openapi.json", "/http"),
             },
@@ -3617,6 +4088,7 @@ mod tests {
             parameters: Vec::new(),
             request_body: None,
             responses: Vec::new(),
+            callbacks: Vec::new(),
             servers: Vec::new(),
             security: None,
             source: SourceRef::new("openapi.json", "/operation"),
@@ -3632,7 +4104,8 @@ mod tests {
             ],
         ];
         let mut sink = DiagnosticSink::new();
-        let plan = plan_auth(&operation, &security, &ir, &mut sink);
+        let schemes = index_security_schemes(&ir);
+        let plan = plan_auth(&operation, &security, &schemes, OasVersion::V3_1, &mut sink);
         assert_eq!(
             plan,
             vec![
@@ -4810,6 +5283,305 @@ mod tests {
     }
 
     #[test]
+    fn urlencoded_style_with_contenttype_warns_1425() {
+        for version in ["3.0.3", "3.1.0"] {
+            let document = json!({
+                "openapi": version,
+                "paths": { "/forms": { "post": {
+                    "requestBody": { "content": {
+                        "application/x-www-form-urlencoded": {
+                            "schema": { "type": "object", "properties": { "field": { "type": "string" } } },
+                            "encoding": { "field": { "style": "form", "contentType": "text/plain" } }
+                        }
+                    }},
+                    "responses": { "204": { "description": "ok" } }
+                }}}
+            });
+            let diagnostics = client_diagnostics(&document);
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == CODE_URLENCODED_CONTENT_TYPE_IGNORED)
+                .expect("OASTS1425 diagnostic");
+            assert_eq!(diagnostic.severity, Severity::Warning);
+            assert_eq!(
+                diagnostic.json_pointer.as_deref(),
+                Some(
+                    "/paths/~1forms/post/requestBody/content/application~1x-www-form-urlencoded/encoding/field"
+                )
+            );
+            assert_eq!(
+                diagnostic.message,
+                "urlencoded field 'field' declares explicit serialization so encoding.contentType is ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn urlencoded_style_without_contenttype_no_warning() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": { "/forms": { "post": {
+                "requestBody": { "content": {
+                    "application/x-www-form-urlencoded": {
+                        "schema": { "type": "object", "properties": { "field": { "type": "string" } } },
+                        "encoding": { "field": { "style": "form" } }
+                    }
+                }},
+                "responses": { "204": { "description": "ok" } }
+            }}}
+        });
+        let diagnostics = client_diagnostics(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn urlencoded_contenttype_without_style_no_warning() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": { "/forms": { "post": {
+                "requestBody": { "content": {
+                    "application/x-www-form-urlencoded": {
+                        "schema": { "type": "object", "properties": { "field": { "type": "string" } } },
+                        "encoding": { "field": { "contentType": "text/plain" } }
+                    }
+                }},
+                "responses": { "204": { "description": "ok" } }
+            }}}
+        });
+        let diagnostics = client_diagnostics(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn multipart_30_style_keywords_warn_1426() {
+        let document = json!({
+            "openapi": "3.0.3",
+            "paths": { "/forms": { "post": {
+                "requestBody": { "content": {
+                    "multipart/form-data": {
+                        "schema": { "type": "object", "properties": {
+                            "styled": { "type": "string" },
+                            "exploded": { "type": "string" },
+                            "reserved": { "type": "string" }
+                        }},
+                        "encoding": {
+                            "styled": { "style": "form" },
+                            "exploded": { "explode": true },
+                            "reserved": { "allowReserved": true }
+                        }
+                    }
+                }},
+                "responses": { "204": { "description": "ok" } }
+            }}}
+        });
+        let diagnostics = client_diagnostics(&document);
+        let warnings = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_MULTIPART_30_STYLE_IGNORED)
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 3);
+        for field in ["styled", "exploded", "reserved"] {
+            let diagnostic = warnings
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic
+                        .json_pointer
+                        .as_deref()
+                        .is_some_and(|pointer| pointer.ends_with(&format!("/encoding/{field}")))
+                })
+                .expect("field warning");
+            assert_eq!(diagnostic.severity, Severity::Warning);
+            assert_eq!(
+                diagnostic.message,
+                "multipart encoding style keywords apply only to urlencoded bodies in OpenAPI 3.0 and are ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_31_style_keywords_no_1426() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": { "/forms": { "post": {
+                "requestBody": { "content": {
+                    "multipart/form-data": {
+                        "schema": { "type": "object", "properties": { "field": { "type": "string" } } },
+                        "encoding": { "field": { "style": "form", "explode": true, "allowReserved": true } }
+                    }
+                }},
+                "responses": { "204": { "description": "ok" } }
+            }}}
+        });
+        let diagnostics = client_diagnostics(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn oxs1427_rejects_undefined_multipart_style_combinations() {
+        // Four ways a 3.1 multipart field can have no defined per-part serialization: an array
+        // explicitly opting out of the repeated-parts default (`explode: false`), an array under a
+        // delimited/deep style (which multipart never defines, unlike urlencoded), an array whose
+        // items are objects even under the otherwise-supported form+explode:true pair, and an
+        // object with any explicit style keyword at all.
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": { "/forms": { "post": {
+                "requestBody": { "content": {
+                    "multipart/form-data": {
+                        "schema": { "type": "object", "properties": {
+                            "arrForm": { "type": "array", "items": { "type": "string" } },
+                            "arrDeep": { "type": "array", "items": { "type": "string" } },
+                            "arrObjItems": { "type": "array", "items": { "type": "object" } },
+                            "objStyled": { "type": "object" }
+                        }},
+                        "encoding": {
+                            "arrForm": { "style": "form", "explode": false },
+                            "arrDeep": { "style": "deepObject" },
+                            "arrObjItems": { "style": "form", "explode": true },
+                            "objStyled": { "style": "form" }
+                        }
+                    }
+                }},
+                "responses": { "204": { "description": "ok" } }
+            }}}
+        });
+        let flagged = client_diagnostics(&document)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == CODE_MULTIPART_STYLE_UNDEFINED)
+            .collect::<Vec<_>>();
+        for field in ["arrForm", "arrDeep", "arrObjItems", "objStyled"] {
+            assert_eq!(
+                flagged
+                    .iter()
+                    .filter(|diagnostic| diagnostic
+                        .json_pointer
+                        .as_deref()
+                        .is_some_and(|pointer| pointer.ends_with(&format!("/encoding/{field}"))))
+                    .count(),
+                1,
+                "expected exactly one OASTS1427 for '{field}'"
+            );
+        }
+        for (field, rendering) in [
+            ("arrForm", "Form/explode=false"),
+            ("arrDeep", "DeepObject/explode=false"),
+            ("arrObjItems", "Form/explode=true"),
+            ("objStyled", "Form/explode=true"),
+        ] {
+            let diagnostic = flagged
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic
+                        .json_pointer
+                        .as_deref()
+                        .is_some_and(|pointer| pointer.ends_with(&format!("/encoding/{field}")))
+                })
+                .expect("field diagnostic");
+            assert!(
+                diagnostic.message.contains(rendering),
+                "'{field}' message missing {rendering:?}: {}",
+                diagnostic.message
+            );
+            assert!(
+                diagnostic
+                    .message
+                    .contains("use encoding.contentType instead")
+            );
+        }
+    }
+
+    /// The conjunction lowering (allOf/$ref/applicator coexistence) resolves an allOf-of-objects
+    /// schema to a `Domain::OBJECT` projection without ever producing a `SchemaNode::Object` node.
+    /// The admission matrix classifies via `default_part_media`'s own domain-projection catch-all,
+    /// so this still reports OASTS1427 instead of silently falling through as unclassified.
+    #[test]
+    fn allof_object_conjunction_with_style_is_rejected() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": { "/forms": { "post": {
+                "requestBody": { "content": {
+                    "multipart/form-data": {
+                        "schema": { "type": "object", "properties": {
+                            "meta": {
+                                "allOf": [
+                                    { "type": "object", "properties": { "a": { "type": "string" } } },
+                                    { "type": "object", "properties": { "b": { "type": "string" } } }
+                                ]
+                            }
+                        }},
+                        "encoding": { "meta": { "style": "form" } }
+                    }
+                }},
+                "responses": { "204": { "description": "ok" } }
+            }}}
+        });
+        let flagged = client_diagnostics(&document)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == CODE_MULTIPART_STYLE_UNDEFINED)
+            .collect::<Vec<_>>();
+        assert_eq!(flagged.len(), 1, "{flagged:#?}");
+        assert!(flagged[0].message.contains("'meta'"));
+    }
+
+    /// A schemaless 3.1 field is the only way to express a binary upload in that version
+    /// (`default_part_media`'s dedicated arm), and it projects to `Domain::FULL` — which includes
+    /// the `OBJECT` bit. The admission matrix must classify it by `default_part_media`'s actual
+    /// media (`application/octet-stream`, not JSON), not by domain-bit containment, or this
+    /// passthrough case would be misclassified as object-shaped and rejected.
+    #[test]
+    fn binary_primitive_multipart_field_with_style_no_oxs1427() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": { "/uploads": { "post": {
+                "requestBody": { "content": {
+                    "multipart/form-data": {
+                        "schema": { "type": "object", "properties": {
+                            "file": {}
+                        }},
+                        "encoding": { "file": { "style": "form" } }
+                    }
+                }},
+                "responses": { "204": { "description": "ok" } }
+            }}}
+        });
+        // Schemaless + styled produces no diagnostic of any kind: it is fully admitted.
+        assert!(client_diagnostics(&document).is_empty());
+    }
+
+    /// OASTS1427 is 3.1-only: 3.0 multipart style keywords are already warn-ignored by OASTS1426, so
+    /// the same object+style shape in a 3.0 document must not additionally report OASTS1427.
+    #[test]
+    fn oxs1427_does_not_fire_on_30_documents() {
+        let document = json!({
+            "openapi": "3.0.3",
+            "paths": { "/forms": { "post": {
+                "requestBody": { "content": {
+                    "multipart/form-data": {
+                        "schema": { "type": "object", "properties": {
+                            "meta": { "type": "object" }
+                        }},
+                        "encoding": { "meta": { "style": "form" } }
+                    }
+                }},
+                "responses": { "204": { "description": "ok" } }
+            }}}
+        });
+        let diagnostics = client_diagnostics(&document);
+        // OASTS1426 (the 3.0 multipart style warning) is expected on this exact shape, so the
+        // diagnostics list here is never empty — the `.filter()` below always has a non-empty
+        // source to iterate.
+        diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_MULTIPART_30_STYLE_IGNORED)
+            .expect("OASTS1426 diagnostic");
+        let oxs1427 = diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == CODE_MULTIPART_STYLE_UNDEFINED)
+            .collect::<Vec<_>>();
+        assert!(oxs1427.is_empty(), "{oxs1427:#?}");
+    }
+
+    #[test]
     fn oxs1419_applies_restricted_styles_to_encoding_objects() {
         let document = json!({
             "openapi": "3.1.0",
@@ -4900,6 +5672,174 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn oauth2_empty_flows_errors_1435() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "oauth": { "type": "oauth2" }
+            }}
+        });
+        let diagnostics = client_diagnostics(&document);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_OAUTH2_EMPTY_FLOWS)
+            .expect("empty OAuth2 flows diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/components/securitySchemes/oauth")
+        );
+        assert_eq!(diagnostic.message, "oauth2 scheme declares no flows");
+    }
+
+    #[test]
+    fn flow_missing_required_url_errors_1436() {
+        for (key, fields) in [
+            ("implicit", vec!["authorizationUrl"]),
+            ("password", vec!["tokenUrl"]),
+            ("clientCredentials", vec!["tokenUrl"]),
+            ("authorizationCode", vec!["authorizationUrl", "tokenUrl"]),
+        ] {
+            let mut document = json!({
+                "openapi": "3.1.0",
+                "components": { "securitySchemes": {
+                    "oauth": { "type": "oauth2", "flows": {} }
+                }}
+            });
+            let mut flows = serde_json::Map::new();
+            flows.insert(key.to_owned(), json!({ "scopes": {} }));
+            document["components"]["securitySchemes"]["oauth"]["flows"] = Value::Object(flows);
+            let diagnostics = client_diagnostics(&document);
+            let hits = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_OAUTH2_FLOW_REQUIRED_URL)
+                .collect::<Vec<_>>();
+            assert_eq!(hits.len(), fields.len(), "{key}: {diagnostics:#?}");
+            let pointer = format!("/components/securitySchemes/oauth/flows/{key}");
+            for (diagnostic, field) in hits.iter().zip(fields) {
+                assert_eq!(diagnostic.severity, Severity::Error);
+                assert_eq!(diagnostic.json_pointer.as_deref(), Some(pointer.as_str()));
+                assert_eq!(diagnostic.message, format!("{key} flow requires {field}"));
+            }
+        }
+    }
+
+    #[test]
+    fn flow_url_not_absolute_errors_1437() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "oauth": {
+                    "type": "oauth2",
+                    "flows": { "authorizationCode": {
+                        "authorizationUrl": "relative",
+                        "tokenUrl": "urn:example",
+                        "refreshUrl": "https://example.test/refresh",
+                        "scopes": {}
+                    }}
+                }
+            }}
+        });
+        let diagnostics = client_diagnostics(&document);
+        let hits = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_OAUTH2_FLOW_URL)
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 2);
+        for diagnostic in &hits {
+            assert_eq!(diagnostic.severity, Severity::Error);
+            assert_eq!(
+                diagnostic.json_pointer.as_deref(),
+                Some("/components/securitySchemes/oauth/flows/authorizationCode")
+            );
+        }
+        assert!(hits.iter().any(|diagnostic| {
+            diagnostic.message
+                == "authorizationCode authorizationUrl 'relative' is not an absolute URL"
+        }));
+        assert!(hits.iter().any(|diagnostic| {
+            diagnostic.message == "authorizationCode tokenUrl 'urn:example' is not an absolute URL"
+        }));
+    }
+
+    #[test]
+    fn openidconnect_url_missing_or_invalid_errors_1439() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "missing": { "type": "openIdConnect" },
+                "invalid": {
+                    "type": "openIdConnect",
+                    "openIdConnectUrl": "urn:example"
+                }
+            }}
+        });
+        let diagnostics = client_diagnostics(&document);
+        let missing = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.message == "openIdConnect scheme requires openIdConnectUrl"
+            })
+            .expect("missing OpenID Connect URL diagnostic");
+        assert_eq!(missing.code, CODE_OPENID_CONNECT_URL);
+        assert_eq!(missing.severity, Severity::Error);
+        assert_eq!(
+            missing.json_pointer.as_deref(),
+            Some("/components/securitySchemes/missing")
+        );
+        let invalid = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.message == "openIdConnectUrl 'urn:example' is not an absolute URL"
+            })
+            .expect("invalid OpenID Connect URL diagnostic");
+        assert_eq!(invalid.code, CODE_OPENID_CONNECT_URL);
+        assert_eq!(invalid.severity, Severity::Error);
+        assert_eq!(
+            invalid.json_pointer.as_deref(),
+            Some("/components/securitySchemes/invalid")
+        );
+    }
+
+    #[test]
+    fn valid_flows_produce_no_diagnostics() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "oauth": {
+                    "type": "oauth2",
+                    "flows": {
+                        "implicit": {
+                            "authorizationUrl": "https://example.test/authorize",
+                            "refreshUrl": "https://example.test/refresh",
+                            "scopes": {}
+                        },
+                        "password": {
+                            "tokenUrl": "https://example.test/token",
+                            "scopes": {}
+                        },
+                        "clientCredentials": {
+                            "tokenUrl": "https://example.test/token",
+                            "scopes": {}
+                        },
+                        "authorizationCode": {
+                            "authorizationUrl": "https://example.test/authorize",
+                            "tokenUrl": "https://example.test/token",
+                            "scopes": {}
+                        }
+                    }
+                },
+                "oidc": {
+                    "type": "openIdConnect",
+                    "openIdConnectUrl": "https://example.test/.well-known/openid-configuration"
+                }
+            }}
+        });
+        let diagnostics = client_diagnostics(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
     #[test]
@@ -5398,6 +6338,201 @@ mod tests {
                 scopes: Vec::new(),
             }]]
         );
+    }
+
+    #[test]
+    fn oauth2_requirement_scope_outside_union_errors_1440() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "oauth": {
+                    "type": "oauth2",
+                    "flows": {
+                        "implicit": {
+                            "authorizationUrl": "https://example.test/authorize",
+                            "scopes": { "scope.a": "A" }
+                        },
+                        "clientCredentials": {
+                            "tokenUrl": "https://example.test/token",
+                            "scopes": { "scope.b": "B" }
+                        }
+                    }
+                }
+            }},
+            "paths": { "/p": { "get": {
+                "operationId": "op",
+                "security": [{ "oauth": ["scope.a", "scope.b", "scope.missing"] }],
+                "responses": { "200": { "description": "ok" } }
+            }}}
+        });
+        let (_analyzed, _model, sink) = runtime_plan(&document);
+        let hits = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_OAUTH2_REQUIREMENT_SCOPE)
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::Error);
+        assert_eq!(hits[0].source_id.as_deref(), Some("workspace/openapi.json"));
+        assert_eq!(hits[0].json_pointer.as_deref(), Some("/paths/~1p/get"));
+        assert_eq!(
+            hits[0].message,
+            "security requirement scope 'scope.missing' is not declared by oauth2 scheme 'oauth'"
+        );
+    }
+
+    #[test]
+    fn oauth2_requirement_all_scopes_declared_is_clean() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "oauth": {
+                    "type": "oauth2",
+                    "flows": {
+                        "implicit": {
+                            "authorizationUrl": "https://example.test/authorize",
+                            "scopes": { "scope.a": "A" }
+                        },
+                        "clientCredentials": {
+                            "tokenUrl": "https://example.test/token",
+                            "scopes": { "scope.b": "B" }
+                        }
+                    }
+                }
+            }},
+            "paths": { "/p": { "get": {
+                "operationId": "op",
+                "security": [{ "oauth": ["scope.a", "scope.b"] }],
+                "responses": { "200": { "description": "ok" } }
+            }}}
+        });
+        let diagnostics = client_diagnostics(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn oauth2_scheme_use_survives_scope_error() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "oauth": {
+                    "type": "oauth2",
+                    "flows": { "clientCredentials": {
+                        "tokenUrl": "https://example.test/token",
+                        "scopes": { "scope.a": "A" }
+                    }}
+                }
+            }},
+            "paths": { "/p": { "get": {
+                "operationId": "op",
+                "security": [{ "oauth": ["scope.missing"] }],
+                "responses": { "200": { "description": "ok" } }
+            }}}
+        });
+        let (_analyzed, model, sink) = runtime_plan(&document);
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_OAUTH2_REQUIREMENT_SCOPE)
+        );
+        assert_eq!(
+            model.operations[0].auth_plan,
+            vec![vec![AuthSchemeUse {
+                name: "oauth".to_owned(),
+                kind: AuthKind::OAuth2,
+                scopes: vec!["scope.missing".to_owned()],
+            }]]
+        );
+    }
+
+    #[test]
+    fn oidc_requirement_scopes_unchecked() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "oidc": {
+                    "type": "openIdConnect",
+                    "openIdConnectUrl": "https://example.test/.well-known/openid-configuration"
+                }
+            }},
+            "paths": { "/p": { "get": {
+                "operationId": "op",
+                "security": [{ "oidc": ["provider-defined", "arbitrary"] }],
+                "responses": { "200": { "description": "ok" } }
+            }}}
+        });
+        let diagnostics = client_diagnostics(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn non_oauth_scopes_error_in_30_clean_in_31() {
+        for (version, expected_code) in [
+            ("3.0.3", Some(CODE_NON_OAUTH_REQUIREMENT_SCOPES)),
+            ("3.1.0", None),
+        ] {
+            let document = json!({
+                "openapi": version,
+                "components": { "securitySchemes": {
+                    "apiKey": { "type": "apiKey", "in": "header", "name": "X-Key" }
+                }},
+                "paths": { "/p": { "get": {
+                    "operationId": "op",
+                    "security": [{ "apiKey": ["role:reader"] }],
+                    "responses": { "200": {
+                        "description": "ok",
+                        "content": { "application/json": { "schema": { "type": "object" } } }
+                    } }
+                }}}
+            });
+            let diagnostics = client_diagnostics(&document);
+            let hits = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_NON_OAUTH_REQUIREMENT_SCOPES)
+                .collect::<Vec<_>>();
+            match expected_code {
+                Some(code) => {
+                    assert_eq!(hits.len(), 1);
+                    assert_eq!(hits[0].code, code);
+                    assert_eq!(hits[0].severity, Severity::Error);
+                    assert_eq!(hits[0].source_id.as_deref(), Some("workspace/openapi.json"));
+                    assert_eq!(hits[0].json_pointer.as_deref(), Some("/paths/~1p/get"));
+                    assert_eq!(
+                        hits[0].message,
+                        "security requirement for 'apiKey' must not list scopes in OpenAPI 3.0"
+                    );
+                }
+                None => assert!(hits.is_empty(), "{diagnostics:#?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn media_less_30_document_still_gates_version_dependent_rules() {
+        // A 3.0 document with no media anywhere (204-only response, no request/response content) has
+        // no media type to infer the OAS version from. The version now rides the IR from the parser,
+        // so the 3.0-only non-oauth-scopes gate (OASTS1441) still fires; the same document as 3.1 is
+        // clean. (Regression: media inference defaulted a media-less document to 3.1 and silently
+        // skipped the gate.)
+        for (version, expected) in [("3.0.3", 1usize), ("3.1.0", 0usize)] {
+            let document = json!({
+                "openapi": version,
+                "components": { "securitySchemes": {
+                    "apiKeyAuth": { "type": "apiKey", "in": "header", "name": "X-Key" }
+                }},
+                "paths": { "/p": { "get": {
+                    "operationId": "op",
+                    "security": [{ "apiKeyAuth": ["scopeA"] }],
+                    "responses": { "204": { "description": "no content" } }
+                }}}
+            });
+            let diagnostics = client_diagnostics(&document);
+            let hits = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_NON_OAUTH_REQUIREMENT_SCOPES)
+                .count();
+            assert_eq!(hits, expected, "version {version}: {diagnostics:#?}");
+        }
     }
 
     #[test]

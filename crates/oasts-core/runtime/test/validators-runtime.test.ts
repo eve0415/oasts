@@ -5,6 +5,7 @@ import {
   appendKey,
   codePointLength,
   deepEqual,
+  hasGet,
   isDate,
   isDateTime,
   isInt32,
@@ -14,6 +15,18 @@ import {
   issue,
   type Issue,
 } from "../validators-runtime.ts";
+
+describe("hasGet", () => {
+  test("recognizes objects with a get method", () => {
+    assert.equal(hasGet(new Headers()), true);
+    assert.equal(hasGet({ get: () => null }), true);
+  });
+
+  test("rejects values without a get method", () => {
+    assert.equal(hasGet(null), false);
+    assert.equal(hasGet({}), false);
+  });
+});
 
 describe("issue", () => {
   test("wraps a path and message into a plain object", () => {

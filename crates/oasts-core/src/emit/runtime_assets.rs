@@ -1,11 +1,11 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::config::ResolvedBaseUrl;
-use crate::ir::SourceRef;
+use crate::ir::{ServerVariable, SourceRef};
 
-use super::GeneratedFile;
 use super::model::EmissionModel;
+use super::{GeneratedFile, render_property_key, render_ts_string};
 
 const RESULT_TS: &str = include_str!("../../runtime/result.ts");
 const SERIALIZE_TS: &str = include_str!("../../runtime/serialize.ts");
@@ -14,6 +14,8 @@ const TRANSPORT_TS: &str = include_str!("../../runtime/transport.ts");
 
 const FROZEN_TRANSPORT_BASE_URL_OPTIONAL: &str = "  baseUrl?: string;                                   // generated as REQUIRED when config client.baseUrl.source is \"runtime\"";
 const FROZEN_TRANSPORT_BASE_URL_REQUIRED: &str = "  baseUrl: string;                                   // generated as REQUIRED when config client.baseUrl.source is \"runtime\"";
+const FROZEN_TRANSPORT_SERVER_VARIABLES: &str =
+    "  serverVariables?: Readonly<Record<string, string>>;";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum RegionId {
@@ -49,6 +51,10 @@ pub(crate) struct RuntimeSelection<'selection, 'input, 'sink> {
     pub(crate) serialize_needed: bool,
     pub(crate) base_url: &'selection ResolvedBaseUrl,
     pub(crate) source: &'selection SourceRef,
+    /// Every `(name, ServerVariable)` declared by any server the client model exposes, across all
+    /// operations, in source order. Determines whether `TransportConfig.serverVariables` narrows
+    /// from `Readonly<Record<string, string>>` to a per-variable literal-union object type.
+    pub(crate) server_variables: &'selection [(String, ServerVariable)],
 }
 
 /// Emits selected runtime modules and registers their paths with all other artifacts.
@@ -96,7 +102,11 @@ pub(crate) fn emit_runtime_files(selection: RuntimeSelection<'_, '_, '_>) -> Vec
         );
     }
 
-    let transport = specialize_transport(&assets.transport, runtime_base_url);
+    let transport = specialize_transport(
+        &assets.transport,
+        runtime_base_url,
+        selection.server_variables,
+    );
     push_runtime_file(
         &mut files,
         selection.model,
@@ -306,24 +316,110 @@ fn render_serialize(
     })
 }
 
-fn specialize_transport(asset: &ParsedAsset<'_>, runtime_base_url: bool) -> String {
+fn specialize_transport(
+    asset: &ParsedAsset<'_>,
+    runtime_base_url: bool,
+    server_variables: &[(String, ServerVariable)],
+) -> String {
     let transport = render_regions(asset, |_| true);
-    let occurrences = transport
-        .match_indices(FROZEN_TRANSPORT_BASE_URL_OPTIONAL)
-        .count();
-    assert_eq!(
-        occurrences, 1,
-        "embedded runtime asset transport.ts must contain the frozen optional baseUrl line exactly once"
+    let transport = substitute_frozen_once(
+        transport,
+        FROZEN_TRANSPORT_BASE_URL_OPTIONAL,
+        "embedded runtime asset transport.ts must contain the frozen optional baseUrl line exactly once",
+        runtime_base_url.then_some(FROZEN_TRANSPORT_BASE_URL_REQUIRED),
     );
-    if runtime_base_url {
-        transport.replacen(
-            FROZEN_TRANSPORT_BASE_URL_OPTIONAL,
-            FROZEN_TRANSPORT_BASE_URL_REQUIRED,
-            1,
-        )
-    } else {
-        transport
+    substitute_frozen_once(
+        transport,
+        FROZEN_TRANSPORT_SERVER_VARIABLES,
+        "embedded runtime asset transport.ts must contain the frozen serverVariables line exactly once",
+        server_variable_union(server_variables).as_deref(),
+    )
+}
+
+/// Asserts the frozen `line` appears exactly once in `text` — the embedded runtime asset is the
+/// source of truth, so a missing or duplicated anchor is a build-time invariant break — then
+/// replaces that single occurrence with `replacement` when one is supplied, leaving `text` as-is
+/// otherwise.
+fn substitute_frozen_once(
+    text: String,
+    line: &str,
+    message: &str,
+    replacement: Option<&str>,
+) -> String {
+    assert_eq!(text.match_indices(line).count(), 1, "{message}");
+    match replacement {
+        Some(replacement) => text.replacen(line, replacement, 1),
+        None => text,
     }
+}
+
+/// Builds the `serverVariables` type from every server the client model exposes, e.g.
+/// `Record<string, never> | { version: "v1" | "v2" } | { region: string }`. One single-property
+/// branch per variable name, first-seen order across servers, plus a leading empty branch so
+/// `{}` (override nothing) stays valid. A name's property type is a literal union only when every
+/// server declaring it gives it a non-empty `enum` (unioning first-seen literals across servers);
+/// it stays `string` when any declaring server omits the enum, since a runtime substitution from
+/// that server could then be any string. Returns `None` when no variable anywhere declares a
+/// non-empty enum — the frozen `Readonly<Record<string, string>>` line then applies verbatim, so
+/// every existing enum-free fixture's transport.ts stays byte-identical (the determinism guard).
+///
+/// A single object type with each property individually optional (`{ version?: "v1" | "v2";
+/// region?: string }`) reads as the obvious shape but does not survive `freezeRecord`'s generic
+/// `Record<Key, Value>` inference: TypeScript infers `Value` from every property's *apparent*
+/// type, and an optional property's apparent type always includes `undefined`, which then fails
+/// to assign back to `Transport.serverVariables: Readonly<Record<string, string>>` (verified
+/// against the pinned `tsc`; every property mandatory-but-optional-object-wide avoids this,
+/// because none of the union's branches contain an optional property for inference to poison).
+/// The branch count is linear in the declared variable count (n + 1), not its powerset: a
+/// caller's object literal is checked for excess properties against the union of every branch's
+/// keys, not one branch in isolation, so combining several names in one call (`{ version: "v2",
+/// region: "us" }`) still typechecks against these single-property branches.
+fn server_variable_union(variables: &[(String, ServerVariable)]) -> Option<String> {
+    if variables
+        .iter()
+        .all(|(_, variable)| variable.enum_values.is_empty())
+    {
+        return None;
+    }
+
+    let mut order: Vec<&str> = Vec::new();
+    let mut lacks_enum: HashSet<&str> = HashSet::new();
+    let mut literals: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (name, variable) in variables {
+        let name = name.as_str();
+        if !order.contains(&name) {
+            order.push(name);
+        }
+        if variable.enum_values.is_empty() {
+            lacks_enum.insert(name);
+            continue;
+        }
+        let bucket = literals.entry(name).or_default();
+        for value in &variable.enum_values {
+            let value = value.as_str();
+            if !bucket.contains(&value) {
+                bucket.push(value);
+            }
+        }
+    }
+
+    let mut branches = vec!["Record<string, never>".to_owned()];
+    branches.extend(order.into_iter().map(|name| {
+        let key = render_property_key(name);
+        if lacks_enum.contains(name) {
+            format!("{{ {key}: string }}")
+        } else {
+            let union = literals
+                .remove(name)
+                .expect("a name absent from lacks_enum declared an enum at least once")
+                .into_iter()
+                .map(render_ts_string)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            format!("{{ {key}: {union} }}")
+        }
+    }));
+    Some(format!("  serverVariables?: {};", branches.join(" | ")))
 }
 
 fn render_regions(asset: &ParsedAsset<'_>, include: impl Fn(&RegionId) -> bool) -> String {
@@ -449,11 +545,24 @@ mod tests {
         serialize_needed: bool,
         base_url: &ResolvedBaseUrl,
     ) -> (Vec<GeneratedFile>, Vec<crate::diag::Diagnostic>) {
+        emit_with_server_variables(config, helpers, serialize_needed, base_url, &[])
+    }
+
+    fn emit_with_server_variables(
+        config: &ResolvedConfig,
+        helpers: impl IntoIterator<Item = &'static str>,
+        serialize_needed: bool,
+        base_url: &ResolvedBaseUrl,
+        server_variables: &[(String, ServerVariable)],
+    ) -> (Vec<GeneratedFile>, Vec<crate::diag::Diagnostic>) {
         let analyzed = Analyzed {
             ir: crate::ir::Ir::default(),
             operation_names: Vec::new(),
             schema_names: Vec::new(),
             enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
         };
         let helpers = helpers.into_iter().map(str::to_owned).collect();
         let source = source();
@@ -465,6 +574,7 @@ mod tests {
             serialize_needed,
             base_url,
             source: &source,
+            server_variables,
         });
         drop(model);
         (files, sink.into_sorted_vec())
@@ -674,6 +784,9 @@ mod tests {
             operation_names: Vec::new(),
             schema_names: Vec::new(),
             enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
         };
         let source = source();
         let helpers = BTreeSet::new();
@@ -687,6 +800,7 @@ mod tests {
             serialize_needed: false,
             base_url: &base_url,
             source: &source,
+            server_variables: &[],
         });
         drop(model);
         assert_eq!(files.len(), 3);
@@ -695,6 +809,85 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "OASTS1302")
         );
+    }
+
+    fn server_variable(default: &str, enum_values: &[&str]) -> ServerVariable {
+        ServerVariable {
+            default: default.to_owned(),
+            enum_values: enum_values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn server_variable_union_orders_dedups_and_widens_mixed_names() {
+        // No variable anywhere has an enum: `None` leaves the frozen line for the caller to keep.
+        assert_eq!(
+            server_variable_union(&[("region".to_owned(), server_variable("us", &[]))]),
+            None
+        );
+        assert_eq!(server_variable_union(&[]), None);
+
+        // order: first-seen name order across servers (region, version, mixed, quoted).
+        // dedup: version's "v2" repeats across its two occurrences and collapses to one.
+        // mixed enum+plain: "mixed" is enum'd in one occurrence and plain in another, so any
+        // declaring occurrence lacking the enum widens the whole name to `string`.
+        // escaping: "quoted"'s literal contains a double quote, rendered through the same TS
+        // string encoder as every other emitted string literal.
+        let variables = [
+            ("region".to_owned(), server_variable("us", &[])),
+            ("version".to_owned(), server_variable("v2", &["v1", "v2"])),
+            ("version".to_owned(), server_variable("v2", &["v2", "v3"])),
+            ("mixed".to_owned(), server_variable("a", &["a"])),
+            ("mixed".to_owned(), server_variable("b", &[])),
+            ("quoted".to_owned(), server_variable("a\"b", &["a\"b"])),
+        ];
+        let expected = format!(
+            "  serverVariables?: Record<string, never> | {{ region: string }} | {{ version: {} }} | {{ mixed: string }} | {{ quoted: {} }};",
+            ["v1", "v2", "v3"].map(render_ts_string).join(" | "),
+            render_ts_string("a\"b"),
+        );
+        assert_eq!(
+            server_variable_union(&variables).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn no_enum_server_variables_leave_transport_byte_identical() {
+        let assets = runtime_assets();
+        let frozen = render_regions(&assets.transport, |_| true);
+        assert!(frozen.contains(FROZEN_TRANSPORT_SERVER_VARIABLES));
+        let no_enum = [("region".to_owned(), server_variable("us", &[]))];
+        assert_eq!(
+            specialize_transport(&assets.transport, false, &no_enum),
+            frozen
+        );
+        assert_eq!(specialize_transport(&assets.transport, false, &[]), frozen);
+    }
+
+    #[test]
+    fn enum_server_variable_rewrites_the_frozen_server_variables_line() {
+        let (_temp, config) = resolved_config(json!({}));
+        let variables = [
+            ("version".to_owned(), server_variable("v2", &["v1", "v2"])),
+            ("region".to_owned(), server_variable("us", &[])),
+        ];
+        let (files, diagnostics) = emit_with_server_variables(
+            &config,
+            [],
+            false,
+            &ResolvedBaseUrl::Server { index: 0 },
+            &variables,
+        );
+        let transport = content(&files, "transport.ts");
+        assert!(!transport.contains(FROZEN_TRANSPORT_SERVER_VARIABLES));
+        assert!(transport.contains(
+            "  serverVariables?: Record<string, never> | { version: \"v1\" | \"v2\" } | { region: string };"
+        ));
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

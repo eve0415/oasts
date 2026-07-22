@@ -11,16 +11,27 @@ use crate::config::{
     EnumExtensions, EnumMemberCase, EnumRepresentation, NamingConfig, OperationCase,
     ResolvedConfig, TypesConfig,
 };
-use crate::diag::{Diagnostic, DiagnosticSink};
+use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
-    AdditionalProperties, Ir, Operation, PrimitiveType, SchemaMeta, SchemaNode, SegmentPart,
-    SourceRef, TupleRest,
+    AdditionalProperties, Callback, ExclusiveBound, Ir, LinkTarget, Operation, ParamLocation,
+    PrimitiveType, SchemaMeta, SchemaNode, SegmentPart, SourceRef, TupleRest, Webhook,
+    finite_parts,
 };
-use crate::num::render_number;
+use crate::num::{finite_binary64, first_number_outside_binary64, render_number};
 
 const CODE_OPERATION_NAME: &str = "OASTS1201";
 const CODE_TYPE_NAME: &str = "OASTS1202";
 const CODE_ENUM_RULE_14: &str = "OASTS1214";
+const CODE_NUMERIC_BOUND_DOMAIN: &str = "OASTS1215";
+const CODE_ANNOTATION_DOMAIN: &str = "OASTS1216";
+const CODE_LINK_OPERATION_ID: &str = "OASTS1231";
+const CODE_LINK_OPERATION_REF: &str = "OASTS1232";
+const CODE_LINK_PARAMETER: &str = "OASTS1233";
+// Webhook and callback name stems allocate in their own scopes (see `allocate_webhook_names`
+// and `allocate_callback_names`) but share one collision/normalization-failure code: both are
+// the same failure shape (a generated identifier collides or fails to normalize) just applied
+// to a different declaration kind, and neither scope is user-configurable yet.
+const CODE_WEBHOOK_NAME: &str = "OASTS1321";
 // Config-category (exit code 2): an override key that names no declaration in the document.
 const CODE_OVERRIDE_UNMATCHED: &str = "OASTS0202";
 
@@ -138,6 +149,57 @@ pub struct AllocatedOperationName {
     pub source: SourceRef,
 }
 
+/// One webhook operation's allocated name stem, indexed into `Ir.webhooks[webhook_index]
+/// .operations[operation_index]`. Webhook files emit to their own output directory, so this
+/// stem lives in a scope entirely separate from `AllocatedOperationName`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllocatedWebhookName {
+    pub webhook_index: usize,
+    pub operation_index: usize,
+    pub stem: String,
+    pub source: SourceRef,
+}
+
+/// Locates the operation that declares a callback, so the emitter can both reach that operation's
+/// `&Operation` (to descend into the callback) and name the `<ParentStem>Callbacks` descriptor.
+/// A callback can hang off a path operation, a webhook operation, or another callback operation
+/// (nesting), so the parent is one of those three — the `Callback` variant references the
+/// enclosing callback's own `AllocatedCallbackName` by its index in `Analyzed.callback_names`,
+/// which allocation always fills before the nested child (pre-order), so the index resolves.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum CallbackParent {
+    /// `Ir.operations[operation_index]`.
+    Operation { operation_index: usize },
+    /// `Ir.webhooks[webhook_index].operations[operation_index]`.
+    WebhookOperation {
+        webhook_index: usize,
+        operation_index: usize,
+    },
+    /// The enclosing callback-expression operation, at `Analyzed.callback_names[index]`.
+    Callback { index: usize },
+}
+
+/// One callback-expression operation's allocated name stem. `parent` plus the three descent
+/// indices address the operation node at
+/// `<parent operation>.callbacks[callback_index].expressions[expression_index]
+/// .operations[operation_index_within_expression]`. Covers callbacks at every depth: on path
+/// operations, on webhook operations, and nested inside another callback's operation.
+///
+/// `parent_stem` is the declaring operation's own stem (e.g. `PutSquare` for a path operation,
+/// the webhook stem for a webhook operation, the enclosing callback's stem for a nested one) —
+/// it is both this stem's naming base and the `<parent_stem>Callbacks` descriptor name, stored
+/// here so the emitter groups and names descriptors without re-deriving parent stems.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllocatedCallbackName {
+    pub parent: CallbackParent,
+    pub parent_stem: String,
+    pub callback_index: usize,
+    pub expression_index: usize,
+    pub operation_index_within_expression: usize,
+    pub stem: String,
+    pub source: SourceRef,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AllocatedSchemaName {
     pub schema_index: usize,
@@ -160,11 +222,21 @@ pub struct EnumMemberTable {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedLink {
+    pub response_source: SourceRef,
+    pub link_name: String,
+    pub target_operation_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Analyzed {
     pub ir: Ir,
     pub operation_names: Vec<AllocatedOperationName>,
     pub schema_names: Vec<AllocatedSchemaName>,
     pub enum_members: Vec<EnumMemberTable>,
+    pub link_targets: Vec<ResolvedLink>,
+    pub webhook_names: Vec<AllocatedWebhookName>,
+    pub callback_names: Vec<AllocatedCallbackName>,
 }
 
 /// Runs name allocation and rule-14 enum analysis using resolved config.
@@ -180,6 +252,9 @@ pub fn analyze_with_options(
     sink: &mut DiagnosticSink,
 ) -> Analyzed {
     let operation_names = allocate_operation_names(&ir, naming, sink);
+    let webhook_names = allocate_webhook_names(&ir, sink);
+    let callback_names = allocate_callback_names(&ir, &operation_names, &webhook_names, sink);
+    let link_targets = resolve_links(&ir, sink);
     let schema_names = allocate_schema_names(&ir, naming, sink);
     report_unmatched_overrides(&ir, naming, sink);
     let mut enum_members = Vec::new();
@@ -212,7 +287,104 @@ pub fn analyze_with_options(
         operation_names,
         schema_names,
         enum_members,
+        link_targets,
+        webhook_names,
+        callback_names,
     }
+}
+
+fn resolve_links(ir: &Ir, sink: &mut DiagnosticSink) -> Vec<ResolvedLink> {
+    // Resolve each link target in O(1). Both maps keep the first operation for a given key, so a
+    // lookup lands on the same operation `Iterator::position` (first match) returned before.
+    let mut by_operation_id: HashMap<&str, usize> = HashMap::new();
+    let mut by_json_pointer: HashMap<&str, usize> = HashMap::new();
+    for (index, operation) in ir.operations.iter().enumerate() {
+        if let Some(operation_id) = operation.operation_id.as_deref() {
+            by_operation_id.entry(operation_id).or_insert(index);
+        }
+        by_json_pointer
+            .entry(operation.source.json_pointer.as_str())
+            .or_insert(index);
+    }
+    let mut resolved_links = Vec::new();
+    for operation in &ir.operations {
+        for response in &operation.responses {
+            for link in &response.links {
+                let target_operation_index = match &link.target {
+                    LinkTarget::OperationId(operation_id) => {
+                        let target = by_operation_id.get(operation_id.as_str()).copied();
+                        if target.is_none() {
+                            sink.push(source_diagnostic(
+                                CODE_LINK_OPERATION_ID,
+                                format!(
+                                    "link '{}' references unknown operationId '{}'",
+                                    link.name, operation_id
+                                ),
+                                &link.source,
+                            ));
+                        }
+                        target
+                    }
+                    LinkTarget::OperationRef(operation_ref) => {
+                        let target = operation_ref
+                            .strip_prefix('#')
+                            .and_then(|fragment| by_json_pointer.get(fragment).copied());
+                        if target.is_none() {
+                            sink.push(source_diagnostic(
+                                CODE_LINK_OPERATION_REF,
+                                format!(
+                                    "link '{}' operationRef '{}' does not resolve to an operation in this document",
+                                    link.name, operation_ref
+                                ),
+                                &link.source,
+                            ));
+                        }
+                        target
+                    }
+                };
+                if let Some(target_operation_index) = target_operation_index {
+                    for (parameter, _) in &link.parameters {
+                        if !link_parameter_is_declared(
+                            &ir.operations[target_operation_index],
+                            parameter,
+                        ) {
+                            sink.push(source_diagnostic(
+                                CODE_LINK_PARAMETER,
+                                format!(
+                                    "link '{}' parameter '{}' is not declared by the target operation",
+                                    link.name, parameter
+                                ),
+                                &link.source,
+                            ));
+                        }
+                    }
+                }
+                resolved_links.push(ResolvedLink {
+                    response_source: response.source.clone(),
+                    link_name: link.name.clone(),
+                    target_operation_index,
+                });
+            }
+        }
+    }
+    resolved_links
+}
+
+fn link_parameter_is_declared(operation: &Operation, key: &str) -> bool {
+    let qualified = key.split_once('.').and_then(|(prefix, name)| {
+        let location = match prefix {
+            "path" => ParamLocation::Path,
+            "query" => ParamLocation::Query,
+            "header" => ParamLocation::Header,
+            "cookie" => ParamLocation::Cookie,
+            _ => return None,
+        };
+        Some((location, name))
+    });
+    let (location, name) = qualified.map_or((None, key), |(location, name)| (Some(location), name));
+    operation.parameters.iter().any(|parameter| {
+        parameter.name == name && location.is_none_or(|location| parameter.location == location)
+    })
 }
 
 /// Allocates one operation name from an explicit ID or its method/path fallback.
@@ -301,6 +473,229 @@ fn allocate_operation_names(
         }
     }
     names
+}
+
+/// Allocates one name stem per webhook operation, in a collision scope entirely separate from
+/// `allocate_operation_names`.
+///
+/// Webhook files emit to their own output directory (a later, emission-side concern), so a
+/// webhook stem colliding with, or being identical to, a path-operation name is not a collision
+/// at all — the two never share a directory. Tracking both kinds in the same `seen` map would
+/// make an unrelated webhook name perturb path-operation allocation (and vice versa), so this
+/// pass keeps its own map and never touches the operation-name one.
+fn allocate_webhook_names(ir: &Ir, sink: &mut DiagnosticSink) -> Vec<AllocatedWebhookName> {
+    let mut names = Vec::new();
+    let mut seen: HashMap<String, (String, SourceRef)> = HashMap::new();
+    for (webhook_index, webhook) in ir.webhooks.iter().enumerate() {
+        for (operation_index, operation) in webhook.operations.iter().enumerate() {
+            match derive_webhook_stem(webhook, operation) {
+                Ok(stem) => {
+                    report_collision(
+                        "webhook",
+                        CODE_WEBHOOK_NAME,
+                        &stem,
+                        &operation.source,
+                        &mut seen,
+                        sink,
+                    );
+                    names.push(AllocatedWebhookName {
+                        webhook_index,
+                        operation_index,
+                        stem,
+                        source: operation.source.clone(),
+                    });
+                }
+                Err((input, error)) => push_name_error(
+                    CODE_WEBHOOK_NAME,
+                    "webhook",
+                    &input,
+                    error,
+                    &operation.source,
+                    sink,
+                ),
+            }
+        }
+    }
+    names
+}
+
+/// Derives one webhook operation's name stem: the operation's own `operationId` if present
+/// (mirroring `derive_operation_name`, which never touches the method once an `operationId` is
+/// available), else the webhook's name plus the Pascal-cased HTTP method — the same
+/// Pascal-cased-token composition `derive_operation_name`'s fallback uses for path parts,
+/// applied to a webhook's name instead of a path template (webhooks have no path).
+///
+/// The method is capitalized directly rather than run through `normalize_identifier`: it is one
+/// of the parser's fixed `METHODS` literals (never document-supplied), so it can never fail to
+/// normalize — exactly the trust `derive_operation_name`'s own fallback already places in it.
+fn derive_webhook_stem(
+    webhook: &Webhook,
+    operation: &Operation,
+) -> Result<String, (String, NormalizeError)> {
+    if let Some(operation_id) = &operation.operation_id {
+        return normalize_identifier(operation_id, TargetCase::Pascal)
+            .map_err(|error| (operation_id.clone(), error));
+    }
+    let name_stem = normalize_identifier(&webhook.name, TargetCase::Pascal)
+        .map_err(|error| (webhook.name.clone(), error))?;
+    Ok(format!(
+        "{name_stem}{}",
+        capitalize_token(&operation.method)
+    ))
+}
+
+/// Allocates one name stem per callback-expression operation at every depth, in a single
+/// collision scope separate from both `allocate_operation_names` and `allocate_webhook_names`.
+///
+/// Every callback operation emits to the one shared `types/callbacks/` directory regardless of
+/// where it was declared, so all callback stems — path-operation, webhook-operation, and nested
+/// — share this pass's one `seen` map (a stem colliding across those declaration sites is a real
+/// file collision), while webhooks and path operations keep their own separate scopes.
+///
+/// The walk is pre-order DFS: each callback operation's stem is allocated, then its own nested
+/// callbacks are walked with that stem as their parent. A callback whose parent operation failed
+/// to allocate a stem (a path/webhook operation absent from its name table, or a callback
+/// operation whose own normalization failed) has no base to build on and is skipped, along with
+/// anything nested beneath it.
+fn allocate_callback_names(
+    ir: &Ir,
+    operation_names: &[AllocatedOperationName],
+    webhook_names: &[AllocatedWebhookName],
+    sink: &mut DiagnosticSink,
+) -> Vec<AllocatedCallbackName> {
+    let mut names = Vec::new();
+    let mut seen: HashMap<String, (String, SourceRef)> = HashMap::new();
+    for allocated in operation_names {
+        let operation = &ir.operations[allocated.operation_index];
+        // Fast-reject before the parent-stem allocation: the vast majority of operations declare
+        // no callbacks, so deriving a stem for each would allocate a String that is never used.
+        if operation.callbacks.is_empty() {
+            continue;
+        }
+        let parent_stem = capitalize_token(&allocated.name);
+        allocate_operation_callbacks(
+            operation,
+            &CallbackParent::Operation {
+                operation_index: allocated.operation_index,
+            },
+            &parent_stem,
+            &mut names,
+            &mut seen,
+            sink,
+        );
+    }
+    for allocated in webhook_names {
+        allocate_operation_callbacks(
+            &ir.webhooks[allocated.webhook_index].operations[allocated.operation_index],
+            &CallbackParent::WebhookOperation {
+                webhook_index: allocated.webhook_index,
+                operation_index: allocated.operation_index,
+            },
+            &allocated.stem,
+            &mut names,
+            &mut seen,
+            sink,
+        );
+    }
+    names
+}
+
+/// Allocates every callback declared directly on `operation`, then recurses into each allocated
+/// callback operation's own callbacks. `parent` and `parent_stem` describe the declaring
+/// operation (the recursion passes the just-allocated child as the parent of its nested
+/// callbacks).
+fn allocate_operation_callbacks(
+    operation: &Operation,
+    parent: &CallbackParent,
+    parent_stem: &str,
+    names: &mut Vec<AllocatedCallbackName>,
+    seen: &mut HashMap<String, (String, SourceRef)>,
+    sink: &mut DiagnosticSink,
+) {
+    for (callback_index, callback) in operation.callbacks.iter().enumerate() {
+        // The expression disambiguator only exists to keep expressions apart within the
+        // same callback; a single-expression callback needs none.
+        let disambiguate = callback.expressions.len() > 1;
+        for (expression_index, expression) in callback.expressions.iter().enumerate() {
+            for (operation_index_within_expression, expression_operation) in
+                expression.operations.iter().enumerate()
+            {
+                let allocation = derive_callback_stem(
+                    parent_stem,
+                    callback,
+                    expression_index,
+                    disambiguate,
+                    expression_operation,
+                );
+                match allocation {
+                    Ok(stem) => {
+                        report_collision(
+                            "callback",
+                            CODE_WEBHOOK_NAME,
+                            &stem,
+                            &expression_operation.source,
+                            seen,
+                            sink,
+                        );
+                        let index = names.len();
+                        names.push(AllocatedCallbackName {
+                            parent: parent.clone(),
+                            parent_stem: parent_stem.to_owned(),
+                            callback_index,
+                            expression_index,
+                            operation_index_within_expression,
+                            stem: stem.clone(),
+                            source: expression_operation.source.clone(),
+                        });
+                        allocate_operation_callbacks(
+                            expression_operation,
+                            &CallbackParent::Callback { index },
+                            &stem,
+                            names,
+                            seen,
+                            sink,
+                        );
+                    }
+                    Err((input, error)) => push_name_error(
+                        CODE_WEBHOOK_NAME,
+                        "callback",
+                        &input,
+                        error,
+                        &expression_operation.source,
+                        sink,
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// Derives one callback-expression operation's name stem: the parent operation's own stem, the
+/// callback's Pascal-cased name, an optional 1-based `_N` expression disambiguator, then the
+/// Pascal-cased HTTP method. The runtime expression string (e.g. `{$request.body#/url}`) never
+/// contributes to the identifier — it is preserved verbatim only for later use as a quoted
+/// string key in descriptor emission.
+///
+/// As in `derive_webhook_stem`, the method is capitalized directly: it is always one of the
+/// parser's fixed `METHODS` literals, never document-supplied, so it cannot fail to normalize.
+fn derive_callback_stem(
+    parent_stem: &str,
+    callback: &Callback,
+    expression_index: usize,
+    disambiguate: bool,
+    operation: &Operation,
+) -> Result<String, (String, NormalizeError)> {
+    let callback_name_stem = normalize_identifier(&callback.name, TargetCase::Pascal)
+        .map_err(|error| (callback.name.clone(), error))?;
+    let disambiguator = if disambiguate {
+        format!("_{}", expression_index + 1)
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "{parent_stem}{callback_name_stem}{disambiguator}{}",
+        capitalize_token(&operation.method)
+    ))
 }
 
 fn allocate_schema_names(
@@ -456,6 +851,8 @@ struct EnumAnalysis<'options, 'output> {
 }
 
 fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>) {
+    validate_numeric_bound_domain(schema.meta(), analysis.sink);
+    validate_annotation_domain(schema.meta(), analysis.sink);
     match schema {
         SchemaNode::Primitive {
             ty,
@@ -484,10 +881,12 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
         SchemaNode::Object {
             properties,
             additional_properties,
+            finite,
             meta,
             ..
         } => {
-            validate_enum_extensions(None, meta, analysis.types, analysis.sink);
+            let (enum_values, const_value) = finite_parts(finite);
+            analyze_finite_values(None, enum_values, const_value, meta, analysis);
             for (_, property, _) in properties {
                 analyze_schema_enums(property, analysis);
             }
@@ -499,16 +898,24 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
                 AdditionalProperties::Allowed(None) | AdditionalProperties::Forbidden => {}
             }
         }
-        SchemaNode::Array { items, meta } => {
-            validate_enum_extensions(None, meta, analysis.types, analysis.sink);
+        SchemaNode::Array {
+            items,
+            finite,
+            meta,
+            ..
+        } => {
+            let (enum_values, const_value) = finite_parts(finite);
+            analyze_finite_values(None, enum_values, const_value, meta, analysis);
             analyze_schema_enums(items, analysis);
         }
         SchemaNode::Tuple {
             prefix_items,
             rest,
+            finite,
             meta,
         } => {
-            validate_enum_extensions(None, meta, analysis.types, analysis.sink);
+            let (enum_values, const_value) = finite_parts(finite);
+            analyze_finite_values(None, enum_values, const_value, meta, analysis);
             for item in prefix_items {
                 analyze_schema_enums(item, analysis);
             }
@@ -517,7 +924,7 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
             }
         }
         SchemaNode::AllOf { branches, meta }
-        | SchemaNode::AnyOf { branches, meta }
+        | SchemaNode::AnyOf { branches, meta, .. }
         | SchemaNode::OneOf { branches, meta, .. } => {
             validate_enum_extensions(None, meta, analysis.types, analysis.sink);
             for branch in branches {
@@ -529,6 +936,59 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
         | SchemaNode::Never { meta }
         | SchemaNode::Unknown { meta, .. } => {
             validate_enum_extensions(None, meta, analysis.types, analysis.sink);
+        }
+    }
+}
+
+fn validate_numeric_bound_domain(meta: &SchemaMeta, sink: &mut DiagnosticSink) {
+    let constraints = meta.numeric_constraints();
+    let bounds = [
+        ("minimum", constraints.minimum.as_ref()),
+        ("maximum", constraints.maximum.as_ref()),
+        (
+            "exclusiveMinimum",
+            match constraints.exclusive_minimum.as_ref() {
+                Some(ExclusiveBound::Number(number)) => Some(number),
+                Some(ExclusiveBound::Boolean(_)) | None => None,
+            },
+        ),
+        (
+            "exclusiveMaximum",
+            match constraints.exclusive_maximum.as_ref() {
+                Some(ExclusiveBound::Number(number)) => Some(number),
+                Some(ExclusiveBound::Boolean(_)) | None => None,
+            },
+        ),
+    ];
+    for (keyword, number) in bounds {
+        if let Some(number) = number
+            && finite_binary64(number).is_none()
+        {
+            sink.push(source_diagnostic(
+                CODE_NUMERIC_BOUND_DOMAIN,
+                format!(
+                    "numeric bound {keyword} '{}' is outside the binary64 domain",
+                    number
+                ),
+                &meta.source,
+            ));
+        }
+    }
+}
+
+fn validate_annotation_domain(meta: &SchemaMeta, sink: &mut DiagnosticSink) {
+    for value in meta.docs.default.iter().chain(meta.docs.examples.iter()) {
+        if let Some(number) = first_number_outside_binary64(value) {
+            let mut diagnostic = source_diagnostic(
+                CODE_ANNOTATION_DOMAIN,
+                format!(
+                    "default or example value '{}' is outside the binary64 domain and is shown only as documentation text",
+                    number
+                ),
+                &meta.source,
+            );
+            diagnostic.severity = Severity::Warning;
+            sink.push(diagnostic);
         }
     }
 }
@@ -856,7 +1316,7 @@ fn validate_numeric_value(
     match value {
         Value::Number(number) => {
             let raw = number.to_string();
-            let Some(binary64) = number.as_f64().filter(|value| value.is_finite()) else {
+            let Some(binary64) = finite_binary64(number) else {
                 enum_error(
                     meta,
                     format!("numeric member {raw} is outside the binary64 domain"),
@@ -1174,14 +1634,22 @@ fn compact_json(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use serde_json::json;
+    use tempfile::TempDir;
 
     use std::collections::BTreeMap;
 
     use super::*;
     use crate::config::{EnumExtensions, EnumRepresentation, NameOverrides};
-    use crate::diag::Category;
-    use crate::ir::{NamedSchema, SchemaDocs, SchemaRef, Segment};
+    use crate::diag::{Category, Severity};
+    use crate::ir::{
+        CallbackExpression, FiniteConstraint, Link, NamedSchema, Param, ParamLocation,
+        ResponseEntry, ResponseStatus, SchemaDocs, SchemaRef, Segment,
+    };
+    use crate::loader::load_graph;
+    use crate::parse::parse;
 
     fn named_schema(name: &str) -> NamedSchema {
         let pointer = format!("/components/schemas/{name}");
@@ -1226,6 +1694,109 @@ mod tests {
         }
     }
 
+    fn diagnostics_for_schema(schema: &str) -> Vec<Diagnostic> {
+        let temp = TempDir::new().expect("temp directory");
+        let input = temp.path().join("openapi.json");
+        let config_path = temp.path().join("oasts.json");
+        let schema = serde_json::from_str::<Value>(schema).expect("schema JSON");
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {},
+            "components": { "schemas": { "Value": schema } }
+        });
+        fs::write(&input, serde_json::to_vec(&document).expect("OpenAPI JSON"))
+            .expect("OpenAPI document");
+        fs::write(
+            &config_path,
+            r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated"}"#,
+        )
+        .expect("config JSON");
+        let config =
+            crate::config::load_config(Some(&config_path), temp.path()).expect("valid config");
+        let mut sink = DiagnosticSink::new();
+        let graph = load_graph(&config, &mut sink).expect("loaded graph");
+        let ir = parse(&graph, &mut sink).expect("supported OpenAPI");
+        let _analyzed = analyze(ir, &config, &mut sink);
+        sink.into_sorted_vec()
+    }
+
+    fn assert_bound_domain_diagnostic(schema: &str, keyword: &str) {
+        let diagnostics = diagnostics_for_schema(schema);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_NUMERIC_BOUND_DOMAIN)
+            .expect("numeric bound domain diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.message,
+            format!("numeric bound {keyword} '1e+999' is outside the binary64 domain")
+        );
+        assert!(
+            diagnostic
+                .source_id
+                .as_deref()
+                .is_some_and(|source| source.ends_with("openapi.json"))
+        );
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/components/schemas/Value")
+        );
+    }
+
+    #[test]
+    fn minimum_outside_binary64_errors() {
+        assert_bound_domain_diagnostic(r#"{"type":"number","minimum":1e999}"#, "minimum");
+    }
+
+    #[test]
+    fn maximum_outside_binary64_errors() {
+        assert_bound_domain_diagnostic(r#"{"type":"number","maximum":1e999}"#, "maximum");
+    }
+
+    #[test]
+    fn exclusive_minimum_number_outside_binary64_errors() {
+        assert_bound_domain_diagnostic(
+            r#"{"type":"number","exclusiveMinimum":1e999}"#,
+            "exclusiveMinimum",
+        );
+    }
+
+    #[test]
+    fn exclusive_maximum_number_outside_binary64_errors() {
+        assert_bound_domain_diagnostic(
+            r#"{"type":"number","exclusiveMaximum":1e999}"#,
+            "exclusiveMaximum",
+        );
+    }
+
+    #[test]
+    fn default_outside_binary64_warns_oxs1216() {
+        let diagnostics = diagnostics_for_schema(r#"{"type":"number","default":1e999}"#);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_ANNOTATION_DOMAIN)
+            .expect("annotation domain diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(
+            diagnostic.message,
+            "default or example value '1e+999' is outside the binary64 domain and is shown only as documentation text"
+        );
+        assert!(
+            diagnostic
+                .source_id
+                .as_deref()
+                .is_some_and(|source| source.ends_with("openapi.json"))
+        );
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/components/schemas/Value")
+        );
+
+        let control = diagnostics_for_schema(r#"{"type":"number","default":1.5}"#);
+        assert!(control.is_empty(), "{control:?}");
+    }
+
     fn operation(path: Vec<Segment>) -> Operation {
         Operation {
             method: "get".to_owned(),
@@ -1238,10 +1809,281 @@ mod tests {
             parameters: Vec::new(),
             request_body: None,
             responses: Vec::new(),
+            callbacks: Vec::new(),
             servers: Vec::new(),
             security: None,
             source: source("/paths/~1test/get"),
         }
+    }
+
+    fn operation_with_response(
+        pointer: &str,
+        operation_id: Option<&str>,
+        response_pointer: &str,
+        links: Vec<Link>,
+    ) -> Operation {
+        let mut operation = operation(Vec::new());
+        operation.operation_id = operation_id.map(str::to_owned);
+        operation.source = source(pointer);
+        operation.responses.push(ResponseEntry {
+            status: ResponseStatus::Exact("200".to_owned()),
+            description: "ok".to_owned(),
+            media_types: Vec::new(),
+            headers: Vec::new(),
+            links,
+            source: source(response_pointer),
+        });
+        operation
+    }
+
+    fn link(name: &str, target: LinkTarget, parameters: &[&str]) -> Link {
+        Link {
+            name: name.to_owned(),
+            target,
+            parameters: parameters
+                .iter()
+                .map(|parameter| ((*parameter).to_owned(), "runtime".to_owned()))
+                .collect(),
+            description: None,
+            source: source(&format!("/paths/~1source/get/responses/200/links/{name}")),
+        }
+    }
+
+    fn parameter(name: &str, location: ParamLocation) -> Param {
+        Param {
+            name: name.to_owned(),
+            location,
+            required: false,
+            deprecated: false,
+            description: None,
+            schema: any_schema(&format!("/paths/~1target/get/parameters/{name}/schema")),
+            style: None,
+            explode: None,
+            allow_reserved: false,
+            source: source(&format!("/paths/~1target/get/parameters/{name}")),
+        }
+    }
+
+    fn analyze_links(operations: Vec<Operation>) -> (Analyzed, DiagnosticSink) {
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            Ir {
+                operations,
+                ..Ir::default()
+            },
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        (analyzed, sink)
+    }
+
+    fn assert_link_diagnostic(diagnostic: &Diagnostic, code: &str, pointer: &str, message: &str) {
+        assert_eq!(diagnostic.code, code);
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(diagnostic.source_id.as_deref(), Some("openapi.yaml"));
+        assert_eq!(diagnostic.json_pointer.as_deref(), Some(pointer));
+        assert_eq!(diagnostic.message, message);
+    }
+
+    #[test]
+    fn link_operation_id_resolves() {
+        let source_pointer = "/paths/~1source/get/responses/200";
+        let (analyzed, sink) = analyze_links(vec![
+            operation_with_response(
+                "/paths/~1source/get",
+                Some("source"),
+                source_pointer,
+                vec![link(
+                    "ById",
+                    LinkTarget::OperationId("target".to_owned()),
+                    &[],
+                )],
+            ),
+            operation_with_response(
+                "/paths/~1target/get",
+                Some("target"),
+                "/paths/~1target/get/responses/200",
+                Vec::new(),
+            ),
+        ]);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            analyzed.link_targets,
+            vec![ResolvedLink {
+                response_source: source(source_pointer),
+                link_name: "ById".to_owned(),
+                target_operation_index: Some(1),
+            }]
+        );
+    }
+
+    #[test]
+    fn link_dangling_operation_id_errors() {
+        let (analyzed, sink) = analyze_links(vec![operation_with_response(
+            "/paths/~1source/get",
+            Some("source"),
+            "/paths/~1source/get/responses/200",
+            vec![link(
+                "Missing",
+                LinkTarget::OperationId("missing".to_owned()),
+                &[],
+            )],
+        )]);
+        let diagnostic = sink.as_slice().first().expect("link diagnostic");
+
+        assert_link_diagnostic(
+            diagnostic,
+            CODE_LINK_OPERATION_ID,
+            "/paths/~1source/get/responses/200/links/Missing",
+            "link 'Missing' references unknown operationId 'missing'",
+        );
+        assert_eq!(analyzed.link_targets[0].target_operation_index, None);
+    }
+
+    #[test]
+    fn link_operation_ref_resolves_locally() {
+        let target_pointer = "/paths/~1pets~1{petId}/get";
+        let (analyzed, sink) = analyze_links(vec![
+            operation_with_response(
+                "/paths/~1source/get",
+                Some("source"),
+                "/paths/~1source/get/responses/200",
+                vec![link(
+                    "ByRef",
+                    LinkTarget::OperationRef("#/paths/~1pets~1{petId}/get".to_owned()),
+                    &[],
+                )],
+            ),
+            operation_with_response(
+                target_pointer,
+                Some("target"),
+                "/paths/~1pets~1{petId}/get/responses/200",
+                Vec::new(),
+            ),
+        ]);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(analyzed.link_targets[0].target_operation_index, Some(1));
+    }
+
+    #[test]
+    fn link_operation_ref_external_or_unknown_errors() {
+        let (analyzed, sink) = analyze_links(vec![operation_with_response(
+            "/paths/~1source/get",
+            Some("source"),
+            "/paths/~1source/get/responses/200",
+            vec![
+                link(
+                    "External",
+                    LinkTarget::OperationRef("other.yaml#/paths/~1target/get".to_owned()),
+                    &[],
+                ),
+                link(
+                    "UnknownLocal",
+                    LinkTarget::OperationRef("#/paths/~1missing/get".to_owned()),
+                    &[],
+                ),
+            ],
+        )]);
+        let diagnostics = sink.as_slice();
+
+        assert_eq!(diagnostics.len(), 2);
+        assert_link_diagnostic(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message.contains("External"))
+                .expect("external ref diagnostic"),
+            CODE_LINK_OPERATION_REF,
+            "/paths/~1source/get/responses/200/links/External",
+            "link 'External' operationRef 'other.yaml#/paths/~1target/get' does not resolve to an operation in this document",
+        );
+        assert_link_diagnostic(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message.contains("UnknownLocal"))
+                .expect("unknown local ref diagnostic"),
+            CODE_LINK_OPERATION_REF,
+            "/paths/~1source/get/responses/200/links/UnknownLocal",
+            "link 'UnknownLocal' operationRef '#/paths/~1missing/get' does not resolve to an operation in this document",
+        );
+        assert!(
+            analyzed
+                .link_targets
+                .iter()
+                .all(|link| link.target_operation_index.is_none())
+        );
+    }
+
+    #[test]
+    fn link_parameter_undeclared_errors() {
+        let mut target = operation_with_response(
+            "/paths/~1target/get",
+            Some("target"),
+            "/paths/~1target/get/responses/200",
+            Vec::new(),
+        );
+        target.parameters = vec![
+            parameter("petId", ParamLocation::Path),
+            parameter("x", ParamLocation::Query),
+            parameter("trace", ParamLocation::Header),
+            parameter("session", ParamLocation::Cookie),
+        ];
+        let (analyzed, sink) = analyze_links(vec![
+            operation_with_response(
+                "/paths/~1source/get",
+                Some("source"),
+                "/paths/~1source/get/responses/200",
+                vec![link(
+                    "Lookup",
+                    LinkTarget::OperationId("target".to_owned()),
+                    &[
+                        "petId",
+                        "path.petId",
+                        "query.x",
+                        "header.trace",
+                        "cookie.session",
+                        "body.missing",
+                    ],
+                )],
+            ),
+            target,
+        ]);
+        let diagnostics = sink.as_slice();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_link_diagnostic(
+            &diagnostics[0],
+            CODE_LINK_PARAMETER,
+            "/paths/~1source/get/responses/200/links/Lookup",
+            "link 'Lookup' parameter 'body.missing' is not declared by the target operation",
+        );
+        assert_eq!(analyzed.link_targets[0].target_operation_index, Some(1));
+    }
+
+    #[test]
+    fn link_unresolved_skips_parameter_check() {
+        let (analyzed, sink) = analyze_links(vec![operation_with_response(
+            "/paths/~1source/get",
+            Some("source"),
+            "/paths/~1source/get/responses/200",
+            vec![link(
+                "Missing",
+                LinkTarget::OperationId("missing".to_owned()),
+                &["body.missing"],
+            )],
+        )]);
+        let diagnostics = sink.as_slice();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_link_diagnostic(
+            &diagnostics[0],
+            CODE_LINK_OPERATION_ID,
+            "/paths/~1source/get/responses/200/links/Missing",
+            "link 'Missing' references unknown operationId 'missing'",
+        );
+        assert_eq!(analyzed.link_targets[0].target_operation_index, None);
     }
 
     fn segment(parts: Vec<SegmentPart>) -> Segment {
@@ -1362,6 +2204,457 @@ mod tests {
             message.contains("/components/schemas/Pet")
                 && message.contains("/components/schemas/pet")
         }));
+    }
+
+    fn callback_leaf_operation(method: &str, pointer: &str) -> Operation {
+        let mut leaf = operation(Vec::new());
+        leaf.method = method.to_owned();
+        leaf.source = source(pointer);
+        leaf
+    }
+
+    #[test]
+    fn webhook_stems_use_operation_id_else_pascal_name() {
+        let mut with_id = operation(Vec::new());
+        with_id.operation_id = Some("customName".to_owned());
+        with_id.source = source("/webhooks/petSubscription/get");
+        let mut without_id = operation(Vec::new());
+        without_id.method = "post".to_owned();
+        without_id.source = source("/webhooks/petSubscription/post");
+        let ir = Ir {
+            webhooks: vec![Webhook {
+                name: "petSubscription".to_owned(),
+                operations: vec![with_id, without_id],
+                source: source("/webhooks/petSubscription"),
+            }],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let stems = analyzed
+            .webhook_names
+            .iter()
+            .map(|allocated| allocated.stem.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(stems, ["CustomName", "PetSubscriptionPost"]);
+    }
+
+    #[test]
+    fn webhook_name_matching_operation_name_is_no_collision() {
+        let mut path_operation = operation(Vec::new());
+        path_operation.operation_id = Some("PetsGet".to_owned());
+        path_operation.source = source("/paths/~1pets/get");
+        let mut webhook_operation = operation(Vec::new());
+        webhook_operation.operation_id = Some("PetsGet".to_owned());
+        webhook_operation.source = source("/webhooks/pets/get");
+        let ir = Ir {
+            operations: vec![path_operation],
+            webhooks: vec![Webhook {
+                name: "pets".to_owned(),
+                operations: vec![webhook_operation],
+                source: source("/webhooks/pets"),
+            }],
+            ..Ir::default()
+        };
+        let naming = NamingConfig {
+            operation_case: OperationCase::Preserve,
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            analyzed
+                .operation_names
+                .iter()
+                .map(|allocated| allocated.name.as_str())
+                .collect::<Vec<_>>(),
+            ["PetsGet"]
+        );
+        assert_eq!(
+            analyzed
+                .webhook_names
+                .iter()
+                .map(|allocated| allocated.stem.as_str())
+                .collect::<Vec<_>>(),
+            ["PetsGet"]
+        );
+    }
+
+    #[test]
+    fn webhook_stem_collision_reports_oxs1321() {
+        let mut first = operation(Vec::new());
+        first.source = source("/webhooks/petCreated/get");
+        let mut second = operation(Vec::new());
+        second.source = source("/webhooks/pet-created/get");
+        let ir = Ir {
+            webhooks: vec![
+                Webhook {
+                    name: "petCreated".to_owned(),
+                    operations: vec![first],
+                    source: source("/webhooks/petCreated"),
+                },
+                Webhook {
+                    name: "pet-created".to_owned(),
+                    operations: vec![second],
+                    source: source("/webhooks/pet-created"),
+                },
+            ],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_WEBHOOK_NAME)
+            .expect("webhook collision diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(diagnostic.message.contains("webhook name collision"));
+        assert!(diagnostic.message.contains("'PetCreatedGet'"));
+        assert!(diagnostic.message.contains("/webhooks/petCreated/get"));
+        assert!(diagnostic.message.contains("/webhooks/pet-created/get"));
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/webhooks/pet-created/get")
+        );
+    }
+
+    #[test]
+    fn webhook_name_without_identifier_chars_reports_oxs1321() {
+        let mut invalid = operation(Vec::new());
+        invalid.source = source("/webhooks/---/get");
+        let ir = Ir {
+            webhooks: vec![Webhook {
+                name: "---".to_owned(),
+                operations: vec![invalid],
+                source: source("/webhooks/---"),
+            }],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(analyzed.webhook_names.is_empty());
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_WEBHOOK_NAME)
+            .expect("webhook normalization diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/webhooks/---/get")
+        );
+    }
+
+    #[test]
+    fn webhook_operation_id_without_identifier_chars_reports_oxs1321() {
+        let mut invalid = operation(Vec::new());
+        invalid.operation_id = Some("---".to_owned());
+        invalid.source = source("/webhooks/petCreated/get");
+        let ir = Ir {
+            webhooks: vec![Webhook {
+                name: "petCreated".to_owned(),
+                operations: vec![invalid],
+                source: source("/webhooks/petCreated"),
+            }],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(analyzed.webhook_names.is_empty());
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_WEBHOOK_NAME)
+            .expect("webhook operationId normalization diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(diagnostic.message.contains("'---'"));
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/webhooks/petCreated/get")
+        );
+    }
+
+    #[test]
+    fn callback_stems_compose_with_expression_disambiguator() {
+        let mut multi = operation(Vec::new());
+        multi.operation_id = Some("subscribe".to_owned());
+        multi.source = source("/paths/~1subscribe/post");
+        multi.callbacks = vec![Callback {
+            name: "delivery.status".to_owned(),
+            expressions: vec![
+                CallbackExpression {
+                    expression: "{$request.body#/callbackUrl}".to_owned(),
+                    operations: vec![callback_leaf_operation(
+                        "post",
+                        "/paths/~1subscribe/post/callbacks/delivery.status/0/post",
+                    )],
+                    source: source("/paths/~1subscribe/post/callbacks/delivery.status/0"),
+                },
+                CallbackExpression {
+                    expression: "{$request.query.fallback}".to_owned(),
+                    operations: vec![callback_leaf_operation(
+                        "get",
+                        "/paths/~1subscribe/post/callbacks/delivery.status/1/get",
+                    )],
+                    source: source("/paths/~1subscribe/post/callbacks/delivery.status/1"),
+                },
+            ],
+            source: source("/paths/~1subscribe/post/callbacks/delivery.status"),
+        }];
+
+        let mut single = operation(Vec::new());
+        single.operation_id = Some("ping".to_owned());
+        single.source = source("/paths/~1ping/post");
+        single.callbacks = vec![Callback {
+            name: "audit".to_owned(),
+            expressions: vec![CallbackExpression {
+                expression: "{$request.header.X-Audit-Url}".to_owned(),
+                operations: vec![callback_leaf_operation(
+                    "put",
+                    "/paths/~1ping/post/callbacks/audit/0/put",
+                )],
+                source: source("/paths/~1ping/post/callbacks/audit/0"),
+            }],
+            source: source("/paths/~1ping/post/callbacks/audit"),
+        }];
+
+        let ir = Ir {
+            operations: vec![multi, single],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let stems = analyzed
+            .callback_names
+            .iter()
+            .map(|allocated| allocated.stem.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stems,
+            [
+                "SubscribeDeliveryStatus_1Post",
+                "SubscribeDeliveryStatus_2Get",
+                "PingAuditPut",
+            ]
+        );
+    }
+
+    #[test]
+    fn callback_expression_text_never_in_identifier() {
+        let mut parent = operation(Vec::new());
+        parent.operation_id = Some("subscribe".to_owned());
+        parent.source = source("/paths/~1subscribe/post");
+        parent.callbacks = vec![Callback {
+            name: "delivery".to_owned(),
+            expressions: vec![CallbackExpression {
+                expression: "{$request.body#/url}".to_owned(),
+                operations: vec![callback_leaf_operation(
+                    "post",
+                    "/paths/~1subscribe/post/callbacks/delivery/0/post",
+                )],
+                source: source("/paths/~1subscribe/post/callbacks/delivery/0"),
+            }],
+            source: source("/paths/~1subscribe/post/callbacks/delivery"),
+        }];
+        let ir = Ir {
+            operations: vec![parent],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(analyzed.callback_names.len(), 1);
+        let stem = analyzed.callback_names[0].stem.as_str();
+        assert!(!stem.contains('{') && !stem.contains('$') && !stem.contains('#'));
+        assert_eq!(stem, "SubscribeDeliveryPost");
+    }
+
+    #[test]
+    fn callback_name_without_identifier_chars_reports_oxs1321() {
+        let mut parent = operation(Vec::new());
+        parent.operation_id = Some("subscribe".to_owned());
+        parent.source = source("/paths/~1subscribe/post");
+        parent.callbacks = vec![Callback {
+            name: "---".to_owned(),
+            expressions: vec![CallbackExpression {
+                expression: "{$request.body#/url}".to_owned(),
+                operations: vec![callback_leaf_operation(
+                    "post",
+                    "/paths/~1subscribe/post/callbacks/---/0/post",
+                )],
+                source: source("/paths/~1subscribe/post/callbacks/---/0"),
+            }],
+            source: source("/paths/~1subscribe/post/callbacks/---"),
+        }];
+        let ir = Ir {
+            operations: vec![parent],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(analyzed.callback_names.is_empty());
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_WEBHOOK_NAME)
+            .expect("callback normalization diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/paths/~1subscribe/post/callbacks/---/0/post")
+        );
+    }
+
+    #[test]
+    fn callbacks_allocate_on_webhook_operations() {
+        let mut webhook_operation = operation(Vec::new());
+        webhook_operation.method = "post".to_owned();
+        webhook_operation.source = source("/webhooks/petCreated/post");
+        webhook_operation.callbacks = vec![Callback {
+            name: "ack".to_owned(),
+            expressions: vec![CallbackExpression {
+                expression: "{$request.body#/ackUrl}".to_owned(),
+                operations: vec![callback_leaf_operation(
+                    "post",
+                    "/webhooks/petCreated/post/callbacks/ack/0/post",
+                )],
+                source: source("/webhooks/petCreated/post/callbacks/ack/0"),
+            }],
+            source: source("/webhooks/petCreated/post/callbacks/ack"),
+        }];
+        let ir = Ir {
+            webhooks: vec![Webhook {
+                name: "petCreated".to_owned(),
+                operations: vec![webhook_operation],
+                source: source("/webhooks/petCreated"),
+            }],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(analyzed.callback_names.len(), 1);
+        let allocated = &analyzed.callback_names[0];
+        // The parent stem is the webhook operation's own stem, not a path-operation stem.
+        assert_eq!(allocated.parent_stem, "PetCreatedPost");
+        assert_eq!(allocated.stem, "PetCreatedPostAckPost");
+        assert_eq!(
+            allocated.parent,
+            CallbackParent::WebhookOperation {
+                webhook_index: 0,
+                operation_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn callbacks_allocate_nested_inside_callback_operations() {
+        let mut nested_leaf = callback_leaf_operation(
+            "get",
+            "/paths/~1subscribe/post/callbacks/delivery/0/post/callbacks/retry/0/get",
+        );
+        nested_leaf.callbacks = Vec::new();
+        let mut outer_leaf =
+            callback_leaf_operation("post", "/paths/~1subscribe/post/callbacks/delivery/0/post");
+        outer_leaf.callbacks = vec![Callback {
+            name: "retry".to_owned(),
+            expressions: vec![CallbackExpression {
+                expression: "{$request.body#/retryUrl}".to_owned(),
+                operations: vec![nested_leaf],
+                source: source(
+                    "/paths/~1subscribe/post/callbacks/delivery/0/post/callbacks/retry/0",
+                ),
+            }],
+            source: source("/paths/~1subscribe/post/callbacks/delivery/0/post/callbacks/retry"),
+        }];
+        let mut parent = operation(Vec::new());
+        parent.operation_id = Some("subscribe".to_owned());
+        parent.source = source("/paths/~1subscribe/post");
+        parent.callbacks = vec![Callback {
+            name: "delivery".to_owned(),
+            expressions: vec![CallbackExpression {
+                expression: "{$request.body#/url}".to_owned(),
+                operations: vec![outer_leaf],
+                source: source("/paths/~1subscribe/post/callbacks/delivery/0"),
+            }],
+            source: source("/paths/~1subscribe/post/callbacks/delivery"),
+        }];
+        let ir = Ir {
+            operations: vec![parent],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        // Pre-order: the outer callback operation is allocated before its nested child.
+        let stems = analyzed
+            .callback_names
+            .iter()
+            .map(|allocated| allocated.stem.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stems,
+            ["SubscribeDeliveryPost", "SubscribeDeliveryPostRetryGet"]
+        );
+        // The nested child's parent is the outer callback operation's own allocation, and its
+        // parent stem is that operation's stem.
+        assert_eq!(
+            analyzed.callback_names[1].parent,
+            CallbackParent::Callback { index: 0 }
+        );
+        assert_eq!(
+            analyzed.callback_names[1].parent_stem,
+            "SubscribeDeliveryPost"
+        );
     }
 
     #[test]
@@ -1936,11 +3229,14 @@ mod tests {
                 properties: Vec::new(),
                 additional_properties: AdditionalProperties::Allowed(Some(Box::new(leaf.clone()))),
                 dependent_required: Vec::new(),
+                finite: None,
+                extra_required: Vec::new(),
                 meta: meta.clone(),
             },
             SchemaNode::Tuple {
                 prefix_items: vec![leaf.clone()],
                 rest: TupleRest::Schema(Box::new(leaf.clone())),
+                finite: None,
                 meta: meta.clone(),
             },
             SchemaNode::AllOf {
@@ -1949,6 +3245,7 @@ mod tests {
             },
             SchemaNode::AnyOf {
                 branches: vec![leaf.clone()],
+                discriminator: None,
                 meta: meta.clone(),
             },
             SchemaNode::OneOf {
@@ -1991,6 +3288,48 @@ mod tests {
         );
         assert_eq!(analyzed.schema_names.len(), 8);
         assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn container_numeric_enum_member_binary64_checked() {
+        let outside_binary64 = "1e999"
+            .parse::<Number>()
+            .expect("arbitrary-precision JSON number");
+        let schema = SchemaNode::Object {
+            properties: Vec::new(),
+            additional_properties: AdditionalProperties::Allowed(None),
+            dependent_required: Vec::new(),
+            finite: Some(Box::new(FiniteConstraint {
+                enum_values: Some(vec![json!({ "value": outside_binary64 })]),
+                const_value: None,
+            })),
+            extra_required: Vec::new(),
+            meta: SchemaMeta {
+                source: source("/components/schemas/Container"),
+                ..SchemaMeta::default()
+            },
+        };
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            Ir {
+                schemas: vec![NamedSchema {
+                    name: "Container".to_owned(),
+                    schema,
+                    source: source("/components/schemas/Container"),
+                }],
+                ..Ir::default()
+            },
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("outside the binary64 domain"))
+            .expect("binary64 domain diagnostic");
+        assert_eq!(diagnostic.code, CODE_ENUM_RULE_14);
+        assert_eq!(diagnostic.severity, Severity::Error);
     }
 
     #[test]

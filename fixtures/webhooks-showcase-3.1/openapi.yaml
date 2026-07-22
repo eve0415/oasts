@@ -1,0 +1,198 @@
+openapi: 3.1.0
+info:
+  title: Oasts webhooks showcase
+  version: 1.0.0
+servers:
+  - url: https://webhooks.api.example.test/v1
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      summary: List pets.
+      responses:
+        '200':
+          description: Every pet.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Pet'
+  /pets/{petId}:
+    get:
+      operationId: getPet
+      summary: Read one pet, with headers and links on the success response.
+      parameters:
+        - name: petId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The matching pet.
+          headers:
+            X-Rate-Limit:
+              description: Requests remaining in the current window.
+              required: true
+              schema:
+                type: integer
+            X-Trace:
+              description: Optional caller trace identifier.
+              schema:
+                type: string
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+            Content-Type:
+              description: Dropped — the media type owns this header.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+          links:
+            listPets:
+              operationId: listPets
+            self:
+              operationRef: '#/paths/~1pets~1{petId}/get'
+              parameters:
+                petId: $request.path.petId
+        '4XX':
+          description: A documented client error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /subscriptions:
+    post:
+      operationId: createSubscription
+      summary: Create a subscription that drives callbacks.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './schemas/subscription.yaml#/Subscription'
+      responses:
+        '201':
+          description: The subscription was created.
+          content:
+            application/json:
+              schema:
+                $ref: './schemas/subscription.yaml#/Subscription'
+      callbacks:
+        subscriptionEvents:
+          '{$request.body#/callbackUrl}':
+            post:
+              summary: Primary delivery, itself carrying a nested acknowledgement callback.
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/Pet'
+              responses:
+                '200':
+                  description: Delivery acknowledged.
+              callbacks:
+                nestedAck:
+                  '{$request.body#/ackUrl}':
+                    post:
+                      summary: Acknowledgement of the primary delivery.
+                      responses:
+                        '204':
+                          description: Acknowledged with no body.
+          '{$request.query.fallbackUrl}':
+            post:
+              summary: Fallback delivery.
+              responses:
+                '202':
+                  description: Fallback accepted.
+components:
+  pathItems:
+    RemovedHook:
+      delete:
+        summary: A pet was removed, delivered through a referenced path item.
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+        responses:
+          '200':
+            description: Removal acknowledged.
+  headers:
+    RequestId:
+      description: Correlation identifier echoed on every response.
+      schema:
+        type: string
+  schemas:
+    Pet:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        tag:
+          type: string
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: integer
+        message:
+          type: string
+webhooks:
+  newPet:
+    post:
+      summary: A new pet was created.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Pet'
+      responses:
+        '200':
+          description: Receipt acknowledged.
+  petEvents:
+    post:
+      summary: A pet event occurred.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Pet'
+      responses:
+        '200':
+          description: Event acknowledged.
+    delete:
+      summary: A pet event was retracted.
+      responses:
+        '204':
+          description: Retraction acknowledged with no body.
+  petRemoved:
+    $ref: '#/components/pathItems/RemovedHook'
+  subscriptionChanged:
+    post:
+      summary: A subscription changed, carrying an externally-defined body.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './schemas/subscription.yaml#/Subscription'
+      responses:
+        '200':
+          description: Change acknowledged.
+  emptyHook: {}

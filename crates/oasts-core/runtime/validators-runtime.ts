@@ -32,6 +32,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function hasGet(value: unknown): value is { get(name: string): string | null } {
+  return (
+    typeof value === "object" && value !== null && "get" in value && typeof value.get === "function"
+  );
+}
+
 // JSON-value equality: numbers/strings/booleans/null by ===, arrays ordered and pairwise,
 // objects by own-enumerable-key set (order-insensitive) with pairwise values. Mixed shapes differ.
 export function deepEqual(a: unknown, b: unknown): boolean {

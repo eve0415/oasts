@@ -37,7 +37,7 @@ generate_and_verify() {
   echo "double-generation byte identity ok: $message"
 }
 
-for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1; do
+for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server-variables-enum-3.1; do
   # A fixture whose client config lives in a separate file says so on disk.
   fixture_config=oasts.yaml
   if [[ -f "fixtures/$f/oasts-client.yaml" ]]; then
@@ -49,6 +49,18 @@ done
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-auth-showcase-3.1/compile-assert/cases.ts"
 echo "compile-assert matrix ok: auth-showcase-3.1"
 
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-server-variables-enum-3.1/compile-assert/cases.ts"
+echo "compile-assert matrix ok: server-variables-enum-3.1"
+
+# Webhooks showcase carries two configs. Run each with double-generation byte-identity: the
+# types-only config proves webhooks/callbacks emit in a client-free artifact; the client config
+# proves the same webhook/callback types coexist with the client and its typed response headers.
+# The compile-assert reads the client output, which carries both the types and the client.
+generate_and_verify webhooks-showcase-3.1 oasts.yaml "$work/webhooks-showcase-types" types "webhooks-showcase-3.1 (types)"
+generate_and_verify webhooks-showcase-3.1 oasts-client.yaml "$work/webhooks-showcase-client" client "webhooks-showcase-3.1 (client)"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/webhooks-showcase-client/compile-assert/cases.ts"
+echo "compile-assert matrix ok: webhooks-showcase-3.1"
+
 # Validators fixtures: one fixture can carry several configs, so these run as explicit
 # (fixture, config) pairs instead of joining the one-config-per-fixture client loop above.
 validators_runs=(
@@ -56,6 +68,7 @@ validators_runs=(
   "validators-showcase-3.1 oasts-client.yaml"
   "validators-readonly-3.1 oasts.yaml"
   "petstore-3.0 oasts-validators.yaml"
+  "webhooks-showcase-3.1 oasts-validators.yaml"
 )
 for run in "${validators_runs[@]}"; do
   f=${run% *}
@@ -78,5 +91,8 @@ echo "validators conformance ok: validators-showcase-3.1"
 # neutral validator rejects is the exact bug this guards).
 OASTS_VALIDATORS_GENERATED_ROOT="$work/validators-validators-readonly-3.1-oasts/generated" OASTS_VALIDATORS_CONFORMANCE_FIXTURE=readonly node --test crates/oasts-core/runtime/test-conformance/
 echo "validators conformance ok: validators-readonly-3.1"
+
+OASTS_VALIDATORS_GENERATED_ROOT="$work/validators-webhooks-showcase-3.1-oasts-validators/generated-validators" OASTS_VALIDATORS_CONFORMANCE_FIXTURE=webhooks node --test crates/oasts-core/runtime/test-conformance/
+echo "validators conformance ok: webhooks-showcase-3.1"
 
 node --test crates/oasts-core/runtime/test-e2e/

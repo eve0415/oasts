@@ -27,6 +27,12 @@ pub(crate) struct EmissionModel<'input, 'sink> {
     schema_targets: HashMap<String, HashMap<String, SchemaTarget>>,
     pub(crate) component_files: Vec<Option<String>>,
     pub(crate) operation_files: Vec<Option<String>>,
+    /// Parallel to `analyzed.webhook_names`: the file base each webhook operation emits to under
+    /// `types/webhooks/`, or `None` if its name failed file-base validation.
+    pub(crate) webhook_files: Vec<Option<String>>,
+    /// Parallel to `analyzed.callback_names`: the file base each callback operation emits to under
+    /// `types/callbacks/`, or `None` if its name failed file-base validation.
+    pub(crate) callback_files: Vec<Option<String>>,
     seen: HashMap<String, (String, SourceRef)>,
     pub(crate) sink: &'sink mut DiagnosticSink,
 }
@@ -45,6 +51,8 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             schema_targets: HashMap::new(),
             component_files: vec![None; analyzed.ir.schemas.len()],
             operation_files: vec![None; analyzed.ir.operations.len()],
+            webhook_files: vec![None; analyzed.webhook_names.len()],
+            callback_files: vec![None; analyzed.callback_names.len()],
             seen: HashMap::new(),
             sink,
         };
@@ -285,6 +293,37 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             let relative = format!("types/operations/{file_base}.ts");
             self.register_path(&relative, &operation.source);
             self.operation_files[allocated.operation_index] = Some(file_base);
+        }
+        // Webhook and callback operations mirror the path-operation branch exactly (operationId if
+        // present, else the allocated stem), but emit to their own `types/webhooks/` and
+        // `types/callbacks/` directories, so their file bases never collide with operations across
+        // directories — only within their own directory, which `register_path` still guards.
+        for (index, allocated) in self.analyzed.webhook_names.iter().enumerate() {
+            let operation = &self.analyzed.ir.webhooks[allocated.webhook_index].operations
+                [allocated.operation_index];
+            let source_name = operation.operation_id.as_deref().unwrap_or(&allocated.stem);
+            let source = allocated.source.clone();
+            let Some(file_base) = self.allocate_file_base(source_name, &source) else {
+                continue;
+            };
+            let relative = format!("types/webhooks/{file_base}.ts");
+            self.register_path(&relative, &source);
+            self.webhook_files[index] = Some(file_base);
+        }
+        for (index, allocated) in self.analyzed.callback_names.iter().enumerate() {
+            let operation = super::callback_operation(
+                &self.analyzed.ir,
+                &self.analyzed.callback_names,
+                allocated,
+            );
+            let source_name = operation.operation_id.as_deref().unwrap_or(&allocated.stem);
+            let source = allocated.source.clone();
+            let Some(file_base) = self.allocate_file_base(source_name, &source) else {
+                continue;
+            };
+            let relative = format!("types/callbacks/{file_base}.ts");
+            self.register_path(&relative, &source);
+            self.callback_files[index] = Some(file_base);
         }
     }
 
@@ -653,6 +692,8 @@ mod tests {
             properties: Vec::new(),
             additional_properties: AdditionalProperties::Allowed(Some(Box::new(pet_ref))),
             dependent_required: Vec::new(),
+            finite: None,
+            extra_required: Vec::new(),
             meta: SchemaMeta::default(),
         };
         let mut edges = Vec::new();

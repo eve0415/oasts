@@ -22,12 +22,14 @@ use crate::client_model::ClientModel;
 use crate::config::{DocumentationConfig, EnumRepresentation, FileCase, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
-    AdditionalProperties, ExclusiveBound, MediaType, NumericConstraints, Operation, Param,
-    ParamLocation, PrimitiveType, PropMeta, ResponseEntry, ResponseStatus, SchemaDocs, SchemaNode,
-    SchemaRef, SourceRef, TupleRest,
+    AdditionalProperties, Discriminator, ExclusiveBound, Ir, MediaType, NumericConstraints,
+    Operation, Param, ParamLocation, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader,
+    ResponseStatus, SchemaDocs, SchemaNode, SchemaRef, SourceRef, TupleRest, finite_parts,
 };
-use crate::num::render_number_value;
-use crate::semantic::{AllocatedSchemaName, Analyzed, EnumMember};
+use crate::num::{first_number_outside_binary64, render_number_value};
+use crate::semantic::{
+    AllocatedCallbackName, AllocatedSchemaName, Analyzed, CallbackParent, EnumMember, ResolvedLink,
+};
 
 mod client;
 mod model;
@@ -42,6 +44,13 @@ const CODE_COMPOSITION: &str = "OASTS1303";
 const CODE_DISCRIMINATOR: &str = "OASTS1304";
 const CODE_REFERENCE: &str = "OASTS1305";
 const CODE_VARIANT_COLLISION: &str = "OASTS1306";
+/// A discriminator `mapping` value that resolves to no allocated component schema — a dangling
+/// mapping target the union can never dispatch to.
+const CODE_MAPPING_TARGET: &str = "OASTS1308";
+/// A discriminator whose `mapping`/`const` proof is internally incoherent — a mapping tag that
+/// contradicts the branch's own fixed value, or an allOf idiom that fixes the tag property to an
+/// empty (uninhabitable) value set. The render degrades to a plain structural union.
+const CODE_DISCRIMINATOR_PROOF: &str = "OASTS1309";
 
 /// A merged `allOf` property borrowed straight from the model IR: name, schema,
 /// and metadata. Borrowed (not owned) so `merge_all_of` never deep-clones the
@@ -314,6 +323,18 @@ enum SchemaChildMode {
 pub(super) struct Emitter<'model, 'input, 'sink> {
     model: &'model mut EmissionModel<'input, 'sink>,
     enum_member_indices: BTreeMap<(String, String), usize>,
+    /// Resolved link indices (into `model.analyzed.link_targets`), grouped by the response
+    /// they were declared on and keyed the same way as `enum_member_indices`. Built only when
+    /// the document has at least one link — the fast-reject keeps a link-free document's
+    /// emission allocation-identical to before links existed. Each group stays in
+    /// `link_targets` order (insertion order, one linear pass), matching the ticket's
+    /// deterministic-order requirement without a separate sort.
+    link_targets_by_response: BTreeMap<(String, String), Vec<usize>>,
+    /// `operation_index -> Stem` for every allocated operation name, the same transform
+    /// `emit_operation` applies to its own `stem`. Populated alongside
+    /// `link_targets_by_response` (same fast-reject) so a resolved link's target response type
+    /// name can be looked up in O(1) instead of scanning `operation_names` per link.
+    operation_stems: HashMap<usize, String>,
     /// Refs whose targets `merge_all_of` is currently inlining, along the active
     /// render ancestry. A recursive schema whose `allOf` branch points
     /// back to an ancestor would otherwise inline forever; the branch renders as a
@@ -341,9 +362,31 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 ))
                 .or_insert(index);
         }
+        let mut link_targets_by_response: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+        let mut operation_stems: HashMap<usize, String> = HashMap::new();
+        if !model.analyzed.link_targets.is_empty() {
+            for (index, resolved) in model.analyzed.link_targets.iter().enumerate() {
+                let resolved: &ResolvedLink = resolved;
+                link_targets_by_response
+                    .entry((
+                        resolved.response_source.source_id.clone(),
+                        resolved.response_source.json_pointer.clone(),
+                    ))
+                    .or_default()
+                    .push(index);
+            }
+            operation_stems = model
+                .analyzed
+                .operation_names
+                .iter()
+                .map(|allocated| (allocated.operation_index, uppercase_first(&allocated.name)))
+                .collect();
+        }
         Self {
             model,
             enum_member_indices,
+            link_targets_by_response,
+            operation_stems,
             inlining_refs: RefCell::new(Vec::new()),
             merge_cache: RefCell::new(HashMap::new()),
         }
@@ -364,9 +407,9 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             self.prewarm_all_of(&self.model.analyzed.ir.schemas[allocated.schema_index].schema);
         }
         // Operations carry inline schemas too (parameters, bodies, response payloads,
-        // encoding headers — the same set validate_model walks); an allOf embedded there
-        // never resolves through a component, so without its own prewarm it would fall
-        // back to the uncached recompute on every render pass.
+        // response headers, encoding headers — the same set validate_model walks); an allOf
+        // embedded there never resolves through a component, so without its own prewarm it
+        // would fall back to the uncached recompute on every render pass.
         for allocated in &self.model.analyzed.operation_names {
             if self.model.operation_files[allocated.operation_index].is_none() {
                 continue;
@@ -389,6 +432,9 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 for media_type in &response.media_types {
                     self.prewarm_all_of(&media_type.schema);
                 }
+                for (_, header) in &response.headers {
+                    self.prewarm_all_of(&header.schema);
+                }
             }
         }
         let mut files = Vec::new();
@@ -398,14 +444,283 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             }
             files.push(self.emit_component(allocated));
         }
+        let mut any_response_headers = false;
         for allocated in &self.model.analyzed.operation_names {
-            if self.model.operation_files[allocated.operation_index].is_none() {
+            let Some(file_base) = self.model.operation_files[allocated.operation_index].as_deref()
+            else {
                 continue;
-            }
-            files.push(self.emit_operation(allocated.operation_index, &allocated.name));
+            };
+            let operation = &self.model.analyzed.ir.operations[allocated.operation_index];
+            self.push_operation_file(
+                &mut files,
+                &mut any_response_headers,
+                operation,
+                &allocated.name,
+                "operations",
+                file_base,
+            );
+        }
+        // Webhook and callback operations reuse the operation renderer verbatim; their response
+        // headers count toward the shared `types/headers.ts` helper just like a path operation's.
+        for index in 0..self.model.analyzed.webhook_names.len() {
+            let Some(file_base) = self.model.webhook_files[index].as_deref() else {
+                continue;
+            };
+            let allocated = &self.model.analyzed.webhook_names[index];
+            let operation = &self.model.analyzed.ir.webhooks[allocated.webhook_index].operations
+                [allocated.operation_index];
+            self.push_operation_file(
+                &mut files,
+                &mut any_response_headers,
+                operation,
+                &allocated.stem,
+                "webhooks",
+                file_base,
+            );
+        }
+        // A document with any webhook gets the `Webhooks` descriptor, including a webhook whose
+        // path item declares no operations (it appears in the map with an empty object type).
+        if !self.model.analyzed.ir.webhooks.is_empty() {
+            files.push(self.emit_webhooks_index());
+        }
+        for index in 0..self.model.analyzed.callback_names.len() {
+            let Some(file_base) = self.model.callback_files[index].as_deref() else {
+                continue;
+            };
+            let allocated = &self.model.analyzed.callback_names[index];
+            let operation = callback_operation(
+                &self.model.analyzed.ir,
+                &self.model.analyzed.callback_names,
+                allocated,
+            );
+            self.push_operation_file(
+                &mut files,
+                &mut any_response_headers,
+                operation,
+                &allocated.stem,
+                "callbacks",
+                file_base,
+            );
+        }
+        if self.model.callback_files.iter().any(Option::is_some) {
+            files.push(self.emit_callbacks_index());
+        }
+        if any_response_headers {
+            files.push(self.emit_headers_helper_file());
         }
         files.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
         files
+    }
+
+    /// Emits `types/webhooks/index.ts`: the `Webhooks` descriptor mapping each webhook name (as
+    /// written in the document, quoted when not a bare identifier) to its per-method
+    /// request/response type pair. Method keys are the lowercase IR methods; the per-file
+    /// `<Stem>Request`/`<Stem>Response` types are imported from the sibling operation files. A
+    /// webhook with no emittable operation contributes an empty object type.
+    fn emit_webhooks_index(&self) -> GeneratedFile {
+        let analyzed = self.model.analyzed;
+        let readonly = self.model.config.types.readonly;
+        let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut body = String::from("export type Webhooks = {\n");
+        // webhook_names is grouped by ascending webhook_index (its allocation order), so each
+        // webhook's entries are the contiguous run at the cursor — advance through them once rather
+        // than rescanning the whole table per webhook.
+        let mut cursor = 0;
+        for (webhook_index, webhook) in analyzed.ir.webhooks.iter().enumerate() {
+            body.push_str("  ");
+            if readonly {
+                body.push_str("readonly ");
+            }
+            body.push_str(&render_property_key(&webhook.name));
+            body.push_str(": {");
+            let mut wrote_method = false;
+            while let Some(allocated) = analyzed
+                .webhook_names
+                .get(cursor)
+                .filter(|allocated| allocated.webhook_index == webhook_index)
+            {
+                let file_base = self.model.webhook_files[cursor].as_deref();
+                cursor += 1;
+                let Some(file_base) = file_base else {
+                    continue;
+                };
+                if !wrote_method {
+                    body.push('\n');
+                    wrote_method = true;
+                }
+                let operation =
+                    &analyzed.ir.webhooks[webhook_index].operations[allocated.operation_index];
+                self.write_descriptor_method(
+                    &mut body,
+                    &mut imports,
+                    file_base,
+                    &allocated.stem,
+                    &operation.method,
+                    4,
+                );
+            }
+            if wrote_method {
+                body.push_str("  };\n");
+            } else {
+                body.push_str("};\n");
+            }
+        }
+        body.push_str("};\n");
+        let mut content = self.header();
+        self.write_imports(&mut content, imports, "./");
+        content.push_str(&body);
+        GeneratedFile {
+            relative_path: "types/webhooks/index.ts".to_owned(),
+            content,
+        }
+    }
+
+    /// Emits `types/callbacks/index.ts`: one `<ParentStem>Callbacks` descriptor per operation that
+    /// declares callbacks (path, webhook, or nested), in first-declared order. Each maps the
+    /// callback name to the runtime expression (verbatim, always a quoted string key — it never
+    /// appears in an identifier) to the per-method request/response pair, imported from the sibling
+    /// callback operation files.
+    fn emit_callbacks_index(&self) -> GeneratedFile {
+        let analyzed = self.model.analyzed;
+        let ir = &analyzed.ir;
+        let readonly = self.model.config.types.readonly;
+        let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut body = String::new();
+        let mut seen_parents: HashSet<&CallbackParent> = HashSet::new();
+        // A parent's filed callback entries interleave with its nested callbacks' entries in
+        // callback_names (pre-order DFS), so group every filed entry by parent once (callback_names
+        // order preserved) rather than rescanning the whole table per parent.
+        let mut entries_by_parent: HashMap<&CallbackParent, Vec<usize>> = HashMap::new();
+        for (index, entry) in analyzed.callback_names.iter().enumerate() {
+            if self.model.callback_files[index].is_some() {
+                entries_by_parent
+                    .entry(&entry.parent)
+                    .or_default()
+                    .push(index);
+            }
+        }
+        for (index, entry) in analyzed.callback_names.iter().enumerate() {
+            if self.model.callback_files[index].is_none() || !seen_parents.insert(&entry.parent) {
+                continue;
+            }
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            let parent = &entry.parent;
+            let parent_op = callback_parent_operation(ir, &analyzed.callback_names, parent);
+            body.push_str("export type ");
+            body.push_str(&uppercase_first(&entry.parent_stem));
+            body.push_str("Callbacks = {\n");
+            // Filed entries for this parent, already ordered by (callback, expression, operation).
+            let entries = &entries_by_parent[parent];
+            for callback_group in entries.chunk_by(|&left, &right| {
+                analyzed.callback_names[left].callback_index
+                    == analyzed.callback_names[right].callback_index
+            }) {
+                let callback_index = analyzed.callback_names[callback_group[0]].callback_index;
+                let callback = &parent_op.callbacks[callback_index];
+                body.push_str("  ");
+                if readonly {
+                    body.push_str("readonly ");
+                }
+                body.push_str(&render_property_key(&callback.name));
+                body.push_str(": {\n");
+                for expression_group in callback_group.chunk_by(|&left, &right| {
+                    analyzed.callback_names[left].expression_index
+                        == analyzed.callback_names[right].expression_index
+                }) {
+                    let expression_index =
+                        analyzed.callback_names[expression_group[0]].expression_index;
+                    body.push_str("    ");
+                    if readonly {
+                        body.push_str("readonly ");
+                    }
+                    body.push_str(&render_property_key(
+                        &callback.expressions[expression_index].expression,
+                    ));
+                    body.push_str(": {\n");
+                    for &i in expression_group {
+                        let entry = &analyzed.callback_names[i];
+                        let file_base = self.model.callback_files[i].as_deref().unwrap_or_default();
+                        let operation = callback_operation(ir, &analyzed.callback_names, entry);
+                        self.write_descriptor_method(
+                            &mut body,
+                            &mut imports,
+                            file_base,
+                            &entry.stem,
+                            &operation.method,
+                            6,
+                        );
+                    }
+                    body.push_str("    };\n");
+                }
+                body.push_str("  };\n");
+            }
+            body.push_str("};\n");
+        }
+        let mut content = self.header();
+        self.write_imports(&mut content, imports, "./");
+        content.push_str(&body);
+        GeneratedFile {
+            relative_path: "types/callbacks/index.ts".to_owned(),
+            content,
+        }
+    }
+
+    /// Writes one `<method>: { request: <Stem>Request; response: <Stem>Response }` descriptor entry
+    /// at the given indent and records the two per-file type imports. Shared by the webhook and
+    /// callback descriptor maps, whose method-level shape is identical.
+    fn write_descriptor_method(
+        &self,
+        body: &mut String,
+        imports: &mut BTreeMap<String, BTreeSet<String>>,
+        file_base: &str,
+        stem: &str,
+        method: &str,
+        indent: usize,
+    ) {
+        let readonly = self.model.config.types.readonly;
+        let stem = uppercase_first(stem);
+        let request = format!("{stem}Request");
+        let response = format!("{stem}Response");
+        let entry = imports.entry(file_base.to_owned()).or_default();
+        entry.insert(request.clone());
+        entry.insert(response.clone());
+        body.push_str(&" ".repeat(indent));
+        if readonly {
+            body.push_str("readonly ");
+        }
+        body.push_str(method);
+        body.push_str(": { ");
+        if readonly {
+            body.push_str("readonly ");
+        }
+        body.push_str("request: ");
+        body.push_str(&request);
+        body.push_str("; ");
+        if readonly {
+            body.push_str("readonly ");
+        }
+        body.push_str("response: ");
+        body.push_str(&response);
+        body.push_str(" };\n");
+    }
+
+    /// Emits the shared `TypedHeaders<K>` helper once, only when at least one emitted
+    /// response declares a header — a document with none stays byte-identical to before this
+    /// helper existed. Pure generated output (no source node backs it, so no
+    /// `write_source_metadata` line); later client tickets are what actually construct a
+    /// `TypedHeaders` value, so nothing in this ticket references it yet.
+    fn emit_headers_helper_file(&self) -> GeneratedFile {
+        let mut content = self.header();
+        content.push_str("export interface TypedHeaders<K extends string> extends Headers {\n");
+        content.push_str("  get(name: K): string | null;\n");
+        content.push_str("  get(name: string): string | null;\n");
+        content.push_str("}\n");
+        GeneratedFile {
+            relative_path: "types/headers.ts".to_owned(),
+            content,
+        }
     }
 
     fn header(&self) -> String {
@@ -434,6 +749,9 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             for response in &operation.responses {
                 for media_type in &response.media_types {
                     self.validate_schema(&media_type.schema, &mut diagnostics);
+                }
+                for (_, header) in &response.headers {
+                    self.validate_schema(&header.schema, &mut diagnostics);
                 }
             }
         }
@@ -465,35 +783,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 branches,
                 discriminator: Some(discriminator),
                 ..
+            }
+            | SchemaNode::AnyOf {
+                branches,
+                discriminator: Some(discriminator),
+                ..
             } => {
-                let mut literals = BTreeSet::new();
-                let mut reason = None;
-                for branch in branches {
-                    match self.discriminator_literal(branch, &discriminator.property_name) {
-                        Some(literal) if literals.insert(literal.clone()) => {}
-                        Some(literal) => {
-                            reason = Some(format!(
-                                "discriminator property '{}' repeats literal {literal}",
-                                discriminator.property_name
-                            ));
-                            break;
-                        }
-                        None => {
-                            reason = Some(format!(
-                                "a branch does not prove one literal for discriminator property '{}'",
-                                discriminator.property_name
-                            ));
-                            break;
-                        }
-                    }
-                }
-                if let Some(reason) = reason {
-                    diagnostics.push(warning_diagnostic(
-                        CODE_DISCRIMINATOR,
-                        format!("emitting a structural union because {reason}"),
-                        &discriminator.source,
-                    ));
-                }
+                self.validate_discriminated(branches, discriminator, diagnostics);
             }
             _ => {}
         }
@@ -716,14 +1012,189 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         })
     }
 
-    fn discriminator_literal(&self, schema: &SchemaNode, property_name: &str) -> Option<String> {
-        let object = self.object_shape(schema, &mut HashSet::new())?;
-        let (_, property, _) = object
-            .properties
-            .iter()
-            .find(|(name, _, _)| name == property_name)?;
-        let values = self.finite_constraint(property, &mut HashSet::new())?;
-        (values.len() == 1).then(|| render_json_compact(&values[0], ObjectKeyMode::Plain))
+    /// Diagnoses a discriminated `oneOf`/`anyOf` (one shared path for both, since the discriminator
+    /// contract is identical). Each branch must contribute a distinct tag value for the discriminator
+    /// property; the tag is drawn — first non-empty wins — from the explicit `mapping`, the branch's
+    /// own fixed `const`/`enum` seen through the `$ref`+allOf idiom, or the referenced component name.
+    /// The render is always a plain structural union — proof drives diagnostics only, never the type
+    /// shape — so an unprovable union degrades to that same union plus one warning saying why.
+    fn validate_discriminated(
+        &self,
+        branches: &[SchemaNode],
+        discriminator: &Discriminator,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        let prop = discriminator.property_name.as_str();
+
+        // Resolve every mapping value once. An unresolvable value is a hard error and contributes no
+        // tag; a resolvable one records (tag -> target component index) for branch matching below.
+        let mut mapping_targets: Vec<(&str, usize)> = Vec::new();
+        for (tag, target) in &discriminator.mapping {
+            match self.resolve_mapping_target(discriminator, target) {
+                Some(index) => mapping_targets.push((tag.as_str(), index)),
+                None => diagnostics.push(source_diagnostic(
+                    CODE_MAPPING_TARGET,
+                    format!(
+                        "discriminator mapping value '{target}' resolves to no component schema"
+                    ),
+                    &discriminator.source,
+                )),
+            }
+        }
+
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut fallback: Option<(&'static str, String)> = None;
+        'proof: for branch in branches {
+            let branch_index = self.branch_target_index(branch);
+            let mapping_tags: Vec<&str> = mapping_targets
+                .iter()
+                .filter(|(_, index)| branch_index == Some(*index))
+                .map(|(tag, _)| *tag)
+                .collect();
+            let const_proof = self.merged_object_property_finite(branch, prop, &mut HashSet::new());
+
+            // An allOf idiom that fixes the tag property to disjoint values proves an uninhabitable
+            // branch: no wire value selects it, so the union cannot dispatch. Warn and fall back.
+            if const_proof.as_deref().is_some_and(<[Value]>::is_empty) {
+                fallback = Some((
+                    CODE_DISCRIMINATOR_PROOF,
+                    format!(
+                        "discriminator branch fixes '{prop}' to no inhabitable value; emitting a structural union"
+                    ),
+                ));
+                break 'proof;
+            }
+
+            let effective: Vec<String> = if !mapping_tags.is_empty() {
+                // A mapping tag that disagrees with the branch's own single fixed value is
+                // incoherent: the wire value the mapping routes here would fail the branch's const.
+                if let Some([value]) = const_proof.as_deref()
+                    && let Some(conflict) = mapping_tags.iter().find(|tag| **tag != tag_key(value))
+                {
+                    fallback = Some((
+                        CODE_DISCRIMINATOR_PROOF,
+                        format!(
+                            "discriminator maps '{conflict}' to a branch whose '{prop}' is fixed to {}; emitting a structural union",
+                            render_json_compact(value, ObjectKeyMode::Plain)
+                        ),
+                    ));
+                    break 'proof;
+                }
+                mapping_tags.iter().map(|tag| (*tag).to_owned()).collect()
+            } else if let Some(values) = const_proof.as_deref().filter(|values| !values.is_empty())
+            {
+                values.iter().map(tag_key).collect()
+            } else {
+                self.implicit_tag(branch).into_iter().collect()
+            };
+
+            if effective.is_empty() {
+                fallback = Some((
+                    CODE_DISCRIMINATOR,
+                    format!(
+                        "emitting a structural union because a branch does not prove one literal for discriminator property '{prop}'"
+                    ),
+                ));
+                break 'proof;
+            }
+            for tag in effective {
+                if !seen.insert(tag.clone()) {
+                    fallback = Some((
+                        CODE_DISCRIMINATOR,
+                        format!(
+                            "emitting a structural union because discriminator property '{prop}' repeats literal {tag}"
+                        ),
+                    ));
+                    break 'proof;
+                }
+            }
+        }
+
+        if let Some((code, message)) = fallback {
+            diagnostics.push(warning_diagnostic(code, message, &discriminator.source));
+        }
+    }
+
+    /// The allocated component index a branch's `$ref` resolves to, or `None` for a non-`$ref`
+    /// branch (inline objects carry no reference identity to match a mapping target against).
+    fn branch_target_index(&self, branch: &SchemaNode) -> Option<usize> {
+        let SchemaNode::Ref { target, .. } = branch else {
+            return None;
+        };
+        self.model
+            .schema_target(&target.source_id, &target.json_pointer)
+            .map(|target| target.index)
+    }
+
+    /// Resolves a discriminator `mapping` value to an allocated component index. A bare name is a
+    /// component in the discriminator's own document; a `#/...` fragment is a local pointer there;
+    /// a `file#/...` value resolves the file relative to that document. `None` means the value
+    /// designates no allocated schema (a dangling mapping target).
+    fn resolve_mapping_target(&self, discriminator: &Discriminator, target: &str) -> Option<usize> {
+        let base = discriminator.source.source_id.as_str();
+        let (source_id, pointer) = match target.split_once('#') {
+            None => (base.to_owned(), format!("/components/schemas/{target}")),
+            Some(("", fragment)) => (base.to_owned(), fragment.to_owned()),
+            Some((file, fragment)) => (join_relative_source(base, file), fragment.to_owned()),
+        };
+        self.model
+            .schema_target(&source_id, &pointer)
+            .map(|target| target.index)
+    }
+
+    /// The implicit discriminator tag for a `$ref` branch: the referenced component's name, taken as
+    /// the reference's last path segment. `None` for a non-`$ref` branch.
+    fn implicit_tag(&self, branch: &SchemaNode) -> Option<String> {
+        let SchemaNode::Ref { target, .. } = branch else {
+            return None;
+        };
+        target.json_pointer.rsplit('/').next().map(str::to_owned)
+    }
+
+    /// The finite value set a branch fixes its tag property to, seen through the `$ref`+allOf idiom:
+    /// a `$ref` resolves and recurses; an object reads the property's own `const`/`enum`; an allOf
+    /// intersects the finite sets its sub-branches prove (the merge that lets the common
+    /// parent+allOf discriminated-union spelling prove). `None` means no finite proof; `Some(empty)`
+    /// means the sub-branches fix the property to disjoint values — an uninhabitable branch. Cycles
+    /// are guarded by a visited set keyed on the resolved `(source_id, json_pointer)`.
+    fn merged_object_property_finite<'a>(
+        &'a self,
+        branch: &'a SchemaNode,
+        prop: &str,
+        visited: &mut HashSet<(&'a str, &'a str)>,
+    ) -> Option<Vec<Value>> {
+        match branch {
+            SchemaNode::Ref { target, .. } => {
+                if !visited.insert((target.source_id.as_str(), target.json_pointer.as_str())) {
+                    return None;
+                }
+                let index = self
+                    .model
+                    .schema_target(&target.source_id, &target.json_pointer)?
+                    .index;
+                let resolved = &self.model.analyzed.ir.schemas.get(index)?.schema;
+                self.merged_object_property_finite(resolved, prop, visited)
+            }
+            SchemaNode::Object { properties, .. } => {
+                let (_, schema, _) = properties.iter().find(|(name, _, _)| name == prop)?;
+                // A primitive tag property fixes its value in `const`/`enum` (resolved through a
+                // `$ref`); an object/array/tuple-typed one carries it in the `finite` box b9e3b24
+                // added. Consult both so either spelling proves.
+                self.finite_constraint(schema, &mut visited.clone())
+                    .or_else(|| container_finite_values(schema))
+            }
+            SchemaNode::AllOf { branches, .. } => {
+                let mut sets = branches.iter().filter_map(|branch| {
+                    self.merged_object_property_finite(branch, prop, &mut visited.clone())
+                });
+                let mut intersection = sets.next()?;
+                for set in sets {
+                    intersection.retain(|value| set.iter().any(|other| json_equal(value, other)));
+                }
+                Some(intersection)
+            }
+            _ => None,
+        }
     }
 
     fn emit_component(&self, allocated: &AllocatedSchemaName) -> GeneratedFile {
@@ -1021,7 +1492,12 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 } else {
                     branches
                         .iter()
-                        .map(|branch| self.render_type(branch, position, indent))
+                        .map(|branch| {
+                            parenthesize_intersection_member(
+                                self.render_type(branch, position, indent),
+                                branch,
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join(" & ")
                 }
@@ -1533,12 +2009,41 @@ impl SchemaTarget {
 }
 
 impl Emitter<'_, '_, '_> {
-    fn emit_operation(&self, operation_index: usize, allocated_name: &str) -> GeneratedFile {
-        let operation = &self.model.analyzed.ir.operations[operation_index];
+    /// Renders one operation-shaped file and appends it, folding its response headers into the
+    /// running `any_response_headers` flag first. Shared by the path-operation, webhook, and
+    /// callback emission loops, which differ only in how they resolve `(operation, name, file_base)`
+    /// and the `subdir` they target.
+    fn push_operation_file(
+        &self,
+        files: &mut Vec<GeneratedFile>,
+        any_response_headers: &mut bool,
+        operation: &Operation,
+        allocated_name: &str,
+        subdir: &str,
+        file_base: &str,
+    ) {
+        if !*any_response_headers {
+            *any_response_headers = operation
+                .responses
+                .iter()
+                .any(|response| !response.headers.is_empty());
+        }
+        files.push(self.emit_operation_file(operation, allocated_name, subdir, file_base));
+    }
+
+    /// Renders one operation-shaped type file — the `<Stem>Request`, per-status `<Stem>Response*`,
+    /// their header interfaces, and the `<Stem>Response` union — to `types/<subdir>/<file_base>.ts`.
+    /// Webhook and callback operations reuse this unchanged: they carry the same
+    /// parameter/body/response/header/link surface as a path operation, and all three subdirectories
+    /// sit at the same depth, so the `../components/` import prefix is shared.
+    fn emit_operation_file(
+        &self,
+        operation: &Operation,
+        allocated_name: &str,
+        subdir: &str,
+        file_base: &str,
+    ) -> GeneratedFile {
         let stem = uppercase_first(allocated_name);
-        let file_base = self.model.operation_files[operation_index]
-            .as_deref()
-            .unwrap_or_default();
         let mut content = self.header();
         let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
         for parameter in &operation.parameters {
@@ -1559,6 +2064,13 @@ impl Emitter<'_, '_, '_> {
                         &mut imports,
                     );
                 }
+            }
+            for (_, header) in &response.headers {
+                self.collect_operation_imports(
+                    &header.schema,
+                    TypePosition::Response,
+                    &mut imports,
+                );
             }
         }
         self.write_imports(&mut content, imports, "../components/");
@@ -1590,11 +2102,19 @@ impl Emitter<'_, '_, '_> {
         for (response_name, response) in response_declarations {
             response_names.push(response_name.clone());
             write_source_metadata(&mut content, &response.source, 0);
+            self.write_response_tsdoc(&mut content, response);
             content.push_str("export type ");
             content.push_str(&response_name);
             content.push_str(" = ");
             content.push_str(&self.render_response_entry(response));
             content.push_str(";\n\n");
+            if !response.headers.is_empty() {
+                self.write_response_headers_interface(
+                    &mut content,
+                    &format!("{response_name}Headers"),
+                    response,
+                );
+            }
         }
         write_source_metadata(&mut content, &operation.source, 0);
         write_operation_tsdoc(&mut content, operation, &self.model.config.documentation, 0);
@@ -1609,9 +2129,87 @@ impl Emitter<'_, '_, '_> {
         content.push_str(";\n");
 
         GeneratedFile {
-            relative_path: format!("types/operations/{file_base}.ts"),
+            relative_path: format!("types/{subdir}/{file_base}.ts"),
             content,
         }
+    }
+
+    /// Writes the response type's own TSDoc block: currently just `@see` entries, one per
+    /// resolved link declared on this response, in `link_targets` order. A response with no
+    /// resolved link produces an empty `TsDoc` that `write_tsdoc` turns into zero bytes, so a
+    /// link-free document's response types stay byte-identical to before links were emitted.
+    /// An unresolved link (`target_operation_index: None`) already fired its diagnostic in
+    /// `semantic::resolve_links` and contributes nothing here; the same applies to a resolved
+    /// target whose own name allocation failed (no entry in `operation_stems`) — there is no
+    /// name left to link to.
+    fn write_response_tsdoc(&self, output: &mut String, response: &ResponseEntry) {
+        if !self.model.config.documentation.enabled {
+            return;
+        }
+        let mut tsdoc = TsDoc::default();
+        // Fast-reject: a link-free document (the common case) keeps `link_targets_by_response`
+        // empty, so every response skips straight past the lookup instead of paying for two
+        // `String` clones to build a key that could only ever miss.
+        if !self.link_targets_by_response.is_empty()
+            && let Some(indices) = self.link_targets_by_response.get(&(
+                response.source.source_id.clone(),
+                response.source.json_pointer.clone(),
+            ))
+        {
+            for &index in indices {
+                let resolved: &ResolvedLink = &self.model.analyzed.link_targets[index];
+                let Some(target_index) = resolved.target_operation_index else {
+                    continue;
+                };
+                let Some(target_stem) = self.operation_stems.get(&target_index) else {
+                    continue;
+                };
+                tsdoc.see.push((
+                    format!("{target_stem}Response"),
+                    Some(resolved.link_name.clone()),
+                ));
+            }
+        }
+        write_tsdoc(output, &tsdoc, 0);
+    }
+
+    /// Emits the `{ResponseName}Headers` interface next to the response payload type it
+    /// describes, one property per declared header keyed exactly as written (quoted through
+    /// `render_property_key` when it is not a bare identifier). Only called when
+    /// `response.headers` is non-empty, so a header-less response never reaches this and stays
+    /// byte-identical to before headers were emitted.
+    fn write_response_headers_interface(
+        &self,
+        output: &mut String,
+        interface_name: &str,
+        response: &ResponseEntry,
+    ) {
+        write_source_metadata(output, &response.source, 0);
+        output.push_str("export interface ");
+        output.push_str(interface_name);
+        output.push_str(" {\n");
+        for (name, header) in &response.headers {
+            write_schema_tsdoc(
+                output,
+                &response_header_docs(header),
+                DocKind::Header,
+                &self.model.config.documentation,
+                2,
+                false,
+            );
+            output.push_str("  ");
+            if self.model.config.types.readonly {
+                output.push_str("readonly ");
+            }
+            output.push_str(&render_property_key(name));
+            if !header.required {
+                output.push('?');
+            }
+            output.push_str(": ");
+            output.push_str(&self.render_type(&header.schema, TypePosition::Response, 2));
+            output.push_str(";\n");
+        }
+        output.push_str("}\n\n");
     }
 
     fn render_request(&self, operation: &Operation, indent: usize) -> String {
@@ -1689,15 +2287,11 @@ impl Emitter<'_, '_, '_> {
     fn render_parameter_group(&self, parameters: &[&Param], indent: usize) -> String {
         let mut output = String::from("{\n");
         for parameter in parameters {
-            let docs = SchemaDocs {
-                title: None,
-                description: parameter.description.clone(),
-                deprecated: parameter.deprecated,
-                default: None,
-                examples: parameter.schema.meta().docs.examples.clone(),
-                comment: parameter.schema.meta().docs.comment.clone(),
-                constraints: parameter.schema.meta().docs.constraints.clone(),
-            };
+            let docs = schema_field_docs(
+                parameter.description.as_deref(),
+                parameter.deprecated,
+                &parameter.schema,
+            );
             write_schema_tsdoc(
                 &mut output,
                 &docs,
@@ -1772,6 +2366,48 @@ impl Emitter<'_, '_, '_> {
     }
 }
 
+/// Resolves the `&Operation` a callback allocation addresses. Walks from the declaring operation
+/// — a path operation, a webhook operation, or (recursively) the enclosing callback operation —
+/// then descends the callback/expression/operation indices to the leaf operation node.
+pub(super) fn callback_operation<'ir>(
+    ir: &'ir Ir,
+    callback_names: &[AllocatedCallbackName],
+    entry: &AllocatedCallbackName,
+) -> &'ir Operation {
+    let parent = match &entry.parent {
+        CallbackParent::Operation { operation_index } => &ir.operations[*operation_index],
+        CallbackParent::WebhookOperation {
+            webhook_index,
+            operation_index,
+        } => &ir.webhooks[*webhook_index].operations[*operation_index],
+        CallbackParent::Callback { index } => {
+            callback_operation(ir, callback_names, &callback_names[*index])
+        }
+    };
+    &parent.callbacks[entry.callback_index].expressions[entry.expression_index].operations
+        [entry.operation_index_within_expression]
+}
+
+/// Resolves the operation that *declares* a callback — the one whose `callbacks` array the
+/// descriptor reads its callback name and expression text from. For a nested callback this is the
+/// enclosing callback operation; otherwise the path or webhook operation named by the parent.
+pub(super) fn callback_parent_operation<'ir>(
+    ir: &'ir Ir,
+    callback_names: &[AllocatedCallbackName],
+    parent: &CallbackParent,
+) -> &'ir Operation {
+    match parent {
+        CallbackParent::Operation { operation_index } => &ir.operations[*operation_index],
+        CallbackParent::WebhookOperation {
+            webhook_index,
+            operation_index,
+        } => &ir.webhooks[*webhook_index].operations[*operation_index],
+        CallbackParent::Callback { index } => {
+            callback_operation(ir, callback_names, &callback_names[*index])
+        }
+    }
+}
+
 fn select_request_media(media_types: &[crate::ir::MediaType]) -> Option<&crate::ir::MediaType> {
     media_types
         .iter()
@@ -1814,6 +2450,34 @@ fn property_docs(schema: &SchemaNode, meta: &PropMeta) -> SchemaDocs {
     }
 }
 
+/// `SchemaDocs` for a Parameter or Header Object: its own `description`/`deprecated`, never a
+/// `title` or `default` (those live only inside the schema), plus the nested schema's
+/// `examples`/`comment`/`constraints`. Both objects carry the same description/deprecated/schema
+/// shape, so `render_parameter_group` (Parameter) and `response_header_docs` (Header) share this.
+fn schema_field_docs(
+    description: Option<&str>,
+    deprecated: bool,
+    schema: &SchemaNode,
+) -> SchemaDocs {
+    SchemaDocs {
+        title: None,
+        description: description.map(str::to_owned),
+        deprecated,
+        default: None,
+        examples: schema.meta().docs.examples.clone(),
+        comment: schema.meta().docs.comment.clone(),
+        constraints: schema.meta().docs.constraints.clone(),
+    }
+}
+
+fn response_header_docs(header: &ResponseHeader) -> SchemaDocs {
+    schema_field_docs(
+        header.description.as_deref(),
+        header.deprecated,
+        &header.schema,
+    )
+}
+
 fn schema_finite_values(schema: &SchemaNode) -> Option<Vec<Value>> {
     let (enum_values, const_value) = match schema {
         SchemaNode::Primitive {
@@ -1854,6 +2518,46 @@ fn json_equal(left: &Value, right: &Value) -> bool {
             .is_some_and(|(left, right)| left == right),
         _ => left == right,
     }
+}
+
+/// The finite value set an object schema fixes itself to via the `finite` box b9e3b24 added (a
+/// whole-object `const`/`enum`). Used for a discriminator tag property typed as an object, whose
+/// fixed value lives in that box rather than a primitive `const`/`enum`; `None` for any other kind.
+fn container_finite_values(schema: &SchemaNode) -> Option<Vec<Value>> {
+    let SchemaNode::Object { finite, .. } = schema else {
+        return None;
+    };
+    let (enum_values, const_value) = finite_parts(finite);
+    finite_values(enum_values, const_value)
+}
+
+/// The canonical string form of a discriminator tag value, shared across the mapping/const/implicit
+/// sources so their tags compare equal for collision detection. A JSON string uses its raw content
+/// (a mapping key and an implicit component name are already raw strings); any other value renders
+/// compactly, matching how it would appear on the wire.
+fn tag_key(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        _ => render_json_compact(value, ObjectKeyMode::Plain),
+    }
+}
+
+/// Resolves a relative file reference against a logical source id (e.g. `workspace/openapi.json`),
+/// normalizing `.` and `..` segments, so a `file#/...` discriminator mapping value can be looked up
+/// in the schema target index. Returns the resolved logical source id.
+fn join_relative_source(base: &str, relative: &str) -> String {
+    let mut segments: Vec<&str> = base.split('/').collect();
+    segments.pop();
+    for part in relative.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    segments.join("/")
 }
 
 fn render_literal_union(values: &[Value]) -> String {
@@ -1933,11 +2637,51 @@ fn parenthesize_array_item(rendered: String, schema: &SchemaNode) -> String {
     }
 }
 
+/// Parenthesizes one `allOf` branch's rendered type before the members are joined with ` & `.
+/// TypeScript's `&` binds tighter than `|`, so an unparenthesized union member silently changes
+/// the type — `A | B & C` parses as `A | (B & C)`. Mirrors [`parenthesize_array_item`], but adds
+/// the rendered-text check: an `enum`/`const` primitive and a `Finite` node render a top-level
+/// union without being a `OneOf`/`AnyOf` or nullable node, so the node-kind test alone misses them.
+fn parenthesize_intersection_member(rendered: String, branch: &SchemaNode) -> String {
+    if matches!(branch, SchemaNode::OneOf { .. } | SchemaNode::AnyOf { .. })
+        || branch.is_nullable()
+        || renders_top_level_union(&rendered)
+    {
+        format!("({rendered})")
+    } else {
+        rendered
+    }
+}
+
+/// True when `rendered` is a union at bracket depth zero — a ` | ` outside every `()`/`[]`/`{}`
+/// pair. A nested union such as `(string | number)[]` or `{ a: string | number }` binds tighter
+/// than `&` and needs no parentheses; only a top-level ` | ` does. The scan anchors on the leading
+/// space so a bare `|` inside a string literal (an `enum` value) is never mistaken for a union.
+fn renders_top_level_union(rendered: &str) -> bool {
+    let bytes = rendered.as_bytes();
+    let mut depth = 0usize;
+    for (index, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b' ' if depth == 0
+                && bytes.get(index + 1) == Some(&b'|')
+                && bytes.get(index + 2) == Some(&b' ') =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DocKind {
     Schema,
     Property,
     Parameter,
+    Header,
 }
 
 #[derive(Default)]
@@ -1979,7 +2723,7 @@ fn write_schema_tsdoc(
                 config,
             );
         }
-        DocKind::Parameter => {
+        DocKind::Parameter | DocKind::Header => {
             if let Some(description) = docs.description.as_ref() {
                 if config.summary {
                     tsdoc.summary = Some(description.clone());
@@ -1994,10 +2738,19 @@ fn write_schema_tsdoc(
             DocKind::Schema => "This schema is deprecated.",
             DocKind::Property => "This property is deprecated.",
             DocKind::Parameter => "This parameter is deprecated.",
+            DocKind::Header => "This header is deprecated.",
         });
     }
     if let Some(default) = docs.default.as_ref() {
-        let rendered = render_json_compact(default, ObjectKeyMode::Plain);
+        let mut rendered = render_json_compact(default, ObjectKeyMode::Plain);
+        if first_number_outside_binary64(default).is_some() {
+            let marker = if default.is_number() {
+                "outside the binary64 range"
+            } else {
+                "contains a value outside the binary64 range"
+            };
+            rendered.push_str(&format!(" ({marker})"));
+        }
         if kind == DocKind::Property && interface_member {
             tsdoc.default_value = Some(rendered);
         } else if kind == DocKind::Schema {
@@ -2019,7 +2772,16 @@ fn write_schema_tsdoc(
             .examples
             .iter()
             .cloned()
-            .map(|value| DocExample { label: None, value })
+            .map(|value| {
+                let label = first_number_outside_binary64(&value).map(|_| {
+                    if value.is_number() {
+                        "Outside the binary64 range.".to_owned()
+                    } else {
+                        "Contains a value outside the binary64 range.".to_owned()
+                    }
+                });
+                DocExample { label, value }
+            })
             .collect();
     }
     tsdoc.private_remarks = docs.comment.clone();
@@ -2942,6 +3704,8 @@ mod tests {
                 )],
                 additional_properties: AdditionalProperties::Allowed(None),
                 dependent_required: Vec::new(),
+                finite: None,
+                extra_required: Vec::new(),
                 meta: meta(pointer),
             }
         }
@@ -2951,6 +3715,9 @@ mod tests {
             operation_names: Vec::new(),
             schema_names: Vec::new(),
             enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
         };
         let (_temp, config) = resolved_config(json!({}));
         let mut sink = DiagnosticSink::new();
@@ -2965,11 +3732,14 @@ mod tests {
                         missing.clone(),
                     ))),
                     dependent_required: Vec::new(),
+                    finite: None,
+                    extra_required: Vec::new(),
                     meta: meta("/object"),
                 },
                 SchemaNode::Tuple {
                     prefix_items: Vec::new(),
                     rest: TupleRest::Schema(Box::new(missing.clone())),
+                    finite: None,
                     meta: meta("/tuple"),
                 },
                 SchemaNode::OneOf {
@@ -2982,6 +3752,7 @@ mod tests {
                     meta: meta("/union"),
                 },
             ],
+            discriminator: None,
             meta: meta("/nested"),
         };
         let mut diagnostics = Vec::new();
@@ -3028,6 +3799,7 @@ mod tests {
                     primitive(PrimitiveType::String, "/string"),
                     primitive(PrimitiveType::Integer, "/integer"),
                 ],
+                discriminator: None,
                 meta: meta("/any-of"),
             },
         ] {
@@ -3070,6 +3842,9 @@ mod tests {
                 source: source("/components/schemas/Loop"),
             }],
             enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
         };
         let (_temp, config) = resolved_config(json!({
             "types": { "enum": "const" }
@@ -3104,6 +3879,7 @@ mod tests {
                 SchemaNode::Tuple {
                     prefix_items: Vec::new(),
                     rest: TupleRest::Allowed,
+                    finite: None,
                     meta: meta("/open-tuple"),
                 },
                 "[...unknown[]]",
@@ -3116,8 +3892,10 @@ mod tests {
                             primitive(PrimitiveType::String, "/tuple-string"),
                             primitive(PrimitiveType::Number, "/tuple-number"),
                         ],
+                        discriminator: None,
                         meta: meta("/tuple-union"),
                     })),
+                    finite: None,
                     meta: meta("/schema-tuple"),
                 },
                 "[...(string | number)[]]",
@@ -3132,6 +3910,7 @@ mod tests {
             (
                 SchemaNode::AnyOf {
                     branches: Vec::new(),
+                    discriminator: None,
                     meta: meta("/empty-any-of"),
                 },
                 "never",
@@ -3173,6 +3952,170 @@ mod tests {
     }
 
     #[test]
+    fn intersection_parenthesizes_union_members() {
+        // `&` binds tighter than `|` in TypeScript, so a union branch of an intersection must be
+        // wrapped or the type changes meaning. Every wrapping trigger is exercised: a `OneOf` node,
+        // a nullable branch, an `enum` primitive (a top-level union that is not a `OneOf`/`AnyOf`
+        // node), and a bare primitive plus an array-of-union that must stay unwrapped.
+        let analyzed = Analyzed {
+            ir: Ir {
+                schemas: Vec::new(),
+                ..Ir::default()
+            },
+            operation_names: Vec::new(),
+            schema_names: Vec::new(),
+            enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
+        };
+        let (_temp, config) = resolved_config(json!({}));
+        let mut sink = DiagnosticSink::new();
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&mut model);
+
+        let mut nullable_string = primitive(PrimitiveType::String, "/nullable");
+        if let SchemaNode::Primitive { meta, .. } = &mut nullable_string {
+            meta.nullable = true;
+        }
+        let enum_string = SchemaNode::Primitive {
+            ty: PrimitiveType::String,
+            format: None,
+            enum_values: Some(vec![json!("a"), json!("b")]),
+            const_value: None,
+            meta: meta("/enum"),
+        };
+        let one_of = |pointer: &str| SchemaNode::OneOf {
+            branches: vec![
+                primitive(PrimitiveType::String, "/one"),
+                primitive(PrimitiveType::Number, "/two"),
+            ],
+            discriminator: None,
+            meta: meta(pointer),
+        };
+        let conjunction = SchemaNode::AllOf {
+            branches: vec![
+                primitive(PrimitiveType::String, "/plain"),
+                one_of("/union"),
+                nullable_string,
+                enum_string,
+                SchemaNode::Array {
+                    items: Box::new(one_of("/array-union")),
+                    finite: None,
+                    meta: meta("/array"),
+                },
+            ],
+            meta: meta("/conjunction"),
+        };
+
+        assert_eq!(
+            emitter.render_type(&conjunction, TypePosition::Neutral, 0),
+            r#"string & (string | number) & (string | null) & ("a" | "b") & (string | number)[]"#,
+        );
+    }
+
+    fn schema_file<'a>(files: &'a [GeneratedFile], base: &str) -> &'a GeneratedFile {
+        let suffix = format!("/{base}.ts");
+        files
+            .iter()
+            .find(|file| file.relative_path.ends_with(&suffix))
+            .expect("generated schema file")
+    }
+
+    fn composition_diagnostic_count(diagnostics: &[Diagnostic]) -> usize {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_COMPOSITION)
+            .count()
+    }
+
+    #[test]
+    fn oneof_anyof_coexist_lowers_to_allof() {
+        // {oneOf, anyOf} on one object is the conjunction of the two unions. It lowers to
+        // AllOf[OneOf, AnyOf] and renders `(A | B) & (C | D)` — the parenthesization from the S4 fix.
+        let (files, _diagnostics) = compile(
+            openapi(json!({
+                "Thing": {
+                    "oneOf": [{ "type": "string" }, { "type": "number" }],
+                    "anyOf": [{ "type": "boolean" }, { "type": "integer" }]
+                }
+            })),
+            json!({}),
+        );
+        let thing = schema_file(&files, "thing");
+        assert!(
+            thing
+                .content
+                .contains("(string | number) & (boolean | number)"),
+            "{}",
+            thing.content
+        );
+    }
+
+    #[test]
+    fn lowered_conjunction_disjoint_type_reports_oxs1303() {
+        // {type:"string", oneOf:[number, integer]} lowers to AllOf[OneOf(number|integer), string].
+        // The primitive domains are disjoint, so the existing composition check now fires OASTS1303 on
+        // a spec that used to be silently wrong.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Thing": {
+                    "type": "string",
+                    "oneOf": [{ "type": "number" }, { "type": "integer" }]
+                }
+            })),
+            json!({}),
+        );
+        assert!(
+            composition_diagnostic_count(&diagnostics) >= 1,
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn lowered_conjunction_compatible_no_diag() {
+        // A compatible coexistence — string on both the allOf branch and the typed piece — intersects
+        // to a non-empty domain, so no OASTS1303.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Thing": {
+                    "type": "string",
+                    "allOf": [{ "type": "string" }]
+                }
+            })),
+            json!({}),
+        );
+        assert_eq!(
+            composition_diagnostic_count(&diagnostics),
+            0,
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn allof_sibling_constraint_documented_once() {
+        // The sibling minLength documents the wrapper's TSDoc exactly once; the typed branch carries
+        // empty docs and never repeats it (the meta split guarding against double-application).
+        let (files, _diagnostics) = compile(
+            openapi(json!({
+                "Base": { "type": "object", "properties": { "id": { "type": "string" } } },
+                "Thing": {
+                    "allOf": [{ "$ref": "#/components/schemas/Base" }],
+                    "minLength": 3
+                }
+            })),
+            json!({}),
+        );
+        let thing = schema_file(&files, "thing");
+        assert_eq!(
+            thing.content.matches("minLength: 3").count(),
+            1,
+            "{}",
+            thing.content
+        );
+    }
+
+    #[test]
     fn recursive_all_of_ref_terminates_as_named_reference() {
         // Regression: a schema whose member is `allOf: [{$ref: self}]` — the Kubernetes
         // JSONSchemaProps idiom — must not inline forever. merge_all_of inlines the ref
@@ -3193,6 +4136,8 @@ mod tests {
             )],
             additional_properties: AdditionalProperties::Forbidden,
             dependent_required: Vec::new(),
+            finite: None,
+            extra_required: Vec::new(),
             meta: meta("/components/schemas/Loop"),
         };
         let analyzed = Analyzed {
@@ -3213,6 +4158,9 @@ mod tests {
                 source: source("/components/schemas/Loop"),
             }],
             enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
         };
         let (_temp, config) = resolved_config(json!({}));
         let mut sink = DiagnosticSink::new();
@@ -3239,6 +4187,8 @@ mod tests {
                 properties,
                 additional_properties,
                 dependent_required: Vec::new(),
+                finite: None,
+                extra_required: Vec::new(),
                 meta: meta(pointer),
             }
         }
@@ -3269,6 +4219,9 @@ mod tests {
                     description: Some("Ready to run.".to_owned()),
                 }],
             }],
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
         };
         let (_temp, config) = resolved_config(json!({
             "types": { "enum": "const" },
@@ -3353,6 +4306,7 @@ mod tests {
                 SchemaNode::Tuple {
                     prefix_items: Vec::new(),
                     rest: TupleRest::Schema(Box::new(target_ref.clone())),
+                    finite: None,
                     meta: meta("/rest-ref"),
                 },
                 SchemaNode::AllOf {
@@ -3371,6 +4325,7 @@ mod tests {
                     meta: meta("/merge-ref"),
                 },
             ],
+            discriminator: None,
             meta: meta("/walk"),
         };
         let mut visits = 0;
@@ -3468,6 +4423,8 @@ mod tests {
                                 ),
                             )),
                             dependent_required: Vec::new(),
+                            finite: None,
+                            extra_required: Vec::new(),
                             meta: meta("/components/schemas/Dict"),
                         },
                         source: dict.clone(),
@@ -3485,6 +4442,8 @@ mod tests {
                                 ),
                             ))),
                             dependent_required: Vec::new(),
+                            finite: None,
+                            extra_required: Vec::new(),
                             meta: meta("/components/schemas/OpenDict"),
                         },
                         source: open_dict.clone(),
@@ -3526,6 +4485,9 @@ mod tests {
                 },
             ],
             enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
         };
         let (_temp, config) = resolved_config(json!({ "emit": { "importExtension": "none" } }));
         let mut sink = DiagnosticSink::new();
@@ -3654,6 +4616,8 @@ mod tests {
                 },
             ))),
             dependent_required: Vec::new(),
+            finite: None,
+            extra_required: Vec::new(),
             meta: meta("/open"),
         };
         let mut extra = Vec::new();
@@ -3757,15 +4721,20 @@ mod tests {
                         oas_version: crate::ir::OasVersion::V3_1,
                         source: source("/response/media"),
                     }],
+                    headers: Vec::new(),
+                    links: Vec::new(),
                     source: source("/response"),
                 },
                 ResponseEntry {
                     status: ResponseStatus::Exact("204".to_owned()),
                     description: "Empty response.".to_owned(),
                     media_types: Vec::new(),
+                    headers: Vec::new(),
+                    links: Vec::new(),
                     source: source("/response/empty"),
                 },
             ],
+            callbacks: Vec::new(),
             servers: Vec::new(),
             security: None,
             source: source("/operation/rich"),
@@ -3781,6 +4750,7 @@ mod tests {
             parameters: Vec::new(),
             request_body: None,
             responses: Vec::new(),
+            callbacks: Vec::new(),
             servers: Vec::new(),
             security: None,
             source: source("/operation/empty"),
@@ -3805,6 +4775,9 @@ mod tests {
             ],
             schema_names: Vec::new(),
             enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
         };
         let (_temp, config) = resolved_config(json!({
             "types": { "readonly": true },
@@ -4326,6 +5299,211 @@ mod tests {
         );
     }
 
+    /// A `readOnly` annotation on a component's own root (not on any of its properties) seeds that
+    /// component's Request variant need directly, with no property-level marker involved. Referenced
+    /// as a property elsewhere, the referent gets a `{Name}Request` alias, and the propagation pass
+    /// carries that need to the referrer too, since the referrer's rendering of that property now
+    /// names the referent's variant type.
+    #[test]
+    fn readonly_root_component_seeds_variant() {
+        let document = openapi(json!({
+            "Timestamps": {
+                "type": "object",
+                "readOnly": true,
+                "properties": { "createdAt": { "type": "string" } }
+            },
+            "Pet": {
+                "type": "object",
+                "properties": { "timestamps": { "$ref": "#/components/schemas/Timestamps" } }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let timestamps = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("timestamps.ts"))
+            .expect("Timestamps file");
+        assert!(
+            timestamps
+                .content
+                .contains("export interface TimestampsRequest {"),
+            "{}",
+            timestamps.content
+        );
+        assert!(
+            !timestamps.content.contains("Response"),
+            "root readOnly alone must not seed a Response variant: {}",
+            timestamps.content
+        );
+        let pet = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("pet.ts"))
+            .expect("Pet file");
+        assert!(
+            pet.content.contains("export interface PetRequest {"),
+            "{}",
+            pet.content
+        );
+        assert!(
+            pet.content.contains("TimestampsRequest"),
+            "PetRequest must reference Timestamps' own Request variant: {}",
+            pet.content
+        );
+    }
+
+    /// A `writeOnly` annotation on the root of a schema nested inside an `allOf` branch — not on a
+    /// property, and not on the referenced component's own top-level node — still seeds that
+    /// component's Response variant need: the recursion into each branch applies the same
+    /// own-annotation check it applies at the top level. The fixpoint then carries the need to
+    /// whatever else references the component.
+    #[test]
+    fn writeonly_in_allof_branch_propagates_via_fixpoint() {
+        let document = openapi(json!({
+            "Secret": {
+                "allOf": [
+                    {
+                        "type": "object",
+                        "writeOnly": true,
+                        "properties": { "value": { "type": "string" } }
+                    }
+                ]
+            },
+            "Envelope": {
+                "type": "object",
+                "properties": { "secret": { "$ref": "#/components/schemas/Secret" } }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let secret = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("secret.ts"))
+            .expect("Secret file");
+        assert!(
+            secret.content.contains("export type SecretResponse ="),
+            "{}",
+            secret.content
+        );
+        assert!(
+            !secret.content.contains("Request"),
+            "an allOf-branch writeOnly alone must not seed a Request variant: {}",
+            secret.content
+        );
+        let envelope = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("envelope.ts"))
+            .expect("Envelope file");
+        assert!(
+            envelope
+                .content
+                .contains("export interface EnvelopeResponse {"),
+            "fixpoint must carry Secret's Response need to Envelope: {}",
+            envelope.content
+        );
+    }
+
+    /// A scalar-rooted component's `readOnly` still seeds its own Request variant (an alias sharing
+    /// the neutral declaration's underlying type), but that root annotation does not retroactively
+    /// mark the referring property's own metadata. Property omission in a rendered position is keyed
+    /// off the referring site's own `readOnly`/`writeOnly` annotation, never off a property inherited
+    /// from what the property's type points at, so a property typed as this component is never
+    /// dropped from a request rendering on the strength of the referent's root alone — only the
+    /// referenced type name changes to the referent's own variant. This is a deliberate, bounded
+    /// limitation of the omission mechanism, not a defect.
+    #[test]
+    fn scalar_readonly_root_generates_alias_not_omission() {
+        let document = openapi(json!({
+            "Token": { "type": "string", "readOnly": true },
+            "Session": {
+                "type": "object",
+                "properties": { "token": { "$ref": "#/components/schemas/Token" } }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let token = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("token.ts"))
+            .expect("Token file");
+        assert!(token.content.contains("TokenRequest"), "{}", token.content);
+        let session = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("session.ts"))
+            .expect("Session file");
+        assert!(
+            session
+                .content
+                .contains("export interface SessionRequest {"),
+            "{}",
+            session.content
+        );
+        // If the property were omitted the way a referring-site `readOnly` omits it, "TokenRequest"
+        // would never appear anywhere in this file — Neutral rendering names the property's type
+        // "Token", so "TokenRequest" only ever appears in a rendering where the property survived and
+        // its type resolved to the referent's own Request variant.
+        assert!(
+            session.content.contains("TokenRequest"),
+            "the token property must survive into SessionRequest, naming Token's Request variant: {}",
+            session.content
+        );
+    }
+
+    /// A `readOnly`-rooted component referenced two hops deep (through an intermediate component,
+    /// itself referenced by a third) still resolves to the same variant alias name at every hop —
+    /// the propagation fixpoint and naming are keyed off each component's own identity, not off the
+    /// path used to reach it, so nesting depth cannot perturb the name.
+    #[test]
+    fn nested_component_variant_naming() {
+        let document = openapi(json!({
+            "Timestamps": {
+                "type": "object",
+                "readOnly": true,
+                "properties": { "createdAt": { "type": "string" } }
+            },
+            "Pet": {
+                "type": "object",
+                "properties": { "timestamps": { "$ref": "#/components/schemas/Timestamps" } }
+            },
+            "Shelter": {
+                "type": "object",
+                "properties": { "pet": { "$ref": "#/components/schemas/Pet" } }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let pet = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("pet.ts"))
+            .expect("Pet file");
+        assert!(
+            pet.content.contains("export interface PetRequest {"),
+            "{}",
+            pet.content
+        );
+        assert!(pet.content.contains("TimestampsRequest"), "{}", pet.content);
+        let shelter = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("shelter.ts"))
+            .expect("Shelter file");
+        assert!(
+            shelter
+                .content
+                .contains("export interface ShelterRequest {"),
+            "{}",
+            shelter.content
+        );
+        assert!(
+            shelter.content.contains("PetRequest"),
+            "Shelter's variant must name Pet's own Request variant, not a mangled compound name: {}",
+            shelter.content
+        );
+        assert!(
+            !shelter.content.contains("PetTimestampsRequest"),
+            "{}",
+            shelter.content
+        );
+    }
+
     #[test]
     fn enum_literal_and_const_forms_snapshot() {
         let document = openapi(json!({
@@ -4469,6 +5647,240 @@ mod tests {
             .find(|file| file.relative_path.ends_with("intersected.ts"))
             .expect("Intersected");
         assert!(generated_body(intersection).contains("export type Intersected = Cat & Dog;"));
+    }
+
+    fn discriminator_diagnostics(diagnostics: &[Diagnostic]) -> Vec<&Diagnostic> {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.code,
+                    CODE_DISCRIMINATOR | CODE_DISCRIMINATOR_PROOF | CODE_MAPPING_TARGET
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn anyof_discriminator_proves_literals() {
+        let document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "cat" } } },
+            "Dog": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "dog" } } },
+            "Pet": { "anyOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }], "discriminator": { "propertyName": "kind" } }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(
+            discriminator_diagnostics(&diagnostics).is_empty(),
+            "{diagnostics:?}"
+        );
+        let pet = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("pet.ts"))
+            .expect("Pet");
+        assert!(generated_body(pet).contains("export type Pet = Cat | Dog;"));
+    }
+
+    #[test]
+    fn anyof_discriminator_structural_fallback_warns() {
+        let document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "cat" } } },
+            "Pet": { "anyOf": [{ "$ref": "#/components/schemas/Cat" }, { "type": "string" }], "discriminator": { "propertyName": "kind" } }
+        }));
+        let (_files, diagnostics) = compile(document, json!({}));
+        let flagged = discriminator_diagnostics(&diagnostics);
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        assert_eq!(flagged[0].code, CODE_DISCRIMINATOR);
+        assert_eq!(flagged[0].severity, Severity::Warning);
+        assert_eq!(
+            flagged[0].json_pointer.as_deref(),
+            Some("/components/schemas/Pet/discriminator")
+        );
+    }
+
+    #[test]
+    fn oneof_and_anyof_discriminator_proof_runs_once() {
+        // oneOf, anyOf, and a discriminator coexist, so the schema lowers to a conjunction. Only the
+        // oneOf branch carries the discriminator, so the structural-fallback proof — and its single
+        // OASTS1304 — fires once, not once per synthetic branch.
+        let document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "cat" } } },
+            "Wrapped": {
+                "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "type": "string" }],
+                "anyOf": [{ "$ref": "#/components/schemas/Cat" }, { "type": "string" }],
+                "discriminator": { "propertyName": "kind" }
+            }
+        }));
+        let (_files, diagnostics) = compile(document, json!({}));
+        let flagged = discriminator_diagnostics(&diagnostics);
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        assert_eq!(flagged[0].code, CODE_DISCRIMINATOR);
+    }
+
+    #[test]
+    fn discriminator_mapping_proves_branch_literal() {
+        let document = openapi(json!({
+            "Cat": { "type": "object", "properties": { "kind": { "type": "string" } } },
+            "Dog": { "type": "object", "properties": { "kind": { "type": "string" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind",
+                       "mapping": { "cat": "#/components/schemas/Cat", "dog": "#/components/schemas/Dog" } } }
+        }));
+        let (_files, diagnostics) = compile(document, json!({}));
+        assert!(
+            discriminator_diagnostics(&diagnostics).is_empty(),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn discriminator_allof_idiom_proves_through_merge() {
+        let document = openapi(json!({
+            "Pet": { "type": "object", "properties": { "name": { "type": "string" } } },
+            "Cat": { "allOf": [
+                { "$ref": "#/components/schemas/Pet" },
+                { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "cat" } } }
+            ] },
+            "Dog": { "allOf": [
+                { "$ref": "#/components/schemas/Pet" },
+                { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "dog" } } }
+            ] },
+            "Animal": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }], "discriminator": { "propertyName": "kind" } }
+        }));
+        let (_files, diagnostics) = compile(document, json!({}));
+        assert!(
+            discriminator_diagnostics(&diagnostics).is_empty(),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn dangling_mapping_is_error_oxs1308() {
+        let document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "cat" } } },
+            "Dog": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "dog" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind",
+                       "mapping": { "cat": "other.json#/components/schemas/Cat" } } }
+        }));
+        let (_files, diagnostics) = compile(document, json!({}));
+        // The const-proved branches still prove; only the dangling mapping value is reported.
+        let flagged = discriminator_diagnostics(&diagnostics);
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        assert_eq!(flagged[0].code, CODE_MAPPING_TARGET);
+        assert_eq!(flagged[0].severity, Severity::Error);
+        assert_eq!(
+            flagged[0].json_pointer.as_deref(),
+            Some("/components/schemas/Pet/discriminator")
+        );
+    }
+
+    #[test]
+    fn mapping_const_conflict_warns_oxs1309() {
+        let document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "cat" } } },
+            "Dog": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "dog" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind", "mapping": { "feline": "Cat" } } }
+        }));
+        let (_files, diagnostics) = compile(document, json!({}));
+        let flagged = discriminator_diagnostics(&diagnostics);
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        let warning = flagged[0];
+        assert_eq!(warning.code, CODE_DISCRIMINATOR_PROOF);
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(
+            warning.json_pointer.as_deref(),
+            Some("/components/schemas/Pet/discriminator")
+        );
+        assert!(warning.message.contains("maps 'feline'"), "{warning:?}");
+        assert!(warning.message.contains("fixed to \"cat\""), "{warning:?}");
+    }
+
+    #[test]
+    fn implicit_mapping_uses_component_name() {
+        let document = openapi(json!({
+            "Cat": { "type": "object", "properties": { "kind": { "type": "string" } } },
+            "Dog": { "type": "object", "properties": { "kind": { "type": "string" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }], "discriminator": { "propertyName": "kind" } }
+        }));
+        let (_files, diagnostics) = compile(document, json!({}));
+        // No mapping and no const: the component names Cat/Dog are the distinct tags, so the union
+        // proves where the pre-implicit path would have warned.
+        assert!(
+            discriminator_diagnostics(&diagnostics).is_empty(),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn allof_conflicting_consts_no_proof() {
+        let document = openapi(json!({
+            "Broken": { "allOf": [
+                { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "a" } } },
+                { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "b" } } }
+            ] },
+            "Other": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "c" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Broken" }, { "$ref": "#/components/schemas/Other" }], "discriminator": { "propertyName": "kind" } }
+        }));
+        let (_files, diagnostics) = compile(document, json!({}));
+        let flagged = discriminator_diagnostics(&diagnostics);
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        let warning = flagged[0];
+        assert_eq!(warning.code, CODE_DISCRIMINATOR_PROOF);
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(
+            warning.json_pointer.as_deref(),
+            Some("/components/schemas/Pet/discriminator")
+        );
+        assert!(
+            warning.message.contains("no inhabitable value"),
+            "{warning:?}"
+        );
+    }
+
+    #[test]
+    fn discriminator_container_finite_tag_proves() {
+        // Branch A's tag property is itself an object with a `const`, so its fixed value lives in the
+        // object `finite` field b9e3b24 added rather than a primitive `const`; the proof must consult
+        // it. Branch B's tag property is a non-finite array, which proves nothing and falls back to
+        // the implicit component name — so the two branches still carry distinct tags.
+        let document = openapi(json!({
+            "A": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "object", "const": { "k": 1 } } } },
+            "B": { "type": "object", "properties": { "kind": { "type": "array", "items": { "type": "string" } } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/A" }, { "$ref": "#/components/schemas/B" }], "discriminator": { "propertyName": "kind" } }
+        }));
+        let (_files, diagnostics) = compile(document, json!({}));
+        assert!(
+            discriminator_diagnostics(&diagnostics).is_empty(),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn discriminator_allof_cycle_terminates() {
+        // A self-referential allOf branch must not recurse forever while proving its tag: the visited
+        // set breaks the cycle, and the non-recursive sub-branch still fixes the literal.
+        let document = openapi(json!({
+            "Rec": { "allOf": [
+                { "$ref": "#/components/schemas/Rec" },
+                { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "rec" } } }
+            ] },
+            "Leaf": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "leaf" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Rec" }, { "$ref": "#/components/schemas/Leaf" }], "discriminator": { "propertyName": "kind" } }
+        }));
+        let (_files, diagnostics) = compile(document, json!({}));
+        assert!(
+            discriminator_diagnostics(&diagnostics).is_empty(),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn discriminator_join_relative_source_normalizes_segments() {
+        assert_eq!(
+            join_relative_source("workspace/nested/openapi.json", "./sibling/../shared.json"),
+            "workspace/nested/shared.json"
+        );
     }
 
     #[test]
@@ -4635,6 +6047,50 @@ mod tests {
     }
 
     #[test]
+    fn annotated_default_and_example_markers_render() {
+        let document = serde_json::from_str::<Value>(
+            r#"{"openapi":"3.1.0","info":{"title":"test","version":"1"},"paths":{},"components":{"schemas":{"Annotated":{"type":"number","default":1e999,"examples":[{"nested":[1e999]}]},"Contained":{"type":"object","default":{"nested":[1e999]},"examples":[1e999]}}}}"#,
+        )
+        .expect("OpenAPI document with arbitrary-precision annotations");
+        let (files, diagnostics) = compile(document, json!({}));
+        assert_eq!(diagnostics.len(), 4, "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.code == "OASTS1216" && diagnostic.severity == Severity::Warning
+            }),
+            "{diagnostics:?}"
+        );
+        let annotated = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("annotated.ts"))
+            .expect("Annotated");
+        let body = generated_body(annotated);
+        assert!(
+            body.contains("Default value: 1e+999 (outside the binary64 range)"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Contains a value outside the binary64 range.\n * \n * ```json"),
+            "{body}"
+        );
+        let contained = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("contained.ts"))
+            .expect("Contained");
+        let body = generated_body(contained);
+        assert!(
+            body.contains(
+                "Default value: {\"nested\":[1e+999]\\} (contains a value outside the binary64 range)"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("Outside the binary64 range.\n * \n * ```json"),
+            "{body}"
+        );
+    }
+
+    #[test]
     fn comment_encoder_escapes_tag_position_at_signs_anywhere_in_prose() {
         assert_eq!(
             encode_comment_text("Contact us at @support for help"),
@@ -4756,6 +6212,309 @@ mod tests {
         assert!(generated_body(&files[0]).ends_with("export type Conditional = unknown;\n"));
     }
 
+    /// A response entry with `n` declared headers ("X-Rate-Limit" optional/integer/deprecated,
+    /// "X-Request-Id" required/string, in that order — only the first `n` are kept) plus a
+    /// `200 application/json: string` payload, wired through a `get /items` operation whose
+    /// generated stem is `ListItems`.
+    fn headered_document(header_count: usize) -> Value {
+        let mut headers = serde_json::Map::new();
+        headers.insert(
+            "X-Rate-Limit".to_owned(),
+            json!({ "deprecated": true, "schema": { "type": "integer" } }),
+        );
+        headers.insert(
+            "X-Request-Id".to_owned(),
+            json!({ "required": true, "schema": { "type": "string" } }),
+        );
+        while headers.len() > header_count {
+            let key = headers.keys().next_back().cloned();
+            if let Some(key) = key {
+                headers.shift_remove(&key);
+            }
+        }
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/items": {
+                    "get": {
+                        "operationId": "listItems",
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": { "application/json": { "schema": { "type": "string" } } },
+                                "headers": Value::Object(headers)
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn response_header_interface_renders_required_and_optional() {
+        let (files, diagnostics) = compile(
+            headered_document(2),
+            json!({ "types": { "readonly": true } }),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let operation = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("listitems.ts"))
+            .expect("operation file");
+        let body = generated_body(operation);
+        let response_at = body
+            .find("export type ListItemsResponse200 = string;")
+            .expect("response type declared");
+        let headers_at = body
+            .find("export interface ListItemsResponse200Headers {")
+            .expect("headers interface declared");
+        assert!(
+            response_at < headers_at,
+            "headers interface must follow the response type it describes:\n{body}"
+        );
+        for expected in [
+            "export interface ListItemsResponse200Headers {",
+            "@deprecated This header is deprecated.",
+            "readonly \"X-Rate-Limit\"?: number;",
+            "readonly \"X-Request-Id\": string;",
+        ] {
+            assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
+        }
+    }
+
+    #[test]
+    fn typed_headers_file_emitted_only_when_headers_exist() {
+        let (headered_files, diagnostics) = compile(headered_document(2), json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let helper = headered_files
+            .iter()
+            .find(|file| file.relative_path == "types/headers.ts")
+            .expect("TypedHeaders helper emitted for a headered document");
+        assert!(
+            generated_body(helper).contains(
+                "export interface TypedHeaders<K extends string> extends Headers {\n  get(name: K): string | null;\n  get(name: string): string | null;\n}\n"
+            )
+        );
+
+        let (headerless_files, diagnostics) = compile(headered_document(0), json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            !headerless_files
+                .iter()
+                .any(|file| file.relative_path == "types/headers.ts")
+        );
+    }
+
+    #[test]
+    fn response_links_render_as_see_tags() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/square": {
+                    "get": {
+                        "operationId": "getSquare",
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": { "application/json": { "schema": { "type": "string" } } },
+                                "links": {
+                                    "GetToPut": {
+                                        "description": "Follow-up write.",
+                                        "operationId": "putSquare",
+                                        "parameters": {}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "put": {
+                        "operationId": "putSquare",
+                        "responses": { "204": { "description": "Updated." } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let operation = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("getsquare.ts"))
+            .expect("get-square operation file");
+        let body = generated_body(operation);
+        assert!(
+            body.contains("@see {@link PutSquareResponse | GetToPut}"),
+            "missing link see-tag in:\n{body}"
+        );
+        let see_at = body
+            .find("@see {@link PutSquareResponse | GetToPut}")
+            .expect("see tag present");
+        let response_at = body
+            .find("export type GetSquareResponse200 = string;")
+            .expect("response type declared");
+        assert!(
+            see_at < response_at,
+            "the see-tag belongs to GetSquareResponse200's own TSDoc block:\n{body}"
+        );
+    }
+
+    /// Two links attached to the same response: one whose `operationId` resolves to no
+    /// operation at all (`target_operation_index: None`, already diagnosed in the semantic
+    /// stage), and one whose target operation exists but whose own name allocation was
+    /// rejected by an invalid `naming.overrides.operations` value (so it never reaches
+    /// `operation_stems`). Neither contributes a `@see` line.
+    #[test]
+    fn response_tsdoc_skips_unresolved_and_unnamed_link_targets() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/square": {
+                    "get": {
+                        "operationId": "getSquare",
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": { "application/json": { "schema": { "type": "string" } } },
+                                "links": {
+                                    "Dangling": {
+                                        "operationId": "missing",
+                                        "parameters": {}
+                                    },
+                                    "Unnamed": {
+                                        "operationId": "badTarget",
+                                        "parameters": {}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "put": {
+                        "operationId": "badTarget",
+                        "responses": { "204": { "description": "Updated." } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(
+            document,
+            json!({ "naming": { "overrides": { "operations": { "badTarget": "bad name" } } } }),
+        );
+        assert!(
+            !diagnostics.is_empty(),
+            "expected the dangling-link and bad-override errors"
+        );
+        let operation = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("getsquare.ts"))
+            .expect("get-square operation file");
+        assert!(!generated_body(operation).contains("@see"));
+    }
+
+    /// `documentation.enabled = false` suppresses a response's `@see` link entries the same
+    /// way it suppresses every other TSDoc this emitter writes.
+    #[test]
+    fn disabled_documentation_suppresses_response_tsdoc() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/square": {
+                    "get": {
+                        "operationId": "getSquare",
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": { "application/json": { "schema": { "type": "string" } } },
+                                "links": {
+                                    "GetToPut": {
+                                        "operationId": "putSquare",
+                                        "parameters": {}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "put": {
+                        "operationId": "putSquare",
+                        "responses": { "204": { "description": "Updated." } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) =
+            compile(document, json!({ "documentation": { "enabled": false } }));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let operation = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("getsquare.ts"))
+            .expect("get-square operation file");
+        assert!(!generated_body(operation).contains("@see"));
+    }
+
+    /// A document with no response headers and no links must render byte-identically to the
+    /// pre-ticket baseline captured against unmodified `main` (`f6773bd`/`5545d2a`, before this
+    /// ticket's emission changes): same two files, same bytes, and no `types/headers.ts`.
+    #[test]
+    fn headerless_document_output_unchanged() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/items": {
+                    "get": {
+                        "operationId": "listItems",
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": "#/components/schemas/Item" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Item": {
+                        "type": "object",
+                        "required": ["id"],
+                        "properties": { "id": { "type": "string" } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(files.len(), 2);
+        let component = files
+            .iter()
+            .find(|file| file.relative_path == "types/components/item.ts")
+            .expect("component file");
+        let operation = files
+            .iter()
+            .find(|file| file.relative_path == "types/operations/listitems.ts")
+            .expect("operation file");
+        assert_eq!(
+            component.content,
+            "// Generated by Oasts 0.0.0. Do not edit.\n// Config schema version: 1\n// Source digest: 208be6d1e9ffea71d2182fe7b8c3d0860489737113cb37ed721ddbe7f13fb21e\n\n// Source: workspace/openapi.json#/components/schemas/Item\nexport interface Item {\n  id: string;\n}\n"
+        );
+        assert_eq!(
+            operation.content,
+            "// Generated by Oasts 0.0.0. Do not edit.\n// Config schema version: 1\n// Source digest: 208be6d1e9ffea71d2182fe7b8c3d0860489737113cb37ed721ddbe7f13fb21e\n\nimport type { Item } from \"../components/item.js\";\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Responses\n * \n * - 200: OK\n */\nexport type ListItemsRequest = {};\n\n// Source: workspace/openapi.json#/paths/~1items/get/responses/200\nexport type ListItemsResponse200 = Item;\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Responses\n * \n * - 200: OK\n */\nexport type ListItemsResponse = ListItemsResponse200;\n"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.relative_path == "types/headers.ts")
+        );
+    }
+
     #[test]
     fn official_fixtures_emit_deterministically() {
         let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
@@ -4793,6 +6552,319 @@ mod tests {
                 assert!(!file.content.contains("namespace "));
             }
         }
+    }
+
+    fn webhook_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "webhooks": {
+                "newPet": {
+                    "post": {
+                        "requestBody": {
+                            "required": true,
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Pet" } } }
+                        },
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                },
+                "petEvents": {
+                    "post": {
+                        "requestBody": {
+                            "required": true,
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Pet" } } }
+                        },
+                        "responses": { "200": { "description": "ok" } }
+                    },
+                    "delete": { "responses": { "204": { "description": "gone" } } }
+                },
+                "pet.created": {
+                    "post": { "responses": { "200": { "description": "ok" } } }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Pet": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" } } }
+                }
+            }
+        })
+    }
+
+    fn find_file<'a>(files: &'a [GeneratedFile], path: &str) -> &'a GeneratedFile {
+        files
+            .iter()
+            .find(|file| file.relative_path == path)
+            .expect("expected generated file")
+    }
+
+    #[test]
+    fn webhook_type_files_render_request_response() {
+        let (files, diagnostics) = compile(webhook_document(), json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        // Single-method webhook: one file, carrying the inherited body/response surface.
+        let single = find_file(&files, "types/webhooks/newpetpost.ts");
+        assert!(
+            single
+                .content
+                .contains("import type { Pet } from \"../components/pet.js\";")
+        );
+        assert!(single.content.contains("export type NewPetPostRequest = {"));
+        assert!(single.content.contains("body: Pet;"));
+        assert!(single.content.contains("export type NewPetPostResponse ="));
+        // Multi-method webhook: one file per method, never a merged file.
+        let post = find_file(&files, "types/webhooks/peteventspost.ts");
+        assert!(
+            post.content
+                .contains("export type PetEventsPostRequest = {")
+        );
+        let delete = find_file(&files, "types/webhooks/peteventsdelete.ts");
+        assert!(
+            delete
+                .content
+                .contains("export type PetEventsDeleteRequest =")
+        );
+        assert!(
+            delete
+                .content
+                .contains("export type PetEventsDeleteResponse =")
+        );
+    }
+
+    #[test]
+    fn webhooks_descriptor_map_shape() {
+        let (files, _) = compile(webhook_document(), json!({}));
+        let index = find_file(&files, "types/webhooks/index.ts");
+        assert!(index.content.contains("export type Webhooks = {"));
+        // Names as written: a bare identifier stays bare, a dotted name is a quoted key.
+        assert!(index.content.contains("  newPet: {\n"));
+        assert!(index.content.contains("  \"pet.created\": {\n"));
+        // Every method arm, keyed by the lowercase IR method.
+        assert!(index.content.contains(
+            "    post: { request: PetEventsPostRequest; response: PetEventsPostResponse };\n"
+        ));
+        assert!(index.content.contains(
+            "    delete: { request: PetEventsDeleteRequest; response: PetEventsDeleteResponse };\n"
+        ));
+        // The per-file types are imported from the sibling operation files.
+        assert!(index.content.contains(
+            "import type { NewPetPostRequest, NewPetPostResponse } from \"./newpetpost.js\";"
+        ));
+    }
+
+    fn callback_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/subscribe": {
+                    "post": {
+                        "operationId": "subscribe",
+                        "responses": { "202": { "description": "accepted" } },
+                        "callbacks": {
+                            "onData": {
+                                "{$request.body#/url}": {
+                                    "post": {
+                                        "responses": { "200": { "description": "ok" } },
+                                        "callbacks": {
+                                            "onAck": {
+                                                "{$request.body#/ackUrl}": {
+                                                    "post": { "responses": { "204": { "description": "acked" } } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                "{$request.query.fallback}": {
+                                    "get": { "responses": { "200": { "description": "ok" } } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn callback_descriptor_uses_quoted_expression_keys() {
+        let (files, diagnostics) = compile(callback_document(), json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let index = find_file(&files, "types/callbacks/index.ts");
+        // Descriptor named after the declaring operation's stem; both runtime expressions on the
+        // multi-expression callback appear only as quoted string keys.
+        assert!(index.content.contains("export type SubscribeCallbacks = {"));
+        assert!(index.content.contains("  onData: {\n"));
+        assert!(index.content.contains("    \"{$request.body#/url}\": {\n"));
+        assert!(
+            index
+                .content
+                .contains("    \"{$request.query.fallback}\": {\n")
+        );
+        // A callback nested inside a callback operation gets its own descriptor.
+        assert!(
+            index
+                .content
+                .contains("export type SubscribeOnData_1PostCallbacks = {")
+        );
+        assert!(index.content.contains("  onAck: {\n"));
+        assert!(
+            index
+                .content
+                .contains("    \"{$request.body#/ackUrl}\": {\n")
+        );
+        // The expression text never leaks into an identifier: every line mentioning `$request`
+        // is a quoted property key, never an export/import token.
+        for line in index.content.lines() {
+            if line.contains("$request") {
+                assert!(
+                    line.trim_start().starts_with('"'),
+                    "expression must only appear as a quoted key: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn webhookless_document_emits_no_webhook_files() {
+        // A document with neither webhooks nor callbacks emits nothing under either directory, so
+        // its file set stays byte-identical to before this ticket.
+        let document = openapi(json!({
+            "Pet": { "type": "object", "properties": { "id": { "type": "string" } } }
+        }));
+        let (files, _) = compile(document, json!({}));
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.relative_path.starts_with("types/webhooks/"))
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.relative_path.starts_with("types/callbacks/"))
+        );
+    }
+
+    #[test]
+    fn empty_webhook_appears_in_map_without_files() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "webhooks": { "quietHook": {} }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        // No per-method file exists — only the index carries the webhook.
+        assert!(!files.iter().any(|file| {
+            file.relative_path.starts_with("types/webhooks/")
+                && file.relative_path != "types/webhooks/index.ts"
+        }));
+        let index = find_file(&files, "types/webhooks/index.ts");
+        assert!(index.content.contains("quietHook: {};"));
+    }
+
+    #[test]
+    fn webhook_side_callback_gets_its_own_descriptor() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "webhooks": {
+                "petCreated": {
+                    "post": {
+                        "responses": { "200": { "description": "ok" } },
+                        "callbacks": {
+                            "ack": {
+                                "{$request.body#/ackUrl}": {
+                                    "post": { "responses": { "204": { "description": "acked" } } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let index = find_file(&files, "types/callbacks/index.ts");
+        // A callback declared on a webhook operation is named after that webhook operation's stem.
+        assert!(
+            index
+                .content
+                .contains("export type PetCreatedPostCallbacks = {")
+        );
+        assert!(index.content.contains("  ack: {\n"));
+        assert!(
+            index
+                .content
+                .contains("    \"{$request.body#/ackUrl}\": {\n")
+        );
+    }
+
+    #[test]
+    fn descriptor_maps_honor_readonly_config() {
+        let readonly = json!({ "types": { "readonly": true } });
+        let (webhook_files, _) = compile(webhook_document(), readonly.clone());
+        let webhooks = find_file(&webhook_files, "types/webhooks/index.ts");
+        assert!(webhooks.content.contains("  readonly newPet: {\n"));
+        assert!(webhooks.content.contains(
+            "    readonly post: { readonly request: NewPetPostRequest; readonly response: NewPetPostResponse };\n"
+        ));
+        let (callback_files, _) = compile(callback_document(), readonly);
+        let callbacks = find_file(&callback_files, "types/callbacks/index.ts");
+        assert!(callbacks.content.contains("  readonly onData: {\n"));
+        assert!(
+            callbacks
+                .content
+                .contains("    readonly \"{$request.body#/url}\": {\n")
+        );
+    }
+
+    #[test]
+    fn webhook_and_callback_files_skipped_when_file_name_invalid() {
+        // A webhook operation whose operationId file-bases to a Windows reserved device gets no
+        // file, so it is dropped from the descriptor map (leaving the webhook an empty object) and
+        // its callback is likewise fileless — exercising the file-base `None` skip on both paths.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "webhooks": {
+                "petCreated": {
+                    "post": {
+                        "operationId": "CON",
+                        "responses": { "200": { "description": "ok" } },
+                        "callbacks": {
+                            "ack": {
+                                "{$request.body#/ackUrl}": {
+                                    "post": {
+                                        "operationId": "AUX",
+                                        "responses": { "204": { "description": "acked" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        // The invalid file names are reported (OASTS1301), not silently absorbed.
+        assert!(diagnostics.iter().any(|d| d.code == CODE_FILE_NAME));
+        // No per-operation webhook file, and the webhook is an empty object in the map.
+        assert!(!files.iter().any(|file| {
+            file.relative_path.starts_with("types/webhooks/")
+                && file.relative_path != "types/webhooks/index.ts"
+        }));
+        let webhooks = find_file(&files, "types/webhooks/index.ts");
+        assert!(webhooks.content.contains("petCreated: {};"));
+        // The fileless callback produces no callbacks index at all.
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.relative_path.starts_with("types/callbacks/"))
+        );
     }
 }
 
@@ -4897,12 +6969,13 @@ fn stricter_upper(left: Option<Bound>, right: Option<Bound>) -> Option<Bound> {
     }
 }
 
-/// Whether a component needs a Request variant (some reachable property is `readOnly`, dropped in
-/// request position) and/or a Response variant (some reachable property is `writeOnly`, dropped in
-/// response position). The traversal mirrors the position-aware renderer exactly: it descends every
-/// inline structure the renderer inlines — nested objects, `additionalProperties`, array items,
-/// tuple members, and `allOf`/`anyOf`/`oneOf` branches — so the decision agrees with what the
-/// renderer produces. A mismatch would emit a dead export or a dangling import.
+/// Whether a component needs a Request variant (some reachable node — including the schema's own
+/// root — carries `readOnly`, dropped in request position) and/or a Response variant (same for
+/// `writeOnly`, dropped in response position). The traversal mirrors the position-aware renderer
+/// exactly: it descends every inline structure the renderer inlines — nested objects,
+/// `additionalProperties`, array items, tuple members, and `allOf`/`anyOf`/`oneOf` branches — so the
+/// decision agrees with what the renderer produces. A mismatch would emit a dead export or a
+/// dangling import.
 ///
 /// A `$ref` is a graph edge, not crossed here: the referenced component renders as its own named
 /// (possibly variant) type, and variance flows across refs in a separate propagation pass. Stack-only
@@ -4918,6 +6991,8 @@ fn accumulate_shape_variants(schema: &SchemaNode, acc: &mut (bool, bool)) {
     if acc.0 && acc.1 {
         return;
     }
+    acc.0 |= schema.meta().read_only;
+    acc.1 |= schema.meta().write_only;
     match schema {
         SchemaNode::Object {
             properties,

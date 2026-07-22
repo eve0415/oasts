@@ -1,0 +1,44 @@
+openapi: 3.1.0
+info:
+  title: Oasts server variable enum union
+  version: 1.0.0
+servers:
+  - url: https://api.example.test/{version}/{region}
+    variables:
+      version:
+        default: v2
+        enum:
+          - v1
+          - v2
+      region:
+        default: us
+security:
+  - docOauth:
+      - read
+paths:
+  /status:
+    get:
+      operationId: getStatus
+      responses:
+        '200':
+          description: Service status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+components:
+  securitySchemes:
+    docOauth:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: https://auth.example.test/authorize
+          tokenUrl: https://auth.example.test/token
+          scopes:
+            read: Read access
+            write: Write access

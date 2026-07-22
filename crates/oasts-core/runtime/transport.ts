@@ -23,11 +23,11 @@ import {
 } from './serialize.ts';
 
 //#region oxs:auth
-export type AuthContext = { readonly operationId: string; readonly scheme: string; readonly scopes: readonly string[]; readonly url: string };
+export type AuthContext<Scope extends string = string> = { readonly operationId: string; readonly scheme: string; readonly scopes: readonly Scope[]; readonly url: string };
 export type BasicCredential = { readonly username: string; readonly password: string };
 export const AmbientCookieCredential: unique symbol = Symbol('AmbientCookieCredential');
 export type AuthCredential = string | BasicCredential | typeof AmbientCookieCredential;
-export type AuthProvider = (context: AuthContext) => AuthCredential | null | Promise<AuthCredential | null>;
+export type AuthProvider<Scope extends string = string> = (context: AuthContext<Scope>) => AuthCredential | null | Promise<AuthCredential | null>;
 export type AuthProviders<S extends string = never> = Readonly<Record<S, AuthProvider>>;
 export type AuthOverrides = 'anonymous' | Readonly<Record<string, AuthCredential>>;
 //#endregion

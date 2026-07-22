@@ -107,7 +107,7 @@ function matchField(line: string, prefix: string): string | undefined {
 
 async function loadValidatorExports(validatorsDir: string): Promise<ReadonlyMap<string, unknown>> {
   const exportsByName = new Map<string, unknown>();
-  for (const group of ["components", "operations"]) {
+  for (const group of ["components", "operations", "webhooks", "callbacks"]) {
     const groupDir = join(validatorsDir, group);
     if (!existsSync(groupDir)) {
       continue;
@@ -227,7 +227,9 @@ if (generatedRoot === undefined || validatorsDir === undefined || !existsSync(va
   const cases: readonly ConformanceCase[] =
     fixture === "readonly"
       ? (await import("./vectors-validators-readonly-conformance.ts")).cases
-      : (await import("./vectors-validators-conformance.ts")).cases;
+      : fixture === "webhooks"
+        ? (await import("./vectors-validators-webhooks-conformance.ts")).cases
+        : (await import("./vectors-validators-conformance.ts")).cases;
 
   for (const testCase of cases) {
     test(testCase.id, () => {

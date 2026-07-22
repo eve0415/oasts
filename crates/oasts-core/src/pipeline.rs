@@ -133,6 +133,7 @@ mod tests {
                 "types/components/error.ts",
                 "types/components/pet.ts",
                 "types/components/pets.ts",
+                "types/headers.ts",
                 "types/operations/createpets.ts",
                 "types/operations/listpets.ts",
                 "types/operations/showpetbyid.ts",

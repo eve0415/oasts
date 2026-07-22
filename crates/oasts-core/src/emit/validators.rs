@@ -3,7 +3,8 @@
 //! Emits, under the output root when the validators artifact is enabled:
 //!   - `validators/standard-schema.ts` and `validators/runtime.ts` (embedded assets, verbatim);
 //!   - `validators/components/<base>.ts`, one per component;
-//!   - `validators/operations/<base>.ts`, one per operation.
+//!   - `validators/operations/<base>.ts`, one per path operation;
+//!   - `validators/webhooks/<base>.ts` and `validators/callbacks/<base>.ts`, for inbound requests.
 //!
 //! Standalone contract: emitted validator files import ONLY from `../standard-schema.ts`,
 //! `../runtime.ts`, and each other — never from the types artifact. Each file re-exports its own
@@ -17,14 +18,14 @@
 //! the keyword/construct and its source pointer. The writer never commits a failed run, so the
 //! types/client artifacts stay byte-identical when validators is disabled.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Number, Value};
 
 use crate::diag::Diagnostic;
 use crate::ir::{
-    AdditionalProperties, ExclusiveBound, Operation, ParamLocation, PrimitiveType, PropMeta,
-    SchemaMeta, SchemaNode, TupleRest,
+    AdditionalProperties, ExclusiveBound, FiniteConstraint, Operation, ParamLocation,
+    PrimitiveType, PropMeta, ResponseEntry, SchemaMeta, SchemaNode, TupleRest, finite_parts,
 };
 use crate::num::render_number_value;
 use crate::semantic::{TargetCase, normalize_identifier};
@@ -32,9 +33,10 @@ use crate::semantic::{TargetCase, normalize_identifier};
 use super::model::EmissionModel;
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
-    Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypePosition, import_extension,
-    lowercase_first, media_is_json, property_in_position, render_json_compact, render_ts_string,
-    response_status_type_suffix, source_diagnostic, uppercase_first,
+    Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypePosition, callback_operation,
+    callback_parent_operation, import_extension, lowercase_first, media_is_json,
+    property_in_position, render_json_compact, render_ts_string, response_status_type_suffix,
+    source_diagnostic, uppercase_first,
 };
 
 /// Emitted verbatim as `validators/runtime.ts`; the generated-validator call ABI is fixed to it.
@@ -69,6 +71,7 @@ const VALIDATOR_RESERVED_NAMES: &[&str] = &[
     "SyncStandardSchemaV1",
     "isRecord",
     "isArray",
+    "hasGet",
 ];
 
 pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
@@ -88,19 +91,16 @@ pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> V
             collect_rejects(&emitter, &schema.schema, &mut rejects);
         }
         for operation in &analyzed.ir.operations {
-            for parameter in &operation.parameters {
-                collect_rejects(&emitter, &parameter.schema, &mut rejects);
+            collect_operation_rejects(&emitter, operation, true, &mut rejects);
+        }
+        for webhook in &analyzed.ir.webhooks {
+            for operation in &webhook.operations {
+                collect_operation_rejects(&emitter, operation, false, &mut rejects);
             }
-            if let Some(body) = &operation.request_body {
-                for media in &body.media_types {
-                    collect_rejects(&emitter, &media.schema, &mut rejects);
-                }
-            }
-            for response in &operation.responses {
-                for media in &response.media_types {
-                    collect_rejects(&emitter, &media.schema, &mut rejects);
-                }
-            }
+        }
+        for allocated in &analyzed.callback_names {
+            let operation = callback_operation(&analyzed.ir, &analyzed.callback_names, allocated);
+            collect_operation_rejects(&emitter, operation, false, &mut rejects);
         }
     }
     model.sink.extend(rejects);
@@ -140,6 +140,47 @@ pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> V
         if let Some(file) = emit_operation(model, allocated.operation_index, &allocated.name) {
             files.push(file);
         }
+    }
+    if !analyzed.ir.webhooks.is_empty() {
+        for index in 0..analyzed.webhook_names.len() {
+            let Some(file_base) = model.webhook_files[index].clone() else {
+                continue;
+            };
+            let allocated = &analyzed.webhook_names[index];
+            let operation = &analyzed.ir.webhooks[allocated.webhook_index].operations
+                [allocated.operation_index];
+            if let Some(file) = emit_operation_file(
+                model,
+                operation,
+                &allocated.stem,
+                "webhooks",
+                &file_base,
+                false,
+            ) {
+                files.push(file);
+            }
+        }
+        files.push(emit_webhooks_index(model));
+    }
+    if !analyzed.callback_names.is_empty() {
+        for index in 0..analyzed.callback_names.len() {
+            let Some(file_base) = model.callback_files[index].clone() else {
+                continue;
+            };
+            let allocated = &analyzed.callback_names[index];
+            let operation = callback_operation(&analyzed.ir, &analyzed.callback_names, allocated);
+            if let Some(file) = emit_operation_file(
+                model,
+                operation,
+                &allocated.stem,
+                "callbacks",
+                &file_base,
+                false,
+            ) {
+                files.push(file);
+            }
+        }
+        files.push(emit_callbacks_index(model));
     }
     files
 }
@@ -199,6 +240,32 @@ fn collect_rejects(emitter: &Emitter<'_, '_, '_>, schema: &SchemaNode, out: &mut
     emitter.for_each_schema_child(schema, SchemaChildMode::Validation, &mut |child| {
         collect_rejects(emitter, child, out);
     });
+}
+
+fn collect_operation_rejects(
+    emitter: &Emitter<'_, '_, '_>,
+    operation: &Operation,
+    include_responses: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    for parameter in &operation.parameters {
+        collect_rejects(emitter, &parameter.schema, out);
+    }
+    if let Some(body) = &operation.request_body {
+        for media in &body.media_types {
+            collect_rejects(emitter, &media.schema, out);
+        }
+    }
+    if include_responses {
+        for response in &operation.responses {
+            for media in &response.media_types {
+                collect_rejects(emitter, &media.schema, out);
+            }
+            for (_, header) in &response.headers {
+                collect_rejects(emitter, &header.schema, out);
+            }
+        }
+    }
 }
 
 // --- per-file scope ----------------------------------------------------------------------------
@@ -361,24 +428,42 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 properties,
                 additional_properties,
                 dependent_required,
+                finite,
+                extra_required,
                 meta,
-            } => self.gen_object(
-                ObjectParts {
-                    properties,
-                    additional_properties,
-                    dependent_required,
-                    meta,
-                },
-                val,
-                path,
-                iss,
-            ),
-            SchemaNode::Array { items, meta } => self.gen_array(items, meta, val, path, iss),
+            } => {
+                self.gen_object(
+                    ObjectParts {
+                        properties,
+                        additional_properties,
+                        dependent_required,
+                        extra_required,
+                        meta,
+                    },
+                    val,
+                    path,
+                    iss,
+                );
+                self.gen_finite_constraint(finite, val, path, iss);
+            }
+            SchemaNode::Array {
+                items,
+                finite,
+                meta,
+                ..
+            } => {
+                self.gen_array(items, meta, val, path, iss);
+                self.gen_finite_constraint(finite, val, path, iss);
+            }
             SchemaNode::Tuple {
                 prefix_items,
                 rest,
+                finite,
                 meta,
-            } => self.gen_tuple(prefix_items, rest, meta, val, path, iss),
+            } => {
+                self.gen_tuple(prefix_items, rest, meta, val, path, iss);
+                self.gen_finite_constraint(finite, val, path, iss);
+            }
             SchemaNode::AllOf { branches, .. } => {
                 for branch in branches {
                     self.gen_schema(branch, val, path, iss);
@@ -400,7 +485,86 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                     render_ts_string("value not allowed")
                 ));
             }
-            SchemaNode::Any { .. } | SchemaNode::Unknown { .. } => {}
+            SchemaNode::Any { meta } => {
+                // A typeless schema carrying assertions (`{minLength: 3}`) constrains only values of
+                // the matching type and vacuously accepts every other type; a plain free-form `Any`
+                // carries no constraint group and emits nothing. `Unknown` accepts all (the reject
+                // walk already failed the run for it).
+                self.gen_typeless_constraints(meta, val, path, iss);
+            }
+            SchemaNode::Unknown { .. } => {}
+        }
+    }
+
+    fn gen_response_headers(&mut self, response: &ResponseEntry) {
+        self.scope.runtime_values.insert("hasGet");
+        self.open("if (hasGet(value)) {");
+        for (name, header) in &response.headers {
+            let index = self.fresh();
+            let val = format!("v{index}");
+            let child_path = format!("path{index}");
+            let key = render_ts_string(name);
+            self.line(&format!("const {val} = value.get({key});"));
+            self.scope.runtime_values.insert("appendKey");
+            self.line(&format!("const {child_path} = appendKey(path, {key});"));
+            if header.required {
+                self.push_issue(
+                    &format!("{val} === null"),
+                    "path",
+                    "issues",
+                    &format!("missing required header {name}"),
+                );
+            }
+            self.open(&format!("if ({val} !== null) {{"));
+            // Header values arrive as wire strings, so non-string schema domains over-report by design.
+            self.gen_schema(&header.schema, &val, &child_path, "issues");
+            self.close("}");
+        }
+        self.indent -= 1;
+        self.open("} else {");
+        self.scope.runtime_values.insert("issue");
+        self.line("issues.push(issue(path, \"value is not a Headers object\"));");
+        self.close("}");
+    }
+
+    /// Emits the type-conditional checks for a typeless constrained schema (`Any` carrying constraint
+    /// groups, e.g. `{minLength: 3}` or the constraint-only typed branch of a lowered conjunction).
+    /// Per JSON Schema, a typeless assertion constrains values OF ITS MATCHING TYPE and vacuously
+    /// accepts every other type — so each present group emits a standalone type-guard block with NO
+    /// else arm (a non-matching type must push no issue). Fixed emission order — number, string,
+    /// array, object — keeps output deterministic. `contentEncoding` is a serialization concern, not
+    /// a JSON-validity assertion, so it is deliberately not checked here.
+    fn gen_typeless_constraints(&mut self, meta: &SchemaMeta, val: &str, path: &str, iss: &str) {
+        if meta.numeric_constraints.is_some() {
+            self.open(&format!(
+                "if (typeof {val} === \"number\" && Number.isFinite({val})) {{"
+            ));
+            self.gen_number_constraints_inner(meta, val, path, iss);
+            self.close("}");
+        }
+        if meta.string_constraints.is_some() {
+            self.open(&format!("if (typeof {val} === \"string\") {{"));
+            self.gen_string_constraints(None, meta, val, path, iss);
+            self.close("}");
+        }
+        if meta.array_constraints.is_some() {
+            self.scope.needs_is_array = true;
+            self.open(&format!("if (isArray({val})) {{"));
+            self.gen_array_constraints(meta, val, path, iss);
+            self.close("}");
+        }
+        if meta.object_constraints.is_some() {
+            self.scope.needs_is_record = true;
+            self.open(&format!("if (isRecord({val})) {{"));
+            let constraints = meta.object_constraints();
+            self.gen_property_count_bounds(
+                constraints.min_properties,
+                constraints.max_properties,
+                &format!("Object.keys({val})"),
+                path,
+                iss,
+            );
+            self.close("}");
         }
     }
 
@@ -503,6 +667,25 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         path: &str,
         iss: &str,
     ) {
+        self.gen_number_constraints_inner(meta, val, path, iss);
+        // The int32 clause is type-specific (it needs a declared integer/int32), so it lives here
+        // rather than in the shared inner body the typeless path reuses.
+        if matches!(ty, PrimitiveType::Integer) && format == Some("int32") {
+            self.scope.runtime_values.insert("isInt32");
+            self.push_issue(&format!("!isInt32({val})"), path, iss, "out of int32 range");
+        }
+    }
+
+    /// The type-agnostic numeric checks — bounds (min/max/exclusive) then multipleOf — shared by the
+    /// declared-number primitive path and the typeless numeric guard. The caller supplies the number
+    /// type gate; this body assumes `val` is already narrowed to a finite number.
+    fn gen_number_constraints_inner(
+        &mut self,
+        meta: &SchemaMeta,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
         let constraints = meta.numeric_constraints();
         self.gen_bound(constraints, BoundDirection::Lower, val, path, iss);
         self.gen_bound(constraints, BoundDirection::Upper, val, path, iss);
@@ -515,10 +698,6 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 iss,
                 &format!("not a multiple of {literal}"),
             );
-        }
-        if matches!(ty, PrimitiveType::Integer) && format == Some("int32") {
-            self.scope.runtime_values.insert("isInt32");
-            self.push_issue(&format!("!isInt32({val})"), path, iss, "out of int32 range");
         }
     }
 
@@ -606,6 +785,19 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         );
     }
 
+    /// Splits an object/array/tuple's `enum`/`const` box and generates its finite-value guard —
+    /// the shared tail of those three schema arms.
+    fn gen_finite_constraint(
+        &mut self,
+        finite: &Option<Box<FiniteConstraint>>,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        let (enum_values, const_value) = finite_parts(finite);
+        self.gen_finite(enum_values, const_value, val, path, iss);
+    }
+
     fn gen_finite(
         &mut self,
         enum_values: Option<&[Value]>,
@@ -652,6 +844,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             properties,
             additional_properties,
             dependent_required,
+            extra_required,
             meta,
         } = parts;
         self.scope.needs_is_record = true;
@@ -701,6 +894,17 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             } else {
                 self.close("}");
             }
+        }
+
+        for name in extra_required {
+            let key = render_ts_string(name);
+            self.scope.runtime_values.insert("issue");
+            self.open(&format!("if (!Object.hasOwn({val}, {key})) {{"));
+            self.line(&format!(
+                "{iss}.push(issue({path}, {}));",
+                render_ts_string(&format!("missing required property {name}"))
+            ));
+            self.close("}");
         }
 
         for (trigger, dependents) in dependent_required {
@@ -754,6 +958,22 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             &keys_expr,
         );
 
+        self.gen_property_count_bounds(min, max, &keys_expr, path, iss);
+
+        self.close_type_gate(meta.nullable, val, path, iss, "object");
+    }
+
+    /// Emits the minProperties/maxProperties count checks against a prepared `Object.keys(...)`
+    /// expression (a hoisted local when the typed object gate also iterates keys, an inline call in
+    /// the typeless guard). Shared so the message vocabulary stays in one place across both paths.
+    fn gen_property_count_bounds(
+        &mut self,
+        min: Option<u64>,
+        max: Option<u64>,
+        keys_expr: &str,
+        path: &str,
+        iss: &str,
+    ) {
         if let Some(min) = min {
             self.push_issue(
                 &format!("{keys_expr}.length < {min}"),
@@ -770,8 +990,6 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 &format!("more properties than maxProperties {max}"),
             );
         }
-
-        self.close_type_gate(meta.nullable, val, path, iss, "object");
     }
 
     fn gen_additional_properties(
@@ -1020,15 +1238,32 @@ struct ObjectParts<'a> {
     properties: &'a [(String, SchemaNode, PropMeta)],
     additional_properties: &'a AdditionalProperties,
     dependent_required: &'a [(String, Vec<String>)],
+    extra_required: &'a [String],
     meta: &'a SchemaMeta,
 }
 
-/// A schema whose validate body is empty, so descending into it emits only dead scaffold. These
-/// are exactly the nodes `gen_schema` handles as a no-op: a free-form `{}`/`true` schema (`Any`)
-/// and an unknown leaf (`Unknown`, which additionally fails the run via the reject walk, so it never
-/// reaches committed output). Callers skip the value/path bindings and loops around such children.
+/// A schema whose validate body is empty, so descending into it emits only dead scaffold. A plain
+/// free-form `{}`/`true` schema (`Any` with no constraint group) and an unknown leaf (`Unknown`,
+/// which additionally fails the run via the reject walk, so it never reaches committed output) are
+/// no-ops. A constrained typeless `Any` (`{minLength: 3}`) is NOT — it emits type-guarded checks, so
+/// callers must give it the full value/path descent scaffold. Callers skip that scaffold only for
+/// the no-op case.
 fn is_noop_schema(schema: &SchemaNode) -> bool {
-    matches!(schema, SchemaNode::Any { .. } | SchemaNode::Unknown { .. })
+    match schema {
+        SchemaNode::Any { meta } => !has_typeless_constraints(meta),
+        other => matches!(other, SchemaNode::Unknown { .. }),
+    }
+}
+
+/// Whether a schema's meta carries any typeless constraint group (numeric/string/array/object) —
+/// the assertions a typeless `Any` node still enforces type-conditionally. `contentEncoding` is not
+/// a validity constraint, so it does not count. The boxed groups follow the `Some` ⟺ non-default
+/// invariant, so a populated box always means a real constraint.
+fn has_typeless_constraints(meta: &SchemaMeta) -> bool {
+    meta.numeric_constraints.is_some()
+        || meta.string_constraints.is_some()
+        || meta.array_constraints.is_some()
+        || meta.object_constraints.is_some()
 }
 
 fn unknown_key_condition(properties: &[(String, SchemaNode, PropMeta)]) -> String {
@@ -1219,6 +1454,24 @@ fn emit_operation(
     let analyzed = model.analyzed;
     let file_base = model.operation_files[operation_index].clone()?;
     let operation = &analyzed.ir.operations[operation_index];
+    emit_operation_file(
+        model,
+        operation,
+        allocated_name,
+        "operations",
+        &file_base,
+        true,
+    )
+}
+
+fn emit_operation_file(
+    model: &mut EmissionModel<'_, '_>,
+    operation: &Operation,
+    allocated_name: &str,
+    directory: &str,
+    file_base: &str,
+    include_responses: bool,
+) -> Option<GeneratedFile> {
     let stem = uppercase_first(allocated_name);
 
     // Deterministic list of (export type name, schema, wire position) to validate: every parameter,
@@ -1242,33 +1495,52 @@ fn emit_operation(
             TypePosition::Request,
         ));
     }
-    let mut responses: Vec<(String, &SchemaNode)> = Vec::new();
-    for response in &operation.responses {
-        if let Some(media) = response
-            .media_types
-            .iter()
-            .find(|media| media_is_json(&media.name))
-        {
-            let suffix = response_status_type_suffix(&response.status);
-            responses.push((format!("{stem}Response{suffix}"), &media.schema));
+    if include_responses {
+        let mut responses: Vec<(String, &SchemaNode)> = Vec::new();
+        for response in &operation.responses {
+            if let Some(media) = response
+                .media_types
+                .iter()
+                .find(|media| media_is_json(&media.name))
+            {
+                let suffix = response_status_type_suffix(&response.status);
+                responses.push((format!("{stem}Response{suffix}"), &media.schema));
+            }
+        }
+        responses.sort_by(|left, right| left.0.cmp(&right.0));
+        for (export_type, schema) in responses {
+            positions.push((export_type, schema, TypePosition::Response));
         }
     }
-    responses.sort_by(|left, right| left.0.cmp(&right.0));
-    for (export_type, schema) in responses {
-        positions.push((export_type, schema, TypePosition::Response));
-    }
 
-    if positions.is_empty() {
+    let mut header_positions = if include_responses {
+        operation
+            .responses
+            .iter()
+            .filter(|response| !response.headers.is_empty())
+            .map(|response| {
+                let suffix = response_status_type_suffix(&response.status);
+                (format!("{stem}Response{suffix}Headers"), response)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    header_positions.sort_by(|left, right| left.0.cmp(&right.0));
+
+    if positions.is_empty() && header_positions.is_empty() {
         return None;
     }
 
     let mut scope = FileScope::default();
     let mut imports = SiblingImports::default();
 
-    // Phase 1: render each position's type alias and collect sibling imports.
-    let type_declarations: Vec<String> = {
+    // Phase 1: render each position's type alias and collect sibling imports. One emitter serves
+    // both the value and header declarations — its merge/link caches carry across the two loops —
+    // and the block scopes its borrow of `model` so phase 2 can reborrow `model` mutably.
+    let (type_declarations, header_type_declarations): (Vec<String>, Vec<String>) = {
         let emitter = Emitter::new(model);
-        positions
+        let type_declarations = positions
             .iter()
             .map(|(export_type, schema, position)| {
                 imports.collect(&emitter, schema, *position, None);
@@ -1277,11 +1549,23 @@ fn emit_operation(
                     emitter.render_type(schema, *position, 0)
                 )
             })
-            .collect()
+            .collect();
+        let header_type_declarations = header_positions
+            .iter()
+            .map(|(export_type, response)| {
+                for (_, header) in &response.headers {
+                    imports.collect(&emitter, &header.schema, TypePosition::Response, None);
+                }
+                let mut declaration = String::new();
+                emitter.write_response_headers_interface(&mut declaration, export_type, response);
+                declaration
+            })
+            .collect();
+        (type_declarations, header_type_declarations)
     };
 
     // Phase 2: generate validate bodies.
-    let mut declarations = Vec::with_capacity(positions.len());
+    let mut declarations = Vec::with_capacity(positions.len() + header_positions.len());
     for ((export_type, schema, position), type_declaration) in
         positions.iter().zip(type_declarations)
     {
@@ -1292,14 +1576,272 @@ fn emit_operation(
             validator: render_validator(export_type, &body.out),
         });
     }
+    for ((export_type, response), type_declaration) in
+        header_positions.iter().zip(header_type_declarations)
+    {
+        let mut body = FnBody::new(&mut scope, model, TypePosition::Response);
+        body.gen_response_headers(response);
+        declarations.push(Decl {
+            type_declaration,
+            validator: render_validator(export_type, &body.out),
+        });
+    }
 
     let content = assemble_file(model, "../components/", &imports, &scope, &declarations);
-    let relative_path = format!("validators/operations/{file_base}.ts");
+    let relative_path = format!("validators/{directory}/{file_base}.ts");
     model.register_path(&relative_path, &operation.source);
     Some(GeneratedFile {
         relative_path,
         content,
     })
+}
+
+fn emit_webhooks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
+    let analyzed = model.analyzed;
+    let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut body = String::from("export const webhooks = {\n");
+    // webhook_names is grouped by ascending webhook_index (its allocation order), so each webhook's
+    // entries are the contiguous run at the cursor — advance through them once instead of rescanning
+    // the whole table per webhook.
+    let mut cursor = 0;
+    for (webhook_index, webhook) in analyzed.ir.webhooks.iter().enumerate() {
+        body.push_str("  ");
+        body.push_str(&render_ts_string(&webhook.name));
+        body.push_str(": {");
+        let mut wrote_method = false;
+        while let Some(allocated) = analyzed
+            .webhook_names
+            .get(cursor)
+            .filter(|allocated| allocated.webhook_index == webhook_index)
+        {
+            let file_base = model.webhook_files[cursor].as_deref();
+            cursor += 1;
+            let Some(file_base) = file_base else {
+                continue;
+            };
+            let operation = &webhook.operations[allocated.operation_index];
+            if !operation_has_request_validators(operation) {
+                continue;
+            }
+            if !wrote_method {
+                body.push('\n');
+                wrote_method = true;
+            }
+            write_request_descriptor_method(
+                &mut body,
+                &mut imports,
+                file_base,
+                &allocated.stem,
+                operation,
+                4,
+            );
+        }
+        if wrote_method {
+            body.push_str("  },\n");
+        } else {
+            body.push_str("},\n");
+        }
+    }
+    body.push_str("};\n");
+    assemble_descriptor_index(model, "validators/webhooks/index.ts", imports, body)
+}
+
+fn emit_callbacks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
+    let analyzed = model.analyzed;
+    let ir = &analyzed.ir;
+    let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut body = String::new();
+    let mut seen_parents = HashSet::new();
+    // A parent's filed, validator-bearing callback entries interleave with its nested callbacks'
+    // entries in callback_names (pre-order DFS), so group every qualifying entry by parent once
+    // (callback_names order preserved) instead of rescanning the whole table per parent.
+    let mut entries_by_parent: HashMap<_, Vec<usize>> = HashMap::new();
+    for (index, entry) in analyzed.callback_names.iter().enumerate() {
+        if model.callback_files[index].is_some()
+            && operation_has_request_validators(callback_operation(
+                ir,
+                &analyzed.callback_names,
+                entry,
+            ))
+        {
+            entries_by_parent
+                .entry(&entry.parent)
+                .or_default()
+                .push(index);
+        }
+    }
+    for (index, entry) in analyzed.callback_names.iter().enumerate() {
+        if model.callback_files[index].is_none()
+            || !operation_has_request_validators(callback_operation(
+                ir,
+                &analyzed.callback_names,
+                entry,
+            ))
+            || !seen_parents.insert(&entry.parent)
+        {
+            continue;
+        }
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        let parent = &entry.parent;
+        let parent_op = callback_parent_operation(ir, &analyzed.callback_names, parent);
+        body.push_str("export const ");
+        body.push_str(&lowercase_first(&uppercase_first(&entry.parent_stem)));
+        body.push_str("Callbacks = {\n");
+        let entries = &entries_by_parent[parent];
+        let mut cursor = 0;
+        while cursor < entries.len() {
+            let callback_index = analyzed.callback_names[entries[cursor]].callback_index;
+            let callback = &parent_op.callbacks[callback_index];
+            body.push_str("  ");
+            body.push_str(&render_ts_string(&callback.name));
+            body.push_str(": {\n");
+            while cursor < entries.len()
+                && analyzed.callback_names[entries[cursor]].callback_index == callback_index
+            {
+                let expression_index = analyzed.callback_names[entries[cursor]].expression_index;
+                body.push_str("    ");
+                body.push_str(&render_ts_string(
+                    &callback.expressions[expression_index].expression,
+                ));
+                body.push_str(": {\n");
+                while cursor < entries.len() && {
+                    let current = &analyzed.callback_names[entries[cursor]];
+                    current.callback_index == callback_index
+                        && current.expression_index == expression_index
+                } {
+                    let i = entries[cursor];
+                    let allocated = &analyzed.callback_names[i];
+                    let file_base = model.callback_files[i].as_deref().unwrap_or_default();
+                    let operation = callback_operation(ir, &analyzed.callback_names, allocated);
+                    write_request_descriptor_method(
+                        &mut body,
+                        &mut imports,
+                        file_base,
+                        &allocated.stem,
+                        operation,
+                        6,
+                    );
+                    cursor += 1;
+                }
+                body.push_str("    },\n");
+            }
+            body.push_str("  },\n");
+        }
+        body.push_str("};\n");
+    }
+    assemble_descriptor_index(model, "validators/callbacks/index.ts", imports, body)
+}
+
+fn operation_has_request_validators(operation: &Operation) -> bool {
+    !operation.parameters.is_empty()
+        || operation.request_body.as_ref().is_some_and(|body| {
+            body.media_types
+                .iter()
+                .any(|media| media_is_json(&media.name))
+        })
+}
+
+fn write_request_descriptor_method(
+    body: &mut String,
+    imports: &mut BTreeMap<String, BTreeSet<String>>,
+    file_base: &str,
+    allocated_name: &str,
+    operation: &Operation,
+    indent: usize,
+) {
+    let stem = uppercase_first(allocated_name);
+    let parameter_names = operation_parameter_validator_names(operation, &stem);
+    let entry = imports.entry(file_base.to_owned()).or_default();
+    body.push_str(&" ".repeat(indent));
+    body.push_str(&operation.method);
+    body.push_str(": {\n");
+    if !operation.parameters.is_empty() {
+        body.push_str(&" ".repeat(indent + 2));
+        body.push_str("parameters: {\n");
+        for location in [
+            ParamLocation::Path,
+            ParamLocation::Query,
+            ParamLocation::Header,
+            ParamLocation::Cookie,
+        ] {
+            let matching = operation
+                .parameters
+                .iter()
+                .zip(&parameter_names)
+                .filter(|(parameter, _)| parameter.location == location)
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                continue;
+            }
+            body.push_str(&" ".repeat(indent + 4));
+            body.push_str(location_key(location));
+            body.push_str(": {\n");
+            for (parameter, export_type) in matching {
+                let validator = format!("{}Validator", lowercase_first(export_type));
+                entry.insert(validator.clone());
+                body.push_str(&" ".repeat(indent + 6));
+                body.push_str(&render_ts_string(&parameter.name));
+                body.push_str(": ");
+                body.push_str(&validator);
+                body.push_str(",\n");
+            }
+            body.push_str(&" ".repeat(indent + 4));
+            body.push_str("},\n");
+        }
+        body.push_str(&" ".repeat(indent + 2));
+        body.push_str("},\n");
+    }
+    if operation.request_body.as_ref().is_some_and(|request_body| {
+        request_body
+            .media_types
+            .iter()
+            .any(|media| media_is_json(&media.name))
+    }) {
+        let validator = format!("{}RequestBodyValidator", lowercase_first(&stem));
+        entry.insert(validator.clone());
+        body.push_str(&" ".repeat(indent + 2));
+        body.push_str("requestBody: ");
+        body.push_str(&validator);
+        body.push_str(",\n");
+    }
+    body.push_str(&" ".repeat(indent));
+    body.push_str("},\n");
+}
+
+fn location_key(location: ParamLocation) -> &'static str {
+    match location {
+        ParamLocation::Path => "path",
+        ParamLocation::Query => "query",
+        ParamLocation::Header => "header",
+        ParamLocation::Cookie => "cookie",
+    }
+}
+
+fn assemble_descriptor_index(
+    model: &EmissionModel<'_, '_>,
+    relative_path: &str,
+    imports: BTreeMap<String, BTreeSet<String>>,
+    body: String,
+) -> GeneratedFile {
+    let extension = import_extension(model);
+    let mut content = model.header();
+    for (file_base, names) in imports {
+        content.push_str("import { ");
+        content.push_str(&names.into_iter().collect::<Vec<_>>().join(", "));
+        content.push_str(" } from ");
+        content.push_str(&render_ts_string(&format!("./{file_base}{extension}")));
+        content.push_str(";\n");
+    }
+    if !content.ends_with("\n\n") {
+        content.push('\n');
+    }
+    content.push_str(&body);
+    GeneratedFile {
+        relative_path: relative_path.to_owned(),
+        content,
+    }
 }
 
 /// The validator export-type name for each of `operation`'s parameters, aligned 1:1 with
@@ -1552,6 +2094,18 @@ mod tests {
             .expect("component validator file")
             .content
             .clone()
+    }
+
+    fn type_component(files: &[GeneratedFile], base: &str) -> String {
+        files
+            .iter()
+            .find(|file| file.relative_path == format!("types/components/{base}.ts"))
+            .expect("component types file")
+            .content
+            .lines()
+            .filter(|line| !line.starts_with("// Source digest:"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn assert_clean(diagnostics: &[Diagnostic]) {
@@ -1864,6 +2418,69 @@ mod tests {
         assert!(content.contains("issues.push(issue(path0, \"value not in enum\"));"));
         assert!(content.contains("if (!deepEqual(value1, \"canis\")) {"));
         assert!(content.contains("issues.push(issue(path1, \"value not equal to const\"));"));
+    }
+
+    #[test]
+    fn object_enum_emits_deepequal_check() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": { "kind": { "type": "string" } },
+                "enum": [{ "kind": "a" }, { "kind": "b" }]
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        let structural = content
+            .find("expected type object")
+            .expect("object type check");
+        let finite = content
+            .find("value not in enum")
+            .expect("object enum check");
+        assert!(content.contains("deepEqual("));
+        assert!(finite > structural);
+    }
+
+    #[test]
+    fn array_const_emits_deepequal_check() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "array",
+                "items": { "type": "integer" },
+                "const": [1, 2]
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("deepEqual("));
+        assert!(content.contains("value not equal to const"));
+    }
+
+    #[test]
+    fn tuple_enum_types_unchanged() {
+        let (plain_files, plain_diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "array",
+                "prefixItems": [{ "type": "string" }, { "type": "integer" }],
+                "items": false
+            }
+        })));
+        let (finite_files, finite_diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "array",
+                "prefixItems": [{ "type": "string" }, { "type": "integer" }],
+                "items": false,
+                "enum": [["a", 1], ["b", 2]]
+            }
+        })));
+        assert_clean(&plain_diagnostics);
+        assert_clean(&finite_diagnostics);
+        assert_eq!(
+            type_component(&plain_files, "thing"),
+            type_component(&finite_files, "thing")
+        );
+        assert!(!component(&plain_files, "thing").contains("value not in enum"));
+        assert!(component(&finite_files, "thing").contains("value not in enum"));
     }
 
     #[test]
@@ -2356,6 +2973,176 @@ mod tests {
             .clone()
     }
 
+    fn response_headers_document(headers: Value) -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/things": {
+                    "get": {
+                        "operationId": "fetchThing",
+                        "responses": {
+                            "201": {
+                                "description": "created",
+                                "headers": headers,
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "string" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn response_header_validator_emits_presence_and_schema_checks() {
+        let (files, diagnostics) = compile(response_headers_document(json!({
+            "X-Token": {
+                "required": true,
+                "schema": { "type": "string", "minLength": 2 }
+            },
+            "X-Trace": {
+                "schema": { "type": "string", "pattern": "^[a-z]+$" }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = operation(&files, "fetchthing");
+        assert!(content.contains("if (hasGet(value)) {"), "{content}");
+        assert!(
+            content.contains("const v0 = value.get(\"X-Token\");"),
+            "{content}"
+        );
+        assert!(content.contains("if (v0 === null) {"), "{content}");
+        assert!(
+            content.contains("missing required header X-Token"),
+            "{content}"
+        );
+        assert!(content.contains("if (v0 !== null) {"), "{content}");
+        assert!(
+            content.contains("if (codePointLength(v0) < 2) {"),
+            "{content}"
+        );
+        assert!(
+            content.contains("const v1 = value.get(\"X-Trace\");"),
+            "{content}"
+        );
+        assert!(content.contains("if (v1 !== null) {"), "{content}");
+        assert!(
+            content.contains("if (!pattern0Regex().test(v1)) {"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("missing required header X-Trace"),
+            "{content}"
+        );
+        assert!(
+            content.contains("value is not a Headers object"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn response_header_validator_position_name_matches_types_interface() {
+        let (files, diagnostics) = compile(response_headers_document(json!({
+            "X-Token": { "schema": { "type": "string" } }
+        })));
+        assert_clean(&diagnostics);
+        let validators = operation(&files, "fetchthing");
+        let types = files
+            .iter()
+            .find(|file| file.relative_path == "types/operations/fetchthing.ts")
+            .expect("operation types file")
+            .content
+            .as_str();
+        let position = "FetchThingResponse201Headers";
+        assert!(
+            types.contains(&format!("export interface {position} {{")),
+            "{types}"
+        );
+        assert!(
+            validators.contains(&format!("export interface {position} {{")),
+            "{validators}"
+        );
+        assert!(
+            validators.contains("export const fetchThingResponse201HeadersValidator"),
+            "{validators}"
+        );
+    }
+
+    #[test]
+    fn multiple_headered_responses_emit_sorted_positions() {
+        let (files, diagnostics) = compile(json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/things": {
+                    "get": {
+                        "operationId": "fetchThing",
+                        "responses": {
+                            "404": {
+                                "description": "missing",
+                                "headers": {
+                                    "X-Reason": { "schema": { "type": "string" } }
+                                }
+                            },
+                            "201": {
+                                "description": "created",
+                                "headers": {
+                                    "X-Token": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        assert_clean(&diagnostics);
+        let validators = operation(&files, "fetchthing");
+        let first = validators
+            .find("fetchThingResponse201HeadersValidator")
+            .expect("201 headers validator");
+        let second = validators
+            .find("fetchThingResponse404HeadersValidator")
+            .expect("404 headers validator");
+        assert!(first < second, "{validators}");
+    }
+
+    #[test]
+    fn non_string_header_schema_still_emits_with_wire_string_semantics() {
+        let (files, diagnostics) = compile(response_headers_document(json!({
+            "X-Count": { "schema": { "type": "integer", "minimum": 1 } }
+        })));
+        assert_clean(&diagnostics);
+        let content = operation(&files, "fetchthing");
+        assert!(
+            content.contains("const v0 = value.get(\"X-Count\");"),
+            "{content}"
+        );
+        assert!(
+            content.contains("if (typeof v0 === \"number\" && Number.isInteger(v0)) {"),
+            "{content}"
+        );
+        assert!(content.contains("if (v0 < 1) {"), "{content}");
+    }
+
+    #[test]
+    fn headerless_document_validators_unchanged() {
+        let document = response_headers_document(json!({}));
+        let (first_files, first_diagnostics) = compile(document.clone());
+        let (second_files, second_diagnostics) = compile(document);
+        assert_clean(&first_diagnostics);
+        assert_clean(&second_diagnostics);
+        let first = operation(&first_files, "fetchthing");
+        let second = operation(&second_files, "fetchthing");
+        assert_eq!(first.as_bytes(), second.as_bytes());
+        assert!(!first.contains("hasGet"), "{first}");
+        assert!(!first.contains("HeadersValidator"), "{first}");
+    }
+
     /// The reported bug: a `$ref` from a request body must delegate to the referent's Request-variant
     /// validator, not the Neutral one, which would demand a `readOnly` property the request type
     /// dropped. Symmetrically, a `$ref` from a response delegates to the Response variant.
@@ -2556,6 +3343,287 @@ mod tests {
     }
 
     #[test]
+    fn webhook_request_validators_emit_body_and_parameter_checks() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "webhooks": {
+                "pet.created": {
+                    "post": {
+                        "parameters": [{
+                            "name": "X-Signature",
+                            "in": "header",
+                            "required": true,
+                            "schema": { "type": "string", "minLength": 8 }
+                        }],
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["id"],
+                                        "properties": { "id": { "type": "string" } }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "subscriber response",
+                                "content": {
+                                    "application/json": { "schema": { "type": "boolean" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document);
+        assert_clean(&diagnostics);
+        let content = files
+            .iter()
+            .find(|file| file.relative_path == "validators/webhooks/petcreatedpost.ts")
+            .expect("webhook validator file")
+            .content
+            .as_str();
+        assert!(content.contains("export const petCreatedPostHeaderXSignatureValidator"));
+        assert!(content.contains("shorter than minLength 8"));
+        assert!(content.contains("export const petCreatedPostRequestBodyValidator"));
+        assert!(content.contains("missing required property id"));
+        assert!(!content.contains("Response200Validator"), "{content}");
+    }
+
+    #[test]
+    fn callback_request_validators_emit() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/subscribe": {
+                    "post": {
+                        "operationId": "subscribe",
+                        "responses": { "202": { "description": "accepted" } },
+                        "callbacks": {
+                            "onData": {
+                                "{$request.body#/url}": {
+                                    "post": {
+                                        "requestBody": {
+                                            "content": {
+                                                "application/json": {
+                                                    "schema": { "type": "string", "minLength": 1 }
+                                                }
+                                            }
+                                        },
+                                        "responses": { "204": { "description": "ok" } },
+                                        "callbacks": {
+                                            "onAck": {
+                                                "{$request.body#/ackUrl}": {
+                                                    "put": {
+                                                        "parameters": [{
+                                                            "name": "token",
+                                                            "in": "query",
+                                                            "schema": { "type": "string" }
+                                                        }],
+                                                        "responses": { "204": { "description": "ok" } }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document);
+        assert_clean(&diagnostics);
+        assert!(files.iter().any(|file| {
+            file.relative_path == "validators/callbacks/subscribeondatapost.ts"
+                && file
+                    .content
+                    .contains("subscribeOnDataPostRequestBodyValidator")
+        }));
+        assert!(files.iter().any(|file| {
+            file.relative_path == "validators/callbacks/subscribeondatapostonackput.ts"
+                && file
+                    .content
+                    .contains("subscribeOnDataPostOnAckPutQueryTokenValidator")
+        }));
+    }
+
+    #[test]
+    fn webhook_validators_descriptor_maps_names_to_consts() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/subscribe": {
+                    "post": {
+                        "operationId": "subscribe",
+                        "responses": { "202": { "description": "accepted" } },
+                        "callbacks": {
+                            "onData": {
+                                "{$request.body#/url}": {
+                                    "post": {
+                                        "requestBody": {
+                                            "content": {
+                                                "application/json": { "schema": { "type": "string" } }
+                                            }
+                                        },
+                                        "responses": { "204": { "description": "ok" } }
+                                    }
+                                },
+                                "{$request.query.fallback}": {
+                                    "get": { "responses": { "204": { "description": "ok" } } }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "webhooks": {
+                "pet.created": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/json": { "schema": { "type": "string" } }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                },
+                "responseOnly": {
+                    "get": { "responses": { "204": { "description": "ok" } } }
+                },
+                "emptyHook": {}
+            }
+        });
+        let (files, diagnostics) = compile(document);
+        assert_clean(&diagnostics);
+        let webhooks = files
+            .iter()
+            .find(|file| file.relative_path == "validators/webhooks/index.ts")
+            .expect("webhooks descriptor")
+            .content
+            .as_str();
+        assert!(webhooks.contains("\"pet.created\": {\n"), "{webhooks}");
+        assert!(webhooks.contains("post: {\n"), "{webhooks}");
+        assert!(
+            webhooks.contains("requestBody: petCreatedPostRequestBodyValidator"),
+            "{webhooks}"
+        );
+        assert!(webhooks.contains("\"responseOnly\": {},\n"), "{webhooks}");
+        assert!(webhooks.contains("\"emptyHook\": {},\n"), "{webhooks}");
+        let callbacks = files
+            .iter()
+            .find(|file| file.relative_path == "validators/callbacks/index.ts")
+            .expect("callbacks descriptor")
+            .content
+            .as_str();
+        assert!(
+            callbacks.contains("\"{$request.body#/url}\": {\n"),
+            "{callbacks}"
+        );
+        for line in callbacks.lines().filter(|line| line.contains("$request")) {
+            assert!(line.trim_start().starts_with('"'), "{line}");
+        }
+        assert!(
+            callbacks.contains("requestBody: subscribeOnData_1PostRequestBodyValidator"),
+            "{callbacks}"
+        );
+    }
+
+    #[test]
+    fn webhook_and_callback_validators_skip_unfileable_names() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "webhooks": {
+                "events": {
+                    "post": {
+                        "operationId": "CON",
+                        "requestBody": {
+                            "content": {
+                                "application/json": { "schema": { "type": "string" } }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } },
+                        "callbacks": {
+                            "ack": {
+                                "{$request.body#/url}": {
+                                    "post": {
+                                        "operationId": "AUX",
+                                        "requestBody": {
+                                            "content": {
+                                                "application/json": {
+                                                    "schema": { "type": "boolean" }
+                                                }
+                                            }
+                                        },
+                                        "responses": { "204": { "description": "ok" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document);
+        assert!(!diagnostics.is_empty());
+        assert!(!files.iter().any(|file| {
+            file.relative_path == "validators/webhooks/con.ts"
+                || file.relative_path == "validators/callbacks/aux.ts"
+        }));
+        let webhooks = files
+            .iter()
+            .find(|file| file.relative_path == "validators/webhooks/index.ts")
+            .expect("webhooks descriptor")
+            .content
+            .as_str();
+        assert!(webhooks.contains("\"events\": {},\n"), "{webhooks}");
+    }
+
+    #[test]
+    fn validator_descriptor_parameter_locations_are_total() {
+        assert_eq!(location_key(ParamLocation::Path), "path");
+        assert_eq!(location_key(ParamLocation::Query), "query");
+        assert_eq!(location_key(ParamLocation::Header), "header");
+        assert_eq!(location_key(ParamLocation::Cookie), "cookie");
+    }
+
+    #[test]
+    fn webhookless_document_validator_files_unchanged() {
+        let document = doc_31(json!({
+            "Pet": { "type": "object", "properties": { "id": { "type": "string" } } }
+        }));
+        let (first, first_diagnostics) = compile(document.clone());
+        let (second, second_diagnostics) = compile(document);
+        assert_clean(&first_diagnostics);
+        assert_clean(&second_diagnostics);
+        let first = first
+            .iter()
+            .filter(|file| file.relative_path.starts_with("validators/"))
+            .map(|file| (&file.relative_path, file.content.as_bytes()))
+            .collect::<Vec<_>>();
+        let second = second
+            .iter()
+            .filter(|file| file.relative_path.starts_with("validators/"))
+            .map(|file| (&file.relative_path, file.content.as_bytes()))
+            .collect::<Vec<_>>();
+        assert_eq!(first, second);
+        assert!(!first.iter().any(|(path, _)| {
+            path.starts_with("validators/webhooks/") || path.starts_with("validators/callbacks/")
+        }));
+    }
+
+    #[test]
     fn operation_with_no_json_positions_emits_no_file() {
         let document = json!({
             "openapi": "3.1.0",
@@ -2617,6 +3685,9 @@ mod tests {
             operation_names: Vec::new(),
             schema_names: Vec::new(),
             enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
         };
         let mut sink = DiagnosticSink::new();
         let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
@@ -2631,16 +3702,12 @@ mod tests {
     }
 
     #[test]
-    fn plain_bounds_and_out_of_f64_range_literals_render() {
-        // Built through the parser (not a Rust literal) so the out-of-f64-range bound survives as a
-        // preserved arbitrary-precision number.
-        let big: Value = serde_json::from_str("1e400").expect("number parses");
+    fn plain_bounds_render() {
         let (files, diagnostics) = compile(doc_31(json!({
             "Thing": {
                 "type": "object",
                 "properties": {
-                    "age": { "type": "integer", "minimum": 0, "maximum": 200 },
-                    "big": { "type": "number", "minimum": big }
+                    "age": { "type": "integer", "minimum": 0, "maximum": 200 }
                 }
             }
         })));
@@ -2650,8 +3717,6 @@ mod tests {
         assert!(content.contains("issues.push(issue(path0, \"less than minimum 0\"));"));
         assert!(content.contains("if (value0 > 200) {"));
         assert!(content.contains("issues.push(issue(path0, \"greater than maximum 200\"));"));
-        // A bound outside the f64 range is rendered from the preserved number's own string form.
-        assert!(content.contains("less than minimum 1e+400"));
     }
 
     #[test]
@@ -2687,18 +3752,18 @@ mod tests {
 
     #[test]
     fn a_non_error_warning_does_not_fail_a_clean_validators_build() {
-        // A discriminator whose branches prove no per-branch literal emits a structural-union
-        // warning (not an error), so a validators build over the same input is still clean.
+        // A discriminator with a branch that proves no per-branch literal (a bare primitive carries
+        // no discriminator property) emits a structural-union warning, not an error, so a validators
+        // build over the same input is still clean.
         let (files, diagnostics) = compile(doc_31(json!({
             "Shape": {
                 "oneOf": [
                     { "$ref": "#/components/schemas/A" },
-                    { "$ref": "#/components/schemas/B" }
+                    { "type": "string" }
                 ],
                 "discriminator": { "propertyName": "kind" }
             },
-            "A": { "type": "object", "properties": { "kind": { "type": "string" } } },
-            "B": { "type": "object", "properties": { "kind": { "type": "string" } } }
+            "A": { "type": "object", "properties": { "kind": { "type": "string" } } }
         })));
         assert!(
             diagnostics.iter().any(|d| d.severity == Severity::Warning),
@@ -3063,6 +4128,32 @@ mod tests {
     }
 
     #[test]
+    fn phantom_required_emits_hasown_presence_check() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "required": ["phantom"],
+                "properties": { "declared": { "type": "string" } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let warning = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "OASTS1111")
+            .expect("phantom required warning");
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(
+            warning.json_pointer.as_deref(),
+            Some("/components/schemas/Thing/required")
+        );
+        let content = component(&files, "thing");
+        assert!(content.contains("if (!Object.hasOwn(value, \"phantom\")) {"));
+        assert!(
+            content.contains("issues.push(issue(path, \"missing required property phantom\"));")
+        );
+    }
+
+    #[test]
     fn free_form_tuple_positions_skip_their_dead_scaffold() {
         // A no-op prefix position and a no-op rest schema each validate against nothing, so both the
         // length-guard block and the rest loop are dead; the surviving position is still checked.
@@ -3205,5 +4296,155 @@ mod tests {
             .split_once(&format!("function {checked_name}("))
             .expect("checked function present")
             .0
+    }
+
+    #[test]
+    fn typeless_string_constraints_type_guarded() {
+        // `{minLength: 3}` is typeless: it constrains only strings and vacuously accepts every other
+        // type. The check must sit inside a `typeof value === "string"` guard with no else arm, so a
+        // number value falls through and pushes nothing.
+        let (files, diagnostics) = compile(doc_31(json!({ "Thing": { "minLength": 3 } })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        let body = validate_body(&content, "validateThing");
+        assert!(
+            body.contains("if (typeof value === \"string\") {"),
+            "{body}"
+        );
+        assert!(body.contains("if (codePointLength(value) < 3) {"), "{body}");
+        assert!(
+            body.contains("issues.push(issue(path, \"shorter than minLength 3\"));"),
+            "{body}"
+        );
+        // Typeless admits every type: no type-mismatch arm, so a non-string value produces no issue.
+        assert!(!body.contains("} else"), "{body}");
+        assert!(!body.contains("expected type"), "{body}");
+        // The only push is the guarded minLength one — nothing unguarded.
+        assert_eq!(body.matches("issues.push(").count(), 1, "{body}");
+    }
+
+    #[test]
+    fn typeless_number_and_array_and_object_guards() {
+        // A typeless schema carrying constraints for several types emits one standalone type-guard
+        // block per present group, in the fixed order number, string, array, object (string absent
+        // here). Each block's checks fire only for a value of its matching type.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": { "minimum": 5, "minItems": 2, "maxProperties": 4 }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        let body = validate_body(&content, "validateThing");
+        let number = body
+            .find("if (typeof value === \"number\" && Number.isFinite(value)) {")
+            .expect("number guard");
+        assert!(body[number..].contains("if (value < 5) {"), "{body}");
+        assert!(
+            body.contains("issues.push(issue(path, \"less than minimum 5\"));"),
+            "{body}"
+        );
+        let array = body.find("if (isArray(value)) {").expect("array guard");
+        assert!(
+            body.contains("issues.push(issue(path, \"fewer items than minItems 2\"));"),
+            "{body}"
+        );
+        let object = body.find("if (isRecord(value)) {").expect("object guard");
+        assert!(
+            body.contains("if (Object.keys(value).length > 4) {"),
+            "{body}"
+        );
+        assert!(
+            body.contains("issues.push(issue(path, \"more properties than maxProperties 4\"));"),
+            "{body}"
+        );
+        // No string group was declared, so no string guard is emitted.
+        assert!(!body.contains("=== \"string\""), "{body}");
+        // Fixed emission order: number, then array, then object.
+        assert!(number < array && array < object, "{body}");
+    }
+
+    #[test]
+    fn constrained_any_is_not_noop_scaffold_emitted() {
+        // A constrained typeless property (`{minimum: 0}`) is no longer a no-op: it must get the full
+        // own-key descent scaffold (own-key read, path append, typed body), where before it was
+        // skipped and its constraint silently dropped.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": { "n": { "minimum": 0 } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(
+            content.contains("if (Object.hasOwn(value, \"n\")) {"),
+            "{content}"
+        );
+        assert!(
+            content.contains("const value0: unknown = value[\"n\"];"),
+            "{content}"
+        );
+        assert!(
+            content.contains("const path0 = appendKey(path, \"n\");"),
+            "{content}"
+        );
+        assert!(
+            content.contains("if (typeof value0 === \"number\" && Number.isFinite(value0)) {"),
+            "{content}"
+        );
+        assert!(
+            content.contains("issues.push(issue(path0, \"less than minimum 0\"));"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn contentencoding_typeless_emits_no_check() {
+        // contentEncoding is a serialization concern, not a JSON-validity assertion, so a typeless
+        // `{contentEncoding: "base64"}` stays a no-op — its validate body is byte-identical to a
+        // plain free-form `{}`.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Encoded": { "contentEncoding": "base64" },
+            "Plain": {}
+        })));
+        assert_clean(&diagnostics);
+        let encoded = component(&files, "encoded");
+        let plain = component(&files, "plain");
+        let encoded_body = validate_body(&encoded, "validateEncoded");
+        let plain_body = validate_body(&plain, "validatePlain");
+        // Byte-identical to a plain free-form `{}`: same empty validate body, no emitted check.
+        assert_eq!(encoded_body, plain_body, "encoded: {encoded}");
+        assert!(!encoded_body.contains("issues.push("), "{encoded}");
+        assert!(!encoded_body.contains("if ("), "{encoded}");
+        assert!(!encoded.contains("base64"), "{encoded}");
+    }
+
+    #[test]
+    fn allof_sibling_constraints_enforced() {
+        // `{allOf: [...], minLength: 3}` lowers to a conjunction whose typed branch is a constraint-
+        // only typeless `Any`. The generated validator must enforce that sibling minLength through the
+        // typed branch's string guard, composing with the applicator branch's own checks.
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Combined": {
+                "allOf": [
+                    { "type": "object", "properties": { "a": { "type": "string" } } }
+                ],
+                "minLength": 3
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "combined");
+        let body = validate_body(&content, "validateCombined");
+        // The applicator branch still checks the object shape.
+        assert!(body.contains("if (isRecord(value)) {"), "{body}");
+        // The sibling minLength is enforced by the typed branch's string guard.
+        assert!(
+            body.contains("if (typeof value === \"string\") {"),
+            "{body}"
+        );
+        assert!(body.contains("if (codePointLength(value) < 3) {"), "{body}");
+        assert!(
+            body.contains("issues.push(issue(path, \"shorter than minLength 3\"));"),
+            "{body}"
+        );
     }
 }

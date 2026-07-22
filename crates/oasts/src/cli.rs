@@ -495,7 +495,22 @@ mod tests {
     }
 
     #[test]
-    fn json_defaults_and_examples_outside_binary64_render_raw_in_tsdoc() {
+    fn invalid_multiple_of_is_an_input_diagnostic() {
+        let temp = raw_json_project(
+            r#"{"openapi":"3.1.0","paths":{},"components":{"schemas":{"Value":{"type":"number","multipleOf":"invalid"}}}}"#,
+        );
+        let (code, stdout, stderr) = invoke(
+            &["oasts", "generate", "--config", "oasts.json"],
+            temp.path(),
+        );
+
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("error[OASTS1112]"), "{stderr}");
+    }
+
+    #[test]
+    fn json_defaults_and_examples_outside_binary64_render_annotated_in_tsdoc() {
         let temp = raw_json_project(
             r#"{"openapi":"3.1.0","paths":{},"components":{"schemas":{"Top":{"type":"number","default":1e999,"examples":[1e999]},"Container":{"type":"object","properties":{"value":{"type":"string","default":{"nested":[1e999]}}}}}}}"#,
         );
@@ -507,15 +522,24 @@ mod tests {
 
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(stdout, "generated 2 files\n");
+        assert!(stderr.contains("OASTS1216"), "{stderr}");
         let top = fs::read_to_string(temp.path().join("generated/types/components/top.ts"))
             .expect("Top output");
-        assert!(top.contains("Default value: 1e+999"), "{top}");
-        assert!(top.contains("```json\n * 1e+999\n * ```"), "{top}");
+        assert!(
+            top.contains("Default value: 1e+999 (outside the binary64 range)"),
+            "{top}"
+        );
+        assert!(
+            top.contains("Outside the binary64 range.\n * \n * ```json\n * 1e+999\n * ```"),
+            "{top}"
+        );
         let container =
             fs::read_to_string(temp.path().join("generated/types/components/container.ts"))
                 .expect("Container output");
         assert!(
-            container.contains("@defaultValue {\"nested\":[1e+999]\\}"),
+            container.contains(
+                "@defaultValue {\"nested\":[1e+999]\\} (contains a value outside the binary64 range)"
+            ),
             "{container}"
         );
     }

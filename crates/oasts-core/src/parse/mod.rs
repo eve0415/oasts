@@ -6,12 +6,13 @@ use serde_json::{Map, Value};
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
-    AdditionalProperties, ArrayConstraints, Body, Discriminator, EncodingHeader, EncodingObject,
-    EnumExtensionData, ExclusiveBound, Ir, MediaType, NamedSchema, NamedSecurityScheme,
-    NumericConstraints, OasVersion, ObjectConstraints, Operation, Param, ParamLocation, ParamStyle,
-    PrimitiveType, PropMeta, ResponseEntry, ResponseStatus, SchemaDocs, SchemaMeta, SchemaNode,
-    SchemaRef, SecKind, SecurityRequirement, Segment, SegmentPart, ServerEntry, ServerVariable,
-    SourceRef, StringConstraints, TupleRest, box_if_populated,
+    AdditionalProperties, ArrayConstraints, Body, Callback, CallbackExpression, Discriminator,
+    EncodingHeader, EncodingObject, EnumExtensionData, ExclusiveBound, FiniteConstraint, Ir, Link,
+    LinkTarget, MediaType, NamedSchema, NamedSecurityScheme, NumericConstraints, OAuthFlow,
+    OAuthFlows, OasVersion, ObjectConstraints, Operation, Param, ParamLocation, ParamStyle,
+    PrimitiveType, PropMeta, ResponseEntry, ResponseHeader, ResponseStatus, SchemaDocs, SchemaMeta,
+    SchemaNode, SchemaRef, SecKind, SecurityRequirement, Segment, SegmentPart, ServerEntry,
+    ServerVariable, SourceRef, StringConstraints, TupleRest, Webhook, box_if_populated,
 };
 use crate::loader::{DocId, DocumentGraph, append_pointer};
 
@@ -24,6 +25,16 @@ const CODE_REFERENCE: &str = "OASTS1106";
 const CODE_MEDIA_TYPE: &str = "OASTS1107";
 const CODE_DUPLICATE_MEDIA_TYPE: &str = "OASTS1108";
 const CODE_RESERVED_HEADER_PARAMETER: &str = "OASTS1109";
+const CODE_REF_SIBLINGS: &str = "OASTS1110";
+const CODE_MULTIPLE_OF: &str = "OASTS1112";
+const CODE_SERVER_VAR_ENUM_EMPTY: &str = "OASTS1131";
+const CODE_SERVER_VAR_DEFAULT: &str = "OASTS1132";
+const CODE_HEADER_CONTENT_TYPE: &str = "OASTS1133";
+const CODE_HEADER_DUPLICATE: &str = "OASTS1134";
+const CODE_WEBHOOKS_VERSION: &str = "OASTS1135";
+const CODE_LINK_TARGET: &str = "OASTS1234";
+const CODE_PHANTOM_REQUIRED: &str = "OASTS1111";
+const CODE_SECURITY_FLOWS_SHAPE: &str = "OASTS1438";
 
 const METHODS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
@@ -158,15 +169,18 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             })
         });
         let security_schemes = self.parse_security_schemes(&root);
+        let webhooks = self.parse_webhooks(&root);
         let operations = self.parse_operations(root.clone());
         let mut schemas = self.parse_named_schemas(root);
-        self.materialize_external_schemas(&mut schemas, &operations);
+        self.materialize_external_schemas(&mut schemas, &operations, &webhooks);
         Ir {
             operations,
+            webhooks,
             schemas,
             root_servers,
             root_security,
             security_schemes,
+            version: self.version,
         }
     }
 
@@ -185,6 +199,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         &mut self,
         schemas: &mut Vec<NamedSchema>,
         operations: &[Operation],
+        webhooks: &[Webhook],
     ) {
         // The loader only loads a document when a `$ref` targets it, so a graph with a single
         // document has no external targets and every reference is entry-internal. Materialization
@@ -218,6 +233,11 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         }
         for operation in operations {
             collect_operation_refs(operation, &mut queue);
+        }
+        for webhook in webhooks {
+            for operation in &webhook.operations {
+                collect_operation_refs(operation, &mut queue);
+            }
         }
 
         let mut discovered = Vec::new();
@@ -315,59 +335,106 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 pointer: path_pointer,
                 value: raw_path_item,
             };
-            let Some(path_item) = self.resolve_object(path_node, "path item") else {
-                continue;
-            };
-            let path_parameters =
-                path_item
-                    .value
-                    .get("parameters")
-                    .map_or_else(Vec::new, |value| {
-                        let pointer = append_pointer(&path_item.pointer, "parameters");
-                        self.parse_parameters(NodeView {
-                            doc_id: path_item.doc_id,
-                            pointer,
-                            value,
-                        })
-                    });
-            let path_servers = path_item
-                .value
-                .get("servers")
-                .map_or_else(Vec::new, |value| {
-                    let pointer = append_pointer(&path_item.pointer, "servers");
-                    self.parse_servers(NodeView {
-                        doc_id: path_item.doc_id,
+            operations.extend(self.parse_path_item_operations(path_node, Some(path)));
+        }
+        operations
+    }
+
+    fn parse_webhooks(&mut self, root: &NodeView<'graph>) -> Vec<Webhook> {
+        let Some(value) = root.value.get("webhooks") else {
+            return Vec::new();
+        };
+        if self.version == OasVersion::V3_0 {
+            self.sink.push(self.warning_diagnostic(
+                CODE_WEBHOOKS_VERSION,
+                root.doc_id,
+                "/webhooks",
+                "top-level 'webhooks' requires OpenAPI 3.1 and is ignored",
+            ));
+            return Vec::new();
+        }
+        let Some(webhooks) = value.as_object() else {
+            self.shape_error(root.doc_id, "/webhooks", "webhooks must be an object");
+            return Vec::new();
+        };
+        webhooks
+            .iter()
+            .filter_map(|(name, value)| {
+                let pointer = append_pointer("/webhooks", name);
+                let path_item = self.resolve_object(
+                    NodeView {
+                        doc_id: root.doc_id,
                         pointer,
                         value,
-                    })
-                });
-            for method in METHODS {
-                let Some(value) = path_item.value.get(method) else {
-                    continue;
-                };
-                let pointer = append_pointer(&path_item.pointer, method);
-                let operation_node = NodeView {
+                    },
+                    "webhook path item",
+                )?;
+                Some(Webhook {
+                    name: name.clone(),
+                    operations: self.parse_path_item_operations(path_item.clone(), None),
+                    source: self.source(path_item.doc_id, &path_item.pointer),
+                })
+            })
+            .collect()
+    }
+
+    fn parse_path_item_operations(
+        &mut self,
+        path_item: NodeView<'graph>,
+        path_context: Option<&str>,
+    ) -> Vec<Operation> {
+        let Some(path_item) = self.resolve_object(path_item, "path item") else {
+            return Vec::new();
+        };
+        let path_parameters = path_item
+            .value
+            .get("parameters")
+            .map_or_else(Vec::new, |value| {
+                let pointer = append_pointer(&path_item.pointer, "parameters");
+                self.parse_parameters(NodeView {
                     doc_id: path_item.doc_id,
                     pointer,
                     value,
-                };
-                let Some(operation_object) = value.as_object() else {
-                    self.shape_error(
-                        operation_node.doc_id,
-                        &operation_node.pointer,
-                        "operation must be an object",
-                    );
-                    continue;
-                };
-                operations.push(self.parse_operation(
-                    method,
-                    path,
-                    operation_node,
-                    operation_object,
-                    &path_parameters,
-                    &path_servers,
-                ));
-            }
+                })
+            });
+        let path_servers = path_item
+            .value
+            .get("servers")
+            .map_or_else(Vec::new, |value| {
+                let pointer = append_pointer(&path_item.pointer, "servers");
+                self.parse_servers(NodeView {
+                    doc_id: path_item.doc_id,
+                    pointer,
+                    value,
+                })
+            });
+        let mut operations = Vec::new();
+        for method in METHODS {
+            let Some(value) = path_item.value.get(method) else {
+                continue;
+            };
+            let pointer = append_pointer(&path_item.pointer, method);
+            let operation_node = NodeView {
+                doc_id: path_item.doc_id,
+                pointer,
+                value,
+            };
+            let Some(operation_object) = value.as_object() else {
+                self.shape_error(
+                    operation_node.doc_id,
+                    &operation_node.pointer,
+                    "operation must be an object",
+                );
+                continue;
+            };
+            operations.push(self.parse_operation(
+                method,
+                path_context,
+                operation_node,
+                operation_object,
+                &path_parameters,
+                &path_servers,
+            ));
         }
         operations
     }
@@ -375,7 +442,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
     fn parse_operation(
         &mut self,
         method: &str,
-        path: &str,
+        path_context: Option<&str>,
         node: NodeView<'graph>,
         object: &'graph Map<String, Value>,
         path_parameters: &[Param],
@@ -390,8 +457,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             })
         });
         let parameters = merge_parameters(path_parameters, operation_parameters);
-        let path_template = parse_path_template(path);
-        self.validate_path_parameters(path, &path_template, &parameters, &node);
+        let path_template = path_context.map_or_else(Vec::new, parse_path_template);
+        if let Some(path) = path_context {
+            self.validate_path_parameters(path, &path_template, &parameters, &node);
+        }
         let request_body = object.get("requestBody").and_then(|value| {
             let pointer = append_pointer(&node.pointer, "requestBody");
             self.parse_body(NodeView {
@@ -433,6 +502,14 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 value,
             })
         });
+        let callbacks = object.get("callbacks").map_or_else(Vec::new, |value| {
+            let pointer = append_pointer(&node.pointer, "callbacks");
+            self.parse_callbacks(NodeView {
+                doc_id: node.doc_id,
+                pointer,
+                value,
+            })
+        });
         Operation {
             method: method.to_owned(),
             path_template,
@@ -444,10 +521,55 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             parameters,
             request_body,
             responses,
+            callbacks,
             servers,
             security,
             source: self.source(node.doc_id, &node.pointer),
         }
+    }
+
+    fn parse_callbacks(&mut self, node: NodeView<'graph>) -> Vec<Callback> {
+        let Some(callbacks) = node.value.as_object() else {
+            self.shape_error(node.doc_id, &node.pointer, "callbacks must be an object");
+            return Vec::new();
+        };
+        callbacks
+            .iter()
+            .filter_map(|(name, value)| {
+                let pointer = append_pointer(&node.pointer, name);
+                let callback_node = self.resolve_object(
+                    NodeView {
+                        doc_id: node.doc_id,
+                        pointer,
+                        value,
+                    },
+                    "callback",
+                )?;
+                let callback = callback_node.value.as_object()?;
+                let expressions = callback
+                    .iter()
+                    .map(|(expression, value)| {
+                        let pointer = append_pointer(&callback_node.pointer, expression);
+                        let path_item = NodeView {
+                            doc_id: callback_node.doc_id,
+                            pointer,
+                            value,
+                        };
+                        let source = self.source(path_item.doc_id, &path_item.pointer);
+                        CallbackExpression {
+                            expression: expression.clone(),
+                            operations: self.parse_path_item_operations(path_item, None),
+                            source,
+                        }
+                    })
+                    .collect();
+                Some(Callback {
+                    name: name.clone(),
+                    expressions,
+                    source: self.source(callback_node.doc_id, &callback_node.pointer),
+                })
+            })
+            .collect()
     }
 
     fn parse_external_docs(
@@ -643,7 +765,166 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                             false,
                         )
                     }),
+                    headers: response.get("headers").map_or_else(Vec::new, |headers| {
+                        self.parse_response_headers(NodeView {
+                            doc_id: response_node.doc_id,
+                            pointer: append_pointer(&response_node.pointer, "headers"),
+                            value: headers,
+                        })
+                    }),
+                    links: response.get("links").map_or_else(Vec::new, |links| {
+                        self.parse_links(NodeView {
+                            doc_id: response_node.doc_id,
+                            pointer: append_pointer(&response_node.pointer, "links"),
+                            value: links,
+                        })
+                    }),
                     source: self.source(response_node.doc_id, &response_node.pointer),
+                })
+            })
+            .collect()
+    }
+
+    fn parse_response_headers(&mut self, node: NodeView<'graph>) -> Vec<(String, ResponseHeader)> {
+        let Some(object) = node.value.as_object() else {
+            self.shape_error(
+                node.doc_id,
+                &node.pointer,
+                "response headers must be an object",
+            );
+            return Vec::new();
+        };
+        let mut parsed = Vec::new();
+        let mut names = HashMap::new();
+        for (name, value) in object {
+            let pointer = append_pointer(&node.pointer, name);
+            if name.eq_ignore_ascii_case("content-type") {
+                self.sink.push(self.warning_diagnostic(
+                    CODE_HEADER_CONTENT_TYPE,
+                    node.doc_id,
+                    &pointer,
+                    "response header 'Content-Type' is defined by the media type and is ignored",
+                ));
+                continue;
+            }
+            let folded_name = name.to_ascii_lowercase();
+            if let Some(prior) = names.get(&folded_name) {
+                self.sink.push(self.input_diagnostic(
+                    CODE_HEADER_DUPLICATE,
+                    node.doc_id,
+                    &pointer,
+                    format!("response header '{name}' conflicts case-insensitively with '{prior}'"),
+                ));
+                continue;
+            }
+            names.insert(folded_name, name.clone());
+            let Some(header_node) = self.resolve_object(
+                NodeView {
+                    doc_id: node.doc_id,
+                    pointer,
+                    value,
+                },
+                "response header",
+            ) else {
+                continue;
+            };
+            let Some(header) = header_node.value.as_object() else {
+                continue;
+            };
+            let schema_pointer = append_pointer(&header_node.pointer, "schema");
+            let Some(schema) = header.get("schema") else {
+                self.unsupported_schema(
+                    header_node.doc_id,
+                    &schema_pointer,
+                    "response header content or missing schema is not supported",
+                );
+                continue;
+            };
+            parsed.push((
+                name.clone(),
+                ResponseHeader {
+                    required: bool_field(header, "required"),
+                    deprecated: bool_field(header, "deprecated"),
+                    description: string_field(header, "description"),
+                    schema: self.parse_schema(NodeView {
+                        doc_id: header_node.doc_id,
+                        pointer: schema_pointer,
+                        value: schema,
+                    }),
+                    source: self.source(header_node.doc_id, &header_node.pointer),
+                },
+            ));
+        }
+        parsed
+    }
+
+    fn parse_links(&mut self, node: NodeView<'graph>) -> Vec<Link> {
+        let Some(object) = node.value.as_object() else {
+            self.shape_error(node.doc_id, &node.pointer, "links must be an object");
+            return Vec::new();
+        };
+        object
+            .iter()
+            .filter_map(|(name, value)| {
+                let pointer = append_pointer(&node.pointer, name);
+                let link_node = self.resolve_object(
+                    NodeView {
+                        doc_id: node.doc_id,
+                        pointer: pointer.clone(),
+                        value,
+                    },
+                    "link",
+                )?;
+                let link = link_node.value.as_object()?;
+                let target = match (
+                    link.get("operationId").and_then(Value::as_str),
+                    link.get("operationRef").and_then(Value::as_str),
+                ) {
+                    (Some(_), Some(_)) => {
+                        self.sink.push(self.input_diagnostic(
+                            CODE_LINK_TARGET,
+                            node.doc_id,
+                            &pointer,
+                            format!("link '{name}' declares both operationId and operationRef"),
+                        ));
+                        return None;
+                    }
+                    (None, None) => {
+                        self.sink.push(self.input_diagnostic(
+                            CODE_LINK_TARGET,
+                            node.doc_id,
+                            &pointer,
+                            format!("link '{name}' declares neither operationId nor operationRef"),
+                        ));
+                        return None;
+                    }
+                    (Some(operation_id), None) => LinkTarget::OperationId(operation_id.to_owned()),
+                    (None, Some(operation_ref)) => {
+                        LinkTarget::OperationRef(operation_ref.to_owned())
+                    }
+                };
+                let parameters = link
+                    .get("parameters")
+                    .and_then(Value::as_object)
+                    .map_or_else(Vec::new, |parameters| {
+                        parameters
+                            .iter()
+                            .map(|(name, value)| {
+                                (
+                                    name.clone(),
+                                    value
+                                        .as_str()
+                                        .map_or_else(|| compact_json(value), str::to_owned),
+                                )
+                            })
+                            .collect()
+                    });
+                Some(Link {
+                    name: name.clone(),
+                    target,
+                    parameters,
+                    description: string_field(link, "description"),
+                    source: self.source(link_node.doc_id, &link_node.pointer),
                 })
             })
             .collect()
@@ -944,6 +1225,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     );
                     return None;
                 };
+                let raw_enum_empty = matches!(
+                    variable.get("enum"),
+                    Some(Value::Array(values)) if values.is_empty()
+                );
                 let enum_values = match variable.get("enum") {
                     None => Vec::new(),
                     Some(Value::Array(values)) => values
@@ -972,6 +1257,46 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                         Vec::new()
                     }
                 };
+                if raw_enum_empty {
+                    let enum_pointer = append_pointer(&pointer, "enum");
+                    let message = format!("server variable '{name}' declares an empty enum");
+                    if self.version == OasVersion::V3_1 {
+                        self.sink.push(self.input_diagnostic(
+                            CODE_SERVER_VAR_ENUM_EMPTY,
+                            node.doc_id,
+                            &enum_pointer,
+                            message,
+                        ));
+                    } else {
+                        self.sink.push(self.warning_diagnostic(
+                            CODE_SERVER_VAR_ENUM_EMPTY,
+                            node.doc_id,
+                            &enum_pointer,
+                            message,
+                        ));
+                    }
+                }
+                if !enum_values.is_empty() && !enum_values.iter().any(|value| value == default) {
+                    let default_pointer = append_pointer(&pointer, "default");
+                    let message = format!(
+                        "server variable '{name}' default '{default}' is not one of its enum values"
+                    );
+                    if self.version == OasVersion::V3_1 {
+                        self.sink.push(self.input_diagnostic(
+                            CODE_SERVER_VAR_DEFAULT,
+                            node.doc_id,
+                            &default_pointer,
+                            message,
+                        ));
+                    } else {
+                        self.sink.push(self.warning_diagnostic(
+                            CODE_SERVER_VAR_DEFAULT,
+                            node.doc_id,
+                            &default_pointer,
+                            message,
+                        ));
+                    }
+                }
                 Some((
                     name.clone(),
                     ServerVariable {
@@ -1067,6 +1392,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 let kind = match scheme.get("type").and_then(Value::as_str) {
                     Some("http") => SecKind::Http {
                         scheme: string_field(scheme, "scheme").unwrap_or_default(),
+                        bearer_format: string_field(scheme, "bearerFormat"),
                     },
                     Some("apiKey") => match scheme.get("in").and_then(Value::as_str) {
                         Some("query") => SecKind::ApiKey {
@@ -1083,8 +1409,12 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                         },
                         _ => SecKind::Other,
                     },
-                    Some("oauth2") => SecKind::OAuth2,
-                    Some("openIdConnect") => SecKind::OpenIdConnect,
+                    Some("oauth2") => SecKind::OAuth2 {
+                        flows: self.parse_oauth_flows(&scheme_node, scheme),
+                    },
+                    Some("openIdConnect") => SecKind::OpenIdConnect {
+                        url: string_field(scheme, "openIdConnectUrl").unwrap_or_default(),
+                    },
                     Some("mutualTLS") => SecKind::MutualTls,
                     _ => SecKind::Other,
                 };
@@ -1095,6 +1425,115 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 })
             })
             .collect()
+    }
+
+    fn parse_oauth_flows(
+        &mut self,
+        scheme_node: &NodeView<'graph>,
+        scheme: &Map<String, Value>,
+    ) -> OAuthFlows {
+        let empty = || OAuthFlows {
+            implicit: None,
+            password: None,
+            client_credentials: None,
+            authorization_code: None,
+        };
+        let Some(value) = scheme.get("flows") else {
+            return empty();
+        };
+        let flows_pointer = append_pointer(&scheme_node.pointer, "flows");
+        let Some(flows) = value.as_object() else {
+            self.shape_error(
+                scheme_node.doc_id,
+                &flows_pointer,
+                "OAuth2 flows must be an object",
+            );
+            return empty();
+        };
+        for key in flows.keys() {
+            if !matches!(
+                key.as_str(),
+                "implicit" | "password" | "clientCredentials" | "authorizationCode"
+            ) {
+                self.sink.push(self.input_diagnostic(
+                    CODE_SECURITY_FLOWS_SHAPE,
+                    scheme_node.doc_id,
+                    &append_pointer(&flows_pointer, key),
+                    format!("unrecognized OAuth2 flow '{key}'"),
+                ));
+            }
+        }
+        OAuthFlows {
+            implicit: self.parse_oauth_flow(scheme_node.doc_id, &flows_pointer, flows, "implicit"),
+            password: self.parse_oauth_flow(scheme_node.doc_id, &flows_pointer, flows, "password"),
+            client_credentials: self.parse_oauth_flow(
+                scheme_node.doc_id,
+                &flows_pointer,
+                flows,
+                "clientCredentials",
+            ),
+            authorization_code: self.parse_oauth_flow(
+                scheme_node.doc_id,
+                &flows_pointer,
+                flows,
+                "authorizationCode",
+            ),
+        }
+    }
+
+    fn parse_oauth_flow(
+        &mut self,
+        doc_id: DocId,
+        flows_pointer: &str,
+        flows: &Map<String, Value>,
+        key: &str,
+    ) -> Option<OAuthFlow> {
+        let value = flows.get(key)?;
+        let pointer = append_pointer(flows_pointer, key);
+        let Some(flow) = value.as_object() else {
+            self.shape_error(doc_id, &pointer, "OAuth2 flow must be an object");
+            return None;
+        };
+        let scopes = match flow.get("scopes") {
+            None => {
+                self.sink.push(self.input_diagnostic(
+                    CODE_SECURITY_FLOWS_SHAPE,
+                    doc_id,
+                    &pointer,
+                    "OAuth2 flow requires a scopes map",
+                ));
+                Vec::new()
+            }
+            Some(value) => {
+                let scopes_pointer = append_pointer(&pointer, "scopes");
+                match value.as_object() {
+                    Some(scopes) if scopes.values().all(Value::is_string) => scopes
+                        .iter()
+                        .map(|(name, description)| {
+                            (
+                                name.clone(),
+                                description.as_str().unwrap_or_default().to_owned(),
+                            )
+                        })
+                        .collect(),
+                    _ => {
+                        self.sink.push(self.input_diagnostic(
+                            CODE_SECURITY_FLOWS_SHAPE,
+                            doc_id,
+                            &scopes_pointer,
+                            "OAuth2 scopes must map scope names to description strings",
+                        ));
+                        Vec::new()
+                    }
+                }
+            }
+        };
+        Some(OAuthFlow {
+            authorization_url: string_field(flow, "authorizationUrl"),
+            token_url: string_field(flow, "tokenUrl"),
+            refresh_url: string_field(flow, "refreshUrl"),
+            scopes,
+        })
     }
 
     fn parse_schema(&mut self, node: NodeView<'graph>) -> SchemaNode {
@@ -1162,7 +1601,51 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 meta,
             };
         }
-        if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        // JSON Schema (both dialects) applies every keyword on one schema object conjunctively.
+        // Detect how many independent "pieces" the object carries; the historical dispatch below
+        // picks exactly one and silently drops the rest, which is only correct when there is at
+        // most one piece.
+        let ref_str = object.get("$ref").and_then(Value::as_str);
+        let has_ref = ref_str.is_some();
+        let has_allof = object.contains_key("allOf");
+        let has_oneof = object.contains_key("oneOf");
+        let has_anyof = object.contains_key("anyOf");
+        // Only an applicator sibling can push a typed/constraint object to two pieces (the
+        // conjunction path) or onto a 3.0 `$ref`'s sibling warning; a plain typed leaf never
+        // consumes `has_typed`, so short-circuit past the content scan when no applicator is present.
+        let has_typed = (has_ref || has_allof || has_oneof || has_anyof)
+            && has_typed_or_constraint_content(object, self.version);
+        let piece_count = usize::from(has_ref)
+            + usize::from(has_allof)
+            + usize::from(has_oneof)
+            + usize::from(has_anyof)
+            + usize::from(has_typed);
+
+        // OpenAPI 3.0 substitutes a Reference Object for the whole schema, so `$ref` wins outright
+        // and every sibling keyword is dropped (unchanged semantics). A structural or constraint
+        // sibling is almost always an authoring mistake — the author expected composition — so warn
+        // and point at how to compose; pure-annotation siblings on a ref are legitimate and silent.
+        if self.version == OasVersion::V3_0
+            && let Some(reference) = ref_str
+        {
+            if has_allof || has_oneof || has_anyof || has_typed {
+                self.sink.push(self.warning_diagnostic(
+                    CODE_REF_SIBLINGS,
+                    node.doc_id,
+                    &node.pointer,
+                    "$ref ignores sibling keyword(s) in OpenAPI 3.0; move them under allOf to compose",
+                ));
+            }
+            return self.parse_schema_ref(node, reference, meta);
+        }
+
+        if piece_count >= 2 {
+            return self.lower_conjunction(node, object, meta, has_typed);
+        }
+
+        // piece_count <= 1: exactly the historical single-interpretation dispatch. Every existing
+        // fixture parses through here unchanged — the determinism guard.
+        if let Some(reference) = ref_str {
             return self.parse_schema_ref(node, reference, meta);
         }
         if let Some(branches) = object.get("allOf") {
@@ -1181,8 +1664,15 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             };
         }
         if let Some(branches) = object.get("anyOf") {
+            // Clone the node only to parse a discriminator that is actually present: an `anyOf`
+            // without one — the overwhelming majority — keeps its pre-discriminator zero-clone cost.
+            let discriminator = object
+                .get("discriminator")
+                .and_then(|value| self.parse_discriminator(node.clone(), Some(value)))
+                .map(Box::new);
             return SchemaNode::AnyOf {
                 branches: self.parse_schema_array(node, "anyOf", branches),
+                discriminator,
                 meta,
             };
         }
@@ -1190,6 +1680,73 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             return self.parse_tuple(node, object, meta);
         }
         self.parse_typed_schema(node, object, meta)
+    }
+
+    /// Lowers a schema object carrying two or more of {`$ref`, `allOf`, `oneOf`, `anyOf`,
+    /// typed/constraint content} into a synthetic `AllOf` conjunction — the fix for the historical
+    /// dispatch silently keeping one interpretation and dropping the rest. Branch order is
+    /// deterministic so regenerated output stays stable: the `$ref` piece, then the flattened
+    /// `allOf` branches (no nested `AllOf`-in-`AllOf`), then the `oneOf`, `anyOf`, and finally the
+    /// typed/tuple piece. The typed piece is parsed by the existing `parse_typed_schema`/`parse_tuple`
+    /// paths, which turns sibling `properties`/`type`/constraints into a real conjunction branch.
+    /// Reached only when `piece_count >= 2`; the OpenAPI 3.0 `$ref`-wins rule is handled by the
+    /// caller, so a `$ref` piece here is always OpenAPI 3.1.
+    fn lower_conjunction(
+        &mut self,
+        node: NodeView<'graph>,
+        object: &'graph Map<String, Value>,
+        meta: SchemaMeta,
+        has_typed: bool,
+    ) -> SchemaNode {
+        let (wrapper_meta, typed_meta) = meta.split_for_conjunction();
+        let mut branches = Vec::new();
+        if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+            branches.push(self.parse_schema_ref(
+                node.clone(),
+                reference,
+                minimal_conjunction_meta(&wrapper_meta.source),
+            ));
+        }
+        if let Some(value) = object.get("allOf") {
+            branches.extend(self.parse_schema_array(node.clone(), "allOf", value));
+        }
+        // The discriminator attaches to a single branch so its proof runs once. oneOf is the
+        // conventional carrier, so when both applicators coexist only oneOf takes it; anyOf carries
+        // it only in the absence of a oneOf piece.
+        let has_one_of = object.contains_key("oneOf");
+        if let Some(value) = object.get("oneOf") {
+            branches.push(SchemaNode::OneOf {
+                branches: self.parse_schema_array(node.clone(), "oneOf", value),
+                discriminator: self
+                    .parse_discriminator(node.clone(), object.get("discriminator"))
+                    .map(Box::new),
+                meta: minimal_conjunction_meta(&wrapper_meta.source),
+            });
+        }
+        if let Some(value) = object.get("anyOf") {
+            branches.push(SchemaNode::AnyOf {
+                branches: self.parse_schema_array(node.clone(), "anyOf", value),
+                discriminator: if has_one_of {
+                    None
+                } else {
+                    self.parse_discriminator(node.clone(), object.get("discriminator"))
+                        .map(Box::new)
+                },
+                meta: minimal_conjunction_meta(&wrapper_meta.source),
+            });
+        }
+        if has_typed {
+            let typed = if self.version == OasVersion::V3_1 && object.contains_key("prefixItems") {
+                self.parse_tuple(node, object, typed_meta)
+            } else {
+                self.parse_typed_schema(node, object, typed_meta)
+            };
+            branches.push(typed);
+        }
+        SchemaNode::AllOf {
+            branches,
+            meta: wrapper_meta,
+        }
     }
 
     fn parse_schema_ref(
@@ -1381,7 +1938,11 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     Some(self.parse_primitive(&branch, ty, branch_meta))
                 })
                 .collect();
-            return SchemaNode::AnyOf { branches, meta };
+            return SchemaNode::AnyOf {
+                branches,
+                discriminator: None,
+                meta,
+            };
         }
         if let Some(ty) = object.get("type").and_then(Value::as_str) {
             return self.parse_type_name(node, object, ty, meta);
@@ -1458,25 +2019,40 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         }
     }
 
+    /// The `enum`/`const` finite constraint carried by object/array/tuple schemas, `None` when the
+    /// object declares neither. `const` is read only in OpenAPI 3.1 (3.0 has no `const` keyword).
+    fn parse_finite_constraint(
+        &self,
+        object: &Map<String, Value>,
+    ) -> Option<Box<FiniteConstraint>> {
+        (object.contains_key("enum") || object.contains_key("const")).then(|| {
+            Box::new(FiniteConstraint {
+                enum_values: object.get("enum").and_then(Value::as_array).cloned(),
+                const_value: (self.version == OasVersion::V3_1)
+                    .then(|| object.get("const").cloned())
+                    .flatten(),
+            })
+        })
+    }
+
     fn parse_object(
         &mut self,
         node: NodeView<'graph>,
         object: &'graph Map<String, Value>,
         meta: SchemaMeta,
     ) -> SchemaNode {
-        let required = object
+        let finite = self.parse_finite_constraint(object);
+        let required_values = object
             .get("required")
             .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<HashSet<_>>()
-            })
+            .map(Vec::as_slice)
             .unwrap_or_default();
-        let properties = object
-            .get("properties")
-            .and_then(Value::as_object)
+        let required = required_values
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<HashSet<_>>();
+        let raw_properties = object.get("properties").and_then(Value::as_object);
+        let properties = raw_properties
             .map(|properties| {
                 properties
                     .iter()
@@ -1510,6 +2086,22 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     .collect()
             })
             .unwrap_or_default();
+        let mut seen_required = HashSet::new();
+        let mut extra_required = Vec::new();
+        let required_pointer = append_pointer(&node.pointer, "required");
+        for name in required_values.iter().filter_map(Value::as_str) {
+            if seen_required.insert(name)
+                && raw_properties.is_none_or(|properties| !properties.contains_key(name))
+            {
+                self.sink.push(self.warning_diagnostic(
+                    CODE_PHANTOM_REQUIRED,
+                    node.doc_id,
+                    &required_pointer,
+                    format!("required lists property '{name}' that is not defined in properties"),
+                ));
+                extra_required.push(name.to_owned());
+            }
+        }
         let additional_properties = match object.get("additionalProperties") {
             None | Some(Value::Bool(true)) => AdditionalProperties::Allowed(None),
             Some(Value::Bool(false)) => AdditionalProperties::Forbidden,
@@ -1531,6 +2123,8 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             properties,
             additional_properties,
             dependent_required,
+            finite,
+            extra_required,
             meta,
         }
     }
@@ -1541,6 +2135,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         object: &'graph Map<String, Value>,
         meta: SchemaMeta,
     ) -> SchemaNode {
+        let finite = self.parse_finite_constraint(object);
         let pointer = append_pointer(&node.pointer, "items");
         let items = match object.get("items") {
             None => SchemaNode::Any {
@@ -1557,6 +2152,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         };
         SchemaNode::Array {
             items: Box::new(items),
+            finite,
             meta,
         }
     }
@@ -1567,6 +2163,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         object: &'graph Map<String, Value>,
         meta: SchemaMeta,
     ) -> SchemaNode {
+        let finite = self.parse_finite_constraint(object);
         let prefix_pointer = append_pointer(&node.pointer, "prefixItems");
         let prefix_items = object
             .get("prefixItems")
@@ -1604,6 +2201,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         SchemaNode::Tuple {
             prefix_items,
             rest,
+            finite,
             meta,
         }
     }
@@ -1635,6 +2233,19 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             },
         };
         let numeric_constraints = collect_numeric_constraints(object, self.version);
+        // `collect_numeric_constraints` already dropped an invalid `multipleOf` (non-number, ≤ 0, or
+        // outside the binary64 domain) from `multiple_of`, so a present keyword with no surviving
+        // value is exactly the invalid case — diagnose it without re-deriving validity here.
+        if object.contains_key("multipleOf") && numeric_constraints.multiple_of.is_none() {
+            self.sink.push(
+                Diagnostic::input(
+                    CODE_MULTIPLE_OF,
+                    "multipleOf must be a positive number within the binary64 domain",
+                )
+                .with_source(self.source_id(node.doc_id))
+                .with_json_pointer(append_pointer(&node.pointer, "multipleOf")),
+            );
+        }
         let string_constraints = collect_string_constraints(object);
         let array_constraints = collect_array_constraints(object);
         let object_constraints = collect_object_constraints(object);
@@ -1645,6 +2256,14 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     .get("nullable")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+            read_only: object
+                .get("readOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            write_only: object
+                .get("writeOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             content_encoding: (self.version == OasVersion::V3_1)
                 .then(|| string_field(object, "contentEncoding"))
                 .flatten(),
@@ -1887,6 +2506,16 @@ fn collect_operation_refs(operation: &Operation, out: &mut Vec<SchemaRef>) {
         for media_type in &response.media_types {
             collect_schema_refs(&media_type.schema, out);
         }
+        for (_, header) in &response.headers {
+            collect_schema_refs(&header.schema, out);
+        }
+    }
+    for callback in &operation.callbacks {
+        for expression in &callback.expressions {
+            for operation in &expression.operations {
+                collect_operation_refs(operation, out);
+            }
+        }
     }
 }
 
@@ -2084,13 +2713,9 @@ fn collect_numeric_constraints(
         maximum: object.get("maximum").and_then(Value::as_number).cloned(),
         exclusive_minimum: exclusive("exclusiveMinimum"),
         exclusive_maximum: exclusive("exclusiveMaximum"),
-        // JSON Schema requires multipleOf > 0; a zero or negative divisor reaches the kernel's
-        // BigInt `%` and throws RangeError at validate time. Retain only strictly-positive values,
-        // matching the parser's other malformed-value tolerance (drop to None). An
-        // arbitrary-precision giant that overflows f64 makes `as_f64` return None (serde_json
-        // filters non-finite results), so it is dropped here too — intended, since no representable
-        // value could be a multiple of it. collect_constraints renders the raw value independently
-        // for the doc string, so this drop does not touch that output.
+        // JSON Schema requires multipleOf > 0 and codegen requires a finite binary64. Invalid
+        // divisors are diagnosed as OASTS1112 in schema_meta; this filter keeps them out of the
+        // validator kernel and constraint docs.
         multiple_of: object
             .get("multipleOf")
             .and_then(Value::as_number)
@@ -2177,7 +2802,12 @@ fn collect_constraints(object: &Map<String, Value>, numeric: &NumericConstraints
                 .map(render_exclusive_bound),
             _ => None,
         };
-        if let Some(rendered) = numeric_value.or_else(|| object.get(key).map(compact_json)) {
+        let rendered = if key == "multipleOf" {
+            numeric.multiple_of.as_ref().map(ToString::to_string)
+        } else {
+            numeric_value.or_else(|| object.get(key).map(compact_json))
+        };
+        if let Some(rendered) = rendered {
             constraints.push(format!("{key}: {rendered}"));
         }
     }
@@ -2188,6 +2818,53 @@ fn collect_constraints(object: &Map<String, Value>, numeric: &NumericConstraints
         }
     }
     constraints
+}
+
+/// True when a schema object carries any typed or value-constraint keyword — the "typed piece" a
+/// conjunction lowering must preserve as a real branch. Pure annotations (title, description,
+/// default, example(s), deprecated, readOnly, writeOnly, nullable, `x-*`) are not pieces. The
+/// version gate mirrors the dispatch: `prefixItems`, `const`, `dependentRequired`, and
+/// `contentEncoding` are OpenAPI 3.1 only, so in 3.0 they do not count (and, being early-rejected
+/// dialect keywords, never reach here anyway).
+fn has_typed_or_constraint_content(object: &Map<String, Value>, version: OasVersion) -> bool {
+    const BOTH_VERSIONS: [&str; 19] = [
+        "type",
+        "properties",
+        "additionalProperties",
+        "items",
+        "enum",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+        "format",
+    ];
+    const V3_1_ONLY: [&str; 4] = [
+        "prefixItems",
+        "const",
+        "dependentRequired",
+        "contentEncoding",
+    ];
+    BOTH_VERSIONS.iter().any(|key| object.contains_key(*key))
+        || (version == OasVersion::V3_1 && V3_1_ONLY.iter().any(|key| object.contains_key(*key)))
+}
+
+/// Source-only meta for a synthetic conjunction branch (`$ref`/`oneOf`/`anyOf` piece). Docs,
+/// nullability, and constraints live on the wrapper or the typed branch, never on these pieces.
+fn minimal_conjunction_meta(source: &SourceRef) -> SchemaMeta {
+    SchemaMeta {
+        source: source.clone(),
+        ..SchemaMeta::default()
+    }
 }
 
 fn render_exclusive_bound(bound: &ExclusiveBound) -> String {
@@ -2255,9 +2932,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::config::{ResolvedConfig, load_config};
+    use crate::config::{ResolvedConfig, load_config, load_config_from_json};
     use crate::ir::{ParamStyle, SecKind};
     use crate::loader::load_graph;
+    use crate::pipeline::compile as compile_pipeline;
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2318,6 +2996,727 @@ mod tests {
         let mut sink = DiagnosticSink::new();
         let ir = parse(&graph, &mut sink).expect("supported OpenAPI version");
         (temp, ir, sink)
+    }
+
+    #[test]
+    fn webhooks_parse_methods_and_ref_path_items() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "webhooks": {
+                "invoice.created": {
+                    "get": {
+                        "responses": { "200": { "description": "ok" } }
+                    },
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/json": { "schema": { "type": "string" } }
+                            }
+                        },
+                        "responses": { "202": { "description": "accepted" } }
+                    }
+                },
+                "invoice.deleted": { "$ref": "#/components/pathItems/DeletedHook" }
+            },
+            "components": {
+                "pathItems": {
+                    "DeletedHook": {
+                        "put": {
+                            "requestBody": {
+                                "content": {
+                                    "application/json": { "schema": { "type": "integer" } }
+                                }
+                            },
+                            "responses": { "204": { "description": "deleted" } }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            ir.webhooks
+                .iter()
+                .map(|webhook| webhook.name.as_str())
+                .collect::<Vec<_>>(),
+            ["invoice.created", "invoice.deleted"]
+        );
+        assert_eq!(
+            ir.webhooks[0]
+                .operations
+                .iter()
+                .map(|operation| operation.method.as_str())
+                .collect::<Vec<_>>(),
+            ["get", "post"]
+        );
+        assert!(
+            ir.webhooks
+                .iter()
+                .flat_map(|webhook| &webhook.operations)
+                .all(|operation| operation.path_template.is_empty()
+                    && !operation.responses.is_empty())
+        );
+        assert!(ir.webhooks[0].operations[1].request_body.is_some());
+        assert!(ir.webhooks[1].operations[0].request_body.is_some());
+    }
+
+    #[test]
+    fn webhooks_on_30_warn_and_drop() {
+        let document = json!({
+            "openapi": "3.0.3",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "webhooks": {
+                "ignored": {
+                    "post": { "responses": { "204": { "description": "ok" } } }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(ir.webhooks.is_empty());
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_WEBHOOKS_VERSION)
+            .expect("webhooks version warning");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(diagnostic.json_pointer.as_deref(), Some("/webhooks"));
+        assert_eq!(
+            diagnostic.message,
+            "top-level 'webhooks' requires OpenAPI 3.1 and is ignored"
+        );
+    }
+
+    #[test]
+    fn webhook_with_no_operations_is_kept() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "webhooks": {
+                "documented": { "description": "No operation yet." }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(ir.webhooks.len(), 1);
+        assert_eq!(ir.webhooks[0].name, "documented");
+        assert!(ir.webhooks[0].operations.is_empty());
+    }
+
+    #[test]
+    fn malformed_webhook_and_callback_maps_are_diagnosed_and_dropped() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/subscribe": {
+                    "post": {
+                        "callbacks": [],
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            },
+            "webhooks": { "invalid": 7 }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(ir.webhooks.is_empty());
+        assert!(ir.operations[0].callbacks.is_empty());
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_SHAPE
+                && diagnostic.json_pointer.as_deref() == Some("/webhooks/invalid")
+        }));
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_SHAPE
+                && diagnostic.json_pointer.as_deref() == Some("/paths/~1subscribe/post/callbacks")
+        }));
+
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/subscribe": {
+                    "post": {
+                        "callbacks": { "invalid": 7 },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            },
+            "webhooks": []
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(ir.webhooks.is_empty());
+        assert!(ir.operations[0].callbacks.is_empty());
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_SHAPE && diagnostic.json_pointer.as_deref() == Some("/webhooks")
+        }));
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_SHAPE
+                && diagnostic.json_pointer.as_deref()
+                    == Some("/paths/~1subscribe/post/callbacks/invalid")
+        }));
+    }
+
+    #[test]
+    fn callbacks_parse_expressions_in_order() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/subscribe": {
+                    "post": {
+                        "callbacks": {
+                            "delivery.status": {
+                                "{$request.body#/callbackUrl}": {
+                                    "post": {
+                                        "responses": { "202": { "description": "accepted" } }
+                                    }
+                                },
+                                "{$request.query.fallback}": {
+                                    "get": {
+                                        "responses": { "200": { "description": "ok" } }
+                                    }
+                                }
+                            },
+                            "audit-log": { "$ref": "#/components/callbacks/Audit" }
+                        },
+                        "responses": { "201": { "description": "subscribed" } }
+                    }
+                }
+            },
+            "components": {
+                "callbacks": {
+                    "Audit": {
+                        "{$request.header.X-Audit-Url}": {
+                            "put": {
+                                "responses": { "204": { "description": "recorded" } }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let callbacks = &ir.operations[0].callbacks;
+        assert_eq!(
+            callbacks
+                .iter()
+                .map(|callback| callback.name.as_str())
+                .collect::<Vec<_>>(),
+            ["delivery.status", "audit-log"]
+        );
+        assert_eq!(
+            callbacks[0]
+                .expressions
+                .iter()
+                .map(|expression| expression.expression.as_str())
+                .collect::<Vec<_>>(),
+            ["{$request.body#/callbackUrl}", "{$request.query.fallback}"]
+        );
+        assert_eq!(callbacks[0].expressions[0].operations[0].method, "post");
+        assert_eq!(callbacks[0].expressions[1].operations[0].method, "get");
+        assert_eq!(callbacks[1].expressions[0].operations[0].method, "put");
+        assert!(
+            callbacks
+                .iter()
+                .flat_map(|callback| &callback.expressions)
+                .flat_map(|expression| &expression.operations)
+                .all(|operation| operation.path_template.is_empty())
+        );
+    }
+
+    #[test]
+    fn nested_callback_operations_parse() {
+        let document = json!({
+            "openapi": "3.0.3",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/subscribe": {
+                    "post": {
+                        "callbacks": {
+                            "outer": {
+                                "{$request.body#/outerUrl}": {
+                                    "post": {
+                                        "callbacks": {
+                                            "inner": {
+                                                "{$request.body#/innerUrl}": {
+                                                    "get": {
+                                                        "responses": {
+                                                            "200": { "description": "ok" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "responses": { "202": { "description": "accepted" } }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "201": { "description": "subscribed" } }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let outer_operation = &ir.operations[0].callbacks[0].expressions[0].operations[0];
+        assert_eq!(outer_operation.callbacks[0].name, "inner");
+        let inner_operation = &outer_operation.callbacks[0].expressions[0].operations[0];
+        assert_eq!(inner_operation.method, "get");
+        assert!(inner_operation.callbacks.is_empty());
+    }
+
+    #[test]
+    fn webhook_external_ref_materializes() {
+        let temp = TempDir::new().expect("temp directory");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.json" },
+            "output": "generated"
+        });
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "webhooks": {
+                "external": {
+                    "post": {
+                        "callbacks": {
+                            "nested": {
+                                "{$request.body#/callbackUrl}": {
+                                    "post": {
+                                        "requestBody": {
+                                            "content": {
+                                                "application/json": {
+                                                    "schema": {
+                                                        "$ref": "schemas.json#/CallbackPayload"
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "responses": {
+                                            "204": { "description": "callback ok" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "schemas.json#/WebhookPayload" }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            temp.path().join("oasts.json"),
+            serde_json::to_vec(&config).expect("config json"),
+        )
+        .expect("write config");
+        std::fs::write(
+            temp.path().join("openapi.json"),
+            serde_json::to_vec(&document).expect("document json"),
+        )
+        .expect("write document");
+        std::fs::write(
+            temp.path().join("schemas.json"),
+            br#"{"WebhookPayload":{"type":"object","properties":{"id":{"type":"string"}}},"CallbackPayload":{"type":"integer"}}"#,
+        )
+        .expect("write external schema");
+        let resolved =
+            load_config(Some(Path::new("oasts.json")), temp.path()).expect("resolved config");
+        let mut load_sink = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut load_sink).expect("graph");
+        assert!(!load_sink.has_errors(), "{:#?}", load_sink.as_slice());
+        let mut sink = DiagnosticSink::new();
+        let ir = parse(&graph, &mut sink).expect("IR");
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let body = ir.webhooks[0].operations[0]
+            .request_body
+            .as_ref()
+            .expect("webhook request body");
+        assert!(matches!(body.media_types[0].schema, SchemaNode::Ref { .. }));
+        assert!(ir.schemas.iter().any(|schema| {
+            schema.name == "WebhookPayload" && matches!(schema.schema, SchemaNode::Object { .. })
+        }));
+        let callback_payload = ir
+            .schemas
+            .iter()
+            .find(|schema| schema.name == "CallbackPayload")
+            .expect("external callback schema materialized");
+        assert!(matches!(
+            callback_payload.schema,
+            SchemaNode::Primitive {
+                ty: PrimitiveType::Integer,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn operations_without_callbacks_have_empty_vec() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/plain": {
+                    "get": { "responses": { "204": { "description": "ok" } } }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert!(ir.operations[0].callbacks.is_empty());
+    }
+
+    #[test]
+    fn required_names_undefined_property_warns_oxs1111() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "Thing": {
+                        "type": "object",
+                        "required": ["b", "a", "b", "declared"],
+                        "properties": { "declared": { "type": "string" } }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        let warnings = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_PHANTOM_REQUIRED)
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(warnings[1].severity, Severity::Warning);
+        assert_eq!(
+            warnings[0].message,
+            "required lists property 'b' that is not defined in properties"
+        );
+        assert_eq!(
+            warnings[1].message,
+            "required lists property 'a' that is not defined in properties"
+        );
+        assert!(warnings.iter().all(|diagnostic| {
+            diagnostic.json_pointer.as_deref() == Some("/components/schemas/Thing/required")
+        }));
+        assert!(matches!(
+            &ir.schemas[0].schema,
+            SchemaNode::Object { extra_required, .. }
+                if extra_required == &["b".to_owned(), "a".to_owned()]
+        ));
+    }
+
+    fn schemas_doc(version: &str, schemas: Value) -> Value {
+        json!({
+            "openapi": version,
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "components": { "schemas": schemas }
+        })
+    }
+
+    fn schema_named<'ir>(ir: &'ir Ir, name: &str) -> &'ir SchemaNode {
+        ir.schemas
+            .iter()
+            .find(|schema| schema.name == name)
+            .map(|schema| &schema.schema)
+            .expect("named schema present")
+    }
+
+    fn ref_sibling_warnings(sink: &DiagnosticSink) -> Vec<&Diagnostic> {
+        sink.as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_REF_SIBLINGS)
+            .collect()
+    }
+
+    #[test]
+    fn allof_with_sibling_properties_lowers_to_conjunction() {
+        // allOf beside sibling `properties`/`required` is a conjunction: the sibling object shape is
+        // a real branch parsed by the typed path, ordered last after the flattened allOf branches.
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Base": { "type": "object", "properties": { "id": { "type": "string" } } },
+                "Thing": {
+                    "allOf": [{ "$ref": "#/components/schemas/Base" }],
+                    "properties": { "name": { "type": "string" } },
+                    "required": ["name"]
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+        // [flattened allOf branch: Ref, typed piece: Object] — typed piece last.
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::AllOf { branches, .. }
+                if branches.len() == 2
+                    && matches!(branches[0], SchemaNode::Ref { .. })
+                    && matches!(
+                        &branches[1],
+                        SchemaNode::Object { properties, .. }
+                            if properties.iter().any(|(name, _, prop)| name == "name" && prop.required)
+                    )
+        ));
+    }
+
+    #[test]
+    fn lowered_anyof_conjunction_carries_discriminator() {
+        // An `anyOf` beside a typed sibling lowers to a conjunction; the discriminator must ride
+        // along on the lowered `anyOf`, exactly as it does for `oneOf`.
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "A": { "type": "object" },
+                "B": { "type": "object" },
+                "Wrapped": {
+                    "anyOf": [{ "$ref": "#/components/schemas/A" }, { "$ref": "#/components/schemas/B" }],
+                    "type": "object",
+                    "properties": { "kind": { "type": "string" } },
+                    "discriminator": { "propertyName": "kind" }
+                }
+            }),
+        );
+        let (_temp, ir, _sink) = parse_value(&document);
+        assert!(matches!(
+            schema_named(&ir, "Wrapped"),
+            SchemaNode::AllOf { branches, .. }
+                if branches.iter().any(|branch| matches!(
+                    branch,
+                    SchemaNode::AnyOf { discriminator: Some(discriminator), .. }
+                        if discriminator.property_name == "kind"
+                ))
+        ));
+    }
+
+    #[test]
+    fn oneof_and_anyof_conjunction_carries_single_discriminator() {
+        // When oneOf, anyOf, and a discriminator coexist, the lowered conjunction attaches the
+        // discriminator to the oneOf branch only (the conventional carrier). Attaching it to both
+        // synthetic branches would run the downstream proof — and its OASTS1304 diagnostic — twice.
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "A": { "type": "object" },
+                "B": { "type": "object" },
+                "Wrapped": {
+                    "oneOf": [{ "$ref": "#/components/schemas/A" }, { "$ref": "#/components/schemas/B" }],
+                    "anyOf": [{ "$ref": "#/components/schemas/A" }, { "$ref": "#/components/schemas/B" }],
+                    "discriminator": { "propertyName": "kind" }
+                }
+            }),
+        );
+        let (_temp, ir, _sink) = parse_value(&document);
+        // The oneOf branch carries the discriminator; the anyOf branch does not; exactly one branch
+        // bears it, so the downstream proof runs once.
+        assert!(matches!(
+            schema_named(&ir, "Wrapped"),
+            SchemaNode::AllOf { branches, .. }
+                if branches.iter().any(|branch| matches!(
+                    branch,
+                    SchemaNode::OneOf { discriminator: Some(discriminator), .. }
+                        if discriminator.property_name == "kind"
+                ))
+                    && branches.iter().any(|branch| matches!(
+                        branch,
+                        SchemaNode::AnyOf { discriminator: None, .. }
+                    ))
+                    && branches
+                        .iter()
+                        .filter(|branch| matches!(
+                            branch,
+                            SchemaNode::OneOf { discriminator: Some(_), .. }
+                                | SchemaNode::AnyOf { discriminator: Some(_), .. }
+                        ))
+                        .count()
+                        == 1
+        ));
+    }
+
+    #[test]
+    fn ref_with_structural_sibling_lowers_in_31() {
+        // OpenAPI 3.1 treats `$ref` as one keyword among many, so a structural sibling composes.
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Base": { "type": "object", "properties": { "id": { "type": "string" } } },
+                "Thing": {
+                    "$ref": "#/components/schemas/Base",
+                    "properties": { "name": { "type": "string" } }
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::AllOf { branches, .. }
+                if branches.len() == 2
+                    && matches!(branches[0], SchemaNode::Ref { .. })
+                    && matches!(branches[1], SchemaNode::Object { .. })
+        ));
+        assert!(
+            ref_sibling_warnings(&sink).is_empty(),
+            "3.1 composes silently"
+        );
+    }
+
+    #[test]
+    fn ref_with_structural_sibling_warns_and_ignores_in_30() {
+        // OpenAPI 3.0 substitutes the Reference Object, dropping siblings; the structural sibling
+        // earns exactly one OASTS1110 warning at the node pointer, and the node stays a plain Ref.
+        let document = schemas_doc(
+            "3.0.3",
+            json!({
+                "Base": { "type": "object", "properties": { "id": { "type": "string" } } },
+                "Thing": {
+                    "$ref": "#/components/schemas/Base",
+                    "properties": { "name": { "type": "string" } }
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(matches!(schema_named(&ir, "Thing"), SchemaNode::Ref { .. }));
+        let warnings = ref_sibling_warnings(&sink);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(
+            warnings[0].json_pointer.as_deref(),
+            Some("/components/schemas/Thing")
+        );
+    }
+
+    #[test]
+    fn ref_with_annotation_sibling_no_warning_in_30() {
+        // Annotating a ref is legitimate in 3.0, so a pure-annotation sibling is silent.
+        let document = schemas_doc(
+            "3.0.3",
+            json!({
+                "Base": { "type": "object", "properties": { "id": { "type": "string" } } },
+                "Thing": { "$ref": "#/components/schemas/Base", "description": "a thing" }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(matches!(schema_named(&ir, "Thing"), SchemaNode::Ref { .. }));
+        assert!(ref_sibling_warnings(&sink).is_empty());
+    }
+
+    #[test]
+    fn single_applicator_shape_unchanged() {
+        // The determinism guard: a single-piece schema parses to exactly its historical node, never
+        // wrapped in a synthetic AllOf and never meta-split.
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Base": { "type": "object", "properties": { "id": { "type": "string" } } },
+                "PlainAllOf": { "allOf": [{ "$ref": "#/components/schemas/Base" }] },
+                "PlainOneOf": { "oneOf": [{ "type": "string" }, { "type": "number" }] },
+                "PlainObject": {
+                    "type": "object",
+                    "properties": { "x": { "type": "string" } },
+                    "description": "d"
+                },
+                "PlainRef": { "$ref": "#/components/schemas/Base" }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+        assert!(matches!(
+            schema_named(&ir, "PlainAllOf"),
+            SchemaNode::AllOf { branches, .. } if branches.len() == 1
+        ));
+        assert!(matches!(
+            schema_named(&ir, "PlainOneOf"),
+            SchemaNode::OneOf { .. }
+        ));
+        // Docs stay on the node — no split happened.
+        assert!(matches!(
+            schema_named(&ir, "PlainObject"),
+            SchemaNode::Object { meta, .. } if meta.docs.description.as_deref() == Some("d")
+        ));
+        assert!(matches!(
+            schema_named(&ir, "PlainRef"),
+            SchemaNode::Ref { .. }
+        ));
+    }
+
+    #[test]
+    fn allof_sibling_constraint_lands_on_typed_branch() {
+        // {allOf:[...], minLength:3}: the human-readable constraint documents the wrapper exactly
+        // once, while the structured constraint rides the typed branch (validators enforce it
+        // there) and is absent from the wrapper — the meta split, checked structurally.
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Base": { "type": "object", "properties": { "id": { "type": "string" } } },
+                "Thing": {
+                    "allOf": [{ "$ref": "#/components/schemas/Base" }],
+                    "minLength": 3
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::AllOf { branches, meta }
+                if meta.docs.constraints == ["minLength: 3".to_owned()]
+                    && meta.string_constraints().min_length.is_none()
+                    && branches
+                        .last()
+                        .is_some_and(|typed| typed.meta().string_constraints().min_length == Some(3))
+        ));
+    }
+
+    #[test]
+    fn tuple_piece_coexists_and_lowers() {
+        // A prefixItems tuple beside another piece lowers via the tuple path; prefixItems is the
+        // 3.1-only trigger for the typed piece.
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Base": { "type": "object", "properties": { "id": { "type": "string" } } },
+                "Thing": {
+                    "allOf": [{ "$ref": "#/components/schemas/Base" }],
+                    "prefixItems": [{ "type": "string" }]
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::AllOf { branches, .. }
+                if branches.len() == 2
+                    && matches!(branches[0], SchemaNode::Ref { .. })
+                    && matches!(branches[1], SchemaNode::Tuple { .. })
+        ));
     }
 
     #[test]
@@ -2988,6 +4387,376 @@ mod tests {
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
     }
 
+    fn document_with_response(response: Value) -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/response": {
+                    "get": { "responses": { "200": response } }
+                }
+            },
+            "components": {
+                "headers": {
+                    "Referenced": {
+                        "required": true,
+                        "deprecated": true,
+                        "description": "referenced header",
+                        "schema": { "type": "boolean" }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn response_headers_parse_required_optional_and_ref() {
+        let document = document_with_response(json!({
+            "description": "ok",
+            "headers": {
+                "X-Required": {
+                    "required": true,
+                    "description": "required header",
+                    "schema": { "type": "string" }
+                },
+                "x-optional": { "schema": { "type": "integer" } },
+                "X-Referenced": { "$ref": "#/components/headers/Referenced" }
+            }
+        }));
+        let (_temp, ir, sink) = parse_value(&document);
+        let headers = &ir.operations[0].responses[0].headers;
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            headers
+                .iter()
+                .map(|(name, header)| {
+                    (
+                        name.as_str(),
+                        header.required,
+                        header.deprecated,
+                        header.description.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                ("X-Required", true, false, Some("required header")),
+                ("x-optional", false, false, None),
+                ("X-Referenced", true, true, Some("referenced header")),
+            ]
+        );
+        assert!(matches!(
+            headers[0].1.schema,
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            }
+        ));
+        assert!(matches!(
+            headers[1].1.schema,
+            SchemaNode::Primitive {
+                ty: PrimitiveType::Integer,
+                ..
+            }
+        ));
+        assert!(matches!(
+            headers[2].1.schema,
+            SchemaNode::Primitive {
+                ty: PrimitiveType::Boolean,
+                ..
+            }
+        ));
+        assert_eq!(
+            headers[2].1.source.json_pointer,
+            "/components/headers/Referenced"
+        );
+    }
+
+    #[test]
+    fn response_header_without_schema_warns_and_drops() {
+        let document = document_with_response(json!({
+            "description": "ok",
+            "headers": {
+                "X-Content": { "content": { "text/plain": { "schema": { "type": "string" } } } }
+            }
+        }));
+        let (_temp, ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
+            .expect("unsupported schema warning");
+
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/paths/~1response/get/responses/200/headers/X-Content/schema")
+        );
+        assert!(ir.operations[0].responses[0].headers.is_empty());
+    }
+
+    #[test]
+    fn response_header_content_type_dropped_with_warning() {
+        let document = document_with_response(json!({
+            "description": "ok",
+            "headers": {
+                "content-TYPE": { "schema": { "type": "string" } }
+            }
+        }));
+        let (_temp, ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_HEADER_CONTENT_TYPE)
+            .expect("Content-Type warning");
+
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/paths/~1response/get/responses/200/headers/content-TYPE")
+        );
+        assert!(ir.operations[0].responses[0].headers.is_empty());
+    }
+
+    #[test]
+    fn response_header_case_duplicate_is_error() {
+        let document = document_with_response(json!({
+            "description": "ok",
+            "headers": {
+                "X-Rate-Limit": { "schema": { "type": "integer" } },
+                "x-rate-limit": { "schema": { "type": "string" } }
+            }
+        }));
+        let (_temp, ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_HEADER_DUPLICATE)
+            .expect("duplicate header error");
+
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/paths/~1response/get/responses/200/headers/x-rate-limit")
+        );
+        assert_eq!(
+            diagnostic.message,
+            "response header 'x-rate-limit' conflicts case-insensitively with 'X-Rate-Limit'"
+        );
+        assert_eq!(ir.operations[0].responses[0].headers.len(), 1);
+        assert_eq!(ir.operations[0].responses[0].headers[0].0, "X-Rate-Limit");
+    }
+
+    #[test]
+    fn links_parse_operation_id_and_ref_forms() {
+        let document = document_with_response(json!({
+            "description": "ok",
+            "links": {
+                "ById": {
+                    "operationId": "getThing",
+                    "parameters": {
+                        "id": "{$request.body#/id}",
+                        "limit": 10
+                    },
+                    "description": "lookup"
+                },
+                "ByRef": { "operationRef": "#/paths/~1things~1{id}/get" }
+            }
+        }));
+        let (_temp, ir, sink) = parse_value(&document);
+        let links = &ir.operations[0].responses[0].links;
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].name, "ById");
+        assert_eq!(
+            links[0].target,
+            LinkTarget::OperationId("getThing".to_owned())
+        );
+        assert_eq!(
+            links[0].parameters,
+            [
+                ("id".to_owned(), "{$request.body#/id}".to_owned()),
+                ("limit".to_owned(), "10".to_owned()),
+            ]
+        );
+        assert_eq!(links[0].description.as_deref(), Some("lookup"));
+        assert_eq!(
+            links[1].target,
+            LinkTarget::OperationRef("#/paths/~1things~1{id}/get".to_owned())
+        );
+        assert!(links[1].parameters.is_empty());
+    }
+
+    #[test]
+    fn link_with_both_targets_is_error() {
+        let document = document_with_response(json!({
+            "description": "ok",
+            "links": {
+                "Ambiguous": { "operationId": "getThing", "operationRef": "#/paths/~1things/get" }
+            }
+        }));
+        let (_temp, ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_LINK_TARGET)
+            .expect("link target error");
+
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/paths/~1response/get/responses/200/links/Ambiguous")
+        );
+        assert_eq!(
+            diagnostic.message,
+            "link 'Ambiguous' declares both operationId and operationRef"
+        );
+        assert!(ir.operations[0].responses[0].links.is_empty());
+    }
+
+    #[test]
+    fn link_with_neither_target_is_error() {
+        let document = document_with_response(json!({
+            "description": "ok",
+            "links": { "Missing": { "description": "no target" } }
+        }));
+        let (_temp, ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_LINK_TARGET)
+            .expect("link target error");
+
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/paths/~1response/get/responses/200/links/Missing")
+        );
+        assert_eq!(
+            diagnostic.message,
+            "link 'Missing' declares neither operationId nor operationRef"
+        );
+        assert!(ir.operations[0].responses[0].links.is_empty());
+    }
+
+    #[test]
+    fn malformed_response_header_and_link_shapes_are_diagnosed_and_dropped() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/response": {
+                    "get": {
+                        "responses": {
+                            "200": { "description": "bad headers map", "headers": [] },
+                            "201": {
+                                "description": "bad header entries",
+                                "headers": {
+                                    "Scalar": 7,
+                                    "ResolvedScalar": { "$ref": "#/components/headers/Scalar" }
+                                }
+                            },
+                            "202": { "description": "bad links map", "links": [] },
+                            "203": {
+                                "description": "bad link entry",
+                                "links": { "Scalar": 7 }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": { "headers": { "Scalar": 7 } }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let diagnostics = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_SHAPE)
+            .collect::<Vec<_>>();
+
+        assert_eq!(diagnostics.len(), 4, "{:#?}", sink.as_slice());
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity == Severity::Error)
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.json_pointer.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                "/paths/~1response/get/responses/200/headers",
+                "/paths/~1response/get/responses/201/headers/Scalar",
+                "/paths/~1response/get/responses/202/links",
+                "/paths/~1response/get/responses/203/links/Scalar",
+            ]
+        );
+        assert!(
+            ir.operations
+                .iter()
+                .flat_map(|operation| &operation.responses)
+                .all(|response| response.headers.is_empty() && response.links.is_empty())
+        );
+    }
+
+    #[test]
+    fn response_header_external_ref_materializes() {
+        let temp = TempDir::new().expect("temp directory");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.json" },
+            "output": "generated"
+        });
+        let document = document_with_response(json!({
+            "description": "ok",
+            "headers": {
+                "X-External": { "schema": { "$ref": "schemas.json#/HeaderValue" } }
+            }
+        }));
+        std::fs::write(
+            temp.path().join("oasts.json"),
+            serde_json::to_vec(&config).expect("config json"),
+        )
+        .expect("write config");
+        std::fs::write(
+            temp.path().join("openapi.json"),
+            serde_json::to_vec(&document).expect("document json"),
+        )
+        .expect("write document");
+        std::fs::write(
+            temp.path().join("schemas.json"),
+            br#"{"HeaderValue":{"type":"string"}}"#,
+        )
+        .expect("write external schema");
+        let resolved =
+            load_config(Some(Path::new("oasts.json")), temp.path()).expect("resolved config");
+        let mut load_sink = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut load_sink).expect("graph");
+        assert!(!load_sink.has_errors(), "{:#?}", load_sink.as_slice());
+        let mut sink = DiagnosticSink::new();
+        let ir = parse(&graph, &mut sink).expect("IR");
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert!(matches!(
+            ir.operations[0].responses[0].headers[0].1.schema,
+            SchemaNode::Ref { .. }
+        ));
+        let materialized = ir
+            .schemas
+            .iter()
+            .find(|schema| schema.name == "HeaderValue")
+            .expect("external header schema materialized");
+        assert!(matches!(
+            materialized.schema,
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn parses_root_servers_and_operation_over_path_server_inheritance() {
         let document = json!({
@@ -3058,6 +4827,120 @@ mod tests {
             .expect("root fallback operation");
         assert!(root_fallback.servers.is_empty());
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn server_variable_empty_enum_errors_in_31() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "servers": [{
+                "url": "https://{region}.example.test",
+                "variables": { "region": { "default": "us", "enum": [] } }
+            }]
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SERVER_VAR_ENUM_EMPTY)
+            .expect("empty enum diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/servers/0/variables/region/enum")
+        );
+        assert!(sink.has_errors());
+        assert!(ir.root_servers[0].variables[0].1.enum_values.is_empty());
+    }
+
+    #[test]
+    fn server_variable_empty_enum_warns_in_30() {
+        let document = json!({
+            "openapi": "3.0.3",
+            "servers": [{
+                "url": "https://{region}.example.test",
+                "variables": { "region": { "default": "us", "enum": [] } }
+            }]
+        });
+        let (_temp, _ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SERVER_VAR_ENUM_EMPTY)
+            .expect("empty enum diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/servers/0/variables/region/enum")
+        );
+        assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn server_variable_default_not_in_enum_errors_in_31() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "servers": [{
+                "url": "https://{region}.example.test",
+                "variables": { "region": { "default": "ap", "enum": ["us", "eu"] } }
+            }]
+        });
+        let (_temp, _ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SERVER_VAR_DEFAULT)
+            .expect("default membership diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/servers/0/variables/region/default")
+        );
+        assert!(sink.has_errors());
+    }
+
+    #[test]
+    fn server_variable_default_not_in_enum_warns_in_30() {
+        let document = json!({
+            "openapi": "3.0.3",
+            "servers": [{
+                "url": "https://{region}.example.test",
+                "variables": { "region": { "default": "ap", "enum": ["us", "eu"] } }
+            }]
+        });
+        let (_temp, _ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SERVER_VAR_DEFAULT)
+            .expect("default membership diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/servers/0/variables/region/default")
+        );
+        assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn server_variable_valid_enum_and_default_clean() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "servers": [{
+                "url": "https://{region}.example.test/{version}",
+                "variables": {
+                    "region": { "default": "us", "enum": ["us", "eu"] },
+                    "version": { "default": "v1" }
+                }
+            }]
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        assert_eq!(sink.as_slice(), []);
+        assert_eq!(ir.root_servers[0].variables.len(), 2);
+        assert_eq!(ir.root_servers[0].variables[0].1.default, "us");
+        assert_eq!(ir.root_servers[0].variables[0].1.enum_values, ["us", "eu"]);
+        assert_eq!(ir.root_servers[0].variables[1].1.default, "v1");
+        assert!(ir.root_servers[0].variables[1].1.enum_values.is_empty());
     }
 
     #[test]
@@ -3150,10 +5033,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 SecKind::Http {
-                    scheme: "bearer".to_owned()
+                    scheme: "bearer".to_owned(),
+                    bearer_format: None
                 },
                 SecKind::Http {
-                    scheme: String::new()
+                    scheme: String::new(),
+                    bearer_format: None
                 },
                 SecKind::ApiKey {
                     location: ParamLocation::Query,
@@ -3168,17 +5053,409 @@ mod tests {
                     name: "session".to_owned()
                 },
                 SecKind::Other,
-                SecKind::OAuth2,
-                SecKind::OpenIdConnect,
+                SecKind::OAuth2 {
+                    flows: OAuthFlows {
+                        implicit: None,
+                        password: None,
+                        client_credentials: None,
+                        authorization_code: None
+                    }
+                },
+                SecKind::OpenIdConnect { url: String::new() },
                 SecKind::MutualTls,
                 SecKind::Other,
                 SecKind::Http {
-                    scheme: "digest".to_owned()
+                    scheme: "digest".to_owned(),
+                    bearer_format: None
                 }
             ]
         );
         assert_eq!(ir.security_schemes[10].source.json_pointer, "/x-http");
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn oauth2_flows_parse_all_four_types_and_scope_order() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "oauth": {
+                    "type": "oauth2",
+                    "flows": {
+                        "implicit": {
+                            "authorizationUrl": " https://example.test/authorize?raw=%2F ",
+                            "refreshUrl": "refresh:implicit",
+                            "scopes": { "read": "Read access", "shared": "Shared access" }
+                        },
+                        "password": {
+                            "tokenUrl": " token:password ",
+                            "scopes": { "write": "Write access", "shared": "Repeated" }
+                        },
+                        "clientCredentials": {
+                            "tokenUrl": "token:client",
+                            "refreshUrl": "refresh:client",
+                            "scopes": { "admin": "Admin access" }
+                        },
+                        "authorizationCode": {
+                            "authorizationUrl": "authorize:code",
+                            "tokenUrl": "token:code",
+                            "refreshUrl": "refresh:code",
+                            "scopes": { "final": "Final access" }
+                        }
+                    }
+                }
+            }}
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let flows = OAuthFlows {
+            implicit: Some(OAuthFlow {
+                authorization_url: Some(" https://example.test/authorize?raw=%2F ".to_owned()),
+                token_url: None,
+                refresh_url: Some("refresh:implicit".to_owned()),
+                scopes: vec![
+                    ("read".to_owned(), "Read access".to_owned()),
+                    ("shared".to_owned(), "Shared access".to_owned()),
+                ],
+            }),
+            password: Some(OAuthFlow {
+                authorization_url: None,
+                token_url: Some(" token:password ".to_owned()),
+                refresh_url: None,
+                scopes: vec![
+                    ("write".to_owned(), "Write access".to_owned()),
+                    ("shared".to_owned(), "Repeated".to_owned()),
+                ],
+            }),
+            client_credentials: Some(OAuthFlow {
+                authorization_url: None,
+                token_url: Some("token:client".to_owned()),
+                refresh_url: Some("refresh:client".to_owned()),
+                scopes: vec![("admin".to_owned(), "Admin access".to_owned())],
+            }),
+            authorization_code: Some(OAuthFlow {
+                authorization_url: Some("authorize:code".to_owned()),
+                token_url: Some("token:code".to_owned()),
+                refresh_url: Some("refresh:code".to_owned()),
+                scopes: vec![("final".to_owned(), "Final access".to_owned())],
+            }),
+        };
+        assert_eq!(
+            ir.security_schemes[0].kind,
+            SecKind::OAuth2 {
+                flows: flows.clone()
+            }
+        );
+        let implicit = flows.implicit.as_ref().expect("implicit flow");
+        assert_eq!(
+            implicit.authorization_url.as_deref(),
+            Some(" https://example.test/authorize?raw=%2F ")
+        );
+        assert_eq!(implicit.token_url, None);
+        assert_eq!(implicit.refresh_url.as_deref(), Some("refresh:implicit"));
+        assert_eq!(
+            implicit.scopes,
+            [
+                ("read".to_owned(), "Read access".to_owned()),
+                ("shared".to_owned(), "Shared access".to_owned())
+            ]
+        );
+        let password = flows.password.as_ref().expect("password flow");
+        assert_eq!(password.token_url.as_deref(), Some(" token:password "));
+        assert_eq!(
+            password.scopes,
+            [
+                ("write".to_owned(), "Write access".to_owned()),
+                ("shared".to_owned(), "Repeated".to_owned())
+            ]
+        );
+        let client = flows
+            .client_credentials
+            .as_ref()
+            .expect("client credentials flow");
+        assert_eq!(client.token_url.as_deref(), Some("token:client"));
+        assert_eq!(client.refresh_url.as_deref(), Some("refresh:client"));
+        assert_eq!(
+            client.scopes,
+            [("admin".to_owned(), "Admin access".to_owned())]
+        );
+        let code = flows
+            .authorization_code
+            .as_ref()
+            .expect("authorization code flow");
+        assert_eq!(code.authorization_url.as_deref(), Some("authorize:code"));
+        assert_eq!(code.token_url.as_deref(), Some("token:code"));
+        assert_eq!(code.refresh_url.as_deref(), Some("refresh:code"));
+        assert_eq!(
+            code.scopes,
+            [("final".to_owned(), "Final access".to_owned())]
+        );
+        assert_eq!(
+            flows.declared_scopes(),
+            ["read", "shared", "write", "admin", "final"]
+        );
+        assert!(!flows.is_empty());
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn http_bearer_format_parses_verbatim() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "formatted": { "type": "http", "scheme": "bearer", "bearerFormat": " JWT + custom " },
+                "plain": { "type": "http", "scheme": "basic" }
+            }}
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(matches!(
+            &ir.security_schemes[0].kind,
+            SecKind::Http { scheme, bearer_format }
+                if scheme == "bearer" && bearer_format.as_deref() == Some(" JWT + custom ")
+        ));
+        assert!(matches!(
+            &ir.security_schemes[1].kind,
+            SecKind::Http { scheme, bearer_format }
+                if scheme == "basic" && bearer_format.is_none()
+        ));
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn openidconnect_url_parses_verbatim() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "present": { "type": "openIdConnect", "openIdConnectUrl": " oidc://raw value " },
+                "missing": { "type": "openIdConnect" }
+            }}
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        assert_eq!(
+            ir.security_schemes[0].kind,
+            SecKind::OpenIdConnect {
+                url: " oidc://raw value ".to_owned()
+            }
+        );
+        assert_eq!(
+            ir.security_schemes[1].kind,
+            SecKind::OpenIdConnect { url: String::new() }
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn oauth2_missing_flows_yields_empty_flows() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "oauth": { "type": "oauth2" },
+                "flowWithoutScopes": {
+                    "type": "oauth2",
+                    "flows": { "password": { "tokenUrl": "token:password", "scopes": {} } }
+                }
+            } }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        assert_eq!(
+            ir.security_schemes[0].kind,
+            SecKind::OAuth2 {
+                flows: OAuthFlows {
+                    implicit: None,
+                    password: None,
+                    client_credentials: None,
+                    authorization_code: None
+                }
+            }
+        );
+        assert!(matches!(
+            &ir.security_schemes[1].kind,
+            SecKind::OAuth2 { flows }
+                if flows.password.as_ref().is_some_and(|flow| flow.scopes.is_empty())
+        ));
+        assert!(sink.as_slice().is_empty());
+    }
+
+    #[test]
+    fn flow_without_scopes_map_errors_1438() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": { "oauth": {
+                "type": "oauth2",
+                "flows": {
+                    "password": { "tokenUrl": "https://example.test/token" }
+                }
+            } } }
+        });
+        let (_temp, _ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SECURITY_FLOWS_SHAPE)
+            .expect("missing scopes diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/components/securitySchemes/oauth/flows/password")
+        );
+        assert_eq!(diagnostic.message, "OAuth2 flow requires a scopes map");
+    }
+
+    #[test]
+    fn unrecognized_flow_key_is_error_oxs1438() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": { "oauth": {
+                "type": "oauth2",
+                "flows": { "deviceCode": { "scopes": {} } }
+            } } }
+        });
+        let (_temp, _ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SECURITY_FLOWS_SHAPE)
+            .expect("flow shape diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/components/securitySchemes/oauth/flows/deviceCode")
+        );
+        assert_eq!(diagnostic.message, "unrecognized OAuth2 flow 'deviceCode'");
+    }
+
+    #[test]
+    fn non_string_scope_value_is_error_oxs1438() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": { "oauth": {
+                "type": "oauth2",
+                "flows": { "implicit": {
+                    "authorizationUrl": "https://example.test/authorize",
+                    "scopes": { "read": "Read access", "write": 7 }
+                } }
+            } } }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SECURITY_FLOWS_SHAPE)
+            .expect("scope shape diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/components/securitySchemes/oauth/flows/implicit/scopes")
+        );
+        assert_eq!(
+            diagnostic.message,
+            "OAuth2 scopes must map scope names to description strings"
+        );
+        assert_eq!(
+            ir.security_schemes[0].kind,
+            SecKind::OAuth2 {
+                flows: OAuthFlows {
+                    implicit: Some(OAuthFlow {
+                        authorization_url: Some("https://example.test/authorize".to_owned()),
+                        token_url: None,
+                        refresh_url: None,
+                        scopes: Vec::new()
+                    }),
+                    password: None,
+                    client_credentials: None,
+                    authorization_code: None
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn non_object_oauth2_shapes_use_general_shape_error() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "components": { "securitySchemes": {
+                "badFlows": { "type": "oauth2", "flows": 7 },
+                "badFlow": { "type": "oauth2", "flows": { "password": 7 } }
+            } }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(matches!(
+            &ir.security_schemes[0].kind,
+            SecKind::OAuth2 { flows } if flows.is_empty()
+        ));
+        assert!(matches!(
+            &ir.security_schemes[1].kind,
+            SecKind::OAuth2 { flows } if flows.is_empty()
+        ));
+        assert_eq!(
+            sink.as_slice()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_SHAPE)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn security_descriptor_bytes_unchanged_after_seckind_payload() {
+        let temp = TempDir::new().expect("temp directory");
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "components": { "securitySchemes": {
+                "oauth": {
+                    "type": "oauth2",
+                    "flows": {
+                        "authorizationCode": {
+                            "authorizationUrl": "https://example.test/authorize",
+                            "tokenUrl": "https://example.test/token",
+                            "scopes": { "read": "Read access" }
+                        }
+                    }
+                },
+                "http": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT" },
+                "oidc": { "type": "openIdConnect", "openIdConnectUrl": "https://example.test/.well-known/openid-configuration" }
+            }},
+            "paths": { "/secure": { "get": {
+                "operationId": "secure",
+                "security": [{ "oauth": ["read"] }, { "http": [] }, { "oidc": [] }],
+                "responses": { "204": { "description": "ok" } }
+            }}}
+        });
+        std::fs::write(
+            temp.path().join("openapi.json"),
+            serde_json::to_vec(&document).expect("OpenAPI JSON"),
+        )
+        .expect("write OpenAPI");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.json" },
+            "output": "generated",
+            "artifacts": { "types": true, "client": true },
+            "client": { "authEnforcement": "types", "baseUrl": { "source": "runtime" } },
+            "validation": { "engine": "off", "unchecked": "allow" }
+        });
+        let config_path = temp.path().join("oasts.json");
+        let resolved = load_config_from_json(
+            &config_path,
+            &serde_json::to_vec(&config).expect("config JSON"),
+        )
+        .expect("resolved config");
+        let mut sink = DiagnosticSink::new();
+        let files = compile_pipeline(&resolved, true, &mut sink).expect("generated files");
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let client = files
+            .iter()
+            .find(|file| file.relative_path == "client/operations/secure.ts")
+            .expect("secure client operation");
+        let start = client.content.find("  security:").expect("security start");
+        let end = client.content[start..]
+            .find("  responses:")
+            .expect("responses start")
+            + start;
+        assert_eq!(
+            &client.content[start..end],
+            "  security: [\n    [{ name: \"oauth\", kind: \"oauth2\", scopes: [\"read\"] }],\n    [{ name: \"http\", kind: \"bearer\", scopes: [] }],\n    [{ name: \"oidc\", kind: \"openIdConnect\", scopes: [] }],\n  ],\n"
+        );
     }
 
     #[test]
@@ -3426,6 +5703,98 @@ mod tests {
         assert_eq!(meta.object_constraints().max_properties, Some(6));
     }
 
+    fn assert_invalid_multiple_of(multiple_of: &str) {
+        let document: Value = serde_json::from_str(&format!(
+            r#"{{
+                "openapi": "3.1.0",
+                "components": {{
+                    "schemas": {{
+                        "Value": {{"type": "number", "multipleOf": {multiple_of}}}
+                    }}
+                }}
+            }}"#
+        ))
+        .expect("valid OpenAPI document");
+        let (_temp, ir, sink) = parse_value(&document);
+        let diagnostics = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_MULTIPLE_OF)
+            .collect::<Vec<_>>();
+
+        assert_eq!(diagnostics.len(), 1, "{:?}", sink.as_slice());
+        assert_eq!(diagnostics[0].severity, Severity::Error);
+        assert!(
+            diagnostics[0]
+                .json_pointer
+                .as_deref()
+                .is_some_and(|pointer| pointer.ends_with("/multipleOf"))
+        );
+        assert!(
+            ir.schemas[0]
+                .schema
+                .meta()
+                .numeric_constraints()
+                .multiple_of
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn multipleof_zero_is_input_error() {
+        assert_invalid_multiple_of("0");
+    }
+
+    #[test]
+    fn multipleof_negative_is_input_error() {
+        assert_invalid_multiple_of("-1");
+    }
+
+    #[test]
+    fn multipleof_nonrepresentable_is_input_error() {
+        assert_invalid_multiple_of("1e999");
+    }
+
+    #[test]
+    fn invalid_multipleof_absent_from_constraint_docs() {
+        let invalid = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "schemas": {
+                    "Value": {"type": "number", "multipleOf": 0, "minimum": 1}
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&invalid);
+        let constraints = &ir.schemas[0].schema.meta().docs.constraints;
+        assert!(sink.has_errors());
+        assert!(constraints.contains(&"minimum: 1".to_owned()));
+        assert!(
+            !constraints
+                .iter()
+                .any(|entry| entry.starts_with("multipleOf:"))
+        );
+
+        let valid = json!({
+            "openapi": "3.1.0",
+            "components": {
+                "schemas": {
+                    "Value": {"type": "number", "multipleOf": 2}
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&valid);
+        assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+        assert!(
+            ir.schemas[0]
+                .schema
+                .meta()
+                .docs
+                .constraints
+                .contains(&"multipleOf: 2".to_owned())
+        );
+    }
+
     #[test]
     fn multiple_of_and_exclusive_bounds_follow_dialect_spelling() {
         for (version, multiple_of, exclusive_minimum) in [
@@ -3583,7 +5952,13 @@ mod tests {
             }
         });
         let (_temp, ir, sink) = parse_value(&document);
-        assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+        let diagnostics = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_MULTIPLE_OF)
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{:?}", sink.as_slice());
+        assert_eq!(diagnostics[0].severity, Severity::Error);
 
         for schema in &ir.schemas {
             let meta = schema.schema.meta();
@@ -3608,10 +5983,8 @@ mod tests {
     }
 
     #[test]
-    fn multiple_of_retains_only_strictly_positive_divisors() {
-        // multipleOf must be > 0; a zero or negative divisor would crash the validator kernel's
-        // BigInt modulo, so the parser drops it to None. A positive divisor is retained. Both
-        // dialects share the numeric collection path.
+    fn multiple_of_retains_positive_and_rejects_nonpositive_divisors() {
+        // Both dialects share the numeric collection and input-diagnostic paths.
         for version in ["3.0.3", "3.1.0"] {
             for (literal, expected) in [("0", None), ("-2", None), ("2.5", Some("2.5"))] {
                 let document: Value = serde_json::from_str(&format!(
@@ -3626,7 +5999,12 @@ mod tests {
                 ))
                 .expect("valid OpenAPI document");
                 let (_temp, ir, sink) = parse_value(&document);
-                assert!(!sink.has_errors(), "{:?}", sink.as_slice());
+                let diagnostics = sink
+                    .as_slice()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == CODE_MULTIPLE_OF)
+                    .collect::<Vec<_>>();
+                assert_eq!(diagnostics.len(), usize::from(expected.is_none()));
                 assert_eq!(
                     ir.schemas[0]
                         .schema
@@ -4166,6 +6544,8 @@ mod tests {
                 meta: SchemaMeta::default(),
             }))),
             dependent_required: Vec::new(),
+            finite: None,
+            extra_required: Vec::new(),
             meta: SchemaMeta::default(),
         };
         assert_canonical(&open);

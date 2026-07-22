@@ -1,0 +1,13 @@
+Subscription:
+  type: object
+  required:
+    - id
+    - callbackUrl
+  properties:
+    id:
+      type: string
+    callbackUrl:
+      type: string
+      format: uri
+    active:
+      type: boolean

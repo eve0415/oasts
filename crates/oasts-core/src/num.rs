@@ -1,6 +1,25 @@
 //! ECMAScript-compatible decimal rendering used by enum-name allocation.
 
-use serde_json::Number;
+use serde_json::{Number, Value};
+
+/// The number's value as a finite binary64, or `None` when it does not fit — a non-numeric-precision
+/// literal, or one whose magnitude overflows f64 (serde returns `None`, never `Some(inf)`). `None` is
+/// the "outside the binary64 domain" predicate that number diagnostics and finite-value handling share.
+#[must_use]
+pub fn finite_binary64(number: &Number) -> Option<f64> {
+    number.as_f64().filter(|value| value.is_finite())
+}
+
+/// First number in the value tree (depth-first, source order) that does not fit binary64.
+#[must_use]
+pub fn first_number_outside_binary64(value: &Value) -> Option<&Number> {
+    match value {
+        Value::Number(number) if finite_binary64(number).is_none() => Some(number),
+        Value::Array(values) => values.iter().find_map(first_number_outside_binary64),
+        Value::Object(values) => values.values().find_map(first_number_outside_binary64),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+    }
+}
 
 /// Renders a finite binary64 value using ECMAScript's decimal/exponent cutovers.
 ///
@@ -112,7 +131,36 @@ impl DecimalParts {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecimalParts, render_number};
+    use serde_json::{Value, json};
+
+    use super::{DecimalParts, first_number_outside_binary64, render_number};
+
+    #[test]
+    fn finds_first_number_outside_binary64_in_value_trees() {
+        let scalar = serde_json::from_str::<Value>("1e999").expect("outside binary64 number");
+        assert_eq!(
+            first_number_outside_binary64(&scalar).map(ToString::to_string),
+            Some("1e+999".to_owned())
+        );
+
+        let nested_array = serde_json::from_str::<Value>(r#"[1,[2,1e999],1e1000]"#)
+            .expect("nested outside binary64 numbers");
+        assert_eq!(
+            first_number_outside_binary64(&nested_array).map(ToString::to_string),
+            Some("1e+999".to_owned())
+        );
+
+        let object = serde_json::from_str::<Value>(r#"{"safe":1,"hit":1e999}"#)
+            .expect("object outside binary64 number");
+        assert_eq!(
+            first_number_outside_binary64(&object).map(ToString::to_string),
+            Some("1e+999".to_owned())
+        );
+        assert_eq!(
+            first_number_outside_binary64(&json!({ "safe": [null, true, "1e999", 1.5] })),
+            None
+        );
+    }
 
     #[test]
     fn matches_node_string_boundary_vectors() {
