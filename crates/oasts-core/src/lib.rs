@@ -4,6 +4,7 @@ pub mod diag;
 pub mod emit;
 pub mod ir;
 pub mod loader;
+mod media;
 pub mod num;
 pub mod parse;
 pub mod pipeline;

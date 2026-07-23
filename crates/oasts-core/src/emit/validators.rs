@@ -34,10 +34,11 @@ use super::model::EmissionModel;
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
     Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypePosition, callback_operation,
-    callback_parent_operation, import_extension, lowercase_first, media_is_json,
-    property_in_position, render_json_compact, render_ts_string, response_status_type_suffix,
-    source_diagnostic, uppercase_first,
+    callback_parent_operation, import_extension, lowercase_first, property_in_position,
+    render_json_compact, render_ts_string, response_status_type_suffix, source_diagnostic,
+    uppercase_first,
 };
+use crate::media::is_json;
 
 /// Emitted verbatim as `validators/runtime.ts`; the generated-validator call ABI is fixed to it.
 const VALIDATORS_RUNTIME_TS: &str = include_str!("../../runtime/validators-runtime.ts");
@@ -500,13 +501,17 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         self.scope.runtime_values.insert("hasGet");
         self.open("if (hasGet(value)) {");
         for (name, header) in &response.headers {
+            // An opaque content header is typed `string`; its wire value is always a string when
+            // present, so an optional one needs no check at all and a required one needs only the
+            // presence check below — never a schema check that would reject the raw string.
+            let opaque = crate::client_model::response_header_is_opaque_string(header);
+            if opaque && !header.required {
+                continue;
+            }
             let index = self.fresh();
             let val = format!("v{index}");
-            let child_path = format!("path{index}");
             let key = render_ts_string(name);
             self.line(&format!("const {val} = value.get({key});"));
-            self.scope.runtime_values.insert("appendKey");
-            self.line(&format!("const {child_path} = appendKey(path, {key});"));
             if header.required {
                 self.push_issue(
                     &format!("{val} === null"),
@@ -515,10 +520,35 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                     &format!("missing required header {name}"),
                 );
             }
-            self.open(&format!("if ({val} !== null) {{"));
-            // Header values arrive as wire strings, so non-string schema domains over-report by design.
-            self.gen_schema(&header.schema, &val, &child_path, "issues");
-            self.close("}");
+            if !opaque {
+                let child_path = format!("path{index}");
+                self.scope.runtime_values.insert("appendKey");
+                self.line(&format!("const {child_path} = appendKey(path, {key});"));
+                self.open(&format!("if ({val} !== null) {{"));
+                if header.content_media_type.is_some() {
+                    // A JSON-family content header (non-opaque with a media type) carries JSON text on
+                    // the wire, so parse it before schema validation — an object/number/array schema
+                    // can never match the raw string. A parse failure is a decode issue; the schema
+                    // check stays inside the try because the generated validators never throw.
+                    self.scope.runtime_values.insert("issue");
+                    let decoded = format!("d{index}");
+                    self.open("try {");
+                    self.line(&format!("const {decoded}: unknown = JSON.parse({val});"));
+                    self.gen_schema(&header.schema, &decoded, &child_path, "issues");
+                    self.indent -= 1;
+                    self.open("} catch {");
+                    self.line(&format!(
+                        "issues.push(issue({child_path}, {}));",
+                        render_ts_string("value is not valid JSON")
+                    ));
+                    self.close("}");
+                } else {
+                    // Schema-style header values arrive as wire strings, so non-string schema domains
+                    // over-report by design.
+                    self.gen_schema(&header.schema, &val, &child_path, "issues");
+                }
+                self.close("}");
+            }
         }
         self.indent -= 1;
         self.open("} else {");
@@ -1487,7 +1517,7 @@ fn emit_operation_file(
         && let Some(media) = body
             .media_types
             .iter()
-            .find(|media| media_is_json(&media.name))
+            .find(|media| is_json(&media.essence))
     {
         positions.push((
             format!("{stem}RequestBody"),
@@ -1501,7 +1531,7 @@ fn emit_operation_file(
             if let Some(media) = response
                 .media_types
                 .iter()
-                .find(|media| media_is_json(&media.name))
+                .find(|media| is_json(&media.essence))
             {
                 let suffix = response_status_type_suffix(&response.status);
                 responses.push((format!("{stem}Response{suffix}"), &media.schema));
@@ -1736,11 +1766,10 @@ fn emit_callbacks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
 
 fn operation_has_request_validators(operation: &Operation) -> bool {
     !operation.parameters.is_empty()
-        || operation.request_body.as_ref().is_some_and(|body| {
-            body.media_types
-                .iter()
-                .any(|media| media_is_json(&media.name))
-        })
+        || operation
+            .request_body
+            .as_ref()
+            .is_some_and(|body| body.media_types.iter().any(|media| is_json(&media.essence)))
 }
 
 fn write_request_descriptor_method(
@@ -1797,7 +1826,7 @@ fn write_request_descriptor_method(
         request_body
             .media_types
             .iter()
-            .any(|media| media_is_json(&media.name))
+            .any(|media| is_json(&media.essence))
     }) {
         let validator = format!("{}RequestBodyValidator", lowercase_first(&stem));
         entry.insert(validator.clone());
@@ -3041,6 +3070,65 @@ mod tests {
         );
         assert!(
             content.contains("value is not a Headers object"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn opaque_content_response_headers_skip_schema_validation() {
+        let (files, diagnostics) = compile(response_headers_document(json!({
+            "X-Json": {
+                "required": true,
+                "content": { "application/json": { "schema": { "type": "string", "minLength": 3 } } }
+            },
+            "X-Opaque-Req": {
+                "required": true,
+                "content": { "application/xml": { "schema": { "type": "string" } } }
+            },
+            "X-Opaque-Opt": {
+                "content": { "application/xml": { "schema": { "type": "string" } } }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = operation(&files, "fetchthing");
+        // A JSON-family content header parses the wire JSON before schema validation, then validates
+        // the decoded value — never the raw wire string, which an object/number schema can't match.
+        assert!(
+            content.contains("const v0 = value.get(\"X-Json\");"),
+            "{content}"
+        );
+        assert!(content.contains("appendKey(path, \"X-Json\")"), "{content}");
+        assert!(
+            content.contains("const d0: unknown = JSON.parse(v0);"),
+            "{content}"
+        );
+        assert!(
+            content.contains("if (codePointLength(d0) < 3) {"),
+            "{content}"
+        );
+        assert!(
+            content.contains("issues.push(issue(path0, \"value is not valid JSON\"));"),
+            "{content}"
+        );
+        // An opaque required content header keeps only its presence check — no schema check that
+        // would reject the raw wire string.
+        assert!(
+            content.contains("const v1 = value.get(\"X-Opaque-Req\");"),
+            "{content}"
+        );
+        assert!(
+            content.contains("missing required header X-Opaque-Req"),
+            "{content}"
+        );
+        assert!(!content.contains("if (v1 !== null) {"), "{content}");
+        assert!(
+            !content.contains("appendKey(path, \"X-Opaque-Req\")"),
+            "{content}"
+        );
+        // An opaque optional content header needs no check at all, so the validator body binds no
+        // value for it (the header still appears as a `string` in the interface declaration).
+        assert!(
+            !content.contains("value.get(\"X-Opaque-Opt\")"),
             "{content}"
         );
     }

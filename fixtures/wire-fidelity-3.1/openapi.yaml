@@ -1,0 +1,124 @@
+openapi: 3.1.0
+info:
+  title: Oasts wire-fidelity showcase
+  version: 1.0.0
+servers:
+  - url: https://api.example.test/v1
+paths:
+  /events:
+    get:
+      operationId: watchEvents
+      summary: List events as JSON, or watch them as a stream of JSON change notifications.
+      description: >-
+        The 200 response carries two distinct content keys for the same status: a plain
+        application/json list, and a parameterized application/json;stream=watch key for callers
+        that opt into the watch protocol, mirroring Kubernetes' watch API.
+      responses:
+        '200':
+          description: Events, or watch notifications when the client requests the stream media type.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Event'
+            application/json;stream=watch:
+              schema:
+                $ref: '#/components/schemas/WatchEvent'
+  /ping:
+    get:
+      operationId: pingStatus
+      summary: An operation with no responses object at all, legal on OpenAPI 3.1.
+  /colors:
+    get:
+      operationId: filterColors
+      summary: Filter colors by two object-valued query parameters using delimited styles.
+      parameters:
+        - name: sd
+          in: query
+          description: An RGB filter serialized as a space-delimited list of alternating keys and values.
+          style: spaceDelimited
+          explode: false
+          schema:
+            type: object
+            additionalProperties: false
+            properties:
+              R:
+                type: integer
+              G:
+                type: integer
+              B:
+                type: integer
+        - name: pd
+          in: query
+          description: An RGB filter serialized as a pipe-delimited list of alternating keys and values.
+          style: pipeDelimited
+          explode: false
+          schema:
+            type: object
+            additionalProperties: false
+            properties:
+              R:
+                type: integer
+              G:
+                type: integer
+              B:
+                type: integer
+      responses:
+        '204':
+          description: The filter was accepted with no response body.
+  /notes:
+    post:
+      operationId: submitNote
+      summary: Upload a note whose multipart part declares an extra header, and a base64-encoded blob part.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - note
+                - blob
+              properties:
+                note:
+                  type: string
+                blob:
+                  type: string
+                  contentEncoding: base64
+            encoding:
+              note:
+                headers:
+                  X-Part-Note:
+                    description: Rejected by RFC 7578, which forbids senders including headers on a multipart/form-data part beyond Content-Type, Content-Disposition, and Content-Transfer-Encoding.
+                    schema:
+                      type: string
+      responses:
+        '204':
+          description: The note was stored without a response body.
+components:
+  schemas:
+    Event:
+      type: object
+      required:
+        - id
+        - message
+      properties:
+        id:
+          type: string
+        message:
+          type: string
+    WatchEvent:
+      type: object
+      required:
+        - type
+        - object
+      properties:
+        type:
+          type: string
+          enum:
+            - ADDED
+            - MODIFIED
+            - DELETED
+        object:
+          $ref: '#/components/schemas/Event'

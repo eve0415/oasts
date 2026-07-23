@@ -465,3 +465,126 @@ export const COOKIE_SENTINEL_VECTORS = [
     expected: { failure: "auth", messageIncludes: "ambient" },
   },
 ] as const satisfies readonly CookieVector[];
+
+// --- Generic HTTP scheme (RFC 9110 §11.1, generalized beyond basic/bearer) ---
+// RFC 9110 defines HTTP authentication as an open, extensible scheme registry ("the 'basic' and
+// 'digest' authentication schemes are defined by other specifications") rather than a fixed set.
+// This project serializes ANY `type: http` scheme whose declared `scheme` value is neither "basic"
+// nor "bearer" (case-insensitively) through this generic arm. The provider credential is
+// `{ credentials: string }` — an opaque string the caller has already formatted to the target
+// scheme's own grammar (e.g. RFC 7616 Digest's `realm=..., response=...` parameter list); this
+// project does not parse or validate that grammar, only the header-value safety of the two pieces
+// it splices onto the wire.
+//
+// A credential that is not an object with a string `credentials` property is an `auth` failure
+// (the wrong-shape case), checked BEFORE the control-character check. Otherwise, either the
+// declared `scheme` name (fixed at generation time from the OpenAPI document) or the credential's
+// `credentials` string containing a header-control byte — 0x00 (NUL), 0x0A (LF), or 0x0D (CR) at
+// any position, the same three bytes as the header API-key grammar check's step 1 — is an `auth`
+// failure before Request construction. A passing credential is emitted VERBATIM as the full header
+// line `Authorization: <scheme> <credentials>` — no case transform, no re-encoding.
+//
+// Harness wiring: on success, format the emitted (name, value) as `name + ": " + value` and assert
+// it equals `expected`; the name is always `Authorization`. On failure, see the shared `expected`
+// doc above. The wrong-shape rejection anchors on "credentials string"; the control-character
+// rejection anchors on "control character".
+
+export type HttpSchemeCredential =
+  | { readonly kind: "valid"; readonly credentials: string }
+  | { readonly kind: "basicShaped"; readonly username: string; readonly password: string };
+
+export type HttpSchemeInput = {
+  readonly scheme: string;
+  readonly credential: HttpSchemeCredential;
+};
+
+export type HttpSchemeVector = {
+  readonly name: string;
+  readonly cite: string;
+  readonly input: HttpSchemeInput;
+  readonly expected: string | AuthFailure;
+};
+
+export const HTTP_SCHEME_VECTORS = [
+  {
+    // The credentials string is opaque to this project and copied verbatim after the scheme name.
+    name: "digest-credentials-verbatim",
+    cite: "RFC 9110",
+    input: {
+      scheme: "Digest",
+      credential: { kind: "valid", credentials: 'realm="api", response="proof"' },
+    },
+    expected: 'Authorization: Digest realm="api", response="proof"',
+  },
+  {
+    // LF in the credentials -> header-control rejection, the same three bytes as the header
+    // API-key grammar check.
+    name: "lf-control-in-credentials",
+    cite: "RFC 9110",
+    input: {
+      scheme: "Digest",
+      credential: { kind: "valid", credentials: "proof\nX-Injected: yes" },
+    },
+    expected: { failure: "auth", messageIncludes: "control character" },
+  },
+  {
+    // A BasicCredential-shaped object (another scheme kind's credential type) is rejected: the
+    // credential TYPE is wrong, independent of its content.
+    name: "basic-shaped-credential-rejected",
+    cite: "RFC 9110",
+    input: {
+      scheme: "Digest",
+      credential: { kind: "basicShaped", username: "user", password: "secret" },
+    },
+    expected: { failure: "auth", messageIncludes: "credentials string" },
+  },
+] as const satisfies readonly HttpSchemeVector[];
+
+// --- Mutual TLS (OpenAPI 3.1 `mutualTLS` scheme; mirrors the cookie ambient-sentinel pattern) ---
+// TLS client-certificate authentication happens below HTTP, so there is no credential value to
+// place on the wire — the same reasoning as the cookie API-key ambient sentinel above. The real
+// sentinel is a unique symbol, `AmbientClientCertificate`, that cannot be imported into this
+// data-only module, so it is represented symbolically exactly like the cookie table: `{ kind:
+// "ambient" }` stands for the real sentinel, `{ kind: "string", value }` stands for a caller
+// mistakenly supplying a plain string.
+//
+// Selecting the ambient sentinel emits NO header and serializes no request data at all; the
+// runtime TLS layer (a custom fetch/dispatcher supplying the client certificate and key) is
+// asserted to already carry the certificate, and the request proceeds unmodified. Supplying a
+// plain string is a fail-closed `auth` failure of ANY content — the credential TYPE is wrong,
+// independent of value.
+//
+// Reading `expected` here (same shape as the cookie table above):
+//   - `"noHeader" in expected` -> SUCCESS: no header is added and the request proceeds unmodified.
+//   - otherwise -> an `AuthFailure` (see the shared `expected` doc). The string rejection uses the
+//     anchor "ambient client certificate" (the required credential kind).
+
+export type MutualTlsCredential =
+  | { readonly kind: "ambient" }
+  | { readonly kind: "string"; readonly value: string };
+
+export type MutualTlsExpectation = { readonly noHeader: true };
+
+export type MutualTlsVector = {
+  readonly name: string;
+  readonly cite: string;
+  readonly input: MutualTlsCredential;
+  readonly expected: MutualTlsExpectation | AuthFailure;
+};
+
+export const MUTUAL_TLS_VECTORS = [
+  {
+    // Ambient sentinel selected -> no header emitted, no request data serialized, request proceeds.
+    name: "ambient-sentinel-no-header",
+    cite: "OpenAPI 3.1",
+    input: { kind: "ambient" },
+    expected: { noHeader: true },
+  },
+  {
+    // A plain string is fail-closed rejected — the credential TYPE is wrong, independent of value.
+    name: "non-sentinel-string-rejected",
+    cite: "OpenAPI 3.1",
+    input: { kind: "string", value: "not-a-certificate" },
+    expected: { failure: "auth", messageIncludes: "ambient client certificate" },
+  },
+] as const satisfies readonly MutualTlsVector[];

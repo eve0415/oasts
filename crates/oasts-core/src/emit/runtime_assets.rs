@@ -12,8 +12,8 @@ const SERIALIZE_TS: &str = include_str!("../../runtime/serialize.ts");
 const STANDARD_SCHEMA_TS: &str = include_str!("../../runtime/standard-schema.ts");
 const TRANSPORT_TS: &str = include_str!("../../runtime/transport.ts");
 
-const FROZEN_TRANSPORT_BASE_URL_OPTIONAL: &str = "  baseUrl?: string;                                   // generated as REQUIRED when config client.baseUrl.source is \"runtime\"";
-const FROZEN_TRANSPORT_BASE_URL_REQUIRED: &str = "  baseUrl: string;                                   // generated as REQUIRED when config client.baseUrl.source is \"runtime\"";
+const FROZEN_TRANSPORT_BASE_URL_OPTIONAL: &str = "  baseUrl?: string;                                   // generated as REQUIRED when runtime URL resolution needs it";
+const FROZEN_TRANSPORT_BASE_URL_REQUIRED: &str = "  baseUrl: string;                                   // generated as REQUIRED when runtime URL resolution needs it";
 const FROZEN_TRANSPORT_SERVER_VARIABLES: &str =
     "  serverVariables?: Readonly<Record<string, string>>;";
 
@@ -48,8 +48,12 @@ static RUNTIME_ASSETS: OnceLock<RuntimeAssets> = OnceLock::new();
 pub(crate) struct RuntimeSelection<'selection, 'input, 'sink> {
     pub(crate) model: &'selection mut EmissionModel<'input, 'sink>,
     pub(crate) helper_ids: &'selection BTreeSet<String>,
-    pub(crate) serialize_needed: bool,
     pub(crate) base_url: &'selection ResolvedBaseUrl,
+    /// Whether any server the client exposes is a relative URL, which needs the runtime transport
+    /// URL as its base. This is a client-model fact, distinct from the transport-level requiredness
+    /// `emit_runtime_files` derives from it, which additionally forces the base when `base_url` is
+    /// `ResolvedBaseUrl::Runtime`.
+    pub(crate) relative_server_url: bool,
     pub(crate) source: &'selection SourceRef,
     /// Every `(name, ServerVariable)` declared by any server the client model exposes, across all
     /// operations, in source order. Determines whether `TransportConfig.serverVariables` narrows
@@ -62,7 +66,8 @@ pub(crate) fn emit_runtime_files(selection: RuntimeSelection<'_, '_, '_>) -> Vec
     let assets = runtime_assets();
     let runtime_directory = selection.model.config.emit.runtime_directory.clone();
     let import_extension = selection.model.config.emit.import_extension.clone();
-    let runtime_base_url = matches!(selection.base_url, ResolvedBaseUrl::Runtime);
+    let transport_base_url_required =
+        matches!(selection.base_url, ResolvedBaseUrl::Runtime) || selection.relative_server_url;
     let mut files = Vec::with_capacity(4);
 
     push_runtime_file(
@@ -86,25 +91,22 @@ pub(crate) fn emit_runtime_files(selection: RuntimeSelection<'_, '_, '_>) -> Vec
         ),
     );
 
-    if selection.serialize_needed || !selection.helper_ids.is_empty() {
-        let serialize = render_serialize(
-            &assets.serialize,
-            selection.helper_ids,
-            selection.serialize_needed,
-        );
-        push_runtime_file(
-            &mut files,
-            selection.model,
-            selection.source,
-            &runtime_directory,
-            "serialize.ts",
-            rewrite_relative_ts_imports(&serialize, &import_extension),
-        );
-    }
+    // transport.ts value-imports ./serialize.ts unconditionally, so serialize.ts is always emitted
+    // alongside it — never gated — or the emitted transport would import a missing module. Its
+    // transport dependencies are therefore always force-included.
+    let serialize = render_serialize(&assets.serialize, selection.helper_ids, true);
+    push_runtime_file(
+        &mut files,
+        selection.model,
+        selection.source,
+        &runtime_directory,
+        "serialize.ts",
+        rewrite_relative_ts_imports(&serialize, &import_extension),
+    );
 
     let transport = specialize_transport(
         &assets.transport,
-        runtime_base_url,
+        transport_base_url_required,
         selection.server_variables,
     );
     push_runtime_file(
@@ -272,13 +274,11 @@ fn render_serialize(
 ) -> String {
     let mut selected = helper_ids.clone();
     if transport_dependencies {
-        // transport.ts imports these serialize helpers unconditionally, so they must
-        // survive helper subsetting whenever transport is emitted — including cte-check,
-        // which the caller-supplied Content-Transfer-Encoding validation depends on, and
-        // query-form-explode, which auth serialization uses to place an apiKey query credential.
+        // transport.ts is always emitted and imports these serialize helpers unconditionally, so
+        // they always survive helper subsetting — including query-form-explode, which auth
+        // serialization uses to place an apiKey query credential.
         selected.extend(
             [
-                "cte-check",
                 "form-urlencoded-body",
                 "media-canonical",
                 "multipart",
@@ -542,16 +542,14 @@ mod tests {
     fn emit_with(
         config: &ResolvedConfig,
         helpers: impl IntoIterator<Item = &'static str>,
-        serialize_needed: bool,
         base_url: &ResolvedBaseUrl,
     ) -> (Vec<GeneratedFile>, Vec<crate::diag::Diagnostic>) {
-        emit_with_server_variables(config, helpers, serialize_needed, base_url, &[])
+        emit_with_server_variables(config, helpers, base_url, &[])
     }
 
     fn emit_with_server_variables(
         config: &ResolvedConfig,
         helpers: impl IntoIterator<Item = &'static str>,
-        serialize_needed: bool,
         base_url: &ResolvedBaseUrl,
         server_variables: &[(String, ServerVariable)],
     ) -> (Vec<GeneratedFile>, Vec<crate::diag::Diagnostic>) {
@@ -571,8 +569,8 @@ mod tests {
         let files = emit_runtime_files(RuntimeSelection {
             model: &mut model,
             helper_ids: &helpers,
-            serialize_needed,
             base_url,
+            relative_server_url: false,
             source: &source,
             server_variables,
         });
@@ -624,19 +622,16 @@ mod tests {
         let (first, first_diagnostics) = emit_with(
             &config,
             ["query-form", "path-simple", "media-canonical"],
-            false,
             &base_url,
         );
         let (second, second_diagnostics) = emit_with(
             &config,
             ["media-canonical", "query-form", "path-simple"],
-            false,
             &base_url,
         );
         let (third, third_diagnostics) = emit_with(
             &config,
             ["query-form", "path-simple", "media-canonical"],
-            false,
             &base_url,
         );
         assert_eq!(first, second);
@@ -665,12 +660,8 @@ mod tests {
                 } => None,
             })
             .collect::<Vec<_>>();
-        let (files, diagnostics) = emit_with(
-            &config,
-            helpers,
-            false,
-            &ResolvedBaseUrl::Server { index: 0 },
-        );
+        let (files, diagnostics) =
+            emit_with(&config, helpers, &ResolvedBaseUrl::Server { index: 0 });
         assert_eq!(
             content(&files, "serialize.ts"),
             rewrite_relative_ts_imports(&without_markers(SERIALIZE_TS), ".js")
@@ -681,11 +672,10 @@ mod tests {
     #[test]
     fn runtime_base_url_requiredness_is_specialized_both_ways() {
         let (_temp, config) = resolved_config(json!({}));
-        let (runtime, _) = emit_with(&config, [], false, &ResolvedBaseUrl::Runtime);
+        let (runtime, _) = emit_with(&config, [], &ResolvedBaseUrl::Runtime);
         let (configured, _) = emit_with(
             &config,
             [],
-            false,
             &ResolvedBaseUrl::Literal {
                 value: "https://example.test".to_owned(),
             },
@@ -696,47 +686,65 @@ mod tests {
         assert!(content(&configured, "result.ts").contains("from './standard-schema.js';"));
         assert!(content(&configured, "transport.ts").contains("from './result.js';"));
         assert!(content(&configured, "transport.ts").contains("from './serialize.js';"));
+
+        let analyzed = Analyzed {
+            ir: crate::ir::Ir::default(),
+            operation_names: Vec::new(),
+            schema_names: Vec::new(),
+            enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
+        };
+        let source = source();
+        let helpers = BTreeSet::new();
+        let base_url = ResolvedBaseUrl::Server { index: 0 };
+        let mut sink = DiagnosticSink::new();
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let relative = emit_runtime_files(RuntimeSelection {
+            model: &mut model,
+            helper_ids: &helpers,
+            base_url: &base_url,
+            relative_server_url: true,
+            source: &source,
+            server_variables: &[],
+        });
+        assert!(content(&relative, "transport.ts").contains(FROZEN_TRANSPORT_BASE_URL_REQUIRED));
+        assert!(!content(&relative, "transport.ts").contains(FROZEN_TRANSPORT_BASE_URL_OPTIONAL));
     }
 
     #[test]
-    fn serialize_subset_keeps_core_and_only_selected_helpers() {
+    fn serialize_subset_keeps_core_transport_dependencies_and_only_selected_helpers() {
         let (_temp, config) = resolved_config(json!({}));
         let (files, _) = emit_with(
             &config,
             ["path-simple", "query-form"],
-            false,
             &ResolvedBaseUrl::Server { index: 0 },
         );
         let serialize = content(&files, "serialize.ts");
         assert!(serialize.contains("export type ParamPrimitive"));
         assert!(serialize.contains("export function serializePathSimple"));
         assert!(serialize.contains("export function serializeQueryForm"));
+        // The transport dependencies survive subsetting unconditionally.
+        assert!(serialize.contains("export function serializeQueryFormExplode"));
+        assert!(serialize.contains("export async function encodeMultipart"));
+        // A descriptor-unselected, non-transport-dependency helper is dropped.
         assert!(!serialize.contains("export function serializePathLabel"));
-        assert!(!serialize.contains("export function serializeQueryFormExplode"));
         assert!(!serialize.contains("//#region"));
         assert!(!serialize.contains("//#endregion"));
     }
 
     #[test]
-    fn zero_helper_selection_emits_transport_dependencies_when_serialize_is_needed() {
+    fn zero_helper_selection_still_emits_serialize_with_transport_dependencies() {
         let (_temp, config) = resolved_config(json!({}));
-        let (omitted, _) = emit_with(&config, [], false, &ResolvedBaseUrl::Server { index: 0 });
-        assert_eq!(omitted.len(), 3);
-        assert!(
-            !omitted
-                .iter()
-                .any(|file| file.relative_path.ends_with("serialize.ts"))
-        );
-
-        let (core, _) = emit_with(&config, [], true, &ResolvedBaseUrl::Server { index: 0 });
+        // Even with no descriptor-selected helper, serialize.ts is emitted (transport imports it)
+        // alongside result, standard-schema, and transport — four files.
+        let (core, _) = emit_with(&config, [], &ResolvedBaseUrl::Server { index: 0 });
         assert_eq!(core.len(), 4);
         assert!(content(&core, "serialize.ts").contains("export type ParamPrimitive"));
         assert!(content(&core, "serialize.ts").contains("encodeFormUrlencodedBody"));
         assert!(content(&core, "serialize.ts").contains("parseMediaType"));
         assert!(content(&core, "serialize.ts").contains("encodeMultipart"));
-        // transport.ts imports checkCteDomain unconditionally, so cte-check must survive
-        // even when no descriptor references a serialize helper.
-        assert!(content(&core, "serialize.ts").contains("export function checkCteDomain"));
         // transport.ts's auth serialization imports serializeQueryFormExplode unconditionally,
         // so query-form-explode must survive even when no descriptor references it.
         assert!(
@@ -750,7 +758,7 @@ mod tests {
         let (_temp, config) = resolved_config(json!({
             "emit": { "importExtension": "none", "runtimeDirectory": "support/runtime" }
         }));
-        let (files, _) = emit_with(&config, [], false, &ResolvedBaseUrl::Server { index: 0 });
+        let (files, _) = emit_with(&config, [], &ResolvedBaseUrl::Server { index: 0 });
         assert_eq!(files[0].relative_path, "support/runtime/result.ts");
         assert_eq!(files[1].relative_path, "support/runtime/standard-schema.ts");
         assert!(content(&files, "result.ts").contains("from './standard-schema';"));
@@ -797,13 +805,13 @@ mod tests {
         let files = emit_runtime_files(RuntimeSelection {
             model: &mut model,
             helper_ids: &helpers,
-            serialize_needed: false,
             base_url: &base_url,
+            relative_server_url: false,
             source: &source,
             server_variables: &[],
         });
         drop(model);
-        assert_eq!(files.len(), 3);
+        assert_eq!(files.len(), 4);
         assert!(
             sink.as_slice()
                 .iter()
@@ -878,7 +886,6 @@ mod tests {
         let (files, diagnostics) = emit_with_server_variables(
             &config,
             [],
-            false,
             &ResolvedBaseUrl::Server { index: 0 },
             &variables,
         );

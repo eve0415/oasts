@@ -7,8 +7,6 @@ import {
   type UnknownHttpError,
 } from './result.ts';
 import {
-  checkCteDomain,
-  EncodeError,
   encodeFormUrlencodedBody,
   encodeMultipart,
   parseMediaType,
@@ -25,15 +23,18 @@ import {
 //#region oxs:auth
 export type AuthContext<Scope extends string = string> = { readonly operationId: string; readonly scheme: string; readonly scopes: readonly Scope[]; readonly url: string };
 export type BasicCredential = { readonly username: string; readonly password: string };
+export type HttpSchemeCredential = { readonly credentials: string };
 export const AmbientCookieCredential: unique symbol = Symbol('AmbientCookieCredential');
-export type AuthCredential = string | BasicCredential | typeof AmbientCookieCredential;
+// TLS happens below HTTP; Node users thread client cert/key through a custom fetch/dispatcher via the transport fetch/init override.
+export const AmbientClientCertificate: unique symbol = Symbol('AmbientClientCertificate');
+export type AuthCredential = string | BasicCredential | HttpSchemeCredential | typeof AmbientCookieCredential | typeof AmbientClientCertificate;
 export type AuthProvider<Scope extends string = string> = (context: AuthContext<Scope>) => AuthCredential | null | Promise<AuthCredential | null>;
 export type AuthProviders<S extends string = never> = Readonly<Record<S, AuthProvider>>;
 export type AuthOverrides = 'anonymous' | Readonly<Record<string, AuthCredential>>;
 //#endregion
 
 export type TransportConfig<S extends string = never> = {
-  baseUrl?: string;                                   // generated as REQUIRED when config client.baseUrl.source is "runtime"
+  baseUrl?: string;                                   // generated as REQUIRED when runtime URL resolution needs it
   serverVariables?: Readonly<Record<string, string>>;
   auth?: AuthProviders<S>;                            // generated scheme-name-keyed provider map
   headers?: HeadersInit;                              // transport default headers
@@ -117,13 +118,26 @@ type ParamSerializer = {
   bivarianceHack(name: string, value: ParamValue, allowReserved: boolean): string;
 }['bivarianceHack'];
 
-export type ParamPlan = {
+// A content JSON serializer receives the raw typed value (any JSON) rather than a flat `ParamValue`,
+// so it takes `unknown` and stringifies internally. The bivariance hack keeps it interchangeable
+// with `ParamSerializer` at assignment.
+type ContentParamSerializer = {
+  bivarianceHack(name: string, value: unknown, allowReserved: boolean): string;
+}['bivarianceHack'];
+
+type ParamPlanBase = {
   readonly name: string;
-  readonly location: 'path' | 'query' | 'header';
+  readonly location: 'path' | 'query' | 'header' | 'cookie';
   readonly required: boolean;
-  readonly serialize: ParamSerializer;
   readonly allowReserved: boolean;
 };
+
+// Discriminated by the presence of `content` (like `UrlencodedFieldPlan`): the flag ships only on
+// content JSON parameters, keeping every other param descriptor byte-identical. Its serializer takes
+// the raw typed value, so the transport forwards it without the `ParamValue` guard.
+export type ParamPlan =
+  | (ParamPlanBase & { readonly serialize: ParamSerializer })
+  | (ParamPlanBase & { readonly serialize: ContentParamSerializer; readonly content: true });
 
 // Discriminated by property presence (`'payloads' in field`) rather than a `kind` tag like every
 // other descriptor union: a tag string would ship in the descriptor bytes of every generated
@@ -156,9 +170,13 @@ export type MultipartFieldPlan = {
   readonly repeated: boolean;
   readonly wrapper: boolean;
   readonly payload: 'json' | 'text' | 'binary';
+  // Per-admitted-media payload kinds, index-for-index with contentType.admitted. Emitted for wrapped
+  // fields whose caller may pick any admitted media: the selected index chooses the payload kind so
+  // the part Content-Type and body serialization agree. Absent for style/fixed single-media fields,
+  // which have exactly one payload kind (`payload`).
+  readonly payloads?: readonly ('json' | 'text' | 'binary')[];
   readonly contentType: MultipartContentTypePolicy;
   readonly filename: boolean;
-  readonly cte?: MultipartPart['cte'];
 };
 
 export type BodyPlan =
@@ -198,12 +216,16 @@ export type OperationDescriptor = {
   readonly body: BodyPlan | null;
   readonly accept: string | null;
   readonly credentialHeaders: readonly string[];
-  readonly security: readonly (readonly {
+  readonly security: readonly (readonly ({
     readonly name: string;
-    readonly kind: 'basic' | 'bearer' | 'apiKeyHeader' | 'apiKeyQuery' | 'apiKeyCookie' | 'oauth2' | 'openIdConnect';
-    readonly param?: string;
     readonly scopes: readonly string[];
-  }[])[];
+  } & (
+    | {
+        readonly kind: 'basic' | 'bearer' | 'apiKeyHeader' | 'apiKeyQuery' | 'apiKeyCookie' | 'oauth2' | 'openIdConnect' | 'mutualTls';
+        readonly param?: string;
+      }
+    | { readonly kind: 'httpScheme'; readonly scheme: string }
+  ))[])[];
   readonly responses: readonly ResponsePlan[];
   readonly baseUrl:
     | { readonly kind: 'runtime' }
@@ -267,7 +289,6 @@ type SerializedBody = {
 type MultipartWrapper = {
   readonly body: unknown;
   readonly contentType: unknown;
-  readonly headers: unknown;
   readonly filename: unknown;
 };
 
@@ -526,6 +547,10 @@ function isBasicCredential(value: unknown): value is BasicCredential {
     typeof value.password === 'string';
 }
 
+function isHttpSchemeCredential(value: unknown): value is HttpSchemeCredential {
+  return isRecord(value) && typeof value.credentials === 'string';
+}
+
 function utf8Base64(value: string): string {
   let bytes = '';
   for (const byte of UTF8_ENCODER.encode(value)) {
@@ -591,6 +616,16 @@ function serializeSelectedAuth(
       headers.push(['Authorization', `Basic ${utf8Base64(`${username}:${password}`)}`]);
       continue;
     }
+    if (use.kind === 'httpScheme') {
+      if (!isHttpSchemeCredential(credential)) {
+        return `Authentication scheme ${use.name} requires a credentials string`;
+      }
+      if (containsHeaderControl(use.scheme) || containsHeaderControl(credential.credentials)) {
+        return `Authentication scheme ${use.name} contains a control character`;
+      }
+      headers.push(['Authorization', `${use.scheme} ${credential.credentials}`]);
+      continue;
+    }
     if (use.kind === 'apiKeyHeader') {
       if (typeof credential !== 'string') {
         return `Authentication scheme ${use.name} header API key must be a string`;
@@ -630,6 +665,12 @@ function serializeSelectedAuth(
     if (use.kind === 'apiKeyCookie') {
       if (credential !== AmbientCookieCredential) {
         return `Authentication scheme ${use.name} requires the ambient cookie credential`;
+      }
+      continue;
+    }
+    if (use.kind === 'mutualTls') {
+      if (credential !== AmbientClientCertificate) {
+        return `Authentication scheme ${use.name} requires the ambient client certificate credential`;
       }
       continue;
     }
@@ -700,27 +741,40 @@ function networkFailure(cause: unknown): ExecutionResult {
 }
 
 function absoluteBaseUrl(transport: Transport, descriptor: OperationDescriptor): string {
+  if (descriptor.baseUrl.kind === 'server') {
+    const server = descriptor.baseUrl.servers[descriptor.baseUrl.index];
+    if (server === undefined) {
+      throw new TypeError('the configured server index did not resolve');
+    }
+    let selected = server.url;
+    for (const [name, declaredDefault] of server.variables) {
+      const value = transport.serverVariables?.[name] ?? declaredDefault;
+      selected = selected.replaceAll(`{${name}}`, value);
+    }
+    if (!URL.canParse(selected)) {
+      if (transport.baseUrl === undefined) {
+        throw new TypeError('no absolute base URL resolved for the operation');
+      }
+      return new URL(selected, transport.baseUrl).toString();
+    }
+    // A configured baseUrl wins and short-circuits: an unresolved `{placeholder}` in the server URL
+    // is moot because the server URL is discarded. Only when nothing overrides it does an unresolved
+    // variable make the operation URL unusable, so the throw follows the fallback rather than
+    // preceding it.
+    if (transport.baseUrl !== undefined) {
+      return transport.baseUrl;
+    }
+    if (/\{[^{}]+\}/u.test(selected)) {
+      throw new TypeError('a server variable is unresolved');
+    }
+    return selected;
+  }
   let resolved = transport.baseUrl;
   if (resolved === undefined) {
     if (descriptor.baseUrl.kind === 'runtime') {
       throw new TypeError('no absolute base URL resolved for the operation');
     }
-    if (descriptor.baseUrl.kind === 'literal') {
-      resolved = descriptor.baseUrl.value;
-    } else {
-      const server = descriptor.baseUrl.servers[descriptor.baseUrl.index];
-      if (server === undefined) {
-        throw new TypeError('the configured server index did not resolve');
-      }
-      resolved = server.url;
-      for (const [name, declaredDefault] of server.variables) {
-        const value = transport.serverVariables?.[name] ?? declaredDefault;
-        resolved = resolved.replaceAll(`{${name}}`, value);
-      }
-      if (/\{[^{}]+\}/u.test(resolved)) {
-        throw new TypeError('a server variable is unresolved');
-      }
-    }
+    resolved = descriptor.baseUrl.value;
   }
   if (!URL.canParse(resolved)) {
     throw new TypeError('the resolved base URL is not absolute');
@@ -743,12 +797,18 @@ function findParamPlan(
 }
 
 function serializedParam(plan: ParamPlan, input: Readonly<Record<string, unknown>>): string | null {
-  const value = input[plan.name];
+  const group = input[plan.location];
+  const value = isRecord(group) ? group[plan.name] : undefined;
   if (value === undefined) {
     if (plan.required) {
       throw new TypeError(`required parameter ${plan.name} is missing`);
     }
     return null;
+  }
+  if ('content' in plan) {
+    // A content JSON parameter serializes the raw typed value; its serializer owns stringification,
+    // so the flat-`ParamValue` guard does not apply.
+    return plan.serialize(plan.name, value, plan.allowReserved);
   }
   if (!isParamValue(value)) {
     throw new TypeError(`parameter ${plan.name} has an unsupported value`);
@@ -805,6 +865,60 @@ function sameParameters(left: ParsedMediaType, right: ParsedMediaType): boolean 
     ([name, value], index) =>
       right.parameters[index]?.[0] === name && right.parameters[index]?.[1] === value,
   );
+}
+
+// RFC 9110 §12.5.1 media-range specificity, used to classify a received response Content-Type
+// against declared response keys: only the most specific applicable key is chosen. A concrete
+// `type/subtype` whose parameters are all present in the received type outranks a bare
+// `type/subtype`, which outranks a `type/*` range, which outranks `*/*`; among concrete keys, more
+// matched parameters is more specific. This subset rule (declared parameters ⊆ received) is what
+// lets a bare `application/json` still match a `application/json; charset=utf-8` response while
+// `application/json;stream=watch` selects over it for a watch stream. Requests use exact matching
+// instead (`selectedMediaType`): the caller picks the wire media type, so it must equal a declared
+// key. Parameter names compare case-insensitively and values byte-for-byte — `parseMediaType`
+// already lower-cases names (and the charset value), so the stored pairs compare directly. Returns a
+// specificity score (higher = more specific) or -1 when the declared key does not apply.
+function mediaSpecificity(declared: ParsedMediaType, actual: ParsedMediaType): number {
+  if (declared.type === '*' && declared.subtype === '*') {
+    return declared.parameters.length === 0 ? 0 : -1;
+  }
+  if (declared.subtype === '*') {
+    return declared.type === actual.type && declared.parameters.length === 0 ? 1 : -1;
+  }
+  if (declared.type !== actual.type || declared.subtype !== actual.subtype) {
+    return -1;
+  }
+  for (const [name, value] of declared.parameters) {
+    const found = actual.parameters.find(([candidate]) => candidate === name);
+    if (found === undefined || found[1] !== value) {
+      return -1;
+    }
+  }
+  // A concrete type/subtype outranks every range; a matched parameter makes it more specific still.
+  return 2 + declared.parameters.length;
+}
+
+// Index of the most specific declared key applicable to `actual`, or -1 when none applies. Equal
+// specificity breaks by canonical byte order (declared keys are ASCII canonical media types), so the
+// choice is deterministic regardless of the order the keys were declared in.
+function mostSpecificMedia(actual: ParsedMediaType, declared: readonly string[]): number {
+  let best = -1;
+  let bestScore = -1;
+  for (const [index, key] of declared.entries()) {
+    const parsed = parseMediaType(key);
+    if (parsed === null) {
+      continue;
+    }
+    const score = mediaSpecificity(parsed, actual);
+    if (score < 0) {
+      continue;
+    }
+    if (score > bestScore || (score === bestScore && key < declared[best])) {
+      best = index;
+      bestScore = score;
+    }
+  }
+  return best;
 }
 
 function selectedMediaType(
@@ -928,45 +1042,8 @@ function multipartWrapper(value: unknown): MultipartWrapper {
   return {
     body: value.body,
     contentType: value.contentType,
-    headers: value.headers,
     filename: value.filename,
   };
-}
-
-function multipartHeaders(value: unknown): readonly (readonly [string, string])[] | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (!isRecord(value)) {
-    throw new TypeError('multipart wrapper headers must be an object');
-  }
-  const headers: (readonly [string, string])[] = [];
-  for (const [name, headerValue] of Object.entries(value)) {
-    if (typeof headerValue !== 'string') {
-      throw new TypeError(`multipart header ${name} must be a string`);
-    }
-    headers.push([name, headerValue]);
-  }
-  return headers;
-}
-
-function checkCallerCte(
-  headers: readonly (readonly [string, string])[] | undefined,
-  payload: Uint8Array,
-): void {
-  for (const [name, value] of headers ?? []) {
-    if (name.toLowerCase() !== 'content-transfer-encoding') {
-      continue;
-    }
-    if (value !== '7bit' && value !== '8bit' && value !== 'binary') {
-      throw new EncodeError(`multipart Content-Transfer-Encoding ${value} is not admitted`);
-    }
-    if (!checkCteDomain(value, payload)) {
-      throw new EncodeError(
-        `multipart payload violates the ${value} Content-Transfer-Encoding domain`,
-      );
-    }
-  }
 }
 
 function blobFilename(value: unknown): string | undefined {
@@ -999,22 +1076,34 @@ async function multipartPayload(kind: MultipartFieldPlan['payload'], value: unkn
   return UTF8_ENCODER.encode(json);
 }
 
-function multipartContentType(
+// Resolves the part Content-Type and the body payload kind from one media selection so they can
+// never disagree. A wrapped part admits caller media selection; the payload kind must follow the
+// selected admitted index, not payloads[0] — otherwise a non-first selection stamps the selected
+// media on a body serialized with the first kind.
+function multipartMedia(
   plan: MultipartFieldPlan,
   selected: unknown,
-): string | undefined {
+): { readonly contentType: string | undefined; readonly payload: MultipartFieldPlan['payload'] } {
   if (plan.contentType.kind === 'none') {
-    return undefined;
+    return { contentType: undefined, payload: plan.payload };
   }
   if (!plan.wrapper) {
     if (plan.contentType.kind === 'selected') {
       throw new TypeError('selected multipart media requires a wrapper');
     }
-    return plan.contentType.value;
+    return { contentType: plan.contentType.value, payload: plan.payload };
   }
   const admitted =
     plan.contentType.kind === 'fixed' ? [plan.contentType.value] : plan.contentType.admitted;
-  return selectedMediaType(selected, admitted).concrete;
+  const chosen = selectedMediaType(selected, admitted);
+  // `payloads` is absent only for the fixed single-media wrapper case, which has one payload kind.
+  const payload = plan.payloads === undefined ? plan.payload : plan.payloads[chosen.index];
+  if (payload === undefined) {
+    throw new TypeError(
+      `multipart field ${plan.name} has no payload kind for the selected media type`,
+    );
+  }
+  return { contentType: chosen.concrete, payload };
 }
 
 async function multipartPart(plan: MultipartFieldPlan, value: unknown): Promise<MultipartPart> {
@@ -1030,16 +1119,13 @@ async function multipartPart(plan: MultipartFieldPlan, value: unknown): Promise<
   if (selectedFilename !== undefined && typeof selectedFilename !== 'string') {
     throw new TypeError(`multipart field ${plan.name} filename must be a string`);
   }
-  const payload = await multipartPayload(plan.payload, body);
-  const extraHeaders = multipartHeaders(wrapper?.headers);
-  checkCallerCte(extraHeaders, payload);
+  const media = multipartMedia(plan, wrapper?.contentType);
+  const payload = await multipartPayload(media.payload, body);
   return {
     name: plan.name,
     payload,
-    contentType: multipartContentType(plan, wrapper?.contentType),
+    contentType: media.contentType,
     filename: plan.filename ? selectedFilename ?? blobFilename(body) : undefined,
-    extraHeaders,
-    cte: plan.cte,
   };
 }
 
@@ -1298,25 +1384,11 @@ function selectedResponseMedia(
   if (actual === null || actual.type === '*' || actual.subtype === '*') {
     return null;
   }
-  for (const tier of ['exact', 'range', 'any'] as const) {
-    for (const entry of media) {
-      const declared = parseMediaType(entry[0]);
-      if (declared === null) {
-        continue;
-      }
-      const exact = declared.type === actual.type && declared.subtype === actual.subtype;
-      const range = declared.type === actual.type && declared.subtype === '*';
-      const any = declared.type === '*' && declared.subtype === '*';
-      if (
-        (tier === 'exact' && exact) ||
-        (tier === 'range' && range) ||
-        (tier === 'any' && any)
-      ) {
-        return entry;
-      }
-    }
-  }
-  return null;
+  const index = mostSpecificMedia(
+    actual,
+    media.map((entry) => entry[0]),
+  );
+  return index < 0 ? null : media[index];
 }
 
 async function decodedBody(
@@ -1567,6 +1639,140 @@ async function assembleResponse(
   }
 }
 
+// Cookie parameters (OAS 3.1 §4.8, `in: cookie`) are operation-owned: each serializes to one
+// `name=value` cookie-pair (RFC 6265 §4.1.1) and they join, in declared order, into a single Cookie
+// header. They are assembled outside `mergedHeaders` — the caller-header validation path that
+// forbids a caller/middleware-injected Cookie — so the operation's own Cookie stays exempt while a
+// caller's stays rejected. `serialized` is the wire pair; `name` is the declared parameter name,
+// surfaced in the unsendable failure.
+type CookieParam = { readonly name: string; readonly serialized: string };
+
+function operationCookieParams(
+  descriptor: OperationDescriptor,
+  input: Readonly<Record<string, unknown>>,
+): readonly CookieParam[] {
+  const cookies: CookieParam[] = [];
+  for (const plan of descriptor.params) {
+    if (plan.location !== 'cookie') {
+      continue;
+    }
+    const serialized = serializedParam(plan, input);
+    if (serialized !== null) {
+      cookies.push({ name: plan.name, serialized });
+    }
+  }
+  return cookies;
+}
+
+type CookieJar = { cookie: string };
+
+function isCookieJar(value: unknown): value is CookieJar {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'cookie' in value &&
+    typeof value.cookie === 'string'
+  );
+}
+
+function readOrigin(value: unknown): string | null {
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    'origin' in value &&
+    typeof value.origin === 'string'
+  ) {
+    return value.origin;
+  }
+  return null;
+}
+
+// Reflect.get returns `any`; the `unknown` return type contains it so no `any` escapes into the
+// guards. `document`/`location` are absent from the Node lib typings, so they are read this way.
+function ambientGlobal(key: string): unknown {
+  return Reflect.get(globalThis, key);
+}
+
+function sameOriginCookieJar(requestUrl: string): CookieJar | null {
+  const documentValue = ambientGlobal('document');
+  if (!isCookieJar(documentValue)) {
+    return null;
+  }
+  const origin = readOrigin(ambientGlobal('location'));
+  if (origin === null || origin !== new URL(requestUrl).origin) {
+    return null;
+  }
+  return documentValue;
+}
+
+function readCookieValue(jarText: string, name: string): string | null {
+  const prefix = `${name}=`;
+  for (const entry of jarText.split('; ')) {
+    if (entry.startsWith(prefix)) {
+      return entry.slice(prefix.length);
+    }
+  }
+  return null;
+}
+
+// Writes each cookie-pair into the document jar and reads it back; a browser silently rejects a
+// cookie it will not store (e.g. a disallowed name), so the round-trip is the only proof it took.
+function writeVerifiedCookies(jar: CookieJar, cookies: readonly CookieParam[]): boolean {
+  for (const cookie of cookies) {
+    // Explicit `path=/` scopes the cookie to the whole origin. A bare `name=value` inherits the
+    // document's default path (RFC 6265 §5.1.4), which can exclude the API route even though the
+    // read-back below — resolved against the document URL — still verifies.
+    jar.cookie = `${cookie.serialized}; path=/`;
+    const separator = cookie.serialized.indexOf('=');
+    const name = cookie.serialized.slice(0, separator);
+    const value = cookie.serialized.slice(separator + 1);
+    if (readCookieValue(jar.cookie, name) !== value) {
+      return false;
+    }
+  }
+  return true;
+}
+
+type CookieRequestPlan =
+  | { readonly kind: 'request'; readonly request: Request }
+  | {
+      readonly kind: 'failure';
+      readonly result: Extract<ExecutionResult, { readonly kind: 'request-failure' }>;
+    };
+
+function cookieUnsendableResult(
+  names: readonly string[],
+): Extract<ExecutionResult, { readonly kind: 'request-failure' }> {
+  return {
+    kind: 'request-failure',
+    ok: false,
+    match: null,
+    status: null,
+    error: { kind: 'cookie-params-unsendable', names },
+  };
+}
+
+// Layered cookie-delivery guard. It never dispatches and never sniffs the user agent: it builds the
+// actual Request, inspects it, and returns the request to send or a failure. Layer 1 — Node/undici
+// keeps the Cookie header, so send the probe. Layer 2 — a browser strips
+// it (WHATWG Fetch forbidden request-header), so a same-origin document jar carries the cookies, but
+// only when the request's credentials mode lets the browser attach them: `omit` attaches nothing,
+// so a jar read-back would falsely verify a cookie the browser will silently drop. Layer 3 — neither
+// path can deliver the declared cookies, so fail loudly rather than drop API surface.
+function prepareCookieRequest(request: Request, cookies: readonly CookieParam[]): CookieRequestPlan {
+  const headers = new Headers(request.headers);
+  headers.set('cookie', cookies.map((cookie) => cookie.serialized).join('; '));
+  const probe = new Request(request, { headers });
+  if (probe.headers.get('cookie') !== null) {
+    return { kind: 'request', request: probe };
+  }
+  const jar = sameOriginCookieJar(request.url);
+  if (jar !== null && request.credentials !== 'omit' && writeVerifiedCookies(jar, cookies)) {
+    return { kind: 'request', request: probe };
+  }
+  return { kind: 'failure', result: cookieUnsendableResult(cookies.map((cookie) => cookie.name)) };
+}
+
 export function execute<Result extends ExecutionResult, S extends string = never>(
   transport: Transport<S>,
   descriptor: OperationDescriptor,
@@ -1605,6 +1811,7 @@ export async function execute<S extends string = never>(
   let finalRequest: Request;
   let sidecar: Readonly<Record<string, unknown>>;
   let context: OperationContext;
+  let cookies: readonly CookieParam[];
   try {
     const serialized = await serializeBody(descriptor.body, input.body);
     const headers = mergedHeaders(
@@ -1615,6 +1822,7 @@ export async function execute<S extends string = never>(
       serialized.contentType,
       serializedAuth.headers,
     );
+    cookies = operationCookieParams(descriptor, input);
     const splitOptions = fetchOptions(transport, descriptor, options);
     sidecar = splitOptions.sidecar;
     finalRequest = new Request(url, {
@@ -1658,9 +1866,29 @@ export async function execute<S extends string = never>(
   if (finalRequest.signal.aborted) {
     return abortedRequest(finalRequest.signal.reason);
   }
+  // The operation Cookie is attached here — after middleware header validation — so it is exempt
+  // from the forbidden-header check while a caller-injected Cookie stays rejected. The guard builds
+  // a fresh Request; probing it disturbs finalRequest's body, so the probe is what gets dispatched.
+  let requestToDispatch = finalRequest;
+  if (cookies.length !== 0) {
+    let plan: CookieRequestPlan;
+    try {
+      plan = prepareCookieRequest(finalRequest, cookies);
+    } catch (cause) {
+      // prepareCookieRequest reconstructs the Request (a body-consuming middleware turns that into a
+      // TypeError) and touches document.cookie (a hostile getter/setter throws SecurityError). Either
+      // would escape the never-throws contract, so map it to the encode-failure shape like the
+      // sibling body-serialization and middleware stages.
+      return encodeFailure(cause);
+    }
+    if (plan.kind === 'failure') {
+      return plan.result;
+    }
+    requestToDispatch = plan.request;
+  }
   let fetchedResponse: Response;
   try {
-    fetchedResponse = await (transport.fetch ?? globalThis.fetch)(finalRequest, sidecar);
+    fetchedResponse = await (transport.fetch ?? globalThis.fetch)(requestToDispatch, sidecar);
   } catch (cause) {
     if (finalRequest.signal.aborted) {
       return abortedRequest(finalRequest.signal.reason);

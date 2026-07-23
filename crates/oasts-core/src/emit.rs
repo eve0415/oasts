@@ -26,6 +26,7 @@ use crate::ir::{
     Operation, Param, ParamLocation, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader,
     ResponseStatus, SchemaDocs, SchemaNode, SchemaRef, SourceRef, TupleRest, finite_parts,
 };
+use crate::media::is_json;
 use crate::num::{first_number_outside_binary64, render_number_value};
 use crate::semantic::{
     AllocatedCallbackName, AllocatedSchemaName, Analyzed, CallbackParent, EnumMember, ResolvedLink,
@@ -2051,13 +2052,13 @@ impl Emitter<'_, '_, '_> {
         }
         if let Some(body) = &operation.request_body
             && let Some(media_type) = select_request_media(&body.media_types)
-            && media_is_json(&media_type.name)
+            && is_json(&media_type.essence)
         {
             self.collect_operation_imports(&media_type.schema, TypePosition::Request, &mut imports);
         }
         for response in &operation.responses {
             for media_type in &response.media_types {
-                if media_is_json(&media_type.name) {
+                if is_json(&media_type.essence) {
                     self.collect_operation_imports(
                         &media_type.schema,
                         TypePosition::Response,
@@ -2206,7 +2207,13 @@ impl Emitter<'_, '_, '_> {
                 output.push('?');
             }
             output.push_str(": ");
-            output.push_str(&self.render_type(&header.schema, TypePosition::Response, 2));
+            if crate::client_model::response_header_is_opaque_string(header) {
+                // A content-sourced non-JSON header carries an opaque wire string; only JSON-family
+                // and schema+style headers render their typed schema.
+                output.push_str("string");
+            } else {
+                output.push_str(&self.render_type(&header.schema, TypePosition::Response, 2));
+            }
             output.push_str(";\n");
         }
         output.push_str("}\n\n");
@@ -2340,9 +2347,9 @@ impl Emitter<'_, '_, '_> {
         media_type: &crate::ir::MediaType,
         position: TypePosition,
     ) -> String {
-        if media_is_json(&media_type.name) {
+        if is_json(&media_type.essence) {
             self.render_type(&media_type.schema, position, 0)
-        } else if media_type.name.starts_with("text/") {
+        } else if media_type.essence.starts_with("text/") {
             "string".to_owned()
         } else {
             // Binary and custom media stay unknown in the types-only artifact;
@@ -2411,16 +2418,12 @@ pub(super) fn callback_parent_operation<'ir>(
 fn select_request_media(media_types: &[crate::ir::MediaType]) -> Option<&crate::ir::MediaType> {
     media_types
         .iter()
-        .find(|media_type| media_is_json(&media_type.name))
+        .find(|media_type| is_json(&media_type.essence))
         .or_else(|| media_types.first())
 }
 
-pub(super) fn media_is_json(name: &str) -> bool {
-    name == "application/json" || name.ends_with("+json")
-}
-
 fn media_is_unknown(name: &str) -> bool {
-    !media_is_json(name) && !name.starts_with("text/")
+    !is_json(name) && !name.starts_with("text/")
 }
 
 pub(super) fn response_status_type_suffix(status: &ResponseStatus) -> String {
@@ -2846,20 +2849,20 @@ fn write_operation_tsdoc(
         let mut media_notes = Vec::new();
         if let Some(body) = &operation.request_body
             && let Some(media_type) = select_request_media(&body.media_types)
-            && media_is_unknown(&media_type.name)
+            && media_is_unknown(&media_type.essence)
         {
             media_notes.push(format!(
                 "- request body {}: represented as unknown in the types artifact.",
-                media_type.name
+                media_type.essence
             ));
         }
         for response in &operation.responses {
             for media_type in &response.media_types {
-                if media_is_unknown(&media_type.name) {
+                if media_is_unknown(&media_type.essence) {
                     media_notes.push(format!(
                         "- response {} {}: represented as unknown in the types artifact.",
                         response_status_label(&response.status),
-                        media_type.name
+                        media_type.essence
                     ));
                 }
             }
@@ -2977,13 +2980,13 @@ pub(super) fn write_client_operation_tsdoc(
 fn push_media_examples(examples: &mut Vec<DocExample>, media_type: &MediaType, source: &str) {
     for (label, value) in &media_type.examples {
         examples.push(DocExample {
-            label: Some(format!("Source: {source} {label} ({})", media_type.name)),
+            label: Some(format!("Source: {source} {label} ({})", media_type.essence)),
             value: value.clone(),
         });
     }
     for value in &media_type.schema.meta().docs.examples {
         examples.push(DocExample {
-            label: Some(format!("Source: {source} ({})", media_type.name)),
+            label: Some(format!("Source: {source} ({})", media_type.essence)),
             value: value.clone(),
         });
     }
@@ -4685,6 +4688,7 @@ mod tests {
                 deprecated: false,
                 description: Some("Optional filter.".to_owned()),
                 schema: primitive(PrimitiveType::Boolean, "/parameter/filter"),
+                content_media_type: None,
                 style: None,
                 explode: None,
                 allow_reserved: false,
@@ -4694,7 +4698,9 @@ mod tests {
                 required: false,
                 description: Some("Opaque body.".to_owned()),
                 media_types: vec![MediaType {
-                    name: "application/octet-stream".to_owned(),
+                    essence: "application/octet-stream".to_owned(),
+                    full: "application/octet-stream".to_owned(),
+                    range_kind: crate::media::MediaRangeKind::Concrete,
                     raw_name: String::new(),
                     schema: request_schema,
                     schema_present: true,
@@ -4711,7 +4717,9 @@ mod tests {
                     status: ResponseStatus::Exact("200".to_owned()),
                     description: "Opaque response.".to_owned(),
                     media_types: vec![MediaType {
-                        name: "application/octet-stream".to_owned(),
+                        essence: "application/octet-stream".to_owned(),
+                        full: "application/octet-stream".to_owned(),
+                        range_kind: crate::media::MediaRangeKind::Concrete,
                         raw_name: String::new(),
                         schema: response_schema,
                         schema_present: true,
@@ -6282,6 +6290,67 @@ mod tests {
         ] {
             assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
         }
+    }
+
+    #[test]
+    fn content_response_headers_type_by_media_family() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/items": {
+                    "get": {
+                        "operationId": "listItems",
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": { "application/json": { "schema": { "type": "string" } } },
+                                "headers": {
+                                    "X-Json": {
+                                        "required": true,
+                                        "content": { "application/json": { "schema": {
+                                            "type": "object",
+                                            "properties": { "label": { "type": "string" } },
+                                            "required": ["label"]
+                                        } } }
+                                    },
+                                    "X-Xml": {
+                                        "content": { "application/xml": { "schema": { "type": "object" } } }
+                                    },
+                                    "X-Plain": { "schema": { "type": "integer" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let operation = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("listitems.ts"))
+            .expect("operation file");
+        let body = generated_body(operation);
+        // A JSON-family content header keeps its typed schema (the declared object shape).
+        assert!(
+            body.contains("\"X-Json\": {"),
+            "X-Json must stay typed:\n{body}"
+        );
+        assert!(
+            body.contains("label"),
+            "X-Json object property missing:\n{body}"
+        );
+        // A non-JSON content header collapses to a bare wire string.
+        assert!(
+            body.contains("\"X-Xml\"?: string;"),
+            "X-Xml must be a plain string:\n{body}"
+        );
+        // A schema+style header is unaffected and stays typed.
+        assert!(
+            body.contains("\"X-Plain\"?: number;"),
+            "X-Plain must stay typed:\n{body}"
+        );
     }
 
     #[test]

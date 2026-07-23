@@ -22,6 +22,21 @@ paths:
       responses:
         '200':
           description: The created pet.
+          headers:
+            X-Pet-Meta:
+              description: >-
+                A JSON-family content header: its wire value is JSON text, so
+                the validator parses it before checking the object schema.
+              required: true
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    required:
+                      - source
+                    properties:
+                      source:
+                        type: string
           content:
             application/json:
               schema:

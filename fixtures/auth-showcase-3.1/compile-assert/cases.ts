@@ -16,7 +16,7 @@
 //
 // Typechecked after the emitter generates the sibling `../generated` tree.
 
-import type { Transport } from "../generated/runtime/transport.js";
+import { AmbientClientCertificate, type Transport } from "../generated/runtime/transport.js";
 import {
   inheritedRootOnly,
   inheritedRootOnlyOrThrow,
@@ -30,6 +30,9 @@ import { unsecured } from "../generated/client/operations/unsecured.js";
 import { sameKindOr } from "../generated/client/operations/samekindor.js";
 import { queryKeyOp } from "../generated/client/operations/querykeyop.js";
 import { cookieKeyOp } from "../generated/client/operations/cookiekeyop.js";
+import { digestAuthOp } from "../generated/client/operations/digestauthop.js";
+import { mutualTlsOp } from "../generated/client/operations/mutualtlsop.js";
+import { cookieParamOp } from "../generated/client/operations/cookieparamop.js";
 
 // Transports typed by the union of scheme names they were configured with.
 declare const tBearer: Transport<"bearerAuth">;
@@ -42,6 +45,8 @@ declare const tBearerAlt: Transport<"bearerAlt">;
 declare const tBearerQuery: Transport<"bearerAuth" | "queryKey">;
 declare const tWide: Transport<string>;
 declare const tCookie: Transport<"cookieKey">;
+declare const tDigestAuth: Transport<"digestAuth">;
+declare const tMutualTls: Transport<"mutualTls">;
 
 // 1. Inherited root requirement, proven by S: options omitted.
 export function inheritedSatisfied(): void {
@@ -135,4 +140,26 @@ export function orThrowParity(): void {
   inheritedRootOnlyOrThrow(tBearer, {});
   // @ts-expect-error S=never proves no alternative for the OrThrow variant either.
   inheritedRootOnlyOrThrow(tNever, {});
+}
+
+// 14. Generalized HTTP scheme (any registered `type: http` scheme beyond basic/bearer) proven by
+// S; unproven requires a `{ credentials }` object matching the scheme's own grammar.
+export function httpSchemeAlternatives(): void {
+  digestAuthOp(tDigestAuth, {});
+  // @ts-expect-error S=never proves no alternative, so the options element is required.
+  digestAuthOp(tNever, {});
+  digestAuthOp(tNever, {}, { auth: { digestAuth: { credentials: "proof" } } });
+}
+
+// 15. Mutual TLS proven by S; unproven requires the ambient client-certificate credential.
+export function mutualTlsAlternatives(): void {
+  mutualTlsOp(tMutualTls, {});
+  // @ts-expect-error S=never proves no alternative, so the options element is required.
+  mutualTlsOp(tNever, {});
+  mutualTlsOp(tNever, {}, { auth: { mutualTls: AmbientClientCertificate } });
+}
+
+// 16. Cookie-parameter operation: input carries a `cookie` group alongside the auth requirement.
+export function cookieParameterInput(): void {
+  cookieParamOp(tBearer, { cookie: { consent: "yes" } });
 }

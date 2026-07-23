@@ -180,6 +180,20 @@ function serializeDelimitedQueryValue(
     .join(separator)}`;
 }
 
+function serializeDelimitedObjectValue(
+  name: string,
+  value: Readonly<Record<string, ParamPrimitive>>,
+  separator: "%20" | "%7C",
+  allowReserved: boolean,
+): string {
+  return `${renderName(name)}=${Object.entries(value)
+    .flatMap(([key, item]) => [
+      renderComponent(key, allowReserved),
+      renderPrimitive(item, allowReserved),
+    ])
+    .join(separator)}`;
+}
+
 function serializeDeepObjectValue(
   name: string,
   value: Readonly<Record<string, ParamPrimitive>>,
@@ -192,6 +206,18 @@ function serializeDeepObjectValue(
         `${encodedName}[${renderComponent(key, allowReserved)}]=${renderPrimitive(item, allowReserved)}`,
     )
     .join("&");
+}
+
+// The JSON text a content-sourced parameter (OpenAPI Parameter Object `content` with a JSON-family
+// media type) puts on the wire before location encoding. `JSON.stringify` returns `undefined` for a
+// value it cannot represent (a function, a symbol, or bare `undefined`); the caller-facing types
+// never admit those, but the guard turns a would-be `undefined` wire value into a clear failure.
+function contentJsonString(value: unknown): string {
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) {
+    throw new TypeError("content parameter value is not JSON-serializable");
+  }
+  return serialized;
 }
 
 function consumeToken(input: string, start: number): number {
@@ -225,43 +251,6 @@ function compareAsciiBytes(left: string, right: string): number {
   return left.length - right.length;
 }
 
-function isCteDomain(
-  encoding: "7bit" | "8bit" | "binary",
-  bytes: Uint8Array,
-): boolean {
-  if (encoding === "binary") {
-    return true;
-  }
-
-  let lineLength = 0;
-  for (let index = 0; index < bytes.length; index += 1) {
-    const byte = bytes[index];
-    if (encoding === "7bit" && byte > 0x7f) {
-      return false;
-    }
-    if (byte === 0x00) {
-      return false;
-    }
-    if (byte === 0x0d) {
-      if (bytes[index + 1] !== 0x0a) {
-        return false;
-      }
-      lineLength = 0;
-      index += 1;
-      continue;
-    }
-    if (byte === 0x0a) {
-      return false;
-    }
-    lineLength += 1;
-    if (lineLength > 998) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
 function escapeMultipartName(name: string): string {
   for (const byte of UTF8_ENCODER.encode(name)) {
     if (byte < 0x20 || byte === 0x7f) {
@@ -270,14 +259,6 @@ function escapeMultipartName(name: string): string {
   }
 
   return name.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
-}
-
-function assertMultipartHeaderText(value: string, field: string): void {
-  for (const byte of UTF8_ENCODER.encode(value)) {
-    if (byte < 0x20 || byte === 0x7f) {
-      throw new EncodeError(`multipart header ${field} contains a control byte`);
-    }
-  }
 }
 
 function encodeMultipartFilenameValue(filename: string): string {
@@ -301,12 +282,39 @@ function encodeMultipartFilenameValue(filename: string): string {
 }
 //#endregion
 
-//#region oxs:helper:cte-check
-export function checkCteDomain(
-  encoding: "7bit" | "8bit" | "binary",
-  bytes: Uint8Array,
-): boolean {
-  return isCteDomain(encoding, bytes);
+//#region oxs:helper:content-json-header
+export function serializeContentJsonHeader(
+  _name: string,
+  value: unknown,
+  _allowReserved: boolean,
+): string {
+  // Content JSON header parameter: the JSON text is the simple-style header value, emitted verbatim
+  // with no component encoding (the `null` policy).
+  return serializeSimpleValue(contentJsonString(value), false, null);
+}
+//#endregion
+
+//#region oxs:helper:content-json-path
+export function serializeContentJsonPath(
+  _name: string,
+  value: unknown,
+  _allowReserved: boolean,
+): string {
+  // Content JSON path parameter: the JSON text is percent-encoded as a single path segment (the
+  // simple-style `false` policy), with no name prefix.
+  return serializeSimpleValue(contentJsonString(value), false, false);
+}
+//#endregion
+
+//#region oxs:helper:content-json-query
+export function serializeContentJsonQuery(
+  name: string,
+  value: unknown,
+  _allowReserved: boolean,
+): string {
+  // Content JSON query parameter: the JSON text becomes one `name=value` pair whose value takes the
+  // component encoding form query values use.
+  return serializeQueryFormValue(name, contentJsonString(value), false, false);
 }
 //#endregion
 
@@ -524,8 +532,6 @@ export type MultipartPart = {
   readonly payload: Uint8Array;
   readonly contentType?: string;
   readonly filename?: string;
-  readonly extraHeaders?: readonly (readonly [string, string])[];
-  readonly cte?: "7bit" | "8bit" | "binary";
 };
 
 export type MultipartBody = {
@@ -552,12 +558,6 @@ function concatMultipartBytes(
 }
 
 function buildEncapsulatedPart(part: MultipartPart): Uint8Array {
-  if (part.cte !== undefined && !isCteDomain(part.cte, part.payload)) {
-    throw new EncodeError(
-      `multipart payload violates the ${part.cte} Content-Transfer-Encoding domain`,
-    );
-  }
-
   let contentDisposition =
     `Content-Disposition: form-data; name="${escapeMultipartName(part.name)}"`;
   if (part.filename !== undefined) {
@@ -568,14 +568,6 @@ function buildEncapsulatedPart(part: MultipartPart): Uint8Array {
   const headerLines = [contentDisposition];
   if (part.contentType !== undefined) {
     headerLines.push(`Content-Type: ${part.contentType}`);
-  }
-  for (const [name, value] of part.extraHeaders ?? []) {
-    assertMultipartHeaderText(name, "name");
-    assertMultipartHeaderText(value, "value");
-    headerLines.push(`${name}: ${value}`);
-  }
-  if (part.cte !== undefined) {
-    headerLines.push(`Content-Transfer-Encoding: ${part.cte}`);
   }
 
   return concatMultipartBytes([
@@ -788,6 +780,16 @@ export function serializeQueryPipeDelimited(
 }
 //#endregion
 
+//#region oxs:helper:query-pipe-delimited-object
+export function serializeQueryPipeDelimitedObject(
+  name: string,
+  value: Readonly<Record<string, ParamPrimitive>>,
+  allowReserved: boolean,
+): string {
+  return serializeDelimitedObjectValue(name, value, "%7C", allowReserved);
+}
+//#endregion
+
 //#region oxs:helper:query-space-delimited
 export function serializeQuerySpaceDelimited(
   name: string,
@@ -795,5 +797,15 @@ export function serializeQuerySpaceDelimited(
   allowReserved: boolean,
 ): string {
   return serializeDelimitedQueryValue(name, value, "%20", allowReserved);
+}
+//#endregion
+
+//#region oxs:helper:query-space-delimited-object
+export function serializeQuerySpaceDelimitedObject(
+  name: string,
+  value: Readonly<Record<string, ParamPrimitive>>,
+  allowReserved: boolean,
+): string {
+  return serializeDelimitedObjectValue(name, value, "%20", allowReserved);
 }
 //#endregion

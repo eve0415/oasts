@@ -15,7 +15,8 @@ export type RequestFailure =
   | { kind: 'request-encode'; message: string; cause?: unknown }
   | { kind: 'request-validation'; issues: readonly StandardSchemaV1.Issue[] }
   | { kind: 'request-transform'; error: TransformError }
-  | { kind: 'request-middleware'; cause: unknown };
+  | { kind: 'request-middleware'; cause: unknown }
+  | { kind: 'cookie-params-unsendable'; names: readonly string[] };
 
 export type ResponseFailure =
   | { kind: 'aborted'; reason: unknown }

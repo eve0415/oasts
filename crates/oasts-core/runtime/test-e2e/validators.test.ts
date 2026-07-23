@@ -105,7 +105,7 @@ test("an out-of-range request value fails as request-validation before any fetch
   // maxDepth 0 is below its minimum; nodeId is valid, so exactly one issue is collected and the
   // wrapper returns the request-failure branch without dispatching.
   const result = requiredRecord(
-    await getTree(transport(), { nodeId: NODE_ID, maxDepth: 0 }),
+    await getTree(transport(), { path: { nodeId: NODE_ID }, query: { maxDepth: 0 } }),
     "getTree request-validation result",
   );
   assert.equal(result.kind, "request-failure");
@@ -150,7 +150,7 @@ test("a valid round-trip returns ok with the served body", async () => {
     body: Buffer.from(JSON.stringify(served)),
   });
   const result = requiredRecord(
-    await getTree(transport(), { nodeId: NODE_ID }),
+    await getTree(transport(), { path: { nodeId: NODE_ID } }),
     "getTree ok result",
   );
   assert.equal(result.kind, "response");
@@ -164,7 +164,7 @@ test("the orThrow variant throws ApiError carrying the request-validation failur
   // orThrow delegates to the validated base function and unwraps, so a request-validation failure
   // throws ApiError whose preserved result is the same request-failure branch — and still no fetch.
   await assert.rejects(
-    async () => getTreeOrThrow(transport(), { nodeId: NODE_ID, maxDepth: 0 }),
+    async () => getTreeOrThrow(transport(), { path: { nodeId: NODE_ID }, query: { maxDepth: 0 } }),
     (error: unknown) => {
       assert.ok(error instanceof Error);
       assert.ok(error instanceof ApiError);

@@ -105,6 +105,48 @@ paths:
             application/json:
               schema:
                 type: object
+  /digest-auth:
+    get:
+      operationId: digestAuthOp
+      security:
+        - digestAuth: []
+      responses:
+        '200':
+          description: A JSON object.
+          content:
+            application/json:
+              schema:
+                type: object
+  /mutual-tls:
+    get:
+      operationId: mutualTlsOp
+      security:
+        - mutualTls: []
+      responses:
+        '200':
+          description: A JSON object.
+          content:
+            application/json:
+              schema:
+                type: object
+  /cookie-param:
+    get:
+      operationId: cookieParamOp
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: consent
+          in: cookie
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: A JSON object.
+          content:
+            application/json:
+              schema:
+                type: object
 components:
   securitySchemes:
     basicAuth:
@@ -138,3 +180,8 @@ components:
     oidc:
       type: openIdConnect
       openIdConnectUrl: https://auth.api.example.test/.well-known/openid-configuration
+    digestAuth:
+      type: http
+      scheme: digest
+    mutualTls:
+      type: mutualTLS

@@ -301,6 +301,93 @@ paths:
             text/*:
               schema:
                 type: string
+  /cookies:
+    get:
+      operationId: readCookiesShowcase
+      summary: Read a resource carrying cookie parameters.
+      parameters:
+        - name: session
+          in: cookie
+          required: true
+          schema:
+            type: string
+        - name: prefs
+          in: cookie
+          required: false
+          schema:
+            type: array
+            items:
+              type: string
+      responses:
+        '204':
+          description: The cookies were accepted with no response body.
+  /content/{ref}:
+    get:
+      operationId: contentShowcase
+      summary: Parameters and a response header carried as JSON content by media type.
+      parameters:
+        - name: ref
+          in: path
+          required: true
+          description: A path segment serialized from a JSON content schema.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+        - name: filter
+          in: query
+          description: A query value serialized as percent-encoded JSON.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: array
+                    items:
+                      type: string
+        - name: X-Ctx
+          in: header
+          description: A simple header carrying verbatim JSON.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant:
+                    type: string
+        - name: pref
+          in: cookie
+          description: A cookie value serialized as percent-encoded JSON.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  theme:
+                    type: string
+      responses:
+        '200':
+          description: A pet with the applied filter echoed as a JSON content header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+          headers:
+            X-Filter-Echo:
+              description: The applied filter echoed as JSON.
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      status:
+                        type: array
+                        items:
+                          type: string
 components:
   schemas:
     Pet:

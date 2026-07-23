@@ -3,9 +3,11 @@ import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 
 import {
-  checkCteDomain,
   encodeFormUrlencodedBody,
   parseMediaType,
+  serializeContentJsonHeader,
+  serializeContentJsonPath,
+  serializeContentJsonQuery,
   serializeHeaderSimple,
   serializeHeaderSimpleExplode,
   serializeMediaType,
@@ -19,9 +21,10 @@ import {
   serializeQueryForm,
   serializeQueryFormExplode,
   serializeQueryPipeDelimited,
+  serializeQueryPipeDelimitedObject,
   serializeQuerySpaceDelimited,
+  serializeQuerySpaceDelimitedObject,
 } from "../serialize.ts";
-import { CTE_VECTORS } from "./vectors-multipart-cte.ts";
 import { MEDIA_VECTORS } from "./vectors-media.ts";
 import {
   STYLE_VECTORS,
@@ -95,6 +98,59 @@ describe("parameter styles", () => {
   for (const [index, vector] of STYLE_VECTORS.entries()) {
     test(`vector ${index + 1}: ${vector.location}/${vector.style}/explode=${String(vector.explode)}`, () => {
       assert.equal(serializeStyleVector(vector), vector.expected);
+    });
+  }
+});
+
+describe("content JSON serialization", () => {
+  // A content-sourced JSON parameter (OpenAPI Parameter Object `content`) stringifies the raw typed
+  // value — including nested shapes a flat ParamValue could never hold — then applies the location's
+  // wire framing: component-encoded `name=value` for query/cookie, an encoded path segment, and the
+  // raw simple-header value.
+  test("query wraps the JSON text as a component-encoded name=value pair", () => {
+    assert.equal(serializeContentJsonQuery("filter", { n: 1 }, false), "filter=%7B%22n%22%3A1%7D");
+    assert.equal(
+      serializeContentJsonQuery("filter", { tags: ["a", "b"] }, false),
+      "filter=%7B%22tags%22%3A%5B%22a%22%2C%22b%22%5D%7D",
+    );
+  });
+
+  test("path percent-encodes the JSON text as one segment with no name", () => {
+    assert.equal(serializeContentJsonPath("p", { n: 1 }, false), "%7B%22n%22%3A1%7D");
+    assert.equal(serializeContentJsonPath("p", [1, 2], false), "%5B1%2C2%5D");
+  });
+
+  test("header emits the JSON text verbatim without component encoding", () => {
+    assert.equal(serializeContentJsonHeader("h", { a: "b c/d" }, false), '{"a":"b c/d"}');
+  });
+
+  test("a value JSON cannot represent is rejected", () => {
+    assert.throws(() => serializeContentJsonHeader("h", undefined, false), TypeError);
+    assert.throws(() => serializeContentJsonQuery("q", () => 1, false), TypeError);
+  });
+});
+
+describe("delimited query objects", () => {
+  for (const [style, serialize, separator] of [
+    ["spaceDelimited", serializeQuerySpaceDelimitedObject, "%20"],
+    ["pipeDelimited", serializeQueryPipeDelimitedObject, "%7C"],
+  ] as const) {
+    test(`${style} encodes each component when reserved characters are disallowed`, () => {
+      assert.equal(
+        serialize("color", { "R?": "/100", G: 200, B: false }, false),
+        `color=R%3F${separator}%2F100${separator}G${separator}200${separator}B${separator}false`,
+      );
+    });
+
+    test(`${style} preserves reserved characters when allowed`, () => {
+      assert.equal(
+        serialize("color", { "R?": "/100", G: 200, B: false }, true),
+        `color=R?${separator}/100${separator}G${separator}200${separator}B${separator}false`,
+      );
+    });
+
+    test(`${style} serializes an empty object`, () => {
+      assert.equal(serialize("color", {}, false), "color=");
     });
   }
 });
@@ -289,17 +345,6 @@ describe("canonical media types", () => {
   });
 });
 
-describe("Content-Transfer-Encoding byte domains", () => {
-  for (const [index, vector] of CTE_VECTORS.entries()) {
-    test(`vector ${index + 1}: ${vector.encoding}/${vector.verdict}`, () => {
-      assert.equal(
-        checkCteDomain(vector.encoding, Uint8Array.from(vector.bytes)),
-        vector.verdict === "ok",
-      );
-    });
-  }
-});
-
 describe("serialize.ts region grammar", () => {
   test("keeps deterministic, non-nested, fully enclosed export regions", () => {
     const source = readFileSync(new URL("../serialize.ts", import.meta.url), "utf8");
@@ -358,7 +403,9 @@ describe("serialize.ts region grammar", () => {
       ["oxs:helper:query-form", "serializeQueryForm"],
       ["oxs:helper:query-form-explode", "serializeQueryFormExplode"],
       ["oxs:helper:query-space-delimited", "serializeQuerySpaceDelimited"],
+      ["oxs:helper:query-space-delimited-object", "serializeQuerySpaceDelimitedObject"],
       ["oxs:helper:query-pipe-delimited", "serializeQueryPipeDelimited"],
+      ["oxs:helper:query-pipe-delimited-object", "serializeQueryPipeDelimitedObject"],
       ["oxs:helper:query-deep-object", "serializeQueryDeepObject"],
       ["oxs:helper:header-simple", "serializeHeaderSimple"],
       ["oxs:helper:header-simple-explode", "serializeHeaderSimpleExplode"],
@@ -368,7 +415,9 @@ describe("serialize.ts region grammar", () => {
       ["oxs:helper:multipart", "encodeMultipart"],
       ["oxs:helper:multipart-cd", "escapeContentDispositionName"],
       ["oxs:helper:multipart-cd", "encodeContentDispositionFilename"],
-      ["oxs:helper:cte-check", "checkCteDomain"],
+      ["oxs:helper:content-json-header", "serializeContentJsonHeader"],
+      ["oxs:helper:content-json-path", "serializeContentJsonPath"],
+      ["oxs:helper:content-json-query", "serializeContentJsonQuery"],
     ];
 
     for (const [regionId, helperName] of expectedHelpers) {

@@ -3,6 +3,7 @@ import { describe, test } from "node:test";
 
 import type { RequestFailure } from "../result.ts";
 import {
+  AmbientClientCertificate,
   AmbientCookieCredential,
   createTransport,
   execute,
@@ -19,6 +20,8 @@ import {
   BEARER_VECTORS,
   COOKIE_SENTINEL_VECTORS,
   HEADER_KEY_VECTORS,
+  HTTP_SCHEME_VECTORS,
+  MUTUAL_TLS_VECTORS,
   QUERY_KEY_VECTORS,
   type AuthFailure as VectorAuthFailure,
 } from "./vectors-auth-serialization.ts";
@@ -235,7 +238,8 @@ describe("frozen auth serialization vectors", () => {
                 allowReserved: false,
               },
             ];
-      const input = vector.input.existingQuery.length === 0 ? {} : { ordinaryQuery: true };
+      const input =
+        vector.input.existingQuery.length === 0 ? {} : { query: { ordinaryQuery: true } };
       const { result, requests } = await executeWithCredential(
         operation({
           params,
@@ -274,6 +278,59 @@ describe("frozen auth serialization vectors", () => {
       const request = requests[0];
       assert.ok(request);
       assert.equal(request.headers.has("Cookie"), false);
+      assert.deepEqual([...request.headers], []);
+    });
+  }
+
+  for (const vector of HTTP_SCHEME_VECTORS) {
+    test(`httpScheme: ${vector.name}`, async () => {
+      const credential: AuthCredential =
+        vector.input.credential.kind === "valid"
+          ? { credentials: vector.input.credential.credentials }
+          : {
+              username: vector.input.credential.username,
+              password: vector.input.credential.password,
+            };
+      const { result, requests } = await executeWithCredential(
+        operation({
+          security: [
+            [{ name: "scheme", kind: "httpScheme", scheme: vector.input.scheme, scopes: [] }],
+          ],
+        }),
+        credential,
+      );
+      if (typeof vector.expected !== "string") {
+        assertVectorFailure(result, vector.expected, requests);
+        return;
+      }
+      assert.equal(requests.length, 1);
+      const request = requests[0];
+      assert.ok(request);
+      assert.equal(`Authorization: ${request.headers.get("Authorization")}`, vector.expected);
+    });
+  }
+
+  for (const vector of MUTUAL_TLS_VECTORS) {
+    test(`mutualTls: ${vector.name}`, async () => {
+      // Map the symbolic ambient entry onto the AmbientClientCertificate symbol, mirroring how the
+      // cookie-sentinel loop maps its ambient entry onto AmbientCookieCredential.
+      const credential: AuthCredential =
+        vector.input.kind === "ambient" ? AmbientClientCertificate : vector.input.value;
+      const { result, requests } = await executeWithCredential(
+        operation({
+          credentialHeaders: [],
+          security: [[{ name: "scheme", kind: "mutualTls", scopes: [] }]],
+        }),
+        credential,
+      );
+      if (!("noHeader" in vector.expected)) {
+        assertVectorFailure(result, vector.expected, requests);
+        return;
+      }
+      assert.equal(requests.length, 1);
+      const request = requests[0];
+      assert.ok(request);
+      assert.equal(request.headers.has("Authorization"), false);
       assert.deepEqual([...request.headers], []);
     });
   }
@@ -363,6 +420,48 @@ describe("frozen auth selection scenarios", () => {
 });
 
 describe("auth runtime boundaries", () => {
+  // Ambient-sentinel acceptance and the plain-string rejection are covered by MUTUAL_TLS_VECTORS in
+  // the frozen-vectors describe; this case exceeds them by rejecting the wrong ambient *symbol*
+  // (AmbientCookieCredential), a different input type than the vector's string.
+  test("rejects a non-sentinel mutual TLS credential", async () => {
+    const { result, requests } = await executeWithCredential(
+      operation({
+        credentialHeaders: [],
+        security: [[{ name: "scheme", kind: "mutualTls", scopes: [] }]],
+      }),
+      AmbientCookieCredential,
+    );
+    assert.match(authFailure(result).message, /ambient client certificate/u);
+    assert.equal(requests.length, 0);
+  });
+
+  // Verbatim serialization and the LF-in-credentials rejection are covered by HTTP_SCHEME_VECTORS.
+  // These two cases exceed the vectors: control bytes in the scheme NAME (the vector injects them in
+  // the credentials), and a non-object string credential (the vector's wrong shape is a basic pair).
+  test("rejects header-control injection in the generic HTTP scheme name", async () => {
+    const { result, requests } = await executeWithCredential(
+      operation({
+        security: [
+          [{ name: "scheme", kind: "httpScheme", scheme: "Digest\r\nX-Injected: yes", scopes: [] }],
+        ],
+      }),
+      { credentials: "proof" },
+    );
+    assert.match(authFailure(result).message, /control character/u);
+    assert.equal(requests.length, 0);
+  });
+
+  test("rejects a non-object generic HTTP credential", async () => {
+    const { result, requests } = await executeWithCredential(
+      operation({
+        security: [[{ name: "scheme", kind: "httpScheme", scheme: "Digest", scopes: [] }]],
+      }),
+      "not-an-object",
+    );
+    assert.match(authFailure(result).message, /credentials string/u);
+    assert.equal(requests.length, 0);
+  });
+
   for (const boundary of [
     {
       name: "string for basic",
@@ -605,7 +704,7 @@ describe("auth runtime boundaries", () => {
         ],
         security: security("scheme", "apiKeyQuery", "token"),
       }),
-      { ordinary: true },
+      { query: { ordinary: true } },
     );
     assert.equal(contexts.length, 1);
     assert.equal(contexts[0]?.url, "https://auth.example/api/resource?ordinary=1");

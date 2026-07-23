@@ -154,6 +154,8 @@ pub struct Param {
     pub deprecated: bool,
     pub description: Option<String>,
     pub schema: SchemaNode,
+    /// Canonical full media type when the parameter is sourced from `content`.
+    pub content_media_type: Option<String>,
     /// Explicit serialization style; location-dependent defaults remain unresolved.
     pub style: Option<ParamStyle>,
     /// Explicit explode value; style-dependent defaults remain unresolved.
@@ -174,7 +176,14 @@ pub struct Body {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaType {
     /// Canonical parameter-free media type or range.
-    pub name: String,
+    pub essence: String,
+    /// Canonical full media type or range, including sorted parameters.
+    pub full: String,
+    /// How wide the essence matches, decided by the RFC 9110 type/subtype wildcards. Carried from
+    /// parse so downstream consumers (body/response discrimination, Accept assembly) never re-derive
+    /// range-ness from a raw `*` substring on the parameterized full string. `pub(crate)` because its
+    /// type lives in the crate-private `media` module.
+    pub(crate) range_kind: crate::media::MediaRangeKind,
     /// Content-map key exactly as written in the source document.
     pub raw_name: String,
     pub schema: SchemaNode,
@@ -215,6 +224,8 @@ pub struct EncodingHeader {
     pub required: bool,
     /// Header value schema.
     pub schema: SchemaNode,
+    /// Canonical full media type when the header is sourced from `content`.
+    pub content_media_type: Option<String>,
     /// Source identity of this Header Object.
     pub source: SourceRef,
 }
@@ -350,6 +361,8 @@ pub struct ResponseHeader {
     pub description: Option<String>,
     /// Header value schema.
     pub schema: SchemaNode,
+    /// Canonical full media type when the header is sourced from `content`.
+    pub content_media_type: Option<String>,
     /// Source identity of this Header Object.
     pub source: SourceRef,
 }

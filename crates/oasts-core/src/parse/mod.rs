@@ -15,6 +15,7 @@ use crate::ir::{
     ServerVariable, SourceRef, StringConstraints, TupleRest, Webhook, box_if_populated,
 };
 use crate::loader::{DocId, DocumentGraph, append_pointer};
+use crate::media::canonical_content_key;
 
 const CODE_VERSION: &str = "OASTS1101";
 const CODE_SHAPE: &str = "OASTS1102";
@@ -27,6 +28,8 @@ const CODE_DUPLICATE_MEDIA_TYPE: &str = "OASTS1108";
 const CODE_RESERVED_HEADER_PARAMETER: &str = "OASTS1109";
 const CODE_REF_SIBLINGS: &str = "OASTS1110";
 const CODE_MULTIPLE_OF: &str = "OASTS1112";
+const CODE_REF_CYCLE: &str = "OASTS1113";
+const CODE_REF_DEPTH: &str = "OASTS1114";
 const CODE_SERVER_VAR_ENUM_EMPTY: &str = "OASTS1131";
 const CODE_SERVER_VAR_DEFAULT: &str = "OASTS1132";
 const CODE_HEADER_CONTENT_TYPE: &str = "OASTS1133";
@@ -125,13 +128,111 @@ struct Parser<'graph, 'sink> {
     graph: &'graph DocumentGraph,
     version: OasVersion,
     sink: &'sink mut DiagnosticSink,
+    entry_defs_referenced: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct NodeView<'a> {
     doc_id: DocId,
     pointer: String,
     value: &'a Value,
+}
+
+enum ContentSchema {
+    NotDeclared,
+    Empty,
+    Parsed {
+        media_type: String,
+        schema: Box<SchemaNode>,
+    },
+    Invalid,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RefChainMember {
+    doc_index: usize,
+    pointer: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RefChainError {
+    Resolution(Box<Diagnostic>),
+    Cycle(Vec<String>),
+    Budget(Vec<String>),
+}
+
+enum RefChainStep<T> {
+    Done,
+    Next { member: RefChainMember, node: T },
+    Fail(Box<Diagnostic>),
+}
+
+fn follow_ref_chain<'graph>(
+    start: NodeView<'graph>,
+    budget: u64,
+    resolve_fn: &mut dyn FnMut(&NodeView<'graph>) -> RefChainStep<NodeView<'graph>>,
+) -> Result<NodeView<'graph>, RefChainError> {
+    let mut current = start;
+    let mut visited = HashSet::new();
+    let mut chain = Vec::new();
+    let mut hops = 0_u64;
+    loop {
+        match resolve_fn(&current) {
+            RefChainStep::Done => return Ok(current),
+            RefChainStep::Fail(diagnostic) => return Err(RefChainError::Resolution(diagnostic)),
+            RefChainStep::Next { member, node } => {
+                chain.push(member.pointer.clone());
+                if !visited.insert(member) {
+                    return Err(RefChainError::Cycle(chain));
+                }
+                hops = hops.saturating_add(1);
+                if hops > budget {
+                    return Err(RefChainError::Budget(chain));
+                }
+                current = node;
+            }
+        }
+    }
+}
+
+/// Maps a reference-chain failure onto the diagnostic pushed at the referencing site. Mid-chain
+/// resolution failures pass their own diagnostic through untouched; cycle and budget failures
+/// name the chain so the offending hop sequence is visible.
+fn ref_chain_failure_diagnostic(
+    kind: &str,
+    max_ref_depth: u64,
+    source_id: &str,
+    pointer: &str,
+    error: RefChainError,
+) -> Diagnostic {
+    match error {
+        RefChainError::Resolution(diagnostic) => *diagnostic,
+        RefChainError::Cycle(chain) => Diagnostic::input(
+            CODE_REF_CYCLE,
+            format!(
+                "{kind} reference chain contains a cycle: {}",
+                chain.join(" -> ")
+            ),
+        )
+        .with_source(source_id)
+        .with_json_pointer(pointer),
+        RefChainError::Budget(chain) => Diagnostic::input(
+            CODE_REF_DEPTH,
+            format!(
+                "{kind} reference chain exceeds maxRefDepth {max_ref_depth}: {}",
+                chain.join(" -> ")
+            ),
+        )
+        .with_source(source_id)
+        .with_json_pointer(pointer),
+    }
+}
+
+const fn should_materialize_external_schemas(
+    document_count: usize,
+    entry_defs_referenced: bool,
+) -> bool {
+    document_count > 1 || entry_defs_referenced
 }
 
 impl<'graph, 'sink> Parser<'graph, 'sink> {
@@ -144,6 +245,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             graph,
             version,
             sink,
+            entry_defs_referenced: false,
         }
     }
 
@@ -201,11 +303,12 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         operations: &[Operation],
         webhooks: &[Webhook],
     ) {
-        // The loader only loads a document when a `$ref` targets it, so a graph with a single
-        // document has no external targets and every reference is entry-internal. Materialization
-        // would then walk the whole IR only to skip every ref, so skip it wholesale — this is the
-        // common case (every single-file spec).
-        if self.graph.documents().len() == 1 {
+        // Most single-document inputs only reference components, which are already materialized.
+        // Avoid walking the IR unless another document or an entry non-component target requires it.
+        if !should_materialize_external_schemas(
+            self.graph.documents().len(),
+            self.entry_defs_referenced,
+        ) {
             return;
         }
         let entry_source = self.source_id(self.graph.entry().id).to_owned();
@@ -245,10 +348,11 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         while cursor < queue.len() {
             let index = cursor;
             cursor += 1;
-            // Skip root-internal references on a borrow, before any clone: a non-component pointer
-            // into the entry document is a separate concern, left to fail its own reference
-            // diagnostic. The queue is appended to below, so the borrow ends before the clone.
-            if queue[index].source_id == entry_source {
+            if queue[index].source_id == entry_source
+                && queue[index]
+                    .json_pointer
+                    .starts_with("/components/schemas/")
+            {
                 continue;
             }
             let key = {
@@ -329,6 +433,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         };
         let mut operations = Vec::new();
         for (path, raw_path_item) in paths {
+            if path.starts_with("x-") {
+                continue;
+            }
             let path_pointer = append_pointer("/paths", path);
             let path_node = NodeView {
                 doc_id: root.doc_id,
@@ -360,6 +467,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         webhooks
             .iter()
             .filter_map(|(name, value)| {
+                if name.starts_with("x-") {
+                    return None;
+                }
                 let pointer = append_pointer("/webhooks", name);
                 let path_item = self.resolve_object(
                     NodeView {
@@ -471,7 +581,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         });
         let responses = match object.get("responses") {
             None => {
-                self.shape_error(node.doc_id, &node.pointer, "operation is missing responses");
+                if self.version == OasVersion::V3_0 {
+                    self.shape_error(node.doc_id, &node.pointer, "operation is missing responses");
+                }
                 Vec::new()
             }
             Some(value) => {
@@ -548,7 +660,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 let callback = callback_node.value.as_object()?;
                 let expressions = callback
                     .iter()
-                    .map(|(expression, value)| {
+                    .filter_map(|(expression, value)| {
+                        if expression.starts_with("x-") {
+                            return None;
+                        }
                         let pointer = append_pointer(&callback_node.pointer, expression);
                         let path_item = NodeView {
                             doc_id: callback_node.doc_id,
@@ -556,11 +671,11 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                             value,
                         };
                         let source = self.source(path_item.doc_id, &path_item.pointer);
-                        CallbackExpression {
+                        Some(CallbackExpression {
                             expression: expression.clone(),
                             operations: self.parse_path_item_operations(path_item, None),
                             source,
-                        }
+                        })
                     })
                     .collect();
                 Some(Callback {
@@ -649,25 +764,56 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             ));
             return None;
         }
-        let schema = match object.get("schema") {
-            None => {
-                let pointer = append_pointer(&node.pointer, "schema");
-                self.unsupported_schema(
-                    node.doc_id,
-                    &pointer,
-                    "parameter content or missing schema is not supported",
-                )
-            }
-            Some(value) => {
-                let pointer = append_pointer(&node.pointer, "schema");
-                self.parse_schema(NodeView {
-                    doc_id: node.doc_id,
-                    pointer,
-                    value,
-                })
-            }
+        let content_declared = object.contains_key("content");
+        let (schema, content_media_type) =
+            match self.parse_content_schema(&node, object, "parameter") {
+                ContentSchema::NotDeclared => match object.get("schema") {
+                    None => {
+                        let pointer = append_pointer(&node.pointer, "schema");
+                        (
+                            self.unsupported_schema(
+                                node.doc_id,
+                                &pointer,
+                                "parameter content or missing schema is not supported",
+                            ),
+                            None,
+                        )
+                    }
+                    Some(value) => {
+                        let pointer = append_pointer(&node.pointer, "schema");
+                        (
+                            self.parse_schema(NodeView {
+                                doc_id: node.doc_id,
+                                pointer,
+                                value,
+                            }),
+                            None,
+                        )
+                    }
+                },
+                ContentSchema::Empty => {
+                    let pointer = append_pointer(&node.pointer, "schema");
+                    (
+                        self.unsupported_schema(
+                            node.doc_id,
+                            &pointer,
+                            "parameter content or missing schema is not supported",
+                        ),
+                        None,
+                    )
+                }
+                ContentSchema::Parsed { media_type, schema } => (*schema, Some(media_type)),
+                ContentSchema::Invalid => return None,
+            };
+        let (style, explode, allow_reserved) = if content_declared {
+            (None, None, false)
+        } else {
+            (
+                self.parse_param_style(&node, object, "parameter"),
+                object.get("explode").and_then(Value::as_bool),
+                bool_field(object, "allowReserved"),
+            )
         };
-        let style = self.parse_param_style(&node, object, "parameter");
         Some(Param {
             name: name.to_owned(),
             location,
@@ -675,11 +821,95 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             deprecated: bool_field(object, "deprecated"),
             description: string_field(object, "description"),
             schema,
+            content_media_type,
             style,
-            explode: object.get("explode").and_then(Value::as_bool),
-            allow_reserved: bool_field(object, "allowReserved"),
+            explode,
+            allow_reserved,
             source: self.source(node.doc_id, &node.pointer),
         })
+    }
+
+    fn parse_content_schema(
+        &mut self,
+        node: &NodeView<'graph>,
+        object: &'graph Map<String, Value>,
+        kind: &str,
+    ) -> ContentSchema {
+        let Some(value) = object.get("content") else {
+            return ContentSchema::NotDeclared;
+        };
+        let pointer = append_pointer(&node.pointer, "content");
+        let Some(content) = value.as_object() else {
+            self.shape_error(
+                node.doc_id,
+                &pointer,
+                format!("{kind} content must be an object"),
+            );
+            return ContentSchema::Invalid;
+        };
+        if content.is_empty() {
+            return ContentSchema::Empty;
+        }
+        if content.len() != 1 {
+            self.shape_error(
+                node.doc_id,
+                &pointer,
+                format!("{kind} content map must contain exactly one entry"),
+            );
+            return ContentSchema::Invalid;
+        }
+        let (raw_name, value) = content.iter().next().expect("one content entry");
+        let media_pointer = append_pointer(&pointer, raw_name);
+        let Some(canonical) = self.parse_content_key(node.doc_id, &media_pointer, raw_name) else {
+            return ContentSchema::Invalid;
+        };
+        let (schema, _) = self.parse_media_schema(node.doc_id, &media_pointer, value);
+        ContentSchema::Parsed {
+            media_type: canonical.full,
+            schema: Box::new(schema),
+        }
+    }
+
+    fn parse_content_key(
+        &mut self,
+        doc_id: DocId,
+        pointer: &str,
+        raw_name: &str,
+    ) -> Option<crate::media::CanonicalMedia> {
+        match canonical_content_key(raw_name) {
+            Ok(media) => {
+                // A wildcard range that carries parameters (`text/*; q=0.5`) has no runtime match
+                // tier — `selectedMediaType` admits the range and any tiers only for
+                // parameter-free keys — so the branch it would form can never be selected. Drop it
+                // with the same media-key warning rather than emit a dead arm. `full != essence`
+                // means parameters are present; ranges are every non-`Concrete` kind.
+                if media.range_kind != crate::media::MediaRangeKind::Concrete
+                    && media.full != media.essence
+                {
+                    self.sink.push(self.warning_diagnostic(
+                        CODE_MEDIA_TYPE,
+                        doc_id,
+                        pointer,
+                        format!(
+                            "content key '{raw_name}' is a media range with parameters, which has no runtime match tier; dropping it"
+                        ),
+                    ));
+                    return None;
+                }
+                Some(media)
+            }
+            Err(()) => {
+                self.sink.push(self.warning_diagnostic(
+                    CODE_MEDIA_TYPE,
+                    doc_id,
+                    pointer,
+                    format!(
+                        "malformed content key '{raw_name}'; expected an RFC 9110 type/subtype media type or wildcard range"
+                    ),
+                ));
+                None
+            }
+        }
     }
 
     fn parse_body(&mut self, node: NodeView<'graph>) -> Option<Body> {
@@ -708,9 +938,20 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             self.shape_error(node.doc_id, &node.pointer, "responses must be an object");
             return Vec::new();
         };
+        if object.keys().all(|key| key.starts_with("x-")) {
+            self.shape_error(
+                node.doc_id,
+                &node.pointer,
+                "responses object must declare at least one response",
+            );
+            return Vec::new();
+        }
         object
             .iter()
             .filter_map(|(key, value)| {
+                if key.starts_with("x-") {
+                    return None;
+                }
                 let pointer = append_pointer(&node.pointer, key);
                 let status = match parse_response_status(key) {
                     Some(status) => status,
@@ -831,26 +1072,47 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             let Some(header) = header_node.value.as_object() else {
                 continue;
             };
-            let schema_pointer = append_pointer(&header_node.pointer, "schema");
-            let Some(schema) = header.get("schema") else {
-                self.unsupported_schema(
-                    header_node.doc_id,
-                    &schema_pointer,
-                    "response header content or missing schema is not supported",
-                );
-                continue;
-            };
+            let (schema, content_media_type) =
+                match self.parse_content_schema(&header_node, header, "response header") {
+                    ContentSchema::NotDeclared => {
+                        let schema_pointer = append_pointer(&header_node.pointer, "schema");
+                        let Some(schema) = header.get("schema") else {
+                            self.unsupported_schema(
+                                header_node.doc_id,
+                                &schema_pointer,
+                                "response header content or missing schema is not supported",
+                            );
+                            continue;
+                        };
+                        (
+                            self.parse_schema(NodeView {
+                                doc_id: header_node.doc_id,
+                                pointer: schema_pointer,
+                                value: schema,
+                            }),
+                            None,
+                        )
+                    }
+                    ContentSchema::Empty => {
+                        let schema_pointer = append_pointer(&header_node.pointer, "schema");
+                        self.unsupported_schema(
+                            header_node.doc_id,
+                            &schema_pointer,
+                            "response header content or missing schema is not supported",
+                        );
+                        continue;
+                    }
+                    ContentSchema::Parsed { media_type, schema } => (*schema, Some(media_type)),
+                    ContentSchema::Invalid => continue,
+                };
             parsed.push((
                 name.clone(),
                 ResponseHeader {
                     required: bool_field(header, "required"),
                     deprecated: bool_field(header, "deprecated"),
                     description: string_field(header, "description"),
-                    schema: self.parse_schema(NodeView {
-                        doc_id: header_node.doc_id,
-                        pointer: schema_pointer,
-                        value: schema,
-                    }),
+                    schema,
+                    content_media_type,
                     source: self.source(header_node.doc_id, &header_node.pointer),
                 },
             ));
@@ -943,72 +1205,29 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         let mut canonical_keys = HashMap::new();
         for (raw_name, value) in object {
             let pointer = append_pointer(&node.pointer, raw_name);
-            let canonical_name = match canonical_media_type(raw_name) {
-                Ok(name) => name,
-                Err(MediaKeyError::Parameterized) => {
-                    // Unsupported construct, not invalid input: warn and drop the entry
-                    // The key never forms a branch; an emptied content map
-                    // degrades to the no-content branch. Generation continues.
-                    self.sink.push(self.warning_diagnostic(
-                        CODE_MEDIA_TYPE,
-                        node.doc_id,
-                        &pointer,
-                        format!(
-                            "parameterized content key '{raw_name}' is not supported; content keys must omit media-type parameters"
-                        ),
-                    ));
-                    continue;
-                }
-                Err(MediaKeyError::Malformed) => {
-                    // Dropped rather than fatal, because an unusable content key cannot form a branch
-                    // and an emptied content map degrades to the no-content branch.
-                    self.sink.push(self.warning_diagnostic(
-                        CODE_MEDIA_TYPE,
-                        node.doc_id,
-                        &pointer,
-                        format!(
-                            "malformed content key '{raw_name}'; expected an RFC 9110 type/subtype media type or wildcard range"
-                        ),
-                    ));
-                    continue;
-                }
+            // Dropped rather than fatal, because an unusable content key cannot form a branch
+            // and an emptied content map degrades to the no-content branch.
+            let Some(canonical) = self.parse_content_key(node.doc_id, &pointer, raw_name) else {
+                continue;
             };
-            if let Some((first_index, first_raw_name)) = canonical_keys.get(&canonical_name) {
+            if let Some((first_index, first_raw_name)) = canonical_keys.get(&canonical.full) {
                 parsed[*first_index] = None;
                 self.sink.push(self.input_diagnostic(
                     CODE_DUPLICATE_MEDIA_TYPE,
                     node.doc_id,
                     &pointer,
                     format!(
-                        "duplicate content keys '{first_raw_name}' and '{raw_name}' canonicalize to '{canonical_name}'"
+                        "duplicate content keys '{first_raw_name}' and '{raw_name}' canonicalize to '{}'",
+                        canonical.full
                     ),
                 ));
                 continue;
             }
-            canonical_keys.insert(canonical_name.clone(), (parsed.len(), raw_name.clone()));
-            let schema_pointer = append_pointer(&pointer, "schema");
-            let (schema, schema_present) = match value.get("schema") {
-                None => (
-                    SchemaNode::Any {
-                        meta: SchemaMeta {
-                            source: self.source(node.doc_id, &schema_pointer),
-                            ..SchemaMeta::default()
-                        },
-                    },
-                    false,
-                ),
-                Some(schema) => (
-                    self.parse_schema(NodeView {
-                        doc_id: node.doc_id,
-                        pointer: schema_pointer,
-                        value: schema,
-                    }),
-                    true,
-                ),
-            };
+            canonical_keys.insert(canonical.full.clone(), (parsed.len(), raw_name.clone()));
+            let (schema, schema_present) = self.parse_media_schema(node.doc_id, &pointer, value);
             let encodings = if parse_encodings
-                && (canonical_name == "application/x-www-form-urlencoded"
-                    || canonical_name.starts_with("multipart/"))
+                && (canonical.essence == "application/x-www-form-urlencoded"
+                    || canonical.essence.starts_with("multipart/"))
             {
                 value.get("encoding").map_or_else(Vec::new, |encoding| {
                     self.parse_encodings(NodeView {
@@ -1021,7 +1240,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 Vec::new()
             };
             parsed.push(Some(MediaType {
-                name: canonical_name,
+                essence: canonical.essence,
+                full: canonical.full,
+                range_kind: canonical.range_kind,
                 raw_name: raw_name.clone(),
                 schema,
                 schema_present,
@@ -1036,6 +1257,34 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             }));
         }
         parsed.into_iter().flatten().collect()
+    }
+
+    fn parse_media_schema(
+        &mut self,
+        doc_id: DocId,
+        pointer: &str,
+        value: &'graph Value,
+    ) -> (SchemaNode, bool) {
+        let schema_pointer = append_pointer(pointer, "schema");
+        match value.get("schema") {
+            None => (
+                SchemaNode::Any {
+                    meta: SchemaMeta {
+                        source: self.source(doc_id, &schema_pointer),
+                        ..SchemaMeta::default()
+                    },
+                },
+                false,
+            ),
+            Some(schema) => (
+                self.parse_schema(NodeView {
+                    doc_id,
+                    pointer: schema_pointer,
+                    value: schema,
+                }),
+                true,
+            ),
+        }
     }
 
     fn parse_encodings(&mut self, node: NodeView<'graph>) -> Vec<(String, EncodingObject)> {
@@ -1056,10 +1305,18 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     pointer,
                     value,
                 };
-                let content_type = encoding
-                    .get("contentType")
-                    .and_then(Value::as_str)
-                    .map(|value| value.split(',').map(str::trim).map(str::to_owned).collect());
+                let content_type =
+                    encoding
+                        .get("contentType")
+                        .and_then(Value::as_str)
+                        .map(|value| {
+                            crate::media::split_media_type_list(value)
+                                .unwrap_or_else(|()| vec![value])
+                                .into_iter()
+                                .map(str::trim)
+                                .map(str::to_owned)
+                                .collect()
+                        });
                 let headers = encoding.get("headers").map_or_else(Vec::new, |headers| {
                     self.parse_encoding_headers(NodeView {
                         doc_id: node.doc_id,
@@ -1108,24 +1365,44 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     "encoding header",
                 )?;
                 let header = header_node.value.as_object()?;
-                let schema_pointer = append_pointer(&header_node.pointer, "schema");
-                let schema = match header.get("schema") {
-                    Some(schema) => self.parse_schema(NodeView {
-                        doc_id: header_node.doc_id,
-                        pointer: schema_pointer,
-                        value: schema,
-                    }),
-                    None => self.unsupported_schema(
-                        header_node.doc_id,
-                        &schema_pointer,
-                        "encoding header content or missing schema is not supported",
-                    ),
-                };
+                let (schema, content_media_type) =
+                    match self.parse_content_schema(&header_node, header, "encoding header") {
+                        ContentSchema::NotDeclared => {
+                            let schema_pointer = append_pointer(&header_node.pointer, "schema");
+                            let schema = match header.get("schema") {
+                                Some(schema) => self.parse_schema(NodeView {
+                                    doc_id: header_node.doc_id,
+                                    pointer: schema_pointer,
+                                    value: schema,
+                                }),
+                                None => self.unsupported_schema(
+                                    header_node.doc_id,
+                                    &schema_pointer,
+                                    "encoding header content or missing schema is not supported",
+                                ),
+                            };
+                            (schema, None)
+                        }
+                        ContentSchema::Empty => {
+                            let schema_pointer = append_pointer(&header_node.pointer, "schema");
+                            (
+                                self.unsupported_schema(
+                                    header_node.doc_id,
+                                    &schema_pointer,
+                                    "encoding header content or missing schema is not supported",
+                                ),
+                                None,
+                            )
+                        }
+                        ContentSchema::Parsed { media_type, schema } => (*schema, Some(media_type)),
+                        ContentSchema::Invalid => return None,
+                    };
                 Some((
                     name.clone(),
                     EncodingHeader {
                         required: bool_field(header, "required"),
                         schema,
+                        content_media_type,
                         source: self.source(header_node.doc_id, &header_node.pointer),
                     },
                 ))
@@ -1775,13 +2052,20 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     meta,
                 }
             }
-            Ok(target) => SchemaNode::Ref {
-                target: SchemaRef {
-                    source_id: self.source_id(target.doc_id).to_owned(),
-                    json_pointer: target.json_pointer,
-                },
-                meta,
-            },
+            Ok(target) => {
+                if target.doc_id == self.graph.entry().id
+                    && !target.json_pointer.starts_with("/components/schemas/")
+                {
+                    self.entry_defs_referenced = true;
+                }
+                SchemaNode::Ref {
+                    target: SchemaRef {
+                        source_id: self.source_id(target.doc_id).to_owned(),
+                        json_pointer: target.json_pointer,
+                    },
+                    meta,
+                }
+            }
             Err(diagnostic) => {
                 self.sink.push(diagnostic);
                 self.sink.push(
@@ -2308,13 +2592,62 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             return Some(node);
         };
         match self.graph.resolve(node.doc_id, reference) {
-            Ok(target) => Some(NodeView {
-                doc_id: target.doc_id,
-                pointer: target.json_pointer,
-                value: target.value,
-            }),
+            Ok(target)
+                if target
+                    .value
+                    .as_object()
+                    .and_then(|object| object.get("$ref"))
+                    .and_then(Value::as_str)
+                    .is_none() =>
+            {
+                return Some(NodeView {
+                    doc_id: target.doc_id,
+                    pointer: target.json_pointer,
+                    value: target.value,
+                });
+            }
+            Ok(_) => {}
             Err(diagnostic) => {
                 self.sink.push(diagnostic);
+                return None;
+            }
+        }
+        let source_id = self.source_id(node.doc_id).to_owned();
+        let pointer = node.pointer.clone();
+        let result = follow_ref_chain(node, self.graph.max_ref_depth(), &mut |current| {
+            let Some(reference) = current
+                .value
+                .as_object()
+                .and_then(|object| object.get("$ref"))
+                .and_then(Value::as_str)
+            else {
+                return RefChainStep::Done;
+            };
+            match self.graph.resolve(current.doc_id, reference) {
+                Ok(target) => RefChainStep::Next {
+                    member: RefChainMember {
+                        doc_index: target.doc_id.index(),
+                        pointer: target.json_pointer.clone(),
+                    },
+                    node: NodeView {
+                        doc_id: target.doc_id,
+                        pointer: target.json_pointer,
+                        value: target.value,
+                    },
+                },
+                Err(diagnostic) => RefChainStep::Fail(Box::new(diagnostic)),
+            }
+        });
+        match result {
+            Ok(node) => Some(node),
+            Err(error) => {
+                self.sink.push(ref_chain_failure_diagnostic(
+                    kind,
+                    self.graph.max_ref_depth(),
+                    &source_id,
+                    &pointer,
+                    error,
+                ));
                 None
             }
         }
@@ -2539,57 +2872,6 @@ fn merge_parameters(path_parameters: &[Param], operation_parameters: Vec<Param>)
         .collect();
     merged.extend(operation_parameters);
     merged
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MediaKeyError {
-    Parameterized,
-    Malformed,
-}
-
-fn canonical_media_type(raw: &str) -> Result<String, MediaKeyError> {
-    if raw.contains(';') {
-        return Err(MediaKeyError::Parameterized);
-    }
-    let Some((media_type, subtype)) = raw.split_once('/') else {
-        return Err(MediaKeyError::Malformed);
-    };
-    if subtype.contains('/')
-        || !is_rfc_9110_token(media_type)
-        || !is_rfc_9110_token(subtype)
-        || (media_type == "*" && subtype != "*")
-    {
-        return Err(MediaKeyError::Malformed);
-    }
-    Ok(format!(
-        "{}/{}",
-        media_type.to_ascii_lowercase(),
-        subtype.to_ascii_lowercase()
-    ))
-}
-
-fn is_rfc_9110_token(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
 }
 
 fn parse_path_template(path: &str) -> Vec<Segment> {
@@ -2956,6 +3238,181 @@ mod tests {
         assert_eq!(external_schema_name("/defs/~01"), "~1");
     }
 
+    fn chain_test_graph() -> (TempDir, DocumentGraph) {
+        graph_for(&json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {}
+        }))
+    }
+
+    fn chain_node<'graph>(graph: &'graph DocumentGraph, pointer: &str) -> NodeView<'graph> {
+        let entry = graph.entry();
+        NodeView {
+            doc_id: entry.id,
+            pointer: pointer.to_owned(),
+            value: &entry.value,
+        }
+    }
+
+    #[test]
+    fn follow_ref_chain_reports_cycles() {
+        let (_temp, graph) = chain_test_graph();
+        let mut step = 0_u64;
+        let error = follow_ref_chain(chain_node(&graph, "/start"), 10, &mut |_| {
+            let pointer = format!("/parameters/{}", step % 2);
+            step += 1;
+            RefChainStep::Next {
+                member: RefChainMember {
+                    doc_index: 0,
+                    pointer: pointer.clone(),
+                },
+                node: chain_node(&graph, &pointer),
+            }
+        })
+        .expect_err("alternating targets form a cycle");
+
+        assert_eq!(
+            error,
+            RefChainError::Cycle(vec![
+                "/parameters/0".to_owned(),
+                "/parameters/1".to_owned(),
+                "/parameters/0".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn follow_ref_chain_reports_budget_exhaustion() {
+        let (_temp, graph) = chain_test_graph();
+        let mut step = 0_u64;
+        let error = follow_ref_chain(chain_node(&graph, "/start"), 2, &mut |_| {
+            let pointer = format!("/parameters/{step}");
+            step += 1;
+            RefChainStep::Next {
+                member: RefChainMember {
+                    doc_index: 0,
+                    pointer: pointer.clone(),
+                },
+                node: chain_node(&graph, &pointer),
+            }
+        })
+        .expect_err("three hops exceed a two-hop budget");
+
+        assert_eq!(
+            error,
+            RefChainError::Budget(vec![
+                "/parameters/0".to_owned(),
+                "/parameters/1".to_owned(),
+                "/parameters/2".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn follow_ref_chain_propagates_resolution_failures() {
+        let (_temp, graph) = chain_test_graph();
+        let diagnostic = Diagnostic::input(CODE_SHAPE, "boom".to_owned());
+        let error = follow_ref_chain(chain_node(&graph, "/start"), 2, &mut |_| {
+            RefChainStep::Fail(Box::new(diagnostic.clone()))
+        })
+        .expect_err("a failing hop aborts the chain");
+
+        assert_eq!(error, RefChainError::Resolution(Box::new(diagnostic)));
+    }
+
+    #[test]
+    fn ref_chain_failure_diagnostics_name_the_chain() {
+        let resolution = Diagnostic::input(CODE_SHAPE, "inner".to_owned());
+        assert_eq!(
+            ref_chain_failure_diagnostic(
+                "parameter",
+                4,
+                "entry",
+                "/p",
+                RefChainError::Resolution(Box::new(resolution.clone())),
+            ),
+            resolution
+        );
+
+        let cycle = ref_chain_failure_diagnostic(
+            "parameter",
+            4,
+            "entry",
+            "/p",
+            RefChainError::Cycle(vec!["/a".to_owned(), "/b".to_owned()]),
+        );
+        assert_eq!(cycle.code, CODE_REF_CYCLE);
+        assert_eq!(
+            cycle.message,
+            "parameter reference chain contains a cycle: /a -> /b"
+        );
+        assert_eq!(cycle.source_id.as_deref(), Some("entry"));
+        assert_eq!(cycle.json_pointer.as_deref(), Some("/p"));
+
+        let budget = ref_chain_failure_diagnostic(
+            "parameter",
+            4,
+            "entry",
+            "/p",
+            RefChainError::Budget(vec!["/a".to_owned(), "/b".to_owned()]),
+        );
+        assert_eq!(budget.code, CODE_REF_DEPTH);
+        assert_eq!(
+            budget.message,
+            "parameter reference chain exceeds maxRefDepth 4: /a -> /b"
+        );
+        assert_eq!(budget.source_id.as_deref(), Some("entry"));
+        assert_eq!(budget.json_pointer.as_deref(), Some("/p"));
+    }
+
+    #[test]
+    fn parameter_ref_chain_mid_resolution_failure_reports_the_hop_diagnostic() {
+        let temp = TempDir::new().expect("temp directory");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.json" },
+            "output": "generated"
+        });
+        std::fs::write(
+            temp.path().join("oasts.json"),
+            serde_json::to_vec(&config).expect("config"),
+        )
+        .expect("write config");
+        std::fs::write(
+            temp.path().join("openapi.json"),
+            br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{"/pets":{"get":{"parameters":[{"$ref":"middle.json#/Hop"}],"responses":{"204":{"description":"ok"}}}}}}"#,
+        )
+        .expect("write entry");
+        std::fs::write(
+            temp.path().join("middle.json"),
+            br#"{"Hop":{"$ref":"last.json#/Concrete"}}"#,
+        )
+        .expect("write middle");
+        std::fs::write(
+            temp.path().join("last.json"),
+            br#"{"Concrete":{"name":"limit","in":"query","schema":{"type":"integer"}}}"#,
+        )
+        .expect("write last");
+        let resolved = load_config(Some(Path::new("oasts.json")), temp.path()).expect("config");
+        let mut load_sink = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut load_sink).expect("graph");
+        assert!(!load_sink.has_errors(), "{:#?}", load_sink.as_slice());
+        std::fs::remove_file(temp.path().join("last.json")).expect("remove last hop");
+
+        let mut sink = DiagnosticSink::new();
+        let ir = parse(&graph, &mut sink).expect("supported OpenAPI version");
+
+        assert!(sink.has_errors(), "{:#?}", sink.as_slice());
+        assert!(ir.operations[0].parameters.is_empty());
+    }
+
+    #[test]
+    fn single_document_materialization_fast_reject_depends_on_entry_defs_references() {
+        assert!(!should_materialize_external_schemas(1, false));
+        assert!(should_materialize_external_schemas(1, true));
+    }
+
     fn load_fixture(name: &str) -> (ResolvedConfig, DocumentGraph) {
         let directory = fixture(name);
         let config_path = directory.join("oasts.yaml");
@@ -2996,6 +3453,292 @@ mod tests {
         let mut sink = DiagnosticSink::new();
         let ir = parse(&graph, &mut sink).expect("supported OpenAPI version");
         (temp, ir, sink)
+    }
+
+    fn compile_value(
+        document: &Value,
+    ) -> (
+        TempDir,
+        Option<Vec<crate::emit::GeneratedFile>>,
+        DiagnosticSink,
+    ) {
+        let temp = TempDir::new().expect("temp directory");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.json" },
+            "output": "generated"
+        });
+        std::fs::write(
+            temp.path().join("oasts.json"),
+            serde_json::to_vec(&config).expect("config json"),
+        )
+        .expect("write config");
+        std::fs::write(
+            temp.path().join("openapi.json"),
+            serde_json::to_vec(document).expect("document json"),
+        )
+        .expect("write document");
+        let resolved =
+            load_config(Some(Path::new("oasts.json")), temp.path()).expect("resolved config");
+        let mut sink = DiagnosticSink::new();
+        let files = compile_pipeline(&resolved, true, &mut sink);
+        (temp, files, sink)
+    }
+
+    fn entry_defs_document(definition_name: &str, component_name: Option<&str>) -> Value {
+        let mut schemas = Map::new();
+        if let Some(component_name) = component_name {
+            schemas.insert(component_name.to_owned(), json!({ "type": "integer" }));
+        }
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/value": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": format!("#/$defs/{definition_name}") }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "$defs": {
+                definition_name: { "type": "string" }
+            },
+            "components": { "schemas": schemas }
+        })
+    }
+
+    #[test]
+    fn entry_defs_reference_materializes_a_named_schema() {
+        let document = entry_defs_document("Foo", None);
+        let (_temp, files, sink) = compile_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let paths = files
+            .expect("entry definition emits")
+            .into_iter()
+            .map(|file| file.relative_path)
+            .collect::<Vec<_>>();
+        assert!(
+            paths.contains(&"types/components/foo.ts".to_owned()),
+            "{paths:#?}"
+        );
+    }
+
+    #[test]
+    fn entry_defs_exact_name_collision_reports_oxs1202() {
+        let document = entry_defs_document("Foo", Some("Foo"));
+        let (_temp, files, sink) = compile_value(&document);
+
+        assert!(files.is_none(), "exact collision must suppress output");
+        let diagnostics = sink.as_slice();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "OASTS1202"),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn entry_defs_case_only_identifier_difference_allocates_both() {
+        let document = entry_defs_document("FOO", Some("Foo"));
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let names = ir
+            .schemas
+            .iter()
+            .map(|schema| schema.name.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(names, HashSet::from(["FOO", "Foo"]));
+    }
+
+    #[test]
+    fn parameter_ref_chain_resolves_to_concrete_parameter() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "parameters": [{ "$ref": "#/components/parameters/A" }],
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            },
+            "components": {
+                "parameters": {
+                    "A": { "$ref": "#/components/parameters/B" },
+                    "B": {
+                        "name": "limit",
+                        "in": "query",
+                        "schema": { "type": "integer" }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(ir.operations[0].parameters.len(), 1);
+        assert_eq!(ir.operations[0].parameters[0].name, "limit");
+    }
+
+    #[test]
+    fn paths_and_webhooks_skip_specification_extensions() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "x-internal": "some string",
+                "/pets": {
+                    "get": { "responses": { "204": { "description": "ok" } } }
+                }
+            },
+            "webhooks": {
+                "x-internal": "some string",
+                "pet.created": {
+                    "post": { "responses": { "204": { "description": "ok" } } }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(ir.operations.len(), 1);
+        assert_eq!(ir.webhooks.len(), 1);
+        assert_eq!(ir.webhooks[0].name, "pet.created");
+    }
+
+    #[test]
+    fn responses_skip_specification_extensions() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "responses": {
+                            "x-internal": "some string",
+                            "204": { "description": "ok" }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(ir.operations[0].responses.len(), 1);
+        assert_eq!(
+            ir.operations[0].responses[0].status,
+            ResponseStatus::Exact("204".to_owned())
+        );
+    }
+
+    #[test]
+    fn callbacks_skip_specification_extensions() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/subscribe": {
+                    "post": {
+                        "callbacks": {
+                            "delivery": {
+                                "x-internal": "some string",
+                                "{$request.body#/callbackUrl}": {
+                                    "post": {
+                                        "responses": { "204": { "description": "ok" } }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "202": { "description": "accepted" } }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(ir.operations[0].callbacks[0].expressions.len(), 1);
+        assert_eq!(
+            ir.operations[0].callbacks[0].expressions[0].expression,
+            "{$request.body#/callbackUrl}"
+        );
+    }
+
+    #[test]
+    fn absent_operation_responses_follow_version_requirement() {
+        let document = |version| {
+            json!({
+                "openapi": version,
+                "info": { "title": "t", "version": "1" },
+                "paths": { "/pets": { "get": {} } }
+            })
+        };
+
+        let (_temp, ir, sink) = parse_value(&document("3.1.0"));
+        assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
+        assert!(ir.operations[0].responses.is_empty());
+
+        let (_temp, ir, sink) = parse_value(&document("3.0.3"));
+        assert!(ir.operations[0].responses.is_empty());
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_SHAPE
+                && diagnostic.json_pointer.as_deref() == Some("/paths/~1pets/get")
+                && diagnostic.message == "operation is missing responses"
+        }));
+    }
+
+    #[test]
+    fn empty_operation_responses_are_shape_errors_in_both_versions() {
+        for version in ["3.0.3", "3.1.0"] {
+            let document = json!({
+                "openapi": version,
+                "info": { "title": "t", "version": "1" },
+                "paths": { "/pets": { "get": { "responses": {} } } }
+            });
+            let (_temp, ir, sink) = parse_value(&document);
+
+            assert!(ir.operations[0].responses.is_empty());
+            assert!(sink.as_slice().iter().any(|diagnostic| {
+                diagnostic.code == CODE_SHAPE
+                    && diagnostic.json_pointer.as_deref() == Some("/paths/~1pets/get/responses")
+                    && diagnostic.message == "responses object must declare at least one response"
+            }));
+        }
+    }
+
+    #[test]
+    fn extension_only_operation_responses_are_shape_errors() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/pets": {
+                    "get": { "responses": { "x-internal": "some string" } }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(ir.operations[0].responses.is_empty());
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_SHAPE
+                && diagnostic.json_pointer.as_deref() == Some("/paths/~1pets/get/responses")
+                && diagnostic.message == "responses object must declare at least one response"
+        }));
     }
 
     #[test]
@@ -3852,7 +4595,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_valid_media_keys_and_rejects_parameterized_or_malformed_keys() {
+    fn canonicalizes_valid_media_keys_with_parameters_and_rejects_malformed_keys() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -3892,21 +4635,45 @@ mod tests {
         assert_eq!(
             request_media
                 .iter()
-                .map(|media| (media.name.as_str(), media.raw_name.as_str()))
+                .map(|media| {
+                    (
+                        media.essence.as_str(),
+                        media.full.as_str(),
+                        media.raw_name.as_str(),
+                    )
+                })
                 .collect::<Vec<_>>(),
             [
-                ("application/json", "Application/JSON"),
-                ("text/*", "TEXT/*"),
-                ("*/*", "*/*")
+                ("application/json", "application/json", "Application/JSON"),
+                ("text/*", "text/*", "TEXT/*"),
+                ("*/*", "*/*", "*/*"),
+                (
+                    "application/json",
+                    "application/json;charset=utf-8",
+                    "application/json; charset=utf-8"
+                ),
             ]
         );
         assert_eq!(
             operation.responses[0]
                 .media_types
                 .iter()
-                .map(|media| (media.name.as_str(), media.raw_name.as_str()))
+                .map(|media| {
+                    (
+                        media.essence.as_str(),
+                        media.full.as_str(),
+                        media.raw_name.as_str(),
+                    )
+                })
                 .collect::<Vec<_>>(),
-            [("image/png", "IMAGE/PNG")]
+            [
+                ("image/png", "image/png", "IMAGE/PNG"),
+                (
+                    "image/png",
+                    "image/png;quality=high",
+                    "image/png;quality=high"
+                ),
+            ]
         );
 
         let invalid = sink
@@ -3914,36 +4681,30 @@ mod tests {
             .iter()
             .filter(|diagnostic| diagnostic.code == "OASTS1107")
             .collect::<Vec<_>>();
-        assert_eq!(invalid.len(), 5);
-        let parameterized = invalid
-            .iter()
-            .filter(|diagnostic| diagnostic.message.contains("parameterized"))
-            .collect::<Vec<_>>();
-        assert_eq!(parameterized.len(), 2);
+        assert_eq!(invalid.len(), 3);
         assert!(
-            parameterized
-                .iter()
-                .all(|diagnostic| diagnostic.severity == Severity::Warning),
-            "parameterized content keys are an unsupported construct, not invalid input"
-        );
-        let malformed = invalid
-            .iter()
-            .filter(|diagnostic| diagnostic.message.contains("malformed"))
-            .collect::<Vec<_>>();
-        assert_eq!(malformed.len(), 3);
-        assert!(
-            malformed
+            invalid
                 .iter()
                 .all(|diagnostic| diagnostic.severity == Severity::Warning),
             "malformed content keys are unusable branches and are dropped"
         );
+        assert!(
+            invalid
+                .iter()
+                .all(|diagnostic| diagnostic.message.contains("malformed"))
+        );
         assert!(invalid.iter().all(|diagnostic| {
             diagnostic.source_id.is_some() && diagnostic.json_pointer.is_some()
         }));
+        assert!(
+            sink.as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.code != CODE_DUPLICATE_MEDIA_TYPE)
+        );
     }
 
     #[test]
-    fn parameterized_content_key_warns_and_drops_the_entry_without_erroring() {
+    fn parameterized_content_key_preserves_quoted_value_in_canonical_full_name() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -3953,7 +4714,7 @@ mod tests {
                             "200": {
                                 "description": "ok",
                                 "content": {
-                                    "application/json;stream=watch": { "schema": { "type": "string" } }
+                                    "Application/JSON; stream=watch; Note=\"a;b\"": { "schema": { "type": "string" } }
                                 }
                             }
                         }
@@ -3963,20 +4724,10 @@ mod tests {
         });
         let (_temp, ir, sink) = parse_value(&document);
 
-        // The only content key is parameterized: it is dropped, leaving a no-content
-        // branch exactly as if the content map were absent.
-        assert!(ir.operations[0].responses[0].media_types.is_empty());
-
-        let warnings = sink
-            .as_slice()
-            .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1107")
-            .collect::<Vec<_>>();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].severity, Severity::Warning);
-        assert!(warnings[0].message.contains("parameterized"));
-        // Generation continues: no Error-severity diagnostic, so exit 0.
-        assert!(!sink.has_errors());
+        let media = &ir.operations[0].responses[0].media_types[0];
+        assert_eq!(media.essence, "application/json");
+        assert_eq!(media.full, "application/json;note=\"a;b\";stream=watch");
+        assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
     }
 
     #[test]
@@ -4015,6 +4766,48 @@ mod tests {
     }
 
     #[test]
+    fn parameterized_media_ranges_warn_and_drop_while_bare_ranges_survive() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/ranges": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "text/*": { "schema": { "type": "string" } },
+                                    "text/*; q=0.5": { "schema": { "type": "string" } },
+                                    "*/*": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        // The bare ranges keep their branches; the parameterized range is dropped.
+        let essences = ir.operations[0].responses[0]
+            .media_types
+            .iter()
+            .map(|media| media.essence.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(essences, ["text/*", "*/*"]);
+
+        let warnings = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1107")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert!(warnings[0].message.contains("text/*; q=0.5"));
+        assert!(!sink.has_errors());
+    }
+
+    #[test]
     fn duplicate_canonical_media_keys_diagnose_the_second_and_drop_both() {
         let document = json!({
             "openapi": "3.1.0",
@@ -4023,8 +4816,8 @@ mod tests {
                     "post": {
                         "requestBody": {
                             "content": {
-                                "Application/JSON": { "schema": { "type": "string" } },
-                                "application/json": { "schema": { "type": "integer" } },
+                                "Application/JSON; Charset=utf-8; version=1": { "schema": { "type": "string" } },
+                                "application/json;VERSION=1;charset=utf-8": { "schema": { "type": "integer" } },
                                 "text/plain": { "schema": { "type": "string" } }
                             }
                         },
@@ -4050,10 +4843,10 @@ mod tests {
                 .as_ref()
                 .expect("request body")
                 .media_types[0]
-                .name,
+                .essence,
             "text/plain"
         );
-        assert_eq!(operation.responses[0].media_types[0].name, "image/*");
+        assert_eq!(operation.responses[0].media_types[0].essence, "image/*");
 
         let duplicates = sink
             .as_slice()
@@ -4068,9 +4861,16 @@ mod tests {
         );
         assert!(duplicates.iter().any(|diagnostic| {
             diagnostic.json_pointer.as_deref()
-                == Some("/paths/~1duplicate/post/requestBody/content/application~1json")
-                && diagnostic.message.contains("Application/JSON")
-                && diagnostic.message.contains("application/json")
+                == Some("/paths/~1duplicate/post/requestBody/content/application~1json;VERSION=1;charset=utf-8")
+                && diagnostic
+                    .message
+                    .contains("Application/JSON; Charset=utf-8; version=1")
+                && diagnostic
+                    .message
+                    .contains("application/json;VERSION=1;charset=utf-8")
+                && diagnostic
+                    .message
+                    .contains("application/json;charset=utf-8;version=1")
         }));
         assert!(duplicates.iter().any(|diagnostic| {
             diagnostic.json_pointer.as_deref()
@@ -4255,12 +5055,132 @@ mod tests {
         assert!(!parameters[1].allow_reserved);
         assert_eq!(parameters[8].explode, None);
         assert!(!parameters[8].allow_reserved);
+        assert!(
+            parameters
+                .iter()
+                .all(|parameter| parameter.content_media_type.is_none())
+        );
         assert!(sink.as_slice().iter().any(|diagnostic| {
             diagnostic.code == CODE_SHAPE
                 && diagnostic.json_pointer.as_deref()
                     == Some("/paths/~1styles/get/parameters/7/style")
                 && diagnostic.message.contains("parameter.style")
         }));
+    }
+
+    fn document_with_parameter(parameter: Value) -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/parameter": {
+                    "get": {
+                        "parameters": [parameter],
+                        "responses": { "204": { "description": "empty" } }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn parameter_content_parses_schema_and_ignores_serialization_fields() {
+        let document = document_with_parameter(json!({
+            "name": "filter",
+            "in": "query",
+            "content": {
+                "Application/JSON": { "schema": { "type": "integer" } }
+            },
+            "style": "invalid",
+            "explode": true,
+            "allowReserved": true
+        }));
+        let (_temp, ir, sink) = parse_value(&document);
+        let parameter = &ir.operations[0].parameters[0];
+
+        assert_eq!(
+            parameter.content_media_type.as_deref(),
+            Some("application/json")
+        );
+        assert!(matches!(
+            parameter.schema,
+            SchemaNode::Primitive {
+                ty: PrimitiveType::Integer,
+                ..
+            }
+        ));
+        assert_eq!(parameter.style, None);
+        assert_eq!(parameter.explode, None);
+        assert!(!parameter.allow_reserved);
+        assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn parameter_content_with_two_entries_is_a_shape_error() {
+        let document = document_with_parameter(json!({
+            "name": "filter",
+            "in": "query",
+            "content": {
+                "application/json": { "schema": { "type": "integer" } },
+                "text/plain": { "schema": { "type": "string" } }
+            }
+        }));
+        let (_temp, _ir, sink) = parse_value(&document);
+
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_SHAPE
+                && diagnostic.message == "parameter content map must contain exactly one entry"
+        }));
+        assert!(sink.has_errors());
+    }
+
+    #[test]
+    fn parameter_without_schema_or_content_keeps_unsupported_warning() {
+        for parameter in [
+            json!({ "name": "filter", "in": "query" }),
+            json!({ "name": "filter", "in": "query", "content": {} }),
+        ] {
+            let document = document_with_parameter(parameter);
+            let (_temp, ir, sink) = parse_value(&document);
+            let parameter = &ir.operations[0].parameters[0];
+
+            assert_eq!(parameter.content_media_type, None);
+            assert!(matches!(parameter.schema, SchemaNode::Unknown { .. }));
+            assert!(sink.as_slice().iter().any(|diagnostic| {
+                diagnostic.code == CODE_UNSUPPORTED
+                    && diagnostic.json_pointer.as_deref()
+                        == Some("/paths/~1parameter/get/parameters/0/schema")
+            }));
+        }
+    }
+
+    #[test]
+    fn malformed_parameter_content_shape_or_key_is_diagnosed_and_dropped() {
+        for (content, code) in [
+            (json!([]), CODE_SHAPE),
+            (
+                json!({ "missing-slash": { "schema": { "type": "string" } } }),
+                CODE_MEDIA_TYPE,
+            ),
+        ] {
+            let document = document_with_parameter(json!({
+                "name": "filter",
+                "in": "query",
+                "content": content
+            }));
+            let (_temp, ir, sink) = parse_value(&document);
+
+            assert!(ir.operations[0].parameters.is_empty());
+            assert!(
+                sink.as_slice()
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code)
+            );
+            assert!(
+                sink.as_slice()
+                    .iter()
+                    .all(|diagnostic| { diagnostic.code != CODE_UNSUPPORTED })
+            );
+        }
     }
 
     #[test]
@@ -4276,7 +5196,7 @@ mod tests {
                                     "schema": { "type": "object" },
                                     "encoding": {
                                         "field-a": {
-                                            "contentType": "text/plain, application/json",
+                                            "contentType": "application/json; note=\"a,b\", text/plain, application/xml",
                                             "headers": {
                                                 "X-Required": { "$ref": "#/components/headers/Required" },
                                                 "X-Optional": { "schema": { "type": "integer" } }
@@ -4326,7 +5246,7 @@ mod tests {
             .media_types;
         let form = media_types
             .iter()
-            .find(|media| media.name == "application/x-www-form-urlencoded")
+            .find(|media| media.essence == "application/x-www-form-urlencoded")
             .expect("form media type");
         assert_eq!(
             form.encodings
@@ -4338,7 +5258,11 @@ mod tests {
         let encoding = &form.encodings[0].1;
         assert_eq!(
             encoding.content_type,
-            Some(vec!["text/plain".to_owned(), "application/json".to_owned()])
+            Some(vec![
+                "application/json; note=\"a,b\"".to_owned(),
+                "text/plain".to_owned(),
+                "application/xml".to_owned(),
+            ])
         );
         assert_eq!(encoding.style, Some(ParamStyle::DeepObject));
         assert_eq!(encoding.explode, Some(true));
@@ -4355,6 +5279,12 @@ mod tests {
             encoding.headers[0].1.source.json_pointer,
             "/components/headers/Required"
         );
+        assert!(
+            encoding
+                .headers
+                .iter()
+                .all(|(_, header)| header.content_media_type.is_none())
+        );
         assert!(matches!(
             encoding.headers[0].1.schema,
             SchemaNode::Primitive {
@@ -4368,13 +5298,13 @@ mod tests {
 
         let multipart = media_types
             .iter()
-            .find(|media| media.name == "multipart/form-data")
+            .find(|media| media.essence == "multipart/form-data")
             .expect("multipart media type");
         assert_eq!(multipart.encodings[0].1.style, Some(ParamStyle::Form));
         assert!(
             media_types
                 .iter()
-                .find(|media| media.name == "application/json")
+                .find(|media| media.essence == "application/json")
                 .expect("JSON media type")
                 .encodings
                 .is_empty()
@@ -4385,6 +5315,108 @@ mod tests {
                 .is_empty()
         );
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    fn document_with_encoding_header(header: Value) -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/encoding-header": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": { "type": "object" },
+                                    "encoding": {
+                                        "field": { "headers": { "X-Field": header } }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "empty" } }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn encoding_header_content_parses_schema_without_unsupported_warning() {
+        let document = document_with_encoding_header(json!({
+            "content": {
+                "Application/JSON; Charset=UTF-8": {
+                    "schema": { "type": "boolean" }
+                }
+            }
+        }));
+        let (_temp, ir, sink) = parse_value(&document);
+        let header = &ir.operations[0]
+            .request_body
+            .as_ref()
+            .expect("request body")
+            .media_types[0]
+            .encodings[0]
+            .1
+            .headers[0]
+            .1;
+
+        assert_eq!(
+            header.content_media_type.as_deref(),
+            Some("application/json;charset=utf-8")
+        );
+        assert!(matches!(
+            header.schema,
+            SchemaNode::Primitive {
+                ty: PrimitiveType::Boolean,
+                ..
+            }
+        ));
+        assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn encoding_header_content_with_two_entries_is_a_shape_error() {
+        let document = document_with_encoding_header(json!({
+            "content": {
+                "application/json": { "schema": { "type": "boolean" } },
+                "text/plain": { "schema": { "type": "string" } }
+            }
+        }));
+        let (_temp, _ir, sink) = parse_value(&document);
+
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_SHAPE
+                && diagnostic.message
+                    == "encoding header content map must contain exactly one entry"
+        }));
+        assert!(sink.has_errors());
+    }
+
+    #[test]
+    fn encoding_header_without_schema_or_content_keeps_unsupported_warning() {
+        for value in [json!({}), json!({ "content": {} })] {
+            let document = document_with_encoding_header(value);
+            let (_temp, ir, sink) = parse_value(&document);
+            let header = &ir.operations[0]
+                .request_body
+                .as_ref()
+                .expect("request body")
+                .media_types[0]
+                .encodings[0]
+                .1
+                .headers[0]
+                .1;
+
+            assert_eq!(header.content_media_type, None);
+            assert!(matches!(header.schema, SchemaNode::Unknown { .. }));
+            assert!(sink.as_slice().iter().any(|diagnostic| {
+                diagnostic.code == CODE_UNSUPPORTED
+                    && diagnostic.json_pointer.as_deref()
+                        == Some(
+                            "/paths/~1encoding-header/post/requestBody/content/multipart~1form-data/encoding/field/headers/X-Field/schema"
+                        )
+            }));
+        }
     }
 
     fn document_with_response(response: Value) -> Value {
@@ -4470,29 +5502,88 @@ mod tests {
             headers[2].1.source.json_pointer,
             "/components/headers/Referenced"
         );
+        assert!(
+            headers
+                .iter()
+                .all(|(_, header)| header.content_media_type.is_none())
+        );
     }
 
     #[test]
-    fn response_header_without_schema_warns_and_drops() {
+    fn response_header_content_parses_schema_without_unsupported_warning() {
         let document = document_with_response(json!({
             "description": "ok",
             "headers": {
-                "X-Content": { "content": { "text/plain": { "schema": { "type": "string" } } } }
+                "X-Content": {
+                    "content": {
+                        "Application/JSON; Charset=UTF-8": {
+                            "schema": { "type": "string" }
+                        }
+                    }
+                }
             }
         }));
         let (_temp, ir, sink) = parse_value(&document);
-        let diagnostic = sink
-            .as_slice()
-            .iter()
-            .find(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
-            .expect("unsupported schema warning");
+        let header = &ir.operations[0].responses[0].headers[0].1;
 
-        assert_eq!(diagnostic.severity, Severity::Warning);
         assert_eq!(
-            diagnostic.json_pointer.as_deref(),
-            Some("/paths/~1response/get/responses/200/headers/X-Content/schema")
+            header.content_media_type.as_deref(),
+            Some("application/json;charset=utf-8")
         );
-        assert!(ir.operations[0].responses[0].headers.is_empty());
+        assert!(matches!(
+            header.schema,
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            }
+        ));
+        assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn response_header_content_with_two_entries_is_a_shape_error() {
+        let document = document_with_response(json!({
+            "description": "ok",
+            "headers": {
+                "X-Content": {
+                    "content": {
+                        "application/json": { "schema": { "type": "string" } },
+                        "text/plain": { "schema": { "type": "string" } }
+                    }
+                }
+            }
+        }));
+        let (_temp, _ir, sink) = parse_value(&document);
+
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_SHAPE
+                && diagnostic.message
+                    == "response header content map must contain exactly one entry"
+        }));
+        assert!(sink.has_errors());
+    }
+
+    #[test]
+    fn response_header_without_schema_or_content_keeps_unsupported_warning() {
+        for value in [json!({}), json!({ "content": {} })] {
+            let document = document_with_response(json!({
+                "description": "ok",
+                "headers": { "X-Missing": value }
+            }));
+            let (_temp, ir, sink) = parse_value(&document);
+            let diagnostic = sink
+                .as_slice()
+                .iter()
+                .find(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
+                .expect("unsupported schema warning");
+
+            assert_eq!(diagnostic.severity, Severity::Warning);
+            assert_eq!(
+                diagnostic.json_pointer.as_deref(),
+                Some("/paths/~1response/get/responses/200/headers/X-Missing/schema")
+            );
+            assert!(ir.operations[0].responses[0].headers.is_empty());
+        }
     }
 
     #[test]
@@ -5532,7 +6623,7 @@ mod tests {
             .expect("request body")
             .media_types
             .iter()
-            .find(|media| media.name == "multipart/form-data")
+            .find(|media| media.essence == "multipart/form-data")
             .expect("multipart");
         assert_eq!(multipart.encodings.len(), 4);
         assert!(multipart.encodings[0].1.headers.is_empty());
@@ -6339,20 +7430,15 @@ mod tests {
         for invalid in ["", "099", "600", "20X", "2000"] {
             assert_eq!(parse_response_status(invalid), None);
         }
-        assert_eq!(
-            canonical_media_type("!#$%&'*+-.^_`|~/!#$%&'*+-.^_`|~"),
-            Ok("!#$%&'*+-.^_`|~/!#$%&'*+-.^_`|~".to_owned())
-        );
+        let media = canonical_content_key("!#$%&'*+-.^_`|~/!#$%&'*+-.^_`|~")
+            .expect("RFC 9110 token characters");
+        assert_eq!(media.full, "!#$%&'*+-.^_`|~/!#$%&'*+-.^_`|~");
         for malformed in ["type/", "/subtype", "type/subtype/extra", "type /subtype"] {
-            assert_eq!(
-                canonical_media_type(malformed),
-                Err(MediaKeyError::Malformed)
-            );
+            assert!(canonical_content_key(malformed).is_err());
         }
-        assert_eq!(
-            canonical_media_type("type/subtype;parameter=value"),
-            Err(MediaKeyError::Parameterized)
-        );
+        let parameterized = canonical_content_key("type/subtype;parameter=value")
+            .expect("parameterized media type");
+        assert_eq!(parameterized.full, "type/subtype;parameter=value");
 
         for (value, ty, expected) in [
             (json!("x"), PrimitiveType::String, true),
@@ -6444,6 +7530,7 @@ mod tests {
             deprecated: false,
             description: None,
             schema: schema.clone(),
+            content_media_type: None,
             style: None,
             explode: None,
             allow_reserved: false,
@@ -6466,7 +7553,10 @@ mod tests {
         // escaping the parser would silently flip merges. Walk every node of the two
         // constraint-heavy fixtures and assert canonical form throughout.
         fn non_default<T: Default + PartialEq>(group: &Option<Box<T>>) -> bool {
-            group.as_deref().is_none_or(|value| *value != T::default())
+            match group.as_deref() {
+                None => true,
+                Some(value) => *value != T::default(),
+            }
         }
         fn assert_canonical(schema: &SchemaNode) {
             let meta = schema.meta();
@@ -6549,5 +7639,66 @@ mod tests {
             meta: SchemaMeta::default(),
         };
         assert_canonical(&open);
+
+        // The walked fixtures never populate the enum-extension group; check its
+        // canonicality predicate directly for both the populated and default shapes.
+        assert!(non_default(&Some(Box::new(EnumExtensionData {
+            enum_varnames: Some(json!(["A"])),
+            ..EnumExtensionData::default()
+        }))));
+        assert!(!non_default(&Some(Box::new(EnumExtensionData::default()))));
+
+        // The walked fixtures have no tuple carrying a rest schema; cover both rest arms.
+        for rest in [
+            TupleRest::Schema(Box::new(SchemaNode::Any {
+                meta: SchemaMeta::default(),
+            })),
+            TupleRest::Allowed,
+        ] {
+            let tuple = SchemaNode::Tuple {
+                prefix_items: Vec::new(),
+                rest,
+                finite: None,
+                meta: SchemaMeta::default(),
+            };
+            assert_canonical(&tuple);
+        }
+    }
+
+    #[test]
+    fn collect_schema_refs_descends_into_tuple_rest_schemas() {
+        let reference = |pointer: &str| SchemaNode::Ref {
+            target: SchemaRef {
+                source_id: "entry".to_owned(),
+                json_pointer: pointer.to_owned(),
+            },
+            meta: SchemaMeta::default(),
+        };
+        let tuple = SchemaNode::Tuple {
+            prefix_items: vec![reference("/$defs/First")],
+            rest: TupleRest::Schema(Box::new(reference("/$defs/Rest"))),
+            finite: None,
+            meta: SchemaMeta::default(),
+        };
+
+        let mut refs = Vec::new();
+        collect_schema_refs(&tuple, &mut refs);
+
+        assert_eq!(
+            refs.iter()
+                .map(|target| target.json_pointer.as_str())
+                .collect::<Vec<_>>(),
+            ["/$defs/First", "/$defs/Rest"]
+        );
+
+        let open_tuple = SchemaNode::Tuple {
+            prefix_items: vec![reference("/$defs/Only")],
+            rest: TupleRest::Allowed,
+            finite: None,
+            meta: SchemaMeta::default(),
+        };
+        let mut refs = Vec::new();
+        collect_schema_refs(&open_tuple, &mut refs);
+        assert_eq!(refs.len(), 1);
     }
 }

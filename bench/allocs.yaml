@@ -9,10 +9,10 @@ keys:
         deallocs: 774291
         allocBytes: 126466727
       - stage: "parse"
-        allocs: 620136
+        allocs: 624002
         reallocs: 46884
-        deallocs: 274527
-        allocBytes: 90944166
+        deallocs: 276460
+        allocBytes: 91661412
       - stage: "analyze"
         allocs: 27681
         reallocs: 6797
@@ -24,7 +24,7 @@ keys:
         deallocs: 730738
         allocBytes: 64263809
     informational:
-      peakBytes: 117744098
+      peakBytes: 118062976
   - fixture: "stripe-3.0"
     config: "oasts.yaml"
     stages:
@@ -34,10 +34,10 @@ keys:
         deallocs: 565269
         allocBytes: 91561055
       - stage: "parse"
-        allocs: 391450
+        allocs: 394972
         reallocs: 32071
-        deallocs: 160323
-        allocBytes: 63298416
+        deallocs: 162084
+        allocBytes: 63905116
       - stage: "analyze"
         allocs: 38989
         reallocs: 9382
@@ -49,7 +49,7 @@ keys:
         deallocs: 432322
         allocBytes: 38417369
     informational:
-      peakBytes: 79315095
+      peakBytes: 79577731
   - fixture: "kubernetes-core-v1-3.0"
     config: "oasts.yaml"
     stages:
@@ -59,22 +59,22 @@ keys:
         deallocs: 197146
         allocBytes: 26317095
       - stage: "parse"
-        allocs: 110203
-        reallocs: 17300
-        deallocs: 60123
-        allocBytes: 14655717
+        allocs: 116798
+        reallocs: 18344
+        deallocs: 64331
+        allocBytes: 15177216
       - stage: "analyze"
         allocs: 8120
         reallocs: 2347
         deallocs: 6370
         allocBytes: 607865
       - stage: "emit"
-        allocs: 460569
-        reallocs: 175683
-        deallocs: 459570
-        allocBytes: 121365808
+        allocs: 461969
+        reallocs: 176383
+        deallocs: 460970
+        allocBytes: 121567530
     informational:
-      peakBytes: 27798403
+      peakBytes: 27946686
   - fixture: "kubernetes-apps-v1-3.0"
     config: "oasts.yaml"
     stages:
@@ -84,22 +84,22 @@ keys:
         deallocs: 78173
         allocBytes: 11479208
       - stage: "parse"
-        allocs: 46246
-        reallocs: 7012
-        deallocs: 24915
-        allocBytes: 6169894
+        allocs: 48647
+        reallocs: 7383
+        deallocs: 26441
+        allocBytes: 6359992
       - stage: "analyze"
         allocs: 4459
         reallocs: 1345
         deallocs: 3574
         allocBytes: 284439
       - stage: "emit"
-        allocs: 414963
-        reallocs: 157135
-        deallocs: 414482
-        allocBytes: 143120393
+        allocs: 415463
+        reallocs: 157385
+        deallocs: 414982
+        allocBytes: 143192461
     informational:
-      peakBytes: 19048777
+      peakBytes: 19104648
   - fixture: "kubernetes-apiextensions-v1-3.0"
     config: "oasts.yaml"
     stages:
@@ -109,22 +109,22 @@ keys:
         deallocs: 13408
         allocBytes: 2106115
       - stage: "parse"
-        allocs: 8247
-        reallocs: 1202
-        deallocs: 4339
-        allocBytes: 1201926
+        allocs: 8592
+        reallocs: 1246
+        deallocs: 4551
+        allocBytes: 1230620
       - stage: "analyze"
         allocs: 1256
         reallocs: 432
         deallocs: 1051
         allocBytes: 79003
       - stage: "emit"
-        allocs: 28391
-        reallocs: 11983
-        deallocs: 28282
-        allocBytes: 8107160
+        allocs: 28451
+        reallocs: 12013
+        deallocs: 28342
+        allocBytes: 8115960
     informational:
-      peakBytes: 2317702
+      peakBytes: 2326245
   - fixture: "petstore-3.0"
     config: "oasts.yaml"
     stages:
@@ -132,12 +132,12 @@ keys:
         allocs: 1997
         reallocs: 123
         deallocs: 1679
-        allocBytes: 174110
+        allocBytes: 183644
       - stage: "parse"
-        allocs: 415
+        allocs: 427
         reallocs: 59
-        deallocs: 225
-        allocBytes: 74931
+        deallocs: 231
+        allocBytes: 78219
       - stage: "analyze"
         allocs: 72
         reallocs: 2
@@ -149,7 +149,7 @@ keys:
         deallocs: 666
         allocBytes: 36613
     informational:
-      peakBytes: 93433
+      peakBytes: 93559
   - fixture: "petstore-3.0-client"
     config: "oasts-client.yaml"
     stages:
@@ -157,12 +157,12 @@ keys:
         allocs: 1997
         reallocs: 123
         deallocs: 1679
-        allocBytes: 174110
+        allocBytes: 183644
       - stage: "parse"
-        allocs: 415
+        allocs: 427
         reallocs: 59
-        deallocs: 225
-        allocBytes: 74931
+        deallocs: 231
+        allocBytes: 78219
       - stage: "analyze"
         allocs: 72
         reallocs: 2
@@ -172,14 +172,14 @@ keys:
         allocs: 193
         reallocs: 0
         deallocs: 61
-        allocBytes: 20312
+        allocBytes: 16808
       - stage: "emit"
-        allocs: 2070
-        reallocs: 482
-        deallocs: 2019
-        allocBytes: 295873
+        allocs: 2087
+        reallocs: 484
+        deallocs: 2032
+        allocBytes: 318454
     informational:
-      peakBytes: 253083
+      peakBytes: 304260
   - fixture: "tictactoe-3.1"
     config: "oasts.yaml"
     stages:
@@ -187,12 +187,12 @@ keys:
         allocs: 3915
         reallocs: 253
         deallocs: 3308
-        allocBytes: 358345
+        allocBytes: 377707
       - stage: "parse"
-        allocs: 785
+        allocs: 801
         reallocs: 111
-        deallocs: 408
-        allocBytes: 112029
+        deallocs: 416
+        allocBytes: 117191
       - stage: "analyze"
         allocs: 150
         reallocs: 14
@@ -204,80 +204,80 @@ keys:
         deallocs: 1446
         allocBytes: 95172
     informational:
-      peakBytes: 185302
+      peakBytes: 185428
   - fixture: "client-showcase-3.1"
     config: "oasts.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 5149
-        reallocs: 146
-        deallocs: 4342
-        allocBytes: 453633
+        allocs: 6644
+        reallocs: 192
+        deallocs: 5608
+        allocBytes: 679449
       - stage: "parse"
-        allocs: 936
-        reallocs: 80
-        deallocs: 427
-        allocBytes: 180586
+        allocs: 1230
+        reallocs: 107
+        deallocs: 583
+        allocBytes: 237799
       - stage: "analyze"
-        allocs: 136
-        reallocs: 18
-        deallocs: 96
-        allocBytes: 10380
+        allocs: 156
+        reallocs: 21
+        deallocs: 110
+        allocBytes: 10938
       - stage: "clientModel"
-        allocs: 817
-        reallocs: 47
-        deallocs: 329
-        allocBytes: 92259
+        allocs: 971
+        reallocs: 41
+        deallocs: 376
+        allocBytes: 106966
       - stage: "emit"
-        allocs: 5230
-        reallocs: 1222
-        deallocs: 5175
-        allocBytes: 621717
+        allocs: 6565
+        reallocs: 1550
+        deallocs: 6500
+        allocBytes: 766131
     informational:
-      peakBytes: 476584
+      peakBytes: 620077
   - fixture: "auth-showcase-3.1"
     config: "oasts.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 2365
-        reallocs: 63
-        deallocs: 1999
-        allocBytes: 215449
+        allocs: 3160
+        reallocs: 80
+        deallocs: 2672
+        allocBytes: 331151
       - stage: "parse"
-        allocs: 425
-        reallocs: 42
-        deallocs: 204
-        allocBytes: 87297
+        allocs: 603
+        reallocs: 59
+        deallocs: 292
+        allocBytes: 132829
       - stage: "analyze"
-        allocs: 90
-        reallocs: 11
-        deallocs: 65
-        allocBytes: 7416
+        allocs: 120
+        reallocs: 15
+        deallocs: 86
+        allocBytes: 8940
       - stage: "clientModel"
-        allocs: 341
+        allocs: 467
         reallocs: 0
-        deallocs: 146
-        allocBytes: 32356
+        deallocs: 196
+        allocBytes: 44484
       - stage: "emit"
-        allocs: 3298
-        reallocs: 802
-        deallocs: 3253
-        allocBytes: 382085
+        allocs: 4549
+        reallocs: 1107
+        deallocs: 4492
+        allocBytes: 487327
     informational:
-      peakBytes: 299634
+      peakBytes: 424547
   - fixture: "pathological-3.1"
     config: "oasts.yaml"
     stages:
       - stage: "loadGraph"
         allocs: 17065
-        reallocs: 707
+        reallocs: 712
         deallocs: 13723
-        allocBytes: 1643145
+        allocBytes: 1713833
       - stage: "parse"
-        allocs: 4804
-        reallocs: 302
-        deallocs: 2353
-        allocBytes: 877170
+        allocs: 4822
+        reallocs: 307
+        deallocs: 2362
+        allocBytes: 888818
       - stage: "analyze"
         allocs: 786
         reallocs: 108
@@ -289,4 +289,4 @@ keys:
         deallocs: 5704
         allocBytes: 509200
     informational:
-      peakBytes: 1165981
+      peakBytes: 1167283

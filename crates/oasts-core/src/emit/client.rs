@@ -4,25 +4,26 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::client_model::{
     AuthAlternative, AuthKind, AuthSchemeUse, BaseUrlPlan, BodyPlan, ClientModel, DecoderClass,
-    FieldSerializationPlan, FormFieldPlan, HeaderInputRequirement, HelperId, OperationPlan,
-    PartMediaPlan, PayloadDisposition, ResponseMatchKind, ResponsePlan, media_essence,
+    FieldSerializationPlan, FormFieldPlan, HelperId, OperationPlan, PartMediaPlan,
+    PayloadDisposition, PayloadKind, ResponseMatchKind, ResponsePlan,
 };
 use crate::config::{
     AuthEnforcement, CacheMode, CredentialsMode, DocumentationConfig, FetchDefaults, RedirectMode,
     ReferrerPolicyValue, RequestModeValue, ValidationEngine,
 };
 use crate::ir::{
-    Operation, Param, ParamLocation, ParamStyle, PrimitiveType, SchemaNode, SecKind, SegmentPart,
+    Operation, ParamLocation, ParamStyle, PrimitiveType, SchemaNode, SecKind, SegmentPart,
     ServerVariable,
 };
+use crate::media::is_json;
 
 use super::model::EmissionModel;
 use super::runtime_assets::{RuntimeSelection, emit_runtime_files};
 use super::validators::operation_parameter_validator_names;
 use super::{
     ClientDocKind, Emitter as TypesEmitter, GeneratedFile, TypePosition, encode_comment_text,
-    import_extension, media_is_json, render_property_key, render_ts_string, source_diagnostic,
-    uppercase_first, write_client_operation_tsdoc, write_source_metadata,
+    import_extension, render_property_key, render_ts_string, uppercase_first,
+    write_client_operation_tsdoc, write_source_metadata,
 };
 
 pub(crate) fn emit_client_from_model(
@@ -47,49 +48,6 @@ pub(crate) fn emit_client_from_model(
             continue;
         };
         let operation = model.analyzed.ir.operations[plan.operation_index].clone();
-        let parameters = operation
-            .parameters
-            .iter()
-            .filter(|parameter| parameter.location != ParamLocation::Cookie)
-            .collect::<Vec<_>>();
-        assert_eq!(parameters.len(), plan.param_plans.len());
-        let mut input_properties: BTreeMap<&str, &Param> = BTreeMap::new();
-        let mut has_parameter_collision = false;
-        for (parameter, parameter_plan) in parameters.iter().zip(&plan.param_plans) {
-            if let Some(first_parameter) = input_properties.get(parameter_plan.name.as_str()) {
-                model.sink.push(source_diagnostic(
-                    "OASTS1422",
-                    format!(
-                        "parameter '{}' in {} ({}) and parameter '{}' in {} ({}) collide at generated input property '{}'",
-                        first_parameter.name,
-                        location_name(first_parameter.location),
-                        first_parameter.source.display(),
-                        parameter.name,
-                        location_name(parameter.location),
-                        parameter.source.display(),
-                        parameter_plan.name,
-                    ),
-                    &parameter.source,
-                ));
-                has_parameter_collision = true;
-                break;
-            }
-            input_properties.insert(parameter_plan.name.as_str(), *parameter);
-        }
-        let mut has_body_collision = false;
-        if plan.body_plan.is_some()
-            && let Some(parameter) = parameters.iter().find(|parameter| parameter.name == "body")
-        {
-            model.sink.push(source_diagnostic(
-                "OASTS1421",
-                "parameter 'body' collides with the request body at generated input property 'body'",
-                &parameter.source,
-            ));
-            has_body_collision = true;
-        }
-        if has_parameter_collision || has_body_collision {
-            continue;
-        }
         helper_ids.extend(
             plan.param_plans
                 .iter()
@@ -158,8 +116,8 @@ pub(crate) fn emit_client_from_model(
     files.extend(emit_runtime_files(RuntimeSelection {
         model,
         helper_ids: &helper_ids,
-        serialize_needed: true,
         base_url: &base_url,
+        relative_server_url: client.base_url_required,
         source: &source,
         server_variables: &server_variables,
     }));
@@ -335,7 +293,7 @@ fn emit_operation(
         .as_ref()
         .expect("client emission requires client config")
         .auth_enforcement;
-    let (imports_basic_credential, imports_cookie_credential) =
+    let (imports_basic_credential, imports_cookie_credential, imports_client_certificate) =
         call_args_credentials(plan, auth_enforcement);
     let runtime_directory = &model.config.emit.runtime_directory;
     let unchecked_response = model
@@ -402,6 +360,9 @@ fn emit_operation(
         output.push_str(";\n");
     }
     output.push_str("import { execute, executeOrThrow");
+    if imports_client_certificate {
+        output.push_str(", type AmbientClientCertificate");
+    }
     if imports_cookie_credential {
         output.push_str(", type AmbientCookieCredential");
     }
@@ -552,8 +513,8 @@ fn validation_flags(model: &EmissionModel<'_, '_>) -> (bool, bool) {
     }
 }
 
-/// The request-side checks: every non-cookie parameter (cookies never reach the fetch client) in
-/// declared order, then the JSON request body. Empty unless request validation is enabled.
+/// The request-side checks: every parameter in declared order, then the JSON request body. Empty
+/// unless request validation is enabled.
 fn request_validation_checks(
     operation: &Operation,
     plan: &OperationPlan,
@@ -566,11 +527,11 @@ fn request_validation_checks(
     let mut checks = Vec::new();
     let names = operation_parameter_validator_names(operation, stem);
     for (parameter, type_name) in operation.parameters.iter().zip(&names) {
-        if parameter.location == ParamLocation::Cookie {
-            continue;
-        }
         checks.push(RequestCheck {
-            access: input_member(&parameter.name),
+            access: input_member(InputMember::Parameter {
+                location: parameter.location,
+                name: &parameter.name,
+            }),
             validator: format!("validate{type_name}"),
             base_path: format!(
                 "[{}, {}]",
@@ -588,7 +549,7 @@ fn request_validation_checks(
             .as_ref()
             .is_some_and(|body| body.required);
         checks.push(RequestCheck {
-            access: "input.body".to_owned(),
+            access: input_member(InputMember::Body),
             validator: format!("validate{stem}RequestBody"),
             base_path: "[\"body\"]".to_owned(),
             guarded: !required,
@@ -633,10 +594,7 @@ fn response_validation_checks(
 fn body_validation_check(response: &ResponsePlan, stem: &str) -> Option<(String, ResponseBody)> {
     if !matches!(response.payload, PayloadDisposition::Payload { .. })
         || response.content_type_discriminated
-        || !response
-            .media
-            .iter()
-            .any(|media| media_is_json(&media.media))
+        || !response.media.iter().any(|media| is_json(&media.media))
     {
         return None;
     }
@@ -656,14 +614,29 @@ fn body_validation_check(response: &ResponsePlan, stem: &str) -> Option<(String,
     ))
 }
 
-/// `input.<name>` for an identifier, `input["<name>"]` otherwise — the accessor for one input
-/// property, reused by both the presence guard and the validator call.
-fn input_member(name: &str) -> String {
-    let key = render_property_key(name);
-    if key == name {
-        format!("input.{name}")
-    } else {
-        format!("input[{key}]")
+enum InputMember<'a> {
+    Parameter {
+        location: ParamLocation,
+        name: &'a str,
+    },
+    Body,
+}
+
+/// The accessor for one nested input member, reused by both the presence guard and validator call.
+fn input_member(member: InputMember<'_>) -> String {
+    match member {
+        InputMember::Parameter { location, name } => {
+            // `location` is always one of the four fixed identifiers (path/query/header/cookie), so
+            // it is always dot-accessed; only a non-identifier parameter name needs a bracket key.
+            let location = location_name(location);
+            let key = render_property_key(name);
+            if key == name {
+                format!("input.{location}?.{name}")
+            } else {
+                format!("input.{location}?.[{key}]")
+            }
+        }
+        InputMember::Body => "input.body".to_owned(),
     }
 }
 
@@ -858,16 +831,6 @@ fn collect_body_imports(
         BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
             for field in fields {
                 renderer.collect_operation_imports(&field.schema, TypePosition::Request, imports);
-                if let FieldSerializationPlan::Content { caller_headers, .. } = &field.serialization
-                {
-                    for header in caller_headers {
-                        renderer.collect_operation_imports(
-                            &header.schema,
-                            TypePosition::Request,
-                            imports,
-                        );
-                    }
-                }
             }
         }
         BodyPlan::ContentTypeDiscriminated { arms, .. } => {
@@ -890,25 +853,54 @@ fn render_input(
     if plan.param_plans.is_empty() && plan.body_plan.is_none() {
         return "{}".to_owned();
     }
-    let parameters = operation
-        .parameters
-        .iter()
-        .filter(|parameter| parameter.location != ParamLocation::Cookie)
-        .collect::<Vec<_>>();
+    let parameters = operation.parameters.iter().collect::<Vec<_>>();
     assert_eq!(parameters.len(), plan.param_plans.len());
     let mut output = String::from("{\n");
-    for (parameter, parameter_plan) in parameters.into_iter().zip(&plan.param_plans) {
-        if let Some(description) = &parameter.description {
-            write_parameter_property_tsdoc(&mut output, description, documentation, 2);
+    for location in [
+        ParamLocation::Path,
+        ParamLocation::Query,
+        ParamLocation::Header,
+        ParamLocation::Cookie,
+    ] {
+        let group = parameters
+            .iter()
+            .copied()
+            .zip(&plan.param_plans)
+            .filter(|(parameter, _)| parameter.location == location)
+            .collect::<Vec<_>>();
+        if group.is_empty() {
+            continue;
         }
         output.push_str("  ");
-        output.push_str(&render_property_key(&parameter_plan.name));
-        if !parameter.required {
+        output.push_str(location_name(location));
+        if !group.iter().any(|(parameter, _)| parameter.required) {
             output.push('?');
         }
-        output.push_str(": ");
-        output.push_str(&renderer.render_type(&parameter_plan.schema, TypePosition::Request, 2));
-        output.push_str(";\n");
+        output.push_str(": {\n");
+        for (parameter, parameter_plan) in group {
+            if let Some(description) = &parameter.description {
+                write_parameter_property_tsdoc(&mut output, description, documentation, 4);
+            }
+            output.push_str("    ");
+            output.push_str(&render_property_key(&parameter_plan.name));
+            if !parameter.required {
+                output.push('?');
+            }
+            output.push_str(": ");
+            if parameter_plan.caller_serialized {
+                // The client cannot serialize this media type, so the input is the caller's
+                // pre-serialized wire string rather than the declared schema (OASTS1443).
+                output.push_str("string");
+            } else {
+                output.push_str(&renderer.render_type(
+                    &parameter_plan.schema,
+                    TypePosition::Request,
+                    4,
+                ));
+            }
+            output.push_str(";\n");
+        }
+        output.push_str("  };\n");
     }
     if let Some(body_plan) = &plan.body_plan {
         output.push_str("  body");
@@ -1037,34 +1029,6 @@ fn render_form_field_input(
         );
     } else {
         output.push_str("string");
-    }
-    if let FieldSerializationPlan::Content { caller_headers, .. } = &field.serialization
-        && field.wrapper.headers != HeaderInputRequirement::None
-    {
-        output.push_str("; headers");
-        if field.wrapper.headers == HeaderInputRequirement::Optional {
-            output.push('?');
-        }
-        output.push_str(": {");
-        if !caller_headers.is_empty() {
-            output.push('\n');
-            for header in caller_headers {
-                output.push_str(&" ".repeat(indent + 2));
-                output.push_str(&render_property_key(&header.name));
-                if !header.required {
-                    output.push('?');
-                }
-                output.push_str(": ");
-                output.push_str(&renderer.render_type(
-                    &header.schema,
-                    TypePosition::Request,
-                    indent + 2,
-                ));
-                output.push_str(";\n");
-            }
-            output.push_str(&" ".repeat(indent));
-        }
-        output.push('}');
     }
     if field.wrapper.filename {
         output.push_str("; filename?: string");
@@ -1282,11 +1246,7 @@ fn write_descriptor(
         output.push_str("],\n");
     }
     output.push_str("  ],\n  params: ");
-    let parameters = operation
-        .parameters
-        .iter()
-        .filter(|parameter| parameter.location != ParamLocation::Cookie)
-        .collect::<Vec<_>>();
+    let parameters = operation.parameters.iter().collect::<Vec<_>>();
     assert_eq!(parameters.len(), plan.param_plans.len());
     if parameters.is_empty() {
         output.push_str("[]");
@@ -1309,6 +1269,11 @@ fn write_descriptor(
             } else {
                 "false"
             });
+            // Content JSON serializers take the raw typed value, so the transport skips its
+            // `ParamValue` guard and forwards it unchecked; the flag is absent otherwise.
+            if parameter_plan.resolved.helper.is_content_json() {
+                output.push_str(", content: true");
+            }
             output.push_str(" },\n");
         }
         output.push_str("  ]");
@@ -1516,6 +1481,8 @@ fn missing_rec(alternative: &[AuthSchemeUse]) -> String {
 fn member_credential(kind: &AuthKind) -> &'static str {
     match kind {
         AuthKind::Basic => "BasicCredential",
+        AuthKind::HttpScheme { .. } => "{ credentials: string }",
+        AuthKind::MutualTls => "typeof AmbientClientCertificate",
         AuthKind::ApiKeyCookie { .. } => "typeof AmbientCookieCredential",
         AuthKind::Bearer
         | AuthKind::ApiKeyHeader { .. }
@@ -1558,14 +1525,15 @@ fn call_args_member_chain(
     )
 }
 
-/// Whether this module's `CallArgs` alias references the `BasicCredential` and/or
-/// `AmbientCookieCredential` runtime types, deciding which runtime imports the module needs.
-fn call_args_credentials(plan: &OperationPlan, enforcement: AuthEnforcement) -> (bool, bool) {
+/// Whether this module's `CallArgs` alias references the runtime credential types, deciding which
+/// runtime imports the module needs.
+fn call_args_credentials(plan: &OperationPlan, enforcement: AuthEnforcement) -> (bool, bool, bool) {
     if call_args_is_unconditional(&plan.auth_plan, enforcement) {
-        return (false, false);
+        return (false, false, false);
     }
     let mut basic = false;
     let mut cookie = false;
+    let mut client_certificate = false;
     for alternative in &plan.auth_plan {
         for scheme in alternative {
             if matches!(scheme.kind, AuthKind::Basic) {
@@ -1574,9 +1542,12 @@ fn call_args_credentials(plan: &OperationPlan, enforcement: AuthEnforcement) -> 
             if matches!(scheme.kind, AuthKind::ApiKeyCookie { .. }) {
                 cookie = true;
             }
+            if matches!(scheme.kind, AuthKind::MutualTls) {
+                client_certificate = true;
+            }
         }
     }
-    (basic, cookie)
+    (basic, cookie, client_certificate)
 }
 
 /// The descriptor `security` value: `[]` when unsecured, else a multi-line array whose entries are
@@ -1605,6 +1576,10 @@ fn render_security_member(scheme: &AuthSchemeUse) -> String {
     member.push_str(&render_ts_string(&scheme.name));
     member.push_str(", kind: ");
     member.push_str(&render_ts_string(auth_kind_tag(&scheme.kind)));
+    if let AuthKind::HttpScheme { scheme } = &scheme.kind {
+        member.push_str(", scheme: ");
+        member.push_str(&render_ts_string(scheme));
+    }
     if let Some(param) = auth_kind_param(&scheme.kind) {
         member.push_str(", param: ");
         member.push_str(&render_ts_string(param));
@@ -1626,6 +1601,8 @@ fn auth_kind_tag(kind: &AuthKind) -> &'static str {
     match kind {
         AuthKind::Basic => "basic",
         AuthKind::Bearer => "bearer",
+        AuthKind::HttpScheme { .. } => "httpScheme",
+        AuthKind::MutualTls => "mutualTls",
         AuthKind::ApiKeyHeader { .. } => "apiKeyHeader",
         AuthKind::ApiKeyQuery { .. } => "apiKeyQuery",
         AuthKind::ApiKeyCookie { .. } => "apiKeyCookie",
@@ -1639,7 +1616,12 @@ fn auth_kind_param(kind: &AuthKind) -> Option<&str> {
         AuthKind::ApiKeyHeader { name }
         | AuthKind::ApiKeyQuery { name }
         | AuthKind::ApiKeyCookie { name } => Some(name),
-        AuthKind::Basic | AuthKind::Bearer | AuthKind::OAuth2 | AuthKind::OpenIdConnect => None,
+        AuthKind::Basic
+        | AuthKind::Bearer
+        | AuthKind::HttpScheme { .. }
+        | AuthKind::MutualTls
+        | AuthKind::OAuth2
+        | AuthKind::OpenIdConnect => None,
     }
 }
 
@@ -1688,16 +1670,8 @@ fn write_body_descriptor(
                             output.push_str(", contentType: ");
                             write_selected_content_type(output, part_media);
                         }
-                        output.push_str(", payloads: [");
-                        output.push_str(
-                            &part_media
-                                .payloads
-                                .iter()
-                                .map(|payload| render_ts_string(payload.as_str()))
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        );
-                        output.push(']');
+                        output.push_str(", ");
+                        write_payloads_array(output, part_media);
                     }
                 }
                 output.push_str(" },\n");
@@ -1727,6 +1701,23 @@ fn write_body_descriptor(
             output.push_str("] }");
         }
     }
+}
+
+/// Renders `payloads: [...]` — the wire payload kind of each admitted media type, index-for-index
+/// with the `admitted` list. The runtime picks `payloads[selected.index]` so the part Content-Type
+/// and the body serialization agree on a non-first selection. The urlencoded body descriptor's
+/// Content arm and the multipart field descriptor's wrapped arm both need this exact rendering.
+fn write_payloads_array(output: &mut String, media: &PartMediaPlan) {
+    output.push_str("payloads: [");
+    output.push_str(
+        &media
+            .payloads
+            .iter()
+            .map(|payload| render_ts_string(payload.as_str()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    output.push(']');
 }
 
 /// Renders `{ kind: "selected", admitted: [...] }` — the descriptor for a wrapped field whose
@@ -1784,7 +1775,13 @@ fn write_multipart_field(
     match &field.serialization {
         FieldSerializationPlan::Style { .. } => output.push_str("{ kind: \"none\" }"),
         FieldSerializationPlan::Content { media, .. } if field.wrapper.wrapped => {
+            // A wrapped part admits caller media selection, so ship the index-aligned payload kinds:
+            // the runtime picks payloads[selected.index], keeping the part Content-Type and the body
+            // serialization from disagreeing on a non-first selection. The single `payload` above
+            // stays for the style and non-wrapped fixed cases, which have exactly one payload kind.
             write_selected_content_type(output, media);
+            output.push_str(", ");
+            write_payloads_array(output, media);
         }
         FieldSerializationPlan::Content { media, .. } => {
             output.push_str("{ kind: \"fixed\", value: ");
@@ -1803,14 +1800,6 @@ fn write_multipart_field(
     } else {
         "false"
     });
-    if let FieldSerializationPlan::Content {
-        content_transfer_encoding: Some(value),
-        ..
-    } = &field.serialization
-    {
-        output.push_str(", cte: ");
-        output.push_str(&render_ts_string(value));
-    }
     output.push_str(" },\n");
 }
 
@@ -1846,19 +1835,7 @@ fn schema_is_array(
 
 fn field_payload(field: &FormFieldPlan) -> &'static str {
     match &field.serialization {
-        FieldSerializationPlan::Content {
-            media,
-            content_transfer_encoding,
-            ..
-        } => {
-            // Plan build never pairs binary_upload=true with a contentTransferEncoding, so the
-            // binary route below always flows back through media_payload's own leading check.
-            if content_transfer_encoding.is_some() {
-                "text"
-            } else {
-                media_payload(media)
-            }
-        }
+        FieldSerializationPlan::Content { media, .. } => media_payload(media),
         FieldSerializationPlan::Style { .. } => match &field.schema {
             SchemaNode::Primitive {
                 ty: PrimitiveType::String,
@@ -1881,17 +1858,10 @@ fn field_payload(field: &FormFieldPlan) -> &'static str {
 }
 
 fn media_payload(media: &PartMediaPlan) -> &'static str {
-    if media.binary_upload {
-        return "binary";
-    }
-    let value = media.values.first().map_or("", String::as_str);
-    let essence = media_essence(value);
-    if essence == "application/json" || essence.ends_with("+json") {
-        "json"
-    } else if essence.starts_with("text/") {
-        "text"
-    } else {
-        "binary"
+    match media.payloads.first() {
+        Some(PayloadKind::Json) => "json",
+        Some(PayloadKind::Text) => "text",
+        Some(PayloadKind::Binary) | None => "binary",
     }
 }
 
@@ -2013,7 +1983,7 @@ fn location_name(location: ParamLocation) -> &'static str {
         ParamLocation::Path => "path",
         ParamLocation::Query => "query",
         ParamLocation::Header => "header",
-        ParamLocation::Cookie => "header",
+        ParamLocation::Cookie => "cookie",
     }
 }
 
@@ -2051,10 +2021,15 @@ fn helper_region_id(helper: HelperId) -> &'static str {
         HelperId::QueryForm => "query-form",
         HelperId::QueryFormExplode => "query-form-explode",
         HelperId::QuerySpaceDelimited => "query-space-delimited",
+        HelperId::QuerySpaceDelimitedObject => "query-space-delimited-object",
         HelperId::QueryPipeDelimited => "query-pipe-delimited",
+        HelperId::QueryPipeDelimitedObject => "query-pipe-delimited-object",
         HelperId::QueryDeepObject => "query-deep-object",
         HelperId::HeaderSimple => "header-simple",
         HelperId::HeaderSimpleExplode => "header-simple-explode",
+        HelperId::ContentJsonPath => "content-json-path",
+        HelperId::ContentJsonQuery => "content-json-query",
+        HelperId::ContentJsonHeader => "content-json-header",
     }
 }
 
@@ -2069,10 +2044,15 @@ fn helper_export_name(helper: HelperId) -> &'static str {
         HelperId::QueryForm => "serializeQueryForm",
         HelperId::QueryFormExplode => "serializeQueryFormExplode",
         HelperId::QuerySpaceDelimited => "serializeQuerySpaceDelimited",
+        HelperId::QuerySpaceDelimitedObject => "serializeQuerySpaceDelimitedObject",
         HelperId::QueryPipeDelimited => "serializeQueryPipeDelimited",
+        HelperId::QueryPipeDelimitedObject => "serializeQueryPipeDelimitedObject",
         HelperId::QueryDeepObject => "serializeQueryDeepObject",
         HelperId::HeaderSimple => "serializeHeaderSimple",
         HelperId::HeaderSimpleExplode => "serializeHeaderSimpleExplode",
+        HelperId::ContentJsonPath => "serializeContentJsonPath",
+        HelperId::ContentJsonQuery => "serializeContentJsonQuery",
+        HelperId::ContentJsonHeader => "serializeContentJsonHeader",
     }
 }
 
@@ -2085,7 +2065,7 @@ mod tests {
 
     use super::*;
     use crate::client_model::{
-        CallerHeaderPlan, FieldWrapperPlan, PayloadKind, ResponseMediaPlan, build_client_model,
+        FieldWrapperPlan, PayloadKind, ResponseMediaPlan, build_client_model,
     };
     use crate::config::{ResolvedConfig, load_config_from_json};
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
@@ -2184,6 +2164,117 @@ mod tests {
     const HEADER: &str = "// Generated by Oasts 0.0.0. Do not edit.\n// Config schema version: 1\n// Source digest: digest\n\n";
 
     #[test]
+    fn content_parameters_emit_typed_and_caller_serialized_inputs() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/search": {
+                    "get": {
+                        "operationId": "search",
+                        "parameters": [
+                            {
+                                "name": "filter",
+                                "in": "query",
+                                "content": { "application/json": { "schema": {
+                                    "type": "object",
+                                    "properties": { "tag": { "type": "string" } }
+                                } } }
+                            },
+                            {
+                                "name": "doc",
+                                "in": "query",
+                                "content": { "application/xml": { "schema": { "type": "object" } } }
+                            }
+                        ],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (content, diagnostics) = emit_operation(document, "search");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == Severity::Error),
+            "{diagnostics:#?}"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS1443")
+                .count(),
+            1,
+        );
+        // The JSON content serializer is imported and its descriptor entry flags `content: true`.
+        assert!(content.contains("serializeContentJsonQuery"), "{content}");
+        assert!(
+            content.contains(
+                "{ name: \"filter\", location: \"query\", required: false, serialize: serializeContentJsonQuery, allowReserved: false, content: true },"
+            ),
+            "{content}"
+        );
+        // The caller-serialized XML parameter forwards through the location default helper unflagged.
+        assert!(
+            content.contains(
+                "{ name: \"doc\", location: \"query\", required: false, serialize: serializeQueryForm, allowReserved: false },"
+            ),
+            "{content}"
+        );
+        // Input types: the JSON parameter stays typed; the XML parameter becomes a bare string.
+        assert!(content.contains("filter?: {"), "{content}");
+        assert!(content.contains("tag?: string;"), "{content}");
+        assert!(content.contains("doc?: string;"), "{content}");
+    }
+
+    #[test]
+    fn delimited_object_parameters_import_object_serializers() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/colors": {
+                    "get": {
+                        "operationId": "getColors",
+                        "parameters": [
+                            {
+                                "name": "space",
+                                "in": "query",
+                                "style": "spaceDelimited",
+                                "explode": false,
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": { "type": "string" }
+                                }
+                            },
+                            {
+                                "name": "pipe",
+                                "in": "query",
+                                "style": "pipeDelimited",
+                                "explode": false,
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": { "type": "string" }
+                                }
+                            }
+                        ],
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+
+        let (actual, diagnostics) = emit_operation(document, "getcolors");
+        assert!(
+            actual.contains(
+                "import { serializeQueryPipeDelimitedObject, serializeQuerySpaceDelimitedObject } from \"../../runtime/serialize.js\";"
+            ),
+            "{actual}"
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
     fn json_get_operation_module_snapshot() {
         let document = json!({
             "openapi": "3.1.0",
@@ -2221,6 +2312,10 @@ mod tests {
         });
         let expected = format!(
             "{HEADER}import type {{ GetPetResponse200, GetPetResponseDefault }} from \"../../types/operations/getpet.js\";\nimport type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ serializePathSimple, serializeQueryFormExplode }} from \"../../runtime/serialize.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetInput = {{\n  /**\n   * The pet identifier.\n   */\n  petId: string;\n  /**\n   * The result limit.\n   */\n  limit?: number;\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetResult =\n  | {{ kind: \"response\"; ok: true; match: \"200\"; status: 200; data: GetPetResponse200; meta: ResponseMeta }}\n  | {{ kind: \"response\"; ok: true; match: \"default\"; status: number; data: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ kind: \"response\"; ok: false; match: \"default\"; status: number; error: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"200\" | \"default\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type GetPetCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"getPet\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"pets\" }}],\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"param\", name: \"petId\" }}],\n  ],\n  params: [\n    {{ name: \"petId\", location: \"path\", required: true, serialize: serializePathSimple, allowReserved: false }},\n    {{ name: \"limit\", location: \"query\", required: false, serialize: serializeQueryFormExplode, allowReserved: false }},\n  ],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n    {{ match: \"default\", kind: \"default\", status: null, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function getPet<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<GetPetResult> {{\n  return execute<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns The successful response data.\n */\nexport async function getPetOrThrow<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<GetPetResponse200 | GetPetResponseDefault> {{\n  return executeOrThrow<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n"
+        );
+        let expected = expected.replace(
+            "export type GetPetInput = {\n  /**\n   * The pet identifier.\n   */\n  petId: string;\n  /**\n   * The result limit.\n   */\n  limit?: number;\n};",
+            "export type GetPetInput = {\n  path: {\n    /**\n     * The pet identifier.\n     */\n    petId: string;\n  };\n  query?: {\n    /**\n     * The result limit.\n     */\n    limit?: number;\n  };\n};",
         );
         let (actual, diagnostics) = emit_operation_with_documentation(document, "getpet", true);
         assert_eq!(actual, expected);
@@ -2261,7 +2356,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetInput = {{\n  body: {{\n    meta: {{ body: {{\n      tag?: string;\n    }}; contentType: \"application/json\" | \"application/cbor\" }};\n    title: string;\n    file: Blob | File;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetResult =\n  | {{ kind: \"response\"; ok: true; match: \"204\"; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"204\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type UploadAssetCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadAsset\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"uploads\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"multipart\", fields: [\n    {{ name: \"meta\", required: true, repeated: false, wrapper: true, payload: \"json\", contentType: {{ kind: \"selected\", admitted: [\"application/json\", \"application/cbor\"] }}, filename: false }},\n    {{ name: \"title\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"text/plain\" }}, filename: false }},\n    {{ name: \"file\", required: true, repeated: false, wrapper: false, payload: \"binary\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: true }},\n  ] }},\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function uploadAsset<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<UploadAssetResult> {{\n  return execute<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function uploadAssetOrThrow<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<undefined> {{\n  return executeOrThrow<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetInput = {{\n  body: {{\n    meta: {{ body: {{\n      tag?: string;\n    }}; contentType: \"application/json\" | \"application/cbor\" }};\n    title: string;\n    file: Blob | File;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetResult =\n  | {{ kind: \"response\"; ok: true; match: \"204\"; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"204\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type UploadAssetCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadAsset\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"uploads\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"multipart\", fields: [\n    {{ name: \"meta\", required: true, repeated: false, wrapper: true, payload: \"json\", contentType: {{ kind: \"selected\", admitted: [\"application/json\", \"application/cbor\"] }}, payloads: [\"json\", \"json\"], filename: false }},\n    {{ name: \"title\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"text/plain\" }}, filename: false }},\n    {{ name: \"file\", required: true, repeated: false, wrapper: false, payload: \"binary\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: true }},\n  ] }},\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function uploadAsset<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<UploadAssetResult> {{\n  return execute<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function uploadAssetOrThrow<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<undefined> {{\n  return executeOrThrow<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "uploadasset");
         assert_eq!(actual, expected);
@@ -2297,7 +2392,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteInput = {{\n  body: {{\n    note: string;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteResult =\n  | {{ kind: \"response\"; ok: true; match: \"204\"; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"204\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type UploadNoteCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadNote\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"notes\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"multipart\", fields: [\n    {{ name: \"note\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: false, cte: \"binary\" }},\n  ] }},\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function uploadNote<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<UploadNoteResult> {{\n  return execute<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function uploadNoteOrThrow<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<undefined> {{\n  return executeOrThrow<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteInput = {{\n  body: {{\n    note: string;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteResult =\n  | {{ kind: \"response\"; ok: true; match: \"204\"; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"204\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type UploadNoteCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadNote\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"notes\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"multipart\", fields: [\n    {{ name: \"note\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: false }},\n  ] }},\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function uploadNote<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<UploadNoteResult> {{\n  return execute<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function uploadNoteOrThrow<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<undefined> {{\n  return executeOrThrow<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "uploadnote");
         assert_eq!(actual, expected);
@@ -2306,7 +2401,7 @@ mod tests {
 
     /// A schemaless 3.1 multipart field with `contentEncoding` (no `type`) carries the already-
     /// encoded string on the wire, so its descriptor mirrors the typed `{ type: string,
-    /// contentEncoding }` case: `payload: "text"`, `cte: "binary"`, and no `filename` (not a binary
+    /// contentEncoding }` case: `payload: "text"`, no CTE header, and no `filename` (not a binary
     /// upload). Without the honoring in `default_part_media`, a schemaless field would emit
     /// `payload: "binary"` and a `Blob | File` input instead.
     #[test]
@@ -2340,7 +2435,7 @@ mod tests {
         let (actual, diagnostics) = emit_operation(document, "uploadnote");
 
         assert!(actual.contains(
-            "{ name: \"note\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: { kind: \"fixed\", value: \"application/octet-stream\" }, filename: false, cte: \"binary\" }"
+            "{ name: \"note\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: { kind: \"fixed\", value: \"application/octet-stream\" }, filename: false }"
         ));
         // The schemaless field's input type is its schema shape (`unknown`), not the `Blob | File`
         // a binary upload would demand.
@@ -2381,7 +2476,7 @@ mod tests {
     }
 
     #[test]
-    fn body_parameter_collision_is_oxs1421_and_skips_the_operation() {
+    fn body_named_parameter_and_request_body_render_in_distinct_groups() {
         let document = json!({
             "openapi": "3.1.0",
             "info": { "title": "test", "version": "1" },
@@ -2402,84 +2497,52 @@ mod tests {
                 }
             }
         });
-        let (_temp, analyzed, config, _source_tuples) = analyzed(&document);
-        let mut sink = DiagnosticSink::new();
-        let client = build_client_model(&analyzed, &config, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
-        drop(model);
+        let (actual, diagnostics) = emit_operation(document, "collidebody");
 
-        assert!(
-            files
-                .iter()
-                .all(|file| !file.relative_path.starts_with("client/operations/"))
-        );
-        let diagnostic = sink
-            .as_slice()
-            .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1421")
-            .expect("collision diagnostic");
-        assert!(diagnostic.message.contains("parameter 'body'"));
-        assert!(diagnostic.message.contains("request body"));
-        assert!(
-            sink.as_slice()
-                .iter()
-                .all(|diagnostic| diagnostic.code != "OASTS1422")
-        );
-        assert_eq!(
-            diagnostic.json_pointer.as_deref(),
-            Some("/paths/~1collision/post/parameters/0")
-        );
+        assert!(actual.contains(
+            "export type CollideBodyInput = {\n  query?: {\n    body?: string;\n  };\n  body?: CollideBodyRequest[\"body\"];\n};"
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
     #[test]
-    fn cookie_body_parameter_is_oxs1410_without_collision_diagnostics() {
+    fn cookie_parameter_emits_form_serializer_and_cookie_group() {
         let document = json!({
             "openapi": "3.1.0",
             "info": { "title": "test", "version": "1" },
             "paths": {
-                "/collision": {
-                    "post": {
-                        "operationId": "cookieBody",
+                "/session": {
+                    "get": {
+                        "operationId": "readSession",
                         "parameters": [
-                            { "name": "body", "in": "cookie", "schema": { "type": "string" } }
+                            { "name": "sid", "in": "cookie", "schema": { "type": "string" } }
                         ],
-                        "requestBody": {
-                            "content": {
-                                "application/json": { "schema": { "type": "string" } }
-                            }
-                        },
                         "responses": { "204": { "description": "done" } }
                     }
                 }
             }
         });
-        let (_temp, analyzed, config, _source_tuples) = analyzed(&document);
-        let mut sink = DiagnosticSink::new();
-        let client = build_client_model(&analyzed, &config, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
-        drop(model);
+        let (actual, diagnostics) = emit_operation(document, "readsession");
 
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
         assert!(
-            files
-                .iter()
-                .any(|file| file.relative_path == "client/operations/cookiebody.ts")
+            actual.contains("import { serializeQueryForm } from \"../../runtime/serialize.js\";"),
+            "cookie serializer import missing:\n{actual}"
         );
         assert!(
-            sink.as_slice()
-                .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1410")
+            actual.contains("  cookie?: {\n    sid?: string;\n  };"),
+            "cookie input group missing:\n{actual}"
         );
         assert!(
-            sink.as_slice()
-                .iter()
-                .all(|diagnostic| { diagnostic.code != "OASTS1421" && diagnostic.code != "OASTS1422" })
+            actual.contains(
+                "{ name: \"sid\", location: \"cookie\", required: false, serialize: serializeQueryForm, allowReserved: false }"
+            ),
+            "cookie descriptor param missing:\n{actual}"
         );
     }
 
     #[test]
-    fn parameter_property_collision_is_oxs1422_and_skips_the_operation() {
+    fn same_wire_name_parameters_render_in_distinct_location_groups() {
         let document = json!({
             "openapi": "3.1.0",
             "info": { "title": "test", "version": "1" },
@@ -2496,32 +2559,39 @@ mod tests {
                 }
             }
         });
-        let (_temp, analyzed, config, _source_tuples) = analyzed(&document);
-        let mut sink = DiagnosticSink::new();
-        let client = build_client_model(&analyzed, &config, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
-        drop(model);
+        let (actual, diagnostics) = emit_operation(document, "collideparameters");
 
-        assert!(
-            files
-                .iter()
-                .all(|file| !file.relative_path.starts_with("client/operations/"))
-        );
-        let diagnostic = sink
-            .as_slice()
-            .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1422")
-            .expect("collision diagnostic");
-        assert!(diagnostic.message.contains("parameter 'id' in path"));
-        assert!(diagnostic.message.contains("parameter 'id' in query"));
-        assert!(diagnostic.message.contains("generated input property 'id'"));
-        assert!(diagnostic.message.contains("/parameters/0"));
-        assert!(diagnostic.message.contains("/parameters/1"));
-        assert_eq!(
-            diagnostic.json_pointer.as_deref(),
-            Some("/paths/~1items~1{id}/get/parameters/1")
-        );
+        assert!(actual.contains(
+            "export type CollideParametersInput = {\n  path: {\n    id: string;\n  };\n  query?: {\n    id?: string;\n  };\n};"
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn input_groups_render_in_fixed_location_order() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/items/{item-id}": {
+                    "get": {
+                        "operationId": "getItem",
+                        "parameters": [
+                            { "name": "X-Trace", "in": "header", "required": true, "schema": { "type": "string" } },
+                            { "name": "limit", "in": "query", "schema": { "type": "integer" } },
+                            { "name": "item-id", "in": "path", "required": true, "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "done" } }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "getitem");
+
+        assert!(actual.contains(
+            "export type GetItemInput = {\n  path: {\n    \"item-id\": string;\n  };\n  query?: {\n    limit?: number;\n  };\n  header: {\n    \"X-Trace\": string;\n  };\n};"
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
     /// A multipart field with an explicit `style` on an object-shaped schema has no OAS-defined
@@ -2691,7 +2761,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_parameter_properties_do_not_emit_oxs1422() {
+    fn distinct_parameter_properties_render() {
         let document = json!({
             "openapi": "3.1.0",
             "info": { "title": "test", "version": "1" },
@@ -2756,8 +2826,8 @@ mod tests {
         });
         let (module, diagnostics) = emit_operation_with_documentation(document, "readpet", true);
         let declaration = "/**\n * Read a pet.\n * \n * @remarks\n * Loads one pet.\n * \n * Responses\n * \n * - 200: Found.\n * - 404: Missing.\n * \n * @deprecated This operation is deprecated.\n * \n * @see {@link https://docs.example.test/pets | Pet guide}\n */\n";
-        let pet_id_property = "/**\n   * The pet identifier.\n   */\n";
-        let limit_property = "/**\n   * The result limit.\n   */\n";
+        let pet_id_property = "/**\n     * The pet identifier.\n     */\n";
+        let limit_property = "/**\n     * The result limit.\n     */\n";
         let result_function = "/**\n * Read a pet.\n * \n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Loads one pet.\n * \n * Responses\n * \n * - 200: Found.\n * - 404: Missing.\n * \n * @deprecated This operation is deprecated.\n * \n * @returns A result discriminated by HTTP status.\n * \n * @see {@link https://docs.example.test/pets | Pet guide}\n */\n";
         let throw_function = result_function.replace(
             "@returns A result discriminated by HTTP status.",
@@ -2821,7 +2891,7 @@ mod tests {
             .expect("operation");
 
         assert!(operation.content.contains(
-            "  /**\n   * @remarks\n   * Line one.\n   * \\@deprecated fake\n   * *\\/\n   */\n  \"X-Trace\"?: string;\n  undocumented?: boolean;"
+            "  query?: {\n    undocumented?: boolean;\n  };\n  header?: {\n    /**\n     * @remarks\n     * Line one.\n     * \\@deprecated fake\n     * *\\/\n     */\n    \"X-Trace\"?: string;\n  };"
         ));
         assert!(!operation.content.contains("@param"));
         assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
@@ -2925,9 +2995,7 @@ mod tests {
         name: &str,
         schema: SchemaNode,
         media: PartMediaPlan,
-        caller_headers: Vec<CallerHeaderPlan>,
         wrapper: FieldWrapperPlan,
-        content_transfer_encoding: Option<&str>,
     ) -> FormFieldPlan {
         FormFieldPlan {
             name: name.to_owned(),
@@ -2935,8 +3003,6 @@ mod tests {
             schema,
             serialization: FieldSerializationPlan::Content {
                 media,
-                caller_headers,
-                content_transfer_encoding: content_transfer_encoding.map(str::to_owned),
                 encoding_source: None,
             },
             wrapper,
@@ -2958,7 +3024,6 @@ mod tests {
             wrapper: FieldWrapperPlan {
                 wrapped: false,
                 content_type_literal: true,
-                headers: HeaderInputRequirement::None,
                 filename: false,
             },
             source: SourceRef::default(),
@@ -2987,7 +3052,6 @@ mod tests {
         ResponseMediaPlan {
             media: media.to_owned(),
             decoder,
-            runtime_classified: false,
             schema: Some(string_schema(None)),
             streaming_marked: false,
             source: SourceRef::default(),
@@ -3006,20 +3070,29 @@ mod tests {
             HelperId::QueryForm,
             HelperId::QueryFormExplode,
             HelperId::QuerySpaceDelimited,
+            HelperId::QuerySpaceDelimitedObject,
             HelperId::QueryPipeDelimited,
+            HelperId::QueryPipeDelimitedObject,
             HelperId::QueryDeepObject,
             HelperId::HeaderSimple,
             HelperId::HeaderSimpleExplode,
+            HelperId::ContentJsonPath,
+            HelperId::ContentJsonQuery,
+            HelperId::ContentJsonHeader,
         ];
         for helper in helpers {
             assert!(!helper_region_id(helper).is_empty());
             assert!(helper_export_name(helper).starts_with("serialize"));
+            assert_eq!(
+                helper.is_content_json(),
+                helper_export_name(helper).starts_with("serializeContentJson"),
+            );
         }
         for (location, expected) in [
             (ParamLocation::Path, "path"),
             (ParamLocation::Query, "query"),
             (ParamLocation::Header, "header"),
-            (ParamLocation::Cookie, "header"),
+            (ParamLocation::Cookie, "cookie"),
         ] {
             assert_eq!(location_name(location), expected);
         }
@@ -3063,21 +3136,15 @@ mod tests {
                 "meta",
                 object_schema(),
                 json_charset,
-                Vec::new(),
                 FieldWrapperPlan {
                     wrapped: false,
                     content_type_literal: true,
-                    headers: HeaderInputRequirement::None,
                     filename: false,
                 },
-                None,
             )),
             "json"
         );
-        // `media_payload`'s leading `binary_upload` check is exercised directly here; it is also
-        // the route `field_payload` takes in production for a 3.0 `format: binary` field (no
-        // contentTransferEncoding: `field_payload` forwards straight into `media_payload`, whose
-        // own check applies).
+        // A binary payload remains binary independently of its media type metadata.
         assert_eq!(
             media_payload(&PartMediaPlan {
                 values: vec!["application/octet-stream".to_owned()],
@@ -3123,6 +3190,59 @@ mod tests {
         );
         assert!(rendered.contains("server"));
         assert!(rendered.contains("region"));
+    }
+
+    #[test]
+    fn relative_server_url_is_written_verbatim() {
+        let mut rendered = String::new();
+        write_base_url(
+            &mut rendered,
+            &BaseUrlPlan::Server {
+                index: 0,
+                servers: vec![ServerEntry {
+                    url: "/api/{version}/".to_owned(),
+                    variables: vec![(
+                        "version".to_owned(),
+                        ServerVariable {
+                            default: "v2".to_owned(),
+                            enum_values: Vec::new(),
+                        },
+                    )],
+                    source: SourceRef::default(),
+                }],
+            },
+        );
+
+        assert_eq!(
+            rendered,
+            "{ kind: \"server\", index: 0, servers: [{ url: \"/api/{version}/\", variables: [[\"version\", \"v2\"]] }] }"
+        );
+    }
+
+    #[test]
+    fn input_member_uses_nested_parameter_access() {
+        for (location, expected) in [
+            (ParamLocation::Path, "input.path?.petId"),
+            (ParamLocation::Query, "input.query?.petId"),
+            (ParamLocation::Header, "input.header?.petId"),
+            (ParamLocation::Cookie, "input.cookie?.petId"),
+        ] {
+            assert_eq!(
+                input_member(InputMember::Parameter {
+                    location,
+                    name: "petId",
+                }),
+                expected
+            );
+        }
+        assert_eq!(
+            input_member(InputMember::Parameter {
+                location: ParamLocation::Path,
+                name: "pet-id",
+            }),
+            "input.path?.[\"pet-id\"]"
+        );
+        assert_eq!(input_member(InputMember::Body), "input.body");
     }
 
     #[test]
@@ -3232,6 +3352,13 @@ mod tests {
     fn result_renderer_covers_range_default_and_discriminated_media() {
         let responses = vec![
             response_plan(
+                "100",
+                ResponseMatchKind::Exact,
+                PayloadDisposition::NoPayload,
+                Vec::new(),
+                false,
+            ),
+            response_plan(
                 "404",
                 ResponseMatchKind::Exact,
                 PayloadDisposition::Payload {
@@ -3279,6 +3406,9 @@ mod tests {
         };
         let mut output = String::new();
         write_result_type(&mut output, &plan, "Probe");
+        assert!(output.contains(
+            "ok: false; match: \"100\"; status: 100; error: undefined; meta: ResponseMeta"
+        ));
         assert!(output.contains("match: \"2XX\"; status: number; data: undefined"));
         assert!(output.contains("contentType: \"text/plain\""));
         assert!(output.contains("ok: false; match: \"default\""));
@@ -3332,8 +3462,7 @@ mod tests {
             "paths": {},
             "components": {
                 "schemas": {
-                    "Items": { "type": "array", "items": { "type": "string" } },
-                    "HeaderValue": { "type": "string" }
+                    "Items": { "type": "array", "items": { "type": "string" } }
                 }
             }
         });
@@ -3341,23 +3470,10 @@ mod tests {
         let source_id = analyzed.ir.schemas[0].source.source_id.clone();
         let items_ref = SchemaNode::Ref {
             target: SchemaRef {
-                source_id: source_id.clone(),
+                source_id,
                 json_pointer: "/components/schemas/Items".to_owned(),
             },
             meta: SchemaMeta::default(),
-        };
-        let header_ref = SchemaNode::Ref {
-            target: SchemaRef {
-                source_id,
-                json_pointer: "/components/schemas/HeaderValue".to_owned(),
-            },
-            meta: SchemaMeta::default(),
-        };
-        let caller_header = CallerHeaderPlan {
-            name: "X-Part".to_owned(),
-            required: false,
-            schema: header_ref,
-            source: SourceRef::default(),
         };
         let selected = content_field(
             "selected",
@@ -3369,14 +3485,11 @@ mod tests {
                 binary_upload: false,
                 declared: true,
             },
-            vec![caller_header.clone()],
             FieldWrapperPlan {
                 wrapped: true,
                 content_type_literal: true,
-                headers: HeaderInputRequirement::Optional,
                 filename: false,
             },
-            Some("base64"),
         );
         let wildcard = content_field(
             "wildcard",
@@ -3388,17 +3501,11 @@ mod tests {
                 binary_upload: false,
                 declared: true,
             },
-            vec![CallerHeaderPlan {
-                required: true,
-                ..caller_header
-            }],
             FieldWrapperPlan {
                 wrapped: true,
                 content_type_literal: false,
-                headers: HeaderInputRequirement::Required,
                 filename: true,
             },
-            None,
         );
         let binary = content_field(
             "binary",
@@ -3410,33 +3517,11 @@ mod tests {
                 binary_upload: true,
                 declared: false,
             },
-            Vec::new(),
             FieldWrapperPlan {
                 wrapped: false,
                 content_type_literal: true,
-                headers: HeaderInputRequirement::None,
                 filename: false,
             },
-            None,
-        );
-        let empty_headers = content_field(
-            "emptyHeaders",
-            string_schema(None),
-            PartMediaPlan {
-                values: vec!["text/plain".to_owned()],
-                payloads: vec![PayloadKind::Text],
-                all_concrete: true,
-                binary_upload: false,
-                declared: true,
-            },
-            Vec::new(),
-            FieldWrapperPlan {
-                wrapped: true,
-                content_type_literal: true,
-                headers: HeaderInputRequirement::Required,
-                filename: false,
-            },
-            None,
         );
         let encoded = content_field(
             "encoded",
@@ -3448,14 +3533,11 @@ mod tests {
                 binary_upload: false,
                 declared: false,
             },
-            Vec::new(),
             FieldWrapperPlan {
                 wrapped: false,
                 content_type_literal: true,
-                headers: HeaderInputRequirement::None,
                 filename: false,
             },
-            Some("binary"),
         );
         let styled_object = style_field("styled", object_schema());
         let styled_binary = style_field("styledBinary", string_schema(Some("binary")));
@@ -3464,7 +3546,6 @@ mod tests {
             selected.clone(),
             wildcard.clone(),
             binary,
-            empty_headers,
             encoded,
             styled_object,
             styled_binary,
@@ -3523,14 +3604,11 @@ mod tests {
                                     binary_upload: false,
                                     declared: false,
                                 },
-                                Vec::new(),
                                 FieldWrapperPlan {
                                     wrapped: false,
                                     content_type_literal: true,
-                                    headers: HeaderInputRequirement::None,
                                     filename: false,
                                 },
-                                None,
                             ),
                             content_field(
                                 "icon",
@@ -3542,14 +3620,11 @@ mod tests {
                                     binary_upload: false,
                                     declared: true,
                                 },
-                                Vec::new(),
                                 FieldWrapperPlan {
                                     wrapped: true,
                                     content_type_literal: true,
-                                    headers: HeaderInputRequirement::None,
                                     filename: false,
                                 },
-                                None,
                             ),
                             content_field(
                                 "raw",
@@ -3561,14 +3636,11 @@ mod tests {
                                     binary_upload: true,
                                     declared: false,
                                 },
-                                Vec::new(),
                                 FieldWrapperPlan {
                                     wrapped: false,
                                     content_type_literal: true,
-                                    headers: HeaderInputRequirement::None,
                                     filename: false,
                                 },
-                                None,
                             ),
                             style_field("form", string_schema(None)),
                         ],
@@ -3613,7 +3685,6 @@ mod tests {
             let renderer = TypesEmitter::new(&mut model);
             let input = render_body_input(&renderer, &body, "Probe", 2);
             assert!(input.contains("contentType: string"));
-            assert!(input.contains("headers?:"));
             assert!(input.contains("filename?: string"));
             assert!(input.contains("Blob | File"));
             assert!(input.contains("encoded: string"));
@@ -3627,12 +3698,15 @@ mod tests {
         write_body_descriptor(&mut descriptor, &model, &body, 2);
         assert!(descriptor.contains("content-discriminated"));
         assert!(descriptor.contains("kind: \"form-urlencoded\""));
-        assert!(descriptor.contains("cte: \"base64\""));
+        // The runtime multipart field plan carries no Content-Transfer-Encoding, so the descriptor
+        // must emit neither the `cte:` key nor a header literal for it.
+        assert!(!descriptor.contains("cte:"));
+        assert!(!descriptor.contains("Content-Transfer-Encoding"));
         assert!(descriptor.contains("payload: \"json\""));
         assert!(descriptor.contains("payload: \"binary\""));
         assert!(descriptor.contains("payload: \"text\""));
         assert!(descriptor.contains(
-            "{ name: \"encoded\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: { kind: \"fixed\", value: \"application/octet-stream\" }, filename: false, cte: \"binary\" }"
+            "{ name: \"encoded\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: { kind: \"fixed\", value: \"application/octet-stream\" }, filename: false }"
         ));
         // Urlencoded content fields: unwrapped fixed-json emits payloads only; a wrapped selected
         // field emits the admitted media list and per-media payload kinds; the Style arm is intact.
@@ -3641,6 +3715,11 @@ mod tests {
             "contentType: { kind: \"selected\", admitted: [\"image/png\", \"image/jpeg\"]"
         ));
         assert!(descriptor.contains("payloads: [\"text\", \"text\"]"));
+        // The wrapped multipart `selected` field admits two media with heterogeneous payload kinds,
+        // so its descriptor carries the index-aligned payloads array alongside the single `payload`.
+        assert!(descriptor.contains(
+            "contentType: { kind: \"selected\", admitted: [\"application/json\", \"application/cbor\"] }, payloads: [\"json\", \"text\"]"
+        ));
         // An urlencoded field whose default media classifies as a binary upload (`PayloadKind::
         // Binary`) still renders through the same `payloads` array as the other content kinds.
         assert!(descriptor.contains("{ name: \"raw\", required: true, payloads: [\"binary\"] }"));
@@ -3660,8 +3739,7 @@ mod tests {
                             "content": {
                                 "text/plain": { "schema": { "type": "string" } }
                             }
-                        },
-                        "responses": {}
+                        }
                     }
                 }
             }
@@ -3719,6 +3797,7 @@ mod tests {
             &mut model,
             &ClientModel {
                 operations: Vec::new(),
+                base_url_required: false,
             },
         );
         assert!(
@@ -3734,13 +3813,13 @@ mod tests {
             "openapi": "3.1.0",
             "info": { "title": "test", "version": "1" },
             "paths": {
-                "/items/{id}": {
+                "/items": {
                     "get": {
                         "operationId": "descriptorProbe",
                         "parameters": [
                             {
                                 "name": "id",
-                                "in": "path",
+                                "in": "query",
                                 "required": true,
                                 "allowReserved": true,
                                 "schema": { "type": "string" }
@@ -3839,6 +3918,60 @@ mod tests {
             security_field(&anonymous_included),
             "[\n    [{ name: \"bearerAuth\", kind: \"bearer\", scopes: [] }],\n    [],\n  ]"
         );
+    }
+
+    #[test]
+    fn generic_http_scheme_renders_credential_type_and_descriptor() {
+        let plan = vec![vec![auth_scheme(
+            "digestAuth",
+            AuthKind::HttpScheme {
+                scheme: "Digest".to_owned(),
+            },
+            &[],
+        )]];
+        assert_eq!(
+            render_call_args(&plan, AuthEnforcement::Types, "Digest"),
+            "type Req = [options: CallOptions & { auth: { readonly digestAuth: { credentials: string } } }];\nexport type DigestCallArgs<S extends string> = [string] extends [S] ? Req : [\"digestAuth\" & S] extends [never] ? Req : [options?: CallOptions];\n"
+        );
+        assert_eq!(
+            security_field(&plan),
+            "[\n    [{ name: \"digestAuth\", kind: \"httpScheme\", scheme: \"Digest\", scopes: [] }],\n  ]"
+        );
+    }
+
+    #[test]
+    fn mutual_tls_renders_ambient_credential_descriptor_and_import() {
+        let plan = vec![vec![auth_scheme("mtls", AuthKind::MutualTls, &[])]];
+        assert_eq!(
+            render_call_args(&plan, AuthEnforcement::Types, "MutualTls"),
+            "type Req = [options: CallOptions & { auth: { readonly mtls: typeof AmbientClientCertificate } }];\nexport type MutualTlsCallArgs<S extends string> = [string] extends [S] ? Req : [\"mtls\" & S] extends [never] ? Req : [options?: CallOptions];\n"
+        );
+        assert_eq!(
+            security_field(&plan),
+            "[\n    [{ name: \"mtls\", kind: \"mutualTls\", scopes: [] }],\n  ]"
+        );
+
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "components": {
+                "securitySchemes": { "mtls": { "type": "mutualTLS" } }
+            },
+            "paths": {
+                "/ping": {
+                    "get": {
+                        "operationId": "ping",
+                        "security": [{ "mtls": [] }],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "ping");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(actual.contains(
+            "import { execute, executeOrThrow, type AmbientClientCertificate, type CallOptions, type OperationDescriptor, type Transport } from"
+        ));
     }
 
     #[test]
@@ -4385,14 +4518,14 @@ mod tests {
         assert!(content.contains(
             r#"export async function readthing<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<ReadthingResult> {
   const requestIssues: Issue[] = [];
-  if (input.id !== undefined) {
-    validateReadthingPathId(input.id, ["path", "id"], requestIssues);
+  if (input.path?.id !== undefined) {
+    validateReadthingPathId(input.path?.id, ["path", "id"], requestIssues);
   }
-  if (input.limit !== undefined) {
-    validateReadthingQueryLimit(input.limit, ["query", "limit"], requestIssues);
+  if (input.query?.limit !== undefined) {
+    validateReadthingQueryLimit(input.query?.limit, ["query", "limit"], requestIssues);
   }
-  if (input["X-Tag"] !== undefined) {
-    validateReadthingHeaderXTag(input["X-Tag"], ["header", "X-Tag"], requestIssues);
+  if (input.header?.["X-Tag"] !== undefined) {
+    validateReadthingHeaderXTag(input.header?.["X-Tag"], ["header", "X-Tag"], requestIssues);
   }
   if (requestIssues.length > 0) {
     return { kind: "request-failure", ok: false, match: null, status: null, error: { kind: "request-validation", issues: requestIssues } };
@@ -4447,8 +4580,8 @@ mod tests {
         assert!(
             content.contains(
                 r#"  const requestIssues: Issue[] = [];
-  if (input.id !== undefined) {
-    validateReadthingPathId(input.id, ["path", "id"], requestIssues);
+  if (input.path?.id !== undefined) {
+    validateReadthingPathId(input.path?.id, ["path", "id"], requestIssues);
   }"#
             ),
             "request block mismatch:\n{content}"
@@ -4529,10 +4662,9 @@ mod tests {
     }
 
     #[test]
-    fn request_validation_skips_a_cookie_parameter_and_never_calls_its_validator() {
-        // A cookie parameter is diagnosed as unsupported for the fetch client, yet emission still runs;
-        // its request binding validates only the non-cookie parameter and never references the cookie
-        // parameter's validator.
+    fn request_validation_binds_a_cookie_parameter() {
+        // A cookie parameter is a first-class fetch-client parameter: its request binding validates
+        // it in declared order under the `cookie` input group, after the query parameter.
         let document = json!({
             "openapi": "3.1.0",
             "info": { "title": "t", "version": "1" },
@@ -4550,18 +4682,16 @@ mod tests {
             }
         });
         let (files, diagnostics) = emit_validated_files(&document, true, false);
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1410"),
-            "expected the cookie parameter to be diagnosed: {diagnostics:#?}"
-        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
         let content = operation_file(&files, "listthing");
         assert!(
             content.contains(
                 r#"  const requestIssues: Issue[] = [];
-  if (input.limit !== undefined) {
-    validateListthingQueryLimit(input.limit, ["query", "limit"], requestIssues);
+  if (input.query?.limit !== undefined) {
+    validateListthingQueryLimit(input.query?.limit, ["query", "limit"], requestIssues);
+  }
+  if (input.cookie?.session !== undefined) {
+    validateListthingCookieSession(input.cookie?.session, ["cookie", "session"], requestIssues);
   }
   if (requestIssues.length > 0) {
     return { kind: "request-failure", ok: false, match: null, status: null, error: { kind: "request-validation", issues: requestIssues } };
@@ -4570,8 +4700,7 @@ mod tests {
             ),
             "request block mismatch:\n{content}"
         );
-        assert!(!content.contains("validateListthingCookieSession"));
-        assert!(!content.contains("session"));
+        assert!(content.contains("validateListthingCookieSession"));
     }
 
     #[test]

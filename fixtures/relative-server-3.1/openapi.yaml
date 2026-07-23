@@ -1,0 +1,13 @@
+openapi: 3.1.0
+info:
+  title: Relative server URL
+  version: 1.0.0
+servers:
+  - url: /api/v2
+paths:
+  /status:
+    get:
+      operationId: getStatus
+      responses:
+        '204':
+          description: Service is available.

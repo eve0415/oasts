@@ -1857,6 +1857,7 @@ mod tests {
             deprecated: false,
             description: None,
             schema: any_schema(&format!("/paths/~1target/get/parameters/{name}/schema")),
+            content_media_type: None,
             style: None,
             explode: None,
             allow_reserved: false,

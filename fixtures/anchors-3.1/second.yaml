@@ -1,0 +1,9 @@
+$defs:
+  CrossFileTarget:
+    $anchor: CrossFile
+    type: object
+    required:
+      - id
+    properties:
+      id:
+        type: integer

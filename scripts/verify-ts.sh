@@ -37,7 +37,10 @@ generate_and_verify() {
   echo "double-generation byte identity ok: $message"
 }
 
-for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server-variables-enum-3.1; do
+generate_and_verify anchors-3.1 oasts.yaml "$work/anchors-3.1" types "anchors-3.1"
+generate_and_verify defs-entry-3.1 oasts.yaml "$work/defs-entry-3.1" types "defs-entry-3.1"
+
+for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server-variables-enum-3.1 relative-server-3.1 wire-fidelity-3.1; do
   # A fixture whose client config lives in a separate file says so on disk.
   fixture_config=oasts.yaml
   if [[ -f "fixtures/$f/oasts-client.yaml" ]]; then
@@ -51,6 +54,9 @@ echo "compile-assert matrix ok: auth-showcase-3.1"
 
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-server-variables-enum-3.1/compile-assert/cases.ts"
 echo "compile-assert matrix ok: server-variables-enum-3.1"
+
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-relative-server-3.1/compile-assert/cases.ts"
+echo "compile-assert matrix ok: relative-server-3.1"
 
 # Webhooks showcase carries two configs. Run each with double-generation byte-identity: the
 # types-only config proves webhooks/callbacks emit in a client-free artifact; the client config

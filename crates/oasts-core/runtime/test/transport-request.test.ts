@@ -8,6 +8,7 @@ import {
   type OperationDescriptor,
 } from "../transport.ts";
 import {
+  serializeContentJsonQuery,
   serializeHeaderSimple,
   serializePathSimple,
   serializeQueryFormExplode,
@@ -90,9 +91,9 @@ describe("request serialization and fetch contract", () => {
         fetchDefaults: { credentials: "same-origin", redirect: "follow" },
       }),
       {
-        petId: "a/b",
-        tag: ["red", "blue"],
-        "X-Layer": "parameter",
+        path: { petId: "a/b" },
+        query: { tag: ["red", "blue"] },
+        header: { "X-Layer": "parameter" },
         body: { name: "Ada" },
       },
       {
@@ -126,6 +127,38 @@ describe("request serialization and fetch contract", () => {
     assert.equal(capturedSidecar.body, "caller body");
   });
 
+  test("forwards a content JSON parameter's raw object value past the ParamValue guard", async () => {
+    let url = "";
+    const transport = createTransport({
+      fetch: async (request) => {
+        url = request.url;
+        return new Response();
+      },
+    });
+
+    await execute(
+      transport,
+      operation({
+        params: [
+          {
+            name: "filter",
+            location: "query",
+            required: true,
+            serialize: serializeContentJsonQuery,
+            allowReserved: false,
+            content: true,
+          },
+        ],
+      }),
+      { query: { filter: { status: ["open", "closed"] } } },
+    );
+
+    assert.equal(
+      url,
+      "https://descriptor.example/api/resource?filter=%7B%22status%22%3A%5B%22open%22%2C%22closed%22%5D%7D",
+    );
+  });
+
   test("resolves server templates with transport variable overrides", async () => {
     let url = "";
     const transport = createTransport({
@@ -157,6 +190,66 @@ describe("request serialization and fetch contract", () => {
     );
 
     assert.equal(url, "https://west.example/v1/resource");
+  });
+
+  test("resolves relative server descriptors against the transport base URL", async () => {
+    const urls: string[] = [];
+    const transport = createTransport({
+      baseUrl: "https://transport.example/root/",
+      fetch: async (request) => {
+        urls.push(request.url);
+        return new Response();
+      },
+    });
+
+    for (const serverUrl of ["/api/{version}", "/api/{version}/"] as const) {
+      await execute(
+        transport,
+        operation({
+          baseUrl: {
+            kind: "server",
+            index: 0,
+            servers: [
+              {
+                url: serverUrl,
+                variables: [["version", "v2"]],
+              },
+            ],
+          },
+        }),
+        {},
+      );
+    }
+
+    assert.deepEqual(urls, [
+      "https://transport.example/api/v2/resource",
+      "https://transport.example/api/v2/resource",
+    ]);
+  });
+
+  test("keeps transport base URL precedence over an absolute server descriptor", async () => {
+    let url = "";
+    const transport = createTransport({
+      baseUrl: "https://transport.example/root/",
+      fetch: async (request) => {
+        url = request.url;
+        return new Response();
+      },
+    });
+
+    await execute(
+      transport,
+      operation({
+        baseUrl: {
+          kind: "server",
+          index: 0,
+          servers: [{ url: "https://server.example/api", variables: [] }],
+        },
+      }),
+      {},
+    );
+
+    assert.equal(url, "https://transport.example/root/resource");
   });
 
   test("serializes form-urlencoded and binary bodies", async () => {
@@ -310,7 +403,6 @@ describe("request serialization and fetch contract", () => {
               payload: "text",
               contentType: { kind: "selected", admitted: ["text/*"] },
               filename: true,
-              cte: "8bit",
             },
             {
               name: "tags",
@@ -338,7 +430,6 @@ describe("request serialization and fetch contract", () => {
           note: {
             body: "héllo",
             contentType: "Text/Plain; Charset=UTF-8",
-            headers: { "X-Part": "yes" },
             filename: "note.txt",
           },
           tags: ["one", "two"],
@@ -354,10 +445,54 @@ describe("request serialization and fetch contract", () => {
     const body = await captured.text();
     assert.match(body, /name="note"; filename="note.txt"/u);
     assert.match(body, /Content-Type: text\/plain; charset=utf-8/u);
-    assert.match(body, /X-Part: yes/u);
-    assert.match(body, /Content-Transfer-Encoding: 8bit/u);
     assert.equal(body.match(/name="tags"/gu)?.length, 2);
     assert.doesNotMatch(body, /name="optional"/u);
+  });
+
+  test("multipart indexes the payload kind by the selected media, not payloads[0]", async () => {
+    // Heterogeneous payloads (`["json", "text"]`) prove the selected media indexes into `payloads`:
+    // reading payloads[0] would serialize the text selection as JSON, stamping text/plain on a
+    // JSON-quoted body. Selecting text/plain (index 1) writes the bare value; application/json
+    // (index 0) writes the `"`-quoted JSON — byte-different, so a wrong index fails.
+    const requests: Request[] = [];
+    const transport = createTransport({
+      fetch: async (request) => {
+        requests.push(request);
+        return new Response();
+      },
+    });
+    const wrapped = operation({
+      method: "POST",
+      body: {
+        kind: "multipart",
+        fields: [
+          {
+            name: "data",
+            required: true,
+            repeated: false,
+            wrapper: true,
+            payload: "json",
+            payloads: ["json", "text"],
+            contentType: { kind: "selected", admitted: ["application/json", "text/plain"] },
+            filename: false,
+          },
+        ],
+      },
+    });
+
+    await execute(transport, wrapped, {
+      body: { data: { body: "hi", contentType: "text/plain" } },
+    });
+    await execute(transport, wrapped, {
+      body: { data: { body: "hi", contentType: "application/json" } },
+    });
+
+    const textPart = await requests[0].text();
+    assert.match(textPart, /Content-Type: text\/plain/u);
+    assert.ok(textPart.includes("\r\n\r\nhi\r\n"), textPart);
+    const jsonPart = await requests[1].text();
+    assert.match(jsonPart, /Content-Type: application\/json/u);
+    assert.ok(jsonPart.includes('\r\n\r\n"hi"\r\n'), jsonPart);
   });
 
   test("selects content-discriminated request arms by media tier", async () => {
@@ -402,17 +537,18 @@ describe("request failures", () => {
   });
 
   test("returns request-encode for unresolved server state", async () => {
-    const result = requestFailure(
-      await execute(
-        createTransport({}),
-        operation({
-          baseUrl: { kind: "server", index: 1, servers: [] },
-        }),
-        {},
-      ),
-    );
+    for (const baseUrl of [
+      { kind: "server", index: 1, servers: [] },
+      {
+        kind: "server",
+        index: 0,
+        servers: [{ url: "/relative", variables: [] }],
+      },
+    ] satisfies OperationDescriptor["baseUrl"][]) {
+      const result = requestFailure(await execute(createTransport({}), operation({ baseUrl }), {}));
 
-    assert.equal(result.error.kind, "request-encode");
+      assert.equal(result.error.kind, "request-encode");
+    }
   });
 
   test("returns request-encode for missing, malformed, range, or unmatched content selections", async () => {
@@ -461,7 +597,7 @@ describe("request failures", () => {
     assert.equal(result.error.kind, "request-encode");
   });
 
-  test("maps multipart present-null and CTE violations to request-encode", async () => {
+  test("maps a present-null multipart field to request-encode", async () => {
     const field = {
       name: "note",
       required: true,
@@ -470,74 +606,13 @@ describe("request failures", () => {
       payload: "text" as const,
       contentType: { kind: "fixed" as const, value: "text/plain" },
       filename: false,
-      cte: "7bit" as const,
     };
     const descriptor = operation({ method: "POST", body: { kind: "multipart", fields: [field] } });
 
-    for (const body of [{ note: null }, { note: "é" }]) {
-      const result = requestFailure(await execute(createTransport({}), descriptor, { body }));
-      assert.equal(result.error.kind, "request-encode");
-    }
-  });
-
-  test("validates caller-supplied multipart Content-Transfer-Encoding", async () => {
-    const descriptor = operation({
-      method: "POST",
-      body: {
-        kind: "multipart",
-        fields: [
-          {
-            name: "note",
-            required: true,
-            repeated: false,
-            wrapper: true,
-            payload: "text",
-            contentType: { kind: "fixed", value: "text/plain" },
-            filename: false,
-          },
-        ],
-      },
-    });
-
-    for (const note of [
-      {
-        body: "ascii",
-        contentType: "text/plain",
-        headers: { "Content-Transfer-Encoding": "base64" },
-      },
-      {
-        body: "é",
-        contentType: "text/plain",
-        headers: { "Content-Transfer-Encoding": "7bit" },
-      },
-    ]) {
-      const result = requestFailure(
-        await execute(createTransport({}), descriptor, { body: { note } }),
-      );
-      assert.equal(result.error.kind, "request-encode");
-    }
-
-    let captured: Request | undefined;
-    await execute(
-      createTransport({
-        fetch: async (request) => {
-          captured = request;
-          return new Response();
-        },
-      }),
-      descriptor,
-      {
-        body: {
-          note: {
-            body: "ascii",
-            contentType: "text/plain",
-            headers: { "Content-Transfer-Encoding": "7bit" },
-          },
-        },
-      },
+    const result = requestFailure(
+      await execute(createTransport({}), descriptor, { body: { note: null } }),
     );
-    assert.ok(captured);
-    assert.match(await captured.text(), /Content-Transfer-Encoding: 7bit\r\n/u);
+    assert.equal(result.error.kind, "request-encode");
   });
 
   test("returns the dependent signal's reason for a pre-dispatch abort", async () => {

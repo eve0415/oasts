@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::config::ResolvedConfig;
-use crate::diag::{Diagnostic, DiagnosticSink};
+use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::syntax::parse_yaml_document_value;
 
 const CODE_IO: &str = "OASTS1001";
@@ -30,6 +30,7 @@ const CODE_MAX_REF_DEPTH: &str = "OASTS1009";
 const CODE_INVALID_REFERENCE: &str = "OASTS1010";
 const CODE_POINTER: &str = "OASTS1011";
 const CODE_NON_SCHEMA_CYCLE: &str = "OASTS1012";
+const CODE_EXTENSION_FALLBACK: &str = "OASTS1013";
 const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
 
 /// Stable index of a document within one graph.
@@ -62,6 +63,8 @@ pub struct NodeLocation {
     pub doc_id: DocId,
     pub json_pointer: String,
 }
+
+type AnchorRegistry = HashMap<(String, String), NodeLocation>;
 
 /// Semantic position in which a reference appeared.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -97,10 +100,12 @@ struct AllowRoot {
 pub struct DocumentGraph {
     documents: Vec<Document>,
     path_to_id: HashMap<PathBuf, DocId>,
+    anchors: AnchorRegistry,
     entry_id: DocId,
     edges: Vec<ReferenceEdge>,
     workspace_root: PathBuf,
     allow_roots: Vec<AllowRoot>,
+    max_ref_depth: u64,
 }
 
 impl DocumentGraph {
@@ -120,6 +125,12 @@ impl DocumentGraph {
     #[must_use]
     pub fn documents(&self) -> &[Document] {
         &self.documents
+    }
+
+    /// Returns the configured maximum number of reference hops.
+    #[must_use]
+    pub const fn max_ref_depth(&self) -> u64 {
+        self.max_ref_depth
     }
 
     /// Returns the node at `json_pointer` inside `doc_id` without re-resolving
@@ -163,6 +174,14 @@ impl DocumentGraph {
             )
         })?;
         let target_url = resolve_uri(&base, reference, Some(&base_document.source_id), None)?;
+        if let Some(target) = registered_anchor_location(
+            &target_url,
+            &self.anchors,
+            Some(&base_document.source_id),
+            None,
+        )? {
+            return self.node_from_location(target);
+        }
         let target_path = local_path_from_url(&target_url, Some(&base_document.source_id), None)?;
         let canonical = fs::canonicalize(&target_path).map_err(|error| {
             io_error(
@@ -191,19 +210,30 @@ impl DocumentGraph {
                 None,
             ));
         };
-        let pointer = pointer_from_url(&target_url, Some(&base_document.source_id), None)?;
-        let target_document = &self.documents[target_id.0];
-        let value = evaluate_pointer(&target_document.value, &pointer).map_err(|message| {
-            input_error(
-                CODE_POINTER,
-                message,
-                Some(&target_document.source_id),
-                Some(&pointer),
-            )
-        })?;
+        let target = pointer_or_anchor(
+            &target_url,
+            target_id,
+            &self.anchors,
+            Some(&base_document.source_id),
+            None,
+        )?;
+        self.node_from_location(target)
+    }
+
+    fn node_from_location(&self, target: NodeLocation) -> Result<Node<'_>, Diagnostic> {
+        let target_document = &self.documents[target.doc_id.0];
+        let value =
+            evaluate_pointer(&target_document.value, &target.json_pointer).map_err(|message| {
+                input_error(
+                    CODE_POINTER,
+                    message,
+                    Some(&target_document.source_id),
+                    Some(&target.json_pointer),
+                )
+            })?;
         Ok(Node {
-            doc_id: target_id,
-            json_pointer: pointer,
+            doc_id: target.doc_id,
+            json_pointer: target.json_pointer,
             value,
         })
     }
@@ -224,7 +254,10 @@ impl DocumentGraph {
 /// Loads the configured local document graph, reporting the first load failure.
 pub fn load_graph(config: &ResolvedConfig, sink: &mut DiagnosticSink) -> Option<DocumentGraph> {
     match GraphBuilder::new(config).and_then(GraphBuilder::build) {
-        Ok(graph) => Some(graph),
+        Ok((graph, warnings)) => {
+            sink.extend(warnings);
+            Some(graph)
+        }
         Err(diagnostic) => {
             sink.push(diagnostic);
             None
@@ -275,11 +308,13 @@ struct GraphBuilder<'a> {
     config: &'a ResolvedConfig,
     documents: Vec<Document>,
     path_to_id: HashMap<PathBuf, DocId>,
+    anchors: AnchorRegistry,
     edges: Vec<ReferenceEdge>,
     workspace_root: PathBuf,
     allow_roots: Vec<AllowRoot>,
     total_bytes: u64,
     visited: HashSet<VisitKey>,
+    warnings: Vec<Diagnostic>,
 }
 
 impl<'a> GraphBuilder<'a> {
@@ -311,15 +346,17 @@ impl<'a> GraphBuilder<'a> {
             config,
             documents: Vec::new(),
             path_to_id: HashMap::new(),
+            anchors: HashMap::new(),
             edges: Vec::new(),
             workspace_root,
             allow_roots,
             total_bytes: 0,
             visited: HashSet::new(),
+            warnings: Vec::new(),
         })
     }
 
-    fn build(mut self) -> Result<DocumentGraph, Diagnostic> {
+    fn build(mut self) -> Result<(DocumentGraph, Vec<Diagnostic>), Diagnostic> {
         let entry_path = configured_entry_path(&self.config.input)?;
         let entry_id = self.load_document(&entry_path)?;
         let entry_path = self.documents[entry_id.0].canonical_path.clone();
@@ -336,14 +373,19 @@ impl<'a> GraphBuilder<'a> {
             0,
             &mut state,
         )?;
-        Ok(DocumentGraph {
-            documents: self.documents,
-            path_to_id: self.path_to_id,
-            entry_id,
-            edges: self.edges,
-            workspace_root: self.workspace_root,
-            allow_roots: self.allow_roots,
-        })
+        Ok((
+            DocumentGraph {
+                documents: self.documents,
+                path_to_id: self.path_to_id,
+                anchors: self.anchors,
+                entry_id,
+                edges: self.edges,
+                workspace_root: self.workspace_root,
+                allow_roots: self.allow_roots,
+                max_ref_depth: self.config.limits.max_ref_depth,
+            },
+            self.warnings,
+        ))
     }
 
     fn load_document(&mut self, requested_path: &Path) -> Result<DocId, Diagnostic> {
@@ -406,10 +448,37 @@ impl<'a> GraphBuilder<'a> {
                 None,
             )
         })?;
-        let value = parse_document(&canonical_path, &raw, &source_id)?;
+        // Fast-reject that gates the anchor tree walk over the *raw* file bytes. It must also fire
+        // on spellings that escape the `$`: a document can write the key with the dollar as a JSON
+        // or YAML unicode/hex character escape and still parse to the key `$anchor`. Missing one
+        // skips registration silently — later refs fail to resolve and duplicate-anchor validation
+        // never runs. Over-triggering is harmless (the walk just finds no `$anchor` keys); a false
+        // negative is not, so the three needles below need no false negatives, not exactness.
+        let contains_anchor = [
+            b"$anchor".as_slice(),
+            // The dollar as the unicode escape U+0024 (JSON, and YAML double-quoted) — the literal
+            // bytes `\`, `u`, `0`, `0`, `2`, `4` followed by `anchor`.
+            [
+                0x5C, 0x75, 0x30, 0x30, 0x32, 0x34, b'a', b'n', b'c', b'h', b'o', b'r',
+            ]
+            .as_slice(),
+            // The dollar as the YAML hex escape \x24, followed by `anchor`.
+            br"\x24anchor".as_slice(),
+        ]
+        .iter()
+        .any(|needle| raw.windows(needle.len()).any(|window| window == *needle));
+        let (value, warning) = parse_document(&canonical_path, &raw, &source_id)?;
+        if let Some(warning) = warning {
+            self.warnings.push(warning);
+        }
         let sha256 = Sha256::digest(&raw).into();
         drop(raw);
         let id = DocId(self.documents.len());
+        if contains_anchor {
+            let base = file_url(&canonical_path)
+                .expect("a canonical filesystem path is representable as a file URI");
+            collect_anchors(&value, id, base, &source_id, &mut self.anchors)?;
+        }
         self.documents.push(Document {
             id,
             canonical_path: canonical_path.clone(),
@@ -614,35 +683,46 @@ impl<'a> GraphBuilder<'a> {
             self.source_id(from.doc_id),
             Some(&reference_pointer),
         )?;
-        let source_id = self.source_id(from.doc_id);
-        let target_path = local_path_from_url(&target_url, source_id, Some(&reference_pointer))?;
-        let target_id = self.load_document(&target_path).map_err(|mut diagnostic| {
-            if diagnostic.source_id.is_none()
-                && let Some(source_id) = self.source_id(from.doc_id)
-            {
-                diagnostic = diagnostic.with_source(source_id);
-            }
-            // load_document diagnostics identify the failing file, never a position inside the
-            // referencing document — the $ref location is always ours to stamp.
-            diagnostic.with_json_pointer(&reference_pointer)
-        })?;
-        let source_id = self.source_id(from.doc_id);
-        let target_pointer = pointer_from_url(&target_url, source_id, Some(&reference_pointer))?;
-        let target_source = self.documents[target_id.0].source_id.clone();
-        evaluate_pointer(&self.documents[target_id.0].value, &target_pointer).map_err(
+        let target = if let Some(target) = registered_anchor_location(
+            &target_url,
+            &self.anchors,
+            self.source_id(from.doc_id),
+            Some(&reference_pointer),
+        )? {
+            target
+        } else {
+            let source_id = self.source_id(from.doc_id);
+            let target_path =
+                local_path_from_url(&target_url, source_id, Some(&reference_pointer))?;
+            let target_id = self.load_document(&target_path).map_err(|mut diagnostic| {
+                if diagnostic.source_id.is_none()
+                    && let Some(source_id) = self.source_id(from.doc_id)
+                {
+                    diagnostic = diagnostic.with_source(source_id);
+                }
+                // load_document diagnostics identify the failing file, never a position inside the
+                // referencing document — the $ref location is always ours to stamp.
+                diagnostic.with_json_pointer(&reference_pointer)
+            })?;
+            pointer_or_anchor(
+                &target_url,
+                target_id,
+                &self.anchors,
+                self.source_id(from.doc_id),
+                Some(&reference_pointer),
+            )?
+        };
+        let target_source = self.documents[target.doc_id.0].source_id.clone();
+        evaluate_pointer(&self.documents[target.doc_id.0].value, &target.json_pointer).map_err(
             |message| {
                 input_error(
                     CODE_POINTER,
                     message,
                     Some(&target_source),
-                    Some(&target_pointer),
+                    Some(&target.json_pointer),
                 )
             },
         )?;
-        let target = NodeLocation {
-            doc_id: target_id,
-            json_pointer: target_pointer,
-        };
         self.edges.push(ReferenceEdge {
             from: from.clone(),
             to: target.clone(),
@@ -792,6 +872,143 @@ impl<'a> GraphBuilder<'a> {
     }
 }
 
+fn collect_anchors(
+    value: &Value,
+    doc_id: DocId,
+    base: Url,
+    source_id: &str,
+    anchors: &mut AnchorRegistry,
+) -> Result<(), Diagnostic> {
+    let context = if value.get("openapi").is_some() {
+        WalkContext::NonSchema
+    } else {
+        WalkContext::Schema
+    };
+    collect_anchors_at(value, doc_id, "", context, base, source_id, anchors)
+}
+
+fn collect_anchors_at(
+    value: &Value,
+    doc_id: DocId,
+    pointer: &str,
+    context: WalkContext,
+    mut base: Url,
+    source_id: &str,
+    anchors: &mut AnchorRegistry,
+) -> Result<(), Diagnostic> {
+    if context == WalkContext::Skip {
+        return Ok(());
+    }
+
+    if context == WalkContext::Schema
+        && let Value::Object(object) = value
+        && let Some(id_value) = object.get("$id")
+    {
+        let Some(id) = id_value.as_str() else {
+            return Ok(());
+        };
+        let Ok(resolved) = resolve_uri(
+            &base,
+            id,
+            Some(source_id),
+            Some(&append_pointer(pointer, "$id")),
+        ) else {
+            return Ok(());
+        };
+        base = resolved;
+    }
+
+    if context == WalkContext::Schema
+        && let Value::Object(object) = value
+        && let Some(anchor_value) = object.get("$anchor")
+    {
+        let anchor_pointer = append_pointer(pointer, "$anchor");
+        let Some(name) = anchor_value.as_str() else {
+            return Err(input_error(
+                CODE_INVALID_REFERENCE,
+                "Schema Object $anchor must be a valid plain name",
+                Some(source_id),
+                Some(&anchor_pointer),
+            ));
+        };
+        if !valid_anchor_name(name) {
+            return Err(input_error(
+                CODE_INVALID_REFERENCE,
+                format!("Schema Object $anchor '{name}' is not a valid plain name"),
+                Some(source_id),
+                Some(&anchor_pointer),
+            ));
+        }
+        let key = (resource_base_uri(&base), name.to_owned());
+        if anchors.contains_key(&key) {
+            return Err(input_error(
+                CODE_INVALID_REFERENCE,
+                format!("duplicate $anchor '{name}' in the same schema resource"),
+                Some(source_id),
+                Some(&anchor_pointer),
+            ));
+        }
+        anchors.insert(
+            key,
+            NodeLocation {
+                doc_id,
+                json_pointer: pointer.to_owned(),
+            },
+        );
+    }
+
+    match value {
+        Value::Object(object) => {
+            for (name, child) in object {
+                let child_context = child_context(context, pointer, name, child);
+                if child_context != WalkContext::Skip {
+                    collect_anchors_at(
+                        child,
+                        doc_id,
+                        &append_pointer(pointer, name),
+                        child_context,
+                        base.clone(),
+                        source_id,
+                        anchors,
+                    )?;
+                }
+            }
+        }
+        Value::Array(array) => {
+            let child_context = array_child_context(context);
+            if child_context != WalkContext::Skip {
+                for (index, child) in array.iter().enumerate() {
+                    collect_anchors_at(
+                        child,
+                        doc_id,
+                        &append_pointer(pointer, &index.to_string()),
+                        child_context,
+                        base.clone(),
+                        source_id,
+                        anchors,
+                    )?;
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+    Ok(())
+}
+
+fn valid_anchor_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn resource_base_uri(url: &Url) -> String {
+    let mut resource = url.clone();
+    resource.set_fragment(None);
+    resource.into()
+}
+
 fn document_byte_len(path: &Path, source_id: &str) -> Result<u64, Diagnostic> {
     fs::metadata(path)
         .map(|metadata| metadata.len())
@@ -805,25 +1022,111 @@ fn document_byte_len(path: &Path, source_id: &str) -> Result<u64, Diagnostic> {
         })
 }
 
-fn parse_document(path: &Path, raw: &[u8], source_id: &str) -> Result<Value, Diagnostic> {
+type DocumentParser = fn(&[u8], &str) -> Result<Value, Diagnostic>;
+
+fn parse_document(
+    path: &Path,
+    raw: &[u8],
+    source_id: &str,
+) -> Result<(Value, Option<Diagnostic>), Diagnostic> {
     match path.extension().and_then(OsStr::to_str) {
-        Some("json") => parse_json(raw, source_id),
-        Some("yaml" | "yml") => parse_yaml(raw, source_id),
-        _ => match parse_json(raw, source_id) {
-            Ok(value) => Ok(value),
-            Err(json_error) => parse_yaml(raw, source_id).map_err(|yaml_error| {
-                input_error(
-                    CODE_PARSE,
-                    format!(
-                        "document is neither valid JSON nor YAML: {}; {}",
-                        json_error.message, yaml_error.message
-                    ),
-                    Some(source_id),
-                    None,
+        // The extension names the primary parser; the other is the fallback. The warning reports the
+        // format actually used, and `combined_parse_error` always receives the errors in canonical
+        // (json, yaml) order with the primary parser's position.
+        Some(ext @ ("json" | "yaml" | "yml")) => {
+            let (primary, fallback, fell_back_to) = if ext == "json" {
+                (
+                    parse_json as DocumentParser,
+                    parse_yaml as DocumentParser,
+                    "YAML",
                 )
-            }),
+            } else {
+                (
+                    parse_yaml as DocumentParser,
+                    parse_json as DocumentParser,
+                    "JSON",
+                )
+            };
+            match parse_with_fallback(raw, source_id, primary, fallback) {
+                Ok((value, false)) => Ok((value, None)),
+                Ok((value, true)) => Ok((
+                    value,
+                    Some(extension_fallback_warning(
+                        source_id,
+                        &format!(".{ext}"),
+                        fell_back_to,
+                    )),
+                )),
+                Err(errors) => {
+                    let (primary_error, fallback_error) = *errors;
+                    let (line, col) = (primary_error.line, primary_error.col);
+                    let (json_error, yaml_error) = if ext == "json" {
+                        (primary_error, fallback_error)
+                    } else {
+                        (fallback_error, primary_error)
+                    };
+                    Err(combined_parse_error(
+                        source_id, line, col, json_error, yaml_error,
+                    ))
+                }
+            }
+        }
+        _ => match parse_with_fallback(raw, source_id, parse_json, parse_yaml) {
+            Ok((value, _)) => Ok((value, None)),
+            Err(errors) => {
+                let (json_error, yaml_error) = *errors;
+                Err(combined_parse_error(
+                    source_id, None, None, json_error, yaml_error,
+                ))
+            }
         },
     }
+}
+
+fn parse_with_fallback(
+    raw: &[u8],
+    source_id: &str,
+    primary: DocumentParser,
+    fallback: DocumentParser,
+) -> Result<(Value, bool), Box<(Diagnostic, Diagnostic)>> {
+    match primary(raw, source_id) {
+        Ok(value) => Ok((value, false)),
+        Err(primary_error) => match fallback(raw, source_id) {
+            Ok(value) => Ok((value, true)),
+            Err(fallback_error) => Err(Box::new((primary_error, fallback_error))),
+        },
+    }
+}
+
+fn combined_parse_error(
+    source_id: &str,
+    line: Option<u32>,
+    col: Option<u32>,
+    json_error: Diagnostic,
+    yaml_error: Diagnostic,
+) -> Diagnostic {
+    let mut diagnostic = input_error(
+        CODE_PARSE,
+        format!(
+            "document is neither valid JSON nor YAML: {}; {}",
+            json_error.message, yaml_error.message
+        ),
+        Some(source_id),
+        None,
+    );
+    diagnostic.line = line;
+    diagnostic.col = col;
+    diagnostic
+}
+
+fn extension_fallback_warning(source_id: &str, extension: &str, format: &str) -> Diagnostic {
+    let mut diagnostic = Diagnostic::input(
+        CODE_EXTENSION_FALLBACK,
+        format!("document '{source_id}' has extension '{extension}' but parsed as {format}"),
+    )
+    .with_source(source_id);
+    diagnostic.severity = Severity::Warning;
+    diagnostic
 }
 
 fn configured_entry_path(path: &Path) -> Result<PathBuf, Diagnostic> {
@@ -992,6 +1295,7 @@ fn parse_yaml(raw: &[u8], source_id: &str) -> Result<Value, Diagnostic> {
             None,
         )
     })?;
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     parse_yaml_document_value(source).map_err(|error| {
         input_error(
             CODE_PARSE,
@@ -1160,6 +1464,71 @@ fn pointer_from_url(
     validate_pointer(&decoded)
         .map_err(|message| input_error(CODE_INVALID_REFERENCE, message, source_id, pointer))?;
     Ok(decoded)
+}
+
+fn registered_anchor_location(
+    url: &Url,
+    anchors: &AnchorRegistry,
+    source_id: Option<&str>,
+    pointer: Option<&str>,
+) -> Result<Option<NodeLocation>, Diagnostic> {
+    if anchors.is_empty() {
+        return Ok(None);
+    }
+    let Some(fragment) = url.fragment() else {
+        return Ok(None);
+    };
+    if fragment.is_empty() || fragment.starts_with('/') {
+        return Ok(None);
+    }
+    let name = percent_decode(fragment)
+        .map_err(|message| input_error(CODE_INVALID_REFERENCE, message, source_id, pointer))?;
+    if name.is_empty() || name.starts_with('/') {
+        return Ok(None);
+    }
+    Ok(anchors.get(&(resource_base_uri(url), name)).cloned())
+}
+
+fn pointer_or_anchor(
+    url: &Url,
+    doc_id: DocId,
+    anchors: &AnchorRegistry,
+    source_id: Option<&str>,
+    pointer: Option<&str>,
+) -> Result<NodeLocation, Diagnostic> {
+    let Some(fragment) = url.fragment() else {
+        return Ok(NodeLocation {
+            doc_id,
+            json_pointer: String::new(),
+        });
+    };
+    if fragment.is_empty() || fragment.starts_with('/') {
+        return Ok(NodeLocation {
+            doc_id,
+            json_pointer: pointer_from_url(url, source_id, pointer)?,
+        });
+    }
+    let name = percent_decode(fragment)
+        .map_err(|message| input_error(CODE_INVALID_REFERENCE, message, source_id, pointer))?;
+    if name.is_empty() || name.starts_with('/') {
+        validate_pointer(&name)
+            .map_err(|message| input_error(CODE_INVALID_REFERENCE, message, source_id, pointer))?;
+        return Ok(NodeLocation {
+            doc_id,
+            json_pointer: name,
+        });
+    }
+    anchors
+        .get(&(resource_base_uri(url), name.clone()))
+        .cloned()
+        .ok_or_else(|| {
+            input_error(
+                CODE_INVALID_REFERENCE,
+                format!("no $anchor '{name}' in the target resource"),
+                source_id,
+                pointer,
+            )
+        })
 }
 
 fn percent_decode(value: &str) -> Result<String, String> {
@@ -1663,7 +2032,7 @@ mod tests {
     }
 
     #[test]
-    fn input_yaml_resolves_anchors_aliases_and_keeps_merge_keys_literal() {
+    fn input_yaml_resolves_anchors_aliases_and_merge_keys() {
         let directory = TempDir::new().expect("tempdir should be created");
         write(
             directory.path(),
@@ -1705,12 +2074,8 @@ mod tests {
         assert_eq!(document["x-third"], document["x-second"]);
         assert_eq!(document["x-second"][0], document["x-first"]);
         assert_eq!(
-            document["x-merge"]["<<"],
+            document["x-merge"],
             document["components"]["parameters"]["Common"]
-        );
-        assert_eq!(
-            document["x-merge"].as_object().expect("merge object").len(),
-            1
         );
     }
 
@@ -2063,6 +2428,311 @@ mod tests {
     }
 
     #[test]
+    fn same_file_forward_anchor_reference_resolves() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Forward:\n      $ref: '#Foo'\n    Target:\n      $anchor: Foo\n      type: string\n",
+        );
+        let config = resolved_config(directory.path(), "");
+
+        let graph = load_ok(&config);
+
+        assert_eq!(graph.edges().len(), 1);
+        assert_eq!(
+            graph.edges()[0].to.json_pointer,
+            "/components/schemas/Target"
+        );
+        let target = graph
+            .resolve(graph.entry().id, "#Foo")
+            .expect("plain-name anchor should resolve");
+        assert_eq!(target.value["type"], "string");
+        assert_eq!(
+            graph
+                .resolve(graph.entry().id, "#%")
+                .expect_err("invalid percent escape should fail")
+                .code,
+            CODE_INVALID_REFERENCE
+        );
+    }
+
+    #[test]
+    fn unicode_escaped_dollar_anchor_key_still_registers() {
+        // The raw file bytes spell the `$anchor` key with the dollar as the JSON `$` unicode
+        // escape, so the fast-reject must fire on that spelling or the anchor never registers and
+        // `#Foo` fails to resolve. Build the escape from bytes so this test source carries no
+        // backslash that a JSON-escaping toolchain could collapse back into a literal `$`.
+        let escaped_dollar_bytes = [0x5C, 0x75, 0x30, 0x30, 0x32, 0x34u8];
+        let escaped_dollar = std::str::from_utf8(&escaped_dollar_bytes)
+            .expect("ascii unicode escape is valid utf-8");
+        let content = [
+            r##"{"openapi":"3.1.0","components":{"schemas":{"Forward":{"$ref":"#Foo"},"Target":{""##,
+            escaped_dollar,
+            r##"anchor":"Foo","type":"string"}}}}"##,
+        ]
+        .concat();
+
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(directory.path(), "workspace/entry.json", &content);
+        let config = resolved_json_config(directory.path());
+
+        let graph = load_ok(&config);
+        let target = graph
+            .resolve(graph.entry().id, "#Foo")
+            .expect("escaped-dollar anchor should register and resolve");
+        assert_eq!(target.value["type"], "string");
+    }
+
+    #[test]
+    fn anchor_resolution_uses_the_innermost_schema_id_scope() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    RootTarget:\n      $anchor: Foo\n      type: string\n    Inner:\n      $id: ./inner.json\n      $defs:\n        InnerTarget:\n          $anchor: Foo\n          type: number\n        Reference:\n          $ref: '#Foo'\n",
+        );
+        let config = resolved_config(directory.path(), "");
+
+        let graph = load_ok(&config);
+
+        let edge = graph
+            .edges()
+            .iter()
+            .find(|edge| edge.reference == "#Foo")
+            .expect("inner reference edge");
+        assert_eq!(
+            edge.to.json_pointer,
+            "/components/schemas/Inner/$defs/InnerTarget"
+        );
+        let root_target = graph
+            .resolve(graph.entry().id, "#Foo")
+            .expect("root anchor should resolve");
+        assert_eq!(root_target.value["type"], "string");
+        let inner_target = graph
+            .resolve(graph.entry().id, "./inner.json#Foo")
+            .expect("inner resource anchor should resolve");
+        assert_eq!(inner_target.value["type"], "number");
+    }
+
+    #[test]
+    fn cross_file_anchor_reference_resolves() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    External:\n      $ref: './b.yaml#Foo'\n",
+        );
+        write(
+            directory.path(),
+            "workspace/b.yaml",
+            "$anchor: Foo\ntype: boolean\n",
+        );
+        let config = resolved_config(directory.path(), "");
+
+        let graph = load_ok(&config);
+
+        assert_eq!(graph.edges().len(), 1);
+        assert_eq!(graph.edges()[0].to.doc_id, DocId(1));
+        assert_eq!(graph.edges()[0].to.json_pointer, "");
+        let target = graph
+            .resolve(graph.entry().id, "./b.yaml#Foo")
+            .expect("cross-file anchor should resolve");
+        assert_eq!(target.value["type"], "boolean");
+    }
+
+    #[test]
+    fn invalid_anchor_name_is_fatal() {
+        for anchor in ["9bad", "7"] {
+            let directory = TempDir::new().expect("tempdir should be created");
+            write(
+                directory.path(),
+                "workspace/entry.yaml",
+                &format!(
+                    "openapi: 3.1.0\ncomponents:\n  schemas:\n    Invalid:\n      $anchor: {anchor}\n      type: string\n"
+                ),
+            );
+            let config = resolved_config(directory.path(), "");
+
+            assert_load_code(&config, CODE_INVALID_REFERENCE);
+        }
+    }
+
+    #[test]
+    fn duplicate_anchor_in_one_resource_is_fatal() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    First:\n      $anchor: Same\n      type: string\n    Second:\n      $anchor: Same\n      type: number\n",
+        );
+        let config = resolved_config(directory.path(), "");
+
+        assert_load_code(&config, CODE_INVALID_REFERENCE);
+    }
+
+    #[test]
+    fn unknown_anchor_name_is_fatal() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Missing:\n      $ref: '#Unknown'\n",
+        );
+        let config = resolved_config(directory.path(), "");
+
+        let diagnostic = assert_load_code(&config, CODE_INVALID_REFERENCE);
+        assert_eq!(
+            diagnostic.message,
+            "no $anchor 'Unknown' in the target resource"
+        );
+    }
+
+    #[test]
+    fn invalid_percent_escape_in_anchor_reference_is_fatal() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Target:\n      $anchor: Known\n      type: string\n    Invalid:\n      $ref: '#%'\n",
+        );
+        let config = resolved_config(directory.path(), "");
+
+        assert_load_code(&config, CODE_INVALID_REFERENCE);
+    }
+
+    #[test]
+    fn document_without_anchor_text_loads_successfully() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Plain: { type: string }\n",
+        );
+        let config = resolved_config(directory.path(), "");
+
+        let graph = load_ok(&config);
+
+        assert_eq!(graph.documents().len(), 1);
+    }
+
+    #[test]
+    fn anchor_collection_skips_invalid_id_subtrees_and_walks_schema_arrays() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let base = file_url(&directory.path().join("entry.yaml")).expect("file URL");
+        let value = json!({
+            "$anchor": "_Root.good-name",
+            "allOf": [
+                { "$anchor": "ArrayTarget", "type": "string" },
+                { "$id": 7, "$anchor": 5 },
+                { "$id": "https://example.invalid/schema", "$anchor": 5 }
+            ]
+        });
+        let mut anchors = AnchorRegistry::new();
+
+        collect_anchors(&value, DocId(4), base.clone(), "entry.yaml", &mut anchors)
+            .expect("invalid IDs should stop only their subtrees");
+
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(
+            anchors
+                .get(&(resource_base_uri(&base), "ArrayTarget".to_owned()))
+                .expect("array anchor"),
+            &NodeLocation {
+                doc_id: DocId(4),
+                json_pointer: "/allOf/0".to_owned(),
+            }
+        );
+        collect_anchors_at(
+            &json!({ "$anchor": 5 }),
+            DocId(4),
+            "",
+            WalkContext::Skip,
+            base.clone(),
+            "entry.yaml",
+            &mut anchors,
+        )
+        .expect("skipped contexts are ignored");
+        collect_anchors_at(
+            &json!([]),
+            DocId(4),
+            "",
+            WalkContext::SchemaMap,
+            base.clone(),
+            "entry.yaml",
+            &mut anchors,
+        )
+        .expect("schema-map arrays are ignored");
+        assert_eq!(
+            collect_anchors_at(
+                &json!({ "$anchor": 5 }),
+                DocId(4),
+                "",
+                WalkContext::Schema,
+                base,
+                "entry.yaml",
+                &mut anchors,
+            )
+            .expect_err("non-string anchor should fail")
+            .code,
+            CODE_INVALID_REFERENCE
+        );
+        assert_eq!(
+            collect_anchors(
+                &json!({ "allOf": [{ "$anchor": "9bad" }] }),
+                DocId(4),
+                file_url(&directory.path().join("invalid.yaml")).expect("file URL"),
+                "invalid.yaml",
+                &mut anchors,
+            )
+            .expect_err("array child errors should propagate")
+            .code,
+            CODE_INVALID_REFERENCE
+        );
+
+        let no_fragment = Url::parse("file:///entry.yaml").expect("URL");
+        assert_eq!(
+            registered_anchor_location(&no_fragment, &anchors, None, None)
+                .expect("lookup should succeed"),
+            None
+        );
+        let pointer_fragment = Url::parse("file:///entry.yaml#/%").expect("URL");
+        assert_eq!(
+            registered_anchor_location(&pointer_fragment, &anchors, None, None)
+                .expect("lookup should succeed"),
+            None
+        );
+        let encoded_pointer = Url::parse("file:///entry.yaml#%2Ftarget").expect("URL");
+        assert_eq!(
+            registered_anchor_location(&encoded_pointer, &anchors, None, None)
+                .expect("lookup should succeed"),
+            None
+        );
+        assert_eq!(
+            pointer_or_anchor(&encoded_pointer, DocId(4), &anchors, None, None)
+                .expect("encoded pointer should resolve"),
+            NodeLocation {
+                doc_id: DocId(4),
+                json_pointer: "/target".to_owned(),
+            }
+        );
+        let invalid_percent = Url::parse("file:///entry.yaml#%").expect("URL");
+        assert_eq!(
+            pointer_or_anchor(&invalid_percent, DocId(4), &anchors, None, None)
+                .expect_err("invalid percent escape should fail")
+                .code,
+            CODE_INVALID_REFERENCE
+        );
+        let invalid_pointer = Url::parse("file:///entry.yaml#%2Fbad~2escape").expect("URL");
+        assert_eq!(
+            pointer_or_anchor(&invalid_pointer, DocId(4), &anchors, None, None)
+                .expect_err("invalid decoded pointer should fail")
+                .code,
+            CODE_INVALID_REFERENCE
+        );
+    }
+
+    #[test]
     fn ancestor_schema_id_applies_when_a_cross_file_ref_targets_a_fragment() {
         let directory = TempDir::new().expect("tempdir should be created");
         write(
@@ -2136,6 +2806,7 @@ mod tests {
                 "https://example.invalid/schema.yaml",
                 CODE_REMOTE_UNSUPPORTED,
             ),
+            ("#/%", CODE_INVALID_REFERENCE),
             ("#not-a-pointer", CODE_INVALID_REFERENCE),
             ("#/missing", CODE_POINTER),
         ] {
@@ -2229,6 +2900,10 @@ mod tests {
             ),
             (
                 "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $ref: 'http://['\n",
+                CODE_INVALID_REFERENCE,
+            ),
+            (
+                "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $ref: '#/%'\n",
                 CODE_INVALID_REFERENCE,
             ),
             (
@@ -2356,21 +3031,26 @@ mod tests {
     fn document_parsers_cover_extensions_utf8_and_fallbacks() {
         assert_eq!(
             parse_document(Path::new("value.json"), br#"{"ok":true}"#, "json")
-                .expect("JSON document"),
+                .expect("JSON document")
+                .0,
             json!({ "ok": true })
         );
         assert_eq!(
-            parse_document(Path::new("value.yaml"), b"ok: true\n", "yaml").expect("YAML document"),
+            parse_document(Path::new("value.yaml"), b"ok: true\n", "yaml")
+                .expect("YAML document")
+                .0,
             json!({ "ok": true })
         );
         assert_eq!(
             parse_document(Path::new("value.data"), br#"[1,2]"#, "fallback-json")
-                .expect("fallback JSON"),
+                .expect("fallback JSON")
+                .0,
             json!([1, 2])
         );
         assert_eq!(
             parse_document(Path::new("value.data"), b"ok: true\n", "fallback-yaml")
-                .expect("fallback YAML"),
+                .expect("fallback YAML")
+                .0,
             json!({ "ok": true })
         );
         assert_eq!(
@@ -2381,6 +3061,110 @@ mod tests {
         assert!(yaml_error.line.is_some());
         let json_error = parse_json(b"{", "bad-json").expect_err("syntax");
         assert!(json_error.line.is_some());
+    }
+
+    #[test]
+    fn yaml_document_skips_one_leading_bom_and_preserves_mid_content_bom() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = resolved_config(temp.path(), "");
+        write(
+            &config.workspace_root,
+            "entry.yaml",
+            "\u{feff}openapi: 3.1.0\ninfo:\n  title: \"before\u{feff}after\"\n  version: 1.0.0\npaths: {}\n",
+        );
+
+        let graph = load_ok(&config);
+
+        assert_eq!(graph.entry().value["openapi"], "3.1.0");
+        assert_eq!(graph.entry().value["info"]["title"], "before\u{feff}after");
+    }
+
+    #[test]
+    fn extension_fallback_loads_json_named_yaml_with_one_warning() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = resolved_json_config(temp.path());
+        write(
+            &config.workspace_root,
+            "entry.json",
+            "openapi: 3.1.0\ninfo:\n  title: API\n  version: 1.0.0\npaths: {}\n",
+        );
+        let mut sink = DiagnosticSink::new();
+
+        let graph = load_graph(&config, &mut sink).expect("YAML fallback should load");
+
+        assert_eq!(graph.entry().value["openapi"], "3.1.0");
+        assert_eq!(sink.as_slice().len(), 1);
+        let warning = &sink.as_slice()[0];
+        assert_eq!(warning.code, "OASTS1013");
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.category, Category::Input);
+        assert_eq!(warning.source_id.as_deref(), Some("workspace/entry.json"));
+        assert_eq!(
+            warning.message,
+            "document 'workspace/entry.json' has extension '.json' but parsed as YAML"
+        );
+    }
+
+    #[test]
+    fn extension_fallback_loads_yaml_named_json_with_one_warning() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = resolved_config(temp.path(), "");
+        write(
+            &config.workspace_root,
+            "entry.yaml",
+            r#"{"openapi":"3.1.0","info":{"title":"\uD834\uDD1E","version":"1.0.0"},"paths":{}}"#,
+        );
+        let mut sink = DiagnosticSink::new();
+
+        let graph = load_graph(&config, &mut sink).expect("JSON fallback should load");
+
+        assert_eq!(graph.entry().value["info"]["title"], "𝄞");
+        assert_eq!(sink.as_slice().len(), 1);
+        let warning = &sink.as_slice()[0];
+        assert_eq!(warning.code, "OASTS1013");
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.source_id.as_deref(), Some("workspace/entry.yaml"));
+        assert_eq!(
+            warning.message,
+            "document 'workspace/entry.yaml' has extension '.yaml' but parsed as JSON"
+        );
+    }
+
+    #[test]
+    fn matching_document_extensions_emit_no_fallback_warning() {
+        let yaml_temp = TempDir::new().expect("tempdir");
+        let yaml_config = resolved_config(yaml_temp.path(), "");
+        write(
+            &yaml_config.workspace_root,
+            "entry.yaml",
+            "openapi: 3.1.0\ninfo: { title: API, version: 1.0.0 }\npaths: {}\n",
+        );
+        load_ok(&yaml_config);
+
+        let json_temp = TempDir::new().expect("tempdir");
+        let json_config = resolved_json_config(json_temp.path());
+        write(
+            &json_config.workspace_root,
+            "entry.json",
+            r#"{"openapi":"3.1.0","info":{"title":"API","version":"1.0.0"},"paths":{}}"#,
+        );
+        load_ok(&json_config);
+    }
+
+    #[test]
+    fn extension_fallback_reports_combined_error_when_both_parsers_fail() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = resolved_json_config(temp.path());
+        write(&config.workspace_root, "entry.json", "value: [\n");
+
+        let diagnostic = assert_load_code(&config, CODE_PARSE);
+
+        assert!(
+            diagnostic
+                .message
+                .starts_with("document is neither valid JSON nor YAML: invalid JSON document:")
+        );
+        assert!(diagnostic.message.contains("; invalid YAML document:"));
     }
 
     #[test]
@@ -2592,10 +3376,12 @@ mod tests {
         let graph = DocumentGraph {
             documents: vec![document],
             path_to_id: HashMap::new(),
+            anchors: HashMap::new(),
             entry_id: DocId(0),
             edges: Vec::new(),
             workspace_root: PathBuf::from("workspace"),
             allow_roots: Vec::new(),
+            max_ref_depth: 64,
         };
         assert_eq!(
             graph

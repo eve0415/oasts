@@ -3,12 +3,12 @@
 # and are never edited afterward — the implementation is written to satisfy them.
 files:
   - path: crates/oasts-core/runtime/test/vectors-auth-serialization.ts
-    sha256: 2556cde52703a36366d000597b7d5d3581218d05b8bc4cf7685b900cf4379dd1
+    sha256: 824099783fcd7aeae58306fd2519e25eb15f4e1c645f2c0c01b4fdbbf543657b
   - path: crates/oasts-core/runtime/test/vectors-auth-selection.ts
     sha256: ea23faaccac59981300acfb1655c6e22b943ad5d4fcff3563205c54d677b0430
   - path: fixtures/auth-showcase-3.1/openapi.yaml
-    sha256: 5bb48091320ad7677c3d80d861f6f446b5f35c33f6c64379ad862cc0e33f5f0a
+    sha256: cd0f0f9545d44000696d45aa8c98b025638a16616b1a671e3da3da3354875609
   - path: fixtures/auth-showcase-3.1/oasts.yaml
     sha256: e7fc4a8671319da62d89eeb00801ee1d578e6469f426cba6352b09ad353807e5
   - path: fixtures/auth-showcase-3.1/compile-assert/cases.ts
-    sha256: 23902fc1dbf02b4575edb0578a28abbf2cb08004c2f3dc5d92da0744918bc854
+    sha256: 56cf88628f1c351f439d5817ce9e3054581cee87faea8e07aaa93efa7cafeaec

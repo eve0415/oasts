@@ -30,7 +30,6 @@ type ExpectedMultipartPart = {
   readonly name: string;
   readonly filename?: string;
   readonly contentType: string;
-  readonly cte?: string;
   readonly payload: Uint8Array;
 };
 
@@ -55,6 +54,8 @@ let headHealthShowcase: ExportedFunction;
 let selectMediaShowcase: ExportedFunction;
 let submitFormShowcase: ExportedFunction;
 let uploadShowcase: ExportedFunction;
+let readCookiesShowcase: ExportedFunction;
+let contentShowcase: ExportedFunction;
 let ApiError: ExportedFunction;
 
 function localTransport(config: Readonly<Record<string, unknown>> = {}): unknown {
@@ -103,8 +104,7 @@ function multipartExpectation(parts: readonly ExpectedMultipartPart[]): {
         ? `Content-Disposition: form-data; name="${part.name}"`
         : `Content-Disposition: form-data; name="${part.name}"; filename="${part.filename}"`;
     const prefix = index === 0 ? `--${boundary}\r\n` : `\r\n--${boundary}\r\n`;
-    const cteLine = part.cte === undefined ? "" : `\r\nContent-Transfer-Encoding: ${part.cte}`;
-    const encapsulated = `${disposition}\r\nContent-Type: ${part.contentType}${cteLine}\r\n\r\n`;
+    const encapsulated = `${disposition}\r\nContent-Type: ${part.contentType}\r\n\r\n`;
     assert.equal(encapsulated.includes(boundary), false);
     assert.equal(Buffer.from(part.payload).includes(Buffer.from(boundary)), false);
     body.push(Buffer.from(prefix + encapsulated), Buffer.from(part.payload));
@@ -162,6 +162,8 @@ before(async () => {
   selectMediaShowcase = requiredFunction(aggregateApi, "selectMediaShowcase");
   submitFormShowcase = requiredFunction(aggregateApi, "submitFormShowcase");
   uploadShowcase = requiredFunction(aggregateApi, "uploadShowcase");
+  readCookiesShowcase = requiredFunction(aggregateApi, "readCookiesShowcase");
+  contentShowcase = requiredFunction(aggregateApi, "contentShowcase");
 
   baseUrl = await harness.start();
 });
@@ -186,7 +188,10 @@ test("JSON GET round-trips through the default fetch and local server", async ()
   });
 
   const transport = createTransport({ baseUrl });
-  const result = requiredRecord(await getPetShowcase(transport, { petId: "p_123" }), "GET result");
+  const result = requiredRecord(
+    await getPetShowcase(transport, { path: { petId: "p_123" } }),
+    "GET result",
+  );
 
   assert.equal(requests.length, 1);
   const received = requests[0];
@@ -263,13 +268,15 @@ test("showcase parameter styles match the committed wire vectors", async () => {
   });
 
   await getPetShowcase(localTransport(), {
-    petId: simple.value,
-    tags: formExplode.value,
-    fields: formCompact.value,
-    spaces: spaces.value,
-    pipes: pipes.value,
-    filter: deepObject.value,
-    "X-Trace": header.value,
+    path: { petId: simple.value },
+    query: {
+      tags: formExplode.value,
+      fields: formCompact.value,
+      spaces: spaces.value,
+      pipes: pipes.value,
+      filter: deepObject.value,
+    },
+    header: { "X-Trace": header.value },
   });
 
   assert.equal(requests.length, 1);
@@ -285,7 +292,7 @@ test("showcase parameter styles match the committed wire vectors", async () => {
       typeof vector.value === "string",
   );
   scriptRoute("GET", `/labels/${label.expected}`, { status: 204 });
-  await getLabelShowcase(localTransport(), { labelId: label.value });
+  await getLabelShowcase(localTransport(), { path: { labelId: label.value } });
   assert.equal(requiredRequest(1).url, `/labels/${label.expected}`);
 
   const matrix = requiredStyleVector(
@@ -301,7 +308,7 @@ test("showcase parameter styles match the committed wire vectors", async () => {
   const matrixExpected = matrix.expected.replaceAll("R", "row").replaceAll("G", "column");
   scriptRoute("GET", `/matrix/${matrixExpected}`, { status: 204 });
   await getMatrixShowcase(localTransport(), {
-    matrixId: { row: matrixValue.R, column: matrixValue.G },
+    path: { matrixId: { row: matrixValue.R, column: matrixValue.G } },
   });
   assert.equal(requiredRequest(2).url, `/matrix/${matrixExpected}`);
 });
@@ -399,7 +406,7 @@ test("unmatched responses preserve all four UnknownHttpError body kinds", async 
       body: scenario.body,
     });
     const result = requiredRecord(
-      await getLabelShowcase(localTransport(), { labelId: scenario.label }),
+      await getLabelShowcase(localTransport(), { path: { labelId: scenario.label } }),
       `${scenario.label} unmatched result`,
     );
     const error = requiredRecord(result.error, `${scenario.label} unmatched error`);
@@ -429,7 +436,7 @@ test("an exact 204 response produces undefined data", async () => {
   // an exact 204 key is statically bodyless.
   scriptRoute("GET", "/labels/.bodyless", { status: 204 });
   const result = requiredRecord(
-    await getLabelShowcase(localTransport(), { labelId: "bodyless" }),
+    await getLabelShowcase(localTransport(), { path: { labelId: "bodyless" } }),
     "204 result",
   );
   assert.equal(result.kind, "response");
@@ -444,7 +451,7 @@ test("a default content branch rejects a dynamic 204 response", async () => {
     headers: [["Content-Type", "application/json"]],
   });
   const result = requiredRecord(
-    await getPetShowcase(localTransport(), { petId: "dynamic-bodyless" }),
+    await getPetShowcase(localTransport(), { path: { petId: "dynamic-bodyless" } }),
     "dynamic bodyless result",
   );
   const error = requiredRecord(result.error, "dynamic bodyless error");
@@ -462,7 +469,7 @@ test("a pre-aborted signal stops the default transport before the server", async
   const result = requiredRecord(
     await getLabelShowcase(
       localTransport(),
-      { labelId: "pre-abort" },
+      { path: { labelId: "pre-abort" } },
       {
         signal: controller.signal,
       },
@@ -501,7 +508,7 @@ test("a mid-flight abort stops a default-fetch body read", async () => {
   });
   const pending = getPetShowcase(
     transport,
-    { petId: "mid-abort" },
+    { path: { petId: "mid-abort" } },
     {
       signal: controller.signal,
     },
@@ -531,7 +538,7 @@ test("injected fetch preserves pre-abort and mid-flight dependent-signal semanti
   const preResult = requiredRecord(
     await getLabelShowcase(
       preTransport,
-      { labelId: "injected-pre" },
+      { path: { labelId: "injected-pre" } },
       {
         signal: preController.signal,
       },
@@ -573,7 +580,7 @@ test("injected fetch preserves pre-abort and mid-flight dependent-signal semanti
   });
   const pending = getPetShowcase(
     midTransport,
-    { petId: "injected-mid" },
+    { path: { petId: "injected-mid" } },
     {
       signal: midController.signal,
     },
@@ -616,7 +623,7 @@ test("request middleware replacement hooks chain in registration order", async (
       },
     ],
   });
-  await getLabelShowcase(transport, { labelId: "replacement-chain" });
+  await getLabelShowcase(transport, { path: { labelId: "replacement-chain" } });
   assert.deepEqual(order, ["first", "one"]);
   assert.equal(requestHeader(requiredRequest(0), "X-First"), "one");
   assert.equal(requestHeader(requiredRequest(0), "X-Second"), "two");
@@ -634,7 +641,7 @@ test("void request middleware may mutate headers in place", async () => {
       },
     ],
   });
-  await getLabelShowcase(transport, { labelId: "void-mutation" });
+  await getLabelShowcase(transport, { path: { labelId: "void-mutation" } });
   assert.equal(requestHeader(requiredRequest(0), "X-Mutated"), "yes");
 });
 
@@ -652,7 +659,7 @@ test("forbidden middleware headers fail before Node sends a request", async () =
     ],
   });
   const result = requiredRecord(
-    await getLabelShowcase(transport, { labelId: "forbidden" }),
+    await getLabelShowcase(transport, { path: { labelId: "forbidden" } }),
     "forbidden middleware result",
   );
   const error = requiredRecord(result.error, "forbidden middleware error");
@@ -692,7 +699,7 @@ test("response middleware replacements chain across status and body changes", as
     ],
   });
   const result = requiredRecord(
-    await getPetShowcase(transport, { petId: "response-chain" }),
+    await getPetShowcase(transport, { path: { petId: "response-chain" } }),
     "response replacement result",
   );
   const meta = requiredRecord(result.meta, "response replacement meta");
@@ -721,7 +728,7 @@ test("response middleware may not consume the current body", async () => {
     ],
   });
   const result = requiredRecord(
-    await getPetShowcase(transport, { petId: "consumed" }),
+    await getPetShowcase(transport, { path: { petId: "consumed" } }),
     "consumed response result",
   );
   const error = requiredRecord(result.error, "consumed response error");
@@ -746,7 +753,7 @@ test("fetchOptions separates a frozen extension sidecar from standard keys", asy
   });
   await getLabelShowcase(
     transport,
-    { labelId: "sidecar" },
+    { path: { labelId: "sidecar" } },
     {
       fetchOptions: { next, cache: "no-store" },
     },
@@ -776,8 +783,8 @@ test("multipart upload bytes follow the pinned boundary and body grammar", async
   // restriction on octet values or line length. OAS 3.1.1 treats a
   // `{ type: string, contentEncoding: binary }` schema's instance value as
   // the already-encoded wire string, so the expected part body is simply
-  // the UTF-8 bytes of that string, and the part gains a
-  // `Content-Transfer-Encoding: binary` header line.
+  // the UTF-8 bytes of that string. RFC 7578 §4.7 deprecates the
+  // Content-Transfer-Encoding part header, so none is emitted.
   const notePayload = Buffer.from("unencoded-note", "utf8");
   const expected = multipartExpectation([
     {
@@ -795,7 +802,6 @@ test("multipart upload bytes follow the pinned boundary and body grammar", async
     {
       name: "note",
       contentType: "application/octet-stream",
-      cte: "binary",
       payload: notePayload,
     },
   ]);
@@ -864,6 +870,64 @@ test("form-urlencoded content fields serialize per Encoding Object", async () =>
   assert.equal(requiredRequest(0).body.toString("utf8"), expected);
 });
 
+test("cookie parameters arrive as one joined Cookie header on the wire", async () => {
+  // Node's undici keeps the Cookie header — WHATWG Fetch forbids it only in browsers — so the
+  // operation-owned cookie parameters reach the server joined with "; " in declared order.
+  scriptRoute("GET", "/cookies", { status: 204 });
+  const result = requiredRecord(
+    await readCookiesShowcase(localTransport(), {
+      cookie: { session: "s3cr3t", prefs: ["dark", "compact"] },
+    }),
+    "cookie result",
+  );
+  assert.equal(result.kind, "response");
+  assert.equal(requestHeader(requiredRequest(0), "Cookie"), "session=s3cr3t; prefs=dark,compact");
+});
+
+test("content-typed parameters and a content response header round-trip on the wire", async () => {
+  // contentShowcase carries JSON content in all four parameter locations plus a JSON content
+  // response header; each location frames the JSON text differently.
+  const filterEcho = '{"status":["a","b"]}';
+  const expectedUrl =
+    "/content/%7B%22id%22%3A%22p1%22%7D?filter=%7B%22status%22%3A%5B%22a%22%2C%22b%22%5D%7D";
+  scriptRoute("GET", expectedUrl, {
+    status: 200,
+    headers: [
+      ["Content-Type", "application/json"],
+      ["X-Filter-Echo", filterEcho],
+    ],
+    body: Buffer.from('{"id":"p_1","name":"Mochi"}'),
+  });
+
+  const result = requiredRecord(
+    await contentShowcase(localTransport(), {
+      path: { ref: { id: "p1" } },
+      query: { filter: { status: ["a", "b"] } },
+      header: { "X-Ctx": { tenant: "acme" } },
+      cookie: { pref: { theme: "dark" } },
+    }),
+    "content showcase result",
+  );
+
+  // Request framing: the path segment is percent-encoded JSON, the query value is percent-encoded
+  // JSON, the header is verbatim JSON, and the cookie pair is percent-encoded JSON.
+  const received = requiredRequest(0);
+  assert.equal(received.url, expectedUrl);
+  assert.equal(requestHeader(received, "X-Ctx"), '{"tenant":"acme"}');
+  assert.equal(requestHeader(received, "Cookie"), "pref=%7B%22theme%22%3A%22dark%22%7D");
+
+  // Response: the body decodes to the Pet, and the JSON content response header is exposed as its
+  // raw JSON text for the caller to decode.
+  assert.equal(result.kind, "response");
+  assert.deepEqual(result.data, { id: "p_1", name: "Mochi" });
+  const meta = requiredRecord(result.meta, "content response meta");
+  const headers = meta.headers;
+  assert.ok(headers instanceof Headers);
+  const echo = headers.get("X-Filter-Echo");
+  assert.equal(echo, filterEcho);
+  assert.deepEqual(JSON.parse(echo ?? "null"), { status: ["a", "b"] });
+});
+
 test("redirect metadata reports the post-redirect provenance URL", async () => {
   // fetchedResponse.url records route B after a default-fetch redirect.
   scriptRoute("GET", "/labels/.redirect-a", {
@@ -872,7 +936,7 @@ test("redirect metadata reports the post-redirect provenance URL", async () => {
   });
   scriptRoute("GET", "/labels/redirect-b", { status: 204 });
   const result = requiredRecord(
-    await getLabelShowcase(localTransport(), { labelId: "redirect-a" }),
+    await getLabelShowcase(localTransport(), { path: { labelId: "redirect-a" } }),
     "redirect result",
   );
   const meta = requiredRecord(result.meta, "redirect meta");
@@ -897,7 +961,7 @@ test("response replacement retains redirected provenance", async () => {
     ],
   });
   const result = requiredRecord(
-    await getLabelShowcase(transport, { labelId: "replaced-a" }),
+    await getLabelShowcase(transport, { path: { labelId: "replaced-a" } }),
     "replacement provenance result",
   );
   assert.equal(
@@ -916,7 +980,7 @@ test("synthetic injected responses fall back to the request URL", async () => {
     },
   });
   const result = requiredRecord(
-    await getLabelShowcase(transport, { labelId: "synthetic" }),
+    await getLabelShowcase(transport, { path: { labelId: "synthetic" } }),
     "synthetic response result",
   );
   const meta = requiredRecord(result.meta, "synthetic response meta");
@@ -932,7 +996,9 @@ test("generated OrThrow exports return data and throw ApiError with the failed r
     headers: [["Content-Type", "application/json"]],
     body: Buffer.from('{"id":"or-throw-success","name":"Success"}'),
   });
-  const data = await getPetShowcaseOrThrow(localTransport(), { petId: "or-throw-success" });
+  const data = await getPetShowcaseOrThrow(localTransport(), {
+    path: { petId: "or-throw-success" },
+  });
   assert.deepEqual(data, { id: "or-throw-success", name: "Success" });
 
   scriptRoute("GET", "/labels/.or-throw-failure", {
@@ -941,7 +1007,8 @@ test("generated OrThrow exports return data and throw ApiError with the failed r
     body: Buffer.from("failure"),
   });
   await assert.rejects(
-    async () => getLabelShowcaseOrThrow(localTransport(), { labelId: "or-throw-failure" }),
+    async () =>
+      getLabelShowcaseOrThrow(localTransport(), { path: { labelId: "or-throw-failure" } }),
     (error: unknown) => {
       assert.ok(error instanceof Error);
       assert.ok(error instanceof ApiError);

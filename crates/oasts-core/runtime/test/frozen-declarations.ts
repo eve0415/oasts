@@ -5,7 +5,7 @@
 
 // TransportConfig<S> + OperationContext, spec text (optional baseUrl?).
 export const FROZEN_TRANSPORT_CONFIG_AND_OPERATION_CONTEXT = `export type TransportConfig<S extends string = never> = {
-  baseUrl?: string;                                   // generated as REQUIRED when config client.baseUrl.source is "runtime"
+  baseUrl?: string;                                   // generated as REQUIRED when runtime URL resolution needs it
   serverVariables?: Readonly<Record<string, string>>;
   auth?: AuthProviders<S>;                            // generated scheme-name-keyed provider map
   headers?: HeadersInit;                              // transport default headers
@@ -23,7 +23,7 @@ export type OperationContext = {
 
 // TransportConfig<S> alone, spec text (optional baseUrl?).
 export const FROZEN_TRANSPORT_CONFIG_OPTIONAL = `export type TransportConfig<S extends string = never> = {
-  baseUrl?: string;                                   // generated as REQUIRED when config client.baseUrl.source is "runtime"
+  baseUrl?: string;                                   // generated as REQUIRED when runtime URL resolution needs it
   serverVariables?: Readonly<Record<string, string>>;
   auth?: AuthProviders<S>;                            // generated scheme-name-keyed provider map
   headers?: HeadersInit;                              // transport default headers
@@ -77,7 +77,8 @@ export type RequestFailure =
   | { kind: 'request-encode'; message: string; cause?: unknown }
   | { kind: 'request-validation'; issues: readonly StandardSchemaV1.Issue[] }
   | { kind: 'request-transform'; error: TransformError }
-  | { kind: 'request-middleware'; cause: unknown };
+  | { kind: 'request-middleware'; cause: unknown }
+  | { kind: 'cookie-params-unsendable'; names: readonly string[] };
 
 export type ResponseFailure =
   | { kind: 'aborted'; reason: unknown }

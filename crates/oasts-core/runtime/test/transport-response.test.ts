@@ -224,6 +224,163 @@ describe("response matching and decoding", () => {
   });
 });
 
+describe("response media specificity", () => {
+  const tiers = operation({
+    responses: [
+      responsePlan({
+        media: [
+          ["application/json;stream=watch", "json"],
+          ["application/json", "json"],
+          ["application/*", "text"],
+          ["*/*", "binary"],
+        ],
+        hasContentTypeDiscriminant: true,
+      }),
+    ],
+  });
+
+  test("selects each tier by the most specific declared key", async () => {
+    const watch = await callWith(
+      new Response('{"type":"ADDED"}', {
+        headers: { "Content-Type": "application/json;stream=watch" },
+      }),
+      tiers,
+    );
+    const bare = await callWith(
+      new Response('{"id":1}', { headers: { "Content-Type": "application/json" } }),
+      tiers,
+    );
+    const range = await callWith(
+      new Response("range", { headers: { "Content-Type": "application/xml" } }),
+      tiers,
+    );
+    const any = await callWith(
+      new Response(Uint8Array.of(7), { headers: { "Content-Type": "image/png" } }),
+      tiers,
+    );
+
+    assert.equal(
+      watch.kind === "response" ? watch.contentType : undefined,
+      "application/json;stream=watch",
+    );
+    assert.deepEqual(watch.kind === "response" && watch.ok ? watch.data : undefined, {
+      type: "ADDED",
+    });
+    assert.equal(bare.kind === "response" ? bare.contentType : undefined, "application/json");
+    assert.deepEqual(bare.kind === "response" && bare.ok ? bare.data : undefined, { id: 1 });
+    assert.equal(range.kind === "response" ? range.contentType : undefined, "application/*");
+    assert.equal(range.kind === "response" && range.ok ? range.data : undefined, "range");
+    assert.equal(any.kind === "response" ? any.contentType : undefined, "*/*");
+  });
+
+  test("matches charset case-insensitively and returns the declared literal", async () => {
+    const result = await callWith(
+      new Response('{"id":2}', {
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      }),
+      operation({
+        responses: [
+          responsePlan({
+            media: [
+              ["application/json;charset=UTF-8", "json"],
+              ["application/json", "json"],
+            ],
+            hasContentTypeDiscriminant: true,
+          }),
+        ],
+      }),
+    );
+    assert.equal(
+      result.kind === "response" ? result.contentType : undefined,
+      "application/json;charset=UTF-8",
+    );
+  });
+
+  test("falls back to the bare arm when a parameter value differs", async () => {
+    const result = await callWith(
+      new Response('{"id":3}', {
+        headers: { "Content-Type": "application/json;stream=other" },
+      }),
+      operation({
+        responses: [
+          responsePlan({
+            media: [
+              ["application/json;stream=watch", "json"],
+              ["application/json", "json"],
+            ],
+            hasContentTypeDiscriminant: true,
+          }),
+        ],
+      }),
+    );
+    assert.equal(result.kind === "response" ? result.contentType : undefined, "application/json");
+  });
+
+  test("breaks specificity ties between equal keys by canonical byte order", async () => {
+    const declaredOrders = [
+      [
+        ["application/json;b=2", "json"],
+        ["application/json;a=1", "json"],
+      ],
+      [
+        ["application/json;a=1", "json"],
+        ["application/json;b=2", "json"],
+      ],
+    ] satisfies ResponsePlan["media"][];
+    for (const media of declaredOrders) {
+      const result = await callWith(
+        new Response('{"id":4}', {
+          headers: { "Content-Type": "application/json;a=1;b=2" },
+        }),
+        operation({
+          responses: [responsePlan({ media, hasContentTypeDiscriminant: true })],
+        }),
+      );
+      assert.equal(
+        result.kind === "response" ? result.contentType : undefined,
+        "application/json;a=1",
+      );
+    }
+  });
+
+  test("skips malformed declared keys", async () => {
+    const result = await callWith(
+      new Response('{"id":6}', { headers: { "Content-Type": "application/json" } }),
+      operation({
+        responses: [
+          responsePlan({
+            media: [
+              ["", "json"],
+              ["application/json", "json"],
+            ],
+            hasContentTypeDiscriminant: true,
+          }),
+        ],
+      }),
+    );
+    assert.equal(result.kind === "response" ? result.contentType : undefined, "application/json");
+  });
+
+  test("fails to decode when no declared key applies", async () => {
+    for (const media of [
+      [["text/*;charset=utf-8", "text"]], // a range key never carries parameters
+      [["*/*;q=1", "binary"]], // an any key never carries parameters
+      [["*/json", "json"]], // a wildcard type is not a concrete essence
+      [["application/json", "json"]], // essence mismatch against the response
+    ] satisfies ResponsePlan["media"][]) {
+      const result = responseFailure(
+        await callWith(
+          new Response("body", { headers: { "Content-Type": "text/plain" } }),
+          operation({
+            responses: [responsePlan({ media, hasContentTypeDiscriminant: true })],
+          }),
+        ),
+      );
+      assert.equal(result.error.kind, "response-decode");
+    }
+  });
+});
+
 describe("response decode failures", () => {
   test("maps malformed JSON and preserves the decode cause", async () => {
     const result = responseFailure(

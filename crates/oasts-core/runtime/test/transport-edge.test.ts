@@ -65,6 +65,38 @@ async function requestEncode(body: BodyPlan, value: unknown): Promise<ExecutionR
 }
 
 describe("descriptor boundary validation", () => {
+  test("reads parameter values only from record location groups", async () => {
+    let url = "";
+    const descriptor = operation({
+      params: [
+        {
+          name: "value",
+          location: "query",
+          required: true,
+          serialize: serializeQueryForm,
+          allowReserved: false,
+        },
+      ],
+    });
+    const present = await execute(
+      createTransport({
+        fetch: async (request) => {
+          url = request.url;
+          return new Response(null, { status: 404 });
+        },
+      }),
+      descriptor,
+      { query: { value: "nested" } },
+    );
+
+    assert.equal(present.kind, "unmatched-response");
+    assert.equal(url, "https://example.com/api/edge?value=nested");
+    for (const input of [{}, { query: "not a record" }]) {
+      const absent = requestFailure(await execute(createTransport({}), descriptor, input));
+      assert.equal(absent.error.kind, "request-encode");
+    }
+  });
+
   test("maps missing plans, required parameters, invalid values, and serializer errors", async () => {
     const descriptors: readonly (readonly [
       OperationDescriptor,
@@ -97,7 +129,7 @@ describe("descriptor boundary validation", () => {
             },
           ],
         }),
-        { value: { nested: null } },
+        { query: { value: { nested: null } } },
       ],
       [
         operation({
@@ -113,7 +145,7 @@ describe("descriptor boundary validation", () => {
             },
           ],
         }),
-        { value: "x" },
+        { query: { value: "x" } },
       ],
       [
         operation({
@@ -129,7 +161,7 @@ describe("descriptor boundary validation", () => {
             },
           ],
         }),
-        { value: "x" },
+        { query: { value: "x" } },
       ],
       [
         operation({
@@ -191,7 +223,7 @@ describe("descriptor boundary validation", () => {
           },
         ],
       }),
-      { empty: "ignored", value: "two" },
+      { query: { empty: "ignored", value: "two" } },
     );
 
     assert.equal(result.kind, "unmatched-response");
@@ -225,7 +257,7 @@ describe("descriptor boundary validation", () => {
           },
         ],
       }),
-      { filter: { state: "open" }, ids: [1, 2] },
+      { query: { filter: { state: "open" }, ids: [1, 2] } },
     );
 
     assert.equal(url, "https://example.com/api/edge?filter[state]=open&ids=1%202");
@@ -255,6 +287,33 @@ describe("descriptor boundary validation", () => {
 
     assert.equal(relative.error.kind, "request-encode");
     assert.equal(placeholder.error.kind, "request-encode");
+  });
+
+  test("a configured baseUrl short-circuits an unresolved server placeholder", async () => {
+    // With a baseUrl set the server URL is discarded, so an unresolved `{unknown}` in it is moot:
+    // the operation resolves against the fallback instead of failing.
+    let captured: Request | undefined;
+    const result = await execute(
+      createTransport({
+        baseUrl: "https://fallback.example/v1",
+        fetch: async (request) => {
+          captured = request;
+          return new Response(null, { status: 204 });
+        },
+      }),
+      operation({
+        baseUrl: {
+          kind: "server",
+          index: 0,
+          servers: [{ url: "https://{known}.example/{unknown}", variables: [["known", "ok"]] }],
+        },
+      }),
+      {},
+    );
+
+    assert.notEqual(result.kind, "request-failure");
+    assert.ok(captured);
+    assert.ok(captured.url.startsWith("https://fallback.example"), captured.url);
   });
 
   test("validates form-urlencoded body shape and fields", async () => {
@@ -414,7 +473,7 @@ describe("multipart descriptor boundary", () => {
     assert.match(body, /\{"ok":true\}/u);
   });
 
-  test("rejects malformed wrappers, fields, payloads, media, headers, and filenames", async () => {
+  test("rejects malformed wrappers, fields, payloads, media, and filenames", async () => {
     const cases: readonly (readonly [MultipartFieldPlan, unknown])[] = [
       [multipartField(), undefined],
       [multipartField({ required: false }), null],
@@ -425,11 +484,6 @@ describe("multipart descriptor boundary", () => {
       [
         multipartField({ wrapper: true, filename: true }),
         { body: "x", contentType: "text/plain", filename: 4 },
-      ],
-      [multipartField({ wrapper: true }), { body: "x", contentType: "text/plain", headers: "bad" }],
-      [
-        multipartField({ wrapper: true }),
-        { body: "x", contentType: "text/plain", headers: { "X-Part": 4 } },
       ],
       [multipartField({ payload: "binary" }), "not binary"],
       [multipartField({ payload: "text" }), 4],
@@ -455,6 +509,16 @@ describe("multipart descriptor boundary", () => {
           contentType: { kind: "fixed", value: "text/plain; charset=ascii" },
         }),
         { body: "x", contentType: "text/plain; charset=utf-8" },
+      ],
+      // A wrapped field whose payloads list has no entry for the selected admitted index has no
+      // payload kind, so the part cannot be serialized.
+      [
+        multipartField({
+          wrapper: true,
+          payloads: [],
+          contentType: { kind: "selected", admitted: ["text/plain"] },
+        }),
+        { body: "x", contentType: "text/plain" },
       ],
     ];
 
@@ -488,7 +552,7 @@ describe("request boundary ownership", () => {
     ]) {
       const result = requestFailure(
         await execute(createTransport({}), operation({ params: [{ ...headerPlan, name }] }), {
-          [name]: value,
+          header: { [name]: value },
         }),
       );
       assert.equal(result.error.kind, "request-encode");
@@ -503,7 +567,7 @@ describe("request boundary ownership", () => {
         },
       }),
       operation({ params: [{ ...headerPlan, name: "X-Method-Override" }] }),
-      { "X-Method-Override": "PATCH" },
+      { header: { "X-Method-Override": "PATCH" } },
     );
     assert.equal(safeValue, "PATCH");
   });

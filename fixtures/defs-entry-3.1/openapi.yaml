@@ -1,0 +1,35 @@
+openapi: 3.1.0
+info:
+  title: Entry document definitions
+  version: 1.0.0
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        '200':
+          description: Pets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/$defs/Pet'
+$defs:
+  Pet:
+    type: object
+    required:
+      - id
+      - owner
+    properties:
+      id:
+        type: integer
+      owner:
+        $ref: '#/$defs/Owner'
+  Owner:
+    type: object
+    required:
+      - name
+    properties:
+      name:
+        type: string
