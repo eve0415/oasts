@@ -8,6 +8,7 @@
 //! narrower value if that signature ever changed, so it does not faithfully
 //! describe the declared members.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -52,6 +53,16 @@ const CODE_MAPPING_TARGET: &str = "OASTS1308";
 /// contradicts the branch's own fixed value, or an allOf idiom that fixes the tag property to an
 /// empty (uninhabitable) value set. The render degrades to a plain structural union.
 const CODE_DISCRIMINATOR_PROOF: &str = "OASTS1309";
+
+const INDENT_CHUNK: &str = "                                ";
+
+fn push_indent(output: &mut String, mut width: usize) {
+    while width >= INDENT_CHUNK.len() {
+        output.push_str(INDENT_CHUNK);
+        width -= INDENT_CHUNK.len();
+    }
+    output.push_str(&INDENT_CHUNK[..width]);
+}
 
 /// A merged `allOf` property borrowed straight from the model IR: name, schema,
 /// and metadata. Borrowed (not owned) so `merge_all_of` never deep-clones the
@@ -687,7 +698,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         let entry = imports.entry(file_base.to_owned()).or_default();
         entry.insert(request.clone());
         entry.insert(response.clone());
-        body.push_str(&" ".repeat(indent));
+        push_indent(body, indent);
         if readonly {
             body.push_str("readonly ");
         }
@@ -1452,7 +1463,10 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             }
             SchemaNode::Array { items, .. } => {
                 let item = self.render_type(items, position, indent);
-                format!("{}[]", parenthesize_array_item(item, items))
+                let mut item = parenthesize_array_item(item, items);
+                item.reserve(2);
+                item.push_str("[]");
+                item
             }
             SchemaNode::Tuple {
                 prefix_items, rest, ..
@@ -1466,7 +1480,11 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     TupleRest::Forbidden => {}
                     TupleRest::Schema(schema) => {
                         let rest = self.render_type(schema, position, indent);
-                        items.push(format!("...{}[]", parenthesize_array_item(rest, schema)));
+                        let mut rest = parenthesize_array_item(rest, schema);
+                        rest.reserve(5);
+                        rest.insert_str(0, "...");
+                        rest.push_str("[]");
+                        items.push(rest);
                     }
                 }
                 format!("[{}]", items.join(", "))
@@ -1568,7 +1586,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     member_indent,
                     interface_members,
                 );
-                output.push_str(&" ".repeat(member_indent));
+                push_indent(&mut output, member_indent);
                 if self.model.config.types.readonly {
                     output.push_str("readonly ");
                 }
@@ -1580,7 +1598,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 output.push_str(&self.render_type(schema, position, member_indent));
                 output.push_str(";\n");
             }
-            output.push_str(&" ".repeat(indent));
+            push_indent(&mut output, indent);
             output.push('}');
             output
         };
@@ -2240,7 +2258,7 @@ impl Emitter<'_, '_, '_> {
             has_members = true;
             let group_required = parameters.iter().any(|parameter| parameter.required);
             let group = self.render_parameter_group(&parameters, indent + 2);
-            output.push_str(&" ".repeat(indent + 2));
+            push_indent(&mut output, indent + 2);
             if self.model.config.types.readonly {
                 output.push_str("readonly ");
             }
@@ -2271,7 +2289,7 @@ impl Emitter<'_, '_, '_> {
                     false,
                 );
             }
-            output.push_str(&" ".repeat(indent + 2));
+            push_indent(&mut output, indent + 2);
             if self.model.config.types.readonly {
                 output.push_str("readonly ");
             }
@@ -2286,7 +2304,7 @@ impl Emitter<'_, '_, '_> {
         if !has_members {
             return "{}".to_owned();
         }
-        output.push_str(&" ".repeat(indent));
+        push_indent(&mut output, indent);
         output.push('}');
         output
     }
@@ -2307,7 +2325,7 @@ impl Emitter<'_, '_, '_> {
                 indent + 2,
                 false,
             );
-            output.push_str(&" ".repeat(indent + 2));
+            push_indent(&mut output, indent + 2);
             if self.model.config.types.readonly {
                 output.push_str("readonly ");
             }
@@ -2323,7 +2341,7 @@ impl Emitter<'_, '_, '_> {
             ));
             output.push_str(";\n");
         }
-        output.push_str(&" ".repeat(indent));
+        push_indent(&mut output, indent);
         output.push('}');
         output
     }
@@ -2589,8 +2607,13 @@ pub(super) fn render_ts_value(value: &Value) -> String {
 #[must_use]
 pub fn render_ts_string(value: &str) -> String {
     let mut encoded = serde_json::to_string(value).expect("serializing a string cannot fail");
-    encoded = encoded.replace('\u{2028}', "\\u2028");
-    encoded.replace('\u{2029}', "\\u2029")
+    if encoded.contains('\u{2028}') {
+        encoded = encoded.replace('\u{2028}', "\\u2028");
+    }
+    if encoded.contains('\u{2029}') {
+        encoded = encoded.replace('\u{2029}', "\\u2029");
+    }
+    encoded
 }
 
 /// Emits a wire property key verbatim, quoting anything outside ASCII identifier syntax.
@@ -2610,7 +2633,7 @@ pub fn render_property_key(value: &str) -> String {
     }
 }
 
-fn add_nullable(rendered: String, schema: &SchemaNode) -> String {
+fn add_nullable(mut rendered: String, schema: &SchemaNode) -> String {
     if !schema.is_nullable()
         || rendered.split(" | ").any(|member| member == "null")
         || matches!(
@@ -2623,18 +2646,23 @@ fn add_nullable(rendered: String, schema: &SchemaNode) -> String {
     {
         rendered
     } else {
-        format!("{rendered} | null")
+        rendered.reserve(7);
+        rendered.push_str(" | null");
+        rendered
     }
 }
 
-fn parenthesize_array_item(rendered: String, schema: &SchemaNode) -> String {
+fn parenthesize_array_item(mut rendered: String, schema: &SchemaNode) -> String {
     if schema.is_nullable()
         || matches!(
             schema,
             SchemaNode::AllOf { .. } | SchemaNode::OneOf { .. } | SchemaNode::AnyOf { .. }
         )
     {
-        format!("({rendered})")
+        rendered.reserve(2);
+        rendered.insert(0, '(');
+        rendered.push(')');
+        rendered
     } else {
         rendered
     }
@@ -2645,12 +2673,15 @@ fn parenthesize_array_item(rendered: String, schema: &SchemaNode) -> String {
 /// the type — `A | B & C` parses as `A | (B & C)`. Mirrors [`parenthesize_array_item`], but adds
 /// the rendered-text check: an `enum`/`const` primitive and a `Finite` node render a top-level
 /// union without being a `OneOf`/`AnyOf` or nullable node, so the node-kind test alone misses them.
-fn parenthesize_intersection_member(rendered: String, branch: &SchemaNode) -> String {
+fn parenthesize_intersection_member(mut rendered: String, branch: &SchemaNode) -> String {
     if matches!(branch, SchemaNode::OneOf { .. } | SchemaNode::AnyOf { .. })
         || branch.is_nullable()
         || renders_top_level_union(&rendered)
     {
-        format!("({rendered})")
+        rendered.reserve(2);
+        rendered.insert(0, '(');
+        rendered.push(')');
+        rendered
     } else {
         rendered
     }
@@ -2992,6 +3023,56 @@ fn push_media_examples(examples: &mut Vec<DocExample>, media_type: &MediaType, s
     }
 }
 
+struct TsDocWriter<'output> {
+    output: &'output mut String,
+    indent: usize,
+    has_section: bool,
+}
+
+impl TsDocWriter<'_> {
+    fn begin_section(&mut self) {
+        if self.has_section {
+            push_indent(self.output, self.indent);
+            self.output.push_str(" * \n");
+        } else {
+            self.has_section = true;
+        }
+    }
+
+    fn start_line(&mut self) {
+        push_indent(self.output, self.indent);
+        self.output.push_str(" * ");
+    }
+
+    fn finish_line(&mut self) {
+        self.output.push('\n');
+    }
+
+    fn plain_line(&mut self, value: &str) {
+        self.start_line();
+        self.output.push_str(value);
+        self.finish_line();
+    }
+
+    fn encoded_lines(&mut self, value: &str) {
+        visit_comment_lines(value, |line, literal| {
+            self.start_line();
+            if literal {
+                write_neutralized(self.output, line);
+            } else {
+                write_comment_line(self.output, line);
+            }
+            self.finish_line();
+        });
+    }
+
+    fn neutralized_line(&mut self, value: &str) {
+        self.start_line();
+        write_neutralized(self.output, value);
+        self.finish_line();
+    }
+}
+
 fn write_tsdoc(output: &mut String, docs: &TsDoc, indent: usize) {
     if docs.summary.is_none()
         && docs.remarks.is_empty()
@@ -3005,152 +3086,218 @@ fn write_tsdoc(output: &mut String, docs: &TsDoc, indent: usize) {
     {
         return;
     }
-    let prefix = " ".repeat(indent);
-    output.push_str(&prefix);
+    push_indent(output, indent);
     output.push_str("/**\n");
-    let mut sections = Vec::<Vec<String>>::new();
+    let mut writer = TsDocWriter {
+        output,
+        indent,
+        has_section: false,
+    };
     if let Some(summary) = &docs.summary {
-        sections.push(encode_comment_lines(summary));
+        writer.begin_section();
+        writer.encoded_lines(summary);
     }
     if !docs.remarks.is_empty() {
-        let mut lines = vec!["@remarks".to_owned()];
-        lines.extend(encode_comment_lines(&docs.remarks.join("\n\n")));
-        sections.push(lines);
+        writer.begin_section();
+        writer.plain_line("@remarks");
+        writer.encoded_lines(&docs.remarks.join("\n\n"));
     }
     if let Some(deprecated) = docs.deprecated {
-        sections.push(vec![format!("@deprecated {deprecated}")]);
+        writer.begin_section();
+        writer.start_line();
+        writer.output.push_str("@deprecated ");
+        writer.output.push_str(deprecated);
+        writer.finish_line();
     }
     if !docs.params.is_empty() {
-        sections.push(
-            docs.params
-                .iter()
-                .map(|(name, description)| {
-                    format!(
-                        "@param {} - {}",
-                        encode_comment_fragment(name),
-                        encode_comment_fragment(description)
-                    )
-                })
-                .collect(),
-        );
+        writer.begin_section();
+        for (name, description) in &docs.params {
+            writer.start_line();
+            writer.output.push_str("@param ");
+            write_comment_fragment(writer.output, name);
+            writer.output.push_str(" - ");
+            write_comment_fragment(writer.output, description);
+            writer.finish_line();
+        }
     }
     if let Some(returns) = docs.returns {
-        sections.push(vec![format!("@returns {returns}")]);
+        writer.begin_section();
+        writer.start_line();
+        writer.output.push_str("@returns ");
+        writer.output.push_str(returns);
+        writer.finish_line();
     }
     if let Some(default) = &docs.default_value {
-        sections.push(vec![format!(
-            "@defaultValue {}",
-            encode_comment_fragment(default)
-        )]);
+        writer.begin_section();
+        writer.start_line();
+        writer.output.push_str("@defaultValue ");
+        write_comment_fragment(writer.output, default);
+        writer.finish_line();
     }
     for example in &docs.examples {
-        let mut lines = vec!["@example".to_owned()];
+        writer.begin_section();
+        writer.plain_line("@example");
         if let Some(label) = &example.label {
-            lines.extend(encode_comment_lines(label));
-            lines.push(String::new());
+            writer.encoded_lines(label);
+            writer.plain_line("");
         }
-        lines.push("```json".to_owned());
-        lines.extend(
-            render_json_pretty(&example.value)
-                .lines()
-                .map(neutralize_comment_close),
-        );
-        lines.push("```".to_owned());
-        sections.push(lines);
+        writer.plain_line("```json");
+        for line in render_json_pretty(&example.value).lines() {
+            writer.neutralized_line(line);
+        }
+        writer.plain_line("```");
     }
     if let Some(private_remarks) = &docs.private_remarks {
-        let mut lines = vec!["@privateRemarks".to_owned()];
-        lines.extend(encode_comment_lines(private_remarks));
-        sections.push(lines);
+        writer.begin_section();
+        writer.plain_line("@privateRemarks");
+        writer.encoded_lines(private_remarks);
     }
     for (url, label) in &docs.see {
-        let encoded_url = encode_link_part(url);
-        let link = label.as_ref().map_or_else(
-            || format!("@see {{@link {encoded_url}}}"),
-            |label| format!("@see {{@link {encoded_url} | {}}}", encode_link_part(label)),
-        );
-        sections.push(vec![link]);
-    }
-    for (section_index, section) in sections.iter().enumerate() {
-        if section_index != 0 {
-            output.push_str(&prefix);
-            output.push_str(" * \n");
+        writer.begin_section();
+        writer.start_line();
+        writer.output.push_str("@see {@link ");
+        write_link_part(writer.output, url);
+        if let Some(label) = label {
+            writer.output.push_str(" | ");
+            write_link_part(writer.output, label);
         }
-        for line in section {
-            output.push_str(&prefix);
-            output.push_str(" * ");
-            output.push_str(line);
-            output.push('\n');
-        }
+        writer.output.push('}');
+        writer.finish_line();
     }
-    output.push_str(&prefix);
-    output.push_str(" */\n");
+    push_indent(writer.output, indent);
+    writer.output.push_str(" */\n");
 }
 
 /// Encodes untrusted CommonMark while preserving code spans and fenced blocks.
 #[must_use]
 pub fn encode_comment_text(value: &str) -> String {
-    encode_comment_lines(value).join("\n")
-}
-
-fn encode_comment_lines(value: &str) -> Vec<String> {
-    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
-    let mut fenced = false;
-    normalized
-        .split('\n')
-        .map(|line| {
-            let trimmed = line.trim_start();
-            let fence_line = trimmed.starts_with("```") || trimmed.starts_with("~~~");
-            let encoded = if fenced || fence_line {
-                neutralize_comment_close(line)
-            } else {
-                encode_comment_line(line)
-            };
-            if fence_line {
-                fenced = !fenced;
-            }
-            encoded
-        })
-        .collect()
-}
-
-fn encode_comment_fragment(value: &str) -> String {
-    encode_comment_lines(value).join(" ")
-}
-
-fn encode_comment_line(line: &str) -> String {
-    let neutralized =
-        neutralize_comment_close(line).replace("sourceMappingURL=", "sourceMappingURL\\=");
-    let leading = neutralized.len() - neutralized.trim_start().len();
-    let mut output = neutralized[..leading].to_owned();
-    let rest = &neutralized[leading..];
-    output.push_str(&encode_comment_inline(rest));
+    let mut output = String::with_capacity(value.len());
+    let mut first = true;
+    visit_comment_lines(value, |line, literal| {
+        if first {
+            first = false;
+        } else {
+            output.push('\n');
+        }
+        if literal {
+            write_neutralized(&mut output, line);
+        } else {
+            write_comment_line(&mut output, line);
+        }
+    });
     output
 }
 
-fn encode_comment_inline(value: &str) -> String {
-    let mut output = String::new();
-    let mut characters = value.char_indices().peekable();
+fn normalize_comment_newlines(value: &str) -> Cow<'_, str> {
+    if !value.contains('\r') {
+        return Cow::Borrowed(value);
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            output.push('\n');
+        } else {
+            output.push(character);
+        }
+    }
+    Cow::Owned(output)
+}
+
+fn visit_comment_lines(value: &str, mut visit: impl FnMut(&str, bool)) {
+    let normalized = normalize_comment_newlines(value);
+    let mut fenced = false;
+    for line in normalized.split('\n') {
+        let trimmed = line.trim_start();
+        let fence_line = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        visit(line, fenced || fence_line);
+        if fence_line {
+            fenced = !fenced;
+        }
+    }
+}
+
+fn write_comment_fragment(output: &mut String, value: &str) {
+    let mut first = true;
+    visit_comment_lines(value, |line, literal| {
+        if first {
+            first = false;
+        } else {
+            output.push(' ');
+        }
+        if literal {
+            write_neutralized(output, line);
+        } else {
+            write_comment_line(output, line);
+        }
+    });
+}
+
+fn write_comment_line(output: &mut String, line: &str) {
+    let leading = line.len() - line.trim_start().len();
+    output.push_str(&line[..leading]);
+    let rest = &line[leading..];
+    if comment_line_requires_encoding(rest) {
+        write_comment_inline(output, rest);
+    } else {
+        output.push_str(rest);
+    }
+}
+
+fn comment_line_requires_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    for index in 0..bytes.len() {
+        match bytes[index] {
+            b'`' | b'@' | b'{' | b'}' | b'<' => return true,
+            b'*' if bytes.get(index + 1) == Some(&b'/') => return true,
+            b's' if value[index..].starts_with("sourceMappingURL=") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn write_comment_inline(output: &mut String, value: &str) {
+    let mut index = 0;
     let mut code = false;
     let mut html = false;
-    while let Some((index, character)) = characters.next() {
+    let mut previous_whitespace = false;
+    while index < value.len() {
+        let rest = &value[index..];
+        if rest.starts_with("*/") {
+            output.push_str("*\\/");
+            index += 2;
+            previous_whitespace = false;
+            continue;
+        }
+        if rest.starts_with("sourceMappingURL=") {
+            output.push_str("sourceMappingURL\\=");
+            index += "sourceMappingURL=".len();
+            previous_whitespace = false;
+            continue;
+        }
+        let character = rest.chars().next().expect("non-empty suffix");
+        let character_len = character.len_utf8();
+        let next = rest[character_len..].chars().next();
         if character == '`' {
             code = !code;
             output.push(character);
+            index += character_len;
+            previous_whitespace = false;
             continue;
         }
         if code {
             output.push(character);
+            index += character_len;
+            previous_whitespace = character.is_whitespace();
             continue;
         }
-        let next = characters.peek().map(|(_, character)| *character);
         match character {
             '@' if next.is_some_and(|next| next.is_ascii_alphabetic())
-                && (index == 0
-                    || value[..index]
-                        .chars()
-                        .next_back()
-                        .is_some_and(char::is_whitespace)) =>
+                && (index == 0 || previous_whitespace) =>
             {
                 output.push_str("\\@");
             }
@@ -3169,28 +3316,62 @@ fn encode_comment_inline(value: &str) -> String {
             }
             _ => output.push(character),
         }
+        index += character_len;
+        previous_whitespace = character.is_whitespace();
     }
-    output
 }
 
-fn neutralize_comment_close(value: &str) -> String {
-    value
-        .replace("*/", "*\\/")
-        .replace("sourceMappingURL=", "sourceMappingURL\\=")
+fn write_neutralized(output: &mut String, mut value: &str) {
+    while !value.is_empty() {
+        let comment_close = value.find("*/").map(|index| (index, 2, "*\\/"));
+        let source_map = value
+            .find("sourceMappingURL=")
+            .map(|index| (index, "sourceMappingURL=".len(), "sourceMappingURL\\="));
+        let next = match (comment_close, source_map) {
+            (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+            (Some(found), None) | (None, Some(found)) => Some(found),
+            (None, None) => None,
+        };
+        let Some((index, matched_len, replacement)) = next else {
+            output.push_str(value);
+            break;
+        };
+        output.push_str(&value[..index]);
+        output.push_str(replacement);
+        value = &value[index + matched_len..];
+    }
 }
 
-fn encode_link_part(value: &str) -> String {
-    let encoded = neutralize_comment_close(value)
-        .replace('{', "\\{")
-        .replace('}', "\\}")
-        .replace('<', "\\<")
-        .replace('>', "\\>")
-        .replace('|', "\\|");
-    encoded.replace(['\n', '\r'], " ")
+fn write_link_part(output: &mut String, value: &str) {
+    let mut index = 0;
+    while index < value.len() {
+        let rest = &value[index..];
+        if rest.starts_with("*/") {
+            output.push_str("*\\/");
+            index += 2;
+            continue;
+        }
+        if rest.starts_with("sourceMappingURL=") {
+            output.push_str("sourceMappingURL\\=");
+            index += "sourceMappingURL=".len();
+            continue;
+        }
+        let character = rest.chars().next().expect("non-empty suffix");
+        match character {
+            '{' => output.push_str("\\{"),
+            '}' => output.push_str("\\}"),
+            '<' => output.push_str("\\<"),
+            '>' => output.push_str("\\>"),
+            '|' => output.push_str("\\|"),
+            '\n' | '\r' => output.push(' '),
+            _ => output.push(character),
+        }
+        index += character.len_utf8();
+    }
 }
 
 pub(super) fn write_source_metadata(output: &mut String, source: &SourceRef, indent: usize) {
-    output.push_str(&" ".repeat(indent));
+    push_indent(output, indent);
     output.push_str("// Source: ");
     output.push_str(&encode_line_comment(&source.display()));
     output.push('\n');
@@ -3615,6 +3796,11 @@ mod tests {
         assert_eq!(render_ts_value(&Value::Number(outside_binary64)), "1e+999");
         assert_eq!(render_ts_value(&json!([null, false])), "[null,false]");
         assert_eq!(render_ts_value(&json!({"a": 1})), "{\"a\":1}");
+        let indent_width = INDENT_CHUNK.len() + 3;
+        let mut indentation = String::new();
+        push_indent(&mut indentation, indent_width);
+        assert_eq!(indentation, " ".repeat(indent_width));
+
         assert_eq!(
             render_json_pretty(&json!([1, {"a": true}])),
             "[\n  1,\n  {\n    \"a\": true\n  }\n]"
@@ -6095,6 +6281,84 @@ mod tests {
         assert!(
             body.contains("Outside the binary64 range.\n * \n * ```json"),
             "{body}"
+        );
+    }
+
+    #[test]
+    fn tsdoc_writer_preserves_section_and_escape_layout() {
+        let docs = TsDoc {
+            summary: Some("Summary @tag\r\nnext".to_owned()),
+            remarks: vec!["First".to_owned(), "Second\nline".to_owned()],
+            deprecated: Some("Deprecated."),
+            params: vec![("arg\r\nname".to_owned(), "Description\rline".to_owned())],
+            returns: Some("A value."),
+            default_value: Some("value\n@tag".to_owned()),
+            examples: vec![
+                DocExample {
+                    label: Some("Label @tag\r\nnext".to_owned()),
+                    value: json!("*/ sourceMappingURL="),
+                },
+                DocExample {
+                    label: None,
+                    value: json!([1, true]),
+                },
+            ],
+            private_remarks: Some("Private @tag\n```txt\n*/ sourceMappingURL=\n```".to_owned()),
+            see: vec![(
+                "u{v}|<x>\r\n*/sourceMappingURL=".to_owned(),
+                Some("L{a}\r\nB".to_owned()),
+            )],
+        };
+        let mut output = String::new();
+
+        write_tsdoc(&mut output, &docs, 2);
+
+        assert_eq!(
+            output,
+            concat!(
+                "  /**\n",
+                "   * Summary \\@tag\n",
+                "   * next\n",
+                "   * \n",
+                "   * @remarks\n",
+                "   * First\n",
+                "   * \n",
+                "   * Second\n",
+                "   * line\n",
+                "   * \n",
+                "   * @deprecated Deprecated.\n",
+                "   * \n",
+                "   * @param arg name - Description line\n",
+                "   * \n",
+                "   * @returns A value.\n",
+                "   * \n",
+                "   * @defaultValue value \\@tag\n",
+                "   * \n",
+                "   * @example\n",
+                "   * Label \\@tag\n",
+                "   * next\n",
+                "   * \n",
+                "   * ```json\n",
+                "   * \"*\\/ sourceMappingURL\\=\"\n",
+                "   * ```\n",
+                "   * \n",
+                "   * @example\n",
+                "   * ```json\n",
+                "   * [\n",
+                "   *   1,\n",
+                "   *   true\n",
+                "   * ]\n",
+                "   * ```\n",
+                "   * \n",
+                "   * @privateRemarks\n",
+                "   * Private \\@tag\n",
+                "   * ```txt\n",
+                "   * *\\/ sourceMappingURL\\=\n",
+                "   * ```\n",
+                "   * \n",
+                "   * @see {@link u\\{v\\}\\|\\<x\\>  *\\/sourceMappingURL\\= | L\\{a\\}  B}\n",
+                "   */\n",
+            ),
         );
     }
 

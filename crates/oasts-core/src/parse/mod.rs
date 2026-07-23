@@ -14,7 +14,7 @@ use crate::ir::{
     SchemaNode, SchemaRef, SecKind, SecurityRequirement, Segment, SegmentPart, ServerEntry,
     ServerVariable, SourceRef, StringConstraints, TupleRest, Webhook, box_if_populated,
 };
-use crate::loader::{DocId, DocumentGraph, append_pointer};
+use crate::loader::{DocId, DocumentGraph, append_pointer, append_pointer_index};
 use crate::media::canonical_content_key;
 
 const CODE_VERSION: &str = "OASTS1101";
@@ -714,7 +714,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             .iter()
             .enumerate()
             .filter_map(|(index, value)| {
-                let pointer = append_pointer(&node.pointer, &index.to_string());
+                let pointer = append_pointer_index(&node.pointer, index);
                 self.parse_parameter(NodeView {
                     doc_id: node.doc_id,
                     pointer,
@@ -1448,7 +1448,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             .iter()
             .enumerate()
             .filter_map(|(index, value)| {
-                let pointer = append_pointer(&node.pointer, &index.to_string());
+                let pointer = append_pointer_index(&node.pointer, index);
                 let Some(server) = value.as_object() else {
                     self.shape_error(node.doc_id, &pointer, "server must be an object");
                     return None;
@@ -1515,10 +1515,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                             value.as_str().map(str::to_owned).or_else(|| {
                                 self.shape_error(
                                     node.doc_id,
-                                    &append_pointer(
-                                        &append_pointer(&pointer, "enum"),
-                                        &index.to_string(),
-                                    ),
+                                    &append_pointer_index(&append_pointer(&pointer, "enum"), index),
                                     "server variable enum values must be strings",
                                 );
                                 None
@@ -1594,7 +1591,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             .iter()
             .enumerate()
             .filter_map(|(index, value)| {
-                let pointer = append_pointer(&node.pointer, &index.to_string());
+                let pointer = append_pointer_index(&node.pointer, index);
                 let Some(requirement) = value.as_object() else {
                     self.shape_error(
                         node.doc_id,
@@ -1623,7 +1620,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                             None => {
                                 self.shape_error(
                                     node.doc_id,
-                                    &append_pointer(&scopes_pointer, &index.to_string()),
+                                    &append_pointer_index(&scopes_pointer, index),
                                     "security requirement scopes must be strings",
                                 );
                                 valid = false;
@@ -2099,7 +2096,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             .iter()
             .enumerate()
             .map(|(index, value)| {
-                let child = append_pointer(&pointer, &index.to_string());
+                let child = append_pointer_index(&pointer, index);
                 self.parse_schema(NodeView {
                     doc_id: parent.doc_id,
                     pointer: child,
@@ -2457,7 +2454,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     .iter()
                     .enumerate()
                     .map(|(index, item)| {
-                        let pointer = append_pointer(&prefix_pointer, &index.to_string());
+                        let pointer = append_pointer_index(&prefix_pointer, index);
                         self.parse_schema(NodeView {
                             doc_id: node.doc_id,
                             pointer,

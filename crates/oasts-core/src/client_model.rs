@@ -1,6 +1,6 @@
 //! Client artifact planning over the normalized OpenAPI IR.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
@@ -2263,45 +2263,93 @@ enum Projection {
 }
 
 struct PrimitiveDomainProjector<'ir> {
-    schemas: HashMap<(String, String), &'ir SchemaNode>,
-    domains: HashMap<(String, String), Projection>,
+    schemas: &'ir [crate::ir::NamedSchema],
+    indices: HashMap<(&'ir str, &'ir str), usize>,
+    domains: Vec<Projection>,
 }
 
 impl<'ir> PrimitiveDomainProjector<'ir> {
     fn new(ir: &'ir Ir) -> Self {
-        let schemas = ir
-            .schemas
-            .iter()
-            .map(|schema| {
-                (
-                    (
-                        schema.source.source_id.clone(),
-                        schema.source.json_pointer.clone(),
-                    ),
-                    &schema.schema,
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let mut domains = schemas
-            .keys()
-            .cloned()
-            .map(|key| (key, Projection::Known(Domain::FULL)))
-            .collect::<HashMap<_, _>>();
-        loop {
-            let next = schemas
-                .iter()
-                .map(|(key, schema)| (key.clone(), project_schema(schema, &domains)))
-                .collect::<HashMap<_, _>>();
-            if next == domains {
-                break;
-            }
-            domains = next;
+        let schemas = ir.schemas.as_slice();
+        if schemas.is_empty() {
+            return Self {
+                schemas,
+                indices: HashMap::new(),
+                domains: Vec::new(),
+            };
         }
-        Self { schemas, domains }
+        let mut indices = HashMap::with_capacity(schemas.len());
+        for (index, schema) in schemas.iter().enumerate() {
+            indices.insert(
+                (
+                    schema.source.source_id.as_str(),
+                    schema.source.json_pointer.as_str(),
+                ),
+                index,
+            );
+        }
+
+        let mut reverse_offsets = vec![0; schemas.len() + 1];
+        let mut dependencies = Vec::new();
+        for schema in schemas {
+            dependencies.clear();
+            collect_projection_dependencies(&schema.schema, &indices, &mut dependencies);
+            dependencies.sort_unstable();
+            dependencies.dedup();
+            for &dependency in &dependencies {
+                reverse_offsets[dependency + 1] += 1;
+            }
+        }
+        for index in 1..reverse_offsets.len() {
+            reverse_offsets[index] += reverse_offsets[index - 1];
+        }
+        let mut reverse_dependencies = vec![0; reverse_offsets[schemas.len()]];
+        let mut cursors = reverse_offsets[..schemas.len()].to_vec();
+        for (source, schema) in schemas.iter().enumerate() {
+            dependencies.clear();
+            collect_projection_dependencies(&schema.schema, &indices, &mut dependencies);
+            dependencies.sort_unstable();
+            dependencies.dedup();
+            for &dependency in &dependencies {
+                reverse_dependencies[cursors[dependency]] = source;
+                cursors[dependency] += 1;
+            }
+        }
+        drop(cursors);
+        drop(dependencies);
+
+        // Starting every component at FULL and only propagating changes preserves the previous
+        // greatest-fixed-point behavior for recursive schemas. A pure ref cycle stays FULL, while
+        // changes introduced by a dependency propagate to every affected schema.
+        let mut domains = vec![Projection::Known(Domain::FULL); schemas.len()];
+        let mut queue = (0..schemas.len()).collect::<VecDeque<_>>();
+        let mut queued = vec![true; schemas.len()];
+        while let Some(index) = queue.pop_front() {
+            queued[index] = false;
+            let next = project_schema(&schemas[index].schema, &indices, &domains);
+            if next == domains[index] {
+                continue;
+            }
+            domains[index] = next;
+            for &dependent in
+                &reverse_dependencies[reverse_offsets[index]..reverse_offsets[index + 1]]
+            {
+                if !queued[dependent] {
+                    queue.push_back(dependent);
+                    queued[dependent] = true;
+                }
+            }
+        }
+
+        Self {
+            schemas,
+            indices,
+            domains,
+        }
     }
 
     fn project(&self, schema: &SchemaNode) -> Projection {
-        project_schema(schema, &self.domains)
+        project_schema(schema, &self.indices, &self.domains)
     }
 
     fn resolve_schema<'schema>(
@@ -2312,23 +2360,64 @@ impl<'ir> PrimitiveDomainProjector<'ir> {
         'ir: 'schema,
     {
         let mut current = schema;
-        let mut seen = BTreeSet::new();
+        let mut seen = HashSet::new();
         while let SchemaNode::Ref { target, .. } = current {
-            let key = (target.source_id.clone(), target.json_pointer.clone());
-            if !seen.insert(key.clone()) {
+            let index = schema_index(&self.indices, &target.source_id, &target.json_pointer)?;
+            if !seen.insert(index) {
                 return None;
             }
-            current = self.schemas.get(&key).copied()?;
+            current = &self.schemas.get(index)?.schema;
         }
         Some(current)
     }
 }
 
-fn project_schema(schema: &SchemaNode, refs: &HashMap<(String, String), Projection>) -> Projection {
+fn schema_index(
+    indices: &HashMap<(&str, &str), usize>,
+    source_id: &str,
+    json_pointer: &str,
+) -> Option<usize> {
+    indices.get(&(source_id, json_pointer)).copied()
+}
+
+fn collect_projection_dependencies(
+    schema: &SchemaNode,
+    indices: &HashMap<(&str, &str), usize>,
+    dependencies: &mut Vec<usize>,
+) {
+    match schema {
+        SchemaNode::Ref { target, .. } => {
+            if let Some(index) = schema_index(indices, &target.source_id, &target.json_pointer) {
+                dependencies.push(index);
+            }
+        }
+        SchemaNode::AllOf { branches, .. }
+        | SchemaNode::OneOf { branches, .. }
+        | SchemaNode::AnyOf { branches, .. } => {
+            for branch in branches {
+                collect_projection_dependencies(branch, indices, dependencies);
+            }
+        }
+        SchemaNode::Primitive { .. }
+        | SchemaNode::Finite { .. }
+        | SchemaNode::Object { .. }
+        | SchemaNode::Array { .. }
+        | SchemaNode::Tuple { .. }
+        | SchemaNode::Any { .. }
+        | SchemaNode::Never { .. }
+        | SchemaNode::Unknown { .. } => {}
+    }
+}
+
+fn project_schema(
+    schema: &SchemaNode,
+    indices: &HashMap<(&str, &str), usize>,
+    domains: &[Projection],
+) -> Projection {
     let (base, apply_nullable) = match schema {
         SchemaNode::Ref { target, .. } => (
-            refs.get(&(target.source_id.clone(), target.json_pointer.clone()))
-                .copied()
+            schema_index(indices, &target.source_id, &target.json_pointer)
+                .and_then(|index| domains.get(index).copied())
                 .unwrap_or(Projection::Unsupported),
             true,
         ),
@@ -2371,7 +2460,7 @@ fn project_schema(schema: &SchemaNode, refs: &HashMap<(String, String), Projecti
         SchemaNode::AllOf { branches, .. } => (
             branches
                 .iter()
-                .map(|branch| project_schema(branch, refs))
+                .map(|branch| project_schema(branch, indices, domains))
                 .reduce(intersect_projection)
                 .unwrap_or(Projection::Known(Domain::FULL)),
             true,
@@ -2379,7 +2468,7 @@ fn project_schema(schema: &SchemaNode, refs: &HashMap<(String, String), Projecti
         SchemaNode::OneOf { branches, .. } | SchemaNode::AnyOf { branches, .. } => (
             branches
                 .iter()
-                .map(|branch| project_schema(branch, refs))
+                .map(|branch| project_schema(branch, indices, domains))
                 .reduce(union_projection)
                 .unwrap_or(Projection::Known(Domain::EMPTY)),
             true,
@@ -2544,6 +2633,43 @@ mod tests {
             enum_values: None,
             const_value: None,
             meta: test_meta(pointer),
+        }
+    }
+
+    fn projection_chain(length: usize, missing_terminal: bool) -> Ir {
+        assert!(length > 0);
+        let mut schemas = Vec::with_capacity(length);
+        for index in 0..length {
+            let name = format!("S{index}");
+            let pointer = format!("/components/schemas/{name}");
+            let schema = if index + 1 < length {
+                SchemaNode::Ref {
+                    target: SchemaRef {
+                        source_id: "openapi.json".to_owned(),
+                        json_pointer: format!("/components/schemas/S{}", index + 1),
+                    },
+                    meta: test_meta(&pointer),
+                }
+            } else if missing_terminal {
+                SchemaNode::Ref {
+                    target: SchemaRef {
+                        source_id: "openapi.json".to_owned(),
+                        json_pointer: "/components/schemas/Missing".to_owned(),
+                    },
+                    meta: test_meta(&pointer),
+                }
+            } else {
+                test_primitive(PrimitiveType::String, &pointer)
+            };
+            schemas.push(NamedSchema {
+                name,
+                schema,
+                source: SourceRef::new("openapi.json", pointer),
+            });
+        }
+        Ir {
+            schemas,
+            ..Ir::default()
         }
     }
 
@@ -4055,6 +4181,10 @@ mod tests {
             ..Ir::default()
         };
         let cycle_projector = PrimitiveDomainProjector::new(&cycle_ir);
+        assert_eq!(
+            cycle_projector.project(&cycle_ir.schemas[0].schema),
+            Projection::Known(Domain::FULL)
+        );
         assert!(
             cycle_projector
                 .resolve_schema(&cycle_ir.schemas[0].schema)
@@ -4212,6 +4342,165 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn primitive_projection_worklist_propagates_long_chains_in_either_source_order() {
+        const LENGTH: usize = 4096;
+        for reversed in [false, true] {
+            let mut ir = projection_chain(LENGTH, false);
+            if reversed {
+                ir.schemas.reverse();
+            }
+            let projector = PrimitiveDomainProjector::new(&ir);
+
+            assert_eq!(projector.domains.len(), LENGTH);
+            assert!(
+                projector
+                    .domains
+                    .iter()
+                    .all(|projection| *projection == Projection::Known(Domain::STRING))
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_projection_worklist_propagates_unsupported_targets() {
+        const LENGTH: usize = 4096;
+        let ir = projection_chain(LENGTH, true);
+        let projector = PrimitiveDomainProjector::new(&ir);
+
+        assert!(
+            projector
+                .domains
+                .iter()
+                .all(|projection| *projection == Projection::Unsupported)
+        );
+    }
+
+    #[test]
+    fn primitive_projection_worklist_propagates_constraints_through_cycles() {
+        let reference = |name: &str, pointer: &str| SchemaNode::Ref {
+            target: SchemaRef {
+                source_id: "openapi.json".to_owned(),
+                json_pointer: format!("/components/schemas/{name}"),
+            },
+            meta: test_meta(pointer),
+        };
+        let ir = Ir {
+            schemas: vec![
+                NamedSchema {
+                    name: "A".to_owned(),
+                    schema: SchemaNode::AllOf {
+                        branches: vec![
+                            reference("B", "/components/schemas/A/allOf/0"),
+                            test_primitive(PrimitiveType::String, "/components/schemas/A/allOf/1"),
+                        ],
+                        meta: test_meta("/components/schemas/A"),
+                    },
+                    source: SourceRef::new("openapi.json", "/components/schemas/A"),
+                },
+                NamedSchema {
+                    name: "B".to_owned(),
+                    schema: reference("A", "/components/schemas/B"),
+                    source: SourceRef::new("openapi.json", "/components/schemas/B"),
+                },
+            ],
+            ..Ir::default()
+        };
+        let projector = PrimitiveDomainProjector::new(&ir);
+
+        assert!(
+            projector
+                .domains
+                .iter()
+                .all(|projection| *projection == Projection::Known(Domain::STRING))
+        );
+    }
+
+    #[test]
+    fn primitive_projection_worklist_tracks_composition_nullable_and_unknown_dependencies() {
+        let reference = |name: &str, pointer: &str, nullable: bool| {
+            let mut meta = test_meta(pointer);
+            meta.nullable = nullable;
+            SchemaNode::Ref {
+                target: SchemaRef {
+                    source_id: "openapi.json".to_owned(),
+                    json_pointer: format!("/components/schemas/{name}"),
+                },
+                meta,
+            }
+        };
+        let named = |name: &str, schema| NamedSchema {
+            name: name.to_owned(),
+            schema,
+            source: SourceRef::new("openapi.json", format!("/components/schemas/{name}")),
+        };
+        let ir = Ir {
+            schemas: vec![
+                named(
+                    "Any",
+                    SchemaNode::AnyOf {
+                        branches: vec![
+                            reference("String", "/components/schemas/Any/anyOf/0", false),
+                            test_primitive(
+                                PrimitiveType::Number,
+                                "/components/schemas/Any/anyOf/1",
+                            ),
+                        ],
+                        discriminator: None,
+                        meta: test_meta("/components/schemas/Any"),
+                    },
+                ),
+                named(
+                    "One",
+                    SchemaNode::OneOf {
+                        branches: vec![
+                            reference("String", "/components/schemas/One/oneOf/0", false),
+                            test_primitive(
+                                PrimitiveType::Boolean,
+                                "/components/schemas/One/oneOf/1",
+                            ),
+                        ],
+                        discriminator: None,
+                        meta: test_meta("/components/schemas/One"),
+                    },
+                ),
+                named(
+                    "Nullable",
+                    reference("String", "/components/schemas/Nullable", true),
+                ),
+                named(
+                    "UnknownRef",
+                    reference("Unknown", "/components/schemas/UnknownRef", false),
+                ),
+                named(
+                    "String",
+                    test_primitive(PrimitiveType::String, "/components/schemas/String"),
+                ),
+                named(
+                    "Unknown",
+                    SchemaNode::Unknown {
+                        reason: "test".to_owned(),
+                        meta: test_meta("/components/schemas/Unknown"),
+                    },
+                ),
+            ],
+            ..Ir::default()
+        };
+        let projector = PrimitiveDomainProjector::new(&ir);
+
+        assert_eq!(
+            projector.domains,
+            [
+                Projection::Known(Domain::STRING.union(Domain::NUMBER)),
+                Projection::Known(Domain::STRING.union(Domain::BOOLEAN)),
+                Projection::Known(Domain::STRING.union(Domain::NULL)),
+                Projection::Unsupported,
+                Projection::Known(Domain::STRING),
+                Projection::Unsupported,
+            ]
+        );
     }
 
     #[test]

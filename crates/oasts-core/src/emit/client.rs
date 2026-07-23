@@ -22,7 +22,7 @@ use super::runtime_assets::{RuntimeSelection, emit_runtime_files};
 use super::validators::operation_parameter_validator_names;
 use super::{
     ClientDocKind, Emitter as TypesEmitter, GeneratedFile, TypePosition, encode_comment_text,
-    import_extension, render_property_key, render_ts_string, uppercase_first,
+    import_extension, push_indent, render_property_key, render_ts_string, uppercase_first,
     write_client_operation_tsdoc, write_source_metadata,
 };
 
@@ -928,20 +928,19 @@ fn write_parameter_property_tsdoc(
     if !documentation.enabled || !documentation.description {
         return;
     }
-    let prefix = " ".repeat(indent);
-    output.push_str(&prefix);
+    push_indent(output, indent);
     output.push_str("/**\n");
     if !documentation.summary {
-        output.push_str(&prefix);
+        push_indent(output, indent);
         output.push_str(" * @remarks\n");
     }
     for line in encode_comment_text(description).split('\n') {
-        output.push_str(&prefix);
+        push_indent(output, indent);
         output.push_str(" * ");
         output.push_str(line);
         output.push('\n');
     }
-    output.push_str(&prefix);
+    push_indent(output, indent);
     output.push_str(" */\n");
 }
 
@@ -983,7 +982,7 @@ fn render_form_input(
 ) -> String {
     let mut output = String::from("{\n");
     for field in fields {
-        output.push_str(&" ".repeat(indent + 2));
+        push_indent(&mut output, indent + 2);
         output.push_str(&render_property_key(&field.name));
         if !field.required {
             output.push('?');
@@ -992,7 +991,7 @@ fn render_form_input(
         output.push_str(&render_form_field_input(renderer, field, indent + 2));
         output.push_str(";\n");
     }
-    output.push_str(&" ".repeat(indent));
+    push_indent(&mut output, indent);
     output.push('}');
     output
 }
@@ -1640,7 +1639,7 @@ fn write_body_descriptor(
             output.push_str(&render_ts_string(media));
             output.push_str(", fields: [\n");
             for field in fields {
-                output.push_str(&" ".repeat(indent + 2));
+                push_indent(output, indent + 2);
                 output.push_str("{ name: ");
                 output.push_str(&render_ts_string(&field.name));
                 output.push_str(", required: ");
@@ -1676,7 +1675,7 @@ fn write_body_descriptor(
                 }
                 output.push_str(" },\n");
             }
-            output.push_str(&" ".repeat(indent));
+            push_indent(output, indent);
             output.push_str("] }");
         }
         BodyPlan::Multipart { fields, .. } => {
@@ -1684,20 +1683,20 @@ fn write_body_descriptor(
             for field in fields {
                 write_multipart_field(output, model, field, indent + 2);
             }
-            output.push_str(&" ".repeat(indent));
+            push_indent(output, indent);
             output.push_str("] }");
         }
         BodyPlan::ContentTypeDiscriminated { arms, .. } => {
             output.push_str("{ kind: \"content-discriminated\", arms: [\n");
             for (media, arm) in arms {
-                output.push_str(&" ".repeat(indent + 2));
+                push_indent(output, indent + 2);
                 output.push('[');
                 output.push_str(&render_ts_string(media));
                 output.push_str(", ");
                 write_body_descriptor(output, model, arm, indent + 2);
                 output.push_str("],\n");
             }
-            output.push_str(&" ".repeat(indent));
+            push_indent(output, indent);
             output.push_str("] }");
         }
     }
@@ -1750,7 +1749,7 @@ fn write_multipart_field(
     field: &FormFieldPlan,
     indent: usize,
 ) {
-    output.push_str(&" ".repeat(indent));
+    push_indent(output, indent);
     output.push_str("{ name: ");
     output.push_str(&render_ts_string(&field.name));
     output.push_str(", required: ");

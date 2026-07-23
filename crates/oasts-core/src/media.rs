@@ -105,24 +105,21 @@ pub(crate) fn is_xml(media: &str) -> bool {
 }
 
 fn parse_media(input: &str) -> Result<ParsedMedia, ()> {
-    let segments = split_quoted(input, ';')?;
-    let essence = segments.first().copied().ok_or(())?.trim();
-    let (media_type, subtype) = essence.split_once('/').ok_or(())?;
-    if media_type.is_empty()
-        || subtype.is_empty()
-        || !media_type.bytes().all(is_tchar)
-        || !subtype.bytes().all(is_tchar)
-        || media_type == "*" && subtype != "*"
-    {
-        return Err(());
+    if !input.as_bytes().contains(&b';') {
+        let (essence, range_kind) = parse_media_essence(input)?;
+        let mut essence = essence.to_owned();
+        essence.make_ascii_lowercase();
+        return Ok(ParsedMedia {
+            essence,
+            range_kind,
+            parameters: BTreeMap::new(),
+        });
     }
-    let range_kind = if media_type == "*" {
-        MediaRangeKind::Any
-    } else if subtype == "*" {
-        MediaRangeKind::TypeRange
-    } else {
-        MediaRangeKind::Concrete
-    };
+
+    let segments = split_quoted(input, ';')?;
+    let (essence, range_kind) = parse_media_essence(segments.first().copied().ok_or(())?)?;
+    let mut canonical_essence = essence.to_owned();
+    canonical_essence.make_ascii_lowercase();
     let mut parameters = BTreeMap::new();
     for segment in &segments[1..] {
         let segment = segment.trim_matches([' ', '\t']);
@@ -144,14 +141,31 @@ fn parse_media(input: &str) -> Result<ParsedMedia, ()> {
         parameters.insert(name, parse_parameter_value(raw_value)?);
     }
     Ok(ParsedMedia {
-        essence: format!(
-            "{}/{}",
-            media_type.to_ascii_lowercase(),
-            subtype.to_ascii_lowercase()
-        ),
+        essence: canonical_essence,
         range_kind,
         parameters,
     })
+}
+
+fn parse_media_essence(input: &str) -> Result<(&str, MediaRangeKind), ()> {
+    let essence = input.trim();
+    let (media_type, subtype) = essence.split_once('/').ok_or(())?;
+    if media_type.is_empty()
+        || subtype.is_empty()
+        || !media_type.bytes().all(is_tchar)
+        || !subtype.bytes().all(is_tchar)
+        || media_type == "*" && subtype != "*"
+    {
+        return Err(());
+    }
+    let range_kind = if media_type == "*" {
+        MediaRangeKind::Any
+    } else if subtype == "*" {
+        MediaRangeKind::TypeRange
+    } else {
+        MediaRangeKind::Concrete
+    };
+    Ok((essence, range_kind))
 }
 
 /// Renders the canonical media string: essence followed by the BTreeMap-sorted parameters.

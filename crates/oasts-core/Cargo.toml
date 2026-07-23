@@ -11,6 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+itoa = "=1.0.18"
 serde = { version = "=1.0.229", features = ["derive"] }
 ryu = "=1.0.23"
 serde_json = { version = "=1.0.150", features = ["arbitrary_precision", "preserve_order"] }

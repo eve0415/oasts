@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -94,13 +94,14 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
     } else {
         output_dir.to_path_buf()
     };
-    let previous = if output_existed {
+    let previous_read = if output_existed {
         validate_target(&canonical_output, MANIFEST_NAME)?;
-        read_manifest(&canonical_output)?
+        read_manifest_bytes(&canonical_output)?
     } else {
         None
     };
-    validate_manifest_paths(previous.as_ref())?;
+    let previous = previous_read.as_ref().map(|(manifest, _)| manifest);
+    validate_manifest_paths(previous)?;
 
     if !output_existed {
         fs::create_dir_all(output_dir).map_err(|error| {
@@ -111,7 +112,7 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
         })?;
     }
     let canonical_output = canonical_output_dir(output_dir)?;
-    preflight_targets(&canonical_output, &prepared, previous.as_ref())?;
+    preflight_targets(&canonical_output, &prepared, previous)?;
 
     let new_paths = prepared
         .iter()
@@ -141,8 +142,19 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
         }
     }
 
+    let mut files_written = 0;
+    let mut existing_content = Vec::new();
     for file in &prepared {
         let target = validate_target(&canonical_output, &file.relative_path)?;
+        let is_unchanged = output_existed
+            && fs::File::open(&target).is_ok_and(|mut existing_file| {
+                existing_content.clear();
+                existing_file.read_to_end(&mut existing_content).is_ok()
+                    && existing_content.as_slice() == file.content.as_slice()
+            });
+        if is_unchanged {
+            continue;
+        }
         let parent = target
             .parent()
             .expect("a validated target inside an absolute output directory has a parent");
@@ -165,6 +177,7 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
                 Some(&target),
             )]
         })?;
+        files_written += 1;
     }
 
     let manifest = Manifest {
@@ -173,15 +186,20 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
     };
     let manifest_bytes = manifest_bytes(&manifest);
     let manifest_target = validate_target(&canonical_output, MANIFEST_NAME)?;
-    fs::write(&manifest_target, manifest_bytes).map_err(|error| {
-        vec![io_diagnostic(
-            format!("failed to write ownership manifest: {error}"),
-            Some(&manifest_target),
-        )]
-    })?;
+    let manifest_is_current = previous_read
+        .as_ref()
+        .is_some_and(|(_, previous_bytes)| previous_bytes.as_slice() == manifest_bytes.as_slice());
+    if !manifest_is_current {
+        fs::write(&manifest_target, manifest_bytes).map_err(|error| {
+            vec![io_diagnostic(
+                format!("failed to write ownership manifest: {error}"),
+                Some(&manifest_target),
+            )]
+        })?;
+    }
 
     Ok(WriteReport {
-        files_written: prepared.len(),
+        files_written,
         files_deleted,
     })
 }
@@ -370,10 +388,6 @@ fn canonical_output_dir(output_dir: &Path) -> Result<PathBuf, Vec<Diagnostic>> {
         )]);
     }
     Ok(canonical)
-}
-
-fn read_manifest(output_dir: &Path) -> Result<Option<Manifest>, Vec<Diagnostic>> {
-    read_manifest_bytes(output_dir).map(|manifest| manifest.map(|(manifest, _)| manifest))
 }
 
 fn read_manifest_bytes(output_dir: &Path) -> Result<Option<(Manifest, Vec<u8>)>, Vec<Diagnostic>> {
@@ -596,6 +610,27 @@ mod tests {
     }
 
     #[test]
+    fn skips_unchanged_files_and_counts_only_rewrites() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        let files = vec![generated("a.ts", "a\n"), generated("b.ts", "b\n")];
+
+        let first = write(&output, files.clone()).expect("first write");
+        assert_eq!(first.files_written, 2);
+
+        let unchanged = write(&output, files).expect("unchanged write");
+        assert_eq!(unchanged, WriteReport::default());
+
+        let changed = write(
+            &output,
+            vec![generated("a.ts", "changed\n"), generated("b.ts", "b\n")],
+        )
+        .expect("changed write");
+        assert_eq!(changed.files_written, 1);
+        assert_eq!(fs::read(output.join("a.ts")).expect("a"), b"changed\n");
+    }
+
+    #[test]
     fn regeneration_deletes_only_obsolete_owned_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("generated");
@@ -814,7 +849,11 @@ mod tests {
             r#"{"manifestVersion":1,"files":[]}"#,
         )
         .expect("manifest");
-        assert!(read_manifest(output).expect("valid manifest").is_some());
+        assert!(
+            read_manifest_bytes(output)
+                .expect("valid manifest")
+                .is_some()
+        );
     }
 
     #[test]
@@ -900,10 +939,16 @@ mod tests {
         mode(&file_output.join("a.ts"), 0o600);
         assert_eq!(file_error[0].code, CODE_IO);
 
-        mode(&file_output.join(MANIFEST_NAME), 0o400);
+        let manifest_path = file_output.join(MANIFEST_NAME);
+        fs::write(
+            &manifest_path,
+            b"{\"manifestVersion\":1,\"files\":[\"a.ts\"]}",
+        )
+        .expect("noncanonical manifest");
+        mode(&manifest_path, 0o400);
         let manifest_error =
             write(&file_output, vec![generated("a.ts", "a")]).expect_err("manifest write");
-        mode(&file_output.join(MANIFEST_NAME), 0o600);
+        mode(&manifest_path, 0o600);
         assert_eq!(manifest_error[0].code, CODE_IO);
     }
 

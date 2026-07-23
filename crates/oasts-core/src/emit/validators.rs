@@ -35,8 +35,8 @@ use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
     Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypePosition, callback_operation,
     callback_parent_operation, import_extension, lowercase_first, property_in_position,
-    render_json_compact, render_ts_string, response_status_type_suffix, source_diagnostic,
-    uppercase_first,
+    push_indent, render_json_compact, render_ts_string, response_status_type_suffix,
+    source_diagnostic, uppercase_first,
 };
 use crate::media::is_json;
 
@@ -1783,11 +1783,11 @@ fn write_request_descriptor_method(
     let stem = uppercase_first(allocated_name);
     let parameter_names = operation_parameter_validator_names(operation, &stem);
     let entry = imports.entry(file_base.to_owned()).or_default();
-    body.push_str(&" ".repeat(indent));
+    push_indent(body, indent);
     body.push_str(&operation.method);
     body.push_str(": {\n");
     if !operation.parameters.is_empty() {
-        body.push_str(&" ".repeat(indent + 2));
+        push_indent(body, indent + 2);
         body.push_str("parameters: {\n");
         for location in [
             ParamLocation::Path,
@@ -1804,22 +1804,22 @@ fn write_request_descriptor_method(
             if matching.is_empty() {
                 continue;
             }
-            body.push_str(&" ".repeat(indent + 4));
+            push_indent(body, indent + 4);
             body.push_str(location_key(location));
             body.push_str(": {\n");
             for (parameter, export_type) in matching {
                 let validator = format!("{}Validator", lowercase_first(export_type));
                 entry.insert(validator.clone());
-                body.push_str(&" ".repeat(indent + 6));
+                push_indent(body, indent + 6);
                 body.push_str(&render_ts_string(&parameter.name));
                 body.push_str(": ");
                 body.push_str(&validator);
                 body.push_str(",\n");
             }
-            body.push_str(&" ".repeat(indent + 4));
+            push_indent(body, indent + 4);
             body.push_str("},\n");
         }
-        body.push_str(&" ".repeat(indent + 2));
+        push_indent(body, indent + 2);
         body.push_str("},\n");
     }
     if operation.request_body.as_ref().is_some_and(|request_body| {
@@ -1830,12 +1830,12 @@ fn write_request_descriptor_method(
     }) {
         let validator = format!("{}RequestBodyValidator", lowercase_first(&stem));
         entry.insert(validator.clone());
-        body.push_str(&" ".repeat(indent + 2));
+        push_indent(body, indent + 2);
         body.push_str("requestBody: ");
         body.push_str(&validator);
         body.push_str(",\n");
     }
-    body.push_str(&" ".repeat(indent));
+    push_indent(body, indent);
     body.push_str("},\n");
 }
 

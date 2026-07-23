@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::str::FromStr;
 
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -182,33 +183,41 @@ impl DocumentGraph {
         )? {
             return self.node_from_location(target);
         }
-        let target_path = local_path_from_url(&target_url, Some(&base_document.source_id), None)?;
-        let canonical = fs::canonicalize(&target_path).map_err(|error| {
-            io_error(
-                CODE_IO,
-                format!("failed to canonicalize referenced document: {error}"),
-                Some(&base_document.source_id),
-                None,
-            )
-        })?;
-        authorize_path(&canonical, &self.workspace_root, &self.allow_roots).map_err(|message| {
-            input_error(
-                CODE_REF_ESCAPE,
-                message,
-                Some(&base_document.source_id),
-                None,
-            )
-        })?;
-        let Some(target_id) = self.path_to_id.get(&canonical).copied() else {
-            return Err(io_error(
-                CODE_IO,
-                format!(
-                    "referenced document '{}' is not part of the loaded graph",
-                    canonical.display()
-                ),
-                Some(&base_document.source_id),
-                None,
-            ));
+        let target_id = if reference.starts_with('#') {
+            base_doc
+        } else {
+            let target_path =
+                local_path_from_url(&target_url, Some(&base_document.source_id), None)?;
+            let canonical = fs::canonicalize(&target_path).map_err(|error| {
+                io_error(
+                    CODE_IO,
+                    format!("failed to canonicalize referenced document: {error}"),
+                    Some(&base_document.source_id),
+                    None,
+                )
+            })?;
+            authorize_path(&canonical, &self.workspace_root, &self.allow_roots).map_err(
+                |message| {
+                    input_error(
+                        CODE_REF_ESCAPE,
+                        message,
+                        Some(&base_document.source_id),
+                        None,
+                    )
+                },
+            )?;
+            let Some(target_id) = self.path_to_id.get(&canonical).copied() else {
+                return Err(io_error(
+                    CODE_IO,
+                    format!(
+                        "referenced document '{}' is not part of the loaded graph",
+                        canonical.display()
+                    ),
+                    Some(&base_document.source_id),
+                    None,
+                ));
+            };
+            target_id
         };
         let target = pointer_or_anchor(
             &target_url,
@@ -289,7 +298,7 @@ impl WalkContext {
 struct VisitKey {
     location: NodeLocation,
     context: WalkContext,
-    base: String,
+    base: Rc<Url>,
 }
 
 #[derive(Clone, Debug)]
@@ -369,7 +378,7 @@ impl<'a> GraphBuilder<'a> {
                 json_pointer: String::new(),
             },
             WalkContext::NonSchema,
-            entry_base,
+            Rc::new(entry_base),
             0,
             &mut state,
         )?;
@@ -389,6 +398,11 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn load_document(&mut self, requested_path: &Path) -> Result<DocId, Diagnostic> {
+        // Resolved file URLs usually produce the same canonical absolute path already stored for
+        // the document. Reuse that entry before asking the filesystem to canonicalize every `$ref`.
+        if let Some(id) = self.path_to_id.get(requested_path) {
+            return Ok(*id);
+        }
         let canonical_path = fs::canonicalize(requested_path).map_err(|error| {
             io_error(
                 CODE_IO,
@@ -495,19 +509,11 @@ impl<'a> GraphBuilder<'a> {
         &mut self,
         location: NodeLocation,
         context: WalkContext,
-        base: Url,
+        base: Rc<Url>,
         ref_depth: u64,
         state: &mut TraversalState,
     ) -> Result<(), Diagnostic> {
         if context == WalkContext::Skip {
-            return Ok(());
-        }
-        let key = VisitKey {
-            location: location.clone(),
-            context,
-            base: base.as_str().to_owned(),
-        };
-        if !self.visited.insert(key) {
             return Ok(());
         }
 
@@ -523,7 +529,11 @@ impl<'a> GraphBuilder<'a> {
             Array {
                 len: usize,
             },
-            Leaf,
+        }
+
+        enum Container<'value> {
+            Object(&'value serde_json::Map<String, Value>),
+            Array(&'value [Value]),
         }
 
         let (effective_base, summary) = {
@@ -541,11 +551,26 @@ impl<'a> GraphBuilder<'a> {
                         Some(&location.json_pointer),
                     )
                 })?;
+            let container = match value {
+                Value::Object(object) => Container::Object(object),
+                Value::Array(values) => Container::Array(values),
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+                    return Ok(());
+                }
+            };
+            let key = VisitKey {
+                location: location.clone(),
+                context,
+                base: Rc::clone(&base),
+            };
+            if !self.visited.insert(key) {
+                return Ok(());
+            }
 
             state.stack.push(location.clone());
             let mut effective_base = base;
             if context == WalkContext::Schema
-                && let Value::Object(object) = value
+                && let Container::Object(object) = &container
                 && let Some(id_value) = object.get("$id")
             {
                 let Some(id) = id_value.as_str() else {
@@ -556,16 +581,16 @@ impl<'a> GraphBuilder<'a> {
                         Some(&append_pointer(&location.json_pointer, "$id")),
                     ));
                 };
-                effective_base = resolve_uri(
+                effective_base = Rc::new(resolve_uri(
                     &effective_base,
                     id,
                     self.source_id(location.doc_id),
                     Some(&append_pointer(&location.json_pointer, "$id")),
-                )?;
+                )?);
             }
 
-            let summary = match value {
-                Value::Object(object) => {
+            let summary = match container {
+                Container::Object(object) => {
                     let reference =
                         if matches!(context, WalkContext::Schema | WalkContext::NonSchema)
                             && let Some(reference_value) = object.get("$ref")
@@ -595,7 +620,8 @@ impl<'a> GraphBuilder<'a> {
                         if child_context == WalkContext::Skip {
                             continue;
                         }
-                        children.push((name.clone(), child_context));
+                        children
+                            .push((append_pointer(&location.json_pointer, name), child_context));
                     }
 
                     NodeSummary::Object {
@@ -603,10 +629,7 @@ impl<'a> GraphBuilder<'a> {
                         children,
                     }
                 }
-                Value::Array(values) => NodeSummary::Array { len: values.len() },
-                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-                    NodeSummary::Leaf
-                }
+                Container::Array(values) => NodeSummary::Array { len: values.len() },
             };
 
             (effective_base, summary)
@@ -628,14 +651,14 @@ impl<'a> GraphBuilder<'a> {
                     )?;
                 }
 
-                for (name, child_context) in children {
+                for (json_pointer, child_context) in children {
                     self.walk_node(
                         NodeLocation {
                             doc_id: location.doc_id,
-                            json_pointer: append_pointer(&location.json_pointer, &name),
+                            json_pointer,
                         },
                         child_context,
-                        effective_base.clone(),
+                        Rc::clone(&effective_base),
                         ref_depth,
                         state,
                     )?;
@@ -648,20 +671,16 @@ impl<'a> GraphBuilder<'a> {
                         self.walk_node(
                             NodeLocation {
                                 doc_id: location.doc_id,
-                                json_pointer: append_pointer(
-                                    &location.json_pointer,
-                                    &index.to_string(),
-                                ),
+                                json_pointer: append_pointer_index(&location.json_pointer, index),
                             },
                             child_context,
-                            effective_base.clone(),
+                            Rc::clone(&effective_base),
                             ref_depth,
                             state,
                         )?;
                     }
                 }
             }
-            NodeSummary::Leaf => {}
         }
         state.stack.pop();
         Ok(())
@@ -762,7 +781,7 @@ impl<'a> GraphBuilder<'a> {
             return Ok(());
         }
 
-        let target_base = self.base_at_target(&target, position)?;
+        let target_base = Rc::new(self.base_at_target(&target, position)?);
         state.active_references.push(ActiveReference {
             target: target.clone(),
             position,
@@ -981,7 +1000,7 @@ fn collect_anchors_at(
                     collect_anchors_at(
                         child,
                         doc_id,
-                        &append_pointer(pointer, &index.to_string()),
+                        &append_pointer_index(pointer, index),
                         child_context,
                         base.clone(),
                         source_id,
@@ -1256,6 +1275,7 @@ where
 /// Builds a `Value` from a JSON map, rejecting duplicate object keys and decoding the
 /// arbitrary-precision number token. Generic over the error type only, so serde_json's
 /// object-parsing and number-token map accesses reuse one instantiation.
+#[inline(always)]
 fn build_map_value<E>(access: &mut dyn DedupMapAccess<E>) -> Result<Value, E>
 where
     E: serde::de::Error,
@@ -1660,6 +1680,11 @@ pub(crate) fn append_pointer(pointer: &str, token: &str) -> String {
     result
 }
 
+pub(crate) fn append_pointer_index(pointer: &str, index: usize) -> String {
+    let mut buffer = itoa::Buffer::new();
+    append_pointer(pointer, buffer.format(index))
+}
+
 fn array_child_context(context: WalkContext) -> WalkContext {
     match context {
         WalkContext::Schema | WalkContext::SchemaArray => WalkContext::Schema,
@@ -2029,6 +2054,25 @@ mod tests {
             )
             .expect("cross-file node should resolve");
         assert_eq!(pet.value["$ref"], "nested.yaml#/Friend");
+    }
+
+    #[test]
+    fn graph_resolve_reuses_the_loaded_document_for_fragment_only_references() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let entry = write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet: { type: string }\n",
+        );
+        let config = resolved_config(directory.path(), "");
+        let graph = load_ok(&config);
+        fs::remove_file(entry).expect("loaded document should be removable");
+
+        let pet = graph
+            .resolve(graph.entry().id, "#/components/schemas/Pet")
+            .expect("fragment-only reference should reuse the loaded document");
+
+        assert_eq!(pet.value["type"], "string");
     }
 
     #[test]
@@ -2964,7 +3008,8 @@ mod tests {
         let entry_id = builder
             .load_document(&config.input)
             .expect("entry should load");
-        let base = file_url(&builder.documents[entry_id.0].canonical_path).expect("file URL");
+        let base =
+            Rc::new(file_url(&builder.documents[entry_id.0].canonical_path).expect("file URL"));
         let location = NodeLocation {
             doc_id: entry_id,
             json_pointer: String::new(),
@@ -2974,7 +3019,7 @@ mod tests {
             .walk_node(
                 location.clone(),
                 WalkContext::NonSchema,
-                base.clone(),
+                Rc::clone(&base),
                 0,
                 &mut state,
             )
@@ -2983,7 +3028,7 @@ mod tests {
             .walk_node(
                 location,
                 WalkContext::NonSchema,
-                base.clone(),
+                Rc::clone(&base),
                 0,
                 &mut state,
             )
@@ -2995,7 +3040,7 @@ mod tests {
                     json_pointer: String::new(),
                 },
                 WalkContext::Skip,
-                base.clone(),
+                Rc::clone(&base),
                 0,
                 &mut state,
             )
@@ -3007,7 +3052,7 @@ mod tests {
                     json_pointer: "/components/schemas/Mixed/items".to_owned(),
                 },
                 WalkContext::SchemaMap,
-                base.clone(),
+                Rc::clone(&base),
                 0,
                 &mut state,
             )
@@ -3025,6 +3070,82 @@ mod tests {
             )
             .expect_err("missing node should fail");
         assert_eq!(error.code, CODE_POINTER);
+    }
+
+    #[test]
+    fn walker_does_not_retain_scalar_visit_keys() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ninfo:\n  title: Example\n  version: 1.0.0\n",
+        );
+        let config = resolved_config(directory.path(), "");
+        let mut builder = GraphBuilder::new(&config).expect("builder");
+        let entry_id = builder
+            .load_document(&config.input)
+            .expect("entry should load");
+        let base =
+            Rc::new(file_url(&builder.documents[entry_id.0].canonical_path).expect("file URL"));
+        builder
+            .walk_node(
+                NodeLocation {
+                    doc_id: entry_id,
+                    json_pointer: String::new(),
+                },
+                WalkContext::NonSchema,
+                base,
+                0,
+                &mut TraversalState::default(),
+            )
+            .expect("document should walk");
+
+        let mut retained = builder
+            .visited
+            .iter()
+            .map(|key| key.location.json_pointer.as_str())
+            .collect::<Vec<_>>();
+        retained.sort_unstable();
+        assert_eq!(retained, ["", "/info"]);
+    }
+
+    #[test]
+    fn load_document_reuses_a_cached_canonical_path_without_filesystem_access() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let entry = write(directory.path(), "workspace/entry.yaml", "openapi: 3.1.0\n");
+        let config = resolved_config(directory.path(), "");
+        let mut builder = GraphBuilder::new(&config).expect("builder");
+        let id = builder.load_document(&entry).expect("entry should load");
+        let canonical_path = builder.documents[id.0].canonical_path.clone();
+        fs::remove_file(&canonical_path).expect("cached document should be removable");
+
+        assert_eq!(
+            builder
+                .load_document(&canonical_path)
+                .expect("cached document should not touch the filesystem"),
+            id
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_document_reuses_a_cached_document_through_a_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new().expect("tempdir should be created");
+        let entry = write(directory.path(), "workspace/entry.yaml", "openapi: 3.1.0\n");
+        let alias = directory.path().join("workspace/alias.yaml");
+        symlink(&entry, &alias).expect("fixture symlink should be created");
+        let config = resolved_config(directory.path(), "");
+        let mut builder = GraphBuilder::new(&config).expect("builder");
+        let id = builder.load_document(&entry).expect("entry should load");
+
+        assert_eq!(
+            builder
+                .load_document(&alias)
+                .expect("alias should reuse the cached document"),
+            id
+        );
     }
 
     #[test]
@@ -3257,6 +3378,12 @@ mod tests {
             assert!(evaluate_pointer(&value, pointer).is_err(), "{pointer}");
         }
         assert_eq!(append_pointer("/root", "a/b~c"), "/root/a~1b~0c");
+        for index in [0, 9, 10, usize::MAX] {
+            assert_eq!(
+                append_pointer_index("/root", index),
+                format!("/root/{index}")
+            );
+        }
         assert_eq!(unescape_pointer_token("plain"), Ok("plain".to_owned()));
         assert!(validate_pointer("bad").is_err());
     }

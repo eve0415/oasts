@@ -5,6 +5,7 @@ use divan::Bencher;
 use oasts_core::client_model::build_client_model as run_build_client_model;
 use oasts_core::config::{ResolvedConfig, load_config};
 use oasts_core::diag::DiagnosticSink;
+use oasts_core::emit::emit_artifacts as run_emit_artifacts;
 use oasts_core::ir::Ir;
 use oasts_core::loader::{DocumentGraph, load_graph as run_load_graph};
 use oasts_core::parse::parse as run_parse;
@@ -176,6 +177,41 @@ fn build_client_model(bencher: Bencher, fixture: &Fixture) {
         .bench_values(|mut sink| {
             let model = run_build_client_model(&analyzed, &fixture.config, &mut sink);
             (model, sink)
+        });
+}
+
+#[divan::bench(args = fixtures(), sample_count = SAMPLE_COUNT)]
+fn emit(bencher: Bencher, fixture: &Fixture) {
+    let graph = prepared_graph(fixture);
+    let mut sink = DiagnosticSink::new();
+    let ir = run_parse(&graph, &mut sink)
+        .unwrap_or_else(|| panic!("failed to parse {}: {:#?}", fixture.name, sink.as_slice()));
+    let analyzed = run_analyze(ir, &fixture.config, &mut sink);
+    let client_model = fixture
+        .config
+        .artifacts
+        .client
+        .enabled
+        .then(|| run_build_client_model(&analyzed, &fixture.config, &mut sink));
+    assert!(
+        !sink.has_errors(),
+        "emission preparation diagnostics for {}: {:#?}",
+        fixture.name,
+        sink.as_slice()
+    );
+    let source_tuples = graph.source_tuples();
+
+    bencher
+        .with_inputs(DiagnosticSink::new)
+        .bench_values(|mut sink| {
+            let files = run_emit_artifacts(
+                &analyzed,
+                &fixture.config,
+                &source_tuples,
+                client_model.as_ref(),
+                &mut sink,
+            );
+            (files, sink)
         });
 }
 

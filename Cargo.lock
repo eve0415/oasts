@@ -965,6 +965,7 @@ name = "oasts-core"
 version = "0.0.0"
 dependencies = [
  "divan",
+ "itoa",
  "ryu",
  "schemars",
  "serde",
