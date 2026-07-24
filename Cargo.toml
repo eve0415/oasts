@@ -12,3 +12,8 @@ homepage = "https://github.com/eve0415/oasts"
 description = "OpenAPI-to-TypeScript compiler with fully typed errors, compile-time auth checks, and a zero-dependency fetch client — plus first-party Zod, TanStack Query, and MSW artifacts."
 keywords = ["openapi", "typescript", "codegen", "compiler"]
 categories = ["command-line-utilities", "development-tools"]
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = "symbols"
