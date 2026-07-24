@@ -439,10 +439,8 @@ mod tests {
             r#"{"openapi":"3.1.0","paths":{},"components":{"schemas":{"Impossible":{"allOf":[{"type":"string"},{"type":"integer"}]}}}}"#,
         );
 
-        let (code, stdout, stderr) = invoke(
-            &["oasts", "check", "--config", "oasts.json"],
-            temp.path(),
-        );
+        let (code, stdout, stderr) =
+            invoke(&["oasts", "check", "--config", "oasts.json"], temp.path());
 
         assert_eq!(code, 1, "{stderr}");
         assert!(stdout.is_empty(), "{stdout}");
@@ -715,22 +713,15 @@ mod tests {
         let missing_config = tempfile::tempdir().expect("tempdir");
         assert_eq!(invoke(&["oasts", "check"], missing_config.path()).0, 2);
         assert_eq!(
-            invoke(
-                &["oasts", "generate", "--unknown"],
-                missing_config.path()
-            )
-            .0,
+            invoke(&["oasts", "generate", "--unknown"], missing_config.path()).0,
             2
         );
         assert_eq!(invoke(&["oasts", "unknown"], missing_config.path()).0, 2);
         assert_eq!(invoke(&["check"], missing_config.path()).0, 2);
 
         let invalid_yaml = copy_fixture("petstore-3.0");
-        fs::write(
-            invalid_yaml.path().join("oasts.yaml"),
-            "schemaVersion: [\n",
-        )
-        .expect("invalid YAML");
+        fs::write(invalid_yaml.path().join("oasts.yaml"), "schemaVersion: [\n")
+            .expect("invalid YAML");
         assert_eq!(invoke(&["oasts", "check"], invalid_yaml.path()).0, 2);
 
         let invalid_json = tempfile::tempdir().expect("tempdir");
@@ -815,8 +806,11 @@ mod tests {
     fn rendering_propagates_writer_failures() {
         let mut writer = FailingWriter;
         std::io::Write::flush(&mut writer).expect("flush");
-        let error = render_diagnostics(vec![Diagnostic::config("OASTS0000", "failure")], &mut writer)
-            .expect_err("writer failure");
+        let error = render_diagnostics(
+            vec![Diagnostic::config("OASTS0000", "failure")],
+            &mut writer,
+        )
+        .expect_err("writer failure");
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
     }

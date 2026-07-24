@@ -481,10 +481,7 @@ mod tests {
 
         write(
             &path,
-            &[
-                key_named("a", "oasts.yaml"),
-                key_named("b", "oasts.yaml"),
-            ],
+            &[key_named("a", "oasts.yaml"), key_named("b", "oasts.yaml")],
             &sample_metadata(),
             &order,
         )

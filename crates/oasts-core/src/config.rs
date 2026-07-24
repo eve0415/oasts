@@ -2173,10 +2173,7 @@ mod tests {
         directory.write("openapi.yaml", "openapi: 3.1.0\npaths: {}\n");
         let invalid =
             br#"{"schemaVersion":2,"input":{"path":"./openapi.yaml"},"output":"./generated"}"#;
-        let file = directory.write(
-            "oasts.json",
-            std::str::from_utf8(invalid).expect("UTF-8"),
-        );
+        let file = directory.write("oasts.json", std::str::from_utf8(invalid).expect("UTF-8"));
 
         let from_bytes =
             load_config_from_json(&file, invalid).expect_err("schemaVersion 2 is invalid");

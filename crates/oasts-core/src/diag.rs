@@ -258,8 +258,11 @@ mod tests {
     fn render_propagates_writer_failures() {
         let mut writer = FailingWriter;
         std::io::Write::flush(&mut writer).expect("flush is infallible");
-        render(vec![Diagnostic::config("OASTS0001", "failure")], &mut writer)
-            .expect_err("write failure");
+        render(
+            vec![Diagnostic::config("OASTS0001", "failure")],
+            &mut writer,
+        )
+        .expect_err("write failure");
     }
 
     #[test]
