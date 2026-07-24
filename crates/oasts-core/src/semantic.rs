@@ -1771,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn default_outside_binary64_warns_oxs1216() {
+    fn default_outside_binary64_warns_oasts1216() {
         let diagnostics = diagnostics_for_schema(r#"{"type":"number","default":1e999}"#);
         let diagnostic = diagnostics
             .iter()
@@ -2289,7 +2289,7 @@ mod tests {
     }
 
     #[test]
-    fn webhook_stem_collision_reports_oxs1321() {
+    fn webhook_stem_collision_reports_oasts1321() {
         let mut first = operation(Vec::new());
         first.source = source("/webhooks/petCreated/get");
         let mut second = operation(Vec::new());
@@ -2333,7 +2333,7 @@ mod tests {
     }
 
     #[test]
-    fn webhook_name_without_identifier_chars_reports_oxs1321() {
+    fn webhook_name_without_identifier_chars_reports_oasts1321() {
         let mut invalid = operation(Vec::new());
         invalid.source = source("/webhooks/---/get");
         let ir = Ir {
@@ -2365,7 +2365,7 @@ mod tests {
     }
 
     #[test]
-    fn webhook_operation_id_without_identifier_chars_reports_oxs1321() {
+    fn webhook_operation_id_without_identifier_chars_reports_oasts1321() {
         let mut invalid = operation(Vec::new());
         invalid.operation_id = Some("---".to_owned());
         invalid.source = source("/webhooks/petCreated/get");
@@ -2505,7 +2505,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_name_without_identifier_chars_reports_oxs1321() {
+    fn callback_name_without_identifier_chars_reports_oasts1321() {
         let mut parent = operation(Vec::new());
         parent.operation_id = Some("subscribe".to_owned());
         parent.source = source("/paths/~1subscribe/post");

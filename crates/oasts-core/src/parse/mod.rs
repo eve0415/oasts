@@ -3531,7 +3531,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_defs_exact_name_collision_reports_oxs1202() {
+    fn entry_defs_exact_name_collision_reports_oasts1202() {
         let document = entry_defs_document("Foo", Some("Foo"));
         let (_temp, files, sink) = compile_value(&document);
 
@@ -4129,7 +4129,7 @@ mod tests {
     }
 
     #[test]
-    fn required_names_undefined_property_warns_oxs1111() {
+    fn required_names_undefined_property_warns_oasts1111() {
         let document = json!({
             "openapi": "3.1.0",
             "info": { "title": "t", "version": "1" },
@@ -6389,7 +6389,7 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_flow_key_is_error_oxs1438() {
+    fn unrecognized_flow_key_is_error_oasts1438() {
         let document = json!({
             "openapi": "3.1.0",
             "components": { "securitySchemes": { "oauth": {
@@ -6412,7 +6412,7 @@ mod tests {
     }
 
     #[test]
-    fn non_string_scope_value_is_error_oxs1438() {
+    fn non_string_scope_value_is_error_oasts1438() {
         let document = json!({
             "openapi": "3.1.0",
             "components": { "securitySchemes": { "oauth": {

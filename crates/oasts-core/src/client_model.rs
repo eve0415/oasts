@@ -4599,7 +4599,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1402_streaming_precedes_other_response_classifiers() {
+    fn oasts1402_streaming_precedes_other_response_classifiers() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -4652,7 +4652,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1403_rejects_xml_requests_and_responses() {
+    fn oasts1403_rejects_xml_requests_and_responses() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -4694,7 +4694,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1404_rejects_only_multipart_responses() {
+    fn oasts1404_rejects_only_multipart_responses() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -4735,7 +4735,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1405_requires_string_projection_for_text_branches() {
+    fn oasts1405_requires_string_projection_for_text_branches() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -4776,7 +4776,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1405_defers_to_existing_unsupported_keyword_diagnostic() {
+    fn oasts1405_defers_to_existing_unsupported_keyword_diagnostic() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -4814,7 +4814,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1406_warns_and_suppresses_classification_for_static_bodyless_media() {
+    fn oasts1406_warns_and_suppresses_classification_for_static_bodyless_media() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -5105,7 +5105,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1411_rejects_unconditionally_forbidden_operation_headers() {
+    fn oasts1411_rejects_unconditionally_forbidden_operation_headers() {
         let document = json!({
             "openapi": "3.1.0",
             "security": [{ "proxyKey": [] }],
@@ -5145,7 +5145,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1412_rejects_active_api_key_owned_header_collisions() {
+    fn oasts1412_rejects_active_api_key_owned_header_collisions() {
         let document = json!({
             "openapi": "3.1.0",
             "components": {
@@ -5176,7 +5176,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1413_rejects_parameter_and_and_alternative_wire_key_collisions() {
+    fn oasts1413_rejects_parameter_and_and_alternative_wire_key_collisions() {
         let document = json!({
             "openapi": "3.1.0",
             "components": {
@@ -5216,7 +5216,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1414_rejects_only_control_bytes_in_multipart_field_names() {
+    fn oasts1414_rejects_only_control_bytes_in_multipart_field_names() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -5331,7 +5331,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1415_warns_only_for_declared_unsupported_cte_values() {
+    fn oasts1415_warns_only_for_declared_unsupported_cte_values() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -5413,7 +5413,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1415_allows_unconstrained_and_admitted_cte_schemas() {
+    fn oasts1415_allows_unconstrained_and_admitted_cte_schemas() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -5466,7 +5466,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1415_skips_unevaluable_cte_composition_after_oxs1103() {
+    fn oasts1415_skips_unevaluable_cte_composition_after_oasts1103() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -5518,7 +5518,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1416_rejects_incompatible_content_disposition_schema() {
+    fn oasts1416_rejects_incompatible_content_disposition_schema() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -5572,7 +5572,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1417_warns_for_headers_outside_rfc7578_set() {
+    fn oasts1417_warns_for_headers_outside_rfc7578_set() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -5614,7 +5614,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1418_validates_declared_encoding_content_types_as_rfc9110() {
+    fn oasts1418_validates_declared_encoding_content_types_as_rfc9110() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -5664,7 +5664,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1423_rejects_binary_urlencoded_field() {
+    fn oasts1423_rejects_binary_urlencoded_field() {
         // A urlencoded body is text-only, so a field whose default part media is binary (3.0
         // format:binary, 3.1 schemaless) cannot be represented; a base64url string can and must not
         // fire. An explicit `encoding.contentType` does not make a binary schema representable in a
@@ -5769,7 +5769,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1424_rejects_text_media_on_structured_urlencoded_field() {
+    fn oasts1424_rejects_text_media_on_structured_urlencoded_field() {
         // A urlencoded object (or array of objects) under a text media type has no wire
         // representation: the form-explode serializer drops an object's field name and throws on an
         // array of objects. Only structured shapes fire; a string under text/plain and an object
@@ -5830,7 +5830,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1419_rejects_illegal_or_shape_ambiguous_parameter_styles() {
+    fn oasts1419_rejects_illegal_or_shape_ambiguous_parameter_styles() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -6045,7 +6045,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1427_rejects_undefined_multipart_style_combinations() {
+    fn oasts1427_rejects_undefined_multipart_style_combinations() {
         // Four ways a 3.1 multipart field can have no defined per-part serialization: an array
         // explicitly opting out of the repeated-parts default (`explode: false`), an array under a
         // delimited/deep style (which multipart never defines, unlike urlencoded), an array whose
@@ -6157,7 +6157,7 @@ mod tests {
     /// media (`application/octet-stream`, not JSON), not by domain-bit containment, or this
     /// passthrough case would be misclassified as object-shaped and rejected.
     #[test]
-    fn binary_primitive_multipart_field_with_style_no_oxs1427() {
+    fn binary_primitive_multipart_field_with_style_no_oasts1427() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": { "/uploads": { "post": {
@@ -6179,7 +6179,7 @@ mod tests {
     /// OASTS1427 is 3.1-only: 3.0 multipart style keywords are already warn-ignored by OASTS1426, so
     /// the same object+style shape in a 3.0 document must not additionally report OASTS1427.
     #[test]
-    fn oxs1427_does_not_fire_on_30_documents() {
+    fn oasts1427_does_not_fire_on_30_documents() {
         let document = json!({
             "openapi": "3.0.3",
             "paths": { "/forms": { "post": {
@@ -6202,15 +6202,15 @@ mod tests {
             .iter()
             .find(|diagnostic| diagnostic.code == CODE_MULTIPART_30_STYLE_IGNORED)
             .expect("OASTS1426 diagnostic");
-        let oxs1427 = diagnostics
+        let oasts1427 = diagnostics
             .into_iter()
             .filter(|diagnostic| diagnostic.code == CODE_MULTIPART_STYLE_UNDEFINED)
             .collect::<Vec<_>>();
-        assert!(oxs1427.is_empty(), "{oxs1427:#?}");
+        assert!(oasts1427.is_empty(), "{oasts1427:#?}");
     }
 
     #[test]
-    fn oxs1419_applies_restricted_styles_to_encoding_objects() {
+    fn oasts1419_applies_restricted_styles_to_encoding_objects() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -6262,7 +6262,7 @@ mod tests {
     }
 
     #[test]
-    fn oxs1420_only_rejects_an_out_of_range_server_index() {
+    fn oasts1420_only_rejects_an_out_of_range_server_index() {
         let document = json!({
             "openapi": "3.1.0",
             "servers": [{ "url": "https://root.example.test" }],
@@ -6878,7 +6878,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_scheme_kind_reports_oxs1433() {
+    fn unknown_scheme_kind_reports_oasts1433() {
         for scheme in [
             json!({ "type": "quantum" }),
             json!({ "type": "apiKey", "in": "path", "name": "bad" }),
@@ -6910,7 +6910,7 @@ mod tests {
     }
 
     #[test]
-    fn undeclared_scheme_name_reports_oxs1434() {
+    fn undeclared_scheme_name_reports_oasts1434() {
         let document = json!({
             "openapi": "3.1.0",
             "components": {
