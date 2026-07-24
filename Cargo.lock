@@ -711,6 +711,70 @@ dependencies = [
 ]
 
 [[package]]
+name = "oasts"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "oasts-core",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "oasts-bench"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "libc",
+ "oasts-core",
+ "oxc_allocator",
+ "oxc_parser",
+ "oxc_span",
+ "sha2",
+ "tempfile",
+ "yaml-rust2",
+]
+
+[[package]]
+name = "oasts-core"
+version = "0.0.0"
+dependencies = [
+ "divan",
+ "itoa",
+ "ryu",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "unicode-general-category",
+ "unicode-normalization",
+ "url",
+ "yaml-rust2",
+]
+
+[[package]]
+name = "oasts-gen"
+version = "0.0.0"
+dependencies = [
+ "oasts-core",
+ "serde_json",
+]
+
+[[package]]
+name = "oasts-napi"
+version = "0.0.0"
+dependencies = [
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "oasts-core",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -932,70 +996,6 @@ dependencies = [
  "oxc_str",
  "phf",
  "unicode-id-start",
-]
-
-[[package]]
-name = "oasts"
-version = "0.0.0"
-dependencies = [
- "clap",
- "oasts-core",
- "serde_json",
- "sha2",
- "tempfile",
-]
-
-[[package]]
-name = "oasts-bench"
-version = "0.0.0"
-dependencies = [
- "clap",
- "libc",
- "oxc_allocator",
- "oxc_parser",
- "oxc_span",
- "oasts-core",
- "sha2",
- "tempfile",
- "yaml-rust2",
-]
-
-[[package]]
-name = "oasts-core"
-version = "0.0.0"
-dependencies = [
- "divan",
- "itoa",
- "ryu",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "unicode-general-category",
- "unicode-normalization",
- "url",
- "yaml-rust2",
-]
-
-[[package]]
-name = "oasts-gen"
-version = "0.0.0"
-dependencies = [
- "oasts-core",
- "serde_json",
-]
-
-[[package]]
-name = "oasts-napi"
-version = "0.0.0"
-dependencies = [
- "napi",
- "napi-build",
- "napi-derive",
- "oasts-core",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
