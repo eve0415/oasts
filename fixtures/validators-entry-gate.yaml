@@ -7,7 +7,7 @@ files:
   - path: crates/oasts-core/runtime/test-conformance/vectors-validators-conformance.ts
     sha256: a78b4b3f4ea22ebfc2a358b28eb3be305e88d8c1a521ca61c362a06d72eb9191
   - path: fixtures/validators-showcase-3.1/openapi.yaml
-    sha256: 778a5c9f6598dbef0d665d7dcc64f26b87eda5c3b228897bb3f8d6e0d8a6707e
+    sha256: 93a4005f2b2b029adfa194f65a8b62318b057bdeab4e214cbfbbf2b87fc2c13d
   - path: fixtures/validators-showcase-3.1/oasts.yaml
     sha256: d45f0c75a2e5b163b6d86e676d72091a9fb3122b70adefd3f2dcacd004886ecd
   - path: fixtures/validators-showcase-3.1/oasts-client.yaml
@@ -17,4 +17,4 @@ files:
   - path: fixtures/validators-showcase-3.1/compile-assert/cases.ts
     sha256: ed30babee9042ddf9847dfc99eb02af4645d09a5fc4db7c676d626a6d123b2d9
   - path: crates/oasts-core/runtime/validators-standard-schema.ts
-    sha256: e1e419cf6cd9b3583aaa9ef87026e3d4f6c3cbd124b06275b4364d8dd1643ad1
+    sha256: dee391633374d36011f9f997fd5e190c218f00f15865801327efb9ddb87561cf
