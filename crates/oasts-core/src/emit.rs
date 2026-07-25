@@ -2274,7 +2274,11 @@ impl Emitter<'_, '_, '_> {
             && let Some(media_type) = select_request_media(&body.media_types)
         {
             has_members = true;
-            let body_type = self.render_media_type(media_type, TypePosition::Request);
+            let body_type = self.media_payload_type(
+                &media_type.essence,
+                &media_type.schema,
+                TypePosition::Request,
+            );
             if let Some(description) = &body.description {
                 let docs = SchemaDocs {
                     description: Some(description.clone()),
@@ -2352,7 +2356,11 @@ impl Emitter<'_, '_, '_> {
         }
         let mut types = Vec::new();
         for media_type in &response.media_types {
-            let rendered = self.render_media_type(media_type, TypePosition::Response);
+            let rendered = self.media_payload_type(
+                &media_type.essence,
+                &media_type.schema,
+                TypePosition::Response,
+            );
             if !types.contains(&rendered) {
                 types.push(rendered);
             }
@@ -2360,18 +2368,23 @@ impl Emitter<'_, '_, '_> {
         types.join(" | ")
     }
 
-    fn render_media_type(
+    /// The TypeScript type one declared media entry's payload renders to. Keyed on the entry's
+    /// essence and schema rather than on an `ir::MediaType`, so the client emitter — which holds a
+    /// `ResponseMediaPlan`, not an IR node — renders each arm through this same rule instead of
+    /// duplicating it and silently diverging from the types artifact.
+    pub(super) fn media_payload_type(
         &self,
-        media_type: &crate::ir::MediaType,
+        essence: &str,
+        schema: &SchemaNode,
         position: TypePosition,
     ) -> String {
-        if is_json(&media_type.essence) {
-            self.render_type(&media_type.schema, position, 0)
-        } else if media_type.essence.starts_with("text/") {
+        if is_json(essence) {
+            self.render_type(schema, position, 0)
+        } else if essence.starts_with("text/") {
             "string".to_owned()
         } else {
             // Binary and custom media stay unknown in the types-only artifact;
-            // Phase 5's client runtime will own byte-container choices.
+            // the client runtime owns byte-container choices.
             "unknown".to_owned()
         }
     }
@@ -2999,9 +3012,9 @@ pub(super) fn write_client_operation_tsdoc(
                     .collect();
             }
             tsdoc.returns = Some(if matches!(kind, ClientDocKind::ResultFunction) {
-                "A result discriminated by HTTP status."
+                "A typed result covering every documented response and failure."
             } else {
-                "The successful response data."
+                "The successful response data and its response metadata."
             });
         }
     }
@@ -6290,7 +6303,16 @@ mod tests {
             summary: Some("Summary @tag\r\nnext".to_owned()),
             remarks: vec!["First".to_owned(), "Second\nline".to_owned()],
             deprecated: Some("Deprecated."),
-            params: vec![("arg\r\nname".to_owned(), "Description\rline".to_owned())],
+            params: vec![
+                ("arg\r\nname".to_owned(), "Description\rline".to_owned()),
+                // A fenced block inside a param description takes the literal path: its lines are
+                // neutralized rather than comment-escaped, so a `*/` inside the fence cannot close
+                // the comment while the fence's own markup survives.
+                (
+                    "fenced".to_owned(),
+                    "before\n```txt\n*/ sourceMappingURL=\n```\nafter @tag".to_owned(),
+                ),
+            ],
             returns: Some("A value."),
             default_value: Some("value\n@tag".to_owned()),
             examples: vec![
@@ -6329,6 +6351,9 @@ mod tests {
                 "   * @deprecated Deprecated.\n",
                 "   * \n",
                 "   * @param arg name - Description line\n",
+                // Fenced lines are neutralized (`*/` and `sourceMappingURL=` escaped) while the
+                // fence markers survive; the surrounding prose still takes the @tag escape.
+                "   * @param fenced - before ```txt *\\/ sourceMappingURL\\= ``` after \\@tag\n",
                 "   * \n",
                 "   * @returns A value.\n",
                 "   * \n",
@@ -7377,6 +7402,32 @@ fn accumulate_shape_variants(schema: &SchemaNode, acc: &mut (bool, bool)) {
         | SchemaNode::Never { .. }
         | SchemaNode::Unknown { .. } => {}
     }
+}
+
+/// The exported-name fragment identifying one media entry, mangled from its canonical full media
+/// string: `*` becomes `Wildcard`, every other non-alphanumeric ASCII byte is a token separator,
+/// and each token is uppercase-first and concatenated (`application/vnd.api+json` →
+/// `ApplicationVndApiJson`). Total by construction — it never invents a disambiguating suffix, so a
+/// collision between two distinct media strings is a diagnostic rather than a silent rename.
+pub(super) fn media_tag(media: &str) -> String {
+    let mut tag = String::with_capacity(media.len());
+    let mut fresh = true;
+    for byte in media.chars() {
+        if byte == '*' {
+            tag.push_str("Wildcard");
+            fresh = true;
+        } else if byte.is_ascii_alphanumeric() {
+            if fresh {
+                tag.extend(byte.to_uppercase());
+            } else {
+                tag.push(byte);
+            }
+            fresh = false;
+        } else {
+            fresh = true;
+        }
+    }
+    tag
 }
 
 pub(super) fn source_diagnostic(

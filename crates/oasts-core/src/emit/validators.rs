@@ -34,7 +34,7 @@ use super::model::EmissionModel;
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
     Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypePosition, callback_operation,
-    callback_parent_operation, import_extension, lowercase_first, property_in_position,
+    callback_parent_operation, import_extension, lowercase_first, media_tag, property_in_position,
     push_indent, render_json_compact, render_ts_string, response_status_type_suffix,
     source_diagnostic, uppercase_first,
 };
@@ -50,6 +50,53 @@ const VALIDATORS_STANDARD_SCHEMA_TS: &str =
 const CODE_REJECTED_KEYWORD: &str = "OASTS1501";
 /// A schema degraded to an unknown leaf, so no faithful validator can be emitted for it.
 const CODE_UNKNOWN_LEAF: &str = "OASTS1502";
+/// Two JSON media entries on one response mangle to the same validator-name fragment.
+const CODE_MEDIA_TAG_COLLISION: &str = "OASTS1400";
+
+/// The response-body validators for one declared response: its JSON media entries paired with the
+/// exported names the client will call.
+///
+/// A response with a single JSON entry keeps the plain `validate{Stem}Response{Suffix}` name — the
+/// common case, where a second entry exists but is not JSON. Two or more JSON entries each get
+/// their own validator, suffixed by the media tag, because they are separate schemas the client
+/// selects between on `contentType`. A tag collision is fatal rather than silently disambiguated:
+/// the compiler never invents a suffix a caller cannot predict from the document.
+fn response_body_validators<'ir>(
+    response: &'ir crate::ir::ResponseEntry,
+    stem: &str,
+    suffix: &str,
+    sink: &mut crate::diag::DiagnosticSink,
+) -> Vec<(String, &'ir SchemaNode)> {
+    let json: Vec<&crate::ir::MediaType> = response
+        .media_types
+        .iter()
+        .filter(|media| is_json(&media.essence))
+        .collect();
+    let Some(first) = json.first() else {
+        return Vec::new();
+    };
+    if json.len() == 1 {
+        return vec![(format!("{stem}Response{suffix}"), &first.schema)];
+    }
+    let mut named: Vec<(String, &SchemaNode)> = Vec::new();
+    let mut claimed: BTreeMap<String, &str> = BTreeMap::new();
+    for media in json {
+        let name = format!("{stem}Response{suffix}{}", media_tag(&media.full));
+        if let Some(previous) = claimed.insert(name.clone(), &media.full) {
+            sink.push(source_diagnostic(
+                CODE_MEDIA_TAG_COLLISION,
+                format!(
+                    "response media types '{previous}' and '{}' produce the same validator name '{name}'",
+                    media.full
+                ),
+                &media.source,
+            ));
+            continue;
+        }
+        named.push((name, &media.schema));
+    }
+    named
+}
 
 /// Identifiers the validators emitter injects into every generated file: the runtime kernel imports
 /// (`type Issue` is always imported; the rest are pulled in on demand), the Standard Schema types,
@@ -1528,14 +1575,10 @@ fn emit_operation_file(
     if include_responses {
         let mut responses: Vec<(String, &SchemaNode)> = Vec::new();
         for response in &operation.responses {
-            if let Some(media) = response
-                .media_types
-                .iter()
-                .find(|media| is_json(&media.essence))
-            {
-                let suffix = response_status_type_suffix(&response.status);
-                responses.push((format!("{stem}Response{suffix}"), &media.schema));
-            }
+            let suffix = response_status_type_suffix(&response.status);
+            responses.extend(response_body_validators(
+                response, &stem, &suffix, model.sink,
+            ));
         }
         responses.sort_by(|left, right| left.0.cmp(&right.0));
         for (export_type, schema) in responses {
@@ -2142,6 +2185,172 @@ mod tests {
             !diagnostics.iter().any(|d| d.severity == Severity::Error),
             "unexpected errors: {diagnostics:#?}"
         );
+    }
+
+    fn operation_validators(files: &[GeneratedFile], base: &str) -> String {
+        files
+            .iter()
+            .find(|file| file.relative_path == format!("validators/operations/{base}.ts"))
+            .expect("operation validator file")
+            .content
+            .clone()
+    }
+
+    fn two_json_response_document(second_media: &str) -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/thing": {
+                    "get": {
+                        "operationId": "readthing",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": { "schema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } },
+                                    second_media: { "schema": { "type": "object", "properties": { "code": { "type": "integer" } }, "required": ["code"] } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_single_json_entry_beside_a_non_json_one_keeps_the_plain_validator_name() {
+        // The common discriminated case: two media entries, one of them JSON. Nothing about the
+        // validator artifact changes — no new name, no per-entry split.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/thing": {
+                    "get": {
+                        "operationId": "readthing",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": { "schema": { "type": "object", "properties": { "id": { "type": "string" } } } },
+                                    "text/plain": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document);
+        assert_clean(&diagnostics);
+        let content = operation_validators(&files, "readthing");
+        assert!(
+            content.contains("export function validateReadthingResponse200("),
+            "{content}"
+        );
+        assert!(
+            !content.contains("validateReadthingResponse200Application"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn two_json_entries_emit_one_validator_each_tagged_by_media() {
+        let (files, diagnostics) = compile(two_json_response_document("application/vnd.api+json"));
+        assert_clean(&diagnostics);
+        let content = operation_validators(&files, "readthing");
+        assert!(
+            content.contains("export function validateReadthingResponse200ApplicationJson("),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function validateReadthingResponse200ApplicationVndApiJson("),
+            "{content}"
+        );
+        // The untagged name is gone: with two schemas there is no single one it could mean.
+        assert!(
+            !content.contains("export function validateReadthingResponse200("),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn parameter_differing_json_entries_tag_distinctly() {
+        let (files, diagnostics) =
+            compile(two_json_response_document("application/json;stream=watch"));
+        assert_clean(&diagnostics);
+        let content = operation_validators(&files, "readthing");
+        assert!(
+            content.contains("export function validateReadthingResponse200ApplicationJson("),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "export function validateReadthingResponse200ApplicationJsonStreamWatch("
+            ),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn oasts1400_rejects_colliding_media_tags() {
+        // `application/json;a-b=1` and `application/json;a.b=1` mangle identically. The compiler
+        // reports it rather than inventing a disambiguating suffix.
+        let (_files, diagnostics) = compile(json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/thing": {
+                    "get": {
+                        "operationId": "readthing",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json;a-b=1": { "schema": { "type": "object" } },
+                                    "application/json;a.b=1": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        let collision = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_MEDIA_TAG_COLLISION)
+            .expect("collision diagnostic");
+        assert_eq!(collision.severity, Severity::Error);
+        assert!(
+            collision
+                .message
+                .contains("validateReadthingResponse200ApplicationJsonAB")
+                || collision
+                    .message
+                    .contains("ReadthingResponse200ApplicationJsonAB"),
+            "{}",
+            collision.message
+        );
+    }
+
+    #[test]
+    fn media_tag_is_total_over_every_byte_class() {
+        assert_eq!(media_tag("application/json"), "ApplicationJson");
+        assert_eq!(
+            media_tag("application/vnd.api+json"),
+            "ApplicationVndApiJson"
+        );
+        assert_eq!(
+            media_tag("application/json;stream=watch"),
+            "ApplicationJsonStreamWatch"
+        );
+        assert_eq!(media_tag("text/*"), "TextWildcard");
+        assert_eq!(media_tag("*/*"), "WildcardWildcard");
+        // A leading digit and a bare separator run both survive without producing empty tokens.
+        assert_eq!(media_tag("application/3d-model"), "Application3dModel");
+        assert_eq!(media_tag("---"), "");
     }
 
     #[test]

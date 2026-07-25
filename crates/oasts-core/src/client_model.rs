@@ -343,7 +343,10 @@ pub struct ResponseMediaPlan {
     /// parameter-differing keys stay distinct arms.
     pub media: String,
     pub decoder: DecoderClass,
-    pub schema: Option<SchemaNode>,
+    /// The entry's declared schema, always the IR node — an absent `schema` keyword leaves the IR's
+    /// unconstrained default here rather than erasing it, so the client renders the same payload
+    /// type the types artifact does for that entry.
+    pub schema: SchemaNode,
     pub streaming_marked: bool,
     pub source: SourceRef,
 }
@@ -362,7 +365,9 @@ pub enum DecoderClass {
 pub enum PayloadDisposition {
     NoPayload,
     StaticBodyless,
-    Payload { schemas: Vec<Option<SchemaNode>> },
+    /// The branch carries a body. The per-entry schemas live on `ResponsePlan.media`, which is the
+    /// single source of truth for them.
+    Payload,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1098,7 +1103,7 @@ fn response_table(
                     // distinct arm. Decoding stays essence-keyed via `classify_response_media`.
                     media: media.full.clone(),
                     decoder: classify_response_media(media),
-                    schema: media.schema_present.then(|| media.schema.clone()),
+                    schema: media.schema.clone(),
                     streaming_marked: media.streaming_marked,
                     source: media.source.clone(),
                 })
@@ -1114,9 +1119,7 @@ fn response_table(
             } else if static_bodyless {
                 PayloadDisposition::StaticBodyless
             } else {
-                PayloadDisposition::Payload {
-                    schemas: media.iter().map(|entry| entry.schema.clone()).collect(),
-                }
+                PayloadDisposition::Payload
             };
             let content_type_discriminated = media.len() > 1
                 || response
@@ -2892,6 +2895,40 @@ mod tests {
                 .iter()
                 .all(|media| media.decoder == DecoderClass::Json)
         );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn schemaless_response_media_plan_carries_the_ir_node() {
+        // A `content` entry with no `schema` keyword still carries the IR's unconstrained node, so
+        // the client renders the same payload type the types artifact renders for that entry. An
+        // `Option` here would erase the node and let the two artifacts disagree.
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/report": {
+                    "get": {
+                        "operationId": "report",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": { "text/csv": {} }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let response = &model.operations[0].response_table[0];
+        let ir_media = &analyzed.ir.operations[0].responses[0].media_types[0];
+        assert!(!ir_media.schema_present);
+        assert_eq!(response.media[0].schema, ir_media.schema);
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
     }
 

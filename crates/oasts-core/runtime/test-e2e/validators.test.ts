@@ -108,10 +108,8 @@ test("an out-of-range request value fails as request-validation before any fetch
     await getTree(transport(), { path: { nodeId: NODE_ID }, query: { maxDepth: 0 } }),
     "getTree request-validation result",
   );
-  assert.equal(result.kind, "request-failure");
-  const error = requiredRecord(result.error, "request failure error");
-  assert.equal(error.kind, "request-validation");
-  assert.deepEqual(error.issues, MAX_DEPTH_ISSUE);
+  assert.equal(result.outcome, "request-validation");
+  assert.deepEqual(result.issues, MAX_DEPTH_ISSUE);
   assert.equal(requests.length, 0);
 });
 
@@ -127,12 +125,10 @@ test("a malformed documented 200 body fails as response-validation with body-roo
     await createPet(transport(), { body: {} }),
     "createPet response-validation result",
   );
-  assert.equal(result.kind, "response-failure");
-  assert.equal(result.match, "200");
+  assert.equal(result.outcome, "response-validation");
+  assert.equal(result.match, 200);
   assert.equal(result.status, 200);
-  const error = requiredRecord(result.error, "response failure error");
-  assert.equal(error.kind, "response-validation");
-  assert.deepEqual(error.issues, [
+  assert.deepEqual(result.issues, [
     { message: "expected type string", path: ["id"] },
     { message: "missing required property name", path: [] },
   ]);
@@ -153,9 +149,8 @@ test("a valid round-trip returns ok with the served body", async () => {
     await getTree(transport(), { path: { nodeId: NODE_ID } }),
     "getTree ok result",
   );
-  assert.equal(result.kind, "response");
+  assert.equal(result.outcome, 200);
   assert.equal(result.ok, true);
-  assert.equal(result.match, "200");
   assert.deepEqual(result.data, served);
   assert.equal(requests.length, 1);
 });
@@ -169,10 +164,8 @@ test("the orThrow variant throws ApiError carrying the request-validation failur
       assert.ok(error instanceof Error);
       assert.ok(error instanceof ApiError);
       const failed = requiredRecord(requiredRecord(error, "ApiError").result, "ApiError result");
-      assert.equal(failed.kind, "request-failure");
-      const failure = requiredRecord(failed.error, "ApiError request failure");
-      assert.equal(failure.kind, "request-validation");
-      assert.deepEqual(failure.issues, MAX_DEPTH_ISSUE);
+      assert.equal(failed.outcome, "request-validation");
+      assert.deepEqual(failed.issues, MAX_DEPTH_ISSUE);
       return true;
     },
   );

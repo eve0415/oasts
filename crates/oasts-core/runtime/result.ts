@@ -8,28 +8,37 @@ export type ResponseMeta = {
   readonly headers: Headers; // a decoupled snapshot, never the live Response headers
 };
 
-export type RequestFailure =
-  | { kind: 'auth'; message: string; triedAlternatives: readonly (readonly string[])[]; cause?: unknown }
-  | { kind: 'aborted'; reason: unknown }
-  | { kind: 'network'; cause: unknown }
-  | { kind: 'request-encode'; message: string; cause?: unknown }
-  | { kind: 'request-validation'; issues: readonly StandardSchemaV1.Issue[] }
-  | { kind: 'request-transform'; error: TransformError }
-  | { kind: 'request-middleware'; cause: unknown }
-  | { kind: 'cookie-params-unsendable'; names: readonly string[] };
+export type RequestPhaseFailure =
+  | { outcome: 'auth'; ok: false; message: string; triedAlternatives: readonly (readonly string[])[]; cause?: unknown }
+  | { outcome: 'aborted'; ok: false; reason: unknown }
+  | { outcome: 'timeout'; ok: false; reason: unknown }
+  | { outcome: 'network'; ok: false; cause: TypeError }
+  | { outcome: 'request-encode'; ok: false; message: string; cause?: unknown }
+  | { outcome: 'request-validation'; ok: false; issues: readonly StandardSchemaV1.Issue[] }
+  | { outcome: 'request-transform'; ok: false; error: TransformError }
+  | { outcome: 'request-middleware'; ok: false; cause: unknown }
+  | { outcome: 'cookie-params-unsendable'; ok: false; names: readonly string[] };
 
-export type ResponseFailure =
-  | { kind: 'aborted'; reason: unknown }
-  | { kind: 'response-decode'; message: string; cause?: unknown }
-  | { kind: 'response-validation'; issues: readonly StandardSchemaV1.Issue[] }
-  | { kind: 'response-transform'; error: TransformError }
-  | { kind: 'response-middleware'; cause: unknown };
+export type ResponsePhaseFailure<Match extends string | number> =
+  | { outcome: 'response-aborted'; ok: false; match: Match | null; status: number; reason: unknown; meta: ResponseMeta }
+  | { outcome: 'response-timeout'; ok: false; match: Match | null; status: number; reason: unknown; meta: ResponseMeta }
+  | { outcome: 'response-decode'; ok: false; match: Match | null; status: number; message: string; cause?: unknown; meta: ResponseMeta }
+  | { outcome: 'response-validation'; ok: false; match: Match | null; status: number; issues: readonly StandardSchemaV1.Issue[]; meta: ResponseMeta }
+  | { outcome: 'response-transform'; ok: false; match: Match | null; status: number; error: TransformError; meta: ResponseMeta }
+  | { outcome: 'response-middleware'; ok: false; match: Match | null; status: number; cause: unknown; meta: ResponseMeta };
 
 export type UnknownHttpError =
   | { kind: 'empty';  contentType: string | null; body: undefined }
   | { kind: 'json';   contentType: string;        body: unknown }
   | { kind: 'text';   contentType: string;        body: string }
   | { kind: 'binary'; contentType: string | null; body: ArrayBuffer };
+
+// Distributive over R (the type parameter is naked), so a union of success arms yields one
+// envelope per arm. Per-arm meta typing — plain ResponseMeta, or the TypedHeaders intersection
+// when that arm declares response headers — therefore falls out without being restated.
+export type SuccessEnvelope<R> = R extends { readonly ok: true; readonly data: infer D; readonly meta: infer M }
+  ? { data: D; meta: M }
+  : never;
 
 export type StreamFailure =
   | { kind: 'sse'; eventsYielded: number; cause: unknown }
@@ -70,14 +79,14 @@ export class ApiError<Failed> extends Error {
   }
 }
 
-export function unwrap<R extends { readonly ok: boolean }>(
-  result: R,
-): R extends { readonly ok: true; readonly data: infer D } ? D : never;
+export function unwrap<R extends { readonly ok: boolean }>(result: R): SuccessEnvelope<R>;
 export function unwrap(
-  result: { readonly ok: true; readonly data: unknown } | { readonly ok: false },
+  result: { readonly ok: true; readonly data: unknown; readonly meta: unknown } | {
+    readonly ok: false;
+  },
 ): unknown {
   if (result.ok) {
-    return result.data;
+    return { data: result.data, meta: result.meta };
   }
   throw new ApiError(result);
 }

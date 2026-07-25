@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 
 import { serializeQueryForm } from "../serialize.ts";
+import { isRequestPhaseFailure, requestFailure } from "./result-narrowing.ts";
 import {
   createTransport,
   execute,
-  type ExecutionResult,
   type OperationDescriptor,
   type ParamPlan,
 } from "../transport.ts";
@@ -79,16 +79,6 @@ function cookieParam(name: string, required: boolean): ParamPlan {
 
 const sid = cookieParam("sid", true);
 const theme = cookieParam("theme", false);
-
-function requestFailure(
-  result: ExecutionResult,
-): Extract<ExecutionResult, { readonly kind: "request-failure" }> {
-  assert.equal(result.kind, "request-failure");
-  if (result.kind !== "request-failure") {
-    throw new Error("expected a request failure");
-  }
-  return result;
-}
 
 // A minimal document.cookie jar. Reading returns the whole "a=1; b=2" string; assigning parses off
 // the trailing attributes (path, etc.) and stores only the name=value pair, exactly as the browser
@@ -164,7 +154,7 @@ describe("cookie parameter dispatch", () => {
     assert.equal(captured.headers.get("cookie"), "sid=abc; theme=dark");
     // A query parameter is not a cookie, and an absent optional cookie is skipped.
     assert.equal(captured.url, `${SAME_ORIGIN}/v1/resource?region=us`);
-    assert.notEqual(result.kind, "request-failure");
+    assert.ok(!isRequestPhaseFailure(result));
   });
 
   test("layer 1: a POST JSON body survives the cookie probe reconstruction", async () => {
@@ -193,7 +183,7 @@ describe("cookie parameter dispatch", () => {
     assert.equal(captured.headers.get("cookie"), "sid=abc; theme=dark");
     assert.equal(captured.headers.get("content-type"), "application/json");
     assert.equal(await captured.text(), JSON.stringify(payload));
-    assert.notEqual(result.kind, "request-failure");
+    assert.ok(!isRequestPhaseFailure(result));
   });
 
   test("no present cookie parameter leaves dispatch untouched", async () => {
@@ -228,10 +218,8 @@ describe("cookie parameter dispatch", () => {
     );
 
     assert.equal(sends, 0);
-    assert.deepEqual(result.error, {
-      kind: "cookie-params-unsendable",
-      names: ["sid", "theme"],
-    });
+    assert.equal(result.outcome, "cookie-params-unsendable");
+    assert.deepEqual(result.names, ["sid", "theme"]);
   });
 
   test("layer 2: a same-origin document jar carries the cookies and the probe is dispatched", async () => {
@@ -256,7 +244,7 @@ describe("cookie parameter dispatch", () => {
     assert.equal(captured.headers.get("cookie"), null);
     assert.equal(jar.readValue("sid"), "abc");
     assert.equal(jar.readValue("theme"), "dark");
-    assert.notEqual(result.kind, "request-failure");
+    assert.ok(!isRequestPhaseFailure(result));
   });
 
   test("layer 2 writes each cookie with an explicit path=/ so it scopes to the API route", async () => {
@@ -270,7 +258,7 @@ describe("cookie parameter dispatch", () => {
       { cookie: { sid: "abc", theme: "dark" } },
     );
 
-    assert.notEqual(result.kind, "request-failure");
+    assert.ok(!isRequestPhaseFailure(result));
     // Without an explicit path the browser scopes the cookie to the document's default path, which
     // can exclude the API route even though the read-back (from the document URL) verifies.
     assert.deepEqual(jar.writes, ["sid=abc; path=/", "theme=dark; path=/"]);
@@ -302,7 +290,8 @@ describe("cookie parameter dispatch", () => {
     // A jar read-back would falsely verify, so the guard must stop before writing: the browser
     // attaches nothing in omit mode, which is the silent drop cookie-params-unsendable exists to catch.
     assert.deepEqual(jar.writes, []);
-    assert.deepEqual(result.error, { kind: "cookie-params-unsendable", names: ["sid"] });
+    assert.equal(result.outcome, "cookie-params-unsendable");
+    assert.deepEqual(result.names, ["sid"]);
   });
 
   test("layer 2 -> 3: a document that rejects the write falls through to failure", async () => {
@@ -338,7 +327,8 @@ describe("cookie parameter dispatch", () => {
 
     assert.equal(sends, 0);
     assert.equal(store.get("sid"), "abc");
-    assert.deepEqual(result.error, { kind: "cookie-params-unsendable", names: ["sid"] });
+    assert.equal(result.outcome, "cookie-params-unsendable");
+    assert.deepEqual(result.names, ["sid"]);
   });
 
   test("layer 3: a cross-origin document is not used", async () => {
@@ -353,7 +343,8 @@ describe("cookie parameter dispatch", () => {
       ),
     );
 
-    assert.deepEqual(result.error, { kind: "cookie-params-unsendable", names: ["sid"] });
+    assert.equal(result.outcome, "cookie-params-unsendable");
+    assert.deepEqual(result.names, ["sid"]);
   });
 
   test("layer 3: malformed document shapes are rejected by the cookie-jar guard", async () => {
@@ -368,7 +359,7 @@ describe("cookie parameter dispatch", () => {
           { cookie: { sid: "abc" } },
         ),
       );
-      assert.equal(result.error.kind, "cookie-params-unsendable");
+      assert.equal(result.outcome, "cookie-params-unsendable");
     }
   });
 
@@ -383,7 +374,7 @@ describe("cookie parameter dispatch", () => {
         { cookie: { sid: "abc" } },
       ),
     );
-    assert.equal(result.error.kind, "request-encode");
+    assert.equal(result.outcome, "request-encode");
   });
 
   test("a hostile document.cookie getter is caught, not thrown", async () => {
@@ -402,7 +393,7 @@ describe("cookie parameter dispatch", () => {
         { cookie: { sid: "abc" } },
       ),
     );
-    assert.equal(result.error.kind, "request-encode");
+    assert.equal(result.outcome, "request-encode");
   });
 
   test("layer 3: malformed location shapes are rejected by the same-origin guard", async () => {
@@ -421,7 +412,7 @@ describe("cookie parameter dispatch", () => {
           { cookie: { sid: "abc" } },
         ),
       );
-      assert.equal(result.error.kind, "cookie-params-unsendable");
+      assert.equal(result.outcome, "cookie-params-unsendable");
     }
   });
 });

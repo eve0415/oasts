@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
+import { isRequestPhaseFailure, requestFailure } from "./result-narrowing.ts";
+
 import {
   createTransport,
   execute,
@@ -46,16 +48,6 @@ function multipartField(overrides: Partial<MultipartFieldPlan> = {}): MultipartF
   };
 }
 
-function requestFailure(result: ExecutionResult): ExecutionResult & {
-  readonly kind: "request-failure";
-} {
-  assert.equal(result.kind, "request-failure");
-  if (result.kind !== "request-failure") {
-    throw new Error("expected request failure");
-  }
-  return result;
-}
-
 async function requestEncode(body: BodyPlan, value: unknown): Promise<ExecutionResult> {
   return execute(
     createTransport({ fetch: async () => new Response(null, { status: 404 }) }),
@@ -89,11 +81,11 @@ describe("descriptor boundary validation", () => {
       { query: { value: "nested" } },
     );
 
-    assert.equal(present.kind, "unmatched-response");
+    assert.equal(present.outcome, "unmatched");
     assert.equal(url, "https://example.com/api/edge?value=nested");
     for (const input of [{}, { query: "not a record" }]) {
       const absent = requestFailure(await execute(createTransport({}), descriptor, input));
-      assert.equal(absent.error.kind, "request-encode");
+      assert.equal(absent.outcome, "request-encode");
     }
   });
 
@@ -182,7 +174,7 @@ describe("descriptor boundary validation", () => {
 
     for (const [descriptor, input] of descriptors) {
       const result = requestFailure(await execute(createTransport({}), descriptor, input));
-      assert.equal(result.error.kind, "request-encode");
+      assert.equal(result.outcome, "request-encode");
     }
   });
 
@@ -226,7 +218,7 @@ describe("descriptor boundary validation", () => {
       { query: { empty: "ignored", value: "two" } },
     );
 
-    assert.equal(result.kind, "unmatched-response");
+    assert.equal(result.outcome, "unmatched");
     assert.equal(url, "https://example.com/api/edge?existing=one&value=two");
   });
 
@@ -285,8 +277,8 @@ describe("descriptor boundary validation", () => {
       ),
     );
 
-    assert.equal(relative.error.kind, "request-encode");
-    assert.equal(placeholder.error.kind, "request-encode");
+    assert.equal(relative.outcome, "request-encode");
+    assert.equal(placeholder.outcome, "request-encode");
   });
 
   test("a configured baseUrl short-circuits an unresolved server placeholder", async () => {
@@ -311,7 +303,7 @@ describe("descriptor boundary validation", () => {
       {},
     );
 
-    assert.notEqual(result.kind, "request-failure");
+    assert.ok(!isRequestPhaseFailure(result));
     assert.ok(captured);
     assert.ok(captured.url.startsWith("https://fallback.example"), captured.url);
   });
@@ -327,7 +319,7 @@ describe("descriptor boundary validation", () => {
     };
     for (const value of ["not an object", {}, { required: null }]) {
       const result = requestFailure(await requestEncode(plan, value));
-      assert.equal(result.error.kind, "request-encode");
+      assert.equal(result.outcome, "request-encode");
     }
 
     let encoded = "";
@@ -362,10 +354,7 @@ describe("descriptor boundary validation", () => {
       { icon: "not a wrapper" },
       { icon: { body: "x", contentType: "image/gif" } },
     ]) {
-      assert.equal(
-        requestFailure(await requestEncode(wrapped, value)).error.kind,
-        "request-encode",
-      );
+      assert.equal(requestFailure(await requestEncode(wrapped, value)).outcome, "request-encode");
     }
 
     // A plan whose payloads list has no entry for the selected media type has no payload kind.
@@ -375,7 +364,7 @@ describe("descriptor boundary validation", () => {
       fields: [{ name: "x", required: false, payloads: [] }],
     };
     assert.equal(
-      requestFailure(await requestEncode(missingKind, { x: "v" })).error.kind,
+      requestFailure(await requestEncode(missingKind, { x: "v" })).outcome,
       "request-encode",
     );
 
@@ -386,10 +375,10 @@ describe("descriptor boundary validation", () => {
       fields: [{ name: "note", required: true, payloads: ["text"] }],
     };
     assert.equal(
-      requestFailure(await requestEncode(text, { note: { deep: { x: 1 } } })).error.kind,
+      requestFailure(await requestEncode(text, { note: { deep: { x: 1 } } })).outcome,
       "request-encode",
     );
-    assert.equal(requestFailure(await requestEncode(text, {})).error.kind, "request-encode");
+    assert.equal(requestFailure(await requestEncode(text, {})).outcome, "request-encode");
   });
 
   test("validates primitive top-level body plans", async () => {
@@ -407,7 +396,7 @@ describe("descriptor boundary validation", () => {
     ];
     for (const [plan, value] of cases) {
       const result = requestFailure(await requestEncode(plan, value));
-      assert.equal(result.error.kind, "request-encode");
+      assert.equal(result.outcome, "request-encode");
     }
 
     let text = "";
@@ -468,7 +457,7 @@ describe("multipart descriptor boundary", () => {
       },
     );
 
-    assert.equal(result.kind, "unmatched-response");
+    assert.equal(result.outcome, "unmatched");
     assert.match(body, /filename="upload.bin"/u);
     assert.match(body, /\{"ok":true\}/u);
   });
@@ -525,14 +514,14 @@ describe("multipart descriptor boundary", () => {
     const notObject = requestFailure(
       await requestEncode({ kind: "multipart", fields: [] }, "not an object"),
     );
-    assert.equal(notObject.error.kind, "request-encode");
+    assert.equal(notObject.outcome, "request-encode");
 
     for (const [field, value] of cases) {
       const body = value === undefined ? {} : { value };
       const result = requestFailure(
         await requestEncode({ kind: "multipart", fields: [field] }, body),
       );
-      assert.equal(result.error.kind, "request-encode");
+      assert.equal(result.outcome, "request-encode");
     }
   });
 });
@@ -555,7 +544,7 @@ describe("request boundary ownership", () => {
           header: { [name]: value },
         }),
       );
-      assert.equal(result.error.kind, "request-encode");
+      assert.equal(result.outcome, "request-encode");
     }
 
     let safeValue = "";
@@ -576,7 +565,7 @@ describe("request boundary ownership", () => {
     const invalidInit = requestFailure(
       await execute(createTransport({}), operation({ fetchDefaults: { mode: "not-a-mode" } }), {}),
     );
-    assert.equal(invalidInit.error.kind, "request-encode");
+    assert.equal(invalidInit.outcome, "request-encode");
 
     const reason = new Error("abort after hook");
     const controller = new AbortController();
@@ -601,7 +590,8 @@ describe("request boundary ownership", () => {
         { signal: controller.signal },
       ),
     );
-    assert.deepEqual(aborted.error, { kind: "aborted", reason });
+    assert.equal(aborted.outcome, "aborted");
+    assert.equal(aborted.reason, reason);
     assert.equal(sent, false);
   });
 
@@ -621,7 +611,7 @@ describe("request boundary ownership", () => {
         operation({ fetchDefaults: { next: extension } }),
         {},
       );
-      assert.equal(result.kind, "unmatched-response");
+      assert.equal(result.outcome, "unmatched");
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -630,4 +620,126 @@ describe("request boundary ownership", () => {
     assert.ok(Object.isFrozen(captured));
     assert.equal(capturedNext, extension);
   });
+});
+
+// The abort classifier reads the abort reason's shape, never which API produced the signal: a
+// DOMException named TimeoutError is a timeout, everything else is a cancellation. That is why a
+// hand-built TimeoutError classifies as a timeout, and why a polyfilled AbortSignal.timeout that
+// rejects with a plain Error correctly would not.
+type AbortVector = {
+  readonly label: string;
+  readonly timeout: boolean;
+  /** A signal not yet aborted, plus the trigger that aborts it (a no-op for a timer signal). */
+  readonly start: () => { readonly signal: AbortSignal; readonly abort: () => void };
+};
+
+function controllerVector(
+  label: string,
+  timeout: boolean,
+  reason: () => readonly [unknown] | null,
+): AbortVector {
+  return {
+    label,
+    timeout,
+    start: () => {
+      const controller = new AbortController();
+      const carried = reason();
+      return {
+        signal: controller.signal,
+        abort: () => {
+          if (carried === null) {
+            controller.abort();
+          } else {
+            controller.abort(carried[0]);
+          }
+        },
+      };
+    },
+  };
+}
+
+const ABORT_VECTORS: readonly AbortVector[] = [
+  {
+    label: "AbortSignal.timeout",
+    timeout: true,
+    // The timer fires on its own, so the trigger has nothing to do.
+    start: () => ({ signal: AbortSignal.timeout(1), abort: () => {} }),
+  },
+  controllerVector("bare controller.abort()", false, () => null),
+  controllerVector("controller.abort(new Error())", false, () => [new Error("x")]),
+  controllerVector("controller.abort(a hand-built TimeoutError)", true, () => [
+    new DOMException("x", "TimeoutError"),
+  ]),
+];
+
+async function settled(signal: AbortSignal): Promise<AbortSignal> {
+  if (!signal.aborted) {
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+  return signal;
+}
+
+describe("abort and timeout classification", () => {
+  for (const vector of ABORT_VECTORS) {
+    test(`pre-dispatch: ${vector.label} is ${vector.timeout ? "timeout" : "aborted"}`, async () => {
+      const { signal, abort } = vector.start();
+      abort();
+      await settled(signal);
+      let sent = false;
+      const failure = requestFailure(
+        await execute(
+          createTransport({
+            fetch: async () => {
+              sent = true;
+              return new Response();
+            },
+          }),
+          operation(),
+          {},
+          { signal },
+        ),
+      );
+
+      assert.equal(sent, false);
+      assert.equal(failure.outcome, vector.timeout ? "timeout" : "aborted");
+      if (failure.outcome === "timeout" || failure.outcome === "aborted") {
+        assert.equal(failure.reason, signal.reason);
+      }
+    });
+
+    test(`mid-body-read: ${vector.label} is ${
+      vector.timeout ? "response-timeout" : "response-aborted"
+    }`, async () => {
+      // The signal is still live at dispatch — a pre-aborted one never reaches the body read — so
+      // the abort is triggered once the request is in flight and errors the body stream.
+      const { signal, abort } = vector.start();
+      const result = await execute(
+        createTransport({
+          fetch: async (request) => {
+            const body = new ReadableStream<Uint8Array>({
+              start(streamController) {
+                request.signal.addEventListener(
+                  "abort",
+                  () => streamController.error(request.signal.reason),
+                  { once: true },
+                );
+              },
+            });
+            abort();
+            return new Response(body, { headers: { "Content-Type": "application/json" } });
+          },
+        }),
+        operation(),
+        {},
+        { signal },
+      );
+
+      assert.equal(result.outcome, vector.timeout ? "response-timeout" : "response-aborted");
+      if (result.outcome === "response-timeout" || result.outcome === "response-aborted") {
+        assert.equal(result.reason, signal.reason);
+      }
+    });
+  }
 });

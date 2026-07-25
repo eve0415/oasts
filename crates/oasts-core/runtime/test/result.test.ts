@@ -107,9 +107,12 @@ test("TransformError preserves every field", () => {
   assert.equal(error.cause, fields.cause);
 });
 
-test("unwrap returns data or throws the complete failed branch", () => {
+test("unwrap returns a { data, meta } envelope or throws the complete failed branch", () => {
   const data = { id: "pet_123" };
-  assert.equal(unwrap({ ok: true as const, data }), data);
+  const meta = { url: "https://example.com/pets/pet_123", status: 200, headers: new Headers() };
+  const envelope = unwrap({ ok: true as const, data, meta });
+  assert.equal(envelope.data, data);
+  assert.equal(envelope.meta, meta);
 
   const failed = { ok: false as const, error: "failed" };
   assert.throws(

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import type { RequestFailure } from "../result.ts";
+import type { RequestPhaseFailure } from "../result.ts";
 import {
   AmbientClientCertificate,
   AmbientCookieCredential,
@@ -33,7 +33,7 @@ import {
   type SchemeUse,
 } from "./vectors-auth-selection.ts";
 
-type AuthError = Extract<RequestFailure, { readonly kind: "auth" }>;
+type AuthError = Extract<RequestPhaseFailure, { readonly outcome: "auth" }>;
 
 function operation(overrides: Partial<OperationDescriptor> = {}): OperationDescriptor {
   return {
@@ -53,13 +53,10 @@ function operation(overrides: Partial<OperationDescriptor> = {}): OperationDescr
 }
 
 function authFailure(result: ExecutionResult): AuthError {
-  if (result.kind !== "request-failure") {
-    throw new Error(`expected auth failure, received ${result.kind}`);
+  if (result.outcome !== "auth") {
+    throw new Error(`expected auth failure, received ${String(result.outcome)}`);
   }
-  if (result.error.kind !== "auth") {
-    throw new Error(`expected auth failure, received ${result.error.kind}`);
-  }
-  return result.error;
+  return result;
 }
 
 function assertVectorFailure(
@@ -68,7 +65,7 @@ function assertVectorFailure(
   requests: readonly Request[],
 ): void {
   const failure = authFailure(result);
-  assert.equal(failure.kind, expected.failure);
+  assert.equal(failure.outcome, expected.failure);
   assert.match(failure.message, new RegExp(expected.messageIncludes, "u"));
   assert.equal(requests.length, 0);
 }
@@ -541,7 +538,7 @@ describe("auth runtime boundaries", () => {
     const request = requests[0];
     assert.ok(request);
     assert.equal(request.headers.get("Authorization"), null);
-    assert.notEqual(result.kind, "request-failure");
+    assert.notEqual(result.outcome, "auth");
   });
 
   test("accepts an empty header API key without normalization", async () => {

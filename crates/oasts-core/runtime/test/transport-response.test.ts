@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
 import { ApiError } from "../result.ts";
+import { isDocumented, responseFailure } from "./result-narrowing.ts";
 import {
   createTransport,
   execute,
@@ -44,16 +45,6 @@ async function callWith(response: Response, descriptor = operation()): Promise<E
   return execute(createTransport({ fetch: async () => response }), descriptor, {});
 }
 
-function responseFailure(result: ExecutionResult): ExecutionResult & {
-  readonly kind: "response-failure";
-} {
-  assert.equal(result.kind, "response-failure");
-  if (result.kind !== "response-failure") {
-    throw new Error("expected a response failure");
-  }
-  return result;
-}
-
 describe("response matching and decoding", () => {
   test("matches exact, then range, then default, then unmatched", async () => {
     const descriptor = operation({
@@ -91,19 +82,16 @@ describe("response matching and decoding", () => {
       operation({ responses: [responsePlan({ media: [["text/plain", "text"]] })] }),
     );
 
-    assert.equal(exact.match, "200");
+    // An exact key is keyed by its numeric status, a range or `default` key by its own literal.
+    assert.equal(exact.outcome, 200);
     assert.equal(exact.ok, true);
-    assert.equal(exact.kind === "response" && exact.ok ? exact.data : undefined, "exact");
-    assert.equal(range.match, "2XX");
+    assert.equal(isDocumented(exact) && exact.ok ? exact.data : undefined, "exact");
+    assert.equal(range.outcome, "2XX");
     assert.equal(range.ok, true);
-    assert.equal(fallback.match, "default");
+    assert.equal(fallback.outcome, "default");
     assert.equal(fallback.ok, false);
-    assert.equal(
-      fallback.kind === "response" && !fallback.ok ? fallback.error : undefined,
-      "default",
-    );
-    assert.equal(unmatched.kind, "unmatched-response");
-    assert.equal(unmatched.match, null);
+    assert.equal(isDocumented(fallback) && !fallback.ok ? fallback.error : undefined, "default");
+    assert.equal(unmatched.outcome, "unmatched");
   });
 
   test("selects response media exact, then type range, then any range", async () => {
@@ -125,9 +113,9 @@ describe("response matching and decoding", () => {
       }),
     );
 
-    assert.equal(result.kind, "response");
+    assert.ok(isDocumented(result));
     assert.equal(result.ok, true);
-    if (result.kind === "response" && result.ok) {
+    if (isDocumented(result) && result.ok) {
       assert.equal(result.data, "exact decoder");
       assert.equal(result.contentType, "application/problem+json");
       assert.equal(
@@ -149,10 +137,10 @@ describe("response matching and decoding", () => {
       operation({ responses: [responsePlan({ match: "400", status: 400 })] }),
     );
 
-    assert.deepEqual(success.kind === "response" && success.ok ? success.data : undefined, {
+    assert.deepEqual(isDocumented(success) && success.ok ? success.data : undefined, {
       id: 1,
     });
-    assert.deepEqual(error.kind === "response" && !error.ok ? error.error : undefined, {
+    assert.deepEqual(isDocumented(error) && !error.ok ? error.error : undefined, {
       message: "bad",
     });
   });
@@ -162,8 +150,8 @@ describe("response matching and decoding", () => {
     const nullBody = await callWith(new Response(null), descriptor);
     const zeroBytes = await callWith(new Response(""), descriptor);
 
-    assert.equal(nullBody.kind === "response" && nullBody.ok ? nullBody.data : "bad", undefined);
-    assert.equal(zeroBytes.kind === "response" && zeroBytes.ok ? zeroBytes.data : "bad", undefined);
+    assert.equal(isDocumented(nullBody) && nullBody.ok ? nullBody.data : "bad", undefined);
+    assert.equal(isDocumented(zeroBytes) && zeroBytes.ok ? zeroBytes.data : "bad", undefined);
   });
 
   test("decodes range, any-range, and binary response media", async () => {
@@ -185,11 +173,11 @@ describe("response matching and decoding", () => {
       }),
     );
 
-    assert.equal(range.kind, "response");
-    assert.equal(range.kind === "response" ? range.contentType : undefined, "application/*");
-    assert.equal(range.kind === "response" && range.ok ? range.data : undefined, "range");
-    assert.equal(anyRange.kind, "response");
-    if (anyRange.kind === "response" && anyRange.ok) {
+    assert.ok(isDocumented(range));
+    assert.equal(isDocumented(range) ? range.contentType : undefined, "application/*");
+    assert.equal(isDocumented(range) && range.ok ? range.data : undefined, "range");
+    assert.ok(isDocumented(anyRange));
+    if (isDocumented(anyRange) && anyRange.ok) {
       assert.equal(anyRange.contentType, "*/*");
       assert.deepEqual(
         new Uint8Array(anyRange.data instanceof ArrayBuffer ? anyRange.data : []),
@@ -216,8 +204,8 @@ describe("response matching and decoding", () => {
       }),
     );
 
-    assert.equal(result.kind, "response");
-    if (result.kind === "response" && !result.ok) {
+    assert.ok(isDocumented(result));
+    if (isDocumented(result) && !result.ok) {
       assert.equal(result.error, "error");
       assert.equal(result.contentType, "text/*");
     }
@@ -260,17 +248,17 @@ describe("response media specificity", () => {
     );
 
     assert.equal(
-      watch.kind === "response" ? watch.contentType : undefined,
+      isDocumented(watch) ? watch.contentType : undefined,
       "application/json;stream=watch",
     );
-    assert.deepEqual(watch.kind === "response" && watch.ok ? watch.data : undefined, {
+    assert.deepEqual(isDocumented(watch) && watch.ok ? watch.data : undefined, {
       type: "ADDED",
     });
-    assert.equal(bare.kind === "response" ? bare.contentType : undefined, "application/json");
-    assert.deepEqual(bare.kind === "response" && bare.ok ? bare.data : undefined, { id: 1 });
-    assert.equal(range.kind === "response" ? range.contentType : undefined, "application/*");
-    assert.equal(range.kind === "response" && range.ok ? range.data : undefined, "range");
-    assert.equal(any.kind === "response" ? any.contentType : undefined, "*/*");
+    assert.equal(isDocumented(bare) ? bare.contentType : undefined, "application/json");
+    assert.deepEqual(isDocumented(bare) && bare.ok ? bare.data : undefined, { id: 1 });
+    assert.equal(isDocumented(range) ? range.contentType : undefined, "application/*");
+    assert.equal(isDocumented(range) && range.ok ? range.data : undefined, "range");
+    assert.equal(isDocumented(any) ? any.contentType : undefined, "*/*");
   });
 
   test("matches charset case-insensitively and returns the declared literal", async () => {
@@ -291,7 +279,7 @@ describe("response media specificity", () => {
       }),
     );
     assert.equal(
-      result.kind === "response" ? result.contentType : undefined,
+      isDocumented(result) ? result.contentType : undefined,
       "application/json;charset=UTF-8",
     );
   });
@@ -313,7 +301,7 @@ describe("response media specificity", () => {
         ],
       }),
     );
-    assert.equal(result.kind === "response" ? result.contentType : undefined, "application/json");
+    assert.equal(isDocumented(result) ? result.contentType : undefined, "application/json");
   });
 
   test("breaks specificity ties between equal keys by canonical byte order", async () => {
@@ -336,10 +324,7 @@ describe("response media specificity", () => {
           responses: [responsePlan({ media, hasContentTypeDiscriminant: true })],
         }),
       );
-      assert.equal(
-        result.kind === "response" ? result.contentType : undefined,
-        "application/json;a=1",
-      );
+      assert.equal(isDocumented(result) ? result.contentType : undefined, "application/json;a=1");
     }
   });
 
@@ -358,7 +343,7 @@ describe("response media specificity", () => {
         ],
       }),
     );
-    assert.equal(result.kind === "response" ? result.contentType : undefined, "application/json");
+    assert.equal(isDocumented(result) ? result.contentType : undefined, "application/json");
   });
 
   test("fails to decode when no declared key applies", async () => {
@@ -376,7 +361,7 @@ describe("response media specificity", () => {
           }),
         ),
       );
-      assert.equal(result.error.kind, "response-decode");
+      assert.equal(result.outcome, "response-decode");
     }
   });
 });
@@ -387,10 +372,10 @@ describe("response decode failures", () => {
       await callWith(new Response("{", { headers: { "Content-Type": "application/json" } })),
     );
 
-    assert.equal(result.match, "200");
-    assert.equal(result.error.kind, "response-decode");
-    if (result.error.kind === "response-decode") {
-      assert.ok(result.error.cause instanceof SyntaxError);
+    assert.equal(result.match, 200);
+    assert.equal(result.outcome, "response-decode");
+    if (result.outcome === "response-decode") {
+      assert.ok(result.cause instanceof SyntaxError);
     }
   });
 
@@ -408,8 +393,8 @@ describe("response decode failures", () => {
       ),
     );
 
-    assert.equal(staticBodyless.error.kind, "response-decode");
-    assert.equal(noPayload.error.kind, "response-decode");
+    assert.equal(staticBodyless.outcome, "response-decode");
+    assert.equal(noPayload.outcome, "response-decode");
   });
 
   test("rejects dynamic bodyless status with declared content and names status and key", async () => {
@@ -430,10 +415,10 @@ describe("response decode failures", () => {
         ),
       );
 
-      assert.equal(result.error.kind, "response-decode");
-      if (result.error.kind === "response-decode") {
-        assert.match(result.error.message, new RegExp(String(status), "u"));
-        assert.match(result.error.message, status === 304 ? /default/u : /2XX/u);
+      assert.equal(result.outcome, "response-decode");
+      if (result.outcome === "response-decode") {
+        assert.match(result.message, new RegExp(String(status), "u"));
+        assert.match(result.message, status === 304 ? /default/u : /2XX/u);
       }
     }
   });
@@ -444,7 +429,7 @@ describe("response decode failures", () => {
       new Response('{"ok":true}', { headers: { "Content-Type": "text/plain" } }),
     ]) {
       const result = responseFailure(await callWith(response));
-      assert.equal(result.error.kind, "response-decode");
+      assert.equal(result.outcome, "response-decode");
     }
   });
 
@@ -479,9 +464,10 @@ describe("response decode failures", () => {
     );
 
     const failure = responseFailure(result);
-    assert.deepEqual(failure.error, { kind: "aborted", reason });
+    assert.equal(failure.outcome, "response-aborted");
+    assert.equal(failure.reason, reason);
     assert.equal(failure.status, 200);
-    assert.equal(failure.match, "200");
+    assert.equal(failure.match, 200);
   });
 
   test("maps a non-abort body stream error to response-decode", async () => {
@@ -495,9 +481,9 @@ describe("response decode failures", () => {
       await callWith(new Response(body, { headers: { "Content-Type": "application/json" } })),
     );
 
-    assert.equal(failure.error.kind, "response-decode");
-    if (failure.error.kind === "response-decode") {
-      assert.equal(failure.error.cause, cause);
+    assert.equal(failure.outcome, "response-decode");
+    if (failure.outcome === "response-decode") {
+      assert.equal(failure.cause, cause);
     }
   });
 
@@ -507,8 +493,8 @@ describe("response decode failures", () => {
       operation({ responses: [responsePlan({ bodyless: true, media: [] })] }),
     );
 
-    assert.equal(result.kind, "response");
-    assert.equal(result.kind === "response" && result.ok ? result.data : "bad", undefined);
+    assert.ok(isDocumented(result));
+    assert.equal(isDocumented(result) && result.ok ? result.data : "bad", undefined);
   });
 
   test("rejects malformed, wildcard, missing, and malformed-plan response media", async () => {
@@ -523,7 +509,7 @@ describe("response decode failures", () => {
       [malformedPlan, operation({ responses: [responsePlan({ media: [["not-media", "text"]] })] })],
     ] as const) {
       const failure = responseFailure(await callWith(response, descriptor));
-      assert.equal(failure.error.kind, "response-decode");
+      assert.equal(failure.outcome, "response-decode");
     }
   });
 });
@@ -555,23 +541,24 @@ describe("unknown HTTP errors", () => {
       descriptor,
     );
 
-    assert.deepEqual(empty.kind === "unmatched-response" ? empty.error : undefined, {
+    assert.deepEqual(empty.outcome === "unmatched" ? empty.error : undefined, {
       kind: "empty",
       contentType: "application/json",
       body: undefined,
     });
-    assert.deepEqual(json.kind === "unmatched-response" ? json.error : undefined, {
+    assert.deepEqual(json.outcome === "unmatched" ? json.error : undefined, {
       kind: "json",
       contentType: "application/problem+json",
       body: { code: 7 },
     });
-    assert.deepEqual(text.kind === "unmatched-response" ? text.error : undefined, {
+    assert.deepEqual(text.outcome === "unmatched" ? text.error : undefined, {
       kind: "text",
       contentType: "application/x-www-form-urlencoded",
       body: "missing",
     });
-    assert.equal(binary.kind, "unmatched-response");
-    if (binary.kind === "unmatched-response") {
+    assert.equal(binary.outcome, "unmatched");
+    if (binary.outcome === "unmatched") {
+      // UnknownHttpError keeps its own `kind`: a body-representation tag, not a result tier.
       assert.equal(binary.error.kind, "binary");
       if (binary.error.kind === "binary") {
         assert.equal(binary.error.contentType, "image/png");
@@ -595,9 +582,9 @@ describe("unknown HTTP errors", () => {
     );
     const missing = await callWith(new Response(Uint8Array.of(8), { status: 404 }), descriptor);
 
-    assert.equal(json.kind === "unmatched-response" ? json.error.kind : undefined, "json");
-    assert.equal(text.kind === "unmatched-response" ? text.error.kind : undefined, "text");
-    assert.equal(missing.kind === "unmatched-response" ? missing.error.kind : undefined, "binary");
+    assert.equal(json.outcome === "unmatched" ? json.error.kind : undefined, "json");
+    assert.equal(text.outcome === "unmatched" ? text.error.kind : undefined, "text");
+    assert.equal(missing.outcome === "unmatched" ? missing.error.kind : undefined, "binary");
   });
 
   test("turns malformed unmatched JSON into response-decode with a null match", async () => {
@@ -612,7 +599,7 @@ describe("unknown HTTP errors", () => {
     );
 
     assert.equal(failure.match, null);
-    assert.equal(failure.error.kind, "response-decode");
+    assert.equal(failure.outcome, "response-decode");
   });
 });
 
@@ -663,8 +650,8 @@ describe("response middleware and metadata", () => {
 
     assert.deepEqual(events, ["first", "second", "replacement/visible"]);
     assert.ok(contexts.every((context) => context === contexts[0]));
-    assert.equal(result.kind, "response");
-    if (result.kind === "response") {
+    assert.ok(isDocumented(result));
+    if (isDocumented(result)) {
       assert.equal(result.meta.url, "https://redirected.example/final");
       assert.equal(result.meta.headers.get("x-void"), "visible");
     }
@@ -706,13 +693,13 @@ describe("response middleware and metadata", () => {
       ),
     );
 
-    assert.equal(consumed.error.kind, "response-middleware");
+    assert.equal(consumed.outcome, "response-middleware");
     assert.equal(consumed.status, 200);
-    assert.equal(hookError.error.kind, "response-middleware");
+    assert.equal(hookError.outcome, "response-middleware");
     assert.equal(hookError.status, 202);
     assert.equal(hookError.meta.headers.get("x-live"), "yes");
-    if (hookError.error.kind === "response-middleware") {
-      assert.equal(hookError.error.cause, thrown);
+    if (hookError.outcome === "response-middleware") {
+      assert.equal(hookError.cause, thrown);
     }
   });
 
@@ -723,8 +710,8 @@ describe("response middleware and metadata", () => {
     const result = await callWith(live);
     live.headers.set("X-Live", "after");
 
-    assert.equal(result.kind, "response");
-    if (result.kind === "response") {
+    assert.ok(isDocumented(result));
+    if (isDocumented(result)) {
       assert.equal(result.meta.url, "https://example.com/api/response");
       assert.equal(result.meta.headers.get("x-live"), "before");
       assert.notEqual(result.meta.headers, live.headers);
@@ -733,8 +720,8 @@ describe("response middleware and metadata", () => {
 });
 
 describe("executeOrThrow", () => {
-  test("returns successful data and throws ApiError with the complete failed result", async () => {
-    const data = await executeOrThrow(
+  test("resolves a { data, meta } envelope and throws ApiError with the complete failed result", async () => {
+    const { data, meta } = await executeOrThrow(
       createTransport({
         fetch: async () =>
           new Response('{"id":9}', { headers: { "Content-Type": "application/json" } }),
@@ -743,6 +730,7 @@ describe("executeOrThrow", () => {
       {},
     );
     assert.deepEqual(data, { id: 9 });
+    assert.equal(meta.status, 200);
 
     await assert.rejects(
       executeOrThrow(
@@ -752,7 +740,7 @@ describe("executeOrThrow", () => {
       ),
       (error: unknown) => {
         assert.ok(error instanceof ApiError);
-        assert.equal(error.result.kind, "unmatched-response");
+        assert.equal(error.result.outcome, "unmatched");
         assert.equal(error.result.ok, false);
         assert.equal(error.result.status, 404);
         const preserved = error.result;

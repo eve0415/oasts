@@ -49,6 +49,9 @@ for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server
   generate_and_verify "$f" "$fixture_config" "$work/client-$f" client "$f"
 done
 
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-client-showcase-3.1/compile-assert/cases.ts"
+echo "compile-assert matrix ok: client-showcase-3.1"
+
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-auth-showcase-3.1/compile-assert/cases.ts"
 echo "compile-assert matrix ok: auth-showcase-3.1"
 
@@ -70,6 +73,7 @@ echo "compile-assert matrix ok: webhooks-showcase-3.1"
 # Validators fixtures: one fixture can carry several configs, so these run as explicit
 # (fixture, config) pairs instead of joining the one-config-per-fixture client loop above.
 validators_runs=(
+  "media-validation-3.1 oasts.yaml"
   "validators-showcase-3.1 oasts.yaml"
   "validators-showcase-3.1 oasts-client.yaml"
   "validators-readonly-3.1 oasts.yaml"

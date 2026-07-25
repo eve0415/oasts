@@ -53,7 +53,8 @@ export const nestedAck: CreateSubscriptionSubscriptionEvents_1PostCallbacks["nes
 
 // 8. On the headered success arm, meta.headers.get is key-checked against the response's declared
 //    header set, yet the wide string overload survives so an undeclared key is not an error.
-type GetPet200 = Extract<GetPetResult, { match: "200" }>;
+// An exact declared status keys its arm as the number literal `200`, never the string "200".
+type GetPet200 = Extract<GetPetResult, { outcome: 200 }>;
 export function headerAccess(result: GetPet200): void {
   const declared: string | null = result.meta.headers.get("X-Rate-Limit");
   const undeclared: string | null = result.meta.headers.get("x-typo");

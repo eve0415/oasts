@@ -134,10 +134,8 @@ function transportFor(client: GeneratedClient, config: Readonly<Record<string, u
 
 function authError(resultValue: unknown, label: string): Readonly<Record<string, unknown>> {
   const result = requiredRecord(resultValue, `${label} result`);
-  assert.equal(result.kind, "request-failure");
-  const error = requiredRecord(result.error, `${label} error`);
-  assert.equal(error.kind, "auth");
-  return error;
+  assert.equal(result.outcome, "auth");
+  return result;
 }
 
 async function generateClient(name: string, toRuntimeMode: boolean): Promise<string> {
@@ -169,7 +167,7 @@ async function assertBearerExactBytes(client: GeneratedClient, label: string): P
   const result = await client.inheritedRootOnly(transport, {});
   assert.equal(requests.length, 1);
   assert.equal(requestHeader(requiredRequest(0), "Authorization"), `Bearer ${token}`);
-  assert.equal(requiredRecord(result, `${label} bearer result`).kind, "response");
+  assert.equal(requiredRecord(result, `${label} bearer result`).outcome, 200);
 }
 
 async function assertNullProviderFailsClosed(
@@ -258,7 +256,7 @@ test("basic provider serializes the frozen non-ASCII vector bytes", async () => 
   const received = requiredRequest(0);
   assert.equal(requestHeader(received, "Authorization"), expectedAuthorization);
   assert.equal(requestHeader(received, "X-Api-Key"), "header-key-companion");
-  assert.equal(requiredRecord(result, "basic result").kind, "response");
+  assert.equal(requiredRecord(result, "basic result").outcome, 200);
 });
 
 test("header API-key provider injects exact X-Api-Key bytes", async () => {
@@ -271,7 +269,7 @@ test("header API-key provider injects exact X-Api-Key bytes", async () => {
   const received = requiredRequest(0);
   assert.equal(requestHeader(received, "X-Api-Key"), apiKey);
   assert.equal(requestHeader(received, "Authorization"), undefined);
-  assert.equal(requiredRecord(result, "header key result").kind, "response");
+  assert.equal(requiredRecord(result, "header key result").outcome, 200);
 });
 
 test("query API-key provider appends api_key with no Authorization header", async () => {
@@ -289,7 +287,7 @@ test("query API-key provider appends api_key with no Authorization header", asyn
   const received = requiredRequest(0);
   assert.equal(received.url, expectedUrl);
   assert.equal(requestHeader(received, "Authorization"), undefined);
-  assert.equal(requiredRecord(result, "query key result").kind, "response");
+  assert.equal(requiredRecord(result, "query key result").outcome, 200);
 });
 
 test("anonymous alternative sends unauthenticated when no providers are configured", async () => {
@@ -300,7 +298,7 @@ test("anonymous alternative sends unauthenticated when no providers are configur
   const result = await typesClient.anonymousIncluded(transport, {});
   assert.equal(requests.length, 1);
   assert.equal(requestHeader(requiredRequest(0), "Authorization"), undefined);
-  assert.equal(requiredRecord(result, "anonymous result").kind, "response");
+  assert.equal(requiredRecord(result, "anonymous result").outcome, 200);
 });
 
 test("null bearer provider without opt-in fails closed (types mode)", async () => {
@@ -324,7 +322,7 @@ test("null bearer provider with anonymous opt-in sends unauthenticated after eva
   assert.equal(requests.length, 1);
   assert.equal(requestHeader(requiredRequest(0), "Authorization"), undefined);
   assert.equal(invocations, 1);
-  assert.equal(requiredRecord(result, "anonymous opt-in result").kind, "response");
+  assert.equal(requiredRecord(result, "anonymous opt-in result").outcome, 200);
 });
 
 test("per-call bearer override wins and the transport provider is never invoked", async () => {
@@ -352,7 +350,7 @@ test("per-call bearer override wins and the transport provider is never invoked"
   assert.equal(requests.length, 1);
   assert.equal(requestHeader(requiredRequest(0), "Authorization"), `Bearer ${perCallToken}`);
   assert.equal(invocations, 0);
-  assert.equal(requiredRecord(result, "override result").kind, "response");
+  assert.equal(requiredRecord(result, "override result").outcome, 200);
 });
 
 test("unsatisfiable same-kind alternatives fail closed with tried alternatives (types mode)", async () => {
@@ -395,8 +393,8 @@ test("concurrent requests carry isolated per-call credentials", async () => {
     `Bearer ${CONCURRENT_ANONYMOUS_TOKEN}`,
   );
   assert.deepEqual(providerCalls.toSorted(), ["anonymousIncluded", "inheritedRootOnly"]);
-  assert.equal(requiredRecord(inheritedResult, "concurrent inherited result").kind, "response");
-  assert.equal(requiredRecord(anonymousResult, "concurrent anonymous result").kind, "response");
+  assert.equal(requiredRecord(inheritedResult, "concurrent inherited result").outcome, 200);
+  assert.equal(requiredRecord(anonymousResult, "concurrent anonymous result").outcome, 200);
 });
 
 test("bearer provider sends exact Authorization bytes (runtime mode)", async () => {

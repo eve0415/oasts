@@ -199,9 +199,8 @@ test("JSON GET round-trips through the default fetch and local server", async ()
   assert.equal(received.method, "GET");
   assert.equal(received.url, "/pets/p_123");
   assert.equal(requestHeader(received, "Accept"), "application/json, text/plain");
-  assert.equal(result.kind, "response");
+  assert.equal(result.outcome, 200);
   assert.equal(result.ok, true);
-  assert.equal(result.match, "200");
   assert.deepEqual(result.data, { id: "p_123", name: "Mochi" });
   assert.equal(requiredRecord(result.meta, "response meta").url, `${baseUrl}/pets/p_123`);
 });
@@ -324,7 +323,7 @@ test("response media selection prefers an exact declared type", async () => {
     await selectMediaShowcase(localTransport(), {}),
     "exact media result",
   );
-  assert.equal(result.kind, "response");
+  assert.equal(result.outcome, 200);
   assert.equal(result.contentType, "application/json");
   assert.equal(typeof result.data, "object");
   assert.deepEqual(result.data, { value: "exact" });
@@ -341,7 +340,7 @@ test("response media selection falls back to the declared type range", async () 
     await selectMediaShowcase(localTransport(), {}),
     "range media result",
   );
-  assert.equal(result.kind, "response");
+  assert.equal(result.outcome, 200);
   assert.equal(result.contentType, "text/*");
   assert.equal(typeof result.data, "string");
   assert.equal(result.data, "range,payload");
@@ -358,11 +357,9 @@ test("response media selection rejects an unmatched concrete type", async () => 
     await selectMediaShowcase(localTransport(), {}),
     "unmatched media result",
   );
-  const error = requiredRecord(result.error, "unmatched media error");
-  assert.equal(result.kind, "response-failure");
-  assert.equal(result.match, "200");
-  assert.equal(error.kind, "response-decode");
-  assert.match(String(error.message), /image\/png does not match declared content/u);
+  assert.equal(result.outcome, "response-decode");
+  assert.equal(result.match, 200);
+  assert.match(String(result.message), /image\/png does not match declared content/u);
 });
 
 test("unmatched responses preserve all four UnknownHttpError body kinds", async () => {
@@ -409,15 +406,16 @@ test("unmatched responses preserve all four UnknownHttpError body kinds", async 
       await getLabelShowcase(localTransport(), { path: { labelId: scenario.label } }),
       `${scenario.label} unmatched result`,
     );
-    const error = requiredRecord(result.error, `${scenario.label} unmatched error`);
-    assert.equal(result.kind, "unmatched-response");
+    assert.equal(result.outcome, "unmatched");
     assert.equal(result.status, 418);
-    assert.equal(error.kind, scenario.kind);
+    // UnknownHttpError keeps its own `kind`: a body-representation tag, not a result tier.
+    const body = requiredRecord(result.error, `${scenario.label} unmatched error`);
+    assert.equal(body.kind, scenario.kind);
     if (scenario.kind === "binary") {
-      assert.ok(error.body instanceof ArrayBuffer);
-      assert.deepEqual(Buffer.from(error.body), scenario.expectedBody);
+      assert.ok(body.body instanceof ArrayBuffer);
+      assert.deepEqual(Buffer.from(body.body), scenario.expectedBody);
     } else {
-      assert.deepEqual(error.body, scenario.expectedBody);
+      assert.deepEqual(body.body, scenario.expectedBody);
     }
   }
 });
@@ -427,7 +425,7 @@ test("HEAD produces undefined data without reading a body", async () => {
   scriptRoute("HEAD", "/health", { status: 200 });
   const result = requiredRecord(await headHealthShowcase(localTransport(), {}), "HEAD result");
   assert.equal(requiredRequest(0).method, "HEAD");
-  assert.equal(result.kind, "response");
+  assert.equal(result.outcome, 200);
   assert.equal(result.data, undefined);
   assert.equal(result.contentType, undefined);
 });
@@ -439,8 +437,7 @@ test("an exact 204 response produces undefined data", async () => {
     await getLabelShowcase(localTransport(), { path: { labelId: "bodyless" } }),
     "204 result",
   );
-  assert.equal(result.kind, "response");
-  assert.equal(result.match, "204");
+  assert.equal(result.outcome, 204);
   assert.equal(result.data, undefined);
 });
 
@@ -454,11 +451,9 @@ test("a default content branch rejects a dynamic 204 response", async () => {
     await getPetShowcase(localTransport(), { path: { petId: "dynamic-bodyless" } }),
     "dynamic bodyless result",
   );
-  const error = requiredRecord(result.error, "dynamic bodyless error");
-  assert.equal(result.kind, "response-failure");
+  assert.equal(result.outcome, "response-decode");
   assert.equal(result.match, "default");
-  assert.equal(error.kind, "response-decode");
-  assert.match(String(error.message), /bodyless status 204.*default/u);
+  assert.match(String(result.message), /bodyless status 204.*default/u);
 });
 
 test("a pre-aborted signal stops the default transport before the server", async () => {
@@ -476,11 +471,43 @@ test("a pre-aborted signal stops the default transport before the server", async
     ),
     "pre-abort result",
   );
-  const error = requiredRecord(result.error, "pre-abort error");
   assert.equal(requests.length, 0);
-  assert.equal(result.kind, "request-failure");
-  assert.equal(error.kind, "aborted");
-  assert.strictEqual(error.reason, reason);
+  assert.equal(result.outcome, "aborted");
+  assert.strictEqual(result.reason, reason);
+});
+
+test("a fired AbortSignal.timeout stops the default transport as a timeout", async () => {
+  // The sibling of the pre-abort case: the same pre-dispatch path, classified by the reason's
+  // shape (a DOMException named TimeoutError) rather than by which API produced the signal.
+  const signal = AbortSignal.timeout(1);
+  await new Promise<void>((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+  const result = requiredRecord(
+    await getLabelShowcase(localTransport(), { path: { labelId: "pre-timeout" } }, { signal }),
+    "pre-timeout result",
+  );
+  assert.equal(requests.length, 0);
+  assert.equal(result.outcome, "timeout");
+  assert.strictEqual(result.reason, signal.reason);
+});
+
+test("a mid-flight timeout stops a default-fetch body read as response-timeout", async () => {
+  // The sibling of the mid-flight abort: the body read is in progress when the timer fires.
+  scriptRoute("GET", "/pets/mid-timeout", {
+    status: 200,
+    headers: [["Content-Type", "application/json"]],
+    body: Buffer.from('{"id":"mid-timeout","name":"Slow"}'),
+    delayBodyMs: 250,
+  });
+  const signal = AbortSignal.timeout(40);
+  const result = requiredRecord(
+    await getPetShowcase(localTransport(), { path: { petId: "mid-timeout" } }, { signal }),
+    "mid-timeout result",
+  );
+  assert.equal(requests.length, 1);
+  assert.equal(result.outcome, "response-timeout");
+  assert.strictEqual(result.reason, signal.reason);
 });
 
 test("a mid-flight abort stops a default-fetch body read", async () => {
@@ -516,11 +543,9 @@ test("a mid-flight abort stops a default-fetch body read", async () => {
   await responseStarted;
   controller.abort(reason);
   const result = requiredRecord(await pending, "mid-abort result");
-  const error = requiredRecord(result.error, "mid-abort error");
   assert.equal(requests.length, 1);
-  assert.equal(result.kind, "response-failure");
-  assert.equal(error.kind, "aborted");
-  assert.strictEqual(error.reason, reason);
+  assert.equal(result.outcome, "response-aborted");
+  assert.strictEqual(result.reason, reason);
 });
 
 test("injected fetch preserves pre-abort and mid-flight dependent-signal semantics", async () => {
@@ -545,11 +570,10 @@ test("injected fetch preserves pre-abort and mid-flight dependent-signal semanti
     ),
     "injected pre-abort result",
   );
-  const preError = requiredRecord(preResult.error, "injected pre-abort error");
   assert.equal(injectedCalls, 0);
   assert.equal(requests.length, 0);
-  assert.equal(preError.kind, "aborted");
-  assert.strictEqual(preError.reason, preReason);
+  assert.equal(preResult.outcome, "aborted");
+  assert.strictEqual(preResult.reason, preReason);
 
   const midReason = { phase: "injected-body" };
   const midController = new AbortController();
@@ -590,11 +614,9 @@ test("injected fetch preserves pre-abort and mid-flight dependent-signal semanti
   assert.notStrictEqual(observedSignal, midController.signal);
   midController.abort(midReason);
   const midResult = requiredRecord(await pending, "injected mid-abort result");
-  const midError = requiredRecord(midResult.error, "injected mid-abort error");
   assert.equal(injectedCalls, 1);
-  assert.equal(midResult.kind, "response-failure");
-  assert.equal(midError.kind, "aborted");
-  assert.strictEqual(midError.reason, midReason);
+  assert.equal(midResult.outcome, "response-aborted");
+  assert.strictEqual(midResult.reason, midReason);
   assert.equal(observedSignal.aborted, true);
   assert.strictEqual(observedSignal.reason, midReason);
 });
@@ -662,10 +684,8 @@ test("forbidden middleware headers fail before Node sends a request", async () =
     await getLabelShowcase(transport, { path: { labelId: "forbidden" } }),
     "forbidden middleware result",
   );
-  const error = requiredRecord(result.error, "forbidden middleware error");
   assert.equal(requests.length, 0);
-  assert.equal(result.kind, "request-failure");
-  assert.equal(error.kind, "request-middleware");
+  assert.equal(result.outcome, "request-middleware");
 });
 
 test("response middleware replacements chain across status and body changes", async () => {
@@ -704,7 +724,7 @@ test("response middleware replacements chain across status and body changes", as
   );
   const meta = requiredRecord(result.meta, "response replacement meta");
   assert.deepEqual(observedStatuses, [503, 202]);
-  assert.equal(result.kind, "response");
+  assert.equal(result.outcome, 200);
   assert.equal(result.status, 200);
   assert.deepEqual(result.data, { id: "response-chain", name: "Final" });
   assert.ok(meta.headers instanceof Headers);
@@ -731,9 +751,7 @@ test("response middleware may not consume the current body", async () => {
     await getPetShowcase(transport, { path: { petId: "consumed" } }),
     "consumed response result",
   );
-  const error = requiredRecord(result.error, "consumed response error");
-  assert.equal(result.kind, "response-failure");
-  assert.equal(error.kind, "response-middleware");
+  assert.equal(result.outcome, "response-middleware");
 });
 
 test("fetchOptions separates a frozen extension sidecar from standard keys", async () => {
@@ -880,7 +898,7 @@ test("cookie parameters arrive as one joined Cookie header on the wire", async (
     }),
     "cookie result",
   );
-  assert.equal(result.kind, "response");
+  assert.equal(result.outcome, 204);
   assert.equal(requestHeader(requiredRequest(0), "Cookie"), "session=s3cr3t; prefs=dark,compact");
 });
 
@@ -918,7 +936,7 @@ test("content-typed parameters and a content response header round-trip on the w
 
   // Response: the body decodes to the Pet, and the JSON content response header is exposed as its
   // raw JSON text for the caller to decode.
-  assert.equal(result.kind, "response");
+  assert.equal(result.outcome, 200);
   assert.deepEqual(result.data, { id: "p_1", name: "Mochi" });
   const meta = requiredRecord(result.meta, "content response meta");
   const headers = meta.headers;
@@ -989,17 +1007,19 @@ test("synthetic injected responses fall back to the request URL", async () => {
   assert.equal(requests.length, 0);
 });
 
-test("generated OrThrow exports return data and throw ApiError with the failed result", async () => {
-  // OrThrow returns data or throws ApiError preserving its result.
+test("generated OrThrow exports resolve { data, meta } and throw ApiError with the failed result", async () => {
+  // OrThrow resolves the success envelope or throws ApiError preserving its result.
   scriptRoute("GET", "/pets/or-throw-success", {
     status: 200,
     headers: [["Content-Type", "application/json"]],
     body: Buffer.from('{"id":"or-throw-success","name":"Success"}'),
   });
-  const data = await getPetShowcaseOrThrow(localTransport(), {
-    path: { petId: "or-throw-success" },
-  });
-  assert.deepEqual(data, { id: "or-throw-success", name: "Success" });
+  const envelope = requiredRecord(
+    await getPetShowcaseOrThrow(localTransport(), { path: { petId: "or-throw-success" } }),
+    "orThrow envelope",
+  );
+  assert.deepEqual(envelope.data, { id: "or-throw-success", name: "Success" });
+  assert.equal(requiredRecord(envelope.meta, "orThrow envelope meta").status, 200);
 
   scriptRoute("GET", "/labels/.or-throw-failure", {
     status: 418,
@@ -1016,7 +1036,7 @@ test("generated OrThrow exports return data and throw ApiError with the failed r
       const preservedResult = apiError.result;
       assert.strictEqual(apiError.result, preservedResult);
       const failed = requiredRecord(preservedResult, "ApiError result");
-      assert.equal(failed.kind, "unmatched-response");
+      assert.equal(failed.outcome, "unmatched");
       assert.equal(failed.status, 418);
       assert.equal(error.name, "ApiError");
       assert.equal(error.message, "Oasts API call failed");

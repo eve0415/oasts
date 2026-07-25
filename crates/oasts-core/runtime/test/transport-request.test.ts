@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
+import type { RequestPhaseFailure } from "../result.ts";
+import { requestFailure as narrowRequestFailure } from "./result-narrowing.ts";
 import {
   createTransport,
   execute,
@@ -31,15 +33,9 @@ function operation(overrides: Partial<OperationDescriptor> = {}): OperationDescr
   };
 }
 
-function requestFailure(result: ExecutionResult | Response): ExecutionResult & {
-  readonly kind: "request-failure";
-} {
+function requestFailure(result: ExecutionResult | Response): RequestPhaseFailure {
   assert.ok(!(result instanceof Response));
-  assert.equal(result.kind, "request-failure");
-  if (result.kind !== "request-failure") {
-    throw new Error("expected a request failure");
-  }
-  return result;
+  return narrowRequestFailure(result);
 }
 
 describe("request serialization and fetch contract", () => {
@@ -532,8 +528,8 @@ describe("request failures", () => {
       await execute(transport, operation({ baseUrl: { kind: "runtime" } }), {}),
     );
 
-    assert.equal(result.error.kind, "request-encode");
-    assert.match(result.error.kind === "request-encode" ? result.error.message : "", /base URL/u);
+    assert.equal(result.outcome, "request-encode");
+    assert.match(result.outcome === "request-encode" ? result.message : "", /base URL/u);
   });
 
   test("returns request-encode for unresolved server state", async () => {
@@ -547,7 +543,7 @@ describe("request failures", () => {
     ] satisfies OperationDescriptor["baseUrl"][]) {
       const result = requestFailure(await execute(createTransport({}), operation({ baseUrl }), {}));
 
-      assert.equal(result.error.kind, "request-encode");
+      assert.equal(result.outcome, "request-encode");
     }
   });
 
@@ -566,7 +562,7 @@ describe("request failures", () => {
       { contentType: "text/plain", body: {} },
     ]) {
       const result = requestFailure(await execute(createTransport({}), descriptor, { body }));
-      assert.equal(result.error.kind, "request-encode");
+      assert.equal(result.outcome, "request-encode");
     }
   });
 
@@ -581,7 +577,7 @@ describe("request failures", () => {
       const result = requestFailure(
         await execute(createTransport({}), descriptor, {}, { headers }),
       );
-      assert.equal(result.error.kind, "request-encode");
+      assert.equal(result.outcome, "request-encode");
     }
   });
 
@@ -594,7 +590,7 @@ describe("request failures", () => {
       ),
     );
 
-    assert.equal(result.error.kind, "request-encode");
+    assert.equal(result.outcome, "request-encode");
   });
 
   test("maps a present-null multipart field to request-encode", async () => {
@@ -612,7 +608,7 @@ describe("request failures", () => {
     const result = requestFailure(
       await execute(createTransport({}), descriptor, { body: { note: null } }),
     );
-    assert.equal(result.error.kind, "request-encode");
+    assert.equal(result.outcome, "request-encode");
   });
 
   test("returns the dependent signal's reason for a pre-dispatch abort", async () => {
@@ -634,16 +630,40 @@ describe("request failures", () => {
       ),
     );
 
-    assert.deepEqual(result.error, { kind: "aborted", reason });
+    assert.equal(result.outcome, "aborted");
+    assert.equal(result.reason, reason);
     assert.equal(sent, false);
   });
 
   test("maps fetch rejection to network and abort-shaped rejection to aborted", async () => {
-    const cause = new Error("offline");
-    const network = requestFailure(
-      await execute(createTransport({ fetch: async () => Promise.reject(cause) }), operation(), {}),
+    // A real fetch() rejection is already a TypeError and passes through by identity.
+    const platformCause = new TypeError("fetch failed");
+    const platform = requestFailure(
+      await execute(
+        createTransport({ fetch: async () => Promise.reject(platformCause) }),
+        operation(),
+        {},
+      ),
     );
-    assert.deepEqual(network.error, { kind: "network", cause });
+    assert.equal(platform.outcome, "network");
+    assert.equal(platform.cause, platformCause);
+
+    // An injected fetch can reject with anything; the declared TypeError is then established by
+    // construction, carrying the original where a platform TypeError carries its own detail.
+    for (const thrown of [new Error("offline"), "offline", null, { code: "ENOTFOUND" }]) {
+      const network = requestFailure(
+        await execute(
+          createTransport({ fetch: async () => Promise.reject(thrown) }),
+          operation(),
+          {},
+        ),
+      );
+      assert.equal(network.outcome, "network");
+      if (network.outcome === "network") {
+        assert.ok(network.cause instanceof TypeError);
+        assert.equal(network.cause.cause, thrown);
+      }
+    }
 
     const reason = new Error("cancelled");
     const controller = new AbortController();
@@ -660,7 +680,8 @@ describe("request failures", () => {
         { signal: controller.signal },
       ),
     );
-    assert.deepEqual(aborted.error, { kind: "aborted", reason });
+    assert.equal(aborted.outcome, "aborted");
+    assert.equal(aborted.reason, reason);
   });
 });
 
@@ -760,10 +781,10 @@ describe("request middleware", () => {
           {},
         ),
       );
-      assert.equal(result.error.kind, "request-middleware");
+      assert.equal(result.outcome, "request-middleware");
       assert.equal(sends, 0);
-      if (hook === hooks[3] && result.error.kind === "request-middleware") {
-        assert.equal(result.error.cause, thrown);
+      if (hook === hooks[3] && result.outcome === "request-middleware") {
+        assert.equal(result.cause, thrown);
       }
     }
   });

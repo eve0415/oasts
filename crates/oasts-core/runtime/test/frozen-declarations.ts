@@ -62,7 +62,7 @@ export const FROZEN_STREAM_FAILURE = `export type StreamFailure =
   | { kind: 'sse'; eventsYielded: number; cause: unknown }
   | { kind: 'raw'; bytesRead: number; cause: unknown };`;
 
-// ResponseMeta, RequestFailure, ResponseFailure, UnknownHttpError, ApiError. Snapshot keeps the declare-class spelling from the spec; runtime ships a real export class with this exact declaration surface (the frozen contract).
+// ResponseMeta, RequestPhaseFailure, ResponsePhaseFailure, UnknownHttpError, SuccessEnvelope, ApiError. Snapshot keeps the declare-class spelling from the spec; runtime ships a real export class with this exact declaration surface (the frozen contract).
 export const FROZEN_FAILURE_MODEL = `export type ResponseMeta = {
   readonly url: string;      // provenance URL: fetchedResponse.url || finalRequest.url, captured
                              // before response middleware — never a replacement's empty url
@@ -70,28 +70,37 @@ export const FROZEN_FAILURE_MODEL = `export type ResponseMeta = {
   readonly headers: Headers; // a decoupled snapshot, never the live Response headers
 };
 
-export type RequestFailure =
-  | { kind: 'auth'; message: string; triedAlternatives: readonly (readonly string[])[]; cause?: unknown }
-  | { kind: 'aborted'; reason: unknown }
-  | { kind: 'network'; cause: unknown }
-  | { kind: 'request-encode'; message: string; cause?: unknown }
-  | { kind: 'request-validation'; issues: readonly StandardSchemaV1.Issue[] }
-  | { kind: 'request-transform'; error: TransformError }
-  | { kind: 'request-middleware'; cause: unknown }
-  | { kind: 'cookie-params-unsendable'; names: readonly string[] };
+export type RequestPhaseFailure =
+  | { outcome: 'auth'; ok: false; message: string; triedAlternatives: readonly (readonly string[])[]; cause?: unknown }
+  | { outcome: 'aborted'; ok: false; reason: unknown }
+  | { outcome: 'timeout'; ok: false; reason: unknown }
+  | { outcome: 'network'; ok: false; cause: TypeError }
+  | { outcome: 'request-encode'; ok: false; message: string; cause?: unknown }
+  | { outcome: 'request-validation'; ok: false; issues: readonly StandardSchemaV1.Issue[] }
+  | { outcome: 'request-transform'; ok: false; error: TransformError }
+  | { outcome: 'request-middleware'; ok: false; cause: unknown }
+  | { outcome: 'cookie-params-unsendable'; ok: false; names: readonly string[] };
 
-export type ResponseFailure =
-  | { kind: 'aborted'; reason: unknown }
-  | { kind: 'response-decode'; message: string; cause?: unknown }
-  | { kind: 'response-validation'; issues: readonly StandardSchemaV1.Issue[] }
-  | { kind: 'response-transform'; error: TransformError }
-  | { kind: 'response-middleware'; cause: unknown };
+export type ResponsePhaseFailure<Match extends string | number> =
+  | { outcome: 'response-aborted'; ok: false; match: Match | null; status: number; reason: unknown; meta: ResponseMeta }
+  | { outcome: 'response-timeout'; ok: false; match: Match | null; status: number; reason: unknown; meta: ResponseMeta }
+  | { outcome: 'response-decode'; ok: false; match: Match | null; status: number; message: string; cause?: unknown; meta: ResponseMeta }
+  | { outcome: 'response-validation'; ok: false; match: Match | null; status: number; issues: readonly StandardSchemaV1.Issue[]; meta: ResponseMeta }
+  | { outcome: 'response-transform'; ok: false; match: Match | null; status: number; error: TransformError; meta: ResponseMeta }
+  | { outcome: 'response-middleware'; ok: false; match: Match | null; status: number; cause: unknown; meta: ResponseMeta };
 
 export type UnknownHttpError =
   | { kind: 'empty';  contentType: string | null; body: undefined }
   | { kind: 'json';   contentType: string;        body: unknown }
   | { kind: 'text';   contentType: string;        body: string }
   | { kind: 'binary'; contentType: string | null; body: ArrayBuffer };
+
+// Distributive over R (the type parameter is naked), so a union of success arms yields one
+// envelope per arm. Per-arm meta typing — plain ResponseMeta, or the TypedHeaders intersection
+// when that arm declares response headers — therefore falls out without being restated.
+export type SuccessEnvelope<R> = R extends { readonly ok: true; readonly data: infer D; readonly meta: infer M }
+  ? { data: D; meta: M }
+  : never;
 
 export declare class ApiError<Failed> extends Error {
   readonly name: 'ApiError';

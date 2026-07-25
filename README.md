@@ -64,7 +64,7 @@ export interface Pet {
 }
 ```
 
-Enable the client artifact and every operation becomes a typed call returning a failure-complete result — documented responses, undocumented statuses, network and decode failures are all in the union, so handling them is exhaustiveness-checking, not guesswork:
+Enable the client artifact and every operation becomes a typed call returning a failure-complete result — documented responses, undocumented statuses, network and decode failures are all in one union keyed by `outcome`, so one `switch` reaches every case and handling them is exhaustiveness-checking, not guesswork:
 
 ```ts
 import { createTransport } from "./generated/runtime/transport.js";
@@ -72,16 +72,33 @@ import { getPetShowcase } from "./generated/client/operations/getpetshowcase.js"
 
 const transport = createTransport({ baseUrl: "https://api.example.com/v1" });
 
-const result = await getPetShowcase(transport, { petId: "42", tags: ["indoor"] });
+const result = await getPetShowcase(transport, {
+  path: { petId: "42" },
+  query: { tags: ["indoor"] },
+});
 
-if (result.ok && result.match === "200" && typeof result.data !== "string") {
-  console.log(result.data.name); // Pet — this 200 declares both JSON and text bodies, and the type makes you handle it
-} else if (result.kind === "response" && !result.ok) {
-  console.error(result.status, result.error.message); // the documented error schema
-} else if (result.kind === "request-failure") {
-  console.error(result.error); // network/serialization failure — a value, not a throw
+switch (result.outcome) {
+  case 200:
+    // this 200 declares both a JSON and a text body, so contentType selects the payload type
+    console.log(result.contentType === "text/plain" ? result.data : result.data.name);
+    break;
+  case "4XX":
+    console.error(result.status, result.error.message); // the documented error schema
+    break;
+  case "unmatched":
+    console.error("undocumented status", result.status);
+    break;
+  case "timeout":
+    break; // retry with backoff
+  case "aborted":
+    break; // the caller cancelled — never auto-retry
+  case "network":
+    console.error(result.cause.message); // a value, not a throw
+    break;
 }
 ```
+
+An exact declared status is a number literal, a range or `default` key and every failure tag a string literal — the two never overlap, so `case 200:` can never also match `"4XX"`.
 
 In CI, fail on drift instead of writing files:
 

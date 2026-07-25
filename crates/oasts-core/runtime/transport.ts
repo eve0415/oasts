@@ -1,9 +1,10 @@
 // Relative `.ts` import suffixes are contractual: the Rust embedding engine rewrites them to the configured emit extension.
 import {
   unwrap,
-  type RequestFailure,
-  type ResponseFailure,
+  type RequestPhaseFailure,
   type ResponseMeta,
+  type ResponsePhaseFailure,
+  type SuccessEnvelope,
   type UnknownHttpError,
 } from './result.ts';
 import {
@@ -194,6 +195,11 @@ export type BodyPlan =
       readonly arms: readonly (readonly [string, BodyPlan])[];
     };
 
+// The non-exact half of the response-key space, statically known to the runtime. Keeping it a
+// literal space rather than plain `string` is what keeps an `outcome` check narrowing: no failure
+// tag and no `'unmatched'` is assignable to it, so testing for one eliminates the HTTP arms.
+export type ResponseRangeKey = `${number}XX` | 'default';
+
 export type ResponsePlan = {
   readonly match: string;
   readonly kind: 'exact' | 'range' | 'default';
@@ -238,48 +244,54 @@ export type OperationDescriptor = {
   readonly fetchDefaults: Readonly<Record<string, unknown>>;
 };
 
+// The erased mirror of a generated operation's result union: same arms, with each operation's
+// declared-key literals widened to `number | string` and its payloads to `unknown`. The precise
+// shape lives in the generated module, which passes it through the `execute<Result>` overload.
 export type ExecutionResult =
   | {
-      readonly kind: 'response';
+      readonly outcome: number | ResponseRangeKey;
       readonly ok: true;
-      readonly match: string;
       readonly status: number;
       readonly data: unknown;
       readonly contentType?: string;
       readonly meta: ResponseMeta;
     }
   | {
-      readonly kind: 'response';
+      readonly outcome: number | ResponseRangeKey;
       readonly ok: false;
-      readonly match: string;
       readonly status: number;
       readonly error: unknown;
       readonly contentType?: string;
       readonly meta: ResponseMeta;
     }
   | {
-      readonly kind: 'unmatched-response';
+      readonly outcome: 'unmatched';
       readonly ok: false;
-      readonly match: null;
       readonly status: number;
       readonly error: UnknownHttpError;
       readonly meta: ResponseMeta;
     }
-  | {
-      readonly kind: 'response-failure';
-      readonly ok: false;
-      readonly match: string | null;
-      readonly status: number;
-      readonly error: ResponseFailure;
-      readonly meta: ResponseMeta;
-    }
-  | {
-      readonly kind: 'request-failure';
-      readonly ok: false;
-      readonly match: null;
-      readonly status: null;
-      readonly error: RequestFailure;
-    };
+  | ResponsePhaseFailure<number | ResponseRangeKey>
+  | RequestPhaseFailure;
+
+// The `outcome` a matched branch is keyed on: the wire status for an exact declared key (the one
+// plan kind carrying one), the declared key itself otherwise. A range key is rebuilt from its
+// leading digit rather than passed through, because `plan.match` is a plain string and rebuilding
+// is what establishes the literal type — no assertion involved.
+function responseOutcome(plan: ResponsePlan): number | ResponseRangeKey {
+  if (plan.status !== null) {
+    return plan.status;
+  }
+  return plan.kind === 'range' ? `${Number(plan.match[0])}XX` : 'default';
+}
+
+// A fired `AbortSignal.timeout(ms)` rejects with a DOMException named TimeoutError; every other
+// abort — including `controller.abort(reason)` with an arbitrary reason — is a cancellation. The
+// test reads the reason's shape, never which API produced the signal, so a manually constructed
+// TimeoutError classifies as a timeout and a polyfill throwing a plain Error does not.
+function isTimeoutReason(reason: unknown): boolean {
+  return reason instanceof DOMException && reason.name === 'TimeoutError';
+}
 
 type SerializedBody = {
   readonly body: BodyInit | null;
@@ -358,7 +370,7 @@ type AuthSelection =
     }
   | {
       readonly kind: 'failure';
-      readonly result: Extract<ExecutionResult, { readonly kind: 'request-failure' }>;
+      readonly result: RequestPhaseFailure;
     };
 
 type AuthSource =
@@ -371,28 +383,16 @@ type AvailableAuthSource = Exclude<AuthSource, { readonly kind: 'missing' }>;
 function authFailureResult(
   message: string,
   triedAlternatives: readonly (readonly string[])[],
-): Extract<ExecutionResult, { readonly kind: 'request-failure' }> {
-  return {
-    kind: 'request-failure',
-    ok: false,
-    match: null,
-    status: null,
-    error: { kind: 'auth', message, triedAlternatives },
-  };
+): RequestPhaseFailure {
+  return { outcome: 'auth', ok: false, message, triedAlternatives };
 }
 
 function providerAuthFailureResult(
   message: string,
   triedAlternatives: readonly (readonly string[])[],
   cause: unknown,
-): Extract<ExecutionResult, { readonly kind: 'request-failure' }> {
-  return {
-    kind: 'request-failure',
-    ok: false,
-    match: null,
-    status: null,
-    error: { kind: 'auth', message, triedAlternatives, cause },
-  };
+): RequestPhaseFailure {
+  return { outcome: 'auth', ok: false, message, triedAlternatives, cause };
 }
 
 function isAuthProvider(value: unknown): value is AuthProvider {
@@ -699,44 +699,31 @@ function isParamValue(value: unknown): value is ParamValue {
   return isRecord(value) && Object.values(value).every(isParamPrimitive);
 }
 
-function encodeFailure(cause: unknown): ExecutionResult {
+function encodeFailure(cause: unknown): RequestPhaseFailure {
   const message = cause instanceof Error ? cause.message : 'request encoding failed';
-  return {
-    kind: 'request-failure',
-    ok: false,
-    match: null,
-    status: null,
-    error: { kind: 'request-encode', message, cause },
-  };
+  return { outcome: 'request-encode', ok: false, message, cause };
 }
 
-function requestMiddlewareFailure(cause: unknown): ExecutionResult {
-  return {
-    kind: 'request-failure',
-    ok: false,
-    match: null,
-    status: null,
-    error: { kind: 'request-middleware', cause },
-  };
+function requestMiddlewareFailure(cause: unknown): RequestPhaseFailure {
+  return { outcome: 'request-middleware', ok: false, cause };
 }
 
-function abortedRequest(reason: unknown): ExecutionResult {
-  return {
-    kind: 'request-failure',
-    ok: false,
-    match: null,
-    status: null,
-    error: { kind: 'aborted', reason },
-  };
+// Branches on the whole object literal, not on a computed `outcome` value: a conditional in the
+// discriminant position widens it to `string` and stops the literal from selecting a union member.
+function abortedRequest(reason: unknown): RequestPhaseFailure {
+  return isTimeoutReason(reason)
+    ? { outcome: 'timeout', ok: false, reason }
+    : { outcome: 'aborted', ok: false, reason };
 }
 
-function networkFailure(cause: unknown): ExecutionResult {
+// A failed `fetch()` is guaranteed to reject with a TypeError, so the real thing passes through by
+// identity. `transport.fetch` is an injection seam that can throw anything, so anything else is
+// wrapped rather than asserted — establishing the declared type by construction.
+function networkFailure(cause: unknown): RequestPhaseFailure {
   return {
-    kind: 'request-failure',
+    outcome: 'network',
     ok: false,
-    match: null,
-    status: null,
-    error: { kind: 'network', cause },
+    cause: cause instanceof TypeError ? cause : new TypeError('fetch failed', { cause }),
   };
 }
 
@@ -1333,20 +1320,44 @@ function responseMeta(provenanceUrl: string, response: Response): ResponseMeta {
   };
 }
 
-function responseFailureResult(
+// The three fields every response-phase failure carries: which declared branch was selected (null
+// when none was), the wire status, and the metadata snapshot. Spread into each tagged constructor
+// so a new failure tag cannot silently omit one.
+type ResponseFailureBase = {
+  readonly match: number | ResponseRangeKey | null;
+  readonly status: number;
+  readonly meta: ResponseMeta;
+};
+
+function responseFailureBase(
   provenanceUrl: string,
   response: Response,
-  match: string | null,
-  error: ResponseFailure,
+  match: number | ResponseRangeKey | null,
+): ResponseFailureBase {
+  return { match, status: response.status, meta: responseMeta(provenanceUrl, response) };
+}
+
+function responseMiddlewareFailure(
+  provenanceUrl: string,
+  response: Response,
+  cause: unknown,
 ): ExecutionResult {
-  return {
-    kind: 'response-failure',
-    ok: false,
-    match,
-    status: response.status,
-    error,
-    meta: responseMeta(provenanceUrl, response),
-  };
+  // No branch was selected yet — middleware runs before status matching — so `match` is null.
+  return { outcome: 'response-middleware', ok: false, ...responseFailureBase(provenanceUrl, response, null), cause };
+}
+
+// Branches on the whole object literal for the same reason `abortedRequest` does: a conditional in
+// the discriminant position widens `outcome` to `string`.
+function responseAbortFailure(
+  provenanceUrl: string,
+  response: Response,
+  match: number | ResponseRangeKey | null,
+  reason: unknown,
+): ExecutionResult {
+  const base = responseFailureBase(provenanceUrl, response, match);
+  return isTimeoutReason(reason)
+    ? { outcome: 'response-timeout', ok: false, ...base, reason }
+    : { outcome: 'response-aborted', ok: false, ...base, reason };
 }
 
 function matchedResponsePlan(
@@ -1446,67 +1457,37 @@ function matchedResponseResult(
   selectedContentType: string | null,
   meta: ResponseMeta,
 ): ExecutionResult {
+  const outcome = responseOutcome(plan);
   const ok = status >= 200 && status <= 299;
   if (ok) {
     if (plan.hasContentTypeDiscriminant && selectedContentType !== null) {
-      return {
-        kind: 'response',
-        ok: true,
-        match: plan.match,
-        status,
-        data: payload,
-        contentType: selectedContentType,
-        meta,
-      };
+      return { outcome, ok: true, status, data: payload, contentType: selectedContentType, meta };
     }
-    return {
-      kind: 'response',
-      ok: true,
-      match: plan.match,
-      status,
-      data: payload,
-      meta,
-    };
+    return { outcome, ok: true, status, data: payload, meta };
   }
   if (plan.hasContentTypeDiscriminant && selectedContentType !== null) {
-    return {
-      kind: 'response',
-      ok: false,
-      match: plan.match,
-      status,
-      error: payload,
-      contentType: selectedContentType,
-      meta,
-    };
+    return { outcome, ok: false, status, error: payload, contentType: selectedContentType, meta };
   }
-  return {
-    kind: 'response',
-    ok: false,
-    match: plan.match,
-    status,
-    error: payload,
-    meta,
-  };
+  return { outcome, ok: false, status, error: payload, meta };
 }
 
 function decodeFailure(
   provenanceUrl: string,
   response: Response,
-  match: string | null,
+  match: number | ResponseRangeKey | null,
   message: string,
   cause?: unknown,
 ): ExecutionResult {
-  const error: ResponseFailure =
-    cause === undefined
-      ? { kind: 'response-decode', message }
-      : { kind: 'response-decode', message, cause };
-  return responseFailureResult(provenanceUrl, response, match, error);
+  const base = responseFailureBase(provenanceUrl, response, match);
+  return cause === undefined
+    ? { outcome: 'response-decode', ok: false, ...base, message }
+    : { outcome: 'response-decode', ok: false, ...base, message, cause };
 }
 
 async function responseBytes(
   provenanceUrl: string,
   response: Response,
-  match: string | null,
+  match: number | ResponseRangeKey | null,
   signal: AbortSignal,
 ): Promise<ArrayBuffer | ExecutionResult> {
   if (response.body === null) {
@@ -1516,10 +1497,7 @@ async function responseBytes(
     return await response.arrayBuffer();
   } catch (cause) {
     if (signal.aborted) {
-      return responseFailureResult(provenanceUrl, response, match, {
-        kind: 'aborted',
-        reason: signal.reason,
-      });
+      return responseAbortFailure(provenanceUrl, response, match, signal.reason);
     }
     return decodeFailure(provenanceUrl, response, match, 'response body read failed', cause);
   }
@@ -1531,7 +1509,7 @@ async function assembleResponse(
   plan: ResponsePlan | null,
   signal: AbortSignal,
 ): Promise<ExecutionResult> {
-  const match = plan?.match ?? null;
+  const match = plan === null ? null : responseOutcome(plan);
   const rawContentType = response.headers.get('Content-Type');
   if (
     plan !== null &&
@@ -1542,7 +1520,7 @@ async function assembleResponse(
     return decodeFailure(
       provenanceUrl,
       response,
-      plan.match,
+      match,
       `bodyless status ${String(response.status)} cannot satisfy declared content for ${plan.match}`,
     );
   }
@@ -1555,9 +1533,8 @@ async function assembleResponse(
     try {
       const error = await unknownHttpError(read, rawContentType);
       return {
-        kind: 'unmatched-response',
+        outcome: 'unmatched',
         ok: false,
-        match: null,
         status: response.status,
         error,
         meta: responseMeta(provenanceUrl, response),
@@ -1578,7 +1555,7 @@ async function assembleResponse(
       return decodeFailure(
         provenanceUrl,
         response,
-        plan.match,
+        match,
         `bodyless response branch ${plan.match} received body bytes`,
       );
     }
@@ -1595,7 +1572,7 @@ async function assembleResponse(
       return decodeFailure(
         provenanceUrl,
         response,
-        plan.match,
+        match,
         `no-payload response branch ${plan.match} received body bytes`,
       );
     }
@@ -1613,7 +1590,7 @@ async function assembleResponse(
     return decodeFailure(
       provenanceUrl,
       response,
-      plan.match,
+      match,
       rawContentType === null
         ? 'response Content-Type is missing for a declared payload'
         : `response Content-Type ${rawContentType} does not match declared content`,
@@ -1632,7 +1609,7 @@ async function assembleResponse(
     return decodeFailure(
       provenanceUrl,
       response,
-      plan.match,
+      match,
       `response body decoding failed for ${selected[0]}`,
       cause,
     );
@@ -1737,19 +1714,11 @@ type CookieRequestPlan =
   | { readonly kind: 'request'; readonly request: Request }
   | {
       readonly kind: 'failure';
-      readonly result: Extract<ExecutionResult, { readonly kind: 'request-failure' }>;
+      readonly result: RequestPhaseFailure;
     };
 
-function cookieUnsendableResult(
-  names: readonly string[],
-): Extract<ExecutionResult, { readonly kind: 'request-failure' }> {
-  return {
-    kind: 'request-failure',
-    ok: false,
-    match: null,
-    status: null,
-    error: { kind: 'cookie-params-unsendable', names },
-  };
+function cookieUnsendableResult(names: readonly string[]): RequestPhaseFailure {
+  return { outcome: 'cookie-params-unsendable', ok: false, names };
 }
 
 // Layered cookie-delivery guard. It never dispatches and never sniffs the user agent: it builds the
@@ -1912,29 +1881,19 @@ export async function execute<S extends string = never>(
       }
     }
   } catch (cause) {
-    return responseFailureResult(provenanceUrl, finalResponse, null, {
-      kind: 'response-middleware',
-      cause,
-    });
+    return responseMiddlewareFailure(provenanceUrl, finalResponse, cause);
   }
 
   const plan = matchedResponsePlan(descriptor, finalResponse.status);
   return assembleResponse(provenanceUrl, finalResponse, plan, finalRequest.signal);
 }
 
-type SuccessfulData<Result extends ExecutionResult> = Result extends {
-  readonly ok: true;
-  readonly data: infer Data;
-}
-  ? Data
-  : never;
-
 export function executeOrThrow<Result extends ExecutionResult, S extends string = never>(
   transport: Transport<S>,
   descriptor: OperationDescriptor,
   input: Readonly<Record<string, unknown>>,
   options?: CallOptions,
-): Promise<SuccessfulData<Result>>;
+): Promise<SuccessEnvelope<Result>>;
 export function executeOrThrow<S extends string = never>(
   transport: Transport<S>,
   descriptor: OperationDescriptor,

@@ -15,7 +15,9 @@ use crate::ir::{
     Operation, ParamLocation, ParamStyle, PrimitiveType, SchemaNode, SecKind, SegmentPart,
     ServerVariable,
 };
-use crate::media::is_json;
+use crate::media::{is_json, media_essence};
+
+use super::media_tag;
 
 use super::model::EmissionModel;
 use super::runtime_assets::{RuntimeSelection, emit_runtime_files};
@@ -267,7 +269,9 @@ fn emit_operation(
         .any(|response| response.has_headers);
     let mut component_imports = BTreeMap::<String, BTreeSet<String>>::new();
     let documentation = model.config.documentation.clone();
-    let input = {
+    // Everything that renders a component type lives in this one borrow scope, because the scope
+    // has to end before `model.header()` can reborrow the model mutably.
+    let (input, result_type, envelope_type) = {
         let renderer = TypesEmitter::new(model);
         for parameter in &plan.param_plans {
             renderer.collect_operation_imports(
@@ -279,7 +283,27 @@ fn emit_operation(
         if let Some(body) = &plan.body_plan {
             collect_body_imports(&renderer, body, &mut component_imports);
         }
-        render_input(&renderer, operation, plan, &stem, &documentation)
+        // A content-type-discriminated branch renders each media entry's own schema inline instead
+        // of the status-wide alias, so those entries' component references import from here.
+        for response in &plan.response_table {
+            if response.content_type_discriminated
+                && matches!(response.payload, PayloadDisposition::Payload)
+            {
+                for entry in &response.media {
+                    renderer.collect_operation_imports(
+                        &entry.schema,
+                        TypePosition::Response,
+                        &mut component_imports,
+                    );
+                }
+            }
+        }
+        let arms = response_result_arms(&renderer, plan, &stem);
+        (
+            render_input(&renderer, operation, plan, &stem, &documentation),
+            render_result_type(&arms, plan, &stem),
+            successful_envelope_union(&arms),
+        )
     };
     let mut function_docs_operation = operation.clone();
     for parameter in &mut function_docs_operation.parameters {
@@ -330,7 +354,7 @@ fn emit_operation(
         output.push_str(";\n");
     }
     output.push_str(
-        "import type { RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError } from ",
+        "import type { RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError } from ",
     );
     output.push_str(&render_ts_string(&format!(
         "../../{runtime_directory}/result{extension}"
@@ -407,7 +431,7 @@ fn emit_operation(
         ClientDocKind::Declaration,
         unchecked_response,
     );
-    write_result_type(&mut output, plan, &stem);
+    output.push_str(&result_type);
     output.push('\n');
 
     output.push_str(&render_call_args(&plan.auth_plan, auth_enforcement, &stem));
@@ -456,7 +480,7 @@ fn emit_operation(
     output.push_str("Input, ...args: ");
     output.push_str(&stem);
     output.push_str("CallArgs<S>): Promise<");
-    output.push_str(&successful_payload_union(plan, &stem));
+    output.push_str(&envelope_type);
     output.push_str("> {\n");
     output.push_str(&throw_function_body(
         allocated_name,
@@ -480,7 +504,17 @@ struct RequestCheck {
     guarded: bool,
 }
 
+/// One JSON body validator call inside a documented branch: which `contentType` selects it (absent
+/// when the branch is not content-type-discriminated, so the call is unguarded), the validator to
+/// call, and which side of the branch carries the body.
+struct BodyCheck {
+    content_type: Option<String>,
+    validator: String,
+    body: ResponseBody,
+}
+
 /// Which side of a documented `response` branch carries the decoded JSON body to validate.
+#[derive(Clone, Copy)]
 enum ResponseBody {
     /// A 2xx branch: the body lives in `result.data`.
     Data,
@@ -495,8 +529,10 @@ enum ResponseBody {
 /// `responseIssues` buffer inside the branch's `if (result.match === ...)` arm. At least one of
 /// the two is always present — a branch with neither never reaches the emitted checks.
 struct ResponseCheck {
-    match_key: String,
-    body: Option<(String, ResponseBody)>,
+    /// The rendered `outcome` literal this branch is keyed on — the same value the result union's
+    /// arm carries, so the emitted guard and the emitted arm can never disagree.
+    outcome: String,
+    body: Vec<BodyCheck>,
     /// The `<...>Headers` validator, called as `validator(result.meta.headers, [], responseIssues)`
     /// after the body check — present exactly when the response declares a header.
     headers_validator: Option<String>,
@@ -572,15 +608,15 @@ fn response_validation_checks(
     plan.response_table
         .iter()
         .filter_map(|response| {
-            let body = body_validation_check(response, stem);
+            let body = body_validation_checks(response, stem);
             let headers_validator = response
                 .has_headers
                 .then(|| format!("validate{}Headers", response_type_name(stem, response)));
-            if body.is_none() && headers_validator.is_none() {
+            if body.is_empty() && headers_validator.is_none() {
                 return None;
             }
             Some(ResponseCheck {
-                match_key: response.match_key.clone(),
+                outcome: outcome_literal(response),
                 body,
                 headers_validator,
             })
@@ -588,30 +624,46 @@ fn response_validation_checks(
         .collect()
 }
 
-/// The JSON body validator call for one response branch — `None` when the decoded body is not
-/// unconditionally JSON: a content-type-discriminated branch, a non-JSON media, or a response
-/// with no payload at all.
-fn body_validation_check(response: &ResponsePlan, stem: &str) -> Option<(String, ResponseBody)> {
-    if !matches!(response.payload, PayloadDisposition::Payload { .. })
-        || response.content_type_discriminated
-        || !response.media.iter().any(|media| is_json(&media.media))
-    {
-        return None;
+/// The JSON body validator calls for one response branch. Empty when the branch carries no JSON
+/// payload at all. A branch that is not content-type-discriminated yields one unguarded call; a
+/// discriminated branch yields one call per JSON media entry, each gated on that entry's
+/// `contentType`, so the schema that runs is the one the selected entry declared.
+///
+/// The two naming cases mirror the validators emitter: one JSON entry keeps the plain
+/// `validate{Stem}Response{Suffix}` name, and two or more are tagged by media.
+fn body_validation_checks(response: &ResponsePlan, stem: &str) -> Vec<BodyCheck> {
+    if !matches!(response.payload, PayloadDisposition::Payload) {
+        return Vec::new();
     }
-    let body = match response.kind {
-        ResponseMatchKind::Default => ResponseBody::Both,
-        _ => {
-            if is_successful_response(response.kind, &response.match_key) {
-                ResponseBody::Data
+    let json = response
+        .media
+        .iter()
+        .filter(|media| is_json(&media.media))
+        .collect::<Vec<_>>();
+    if json.is_empty() {
+        return Vec::new();
+    }
+    let body = response_body_side(response.kind, &response.match_key);
+    let base = response_type_name(stem, response);
+    if !response.content_type_discriminated {
+        return vec![BodyCheck {
+            content_type: None,
+            validator: format!("validate{base}"),
+            body,
+        }];
+    }
+    let tagged = json.len() > 1;
+    json.into_iter()
+        .map(|media| BodyCheck {
+            content_type: Some(media.media.clone()),
+            validator: if tagged {
+                format!("validate{base}{}", media_tag(&media.media))
             } else {
-                ResponseBody::Error
-            }
-        }
-    };
-    Some((
-        format!("validate{}", response_type_name(stem, response)),
-        body,
-    ))
+                format!("validate{base}")
+            },
+            body,
+        })
+        .collect()
 }
 
 enum InputMember<'a> {
@@ -659,7 +711,7 @@ fn write_validator_imports(
         .chain(
             response
                 .iter()
-                .filter_map(|check| check.body.as_ref().map(|(validator, _)| validator.as_str())),
+                .flat_map(|check| check.body.iter().map(|body| body.validator.as_str())),
         )
         .chain(
             response
@@ -705,7 +757,9 @@ fn result_function_body(
             }
         }
         body.push_str("  if (requestIssues.length > 0) {\n");
-        body.push_str("    return { kind: \"request-failure\", ok: false, match: null, status: null, error: { kind: \"request-validation\", issues: requestIssues } };\n");
+        body.push_str(
+            "    return { outcome: \"request-validation\", ok: false, issues: requestIssues };\n",
+        );
         body.push_str("  }\n");
     }
     if response.is_empty() {
@@ -717,54 +771,100 @@ fn result_function_body(
     body.push_str(&format!(
         "  const result = await execute<{stem}Result>(transport, descriptor, input, args[0]);\n"
     ));
-    body.push_str("  if (result.kind === \"response\") {\n");
+    // The outer guard admits exactly the branches that carry a check, which is what narrows
+    // `result` to the arms with a `status` and a `meta` for the failure return below. A single
+    // checked branch needs no inner test — the guard already established it.
+    body.push_str("  if (");
+    body.push_str(
+        &response
+            .iter()
+            .map(|check| format!("result.outcome === {}", check.outcome))
+            .collect::<Vec<_>>()
+            .join(" || "),
+    );
+    body.push_str(") {\n");
     body.push_str("    const responseIssues: Issue[] = [];\n");
+    let branched = response.len() > 1;
+    let indent = if branched { "      " } else { "    " };
     for (index, check) in response.iter().enumerate() {
-        if index == 0 {
+        if branched {
+            let keyword = if index == 0 {
+                "    if"
+            } else {
+                "    } else if"
+            };
             body.push_str(&format!(
-                "    if (result.match === {}) {{\n",
-                render_ts_string(&check.match_key)
-            ));
-        } else {
-            body.push_str(&format!(
-                "    }} else if (result.match === {}) {{\n",
-                render_ts_string(&check.match_key)
+                "{keyword} (result.outcome === {}) {{\n",
+                check.outcome
             ));
         }
-        if let Some((validator, kind)) = &check.body {
-            match kind {
-                ResponseBody::Data => body.push_str(&format!(
-                    "      {validator}(result.data, [], responseIssues);\n"
-                )),
-                ResponseBody::Error => body.push_str(&format!(
-                    "      {validator}(result.error, [], responseIssues);\n"
-                )),
-                ResponseBody::Both => {
-                    body.push_str("      if (result.ok) {\n");
+        for (media_index, media_check) in check.body.iter().enumerate() {
+            // A content-type-discriminated branch gates each call on the entry that was actually
+            // selected, so the schema that runs is the one that entry declared.
+            let indent = match &media_check.content_type {
+                Some(content_type) => {
+                    let keyword = if media_index == 0 { "if" } else { "} else if" };
                     body.push_str(&format!(
-                        "        {validator}(result.data, [], responseIssues);\n"
+                        "{indent}{keyword} (result.contentType === {}) {{\n",
+                        render_ts_string(content_type)
                     ));
-                    body.push_str("      } else {\n");
-                    body.push_str(&format!(
-                        "        {validator}(result.error, [], responseIssues);\n"
-                    ));
-                    body.push_str("      }\n");
+                    &format!("{indent}  ")
                 }
-            }
+                None => indent,
+            };
+            write_body_validator_call(&mut body, indent, media_check);
+        }
+        if check
+            .body
+            .last()
+            .is_some_and(|media_check| media_check.content_type.is_some())
+        {
+            body.push_str(&format!("{indent}}}\n"));
         }
         if let Some(headers_validator) = &check.headers_validator {
             body.push_str(&format!(
-                "      {headers_validator}(result.meta.headers, [], responseIssues);\n"
+                "{indent}{headers_validator}(result.meta.headers, [], responseIssues);\n"
             ));
         }
     }
-    body.push_str("    }\n");
+    if branched {
+        body.push_str("    }\n");
+    }
     body.push_str("    if (responseIssues.length > 0) {\n");
-    body.push_str("      return { kind: \"response-failure\", ok: false, match: result.match, status: result.status, error: { kind: \"response-validation\", issues: responseIssues }, meta: result.meta };\n");
+    body.push_str("      return { outcome: \"response-validation\", ok: false, match: result.outcome, status: result.status, issues: responseIssues, meta: result.meta };\n");
     body.push_str("    }\n");
     body.push_str("  }\n");
     body.push_str("  return result;\n");
     body
+}
+
+/// One validator call, selecting `result.data` or `result.error` by the branch's side — or both,
+/// chosen at runtime on `result.ok`, for a `default` branch that spans them.
+fn write_body_validator_call(body: &mut String, indent: &str, check: &BodyCheck) {
+    let validator = &check.validator;
+    match check.body {
+        ResponseBody::Data => {
+            body.push_str(&format!(
+                "{indent}{validator}(result.data, [], responseIssues);\n"
+            ));
+        }
+        ResponseBody::Error => {
+            body.push_str(&format!(
+                "{indent}{validator}(result.error, [], responseIssues);\n"
+            ));
+        }
+        ResponseBody::Both => {
+            body.push_str(&format!("{indent}if (result.ok) {{\n"));
+            body.push_str(&format!(
+                "{indent}  {validator}(result.data, [], responseIssues);\n"
+            ));
+            body.push_str(&format!("{indent}}} else {{\n"));
+            body.push_str(&format!(
+                "{indent}  {validator}(result.error, [], responseIssues);\n"
+            ));
+            body.push_str(&format!("{indent}}}\n"));
+        }
+    }
 }
 
 /// The orThrow function body: today's direct `executeOrThrow` when nothing is bound, else `unwrap`
@@ -799,7 +899,11 @@ fn operation_type_imports(plan: &OperationPlan, stem: &str) -> BTreeSet<String> 
         names.insert(format!("{stem}Request"));
     }
     for response in &plan.response_table {
-        if matches!(response.payload, PayloadDisposition::Payload { .. }) {
+        // A content-type-discriminated branch renders each entry's own schema inline, so the
+        // status-wide alias has no reader and importing it would be an unused import.
+        if matches!(response.payload, PayloadDisposition::Payload)
+            && !response.content_type_discriminated
+        {
             names.insert(response_type_name(stem, response));
         }
         if response.has_headers {
@@ -1036,129 +1140,168 @@ fn render_form_field_input(
     output
 }
 
-fn write_result_type(output: &mut String, plan: &OperationPlan, stem: &str) {
-    output.push_str("export type ");
-    output.push_str(stem);
-    output.push_str("Result =\n");
-    for response in &plan.response_table {
-        write_response_result_arms(output, response, stem);
-    }
-    output.push_str("  | { kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }\n");
-    output.push_str("  | { kind: \"response-failure\"; ok: false; match: ");
-    if plan.response_table.is_empty() {
-        output.push_str("null");
-    } else {
-        output.push_str(
-            &plan
-                .response_table
-                .iter()
-                .map(|response| render_ts_string(&response.match_key))
-                .chain(std::iter::once("null".to_owned()))
-                .collect::<Vec<_>>()
-                .join(" | "),
-        );
-    }
-    output.push_str("; status: number; error: ResponseFailure; meta: ResponseMeta }\n");
-    output.push_str("  | { kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure };\n");
+/// One emitted HTTP arm of a per-operation result union. The result type, the `orThrow` envelope
+/// type, and the validation binding are all built from this one list, so the three can never
+/// disagree about which arms exist or what each carries.
+struct ResultArm {
+    /// The rendered `outcome` literal: a bare number for an exact declared status, a quoted string
+    /// for a range or `default`. Number literals and string literals never overlap, which is what
+    /// keeps the declared-key space disjoint from the failure-tag space by construction.
+    outcome: String,
+    ok: bool,
+    /// The rendered `status` type: a numeric literal for an exact key, `number` for a range or
+    /// `default`, whose wire status is only known at runtime.
+    status: String,
+    payload: String,
+    content_type: Option<String>,
+    headers_interface: Option<String>,
 }
 
-fn write_response_result_arms(output: &mut String, response: &ResponsePlan, stem: &str) {
-    let statuses = match response.kind {
+fn response_result_arms(
+    renderer: &TypesEmitter<'_, '_, '_>,
+    plan: &OperationPlan,
+    stem: &str,
+) -> Vec<ResultArm> {
+    let mut arms = Vec::new();
+    for response in &plan.response_table {
+        push_response_result_arms(&mut arms, renderer, response, stem);
+    }
+    arms
+}
+
+fn push_response_result_arms(
+    arms: &mut Vec<ResultArm>,
+    renderer: &TypesEmitter<'_, '_, '_>,
+    response: &ResponsePlan,
+    stem: &str,
+) {
+    let status = match response.kind {
         ResponseMatchKind::Exact => response.match_key.clone(),
         ResponseMatchKind::Range | ResponseMatchKind::Default => "number".to_owned(),
     };
-    let payload = response_payload_type(response, stem);
+    let outcome = outcome_literal(response);
     // Only computed when the response declares a header, keeping a header-less response's arms
     // free of any new allocation on this path.
     let headers_interface = response
         .has_headers
         .then(|| format!("{}Headers", response_type_name(stem, response)));
-    let media = if matches!(response.payload, PayloadDisposition::Payload { .. })
-        && response.content_type_discriminated
-    {
-        response
-            .media
-            .iter()
-            .map(|media| Some(media.media.as_str()))
-            .collect::<Vec<_>>()
-    } else {
-        vec![None]
+    // A content-type-discriminated payload is one arm per declared media entry, each typed to that
+    // entry's own schema through the renderer the types artifact uses — so the two artifacts can
+    // never render the same entry differently. Everything else keeps the status-wide alias.
+    let media: Vec<(Option<String>, String)> =
+        if matches!(response.payload, PayloadDisposition::Payload)
+            && response.content_type_discriminated
+        {
+            response
+                .media
+                .iter()
+                .map(|entry| {
+                    (
+                        Some(entry.media.clone()),
+                        renderer.media_payload_type(
+                            media_essence(&entry.media),
+                            &entry.schema,
+                            TypePosition::Response,
+                        ),
+                    )
+                })
+                .collect()
+        } else {
+            vec![(None, response_payload_type(response, stem))]
+        };
+    // `default` is the one key that spans both outcomes, so each of its media entries yields a
+    // success arm and a failure arm; every other key resolves to exactly one.
+    let outcomes: &[bool] = match response_body_side(response.kind, &response.match_key) {
+        ResponseBody::Both => &[true, false],
+        ResponseBody::Data => &[true],
+        ResponseBody::Error => &[false],
     };
-    match response.kind {
-        ResponseMatchKind::Default => {
-            for content_type in &media {
-                write_response_result_arm(
-                    output,
-                    response,
-                    &statuses,
-                    &payload,
-                    true,
-                    *content_type,
-                    headers_interface.as_deref(),
-                );
-                write_response_result_arm(
-                    output,
-                    response,
-                    &statuses,
-                    &payload,
-                    false,
-                    *content_type,
-                    headers_interface.as_deref(),
-                );
-            }
-        }
-        ResponseMatchKind::Exact | ResponseMatchKind::Range => {
-            let ok = if response.kind == ResponseMatchKind::Exact {
-                response
-                    .match_key
-                    .parse::<u16>()
-                    .is_ok_and(|status| (200..=299).contains(&status))
-            } else {
-                response.match_key.starts_with('2')
-            };
-            for content_type in media {
-                write_response_result_arm(
-                    output,
-                    response,
-                    &statuses,
-                    &payload,
-                    ok,
-                    content_type,
-                    headers_interface.as_deref(),
-                );
-            }
+    for (content_type, payload) in media {
+        for &ok in outcomes {
+            arms.push(ResultArm {
+                outcome: outcome.clone(),
+                ok,
+                status: status.clone(),
+                payload: payload.clone(),
+                content_type: content_type.clone(),
+                headers_interface: headers_interface.clone(),
+            });
         }
     }
 }
 
-fn write_response_result_arm(
-    output: &mut String,
-    response: &ResponsePlan,
-    status: &str,
-    payload: &str,
-    ok: bool,
-    content_type: Option<&str>,
-    headers_interface: Option<&str>,
-) {
-    output.push_str("  | { kind: \"response\"; ok: ");
-    output.push_str(if ok { "true" } else { "false" });
-    output.push_str("; match: ");
-    output.push_str(&render_ts_string(&response.match_key));
+fn render_result_type(arms: &[ResultArm], plan: &OperationPlan, stem: &str) -> String {
+    let mut output = String::new();
+    output.push_str("export type ");
+    output.push_str(stem);
+    output.push_str("Result =\n");
+    for arm in arms {
+        write_response_result_arm(&mut output, arm);
+    }
+    output
+        .push_str("  | { outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }\n");
+    output.push_str("  | ResponsePhaseFailure<");
+    output.push_str(&outcome_space(plan));
+    output.push_str(">\n");
+    output.push_str("  | RequestPhaseFailure;\n");
+    output
+}
+
+/// The operation's declared-key literal union, as `ResponsePhaseFailure`'s `Match` argument.
+/// `never` when the operation documents no response at all, which leaves those arms' `match` as
+/// `null` — the only branch identity there is.
+fn outcome_space(plan: &OperationPlan) -> String {
+    if plan.response_table.is_empty() {
+        return "never".to_owned();
+    }
+    plan.response_table
+        .iter()
+        .map(outcome_literal)
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// The `outcome` value one declared response is keyed on: an exact status is the number literal a
+/// caller writes as `case 200:`, a range or `default` key its own string literal.
+fn outcome_literal(response: &ResponsePlan) -> String {
+    match response.kind {
+        // Exact keys are three ASCII digits with a 1-5 lead, so they are always valid — and
+        // leading-zero-free — TypeScript number literals.
+        ResponseMatchKind::Exact => response.match_key.clone(),
+        ResponseMatchKind::Range | ResponseMatchKind::Default => {
+            render_ts_string(&response.match_key)
+        }
+    }
+}
+
+fn write_response_result_arm(output: &mut String, arm: &ResultArm) {
+    output.push_str("  | { outcome: ");
+    output.push_str(&arm.outcome);
+    output.push_str("; ok: ");
+    output.push_str(if arm.ok { "true" } else { "false" });
     output.push_str("; status: ");
-    output.push_str(status);
-    output.push_str(if ok { "; data: " } else { "; error: " });
-    output.push_str(payload);
-    if let Some(content_type) = content_type {
+    output.push_str(&arm.status);
+    output.push_str(if arm.ok { "; data: " } else { "; error: " });
+    output.push_str(&arm.payload);
+    if let Some(content_type) = &arm.content_type {
         output.push_str("; contentType: ");
         output.push_str(&render_ts_string(content_type));
     }
+    output.push_str("; meta: ");
+    output.push_str(&meta_type(arm.headers_interface.as_deref()));
+    output.push_str(" }\n");
+}
+
+/// The `meta` type one arm carries: plain `ResponseMeta`, or the narrowing intersection when that
+/// arm's response declares headers. Shared with the `orThrow` envelope so the typed headers
+/// reachable through the result form's `meta.headers` are equally reachable through the thrown
+/// form's resolved `.meta.headers`.
+fn meta_type(headers_interface: Option<&str>) -> String {
     match headers_interface {
-        Some(interface_name) => {
-            output.push_str("; meta: ResponseMeta & { readonly headers: TypedHeaders<keyof ");
-            output.push_str(interface_name);
-            output.push_str(" & string> } }\n");
-        }
-        None => output.push_str("; meta: ResponseMeta }\n"),
+        Some(interface_name) => format!(
+            "ResponseMeta & {{ readonly headers: TypedHeaders<keyof {interface_name} & string> }}"
+        ),
+        None => "ResponseMeta".to_owned(),
     }
 }
 
@@ -1167,7 +1310,7 @@ fn response_payload_type(response: &ResponsePlan, stem: &str) -> String {
         PayloadDisposition::NoPayload | PayloadDisposition::StaticBodyless => {
             "undefined".to_owned()
         }
-        PayloadDisposition::Payload { .. } => response_type_name(stem, response),
+        PayloadDisposition::Payload => response_type_name(stem, response),
     }
 }
 
@@ -1181,34 +1324,48 @@ fn response_type_name(stem: &str, response: &ResponsePlan) -> String {
     format!("{stem}Response{suffix}")
 }
 
-/// Whether a response branch carries a 2xx (success) payload: an exact status in 200-299, a range
-/// beginning with `2`, or the catch-all `default` (which the successful-union path treats as
-/// success). `response_validation_checks` handles `default` on its own before calling, so there the
-/// helper only classifies the exact/range branches.
-fn is_successful_response(kind: ResponseMatchKind, match_key: &str) -> bool {
-    match kind {
+/// Which side of the `ok` split a declared response key resolves to: a 2xx exact status or a
+/// `2XX`-style range carries the success payload, any other declared status the error payload, and
+/// `default` spans both because one `default` branch can cover 2xx and non-2xx statuses alike.
+/// One classification for both readers — the arm writer, which turns it into how many arms the key
+/// emits, and the validation binding, which turns it into which field it checks.
+fn response_body_side(kind: ResponseMatchKind, match_key: &str) -> ResponseBody {
+    let successful = match kind {
+        ResponseMatchKind::Default => return ResponseBody::Both,
         ResponseMatchKind::Exact => match_key
             .parse::<u16>()
             .is_ok_and(|status| (200..=299).contains(&status)),
         ResponseMatchKind::Range => match_key.starts_with('2'),
-        ResponseMatchKind::Default => true,
+    };
+    if successful {
+        ResponseBody::Data
+    } else {
+        ResponseBody::Error
     }
 }
 
-fn successful_payload_union(plan: &OperationPlan, stem: &str) -> String {
-    let mut payloads = Vec::new();
-    for response in &plan.response_table {
-        if is_successful_response(response.kind, &response.match_key) {
-            let payload = response_payload_type(response, stem);
-            if !payloads.contains(&payload) {
-                payloads.push(payload);
-            }
+/// The `orThrow` resolved type: one `{ data, meta }` envelope per distinct success arm, deduped on
+/// the whole envelope so two arms differing only in `contentType` collapse. `never` when the
+/// operation documents no successful response — the form can then only throw.
+fn successful_envelope_union(arms: &[ResultArm]) -> String {
+    let mut envelopes = Vec::new();
+    for arm in arms {
+        if !arm.ok {
+            continue;
+        }
+        let envelope = format!(
+            "{{ data: {}; meta: {} }}",
+            arm.payload,
+            meta_type(arm.headers_interface.as_deref())
+        );
+        if !envelopes.contains(&envelope) {
+            envelopes.push(envelope);
         }
     }
-    if payloads.is_empty() {
+    if envelopes.is_empty() {
         "never".to_owned()
     } else {
-        payloads.join(" | ")
+        envelopes.join(" | ")
     }
 }
 
@@ -2310,7 +2467,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ GetPetResponse200, GetPetResponseDefault }} from \"../../types/operations/getpet.js\";\nimport type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ serializePathSimple, serializeQueryFormExplode }} from \"../../runtime/serialize.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetInput = {{\n  /**\n   * The pet identifier.\n   */\n  petId: string;\n  /**\n   * The result limit.\n   */\n  limit?: number;\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetResult =\n  | {{ kind: \"response\"; ok: true; match: \"200\"; status: 200; data: GetPetResponse200; meta: ResponseMeta }}\n  | {{ kind: \"response\"; ok: true; match: \"default\"; status: number; data: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ kind: \"response\"; ok: false; match: \"default\"; status: number; error: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"200\" | \"default\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type GetPetCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"getPet\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"pets\" }}],\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"param\", name: \"petId\" }}],\n  ],\n  params: [\n    {{ name: \"petId\", location: \"path\", required: true, serialize: serializePathSimple, allowReserved: false }},\n    {{ name: \"limit\", location: \"query\", required: false, serialize: serializeQueryFormExplode, allowReserved: false }},\n  ],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n    {{ match: \"default\", kind: \"default\", status: null, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function getPet<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<GetPetResult> {{\n  return execute<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns The successful response data.\n */\nexport async function getPetOrThrow<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<GetPetResponse200 | GetPetResponseDefault> {{\n  return executeOrThrow<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ GetPetResponse200, GetPetResponseDefault }} from \"../../types/operations/getpet.js\";\nimport type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ serializePathSimple, serializeQueryFormExplode }} from \"../../runtime/serialize.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetInput = {{\n  /**\n   * The pet identifier.\n   */\n  petId: string;\n  /**\n   * The result limit.\n   */\n  limit?: number;\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetResult =\n  | {{ outcome: 200; ok: true; status: 200; data: GetPetResponse200; meta: ResponseMeta }}\n  | {{ outcome: \"default\"; ok: true; status: number; data: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ outcome: \"default\"; ok: false; status: number; error: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<200 | \"default\">\n  | RequestPhaseFailure;\n\nexport type GetPetCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"getPet\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"pets\" }}],\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"param\", name: \"petId\" }}],\n  ],\n  params: [\n    {{ name: \"petId\", location: \"path\", required: true, serialize: serializePathSimple, allowReserved: false }},\n    {{ name: \"limit\", location: \"query\", required: false, serialize: serializeQueryFormExplode, allowReserved: false }},\n  ],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n    {{ match: \"default\", kind: \"default\", status: null, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function getPet<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<GetPetResult> {{\n  return execute<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function getPetOrThrow<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<{{ data: GetPetResponse200; meta: ResponseMeta }} | {{ data: GetPetResponseDefault; meta: ResponseMeta }}> {{\n  return executeOrThrow<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let expected = expected.replace(
             "export type GetPetInput = {\n  /**\n   * The pet identifier.\n   */\n  petId: string;\n  /**\n   * The result limit.\n   */\n  limit?: number;\n};",
@@ -2355,7 +2512,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetInput = {{\n  body: {{\n    meta: {{ body: {{\n      tag?: string;\n    }}; contentType: \"application/json\" | \"application/cbor\" }};\n    title: string;\n    file: Blob | File;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetResult =\n  | {{ kind: \"response\"; ok: true; match: \"204\"; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"204\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type UploadAssetCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadAsset\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"uploads\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"multipart\", fields: [\n    {{ name: \"meta\", required: true, repeated: false, wrapper: true, payload: \"json\", contentType: {{ kind: \"selected\", admitted: [\"application/json\", \"application/cbor\"] }}, payloads: [\"json\", \"json\"], filename: false }},\n    {{ name: \"title\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"text/plain\" }}, filename: false }},\n    {{ name: \"file\", required: true, repeated: false, wrapper: false, payload: \"binary\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: true }},\n  ] }},\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function uploadAsset<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<UploadAssetResult> {{\n  return execute<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function uploadAssetOrThrow<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<undefined> {{\n  return executeOrThrow<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetInput = {{\n  body: {{\n    meta: {{ body: {{\n      tag?: string;\n    }}; contentType: \"application/json\" | \"application/cbor\" }};\n    title: string;\n    file: Blob | File;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetResult =\n  | {{ outcome: 204; ok: true; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<204>\n  | RequestPhaseFailure;\n\nexport type UploadAssetCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadAsset\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"uploads\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"multipart\", fields: [\n    {{ name: \"meta\", required: true, repeated: false, wrapper: true, payload: \"json\", contentType: {{ kind: \"selected\", admitted: [\"application/json\", \"application/cbor\"] }}, payloads: [\"json\", \"json\"], filename: false }},\n    {{ name: \"title\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"text/plain\" }}, filename: false }},\n    {{ name: \"file\", required: true, repeated: false, wrapper: false, payload: \"binary\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: true }},\n  ] }},\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function uploadAsset<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<UploadAssetResult> {{\n  return execute<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function uploadAssetOrThrow<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<{{ data: undefined; meta: ResponseMeta }}> {{\n  return executeOrThrow<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "uploadasset");
         assert_eq!(actual, expected);
@@ -2391,7 +2548,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteInput = {{\n  body: {{\n    note: string;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteResult =\n  | {{ kind: \"response\"; ok: true; match: \"204\"; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"204\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type UploadNoteCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadNote\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"notes\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"multipart\", fields: [\n    {{ name: \"note\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: false }},\n  ] }},\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function uploadNote<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<UploadNoteResult> {{\n  return execute<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function uploadNoteOrThrow<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<undefined> {{\n  return executeOrThrow<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteInput = {{\n  body: {{\n    note: string;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteResult =\n  | {{ outcome: 204; ok: true; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<204>\n  | RequestPhaseFailure;\n\nexport type UploadNoteCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadNote\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"notes\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"multipart\", fields: [\n    {{ name: \"note\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: false }},\n  ] }},\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function uploadNote<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<UploadNoteResult> {{\n  return execute<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function uploadNoteOrThrow<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<{{ data: undefined; meta: ResponseMeta }}> {{\n  return executeOrThrow<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "uploadnote");
         assert_eq!(actual, expected);
@@ -2467,7 +2624,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ SendMessageRequest, SendMessageResponse200 }} from \"../../types/operations/sendmessage.js\";\nimport type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageInput = {{\n  body: {{ contentType: \"application/json\"; body: SendMessageRequest[\"body\"] }} | {{ contentType: \"text/plain\"; body: string }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageResult =\n  | {{ kind: \"response\"; ok: true; match: \"200\"; status: 200; data: SendMessageResponse200; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"200\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type SendMessageCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"sendMessage\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"messages\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"content-discriminated\", arms: [\n    [\"application/json\", {{ kind: \"json\", contentType: \"application/json\" }}],\n    [\"text/plain\", {{ kind: \"text\", contentType: \"text/plain\" }}],\n  ] }},\n  accept: \"text/plain\",\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"text/plain\", \"text\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function sendMessage<S extends string = never>(transport: Transport<S>, input: SendMessageInput, ...args: SendMessageCallArgs<S>): Promise<SendMessageResult> {{\n  return execute<SendMessageResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function sendMessageOrThrow<S extends string = never>(transport: Transport<S>, input: SendMessageInput, ...args: SendMessageCallArgs<S>): Promise<SendMessageResponse200> {{\n  return executeOrThrow<SendMessageResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ SendMessageRequest, SendMessageResponse200 }} from \"../../types/operations/sendmessage.js\";\nimport type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageInput = {{\n  body: {{ contentType: \"application/json\"; body: SendMessageRequest[\"body\"] }} | {{ contentType: \"text/plain\"; body: string }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageResult =\n  | {{ outcome: 200; ok: true; status: 200; data: SendMessageResponse200; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<200>\n  | RequestPhaseFailure;\n\nexport type SendMessageCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"sendMessage\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"messages\" }}],\n  ],\n  params: [],\n  body: {{ kind: \"content-discriminated\", arms: [\n    [\"application/json\", {{ kind: \"json\", contentType: \"application/json\" }}],\n    [\"text/plain\", {{ kind: \"text\", contentType: \"text/plain\" }}],\n  ] }},\n  accept: \"text/plain\",\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"text/plain\", \"text\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function sendMessage<S extends string = never>(transport: Transport<S>, input: SendMessageInput, ...args: SendMessageCallArgs<S>): Promise<SendMessageResult> {{\n  return execute<SendMessageResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function sendMessageOrThrow<S extends string = never>(transport: Transport<S>, input: SendMessageInput, ...args: SendMessageCallArgs<S>): Promise<{{ data: SendMessageResponse200; meta: ResponseMeta }}> {{\n  return executeOrThrow<SendMessageResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "sendmessage");
         assert_eq!(actual, expected);
@@ -2827,10 +2984,10 @@ mod tests {
         let declaration = "/**\n * Read a pet.\n * \n * @remarks\n * Loads one pet.\n * \n * Responses\n * \n * - 200: Found.\n * - 404: Missing.\n * \n * @deprecated This operation is deprecated.\n * \n * @see {@link https://docs.example.test/pets | Pet guide}\n */\n";
         let pet_id_property = "/**\n     * The pet identifier.\n     */\n";
         let limit_property = "/**\n     * The result limit.\n     */\n";
-        let result_function = "/**\n * Read a pet.\n * \n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Loads one pet.\n * \n * Responses\n * \n * - 200: Found.\n * - 404: Missing.\n * \n * @deprecated This operation is deprecated.\n * \n * @returns A result discriminated by HTTP status.\n * \n * @see {@link https://docs.example.test/pets | Pet guide}\n */\n";
+        let result_function = "/**\n * Read a pet.\n * \n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Loads one pet.\n * \n * Responses\n * \n * - 200: Found.\n * - 404: Missing.\n * \n * @deprecated This operation is deprecated.\n * \n * @returns A typed result covering every documented response and failure.\n * \n * @see {@link https://docs.example.test/pets | Pet guide}\n */\n";
         let throw_function = result_function.replace(
-            "@returns A result discriminated by HTTP status.",
-            "@returns The successful response data.",
+            "@returns A typed result covering every documented response and failure.",
+            "@returns The successful response data and its response metadata.",
         );
         assert_eq!(
             tsdoc_blocks(&module),
@@ -3051,7 +3208,7 @@ mod tests {
         ResponseMediaPlan {
             media: media.to_owned(),
             decoder,
-            schema: Some(string_schema(None)),
+            schema: string_schema(None),
             streaming_marked: false,
             source: SourceRef::default(),
         }
@@ -3347,6 +3504,91 @@ mod tests {
         }
     }
 
+    /// Every string tag the shared phase-failure unions occupy, plus the `unmatched` arm's own tag.
+    /// A declared response key that rendered to one of these would silently merge two unrelated arms,
+    /// so the disjointness is pinned by test rather than left to the shape of the key grammar.
+    const RESERVED_OUTCOMES: [&str; 16] = [
+        "unmatched",
+        "auth",
+        "aborted",
+        "timeout",
+        "network",
+        "request-encode",
+        "request-validation",
+        "request-transform",
+        "request-middleware",
+        "cookie-params-unsendable",
+        "response-aborted",
+        "response-timeout",
+        "response-decode",
+        "response-validation",
+        "response-transform",
+        "response-middleware",
+    ];
+
+    /// A renderer over an empty document: enough for the result-type tests, whose payload types
+    /// come from inline schemas rather than from named components.
+    fn probe_analyzed() -> (TempDir, Analyzed, ResolvedConfig) {
+        let (temporary, analyzed, config, _) = analyzed(&json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {}
+        }));
+        (temporary, analyzed, config)
+    }
+
+    #[test]
+    fn the_declared_outcome_space_is_disjoint_from_every_reserved_tag() {
+        // Two guards. First: the reserved list is the one the runtime actually declares — parsed
+        // out of the embedded result.ts rather than restated, so a new failure tag cannot land
+        // there without landing here. Second: no response key the parser admits can render to a
+        // reserved tag, over the whole admitted key grammar (every exact status and every range).
+        let runtime = include_str!("../../runtime/result.ts");
+        let declared = runtime
+            .match_indices("outcome: '")
+            .map(|(index, marker)| {
+                let rest = &runtime[index + marker.len()..];
+                &rest[..rest.find('\'').expect("unterminated outcome literal")]
+            })
+            .collect::<BTreeSet<_>>();
+        let reserved = RESERVED_OUTCOMES.into_iter().collect::<BTreeSet<_>>();
+        // `unmatched` is emitted by the client, not declared in result.ts, so it is the one
+        // reserved tag the runtime scan cannot see.
+        assert_eq!(
+            declared,
+            reserved
+                .iter()
+                .copied()
+                .filter(|tag| *tag != "unmatched")
+                .collect::<BTreeSet<_>>()
+        );
+
+        let mut keys = vec!["default".to_owned()];
+        for lead in '1'..='5' {
+            keys.push(format!("{lead}XX"));
+            for status in 0..100 {
+                keys.push(format!("{lead}{status:02}"));
+            }
+        }
+        for key in keys {
+            let kind = if key == "default" {
+                ResponseMatchKind::Default
+            } else if key.ends_with("XX") {
+                ResponseMatchKind::Range
+            } else {
+                ResponseMatchKind::Exact
+            };
+            let plan = response_plan(&key, kind, PayloadDisposition::NoPayload, Vec::new(), false);
+            let rendered = outcome_literal(&plan);
+            for tag in RESERVED_OUTCOMES {
+                assert_ne!(rendered, render_ts_string(tag), "{key} collides with {tag}");
+            }
+            // An exact key renders as a bare number literal, everything else as a quoted string —
+            // the two families cannot overlap even before the tag comparison above.
+            assert_eq!(rendered.starts_with('"'), kind != ResponseMatchKind::Exact);
+        }
+    }
+
     #[test]
     fn result_renderer_covers_range_default_and_discriminated_media() {
         let responses = vec![
@@ -3360,9 +3602,7 @@ mod tests {
             response_plan(
                 "404",
                 ResponseMatchKind::Exact,
-                PayloadDisposition::Payload {
-                    schemas: vec![Some(string_schema(None))],
-                },
+                PayloadDisposition::Payload,
                 vec![response_media("application/json", DecoderClass::Json)],
                 false,
             ),
@@ -3383,9 +3623,7 @@ mod tests {
             response_plan(
                 "default",
                 ResponseMatchKind::Default,
-                PayloadDisposition::Payload {
-                    schemas: vec![Some(string_schema(None)), Some(string_schema(None))],
-                },
+                PayloadDisposition::Payload,
                 vec![
                     response_media("text/plain", DecoderClass::Text),
                     response_media("application/octet-stream", DecoderClass::Binary),
@@ -3403,27 +3641,154 @@ mod tests {
             auth_plan: Vec::new(),
             credential_headers: Vec::new(),
         };
-        let mut output = String::new();
-        write_result_type(&mut output, &plan, "Probe");
+        let (_temporary, analyzed, config) = probe_analyzed();
+        let mut sink = DiagnosticSink::new();
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let renderer = TypesEmitter::new(&mut model);
+        let arms = response_result_arms(&renderer, &plan, "Probe");
+        let output = render_result_type(&arms, &plan, "Probe");
         assert!(output.contains(
-            "ok: false; match: \"100\"; status: 100; error: undefined; meta: ResponseMeta"
+            "outcome: 100; ok: false; status: 100; error: undefined; meta: ResponseMeta"
         ));
-        assert!(output.contains("match: \"2XX\"; status: number; data: undefined"));
+        assert!(output.contains("outcome: \"2XX\"; ok: true; status: number; data: undefined"));
         assert!(output.contains("contentType: \"text/plain\""));
-        assert!(output.contains("ok: false; match: \"default\""));
+        assert!(output.contains("outcome: \"default\"; ok: false"));
+        // The declared-key space is what ResponsePhaseFailure is instantiated over: exact keys as
+        // number literals, range and default keys as strings, so the two families stay disjoint.
+        assert!(output.contains(
+            "| ResponsePhaseFailure<100 | 404 | \"2XX\" | \"4XX\" | \"default\">\n  | RequestPhaseFailure;\n"
+        ));
+        // The discriminated `default` branch contributes one envelope per media entry, each typed
+        // to that entry's own schema (text/plain → string, application/octet-stream → unknown),
+        // not one status-wide alias repeated.
         assert_eq!(
-            successful_payload_union(&plan, "Probe"),
-            "undefined | ProbeResponseDefault"
+            successful_envelope_union(&arms),
+            "{ data: undefined; meta: ResponseMeta } | { data: string; meta: ResponseMeta } | { data: unknown; meta: ResponseMeta }"
         );
 
         let empty = OperationPlan {
             response_table: Vec::new(),
             ..plan
         };
-        let mut output = String::new();
-        write_result_type(&mut output, &empty, "Empty");
-        assert!(output.contains("response-failure\"; ok: false; match: null"));
-        assert_eq!(successful_payload_union(&empty, "Empty"), "never");
+        let empty_arms = response_result_arms(&renderer, &empty, "Empty");
+        let output = render_result_type(&empty_arms, &empty, "Empty");
+        assert!(output.contains("| ResponsePhaseFailure<never>\n  | RequestPhaseFailure;\n"));
+        assert_eq!(successful_envelope_union(&empty_arms), "never");
+    }
+
+    #[test]
+    fn each_declared_media_entry_carries_its_own_payload_type() {
+        // A 200 declaring an object JSON body beside a text body emits two arms with *different*
+        // data types — the bug this replaces handed both arms the same status-wide union.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/pet": {
+                    "get": {
+                        "operationId": "readpet",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": { "schema": { "$ref": "#/components/schemas/Pet" } },
+                                    "text/plain": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Pet": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] }
+                }
+            }
+        });
+        let (content, diagnostics) = emit_operation(document, "readpet");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(
+            content.contains(
+                "export type ReadpetResult =\n  | { outcome: 200; ok: true; status: 200; data: Pet; contentType: \"application/json\"; meta: ResponseMeta }\n  | { outcome: 200; ok: true; status: 200; data: string; contentType: \"text/plain\"; meta: ResponseMeta }\n"
+            ),
+            "{content}"
+        );
+        // The per-entry schema reference imports from the component module; the status-wide alias
+        // has no reader left, so it is not imported at all.
+        assert!(content.contains("import type { Pet } from \"../../types/components/pet.js\";"));
+        assert!(!content.contains("ReadpetResponse200"), "{content}");
+        // The orThrow envelope follows the same split.
+        assert!(
+            content.contains(
+                "Promise<{ data: Pet; meta: ResponseMeta } | { data: string; meta: ResponseMeta }>"
+            ),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_discriminated_default_branch_emits_four_arms() {
+        // `default` spans both outcomes and this one declares two media entries, so it is 2 x 2 —
+        // not the two arms a status-keyed branch would produce.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/thing": {
+                    "get": {
+                        "operationId": "readthing",
+                        "responses": {
+                            "default": {
+                                "description": "any",
+                                "content": {
+                                    "application/json": { "schema": { "type": "object", "properties": { "code": { "type": "integer" } } } },
+                                    "text/plain": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (content, diagnostics) = emit_operation(document, "readthing");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(
+            content.contains(
+                "export type ReadthingResult =\n  | { outcome: \"default\"; ok: true; status: number; data: {\n  code?: number;\n}; contentType: \"application/json\"; meta: ResponseMeta }\n  | { outcome: \"default\"; ok: false; status: number; error: {\n  code?: number;\n}; contentType: \"application/json\"; meta: ResponseMeta }\n  | { outcome: \"default\"; ok: true; status: number; data: string; contentType: \"text/plain\"; meta: ResponseMeta }\n  | { outcome: \"default\"; ok: false; status: number; error: string; contentType: \"text/plain\"; meta: ResponseMeta }\n"
+            ),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_sole_media_range_is_discriminated_and_typed_by_its_essence() {
+        // One declared key that is a range is content-type-discriminated even though there is only
+        // one entry, and `text/*` types as string.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/note": {
+                    "get": {
+                        "operationId": "readnote",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": { "text/*": { "schema": { "type": "string" } } }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (content, diagnostics) = emit_operation(document, "readnote");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(
+            content.contains(
+                "export type ReadnoteResult =\n  | { outcome: 200; ok: true; status: 200; data: string; contentType: \"text/*\"; meta: ResponseMeta }\n"
+            ),
+            "{content}"
+        );
     }
 
     #[test]
@@ -3447,9 +3812,16 @@ mod tests {
             auth_plan: Vec::new(),
             credential_headers: Vec::new(),
         };
-        let mut actual = String::new();
-        write_result_type(&mut actual, &plan, "HeadHealth");
-        let expected = "export type HeadHealthResult =\n  | { kind: \"response\"; ok: true; match: \"200\"; status: 200; data: undefined; meta: ResponseMeta }\n  | { kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }\n  | { kind: \"response-failure\"; ok: false; match: \"200\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }\n  | { kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure };\n";
+        let (_temporary, analyzed, config) = probe_analyzed();
+        let mut sink = DiagnosticSink::new();
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let renderer = TypesEmitter::new(&mut model);
+        let actual = render_result_type(
+            &response_result_arms(&renderer, &plan, "HeadHealth"),
+            &plan,
+            "HeadHealth",
+        );
+        let expected = "export type HeadHealthResult =\n  | { outcome: 200; ok: true; status: 200; data: undefined; meta: ResponseMeta }\n  | { outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }\n  | ResponsePhaseFailure<200>\n  | RequestPhaseFailure;\n";
         assert_eq!(actual, expected);
     }
 
@@ -4502,7 +4874,7 @@ mod tests {
             "export async function readthing<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<ReadthingResult> {\n  return execute<ReadthingResult>(transport, descriptor, input, args[0]);\n}"
         ));
         assert!(content.contains(
-            "export async function readthingOrThrow<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<ReadthingResponse200> {\n  return executeOrThrow<ReadthingResult>(transport, descriptor, input, args[0]);\n}"
+            "export async function readthingOrThrow<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<{ data: ReadthingResponse200; meta: ResponseMeta }> {\n  return executeOrThrow<ReadthingResult>(transport, descriptor, input, args[0]);\n}"
         ));
         assert!(!content.contains("Issue"));
         assert!(!content.contains("validators/"));
@@ -4527,7 +4899,7 @@ mod tests {
     validateReadthingHeaderXTag(input.header?.["X-Tag"], ["header", "X-Tag"], requestIssues);
   }
   if (requestIssues.length > 0) {
-    return { kind: "request-failure", ok: false, match: null, status: null, error: { kind: "request-validation", issues: requestIssues } };
+    return { outcome: "request-validation", ok: false, issues: requestIssues };
   }
   return execute<ReadthingResult>(transport, descriptor, input, args[0]);
 }"#
@@ -4541,7 +4913,7 @@ mod tests {
             "import { validateReadthingHeaderXTag, validateReadthingPathId, validateReadthingQueryLimit } from \"../../validators/operations/readthing.js\";"
         ));
         assert!(content.contains(
-            "export async function readthingOrThrow<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<ReadthingResponse200> {\n  return unwrap(await readthing(transport, input, ...args));\n}"
+            "export async function readthingOrThrow<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<{ data: ReadthingResponse200; meta: ResponseMeta }> {\n  return unwrap(await readthing(transport, input, ...args));\n}"
         ));
     }
 
@@ -4552,13 +4924,11 @@ mod tests {
         assert!(content.contains(
             r#"export async function readthing<S extends string = never>(transport: Transport<S>, input: ReadthingInput, ...args: ReadthingCallArgs<S>): Promise<ReadthingResult> {
   const result = await execute<ReadthingResult>(transport, descriptor, input, args[0]);
-  if (result.kind === "response") {
+  if (result.outcome === 200) {
     const responseIssues: Issue[] = [];
-    if (result.match === "200") {
-      validateReadthingResponse200(result.data, [], responseIssues);
-    }
+    validateReadthingResponse200(result.data, [], responseIssues);
     if (responseIssues.length > 0) {
-      return { kind: "response-failure", ok: false, match: result.match, status: result.status, error: { kind: "response-validation", issues: responseIssues }, meta: result.meta };
+      return { outcome: "response-validation", ok: false, match: result.outcome, status: result.status, issues: responseIssues, meta: result.meta };
     }
   }
   return result;
@@ -4587,11 +4957,9 @@ mod tests {
         );
         assert!(content.contains(
             r#"  const result = await execute<ReadthingResult>(transport, descriptor, input, args[0]);
-  if (result.kind === "response") {
+  if (result.outcome === 200) {
     const responseIssues: Issue[] = [];
-    if (result.match === "200") {
-      validateReadthingResponse200(result.data, [], responseIssues);
-    }"#
+    validateReadthingResponse200(result.data, [], responseIssues);"#
         ), "response block mismatch:\n{content}");
         assert!(content.contains(
             "import { validateReadthingHeaderXTag, validateReadthingPathId, validateReadthingQueryLimit, validateReadthingResponse200 } from \"../../validators/operations/readthing.js\";"
@@ -4608,16 +4976,16 @@ mod tests {
   const requestIssues: Issue[] = [];
   validateMakethingRequestBody(input.body, ["body"], requestIssues);
   if (requestIssues.length > 0) {
-    return { kind: "request-failure", ok: false, match: null, status: null, error: { kind: "request-validation", issues: requestIssues } };
+    return { outcome: "request-validation", ok: false, issues: requestIssues };
   }
   const result = await execute<MakethingResult>(transport, descriptor, input, args[0]);
-  if (result.kind === "response") {
+  if (result.outcome === 200 || result.outcome === "4XX" || result.outcome === "default") {
     const responseIssues: Issue[] = [];
-    if (result.match === "200") {
+    if (result.outcome === 200) {
       validateMakethingResponse200(result.data, [], responseIssues);
-    } else if (result.match === "4XX") {
+    } else if (result.outcome === "4XX") {
       validateMakethingResponse4XX(result.error, [], responseIssues);
-    } else if (result.match === "default") {
+    } else if (result.outcome === "default") {
       if (result.ok) {
         validateMakethingResponseDefault(result.data, [], responseIssues);
       } else {
@@ -4625,14 +4993,14 @@ mod tests {
       }
     }
     if (responseIssues.length > 0) {
-      return { kind: "response-failure", ok: false, match: result.match, status: result.status, error: { kind: "response-validation", issues: responseIssues }, meta: result.meta };
+      return { outcome: "response-validation", ok: false, match: result.outcome, status: result.status, issues: responseIssues, meta: result.meta };
     }
   }
   return result;
 }"#
         ), "base function mismatch:\n{content}");
         assert!(content.contains(
-            "export async function makethingOrThrow<S extends string = never>(transport: Transport<S>, input: MakethingInput, ...args: MakethingCallArgs<S>): Promise<MakethingResponse200 | MakethingResponseDefault> {\n  return unwrap(await makething(transport, input, ...args));\n}"
+            "export async function makethingOrThrow<S extends string = never>(transport: Transport<S>, input: MakethingInput, ...args: MakethingCallArgs<S>): Promise<{ data: MakethingResponse200; meta: ResponseMeta } | { data: MakethingResponseDefault; meta: ResponseMeta }> {\n  return unwrap(await makething(transport, input, ...args));\n}"
         ));
     }
 
@@ -4649,7 +5017,7 @@ mod tests {
     validateSavethingRequestBody(input.body, ["body"], requestIssues);
   }
   if (requestIssues.length > 0) {
-    return { kind: "request-failure", ok: false, match: null, status: null, error: { kind: "request-validation", issues: requestIssues } };
+    return { outcome: "request-validation", ok: false, issues: requestIssues };
   }
   return execute<SavethingResult>(transport, descriptor, input, args[0]);
 }"#
@@ -4693,13 +5061,138 @@ mod tests {
     validateListthingCookieSession(input.cookie?.session, ["cookie", "session"], requestIssues);
   }
   if (requestIssues.length > 0) {
-    return { kind: "request-failure", ok: false, match: null, status: null, error: { kind: "request-validation", issues: requestIssues } };
+    return { outcome: "request-validation", ok: false, issues: requestIssues };
   }
   return execute<ListthingResult>(transport, descriptor, input, args[0]);"#
             ),
             "request block mismatch:\n{content}"
         );
         assert!(content.contains("validateListthingCookieSession"));
+    }
+
+    #[test]
+    fn a_response_with_no_json_media_binds_no_body_validator() {
+        // A payload branch whose declared media is text only: there is no JSON schema to check, so
+        // the branch contributes no body validator — but its header validator still binds, which is
+        // what keeps the branch in the emitted check list at all.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/note": {
+                    "get": {
+                        "operationId": "readnote",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "headers": { "X-Trace": { "schema": { "type": "string" } } },
+                                "content": { "text/plain": { "schema": { "type": "string" } } }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let content = emit_validated_operation(document, "readnote", false, true);
+        assert!(
+            content.contains(
+                r#"  if (result.outcome === 200) {
+    const responseIssues: Issue[] = [];
+    validateReadnoteResponse200Headers(result.meta.headers, [], responseIssues);"#
+            ),
+            "response block mismatch:\n{content}"
+        );
+        assert!(
+            !content.contains("validateReadnoteResponse200("),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_discriminated_branch_validates_against_the_matched_media_entry() {
+        // One JSON entry beside a text entry: the validator name and schema are unchanged, and the
+        // call is gated on the entry that was actually selected rather than skipped entirely.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/thing": {
+                    "get": {
+                        "operationId": "readthing",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": { "schema": { "type": "object", "properties": { "id": { "type": "string" } } } },
+                                    "text/plain": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let content = emit_validated_operation(document, "readthing", false, true);
+        assert!(
+            content.contains(
+                r#"  if (result.outcome === 200) {
+    const responseIssues: Issue[] = [];
+    if (result.contentType === "application/json") {
+      validateReadthingResponse200(result.data, [], responseIssues);
+    }"#
+            ),
+            "response block mismatch:\n{content}"
+        );
+    }
+
+    #[test]
+    fn two_json_entries_each_validate_under_their_own_content_type() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/thing": {
+                    "get": {
+                        "operationId": "readthing",
+                        "responses": {
+                            "default": {
+                                "description": "any",
+                                "content": {
+                                    "application/json": { "schema": { "type": "object", "properties": { "id": { "type": "string" } } } },
+                                    "application/vnd.api+json": { "schema": { "type": "object", "properties": { "code": { "type": "integer" } } } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let content = emit_validated_operation(document, "readthing", false, true);
+        // A `default` branch spans both sides, so each media arm still selects on `ok`.
+        assert!(
+            content.contains(
+                r#"    if (result.contentType === "application/json") {
+      if (result.ok) {
+        validateReadthingResponseDefaultApplicationJson(result.data, [], responseIssues);
+      } else {
+        validateReadthingResponseDefaultApplicationJson(result.error, [], responseIssues);
+      }
+    } else if (result.contentType === "application/vnd.api+json") {
+      if (result.ok) {
+        validateReadthingResponseDefaultApplicationVndApiJson(result.data, [], responseIssues);
+      } else {
+        validateReadthingResponseDefaultApplicationVndApiJson(result.error, [], responseIssues);
+      }
+    }"#
+            ),
+            "response block mismatch:\n{content}"
+        );
+        assert!(
+            content.contains(
+                "import { validateReadthingResponseDefaultApplicationJson, validateReadthingResponseDefaultApplicationVndApiJson } from \"../../validators/operations/readthing.js\";"
+            ),
+            "{content}"
+        );
     }
 
     #[test]
@@ -4724,9 +5217,9 @@ mod tests {
         let content = emit_validated_operation(document, "pollthing", false, true);
         assert!(
             content.contains(
-                r#"    if (result.match === "500") {
+                r#"    if (result.outcome === 500) {
       validatePollthingResponse500(result.error, [], responseIssues);
-    } else if (result.match === "2XX") {
+    } else if (result.outcome === "2XX") {
       validatePollthingResponse2XX(result.data, [], responseIssues);
     }"#
             ),
@@ -4779,13 +5272,13 @@ mod tests {
         );
         assert!(
             content.contains(
-                "| { kind: \"response\"; ok: true; match: \"200\"; status: 200; data: FetchThingResponse200; meta: ResponseMeta & { readonly headers: TypedHeaders<keyof FetchThingResponse200Headers & string> } }"
+                "| { outcome: 200; ok: true; status: 200; data: FetchThingResponse200; meta: ResponseMeta & { readonly headers: TypedHeaders<keyof FetchThingResponse200Headers & string> } }"
             ),
             "the headered arm must narrow meta to the intersection type:\n{content}"
         );
         assert!(
             content.contains(
-                "| { kind: \"response\"; ok: false; match: \"404\"; status: 404; error: FetchThingResponse404; meta: ResponseMeta }"
+                "| { outcome: 404; ok: false; status: 404; error: FetchThingResponse404; meta: ResponseMeta }"
             ),
             "a sibling header-less arm must keep the plain meta type:\n{content}"
         );
@@ -4811,7 +5304,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ ListItemsResponse200 }} from \"../../types/operations/listitems.js\";\nimport type {{ RequestFailure, ResponseFailure, ResponseMeta, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1items/get\nexport type ListItemsInput = {{}};\n\n// Source: workspace/openapi.json#/paths/~1items/get\nexport type ListItemsResult =\n  | {{ kind: \"response\"; ok: true; match: \"200\"; status: 200; data: ListItemsResponse200; meta: ResponseMeta }}\n  | {{ kind: \"unmatched-response\"; ok: false; match: null; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | {{ kind: \"response-failure\"; ok: false; match: \"200\" | null; status: number; error: ResponseFailure; meta: ResponseMeta }}\n  | {{ kind: \"request-failure\"; ok: false; match: null; status: null; error: RequestFailure }};\n\nexport type ListItemsCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1items/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"listItems\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"items\" }}],\n  ],\n  params: [],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A result discriminated by HTTP status.\n */\nexport async function listItems<S extends string = never>(transport: Transport<S>, input: ListItemsInput, ...args: ListItemsCallArgs<S>): Promise<ListItemsResult> {{\n  return execute<ListItemsResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data.\n */\nexport async function listItemsOrThrow<S extends string = never>(transport: Transport<S>, input: ListItemsInput, ...args: ListItemsCallArgs<S>): Promise<ListItemsResponse200> {{\n  return executeOrThrow<ListItemsResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ ListItemsResponse200 }} from \"../../types/operations/listitems.js\";\nimport type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1items/get\nexport type ListItemsInput = {{}};\n\n// Source: workspace/openapi.json#/paths/~1items/get\nexport type ListItemsResult =\n  | {{ outcome: 200; ok: true; status: 200; data: ListItemsResponse200; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<200>\n  | RequestPhaseFailure;\n\nexport type ListItemsCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1items/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"listItems\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"items\" }}],\n  ],\n  params: [],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  security: [],\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function listItems<S extends string = never>(transport: Transport<S>, input: ListItemsInput, ...args: ListItemsCallArgs<S>): Promise<ListItemsResult> {{\n  return execute<ListItemsResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function listItemsOrThrow<S extends string = never>(transport: Transport<S>, input: ListItemsInput, ...args: ListItemsCallArgs<S>): Promise<{{ data: ListItemsResponse200; meta: ResponseMeta }}> {{\n  return executeOrThrow<ListItemsResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "listitems");
         assert_eq!(
@@ -4858,10 +5351,10 @@ mod tests {
         let enabled = emit_validated_operation(document.clone(), "fetchthing", false, true);
         assert!(
             enabled.contains(
-                r#"    if (result.match === "200") {
+                r#"    if (result.outcome === 200) {
       validateFetchThingResponse200(result.data, [], responseIssues);
       validateFetchThingResponse200Headers(result.meta.headers, [], responseIssues);
-    } else if (result.match === "204") {
+    } else if (result.outcome === 204) {
       validateFetchThingResponse204Headers(result.meta.headers, [], responseIssues);
     }"#
             ),

@@ -1,0 +1,36 @@
+openapi: 3.1.0
+info:
+  title: Oasts per-media response validation
+  version: 1.0.0
+servers:
+  - url: https://media.api.example.test/v1
+paths:
+  /report:
+    get:
+      operationId: readReport
+      summary: Read a report offered under two mutually exclusive JSON schemas.
+      responses:
+        '200':
+          description: The report, in whichever JSON dialect the server chose.
+          content:
+            # The two schemas are mutually exclusive on purpose: a body valid under one is invalid
+            # under the other, so validating the wrong entry's schema is observable rather than
+            # silently equivalent.
+            application/json:
+              schema:
+                type: object
+                required:
+                  - id
+                properties:
+                  id:
+                    type: string
+                additionalProperties: false
+            application/vnd.api+json:
+              schema:
+                type: object
+                required:
+                  - code
+                properties:
+                  code:
+                    type: integer
+                additionalProperties: false
