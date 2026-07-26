@@ -1,0 +1,65 @@
+openapi: 3.0.3
+info:
+  title: deep object encodings, extended
+  version: 1.0.0
+servers:
+  - url: https://api.example.test/v1
+paths:
+  /search:
+    post:
+      operationId: search
+      parameters:
+        - name: filter
+          in: query
+          style: deepObject
+          explode: true
+          schema:
+            type: object
+            properties:
+              colour:
+                type: string
+        - name: tags
+          in: query
+          style: deepObject
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: raw
+          in: query
+          style: deepObject
+          explode: true
+          schema: {}
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                where:
+                  type: object
+                  properties:
+                    city:
+                      type: string
+                ids:
+                  type: array
+                  items:
+                    type: string
+            encoding:
+              where:
+                style: deepObject
+                explode: true
+              ids:
+                style: deepObject
+                explode: true
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string

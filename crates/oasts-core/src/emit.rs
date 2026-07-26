@@ -46,6 +46,10 @@ const CODE_COMPOSITION: &str = "OASTS1303";
 const CODE_DISCRIMINATOR: &str = "OASTS1304";
 const CODE_REFERENCE: &str = "OASTS1305";
 const CODE_VARIANT_COLLISION: &str = "OASTS1306";
+/// A component import an operation module renames to escape shadowing one of its own declarations,
+/// whose role-derived replacement is itself taken by another import or declaration in that module.
+/// Nothing is left to rename it to, so the module is refused rather than emitted uncompilable.
+const CODE_IMPORT_ALIAS: &str = "OASTS1307";
 /// A discriminator `mapping` value that resolves to no allocated component schema — a dangling
 /// mapping target the union can never dispatch to.
 const CODE_MAPPING_TARGET: &str = "OASTS1308";
@@ -361,6 +365,16 @@ pub(super) struct Emitter<'model, 'input, 'sink> {
     /// share a local's address. Empty slices all share the dangling-pointer sentinel, so
     /// `cache_merge_all_of` refuses to insert them.
     merge_cache: RefCell<HashMap<(usize, usize), CachedAllOf<'input>>>,
+    /// Component imports the operation module being rendered binds under a different local name,
+    /// keyed by the imported variant name. An operation module declares `<Stem>Request` and
+    /// `<Stem>Response*` of its own; a component that already carries one of those names would be
+    /// shadowed by the local declaration, silently retyping every reference site to the envelope.
+    /// Filled for the duration of that one file and empty everywhere else, so a module with no
+    /// such component renders byte-identically to before aliasing existed.
+    import_aliases: RefCell<HashMap<String, String>>,
+    /// Diagnostics raised while rendering, which runs behind `&self` and so cannot reach the
+    /// sink. Flushed in emission order once rendering is done.
+    deferred_diagnostics: RefCell<Vec<Diagnostic>>,
 }
 
 impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
@@ -401,6 +415,8 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             operation_stems,
             inlining_refs: RefCell::new(Vec::new()),
             merge_cache: RefCell::new(HashMap::new()),
+            import_aliases: RefCell::new(HashMap::new()),
+            deferred_diagnostics: RefCell::new(Vec::new()),
         }
     }
 
@@ -519,6 +535,9 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         }
         if any_response_headers {
             files.push(self.emit_headers_helper_file());
+        }
+        for diagnostic in self.deferred_diagnostics.take() {
+            self.model.sink.push(diagnostic);
         }
         files.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
         files
@@ -1429,7 +1448,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 .schema_target(&target.source_id, &target.json_pointer)
                 .map_or_else(
                     || "unknown".to_owned(),
-                    |target| target.variant_name(position),
+                    |target| self.local_import_name(target.variant_name(position)),
                 ),
             SchemaNode::Primitive {
                 ty,
@@ -1509,27 +1528,38 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 } else if branches.is_empty() {
                     "unknown".to_owned()
                 } else {
-                    branches
+                    let rendered = branches
                         .iter()
-                        .map(|branch| {
-                            parenthesize_intersection_member(
-                                self.render_type(branch, position, indent),
-                                branch,
-                            )
+                        .filter_map(|branch| {
+                            let rendered = self.render_type(branch, position, indent);
+                            if rendered == "unknown" {
+                                None
+                            } else {
+                                Some(parenthesize_intersection_member(rendered, branch))
+                            }
                         })
-                        .collect::<Vec<_>>()
-                        .join(" & ")
+                        .collect::<Vec<_>>();
+                    if rendered.is_empty() {
+                        "unknown".to_owned()
+                    } else {
+                        rendered.join(" & ")
+                    }
                 }
             }
             SchemaNode::OneOf { branches, .. } | SchemaNode::AnyOf { branches, .. } => {
                 if branches.is_empty() {
                     "never".to_owned()
                 } else {
-                    branches
-                        .iter()
-                        .map(|branch| self.render_type(branch, position, indent))
-                        .collect::<Vec<_>>()
-                        .join(" | ")
+                    // Linear membership rather than a hash set: a union carries a handful of
+                    // branches, and a set would clone every rendered branch to own its key.
+                    let mut rendered_branches = Vec::with_capacity(branches.len());
+                    for branch in branches {
+                        let rendered = self.render_type(branch, position, indent);
+                        if !rendered_branches.contains(&rendered) {
+                            rendered_branches.push(rendered);
+                        }
+                    }
+                    rendered_branches.join(" | ")
                 }
             }
             SchemaNode::Any { .. } | SchemaNode::Unknown { .. } => "unknown".to_owned(),
@@ -2003,15 +2033,79 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         if imports.is_empty() {
             return;
         }
+        let aliases = self.import_aliases.borrow();
         let extension = import_extension(self.model);
         for (file, names) in imports {
             output.push_str("import type { ");
-            output.push_str(&names.into_iter().collect::<Vec<_>>().join(", "));
+            output.push_str(
+                &names
+                    .into_iter()
+                    .map(|name| import_clause(name, &aliases))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
             output.push_str(" } from ");
             output.push_str(&render_ts_string(&format!("{prefix}{file}{extension}")));
             output.push_str(";\n");
         }
         output.push('\n');
+    }
+}
+
+/// Picks the local binding for every component import a module would otherwise let its own
+/// declarations shadow. A shadowed import is silently retyped to the local declaration, so the
+/// emitted module is not merely uncompilable — where it does compile, it is wrong.
+///
+/// The colliding name is by construction one of the module's own declarations, so appending `Body`
+/// names the reference site's role exactly (`<Stem>RequestBody`, `<Stem>Response200Body`,
+/// `<Stem>InputBody`). The component and the declaration are two legitimate public types in two
+/// different modules and the rename is file-local, so no exported name changes; refusing the
+/// document instead would reject input that generates perfectly valid TypeScript.
+///
+/// The residual case — the role name is itself taken by another import or declaration here — is a
+/// genuine two-way collision with no local remedy, so it is fatal and points at `naming.overrides`.
+/// Returns the diagnostics rather than pushing them: the types emitter renders behind `&self` and
+/// defers them, while the client emitter owns a sink at that point.
+pub(super) fn assign_import_aliases(
+    declared: &BTreeSet<String>,
+    imports: &BTreeMap<String, BTreeSet<String>>,
+    source: &SourceRef,
+) -> (HashMap<String, String>, Vec<Diagnostic>) {
+    let mut aliases = HashMap::new();
+    let mut diagnostics = Vec::new();
+    // Fast-reject: the overwhelming majority of modules import nothing carrying a declaration's
+    // name, and this runs once per emitted module.
+    let shadowed = imports
+        .values()
+        .flatten()
+        .filter(|name| declared.contains(name.as_str()))
+        .collect::<Vec<_>>();
+    if shadowed.is_empty() {
+        return (aliases, diagnostics);
+    }
+    let imported = imports.values().flatten().collect::<BTreeSet<_>>();
+    for name in shadowed {
+        let alias = format!("{name}Body");
+        if declared.contains(&alias) || imported.contains(&alias) {
+            diagnostics.push(source_diagnostic(
+                CODE_IMPORT_ALIAS,
+                format!(
+                    "component '{name}' is shadowed by this operation module's own '{name}' declaration, and the replacement name '{alias}' is already taken here; rename one with naming.overrides"
+                ),
+                source,
+            ));
+            continue;
+        }
+        aliases.insert(name.clone(), alias);
+    }
+    (aliases, diagnostics)
+}
+
+/// Renders one import's clause, naming the alias when the module binds the component locally.
+pub(super) fn import_clause(name: String, aliases: &HashMap<String, String>) -> String {
+    match aliases.get(&name) {
+        Some(alias) => format!("{name} as {alias}"),
+        None => name,
     }
 }
 
@@ -2063,6 +2157,22 @@ impl Emitter<'_, '_, '_> {
         file_base: &str,
     ) -> GeneratedFile {
         let stem = uppercase_first(allocated_name);
+        let mut response_declarations = operation
+            .responses
+            .iter()
+            .map(|response| {
+                (
+                    format!(
+                        "{}Response{}",
+                        stem,
+                        response_status_type_suffix(&response.status)
+                    ),
+                    response,
+                )
+            })
+            .collect::<Vec<_>>();
+        response_declarations.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
         let mut content = self.header();
         let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
         for parameter in &operation.parameters {
@@ -2092,6 +2202,26 @@ impl Emitter<'_, '_, '_> {
                 );
             }
         }
+        // The declaration set exists only to be tested against imports, so an import-free module
+        // never builds it. Most operation modules do import something, but the ones that do not
+        // stay allocation-identical to before aliasing existed.
+        let (aliases, alias_diagnostics) = if imports.is_empty() {
+            (HashMap::new(), Vec::new())
+        } else {
+            let mut declared =
+                BTreeSet::from([format!("{stem}Request"), format!("{stem}Response")]);
+            for (response_name, response) in &response_declarations {
+                declared.insert(response_name.clone());
+                if !response.headers.is_empty() {
+                    declared.insert(format!("{response_name}Headers"));
+                }
+            }
+            assign_import_aliases(&declared, &imports, &operation.source)
+        };
+        self.set_import_aliases(aliases);
+        self.deferred_diagnostics
+            .borrow_mut()
+            .extend(alias_diagnostics);
         self.write_imports(&mut content, imports, "../components/");
 
         write_source_metadata(&mut content, &operation.source, 0);
@@ -2102,21 +2232,6 @@ impl Emitter<'_, '_, '_> {
         content.push_str(&self.render_request(operation, 0));
         content.push_str(";\n\n");
 
-        let mut response_declarations = operation
-            .responses
-            .iter()
-            .map(|response| {
-                (
-                    format!(
-                        "{}Response{}",
-                        stem,
-                        response_status_type_suffix(&response.status)
-                    ),
-                    response,
-                )
-            })
-            .collect::<Vec<_>>();
-        response_declarations.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         let mut response_names = Vec::new();
         for (response_name, response) in response_declarations {
             response_names.push(response_name.clone());
@@ -2147,10 +2262,27 @@ impl Emitter<'_, '_, '_> {
         }
         content.push_str(";\n");
 
+        self.import_aliases.borrow_mut().clear();
         GeneratedFile {
             relative_path: format!("types/{subdir}/{file_base}.ts"),
             content,
         }
+    }
+
+    /// Binds the module being rendered to `aliases`, so every reference site resolves a component
+    /// through `local_import_name`. Set for the duration of one file and cleared after it.
+    pub(super) fn set_import_aliases(&self, aliases: HashMap<String, String>) {
+        self.import_aliases.replace(aliases);
+    }
+
+    /// The name a component's exported identifier is bound to inside the module being rendered.
+    /// Differs from the exported name only where `assign_import_aliases` had to rename it.
+    fn local_import_name(&self, name: String) -> String {
+        let aliases = self.import_aliases.borrow();
+        if aliases.is_empty() {
+            return name;
+        }
+        aliases.get(&name).cloned().unwrap_or(name)
     }
 
     /// Writes the response type's own TSDoc block: currently just `@see` entries, one per
@@ -4151,6 +4283,113 @@ mod tests {
             &source("/fallback-enum"),
         );
         assert!(declaration.contains("Value1: \"fallback\""));
+    }
+
+    #[test]
+    fn render_type_reduces_unknown_in_unions_and_intersections() {
+        let analyzed = Analyzed {
+            ir: Ir::default(),
+            operation_names: Vec::new(),
+            schema_names: Vec::new(),
+            enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
+        };
+        let (_temp, config) = resolved_config(json!({}));
+        let mut sink = DiagnosticSink::new();
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&mut model);
+
+        let unknown = |reason: &str, pointer: &str| SchemaNode::Unknown {
+            reason: reason.to_owned(),
+            meta: meta(pointer),
+        };
+        let object = SchemaNode::Object {
+            properties: vec![(
+                "a".to_owned(),
+                primitive(PrimitiveType::String, "/object/a"),
+                prop_meta("/object/a"),
+            )],
+            additional_properties: AdditionalProperties::Forbidden,
+            dependent_required: Vec::new(),
+            finite: None,
+            extra_required: Vec::new(),
+            meta: meta("/object"),
+        };
+        let conjunction = SchemaNode::AllOf {
+            branches: vec![
+                SchemaNode::OneOf {
+                    branches: vec![
+                        unknown("first reason", "/one-of/first"),
+                        unknown("second reason", "/one-of/second"),
+                    ],
+                    discriminator: None,
+                    meta: meta("/one-of"),
+                },
+                object,
+            ],
+            meta: meta("/all-of"),
+        };
+        assert_eq!(
+            emitter.render_type(&conjunction, TypePosition::Neutral, 0),
+            "{\n  a?: string;\n}"
+        );
+
+        let duplicate_unknowns = SchemaNode::AnyOf {
+            branches: vec![
+                unknown("one reason", "/duplicates/first"),
+                unknown("another reason", "/duplicates/second"),
+            ],
+            discriminator: None,
+            meta: meta("/duplicates"),
+        };
+        assert_eq!(
+            emitter.render_type(&duplicate_unknowns, TypePosition::Neutral, 0),
+            "unknown"
+        );
+
+        let distinct = SchemaNode::OneOf {
+            branches: vec![
+                primitive(PrimitiveType::String, "/distinct/string"),
+                primitive(PrimitiveType::Number, "/distinct/number"),
+            ],
+            discriminator: None,
+            meta: meta("/distinct"),
+        };
+        assert_eq!(
+            emitter.render_type(&distinct, TypePosition::Neutral, 0),
+            "string | number"
+        );
+
+        let boolean_schemas = SchemaNode::AnyOf {
+            branches: vec![
+                SchemaNode::Any {
+                    meta: meta("/boolean-schemas/true"),
+                },
+                SchemaNode::Never {
+                    meta: meta("/boolean-schemas/false"),
+                },
+                primitive(PrimitiveType::String, "/boolean-schemas/string"),
+            ],
+            discriminator: None,
+            meta: meta("/boolean-schemas"),
+        };
+        assert_eq!(
+            emitter.render_type(&boolean_schemas, TypePosition::Neutral, 0),
+            "unknown | never | string"
+        );
+
+        let only_unknown = SchemaNode::AllOf {
+            branches: vec![SchemaNode::Any {
+                meta: meta("/all-unknown/true"),
+            }],
+            meta: meta("/all-unknown"),
+        };
+        assert_eq!(
+            emitter.render_type(&only_unknown, TypePosition::Neutral, 0),
+            "unknown"
+        );
     }
 
     #[test]
@@ -6954,6 +7193,138 @@ mod tests {
             .iter()
             .find(|file| file.relative_path == path)
             .expect("expected generated file")
+    }
+
+    /// One operation whose synthesized declarations may collide with the components it imports.
+    /// `body_ref` and `response_ref` name the component each site references, or `null` to inline.
+    fn shadowing_document(schemas: Value, body_ref: &str, response_ref: &str) -> Value {
+        let media = |reference: &str| {
+            if reference.is_empty() {
+                json!({ "application/json": { "schema": { "type": "string" } } })
+            } else {
+                json!({
+                    "application/json": {
+                        "schema": { "$ref": format!("#/components/schemas/{reference}") }
+                    }
+                })
+            }
+        };
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/uploads": {
+                    "post": {
+                        "operationId": "completeUpload",
+                        "requestBody": { "required": true, "content": media(body_ref) },
+                        "responses": {
+                            "200": { "description": "ok", "content": media(response_ref) }
+                        }
+                    }
+                }
+            },
+            "components": { "schemas": schemas }
+        })
+    }
+
+    #[test]
+    fn a_component_shadowing_the_request_type_imports_under_a_role_alias() {
+        let (files, diagnostics) = compile(
+            shadowing_document(
+                json!({
+                    "CompleteUploadRequest": {
+                        "type": "object",
+                        "properties": { "id": { "type": "string" } }
+                    }
+                }),
+                "CompleteUploadRequest",
+                "",
+            ),
+            json!({}),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let file = find_file(&files, "types/operations/completeupload.ts");
+        assert!(
+            file.content.contains(
+                "import type { CompleteUploadRequest as CompleteUploadRequestBody } from \"../components/completeuploadrequest.js\";"
+            ),
+            "{}",
+            file.content
+        );
+        // The declaration keeps its name and the member names the alias, so `body` resolves to the
+        // component rather than back to the envelope being declared.
+        assert!(
+            file.content
+                .contains("export type CompleteUploadRequest = {"),
+            "{}",
+            file.content
+        );
+        assert!(
+            file.content.contains("body: CompleteUploadRequestBody;"),
+            "{}",
+            file.content
+        );
+    }
+
+    #[test]
+    fn a_component_shadowing_a_response_type_imports_under_a_role_alias() {
+        let (files, diagnostics) = compile(
+            shadowing_document(
+                json!({
+                    "CompleteUploadResponse200": {
+                        "type": "object",
+                        "properties": { "id": { "type": "string" } }
+                    }
+                }),
+                "",
+                "CompleteUploadResponse200",
+            ),
+            json!({}),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let file = find_file(&files, "types/operations/completeupload.ts");
+        assert!(
+            file.content.contains(
+                "import type { CompleteUploadResponse200 as CompleteUploadResponse200Body } from \"../components/completeuploadresponse200.js\";"
+            ),
+            "{}",
+            file.content
+        );
+        assert!(
+            file.content
+                .contains("export type CompleteUploadResponse200 = CompleteUploadResponse200Body;"),
+            "{}",
+            file.content
+        );
+    }
+
+    #[test]
+    fn an_alias_that_is_itself_imported_is_a_fatal_collision() {
+        let (_, diagnostics) = compile(
+            shadowing_document(
+                json!({
+                    "CompleteUploadRequest": {
+                        "type": "object",
+                        "properties": { "id": { "type": "string" } }
+                    },
+                    "CompleteUploadRequestBody": { "type": "string" }
+                }),
+                "CompleteUploadRequest",
+                "CompleteUploadRequestBody",
+            ),
+            json!({}),
+        );
+        let flagged = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_IMPORT_ALIAS)
+            .expect("alias collision diagnostic");
+        assert_eq!(flagged.severity, Severity::Error);
+        assert!(
+            flagged.message.contains("CompleteUploadRequest")
+                && flagged.message.contains("CompleteUploadRequestBody"),
+            "{}",
+            flagged.message
+        );
     }
 
     #[test]

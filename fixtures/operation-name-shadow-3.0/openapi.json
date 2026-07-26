@@ -1,0 +1,86 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "operation name shadow",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/uploads/{uploadId}/complete": {
+      "post": {
+        "operationId": "completeUpload",
+        "parameters": [
+          {
+            "name": "uploadId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CompleteUploadRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompleteUploadResponse200"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/pets": {
+      "get": {
+        "operationId": "readPet",
+        "responses": {
+          "200": {
+            "description": "found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadPetInput" }
+              },
+              "text/plain": { "schema": { "type": "string" } }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ReadPetInput": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" }
+        }
+      },
+      "CompleteUploadRequest": {
+        "type": "object",
+        "required": ["partIds"],
+        "properties": {
+          "partIds": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "CompleteUploadResponse200": {
+        "type": "object",
+        "required": ["uploadId"],
+        "properties": {
+          "uploadId": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -208,6 +208,31 @@ function serializeDeepObjectValue(
     .join("&");
 }
 
+// Bracket-path encoding, dispatched on the value's shape: `p[key]=v` for an object — the form
+// OpenAPI defines — `p[0]=v` for an array, and `p=v` for a scalar, which has no nesting to bracket
+// and so is the same rule at depth zero. Measured against `qs.stringify`, the library `deepObject`
+// is modelled on. Only the object form is specified, so the generator admits the other shapes only
+// under `compat.deepObjectEncoding: "extended"`.
+function serializeDeepObjectDispatched(
+  name: string,
+  value: ParamValue,
+  allowReserved: boolean,
+): string {
+  if (isParamArray(value)) {
+    const encodedName = renderName(name);
+    return value
+      .map(
+        (item, index) =>
+          `${encodedName}[${index}]=${renderPrimitive(item, allowReserved)}`,
+      )
+      .join("&");
+  }
+  if (isParamObject(value)) {
+    return serializeDeepObjectValue(name, value, allowReserved);
+  }
+  return `${renderName(name)}=${renderPrimitive(value, allowReserved)}`;
+}
+
 // The JSON text a content-sourced parameter (OpenAPI Parameter Object `content` with a JSON-family
 // media type) puts on the wire before location encoding. `JSON.stringify` returns `undefined` for a
 // value it cannot represent (a function, a symbol, or bare `undefined`); the caller-facing types
@@ -386,10 +411,10 @@ export function encodeFormUrlencodedBody(
           allowReserved,
         );
       }
-      if (!isParamObject(field.value)) {
-        throw new TypeError("deepObject fields require an object value");
-      }
-      return serializeDeepObjectValue(
+      // A field only ever holds a non-object value under `compat.deepObjectEncoding: "extended"`,
+      // where the generator has already admitted the shape; under the strict default the schema is
+      // object-only, so the dispatch takes its object branch and the wire bytes are unchanged.
+      return serializeDeepObjectDispatched(
         field.name,
         field.value,
         allowReserved,
@@ -747,6 +772,16 @@ export function serializeQueryDeepObject(
   allowReserved: boolean,
 ): string {
   return serializeDeepObjectValue(name, value, allowReserved);
+}
+//#endregion
+
+//#region oxs:helper:query-deep-object-extended
+export function serializeQueryDeepObjectExtended(
+  name: string,
+  value: ParamValue,
+  allowReserved: boolean,
+): string {
+  return serializeDeepObjectDispatched(name, value, allowReserved);
 }
 //#endregion
 

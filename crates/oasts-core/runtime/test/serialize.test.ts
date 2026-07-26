@@ -18,6 +18,7 @@ import {
   serializePathSimple,
   serializePathSimpleExplode,
   serializeQueryDeepObject,
+  serializeQueryDeepObjectExtended,
   serializeQueryForm,
   serializeQueryFormExplode,
   serializeQueryPipeDelimited,
@@ -217,6 +218,25 @@ describe("form-urlencoded body", () => {
     );
   });
 
+  test("extended deepObject applies the bracket-path rule at every depth", () => {
+    // Only the object form is specified, so these encodings are pinned here rather than derived
+    // from the conformance vectors. They match `qs.stringify` for the same values.
+    assert.equal(
+      serializeQueryDeepObjectExtended("tags", ["a", "b"], false),
+      "tags[0]=a&tags[1]=b",
+    );
+    assert.equal(
+      serializeQueryDeepObjectExtended("filter", { colour: "red" }, false),
+      "filter[colour]=red",
+    );
+    // A scalar has no nesting to bracket, so it is the same rule at depth zero.
+    assert.equal(serializeQueryDeepObjectExtended("q", "plain", false), "q=plain");
+    // An untyped schema dispatches on the value it is handed, so every form reaches one helper.
+    assert.equal(serializeQueryDeepObjectExtended("raw", [], false), "");
+    assert.equal(serializeQueryDeepObjectExtended("raw", {}, false), "");
+    assert.equal(serializeQueryDeepObjectExtended("q", ["a b"], true), "q[0]=a%20b");
+  });
+
   test("composes the pinned allowReserved form fragment", () => {
     const vector = findStyleVector(
       (candidate) =>
@@ -268,9 +288,15 @@ describe("form-urlencoded body", () => {
       () => encodeFormUrlencodedBody([{ name: "value", value: "x", style: "pipeDelimited" }]),
       /pipeDelimited fields require an array value/u,
     );
-    assert.throws(
-      () => encodeFormUrlencodedBody([{ name: "value", value: ["x"], style: "deepObject" }]),
-      /deepObject fields require an object value/u,
+    // A deepObject field brackets an array by index and an object by key, and leaves a scalar as a
+    // plain pair — the same bracket-path rule at each depth.
+    assert.equal(
+      encodeFormUrlencodedBody([{ name: "value", value: ["x"], style: "deepObject" }]),
+      "value[0]=x",
+    );
+    assert.equal(
+      encodeFormUrlencodedBody([{ name: "value", value: "x", style: "deepObject" }]),
+      "value=x",
     );
   });
 });
@@ -407,6 +433,7 @@ describe("serialize.ts region grammar", () => {
       ["oxs:helper:query-pipe-delimited", "serializeQueryPipeDelimited"],
       ["oxs:helper:query-pipe-delimited-object", "serializeQueryPipeDelimitedObject"],
       ["oxs:helper:query-deep-object", "serializeQueryDeepObject"],
+      ["oxs:helper:query-deep-object-extended", "serializeQueryDeepObjectExtended"],
       ["oxs:helper:header-simple", "serializeHeaderSimple"],
       ["oxs:helper:header-simple-explode", "serializeHeaderSimpleExplode"],
       ["oxs:helper:form-urlencoded-body", "encodeFormUrlencodedBody"],

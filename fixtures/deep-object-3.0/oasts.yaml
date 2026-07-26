@@ -1,0 +1,14 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+artifacts:
+  types: true
+  client: true
+client:
+  baseUrl:
+    source: server
+    index: 0
+validation:
+  engine: off
+  unchecked: allow

@@ -13,6 +13,7 @@ use crate::ir::{
     PrimitiveType, PropMeta, ResponseEntry, ResponseHeader, ResponseStatus, SchemaDocs, SchemaMeta,
     SchemaNode, SchemaRef, SecKind, SecurityRequirement, Segment, SegmentPart, ServerEntry,
     ServerVariable, SourceRef, StringConstraints, TupleRest, Webhook, box_if_populated,
+    is_root_component_pointer,
 };
 use crate::loader::{DocId, DocumentGraph, append_pointer, append_pointer_index};
 use crate::media::canonical_content_key;
@@ -348,10 +349,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         while cursor < queue.len() {
             let index = cursor;
             cursor += 1;
+            // A root component of the entry document is already a named schema; anything deeper
+            // under `components/schemas` is an inline schema that still needs materializing.
             if queue[index].source_id == entry_source
-                && queue[index]
-                    .json_pointer
-                    .starts_with("/components/schemas/")
+                && is_root_component_pointer(&queue[index].json_pointer)
             {
                 continue;
             }
@@ -1861,6 +1862,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 meta,
             };
         }
+        // Unsupported keywords are conjuncts like every other keyword on a schema object, so drop
+        // only that unrepresentable conjunct while preserving any representable siblings. Without
+        // a representable sibling, dropping it would widen the schema to `Any`; retain `Unknown` to
+        // record the imprecision reported by the diagnostic.
         if let Some(keyword) = UNSUPPORTED_SCHEMA_KEYWORDS
             .iter()
             .find(|keyword| object.contains_key(**keyword))
@@ -1870,10 +1875,17 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 &append_pointer(&node.pointer, keyword),
                 format!("unsupported schema keyword '{keyword}' becomes unknown"),
             ));
-            return SchemaNode::Unknown {
-                reason: format!("unsupported keyword {keyword}"),
-                meta,
-            };
+            if !object.contains_key("$ref")
+                && !object.contains_key("allOf")
+                && !object.contains_key("oneOf")
+                && !object.contains_key("anyOf")
+                && !has_typed_or_constraint_content(object, self.version)
+            {
+                return SchemaNode::Unknown {
+                    reason: format!("unsupported keyword {keyword}"),
+                    meta,
+                };
+            }
         }
         // JSON Schema (both dialects) applies every keyword on one schema object conjunctively.
         // Detect how many independent "pieces" the object carries; the historical dispatch below
@@ -2051,7 +2063,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             }
             Ok(target) => {
                 if target.doc_id == self.graph.entry().id
-                    && !target.json_pointer.starts_with("/components/schemas/")
+                    && !is_root_component_pointer(&target.json_pointer)
                 {
                     self.entry_defs_referenced = true;
                 }
@@ -2849,12 +2861,76 @@ fn collect_operation_refs(operation: &Operation, out: &mut Vec<SchemaRef>) {
     }
 }
 
-/// Names an external schema from its defining pointer's final segment, so it
-/// flows through the same identifier normalization and collision checks as a root
-/// component. The segment is JSON-Pointer unescaped (`~1` → `/`, `~0` → `~`).
+const SCHEMA_NAME_STRUCTURAL_SEGMENTS: [&str; 7] = [
+    "schema",
+    "items",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "prefixItems",
+];
+
+/// Names an external schema from the named and structural context in its defining pointer.
+///
+/// Container segments and media types are omitted. Remaining segments are JSON-Pointer
+/// unescaped (`~1` → `/`, `~0` → `~`), and structural roles have their first ASCII character
+/// uppercased before the parts are joined with spaces.
 fn external_schema_name(json_pointer: &str) -> String {
-    let segment = json_pointer.rsplit('/').next().unwrap_or(json_pointer);
-    segment.replace("~1", "/").replace("~0", "~")
+    if json_pointer.is_empty() {
+        return String::new();
+    }
+
+    let segments = json_pointer
+        .strip_prefix('/')
+        .unwrap_or(json_pointer)
+        .split('/')
+        .map(|segment| segment.replace("~1", "/").replace("~0", "~"))
+        .collect::<Vec<_>>();
+    let mut parts = Vec::new();
+    let mut index = 0;
+    while index < segments.len() {
+        let segment = &segments[index];
+        if (index == 0 && segment == "components") || (index == 1 && segments[0] == "components") {
+            index += 1;
+            continue;
+        }
+        // `content` introduces a Media Type map, and a media range always carries a `/`
+        // (`application/json`, `*/*`). Testing the child rather than the keyword keeps a property
+        // literally named `content` from swallowing its own child and losing the name.
+        if segment == "content"
+            && segments
+                .get(index + 1)
+                .is_some_and(|media| media.contains('/'))
+        {
+            index += 2;
+            continue;
+        }
+        // A container keyword names nothing itself — its child does. No schema sits at a bare
+        // container, so a container word in final position is a property name, not a container.
+        if index + 1 < segments.len()
+            && matches!(
+                segment.as_str(),
+                "$defs" | "definitions" | "properties" | "schema"
+            )
+        {
+            index += 1;
+            continue;
+        }
+        parts.push(
+            if SCHEMA_NAME_STRUCTURAL_SEGMENTS.contains(&segment.as_str()) {
+                uppercase_first_ascii(segment)
+            } else {
+                segment.clone()
+            },
+        );
+        index += 1;
+    }
+    parts.join(" ")
+}
+
+fn uppercase_first_ascii(value: &str) -> String {
+    format!("{}{}", value[..1].to_ascii_uppercase(), &value[1..])
 }
 
 fn merge_parameters(path_parameters: &[Param], operation_parameters: Vec<Param>) -> Vec<Param> {
@@ -3215,6 +3291,7 @@ mod tests {
     use crate::ir::{ParamStyle, SecKind};
     use crate::loader::load_graph;
     use crate::pipeline::compile as compile_pipeline;
+    use crate::semantic::{TargetCase, normalize_identifier};
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3223,16 +3300,90 @@ mod tests {
     }
 
     #[test]
-    fn external_schema_name_takes_the_last_segment_and_unescapes_it() {
-        // Plain final segment.
-        assert_eq!(external_schema_name("/components/schemas/Pet"), "Pet");
-        // `~1` decodes to `/`.
-        assert_eq!(external_schema_name("/defs/foo~1bar"), "foo/bar");
-        // `~0` decodes to `~`.
-        assert_eq!(external_schema_name("/defs/foo~0bar"), "foo~bar");
-        // Order matters: `~1` is substituted before `~0`, so `~01` decodes to the literal `~1`
-        // (the `~1` pass finds nothing, then `~0`→`~` leaves the trailing `1`) rather than `/`.
-        assert_eq!(external_schema_name("/defs/~01"), "~1");
+    fn external_schema_name_derives_from_pointer_context() {
+        let cases = [
+            ("/$defs/JsonValue", "JsonValue"),
+            ("/$defs/foo~1bar", "foo/bar"),
+            (
+                "/components/parameters/audit_method_type/schema",
+                "audit_method_type Schema",
+            ),
+            (
+                "/components/responses/Conflict/content/application~1json/schema",
+                "Conflict Schema",
+            ),
+            (
+                "/components/responses/R/content/application~1json/schema/oneOf/0",
+                "R OneOf 0",
+            ),
+            (
+                "/components/requestBodies/B/content/application~1json/schema",
+                "B Schema",
+            ),
+            ("/components/schemas/Foo/properties/bar", "Foo bar"),
+            ("/components/schemas/Foo/items", "Foo Items"),
+            // A property whose name happens to be a container keyword still names its schema.
+            ("/components/schemas/Foo/properties/content", "Foo content"),
+            (
+                "/components/schemas/Foo/properties/properties",
+                "Foo properties",
+            ),
+            ("", ""),
+        ];
+
+        for (pointer, expected) in cases {
+            assert_eq!(external_schema_name(pointer), expected, "{pointer}");
+        }
+    }
+
+    #[test]
+    fn an_inline_schema_under_a_declared_component_is_materialized() {
+        // `/components/schemas/Envelope/properties/payload` shares the declared component's prefix,
+        // so a prefix-only skip would leave it unnamed and every reference to it dangling.
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Envelope": {
+                    "type": "object",
+                    "properties": { "payload": { "type": "object" } }
+                },
+                "Holder": {
+                    "type": "object",
+                    "properties": {
+                        "inner": { "$ref": "#/components/schemas/Envelope/properties/payload" }
+                    }
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors());
+        let names = ir
+            .schemas
+            .iter()
+            .map(|schema| schema.name.as_str())
+            .collect::<Vec<_>>();
+        // Materialized schemas are appended after the declared components, in pointer order.
+        assert_eq!(names, ["Envelope", "Holder", "Envelope payload"]);
+    }
+
+    #[test]
+    fn external_schema_name_normalizes_to_the_final_identifier() {
+        for (pointer, expected) in [
+            (
+                "/components/parameters/audit_method_type/schema",
+                "AuditMethodTypeSchema",
+            ),
+            (
+                "/components/responses/R/content/application~1json/schema/oneOf/0",
+                "ROneOf0",
+            ),
+        ] {
+            assert_eq!(
+                normalize_identifier(&external_schema_name(pointer), TargetCase::Pascal),
+                Ok(expected.to_owned())
+            );
+        }
     }
 
     fn chain_test_graph() -> (TempDir, DocumentGraph) {
@@ -7120,6 +7271,85 @@ mod tests {
         assert!(!sink.has_errors());
         assert!(!sink.as_slice().is_empty());
         assert!(matches!(ir.schemas[0].schema, SchemaNode::Unknown { .. }));
+    }
+
+    #[test]
+    fn unsupported_not_preserves_object_siblings() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Thing": {
+                    "type": "object",
+                    "properties": {
+                        "a": { "type": "string" },
+                        "b": { "type": "string" }
+                    },
+                    "not": { "type": "string" }
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::Object { properties, .. }
+                if properties.iter().map(|(name, _, _)| name.as_str()).collect::<Vec<_>>()
+                    == ["a", "b"]
+        ));
+        let diagnostics = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{:?}", sink.as_slice());
+        assert!(diagnostics[0].message.contains("'not'"));
+    }
+
+    #[test]
+    fn unsupported_not_without_representable_siblings_stays_unknown() {
+        let document = schemas_doc("3.1.0", json!({ "Thing": { "not": { "type": "string" } } }));
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::Unknown { .. }
+        ));
+        let diagnostics = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{:?}", sink.as_slice());
+        assert!(diagnostics[0].message.contains("'not'"));
+    }
+
+    #[test]
+    fn unsupported_pattern_properties_preserves_object_siblings() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Thing": {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "patternProperties": { "^x": { "type": "string" } }
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::Object { properties, .. }
+                if properties.iter().map(|(name, _, _)| name.as_str()).collect::<Vec<_>>()
+                    == ["a"]
+        ));
+        let diagnostics = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{:?}", sink.as_slice());
+        assert!(diagnostics[0].message.contains("'patternProperties'"));
     }
 
     #[test]

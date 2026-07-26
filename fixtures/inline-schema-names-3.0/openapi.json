@@ -1,0 +1,153 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "inline schema names",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/audits": {
+      "get": {
+        "operationId": "listAudits",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/audit_method_type"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditRecord"
+                }
+              }
+            }
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      },
+      "post": {
+        "operationId": "replaceAudit",
+        "requestBody": {
+          "$ref": "#/components/requestBodies/Replace"
+        },
+        "responses": {
+          "204": {
+            "description": "replaced"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AuditRecord": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "$ref": "#/components/parameters/audit_method_type/schema"
+          },
+          "limit": {
+            "$ref": "#/components/parameters/limit/schema"
+          },
+          "conflictA": {
+            "$ref": "#/components/responses/Conflict/content/application~1json/schema/oneOf/0"
+          },
+          "conflictB": {
+            "$ref": "#/components/responses/Conflict/content/application~1json/schema/oneOf/1"
+          },
+          "replacement": {
+            "$ref": "#/components/requestBodies/Replace/content/application~1json/schema"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Envelope/properties/payload"
+          }
+        }
+      },
+      "Envelope": {
+        "type": "object",
+        "properties": {
+          "payload": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "parameters": {
+      "audit_method_type": {
+        "name": "method",
+        "in": "query",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "api_token",
+            "oauth"
+          ]
+        }
+      },
+      "limit": {
+        "name": "limit",
+        "in": "query",
+        "schema": {
+          "type": "integer"
+        }
+      }
+    },
+    "responses": {
+      "Conflict": {
+        "description": "conflict",
+        "content": {
+          "application/json": {
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "requestBodies": {
+      "Replace": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

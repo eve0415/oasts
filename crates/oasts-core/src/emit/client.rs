@@ -1,6 +1,6 @@
 //! Fetch client artifact emission from the client planning IR.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::client_model::{
     AuthAlternative, AuthKind, AuthSchemeUse, BaseUrlPlan, BodyPlan, ClientModel, DecoderClass,
@@ -23,9 +23,9 @@ use super::model::EmissionModel;
 use super::runtime_assets::{RuntimeSelection, emit_runtime_files};
 use super::validators::operation_parameter_validator_names;
 use super::{
-    ClientDocKind, Emitter as TypesEmitter, GeneratedFile, TypePosition, encode_comment_text,
-    import_extension, push_indent, render_property_key, render_ts_string, uppercase_first,
-    write_client_operation_tsdoc, write_source_metadata,
+    ClientDocKind, Emitter as TypesEmitter, GeneratedFile, TypePosition, assign_import_aliases,
+    encode_comment_text, import_clause, import_extension, push_indent, render_property_key,
+    render_ts_string, uppercase_first, write_client_operation_tsdoc, write_source_metadata,
 };
 
 pub(crate) fn emit_client_from_model(
@@ -271,7 +271,7 @@ fn emit_operation(
     let documentation = model.config.documentation.clone();
     // Everything that renders a component type lives in this one borrow scope, because the scope
     // has to end before `model.header()` can reborrow the model mutably.
-    let (input, result_type, envelope_type) = {
+    let (input, result_type, envelope_type, component_aliases, alias_diagnostics) = {
         let renderer = TypesEmitter::new(model);
         for parameter in &plan.param_plans {
             renderer.collect_operation_imports(
@@ -298,13 +298,29 @@ fn emit_operation(
                 }
             }
         }
+        // No component import means nothing can be shadowed, so the declaration set is not built.
+        let (aliases, diagnostics) = if component_imports.is_empty() {
+            (HashMap::new(), Vec::new())
+        } else {
+            assign_import_aliases(
+                &client_declarations(&stem, &operation_type_names),
+                &component_imports,
+                &operation.source,
+            )
+        };
+        renderer.set_import_aliases(aliases.clone());
         let arms = response_result_arms(&renderer, plan, &stem);
         (
             render_input(&renderer, operation, plan, &stem, &documentation),
             render_result_type(&arms, plan, &stem),
             successful_envelope_union(&arms),
+            aliases,
+            diagnostics,
         )
     };
+    for diagnostic in alias_diagnostics {
+        model.sink.push(diagnostic);
+    }
     let mut function_docs_operation = operation.clone();
     for parameter in &mut function_docs_operation.parameters {
         parameter.description = None;
@@ -330,7 +346,12 @@ fn emit_operation(
     let response_checks = response_validation_checks(plan, &stem, validate_response);
     let validation_binding = !request_checks.is_empty() || !response_checks.is_empty();
     let mut output = model.header();
-    write_component_imports(&mut output, component_imports, &extension);
+    write_component_imports(
+        &mut output,
+        component_imports,
+        &component_aliases,
+        &extension,
+    );
     if !operation_type_names.is_empty() {
         output.push_str("import type { ");
         output.push_str(
@@ -877,14 +898,39 @@ fn throw_function_body(name: &str, stem: &str, binding: bool) -> String {
     }
 }
 
+/// Every name a client operation module declares or imports from the types artifact. A component
+/// import carrying one of these would be shadowed by the local declaration or duplicate the
+/// operation-type import, so `assign_import_aliases` renames it. `Req` and `Missing` are reserved
+/// unconditionally: they are the call-args helpers, and which of them this operation declares
+/// depends on its resolved auth shape, which is not settled when imports are written.
+fn client_declarations(stem: &str, operation_type_names: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut declared = BTreeSet::from([
+        format!("{stem}Input"),
+        format!("{stem}Result"),
+        format!("{stem}CallArgs"),
+        "descriptor".to_owned(),
+        "Req".to_owned(),
+        "Missing".to_owned(),
+    ]);
+    declared.extend(operation_type_names.iter().cloned());
+    declared
+}
+
 fn write_component_imports(
     output: &mut String,
     imports: BTreeMap<String, BTreeSet<String>>,
+    aliases: &HashMap<String, String>,
     extension: &str,
 ) {
     for (file, names) in imports {
         output.push_str("import type { ");
-        output.push_str(&names.into_iter().collect::<Vec<_>>().join(", "));
+        output.push_str(
+            &names
+                .into_iter()
+                .map(|name| import_clause(name, aliases))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         output.push_str(" } from ");
         output.push_str(&render_ts_string(&format!(
             "../../types/components/{file}{extension}"
@@ -2181,6 +2227,7 @@ fn helper_region_id(helper: HelperId) -> &'static str {
         HelperId::QueryPipeDelimited => "query-pipe-delimited",
         HelperId::QueryPipeDelimitedObject => "query-pipe-delimited-object",
         HelperId::QueryDeepObject => "query-deep-object",
+        HelperId::QueryDeepObjectExtended => "query-deep-object-extended",
         HelperId::HeaderSimple => "header-simple",
         HelperId::HeaderSimpleExplode => "header-simple-explode",
         HelperId::ContentJsonPath => "content-json-path",
@@ -2204,6 +2251,7 @@ fn helper_export_name(helper: HelperId) -> &'static str {
         HelperId::QueryPipeDelimited => "serializeQueryPipeDelimited",
         HelperId::QueryPipeDelimitedObject => "serializeQueryPipeDelimitedObject",
         HelperId::QueryDeepObject => "serializeQueryDeepObject",
+        HelperId::QueryDeepObjectExtended => "serializeQueryDeepObjectExtended",
         HelperId::HeaderSimple => "serializeHeaderSimple",
         HelperId::HeaderSimpleExplode => "serializeHeaderSimpleExplode",
         HelperId::ContentJsonPath => "serializeContentJsonPath",
@@ -3230,6 +3278,7 @@ mod tests {
             HelperId::QueryPipeDelimited,
             HelperId::QueryPipeDelimitedObject,
             HelperId::QueryDeepObject,
+            HelperId::QueryDeepObjectExtended,
             HelperId::HeaderSimple,
             HelperId::HeaderSimpleExplode,
             HelperId::ContentJsonPath,
@@ -3677,6 +3726,100 @@ mod tests {
     }
 
     #[test]
+    fn a_component_shadowing_a_client_declaration_imports_under_an_alias() {
+        // The client module declares `ReadpetInput`; a component of that name reaches it through a
+        // content-discriminated arm, which renders the component directly instead of the
+        // status-wide alias. Unaliased, the import and the declaration collide.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/pet": {
+                    "get": {
+                        "operationId": "readpet",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": { "schema": { "$ref": "#/components/schemas/ReadpetInput" } },
+                                    "text/plain": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "ReadpetInput": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] }
+                }
+            }
+        });
+        let (content, diagnostics) = emit_operation(document, "readpet");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(
+            content.contains(
+                "import type { ReadpetInput as ReadpetInputBody } from \"../../types/components/readpetinput.js\";"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("data: ReadpetInputBody; contentType: \"application/json\""),
+            "{content}"
+        );
+        assert!(
+            content.contains("export type ReadpetInput = {"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_client_alias_that_is_itself_imported_is_a_fatal_collision() {
+        // `ReadpetInput` is shadowed by the module's own declaration, and the replacement name
+        // `ReadpetInputBody` is a component this module already imports — no local rename is left.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/pet": {
+                    "get": {
+                        "operationId": "readpet",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": { "schema": { "$ref": "#/components/schemas/ReadpetInput" } },
+                                    "text/plain": { "schema": { "type": "string" } }
+                                }
+                            },
+                            "400": {
+                                "description": "bad",
+                                "content": {
+                                    "application/json": { "schema": { "$ref": "#/components/schemas/ReadpetInputBody" } },
+                                    "text/plain": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "ReadpetInput": { "type": "object", "properties": { "id": { "type": "string" } } },
+                    "ReadpetInputBody": { "type": "object", "properties": { "detail": { "type": "string" } } }
+                }
+            }
+        });
+        let (_, diagnostics) = emit_operation(document, "readpet");
+        let flagged = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "OASTS1307")
+            .expect("alias collision diagnostic");
+        assert_eq!(flagged.severity, Severity::Error);
+        assert!(flagged.message.contains("ReadpetInputBody"));
+    }
+
+    #[test]
     fn each_declared_media_entry_carries_its_own_payload_type() {
         // A 200 declaring an object JSON body beside a text body emits two arms with *different*
         // data types — the bug this replaces handed both arms the same status-wide union.
@@ -4062,7 +4205,7 @@ mod tests {
             let mut imports = BTreeMap::new();
             collect_body_imports(&renderer, &body, &mut imports);
             let mut import_text = String::new();
-            write_component_imports(&mut import_text, imports, ".js");
+            write_component_imports(&mut import_text, imports, &HashMap::new(), ".js");
             assert!(import_text.contains("types/components"));
         }
         let mut descriptor = String::new();

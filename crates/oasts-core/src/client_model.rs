@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
-use crate::config::{ResolvedBaseUrl, ResolvedConfig};
+use crate::config::{DeepObjectEncoding, ResolvedBaseUrl, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
     EncodingObject, Ir, MediaType, NamedSecurityScheme, OAuthFlow, OasVersion, Operation,
@@ -117,6 +117,9 @@ pub enum HelperId {
     QueryPipeDelimited,
     QueryPipeDelimitedObject,
     QueryDeepObject,
+    /// Bracket encoding for a `deepObject` parameter whose schema is not object-only, dispatching
+    /// on the runtime value's shape. Reached only under `compat.deepObjectEncoding: extended`.
+    QueryDeepObjectExtended,
     HeaderSimple,
     HeaderSimpleExplode,
     /// Content-sourced JSON-family parameters: `JSON.stringify` then location-appropriate encoding.
@@ -394,6 +397,7 @@ pub fn build_client_model(
         .as_ref()
         .expect("the client model runs only when the client artifact is enabled");
     let projector = PrimitiveDomainProjector::new(&analyzed.ir);
+    let deep_object = config.compat.deep_object_encoding;
     let oas_version = analyzed.ir.version;
     diagnose_security_schemes(&analyzed.ir, sink);
     let security_schemes = index_security_schemes(&analyzed.ir);
@@ -423,7 +427,7 @@ pub fn build_client_model(
                     servers: effective_servers,
                 },
             };
-            diagnose_parameters(operation, &projector, sink);
+            diagnose_parameters(operation, &projector, deep_object, sink);
             diagnose_security(operation, &effective_security, &analyzed.ir, sink);
             let auth_plan = plan_auth(
                 operation,
@@ -436,13 +440,13 @@ pub fn build_client_model(
             if let Some(body) = &operation.request_body {
                 diagnose_request_media(&body.media_types, &projector, sink);
                 for media in &body.media_types {
-                    diagnose_form_media(media, &projector, sink);
+                    diagnose_form_media(media, &projector, deep_object, sink);
                 }
             }
             let param_plans = operation
                 .parameters
                 .iter()
-                .map(|parameter| parameter_plan(parameter, &projector))
+                .map(|parameter| parameter_plan(parameter, &projector, deep_object))
                 .collect();
             let body_plan = operation
                 .request_body
@@ -690,6 +694,7 @@ fn content_json_helper(location: ParamLocation) -> HelperId {
 fn parameter_plan(
     parameter: &crate::ir::Param,
     projector: &PrimitiveDomainProjector<'_>,
+    deep_object: DeepObjectEncoding,
 ) -> ParameterPlan {
     // OAS 3.1 §4.8.12.2.2: the default style for `in: cookie` is `form`, matching `in: query`.
     // Content parameters carry no style/explode (parse zeroes them), so these resolve to the
@@ -709,6 +714,7 @@ fn parameter_plan(
                 style,
                 explode,
                 projector.project(&parameter.schema),
+                deep_object,
             ),
             false,
         ),
@@ -738,6 +744,7 @@ fn helper_id(
     style: ParamStyle,
     explode: bool,
     projection: Projection,
+    deep_object: DeepObjectEncoding,
 ) -> HelperId {
     match (location, style, explode) {
         (ParamLocation::Path, ParamStyle::Simple, false) => HelperId::PathSimple,
@@ -756,7 +763,18 @@ fn helper_id(
             HelperId::QueryPipeDelimitedObject
         }
         (ParamLocation::Query, ParamStyle::PipeDelimited, _) => HelperId::QueryPipeDelimited,
-        (ParamLocation::Query, ParamStyle::DeepObject, _) => HelperId::QueryDeepObject,
+        // An object-only schema keeps the OpenAPI-defined serializer in both modes, so opting into
+        // `extended` never changes output for a parameter the specification already covers. Every
+        // other admitted shape — array, untyped, or a projection the domain analysis cannot pin —
+        // may hold either an object or an array at runtime, so it takes the dispatching serializer.
+        (ParamLocation::Query, ParamStyle::DeepObject, _)
+            if deep_object == DeepObjectEncoding::Strict
+                || matches!(projection, Projection::Known(domain)
+                    if domain_is_required_with_optional_null(domain, Domain::OBJECT)) =>
+        {
+            HelperId::QueryDeepObject
+        }
+        (ParamLocation::Query, ParamStyle::DeepObject, _) => HelperId::QueryDeepObjectExtended,
         (ParamLocation::Header, ParamStyle::Simple, false) => HelperId::HeaderSimple,
         (ParamLocation::Header, ParamStyle::Simple, true) => HelperId::HeaderSimpleExplode,
         _ => location_default_helper(location),
@@ -1145,6 +1163,7 @@ const CODE_CONTENT_CALLER_SERIALIZED: &str = "OASTS1443";
 fn diagnose_parameters(
     operation: &Operation,
     projector: &PrimitiveDomainProjector<'_>,
+    deep_object: DeepObjectEncoding,
     sink: &mut DiagnosticSink,
 ) {
     for parameter in &operation.parameters {
@@ -1174,7 +1193,7 @@ fn diagnose_parameters(
                 Severity::Warning,
             ));
         }
-        let resolved = parameter_plan(parameter, projector).resolved;
+        let resolved = parameter_plan(parameter, projector, deep_object).resolved;
         if resolved.style == ParamStyle::DeepObject && parameter.explode == Some(false) {
             sink.push(source_diagnostic(
                 CODE_DEEP_OBJECT_FALSE_EXPLODE,
@@ -1188,6 +1207,7 @@ fn diagnose_parameters(
             resolved.style,
             resolved.explode,
             projector.project(&parameter.schema),
+            deep_object,
         ) {
             sink.push(source_diagnostic(
                 "OASTS1419",
@@ -1207,6 +1227,7 @@ fn invalid_style_combination(
     style: ParamStyle,
     explode: bool,
     projection: Projection,
+    deep_object: DeepObjectEncoding,
 ) -> bool {
     let legal = match location {
         ParamLocation::Path => matches!(
@@ -1233,8 +1254,14 @@ fn invalid_style_combination(
                 || !(domain_is_required_with_optional_null(domain, Domain::ARRAY)
                     || domain_is_required_with_optional_null(domain, Domain::OBJECT))
         }
+        // OpenAPI defines `deepObject` for `object` only, so strict admits nothing else. Bracket-path
+        // encoding is total over shapes — an array brackets by index, a scalar is the same rule at
+        // depth zero — so extended admits every projection and the schema's type stops deciding.
+        // The axes that still reject are unchanged: an illegal location/style pair above, and
+        // `explode: false`, which is a different question from the schema's type.
         (ParamStyle::DeepObject, Projection::Known(domain)) => {
-            !domain_is_required_with_optional_null(domain, Domain::OBJECT)
+            deep_object == DeepObjectEncoding::Strict
+                && !domain_is_required_with_optional_null(domain, Domain::OBJECT)
         }
         (
             ParamStyle::SpaceDelimited | ParamStyle::PipeDelimited | ParamStyle::DeepObject,
@@ -1662,6 +1689,7 @@ fn array_item_media(
 fn diagnose_form_media(
     media: &MediaType,
     projector: &PrimitiveDomainProjector<'_>,
+    deep_object: DeepObjectEncoding,
     sink: &mut DiagnosticSink,
 ) {
     let multipart = media.essence.starts_with("multipart/");
@@ -1729,6 +1757,7 @@ fn diagnose_form_media(
                 style,
                 explode,
                 projector.project(schema),
+                deep_object,
             ) {
                 sink.push(source_diagnostic(
                     "OASTS1419",
@@ -3844,7 +3873,13 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                helper_id(ParamLocation::Query, style, false, projection),
+                helper_id(
+                    ParamLocation::Query,
+                    style,
+                    false,
+                    projection,
+                    DeepObjectEncoding::Strict,
+                ),
                 expected
             );
         }
@@ -3927,7 +3962,13 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                helper_id(location, style, explode, Projection::Unsupported),
+                helper_id(
+                    location,
+                    style,
+                    explode,
+                    Projection::Unsupported,
+                    DeepObjectEncoding::Strict,
+                ),
                 expected
             );
         }
@@ -3938,25 +3979,33 @@ mod tests {
         let any_media = classifier_media("multipart/form-data", false);
         assert!(form_fields(&any_media, true, &projector).is_empty());
         let mut diagnostic_sink = DiagnosticSink::new();
-        diagnose_form_media(&any_media, &projector, &mut diagnostic_sink);
+        diagnose_form_media(
+            &any_media,
+            &projector,
+            DeepObjectEncoding::Strict,
+            &mut diagnostic_sink,
+        );
         assert!(diagnostic_sink.as_slice().is_empty());
         assert!(!invalid_style_combination(
             ParamLocation::Cookie,
             ParamStyle::Form,
             false,
-            Projection::Known(Domain::STRING)
+            Projection::Known(Domain::STRING),
+            DeepObjectEncoding::Strict,
         ));
         assert!(invalid_style_combination(
             ParamLocation::Cookie,
             ParamStyle::Simple,
             false,
-            Projection::Known(Domain::STRING)
+            Projection::Known(Domain::STRING),
+            DeepObjectEncoding::Strict,
         ));
         assert!(!invalid_style_combination(
             ParamLocation::Query,
             ParamStyle::DeepObject,
             true,
-            Projection::Unsupported
+            Projection::Unsupported,
+            DeepObjectEncoding::Strict,
         ));
 
         let unresolved = SchemaNode::Ref {
@@ -4373,6 +4422,7 @@ mod tests {
                         style,
                         explode,
                         Projection::Known(domain),
+                        DeepObjectEncoding::Strict,
                     ),
                     expected,
                     "unexpected result for {domain:?} with {style:?}",
@@ -5897,6 +5947,109 @@ mod tests {
                 .count(),
             5
         );
+    }
+
+    /// The three deepObject schema shapes real documents use, in one operation.
+    fn deep_object_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/search": {
+                    "get": {
+                        "parameters": [
+                            { "name": "filter", "in": "query", "style": "deepObject", "schema": { "type": "object" } },
+                            { "name": "tags", "in": "query", "style": "deepObject", "schema": { "type": "array", "items": { "type": "string" } } },
+                            { "name": "raw", "in": "query", "style": "deepObject", "schema": {} },
+                            { "name": "label", "in": "query", "style": "deepObject", "schema": { "type": "string" } }
+                        ],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        })
+    }
+
+    fn deep_object_plan(
+        document: &Value,
+        deep_object: DeepObjectEncoding,
+    ) -> (Vec<(String, HelperId)>, Vec<Diagnostic>) {
+        let (_temp, analyzed, mut config) = analyzed(
+            document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        config.compat.deep_object_encoding = deep_object;
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let helpers = model.operations[0]
+            .param_plans
+            .iter()
+            .map(|plan| (plan.name.clone(), plan.resolved.helper))
+            .collect();
+        (helpers, sink.into_sorted_vec())
+    }
+
+    #[test]
+    fn strict_deep_object_admits_only_object_schemas() {
+        let (helpers, diagnostics) =
+            deep_object_plan(&deep_object_document(), DeepObjectEncoding::Strict);
+        let rejected = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1419")
+            .count();
+        assert_eq!(rejected, 3, "{diagnostics:#?}");
+        // Only the object-typed parameter survives the strict gate.
+        assert!(
+            helpers
+                .iter()
+                .all(|(_, helper)| *helper == HelperId::QueryDeepObject),
+            "{helpers:?}"
+        );
+    }
+
+    #[test]
+    fn extended_deep_object_admits_every_schema_shape() {
+        let (helpers, diagnostics) =
+            deep_object_plan(&deep_object_document(), DeepObjectEncoding::Extended);
+        // Bracket-path encoding is total over shapes, so the schema's type stops rejecting anything
+        // and the operation plans clean.
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            helpers,
+            vec![
+                ("filter".to_owned(), HelperId::QueryDeepObject),
+                ("tags".to_owned(), HelperId::QueryDeepObjectExtended),
+                ("raw".to_owned(), HelperId::QueryDeepObjectExtended),
+                ("label".to_owned(), HelperId::QueryDeepObjectExtended),
+            ]
+        );
+    }
+
+    #[test]
+    fn extended_deep_object_leaves_explode_handling_alone() {
+        // `explode: false` with deepObject is undefined in OpenAPI and is a different question from
+        // the schema's type, so `compat` must not touch it.
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/search": {
+                    "get": {
+                        "parameters": [
+                            { "name": "tags", "in": "query", "style": "deepObject", "explode": false, "schema": { "type": "array", "items": { "type": "string" } } }
+                        ],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        for encoding in [DeepObjectEncoding::Strict, DeepObjectEncoding::Extended] {
+            let (_, diagnostics) = deep_object_plan(&document, encoding);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == CODE_DEEP_OBJECT_FALSE_EXPLODE),
+                "{encoding:?}: {diagnostics:#?}"
+            );
+        }
     }
 
     #[test]

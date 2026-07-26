@@ -2,6 +2,20 @@
 
 use serde_json::{Number, Value};
 
+/// Whether a JSON Pointer addresses a `components/schemas` entry itself, rather than something
+/// nested inside one.
+///
+/// A prefix test alone is not enough: `/components/schemas/Foo/properties/bar` shares the prefix
+/// but is an inline schema, which has a name of its own to derive and a declaration of its own to
+/// emit. Callers use this to tell the two apart — a declared component is already named by its map
+/// key, everything else is addressed by pointer.
+#[must_use]
+pub fn is_root_component_pointer(json_pointer: &str) -> bool {
+    json_pointer
+        .strip_prefix("/components/schemas/")
+        .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+}
+
 /// Stable source identity attached to parsed nodes.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct SourceRef {

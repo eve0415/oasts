@@ -135,6 +135,8 @@ pub struct RawConfig {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub limits: Option<LimitsConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub compat: Option<CompatConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub watch: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub ci: Option<Value>,
@@ -754,6 +756,46 @@ pub struct LimitsConfig {
     pub max_ref_depth: u64,
 }
 
+/// How a `deepObject` query parameter is lowered onto the wire.
+///
+/// OpenAPI defines `deepObject` for `object` schemas only. Real documents declare it on arrays,
+/// on schemas with no type, and on scalars, expecting the bracket-path encoding of `qs` — `p[k]=v`
+/// for an object, `p[0]=v` for an array, and a plain `p=v` for a scalar, which has no nesting to
+/// bracket. That is a wire format the specification does not define, so taking it is a recorded
+/// opt-in rather than a default.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum DeepObjectEncoding {
+    /// Admit `deepObject` only where OpenAPI defines it: an `object`-projecting schema.
+    #[default]
+    Strict,
+    /// Admit every schema shape, lowering each with the bracket-path encoding of `qs`.
+    Extended,
+}
+
+/// Opt-in departures from strict OpenAPI conformance.
+///
+/// oasts follows the OpenAPI and JSON Schema specifications by default and widens only where the
+/// ecosystem demonstrably diverges. Every such widening lives here, so a reader can audit the full
+/// set of departures in one block of any configuration rather than hunting for them per feature.
+/// The section is optional and every key defaults to the strict reading, so a configuration without
+/// it behaves exactly as if conformance were unconditional.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "Opt-in departures from strict OpenAPI conformance."
+    )
+)]
+pub struct CompatConfig {
+    pub deep_object_encoding: DeepObjectEncoding,
+}
+
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
@@ -830,6 +872,7 @@ pub struct ResolvedConfig {
     pub emit: EmitConfig,
     pub local_allow_paths: Vec<PathBuf>,
     pub limits: LimitsConfig,
+    pub compat: CompatConfig,
 }
 
 /// A discovered configuration candidate before script-support policy is applied.
@@ -1185,6 +1228,7 @@ pub fn resolve_config(
     let local_allow_paths = resolve_local_paths(&local, &config_dir, source_path, &mut sink);
     let limits = raw.limits.unwrap_or_default();
     validate_limits(&limits, source_path, &mut sink);
+    let compat = raw.compat.unwrap_or_default();
 
     for (present, pointer, name) in [
         (raw.remote.is_some(), "/remote", "remote"),
@@ -1233,6 +1277,7 @@ pub fn resolve_config(
         emit,
         local_allow_paths,
         limits,
+        compat,
     })
 }
 
@@ -2135,6 +2180,36 @@ mod tests {
         assert!(!resolved.artifacts.client.enabled);
         assert_eq!(resolved.emit.runtime_directory, "runtime");
         assert_eq!(resolved.limits, LimitsConfig::default());
+        assert_eq!(resolved.compat, CompatConfig::default());
+        assert_eq!(
+            resolved.compat.deep_object_encoding,
+            DeepObjectEncoding::Strict
+        );
+    }
+
+    #[test]
+    fn compat_section_parses_and_rejects_unknown_shapes() {
+        let mut value = valid_json_value();
+        value["compat"] = json!({ "deepObjectEncoding": "extended" });
+        let resolved = load_json(&value).expect("extended deepObject should resolve");
+        assert_eq!(
+            resolved.compat.deep_object_encoding,
+            DeepObjectEncoding::Extended
+        );
+
+        // An empty section is the strict default, so opting into the block costs nothing.
+        value["compat"] = json!({});
+        let resolved = load_json(&value).expect("empty compat should resolve");
+        assert_eq!(
+            resolved.compat.deep_object_encoding,
+            DeepObjectEncoding::Strict
+        );
+
+        value["compat"] = json!({ "deepObjectEncodings": "extended" });
+        assert_code(load_json(&value), CODE_PARSE);
+
+        value["compat"] = json!({ "deepObjectEncoding": "loose" });
+        assert_code(load_json(&value), CODE_PARSE);
     }
 
     #[test]

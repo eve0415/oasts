@@ -13,9 +13,9 @@ use crate::config::{
 };
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
-    AdditionalProperties, Callback, ExclusiveBound, Ir, LinkTarget, Operation, ParamLocation,
-    PrimitiveType, SchemaMeta, SchemaNode, SegmentPart, SourceRef, TupleRest, Webhook,
-    finite_parts,
+    AdditionalProperties, Callback, ExclusiveBound, Ir, LinkTarget, NamedSchema, Operation,
+    ParamLocation, PrimitiveType, SchemaMeta, SchemaNode, SegmentPart, SourceRef, TupleRest,
+    Webhook, finite_parts, is_root_component_pointer,
 };
 use crate::num::{finite_binary64, first_number_outside_binary64, render_number};
 
@@ -698,6 +698,30 @@ fn derive_callback_stem(
     ))
 }
 
+/// Whether a schema is one the document declares under `components/schemas`, as opposed to one
+/// materialized at an inline pointer (a media type's `schema`, a `oneOf` branch, a `$defs` entry).
+///
+/// `naming.overrides.schemas` keys address declared components only, because that is how OpenAPI
+/// itself addresses them — by their map key. An inline schema has no such key; it is addressed by
+/// JSON Pointer, and its generated identifier is derived, so matching an override against that
+/// derived name would be matching a name the document never wrote. The trailing-segment test keeps
+/// `/components/schemas/Foo/properties/bar` — an inline schema that merely lives under a declared
+/// one — out.
+fn is_declared_component(source: &SourceRef) -> bool {
+    is_root_component_pointer(&source.json_pointer)
+}
+
+/// The override entry that renames `schema`, if the document declares it as a component and the
+/// user named it.
+fn declared_component_override<'naming>(
+    naming: &'naming NamingConfig,
+    schema: &NamedSchema,
+) -> Option<&'naming String> {
+    is_declared_component(&schema.source)
+        .then(|| naming.overrides.schemas.get(&schema.name))
+        .flatten()
+}
+
 fn allocate_schema_names(
     ir: &Ir,
     naming: &NamingConfig,
@@ -708,7 +732,7 @@ fn allocate_schema_names(
     for (schema_index, schema) in ir.schemas.iter().enumerate() {
         // An override supplies the complete identifier: typePrefix/typeSuffix are not applied on
         // top, but the value must still validate and collide like any generated name.
-        let allocation = match naming.overrides.schemas.get(&schema.name) {
+        let allocation = match declared_component_override(naming, schema) {
             Some(name) => validate_final_identifier(name)
                 .map(|()| name.clone())
                 .map_err(|error| (name.clone(), error)),
@@ -758,7 +782,11 @@ fn allocate_schema_names(
 /// in the map's sorted order, so the diagnostics are deterministic.
 fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut DiagnosticSink) {
     for key in naming.overrides.schemas.keys() {
-        if !ir.schemas.iter().any(|schema| &schema.name == key) {
+        if !ir
+            .schemas
+            .iter()
+            .any(|schema| &schema.name == key && is_declared_component(&schema.source))
+        {
             sink.push(unmatched_override_diagnostic("schema", "schemas", key));
         }
     }
@@ -1657,6 +1685,16 @@ mod tests {
             name: name.to_owned(),
             schema: any_schema(&pointer),
             source: source(&pointer),
+        }
+    }
+
+    /// A schema materialized at an inline pointer — the shape a `$ref` into a media type's
+    /// `schema`, a `oneOf` branch, or a `$defs` entry produces. Its name is derived, not declared.
+    fn materialized_schema(name: &str, pointer: &str) -> NamedSchema {
+        NamedSchema {
+            name: name.to_owned(),
+            schema: any_schema(pointer),
+            source: source(pointer),
         }
     }
 
@@ -2748,6 +2786,94 @@ mod tests {
                 && diagnostic.message.contains("collision")
                 && diagnostic.message.contains("'Same'")
         }));
+    }
+
+    #[test]
+    fn normalized_schema_names_still_report_an_exact_match_collision() {
+        let ir = Ir {
+            schemas: vec![named_schema("Foo Bar"), named_schema("FooBar")],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_TYPE_NAME
+                && diagnostic.message.contains("collision")
+                && diagnostic.message.contains("'FooBar'")
+        }));
+    }
+
+    #[test]
+    fn a_schema_override_renames_a_declared_component() {
+        let ir = Ir {
+            schemas: vec![named_schema("widget")],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &schema_overrides(&[("widget", "Gadget")]),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert_eq!(analyzed.schema_names[0].name, "Gadget");
+        assert!(sink.as_slice().is_empty());
+    }
+
+    #[test]
+    fn a_schema_override_keyed_on_a_materialized_name_is_a_config_error() {
+        // `Conflict Schema` is derived from the pointer, not written in the document, so the key
+        // names no component and must be reported instead of silently renaming the inline schema.
+        let ir = Ir {
+            schemas: vec![materialized_schema(
+                "Conflict Schema",
+                "/components/responses/Conflict/content/application~1json/schema",
+            )],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &schema_overrides(&[("Conflict Schema", "Renamed")]),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert_eq!(analyzed.schema_names[0].name, "ConflictSchema");
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_OVERRIDE_UNMATCHED
+                && diagnostic.message.contains("'Conflict Schema'")
+        }));
+    }
+
+    #[test]
+    fn an_inline_schema_under_a_declared_component_is_not_overridable() {
+        // `/components/schemas/Foo/properties/bar` shares the declared component's prefix but is
+        // itself inline, so the trailing-segment test must keep it out of the override namespace.
+        let ir = Ir {
+            schemas: vec![materialized_schema(
+                "Foo bar",
+                "/components/schemas/Foo/properties/bar",
+            )],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &schema_overrides(&[("Foo bar", "Renamed")]),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert_eq!(analyzed.schema_names[0].name, "FooBar");
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_OVERRIDE_UNMATCHED)
+        );
     }
 
     #[test]
