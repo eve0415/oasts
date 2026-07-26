@@ -1,0 +1,14 @@
+schemaVersion: 1
+input:
+  path: ./openapi.json
+output: ./generated
+artifacts:
+  types: true
+  client: true
+client:
+  baseUrl:
+    source: literal
+    value: https://api.example.test/v1
+validation:
+  engine: off
+  unchecked: allow

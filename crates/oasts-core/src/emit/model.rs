@@ -6,8 +6,8 @@ use crate::ir::{AdditionalProperties, SchemaNode, SourceRef, TupleRest};
 use crate::semantic::Analyzed;
 
 use super::{
-    CODE_FILE_NAME, CODE_PATH_COLLISION, CODE_VARIANT_COLLISION, file_base_name, shape_variants,
-    source_diagnostic,
+    CODE_FILE_NAME, CODE_PATH_COLLISION, CODE_VARIANT_ALIAS, CODE_VARIANT_COLLISION,
+    file_base_name, shape_variants, source_diagnostic, warning_diagnostic,
 };
 
 #[derive(Clone, Debug)]
@@ -17,6 +17,12 @@ pub(crate) struct SchemaTarget {
     pub(crate) file_base: String,
     pub(crate) request_differs: bool,
     pub(crate) response_differs: bool,
+    /// The name this component's request-position variant exports under when the derived
+    /// `{name}Request` is already a declared component's name. `None` — the overwhelmingly common
+    /// case — means `variant_name` derives it, so a document without a collision allocates exactly
+    /// as it did before this field existed.
+    pub(crate) request_variant: Option<String>,
+    pub(crate) response_variant: Option<String>,
 }
 
 /// Shared deterministic allocation product for all emitters.
@@ -139,13 +145,21 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             }
         }
 
-        self.detect_variant_collisions();
+        self.resolve_variant_collisions();
     }
 
-    /// Rejects a generated `{Name}Request`/`{Name}Response` variant name that collides with a
-    /// component's own exported type name: both would import the same identifier from different
-    /// files, a load-time SyntaxError/TS2300 the semantic-stage exact-collision check (which runs
-    /// before variance is resolved) structurally cannot see.
+    /// Renames a generated `{Name}Request`/`{Name}Response` variant that collides with a
+    /// component's own exported type name: both would export the same identifier from different
+    /// files, and any module needing both would emit two conflicting imports — a load-time
+    /// SyntaxError/TS2300 the semantic-stage exact-collision check (which runs before variance is
+    /// resolved) structurally cannot see. The document's own component name is its public API and
+    /// stays put; the derived name is the compiler's invention, so it is the one that yields, to
+    /// `{Name}RequestBody`/`{Name}ResponseBody` — the same role-derived word `assign_import_aliases`
+    /// uses for the analogous import-shadowing case. Renaming here rather than at the reference
+    /// sites means one name globally: every reference, sibling import and validator declaration
+    /// follows through `SchemaTarget::variant_name`, and the result is order-independent, so the
+    /// same document always produces the same identifier. It warns rather than staying silent
+    /// because, unlike the file-local import alias, an exported name changes.
     ///
     /// Reached only after the fast-reject above returns for variance-free input, so a document with
     /// no read/write-only marker never runs this and stays allocation-identical (the allocs gate
@@ -159,8 +173,13 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
     /// never collide with each other (that needs equal base names, which the exact-collision check
     /// already blocks), so a variant-vs-base scan against the index is complete.
     ///
+    /// The replacement is one fixed candidate, never a search: a numeric fallback would be
+    /// order-dependent and produce unstable public API. When it is itself taken — by a declared
+    /// component or by a replacement handed out earlier in this pass — nothing compiler-invented
+    /// remains, so that residual is fatal and points at `naming.overrides`.
+    ///
     /// `schema_names` order fixes diagnostic order; one diagnostic per collision.
-    fn detect_variant_collisions(&mut self) {
+    fn resolve_variant_collisions(&mut self) {
         let mut by_name: HashMap<&str, &SchemaTarget> = HashMap::new();
         for allocated in &self.analyzed.schema_names {
             let schema = &self.analyzed.ir.schemas[allocated.schema_index];
@@ -172,6 +191,9 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         }
 
         let mut diagnostics = Vec::new();
+        // Both stay empty until a collision actually fires, so the common path allocates nothing.
+        let mut assigned: Vec<String> = Vec::new();
+        let mut renames: Vec<(String, String, bool, String)> = Vec::new();
         for allocated in &self.analyzed.schema_names {
             let schema = &self.analyzed.ir.schemas[allocated.schema_index];
             let Some(shadowed) =
@@ -190,18 +212,54 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                         candidate.response_differs
                     }
                 });
-                if let Some(owner) = owner {
-                    let source = &self.analyzed.ir.schemas[owner.index].source;
+                let Some(owner) = owner else {
+                    continue;
+                };
+                let source = &self.analyzed.ir.schemas[owner.index].source;
+                let alias = format!("{}Body", shadowed.name);
+                if by_name.contains_key(alias.as_str()) || assigned.contains(&alias) {
                     diagnostics.push(source_diagnostic(
-                        CODE_VARIANT_COLLISION,
+                        CODE_VARIANT_ALIAS,
                         format!(
-                            "generated variant name '{shadowed}' for component '{owner}' collides with component '{shadowed}'; rename one with naming.overrides",
+                            "generated variant name '{shadowed}' for component '{owner}' collides with component '{shadowed}', and the replacement name '{alias}' is already taken; rename one with naming.overrides",
                             shadowed = shadowed.name,
                             owner = owner.name,
                         ),
                         source,
                     ));
+                    continue;
                 }
+                diagnostics.push(warning_diagnostic(
+                    CODE_VARIANT_COLLISION,
+                    format!(
+                        "generated variant name '{shadowed}' for component '{owner}' collides with component '{shadowed}'; emitting it as '{alias}'",
+                        shadowed = shadowed.name,
+                        owner = owner.name,
+                    ),
+                    source,
+                ));
+                renames.push((
+                    source.source_id.clone(),
+                    source.json_pointer.clone(),
+                    request,
+                    alias.clone(),
+                ));
+                assigned.push(alias);
+            }
+        }
+        drop(by_name);
+        for (source_id, json_pointer, request, alias) in renames {
+            // Infallible: the key was produced by a successful `schema_target` lookup above, and
+            // nothing between there and here removes an entry.
+            let target = self
+                .schema_targets
+                .get_mut(&source_id)
+                .and_then(|by_pointer| by_pointer.get_mut(&json_pointer))
+                .expect("a renamed variant's owner resolves through the key it was found under");
+            if request {
+                target.request_variant = Some(alias);
+            } else {
+                target.response_variant = Some(alias);
             }
         }
         for diagnostic in diagnostics {
@@ -281,6 +339,8 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                         file_base,
                         request_differs,
                         response_differs,
+                        request_variant: None,
+                        response_variant: None,
                     },
                 );
         }
@@ -405,6 +465,13 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             }
             taken.insert(candidate.clone());
             target.name = candidate;
+            // A variant override survives the rename deliberately. Clearing it would re-derive
+            // `{newName}Request` from a name this pass invented, and nothing re-checks that
+            // derivation against the declared components — a document declaring both `Issue` and
+            // `Issue2Request` would then export `Issue2Request` from two modules with no
+            // diagnostic. The stored alias is still globally unique (it was checked against every
+            // declared name when it was assigned, and `taken` here can never re-mint it), so
+            // keeping it is the collision-free choice even though it no longer echoes the new name.
         }
     }
 
@@ -702,25 +769,35 @@ mod tests {
         assert_eq!(edges, vec![pet_index]);
     }
 
-    /// Builds the model for `schemas` and returns the OASTS1306 variant-collision diagnostics the
-    /// emission model produced.
-    fn variant_collisions(schemas: Value) -> Vec<crate::diag::Diagnostic> {
+    /// Builds the model for `schemas` and returns the diagnostics it produced under `code`.
+    fn model_diagnostics(schemas: Value, code: &str) -> Vec<crate::diag::Diagnostic> {
         let (_temp, resolved, analyzed, digest) = build_model_inputs(schemas);
         let mut sink = DiagnosticSink::new();
         let model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
         drop(model);
         sink.into_sorted_vec()
             .into_iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1306")
+            .filter(|diagnostic| diagnostic.code == code)
             .collect()
     }
 
+    /// The OASTS1306 rename warnings for `schemas`.
+    fn variant_collisions(schemas: Value) -> Vec<crate::diag::Diagnostic> {
+        model_diagnostics(schemas, "OASTS1306")
+    }
+
+    /// The OASTS1310 residual-collision errors for `schemas` — the replacement name was taken too.
+    fn variant_alias_collisions(schemas: Value) -> Vec<crate::diag::Diagnostic> {
+        model_diagnostics(schemas, "OASTS1310")
+    }
+
     /// A component literally named `PetRequest` shadows the synthetic `PetRequest` that `Pet`'s
-    /// readOnly property forces: both would import the same identifier from different files, a
+    /// readOnly property forces: both would export the same identifier from different files, a
     /// load-time error the semantic-stage exact-collision check cannot see (it runs before variance
-    /// is resolved). Fail closed with an actionable diagnostic naming both parties.
+    /// is resolved). The document's own component keeps its name and the derived variant — the
+    /// compiler's own invention — takes the role-derived replacement.
     #[test]
-    fn variant_collision_request_flags_shadowing_component() {
+    fn variant_collision_request_renames_the_derived_variant_and_warns() {
         let schemas = json!({
             "Pet": {
                 "type": "object",
@@ -733,10 +810,67 @@ mod tests {
         });
         let flagged = variant_collisions(schemas);
         assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].severity, crate::diag::Severity::Warning);
+        assert_eq!(
+            flagged[0].message,
+            "generated variant name 'PetRequest' for component 'Pet' collides with component 'PetRequest'; emitting it as 'PetRequestBody'"
+        );
+    }
+
+    /// The replacement is a single fixed candidate, not a search: when `PetRequestBody` is itself a
+    /// declared component the compiler has nothing left to invent, so the document is refused.
+    #[test]
+    fn a_variant_alias_that_is_itself_declared_is_a_fatal_collision() {
+        let schemas = json!({
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            },
+            "PetRequest": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } }
+            },
+            "PetRequestBody": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            }
+        });
+        let flagged = variant_alias_collisions(schemas);
+        assert_eq!(flagged.len(), 1);
         assert_eq!(flagged[0].severity, crate::diag::Severity::Error);
         assert_eq!(
             flagged[0].message,
-            "generated variant name 'PetRequest' for component 'Pet' collides with component 'PetRequest'; rename one with naming.overrides"
+            "generated variant name 'PetRequest' for component 'Pet' collides with component 'PetRequest', and the replacement name 'PetRequestBody' is already taken; rename one with naming.overrides"
+        );
+    }
+
+    /// Two owners whose derived variants both collide each get their own replacement, and the
+    /// second sees the first's — the taken-set is declared names plus aliases already handed out.
+    #[test]
+    fn a_second_collision_sees_the_first_alias_as_taken() {
+        let schemas = json!({
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            },
+            "PetRequest": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            },
+            "PetRequestRequest": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            }
+        });
+        let flagged = variant_collisions(schemas);
+        assert_eq!(flagged.len(), 2);
+        assert_eq!(
+            flagged[0].message,
+            "generated variant name 'PetRequest' for component 'Pet' collides with component 'PetRequest'; emitting it as 'PetRequestBody'"
+        );
+        assert_eq!(
+            flagged[1].message,
+            "generated variant name 'PetRequestRequest' for component 'PetRequest' collides with component 'PetRequestRequest'; emitting it as 'PetRequestRequestBody'"
         );
     }
 
@@ -763,7 +897,7 @@ mod tests {
         assert_eq!(flagged.len(), 1);
         assert_eq!(
             flagged[0].message,
-            "generated variant name 'EnvelopeRequest' for component 'Envelope' collides with component 'EnvelopeRequest'; rename one with naming.overrides"
+            "generated variant name 'EnvelopeRequest' for component 'Envelope' collides with component 'EnvelopeRequest'; emitting it as 'EnvelopeRequestBody'"
         );
     }
 
@@ -790,7 +924,34 @@ mod tests {
         assert_eq!(flagged.len(), 1);
         assert_eq!(
             flagged[0].message,
-            "generated variant name 'PetResponse' for component 'Pet' collides with component 'PetResponse'; rename one with naming.overrides"
+            "generated variant name 'PetResponse' for component 'Pet' collides with component 'PetResponse'; emitting it as 'PetResponseBody'"
+        );
+    }
+
+    /// The response mirror of the residual-fatal case: a taken `{Name}ResponseBody` is refused the
+    /// same way, so neither position can silently fall through to a colliding declaration.
+    #[test]
+    fn a_response_variant_alias_that_is_itself_declared_is_a_fatal_collision() {
+        let schemas = json!({
+            "Pet": {
+                "type": "object",
+                "properties": { "secret": { "type": "string", "writeOnly": true } }
+            },
+            "PetResponse": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } }
+            },
+            "PetResponseBody": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } }
+            }
+        });
+        let flagged = variant_alias_collisions(schemas);
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].severity, crate::diag::Severity::Error);
+        assert_eq!(
+            flagged[0].message,
+            "generated variant name 'PetResponse' for component 'Pet' collides with component 'PetResponse', and the replacement name 'PetResponseBody' is already taken; rename one with naming.overrides"
         );
     }
 

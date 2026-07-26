@@ -1426,30 +1426,31 @@ fn emit_component(
 
     // A `readOnly`/`writeOnly` property somewhere in this component (or a component it references)
     // makes the request and/or response shape diverge from the neutral one, so this component gains
-    // first-class Request/Response validator variants mirroring the type artifact. The flags were
-    // resolved across the whole reference graph at model construction.
-    let (request_differs, response_differs) = {
+    // first-class Request/Response validator variants mirroring the type artifact. The divergence
+    // was resolved across the whole reference graph at model construction; `Some` is exactly the
+    // positions that diverge, and carries the name each one declares under.
+    let (request_variant, response_variant) = {
         let target = model
             .schema_target(&schema.source.source_id, &schema.source.json_pointer)
             .expect("a component with an allocated file has a registered target");
-        (target.request_differs, target.response_differs)
+        (target.request_export(), target.response_export())
     };
 
     let mut scope = FileScope::default();
     let mut imports = SiblingImports::default();
 
-    let declarations = if request_differs || response_differs {
+    let declarations = if request_variant.is_some() || response_variant.is_some() {
         // One full validator triplet per needed position. Fixed order — Neutral, then Request, then
-        // Response — keeps the emitted file deterministic. The variant export name matches the type
-        // artifact's `{name}Request`/`{name}Response` and `SchemaTarget::variant_name`, so a sibling
-        // that imports this component by its position variant resolves the same name.
+        // Response — keeps the emitted file deterministic. The variant export names come from
+        // `SchemaTarget`, the same producer the type artifact and every sibling import read, so
+        // agreement is enforced here rather than restated.
         let mut variants: Vec<(String, TypePosition)> = Vec::with_capacity(3);
         variants.push((name.to_owned(), TypePosition::Neutral));
-        if request_differs {
-            variants.push((format!("{name}Request"), TypePosition::Request));
+        if let Some(export) = request_variant {
+            variants.push((export, TypePosition::Request));
         }
-        if response_differs {
-            variants.push((format!("{name}Response"), TypePosition::Response));
+        if let Some(export) = response_variant {
+            variants.push((export, TypePosition::Response));
         }
 
         // Phase 1: render each variant's structural type and collect its sibling imports through the
@@ -2166,6 +2167,58 @@ mod tests {
             .expect("component validator file")
             .content
             .clone()
+    }
+
+    /// `reserve_names` renames `Issue` (a kernel identifier this artifact injects) to `Issue2`
+    /// after the collision pass has already aliased its request variant to `IssueRequestBody`.
+    /// Dropping that alias on the rename would re-derive `Issue2Request` — a name this document
+    /// declares — and nothing re-checks a post-rename derivation, so two modules would export one
+    /// identifier with no diagnostic and the artifact would not compile. The alias is kept instead:
+    /// it stays globally unique because it was checked against every declared name when assigned.
+    #[test]
+    fn a_reserved_name_rename_keeps_the_variant_alias_it_was_given() {
+        let (files, diagnostics) = compile(doc_30(json!({
+            "Issue": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true }, "n": { "type": "string" } }
+            },
+            "IssueRequest": { "type": "object", "properties": { "label": { "type": "string" } } },
+            "Issue2Request": { "type": "object", "properties": { "z": { "type": "string" } } },
+            "Envelope": {
+                "type": "object",
+                "properties": {
+                    "a": { "$ref": "#/components/schemas/Issue" },
+                    "b": { "$ref": "#/components/schemas/Issue2Request" }
+                }
+            }
+        })));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Severity::Error),
+            "{diagnostics:?}"
+        );
+        // The renamed component keeps the alias rather than re-deriving `Issue2Request`.
+        let issue = component(&files, "issue");
+        assert!(
+            issue.contains("export interface IssueRequestBody {"),
+            "{issue}"
+        );
+        assert!(!issue.contains("Issue2Request"), "{issue}");
+        // The importer therefore binds two distinct identifiers, one per source module.
+        let envelope = component(&files, "envelope");
+        assert!(
+            envelope.contains(
+                "import { type Issue2, type IssueRequestBody, validateIssue2, validateIssueRequestBody } from \"./issue.js\";"
+            ),
+            "{envelope}"
+        );
+        assert!(
+            envelope.contains(
+                "import { type Issue2Request, validateIssue2Request } from \"./issue2request.js\";"
+            ),
+            "{envelope}"
+        );
     }
 
     fn type_component(files: &[GeneratedFile], base: &str) -> String {

@@ -42,6 +42,8 @@ generate_and_verify defs-entry-3.1 oasts.yaml "$work/defs-entry-3.1" types "defs
 generate_and_verify inline-schema-names-3.0 oasts.yaml "$work/inline-schema-names-3.0" types "inline-schema-names-3.0"
 generate_and_verify operation-name-shadow-3.0 oasts.yaml "$work/operation-name-shadow-3.0" types "operation-name-shadow-3.0"
 generate_and_verify operation-name-shadow-3.0 oasts-client.yaml "$work/client-operation-name-shadow-3.0" client "operation-name-shadow-3.0 (client)"
+generate_and_verify variant-name-shadow-3.0 oasts.yaml "$work/variant-name-shadow-3.0" types "variant-name-shadow-3.0"
+generate_and_verify variant-name-shadow-3.0 oasts-client.yaml "$work/client-variant-name-shadow-3.0" client "variant-name-shadow-3.0 (client)"
 
 # deepObject carries one document per conformance mode, because the extended-only shapes (array,
 # untyped) are a hard OASTS1419 under the strict default and so cannot share a document.
@@ -49,6 +51,8 @@ generate_and_verify deep-object-3.0 oasts.yaml "$work/deep-object-strict" client
 generate_and_verify deep-object-3.0 oasts-compat.yaml "$work/deep-object-extended" client "deep-object-3.0 (extended)"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/operation-name-shadow-3.0/compile-assert/cases.ts"
 echo "compile-assert matrix ok: operation-name-shadow-3.0"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/variant-name-shadow-3.0/compile-assert/cases.ts"
+echo "compile-assert matrix ok: variant-name-shadow-3.0"
 
 for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server-variables-enum-3.1 relative-server-3.1 wire-fidelity-3.1; do
   # A fixture whose client config lives in a separate file says so on disk.
@@ -87,6 +91,7 @@ validators_runs=(
   "validators-showcase-3.1 oasts.yaml"
   "validators-showcase-3.1 oasts-client.yaml"
   "validators-readonly-3.1 oasts.yaml"
+  "variant-name-shadow-3.0 oasts.yaml"
   "petstore-3.0 oasts-validators.yaml"
   "webhooks-showcase-3.1 oasts-validators.yaml"
 )

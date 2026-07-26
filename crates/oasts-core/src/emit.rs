@@ -50,13 +50,20 @@ const CODE_VARIANT_COLLISION: &str = "OASTS1306";
 /// whose role-derived replacement is itself taken by another import or declaration in that module.
 /// Nothing is left to rename it to, so the module is refused rather than emitted uncompilable.
 const CODE_IMPORT_ALIAS: &str = "OASTS1307";
-/// A discriminator `mapping` value that resolves to no allocated component schema — a dangling
-/// mapping target the union can never dispatch to.
+/// A discriminator `mapping` value that resolves to no allocated component schema. A mapping target
+/// can only ever matter when it equals a branch's `$ref` target, and those are always materialized,
+/// so a value that fails to resolve could never have matched a branch: it is a dead entry, not a
+/// broken document. It drops out of tag resolution and proof falls back to the branch's own
+/// `const`/`enum` or component name.
 const CODE_MAPPING_TARGET: &str = "OASTS1308";
 /// A discriminator whose `mapping`/`const` proof is internally incoherent — a mapping tag that
 /// contradicts the branch's own fixed value, or an allOf idiom that fixes the tag property to an
 /// empty (uninhabitable) value set. The render degrades to a plain structural union.
 const CODE_DISCRIMINATOR_PROOF: &str = "OASTS1309";
+/// A generated request/response variant whose colliding-name replacement is itself a declared
+/// component or another variant's replacement. No local remedy exists, so the document is refused
+/// rather than emitted with two declarations fighting over one identifier.
+const CODE_VARIANT_ALIAS: &str = "OASTS1310";
 
 const INDENT_CHUNK: &str = "                                ";
 
@@ -1057,16 +1064,17 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     ) {
         let prop = discriminator.property_name.as_str();
 
-        // Resolve every mapping value once. An unresolvable value is a hard error and contributes no
-        // tag; a resolvable one records (tag -> target component index) for branch matching below.
+        // Resolve every mapping value once. An unresolvable value warns and contributes no tag — the
+        // mapping never shapes the emitted union, so a stale pointer degrades proof, not output —
+        // while a resolvable one records (tag -> target component index) for branch matching below.
         let mut mapping_targets: Vec<(&str, usize)> = Vec::new();
         for (tag, target) in &discriminator.mapping {
             match self.resolve_mapping_target(discriminator, target) {
                 Some(index) => mapping_targets.push((tag.as_str(), index)),
-                None => diagnostics.push(source_diagnostic(
+                None => diagnostics.push(warning_diagnostic(
                     CODE_MAPPING_TARGET,
                     format!(
-                        "discriminator mapping value '{target}' resolves to no component schema"
+                        "discriminator mapping value '{target}' resolves to no component schema; the entry contributes no tag"
                     ),
                     &discriminator.source,
                 )),
@@ -1245,9 +1253,12 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             .model
             .schema_target(&schema.source.source_id, &schema.source.json_pointer)
             .expect("an allocated component file has a schema target");
-        let request_differs = target.request_differs;
-        let response_differs = target.response_differs;
-        if request_differs {
+        // The declarations read the same producer every reference site reads, so a variant this
+        // component exports and a sibling's import of it can never spell the name differently.
+        // `Some` is exactly "this position diverges", so it also gates the per-position imports.
+        let request_variant = target.request_export();
+        let response_variant = target.response_export();
+        if request_variant.is_some() {
             self.collect_component_imports(
                 &schema.schema,
                 TypePosition::Request,
@@ -1255,7 +1266,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 &mut imports,
             );
         }
-        if response_differs {
+        if response_variant.is_some() {
             self.collect_component_imports(
                 &schema.schema,
                 TypePosition::Response,
@@ -1271,19 +1282,19 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             TypePosition::Neutral,
             &schema.source,
         );
-        if request_differs {
+        if let Some(export) = &request_variant {
             self.write_schema_declaration(
                 &mut content,
-                &format!("{}Request", allocated.name),
+                export,
                 &schema.schema,
                 TypePosition::Request,
                 &schema.source,
             );
         }
-        if response_differs {
+        if let Some(export) = &response_variant {
             self.write_schema_declaration(
                 &mut content,
-                &format!("{}Response", allocated.name),
+                export,
                 &schema.schema,
                 TypePosition::Response,
                 &schema.source,
@@ -2112,12 +2123,32 @@ pub(super) fn import_clause(name: String, aliases: &HashMap<String, String>) -> 
 impl SchemaTarget {
     pub(super) fn variant_name(&self, position: TypePosition) -> String {
         match position {
-            TypePosition::Request if self.request_differs => format!("{}Request", self.name),
-            TypePosition::Response if self.response_differs => format!("{}Response", self.name),
+            TypePosition::Request if self.request_differs => self
+                .request_variant
+                .clone()
+                .unwrap_or_else(|| format!("{}Request", self.name)),
+            TypePosition::Response if self.response_differs => self
+                .response_variant
+                .clone()
+                .unwrap_or_else(|| format!("{}Response", self.name)),
             TypePosition::Neutral | TypePosition::Request | TypePosition::Response => {
                 self.name.clone()
             }
         }
+    }
+
+    /// The name this component's request-position variant declares under, or `None` when the
+    /// position does not diverge from the neutral shape and so declares nothing of its own.
+    /// Every artifact that emits a component reads this rather than pairing the `differs` flag
+    /// with its own `variant_name` call, so the flag and the name cannot drift apart.
+    pub(super) fn request_export(&self) -> Option<String> {
+        self.request_differs
+            .then(|| self.variant_name(TypePosition::Request))
+    }
+
+    pub(super) fn response_export(&self) -> Option<String> {
+        self.response_differs
+            .then(|| self.variant_name(TypePosition::Response))
     }
 }
 
@@ -6199,8 +6230,11 @@ mod tests {
         );
     }
 
+    /// A mapping value the compiler cannot resolve is a dead entry, not a broken document: the
+    /// mapping never shapes the emitted union, so the entry drops out of tag resolution and proof
+    /// falls back to each branch's own `const`. Files are still emitted.
     #[test]
-    fn dangling_mapping_is_error_oasts1308() {
+    fn dangling_mapping_warns_and_contributes_no_tag() {
         let document = openapi(json!({
             "Cat": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "cat" } } },
             "Dog": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "dog" } } },
@@ -6208,15 +6242,62 @@ mod tests {
                      "discriminator": { "propertyName": "kind",
                        "mapping": { "cat": "other.json#/components/schemas/Cat" } } }
         }));
-        let (_files, diagnostics) = compile(document, json!({}));
+        let (files, diagnostics) = compile(document, json!({}));
         // The const-proved branches still prove; only the dangling mapping value is reported.
         let flagged = discriminator_diagnostics(&diagnostics);
         assert_eq!(flagged.len(), 1, "{diagnostics:?}");
         assert_eq!(flagged[0].code, CODE_MAPPING_TARGET);
-        assert_eq!(flagged[0].severity, Severity::Error);
+        assert_eq!(flagged[0].severity, Severity::Warning);
+        assert_eq!(
+            flagged[0].message,
+            "discriminator mapping value 'other.json#/components/schemas/Cat' resolves to no component schema; the entry contributes no tag"
+        );
         assert_eq!(
             flagged[0].json_pointer.as_deref(),
             Some("/components/schemas/Pet/discriminator")
+        );
+        // The dropped entry must not also make the union unprovable.
+        assert!(
+            flagged
+                .iter()
+                .all(|diagnostic| diagnostic.code != CODE_DISCRIMINATOR),
+            "{diagnostics:?}"
+        );
+        let pet = find_file(&files, "types/components/pet.ts");
+        assert!(
+            pet.content.contains("export type Pet = Cat | Dog;"),
+            "{}",
+            pet.content
+        );
+    }
+
+    /// Every mapping entry dangling still emits the same structural union, now with one warning per
+    /// dead entry — proof falls all the way back to the referenced component names.
+    #[test]
+    fn an_entirely_dangling_mapping_still_emits_the_union() {
+        let document = openapi(json!({
+            "Cat": { "type": "object", "properties": { "kind": { "type": "string" } } },
+            "Dog": { "type": "object", "properties": { "kind": { "type": "string" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind",
+                       "mapping": { "cat": "other.json#/components/schemas/Cat",
+                                    "dog": "other.json#/components/schemas/Dog" } } }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        let flagged = discriminator_diagnostics(&diagnostics);
+        assert_eq!(flagged.len(), 2, "{diagnostics:?}");
+        assert!(
+            flagged
+                .iter()
+                .all(|diagnostic| diagnostic.code == CODE_MAPPING_TARGET
+                    && diagnostic.severity == Severity::Warning),
+            "{diagnostics:?}"
+        );
+        let pet = find_file(&files, "types/components/pet.ts");
+        assert!(
+            pet.content.contains("export type Pet = Cat | Dog;"),
+            "{}",
+            pet.content
         );
     }
 
@@ -7327,6 +7408,150 @@ mod tests {
         );
     }
 
+    /// The whole point of routing declarations through `variant_name`: the module that declares the
+    /// renamed variant and the sibling that imports it read one producer, so a rename can never
+    /// leave a dangling import. `Envelope` gains a Request variant only by referencing `Pet`, so its
+    /// request rendering names `Pet`'s request variant — under the alias, not the derived name.
+    #[test]
+    fn a_renamed_variant_is_declared_and_imported_under_the_alias() {
+        let (files, diagnostics) = compile(
+            openapi(json!({
+                "Pet": {
+                    "type": "object",
+                    "properties": { "id": { "type": "string", "readOnly": true } }
+                },
+                "PetRequest": {
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } }
+                },
+                "Envelope": {
+                    "type": "object",
+                    "properties": { "pet": { "$ref": "#/components/schemas/Pet" } }
+                }
+            })),
+            json!({}),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Severity::Error),
+            "{diagnostics:?}"
+        );
+        let pet = find_file(&files, "types/components/pet.ts");
+        assert!(
+            pet.content.contains("export interface PetRequestBody {"),
+            "{}",
+            pet.content
+        );
+        assert!(
+            !pet.content.contains("export interface PetRequest {"),
+            "{}",
+            pet.content
+        );
+        // The document's own component is untouched, in its own file under its own name.
+        let declared = find_file(&files, "types/components/petrequest.ts");
+        assert!(
+            declared.content.contains("export interface PetRequest {"),
+            "{}",
+            declared.content
+        );
+        let envelope = find_file(&files, "types/components/envelope.ts");
+        assert!(
+            envelope
+                .content
+                .contains("import type { Pet, PetRequestBody } from \"./pet.js\";"),
+            "{}",
+            envelope.content
+        );
+        assert!(
+            envelope.content.contains("pet?: PetRequestBody;"),
+            "{}",
+            envelope.content
+        );
+    }
+
+    /// The response mirror: a `writeOnly` marker forces the Response variant, and a declared
+    /// `PetResponse` pushes it to `PetResponseBody` at both the declaration and the reference.
+    #[test]
+    fn a_renamed_response_variant_is_declared_and_imported_under_the_alias() {
+        let (files, diagnostics) = compile(
+            openapi(json!({
+                "Pet": {
+                    "type": "object",
+                    "properties": { "secret": { "type": "string", "writeOnly": true } }
+                },
+                "PetResponse": {
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } }
+                },
+                "Envelope": {
+                    "type": "object",
+                    "properties": { "pet": { "$ref": "#/components/schemas/Pet" } }
+                }
+            })),
+            json!({}),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Severity::Error),
+            "{diagnostics:?}"
+        );
+        let pet = find_file(&files, "types/components/pet.ts");
+        assert!(
+            pet.content.contains("export interface PetResponseBody {"),
+            "{}",
+            pet.content
+        );
+        assert!(
+            !pet.content.contains("export interface PetResponse {"),
+            "{}",
+            pet.content
+        );
+        let envelope = find_file(&files, "types/components/envelope.ts");
+        assert!(
+            envelope
+                .content
+                .contains("import type { Pet, PetResponseBody } from \"./pet.js\";"),
+            "{}",
+            envelope.content
+        );
+    }
+
+    /// Both `Body` producers can land on one identifier: the operation module `completeUpload`
+    /// declares `CompleteUploadRequest`, so its import of the component `CompleteUploadRequest`
+    /// aliases to `CompleteUploadRequestBody` — the same name `CompleteUpload`'s renamed request
+    /// variant already exports, which this module also imports. Two bindings, one identifier, no
+    /// local remedy, so the existing fatal alias collision is the correct landing.
+    #[test]
+    fn a_variant_alias_colliding_with_an_import_alias_is_a_fatal_collision() {
+        let (_, diagnostics) = compile(
+            shadowing_document(
+                json!({
+                    "CompleteUpload": {
+                        "type": "object",
+                        "properties": { "id": { "type": "string", "readOnly": true } }
+                    },
+                    "CompleteUploadRequest": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } }
+                    }
+                }),
+                "CompleteUpload",
+                "CompleteUploadRequest",
+            ),
+            json!({}),
+        );
+        let flagged: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_IMPORT_ALIAS)
+            .collect();
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        assert_eq!(flagged[0].severity, Severity::Error);
+        let message = flagged[0].message.as_str();
+        assert!(message.contains("CompleteUploadRequestBody"), "{message}");
+    }
+
     #[test]
     fn webhook_type_files_render_request_response() {
         let (files, diagnostics) = compile(webhook_document(), json!({}));
@@ -7815,7 +8040,7 @@ pub(super) fn source_diagnostic(
     diagnostic
 }
 
-fn warning_diagnostic(
+pub(super) fn warning_diagnostic(
     code: &'static str,
     message: impl Into<String>,
     source: &SourceRef,

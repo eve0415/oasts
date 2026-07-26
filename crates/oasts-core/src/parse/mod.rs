@@ -31,6 +31,10 @@ const CODE_REF_SIBLINGS: &str = "OASTS1110";
 const CODE_MULTIPLE_OF: &str = "OASTS1112";
 const CODE_REF_CYCLE: &str = "OASTS1113";
 const CODE_REF_DEPTH: &str = "OASTS1114";
+/// A discriminator `mapping` value that is not a JSON string. It cannot name a schema, so it drops
+/// out of tag resolution — diagnosed rather than dropped silently so a malformed entry is no
+/// quieter than a dangling one.
+const CODE_MAPPING_VALUE_SHAPE: &str = "OASTS1115";
 const CODE_SERVER_VAR_ENUM_EMPTY: &str = "OASTS1131";
 const CODE_SERVER_VAR_DEFAULT: &str = "OASTS1132";
 const CODE_HEADER_CONTENT_TYPE: &str = "OASTS1133";
@@ -2127,18 +2131,24 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         let pointer = append_pointer(&parent.pointer, "discriminator");
         let object = value.as_object()?;
         let property_name = object.get("propertyName")?.as_str()?.to_owned();
-        let mapping = object
-            .get("mapping")
-            .and_then(Value::as_object)
-            .map(|mapping| {
-                mapping
-                    .iter()
-                    .filter_map(|(key, value)| {
-                        value.as_str().map(|value| (key.clone(), value.to_owned()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut mapping = Vec::new();
+        if let Some(entries) = object.get("mapping").and_then(Value::as_object) {
+            for (key, value) in entries {
+                match value.as_str() {
+                    Some(value) => mapping.push((key.clone(), value.to_owned())),
+                    // Dropped either way; the discriminator never shapes the union. Diagnosing it
+                    // keeps a malformed value from being quieter than a dangling one (OASTS1308).
+                    None => self.sink.push(self.warning_diagnostic(
+                        CODE_MAPPING_VALUE_SHAPE,
+                        parent.doc_id,
+                        &pointer,
+                        format!(
+                            "discriminator mapping value for '{key}' is not a string; the entry is dropped and contributes no tag"
+                        ),
+                    )),
+                }
+            }
+        }
         Some(Discriminator {
             property_name,
             mapping,
@@ -7477,6 +7487,54 @@ mod tests {
                 && diagnostic.message.contains("case-sensitive")
                 && diagnostic.message.contains("'4XX'")
         }));
+    }
+
+    /// A mapping value that is not a JSON string cannot name a schema, so it drops out of tag
+    /// resolution the same way a dangling one does — but silently dropping it would make a
+    /// malformed entry quieter than a dangling one, which warns from the emitter.
+    #[test]
+    fn a_non_string_mapping_value_warns_and_drops() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {},
+            "components": { "schemas": {
+                "Cat": { "type": "object", "properties": { "kind": { "type": "string" } } },
+                "Pet": {
+                    "oneOf": [{ "$ref": "#/components/schemas/Cat" }],
+                    "discriminator": { "propertyName": "kind", "mapping": { "cat": "Cat", "bad": 7 } }
+                }
+            } }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        let flagged: Vec<_> = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_MAPPING_VALUE_SHAPE)
+            .collect();
+        assert_eq!(flagged.len(), 1, "{:?}", sink.as_slice());
+        assert_eq!(flagged[0].severity, Severity::Warning);
+        assert_eq!(
+            flagged[0].message,
+            "discriminator mapping value for 'bad' is not a string; the entry is dropped and contributes no tag"
+        );
+        assert_eq!(
+            flagged[0].json_pointer.as_deref(),
+            Some("/components/schemas/Pet/discriminator")
+        );
+        // The well-formed sibling entry survives; only the malformed one drops.
+        let discriminator = ir
+            .schemas
+            .iter()
+            .find_map(|schema| match &schema.schema {
+                SchemaNode::OneOf { discriminator, .. } => discriminator.as_deref(),
+                _ => None,
+            })
+            .expect("the oneOf carries a discriminator");
+        assert_eq!(
+            discriminator.mapping,
+            vec![("cat".to_owned(), "Cat".to_owned())]
+        );
     }
 
     #[test]

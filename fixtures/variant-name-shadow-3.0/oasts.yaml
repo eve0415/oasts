@@ -1,0 +1,7 @@
+schemaVersion: 1
+input:
+  path: ./openapi.json
+output: ./generated
+artifacts:
+  types: true
+  validators: true
