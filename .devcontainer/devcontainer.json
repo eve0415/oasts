@@ -1,7 +1,7 @@
 {
   "features": {
     "ghcr.io/devcontainers/features/github-cli:1.1.0": {
-      "extensions": "",
+      "extensions": "github/gh-stack",
       "installDirectlyFromGitHubRelease": true,
       "version": "latest"
     },
@@ -15,7 +15,7 @@
       "version": "lts"
     }
   },
-  "image": "mcr.microsoft.com/devcontainers/rust:2.0.13-trixie",
+  "image": "mcr.microsoft.com/devcontainers/rust:2.0.14-trixie",
   "name": "oasts",
   "postCreateCommand": "pnpm install --frozen-lockfile && cargo run -p oasts-gen && pnpm -C packages/oasts build:napi"
 }
