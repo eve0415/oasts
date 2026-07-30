@@ -1,0 +1,6 @@
+# SHA-256 manifest of the date/time transform frozen entry-gate files; scripts/transform-gate.sh verifies it.
+# These files were authored from the pinned transform contract before any implementation existed
+# and are never edited afterward — the implementation is written to satisfy them.
+files:
+  - path: crates/oasts-core/runtime/test/vectors-transform.ts
+    sha256: b02a3f9341257d0122ffb0bc38ea51c6b1c4c3c3fdbd6c8937e85772ab5133ed

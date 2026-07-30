@@ -36,6 +36,7 @@ use crate::semantic::{
 mod client;
 mod model;
 pub(crate) mod runtime_assets;
+mod transform;
 mod validators;
 
 use model::{EmissionModel, SchemaTarget};
@@ -64,6 +65,18 @@ const CODE_DISCRIMINATOR_PROOF: &str = "OASTS1309";
 /// component or another variant's replacement. No local remedy exists, so the document is refused
 /// rather than emitted with two declarations fighting over one identifier.
 const CODE_VARIANT_ALIAS: &str = "OASTS1310";
+/// A union whose branches convert date/time values differently, where no JSON value kind and no
+/// declared discriminator tells them apart. Applying either branch's conversion to the other's value
+/// would corrupt it silently, and ordered try-each-branch decoding cannot detect the mistake — a
+/// non-converting branch always succeeds by identity — so the document is refused instead.
+const CODE_TRANSFORM_UNION: &str = "OASTS1313";
+/// A wire twin whose derived `{Name}Wire` is already a declared component's name. The document owns
+/// its name; the compiler invented the other, so the twin yields to `{Name}WireValue` and generation
+/// continues — the same rule OASTS1306 applies to a colliding request/response variant.
+const CODE_WIRE_ALIAS: &str = "OASTS1311";
+/// The residual: `{Name}WireValue` is itself declared. Nothing compiler-invented remains, so the
+/// document is refused rather than emitted with two declarations fighting over one identifier.
+const CODE_WIRE_COLLISION: &str = "OASTS1312";
 
 const INDENT_CHUNK: &str = "                                ";
 
@@ -322,6 +335,9 @@ pub fn emit_artifacts(
     let mut files = emit_types_from_model(&mut model);
     if let Some(client_model) = client_model {
         files.extend(client::emit_client_from_model(&mut model, client_model));
+        // The transform artifact lives under the client's tree and only ever runs at the client's
+        // pipeline positions, so it is emitted with the client and never without it.
+        files.extend(transform::emit_transform_from_model(&mut model));
     }
     if config.artifacts.validators.enabled {
         files.extend(validators::emit_validators_from_model(&mut model));
@@ -335,6 +351,28 @@ pub(super) enum TypePosition {
     Neutral,
     Request,
     Response,
+}
+
+/// Which of a schema's two type surfaces is being rendered.
+///
+/// They differ only where a date/time transform reaches: the application surface names `Date` or a
+/// `Temporal` type there, the wire surface names `string`. Everywhere else — and everywhere at all
+/// under the `string` default — the two are the same declaration and only one is emitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TypeAxis {
+    Application,
+    Wire,
+}
+
+impl TypePosition {
+    /// A stable slot for per-position state, so one array replaces one field per position.
+    pub(super) const fn index(self) -> usize {
+        match self {
+            Self::Neutral => 0,
+            Self::Request => 1,
+            Self::Response => 2,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1062,28 +1100,58 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         discriminator: &Discriminator,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
-        let prop = discriminator.property_name.as_str();
+        let (mapping_targets, dangling) = self.mapping_targets(discriminator);
+        for target in dangling {
+            diagnostics.push(warning_diagnostic(
+                CODE_MAPPING_TARGET,
+                format!(
+                    "discriminator mapping value '{target}' resolves to no component schema; the entry contributes no tag"
+                ),
+                &discriminator.source,
+            ));
+        }
+        if let Err((code, message)) =
+            self.prove_discriminator_tags(branches, discriminator, &mapping_targets)
+        {
+            diagnostics.push(warning_diagnostic(code, message, &discriminator.source));
+        }
+    }
 
-        // Resolve every mapping value once. An unresolvable value warns and contributes no tag — the
-        // mapping never shapes the emitted union, so a stale pointer degrades proof, not output —
-        // while a resolvable one records (tag -> target component index) for branch matching below.
-        let mut mapping_targets: Vec<(&str, usize)> = Vec::new();
+    /// Resolves every `mapping` value once, splitting the resolvable `(tag, component index)` pairs
+    /// from the values that designate no allocated schema. The mapping never shapes the emitted
+    /// union, so a stale pointer degrades proof, not output — the caller decides whether to warn.
+    fn mapping_targets<'a>(
+        &self,
+        discriminator: &'a Discriminator,
+    ) -> (Vec<(&'a str, usize)>, Vec<&'a str>) {
+        let mut resolved: Vec<(&'a str, usize)> = Vec::new();
+        let mut dangling: Vec<&'a str> = Vec::new();
         for (tag, target) in &discriminator.mapping {
             match self.resolve_mapping_target(discriminator, target) {
-                Some(index) => mapping_targets.push((tag.as_str(), index)),
-                None => diagnostics.push(warning_diagnostic(
-                    CODE_MAPPING_TARGET,
-                    format!(
-                        "discriminator mapping value '{target}' resolves to no component schema; the entry contributes no tag"
-                    ),
-                    &discriminator.source,
-                )),
+                Some(index) => resolved.push((tag.as_str(), index)),
+                None => dangling.push(target.as_str()),
             }
         }
+        (resolved, dangling)
+    }
 
+    /// The literal tags each branch proves for the discriminator property, in branch order, or the
+    /// `(code, message)` of the one proof failure that stops the union from dispatching.
+    ///
+    /// This is the sole producer of discriminator tag semantics. `validate_discriminated` reads it
+    /// for its diagnostic; the transform emitter reads it to decide whether a union can dispatch a
+    /// per-branch transform on the tag property (`emit::transform`). Neither re-derives it, so the
+    /// two can never disagree about what a document's discriminator proves.
+    fn prove_discriminator_tags(
+        &self,
+        branches: &[SchemaNode],
+        discriminator: &Discriminator,
+        mapping_targets: &[(&str, usize)],
+    ) -> Result<Vec<Vec<String>>, (&'static str, String)> {
+        let prop = discriminator.property_name.as_str();
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut fallback: Option<(&'static str, String)> = None;
-        'proof: for branch in branches {
+        let mut proven: Vec<Vec<String>> = Vec::with_capacity(branches.len());
+        for branch in branches {
             let branch_index = self.branch_target_index(branch);
             let mapping_tags: Vec<&str> = mapping_targets
                 .iter()
@@ -1095,13 +1163,12 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             // An allOf idiom that fixes the tag property to disjoint values proves an uninhabitable
             // branch: no wire value selects it, so the union cannot dispatch. Warn and fall back.
             if const_proof.as_deref().is_some_and(<[Value]>::is_empty) {
-                fallback = Some((
+                return Err((
                     CODE_DISCRIMINATOR_PROOF,
                     format!(
                         "discriminator branch fixes '{prop}' to no inhabitable value; emitting a structural union"
                     ),
                 ));
-                break 'proof;
             }
 
             let effective: Vec<String> = if !mapping_tags.is_empty() {
@@ -1110,14 +1177,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 if let Some([value]) = const_proof.as_deref()
                     && let Some(conflict) = mapping_tags.iter().find(|tag| **tag != tag_key(value))
                 {
-                    fallback = Some((
+                    return Err((
                         CODE_DISCRIMINATOR_PROOF,
                         format!(
                             "discriminator maps '{conflict}' to a branch whose '{prop}' is fixed to {}; emitting a structural union",
                             render_json_compact(value, ObjectKeyMode::Plain)
                         ),
                     ));
-                    break 'proof;
                 }
                 mapping_tags.iter().map(|tag| (*tag).to_owned()).collect()
             } else if let Some(values) = const_proof.as_deref().filter(|values| !values.is_empty())
@@ -1128,30 +1194,26 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             };
 
             if effective.is_empty() {
-                fallback = Some((
+                return Err((
                     CODE_DISCRIMINATOR,
                     format!(
                         "emitting a structural union because a branch does not prove one literal for discriminator property '{prop}'"
                     ),
                 ));
-                break 'proof;
             }
-            for tag in effective {
+            for tag in &effective {
                 if !seen.insert(tag.clone()) {
-                    fallback = Some((
+                    return Err((
                         CODE_DISCRIMINATOR,
                         format!(
                             "emitting a structural union because discriminator property '{prop}' repeats literal {tag}"
                         ),
                     ));
-                    break 'proof;
                 }
             }
+            proven.push(effective);
         }
-
-        if let Some((code, message)) = fallback {
-            diagnostics.push(warning_diagnostic(code, message, &discriminator.source));
-        }
+        Ok(proven)
     }
 
     /// The allocated component index a branch's `$ref` resolves to, or `None` for a non-`$ref`
@@ -1242,10 +1304,12 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             .as_deref()
             .unwrap_or_default();
         let mut content = self.header();
+        let header_len = content.len();
         let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
         self.collect_component_imports(
             &schema.schema,
             TypePosition::Neutral,
+            TypeAxis::Application,
             allocated.schema_index,
             &mut imports,
         );
@@ -1262,6 +1326,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             self.collect_component_imports(
                 &schema.schema,
                 TypePosition::Request,
+                TypeAxis::Application,
                 allocated.schema_index,
                 &mut imports,
             );
@@ -1270,9 +1335,36 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             self.collect_component_imports(
                 &schema.schema,
                 TypePosition::Response,
+                TypeAxis::Application,
                 allocated.schema_index,
                 &mut imports,
             );
+        }
+        // A twin is emitted for exactly the positions that declare one, and each pulls the wire
+        // names of the components it references.
+        let wire_exports = [
+            TypePosition::Neutral,
+            TypePosition::Request,
+            TypePosition::Response,
+        ]
+        .map(|position| target.wire_export(position));
+        for (index, position) in [
+            TypePosition::Neutral,
+            TypePosition::Request,
+            TypePosition::Response,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if wire_exports[index].is_some() {
+                self.collect_component_imports(
+                    &schema.schema,
+                    position,
+                    TypeAxis::Wire,
+                    allocated.schema_index,
+                    &mut imports,
+                );
+            }
         }
         self.write_imports(&mut content, imports, "./");
         self.write_schema_declaration(
@@ -1280,6 +1372,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             &allocated.name,
             &schema.schema,
             TypePosition::Neutral,
+            TypeAxis::Application,
             &schema.source,
         );
         if let Some(export) = &request_variant {
@@ -1288,6 +1381,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 export,
                 &schema.schema,
                 TypePosition::Request,
+                TypeAxis::Application,
                 &schema.source,
             );
         }
@@ -1297,12 +1391,34 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 export,
                 &schema.schema,
                 TypePosition::Response,
+                TypeAxis::Application,
                 &schema.source,
             );
         }
+        // Each twin sits directly after its application type: the declaration order stays
+        // dependency-topological, and a reader sees the two surfaces of one schema together.
+        for (index, position) in [
+            TypePosition::Neutral,
+            TypePosition::Request,
+            TypePosition::Response,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(export) = &wire_exports[index] {
+                self.write_schema_declaration(
+                    &mut content,
+                    export,
+                    &schema.schema,
+                    position,
+                    TypeAxis::Wire,
+                    &schema.source,
+                );
+            }
+        }
         GeneratedFile {
             relative_path: format!("types/components/{file_base}.ts"),
-            content,
+            content: insert_temporal_reference(content, header_len),
         }
     }
 
@@ -1312,6 +1428,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         name: &str,
         schema: &SchemaNode,
         position: TypePosition,
+        axis: TypeAxis,
         source: &SourceRef,
     ) {
         if let Some(values) = schema_finite_values(schema)
@@ -1408,13 +1525,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             output.push_str("export interface ");
             output.push_str(name);
             output.push(' ');
-            output.push_str(&self.render_interface_body(properties, position, 0));
+            output.push_str(&self.render_interface_body(properties, position, axis, 0));
             output.push('\n');
         } else {
             output.push_str("export type ");
             output.push_str(name);
             output.push_str(" = ");
-            output.push_str(&self.render_type(schema, position, 0));
+            output.push_str(&self.render_type(schema, position, axis, 0));
             output.push_str(";\n");
         }
     }
@@ -1435,6 +1552,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         &self,
         properties: &[(String, SchemaNode, PropMeta)],
         position: TypePosition,
+        axis: TypeAxis,
         indent: usize,
     ) -> String {
         let borrowed = borrow_properties(properties);
@@ -1442,6 +1560,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             &borrowed,
             &AdditionalProperties::Forbidden,
             position,
+            axis,
             indent,
             true,
         )
@@ -1451,15 +1570,34 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         &self,
         schema: &SchemaNode,
         position: TypePosition,
+        axis: TypeAxis,
         indent: usize,
     ) -> String {
+        // A transform site is the one place the two surfaces disagree: the application surface names
+        // the runtime type, the wire surface keeps the `string` the JSON actually carries. The site
+        // predicate already excludes a formatted string carrying an `enum`/`const`, so a literal
+        // union stays the literal union it is.
+        if axis == TypeAxis::Application
+            && let Some(kind) = self.model.transform_facts().site(schema)
+        {
+            return add_nullable(kind.ts_type().to_owned(), schema);
+        }
         let rendered = match schema {
             SchemaNode::Ref { target, .. } => self
                 .model
                 .schema_target(&target.source_id, &target.json_pointer)
                 .map_or_else(
                     || "unknown".to_owned(),
-                    |target| self.local_import_name(target.variant_name(position)),
+                    |target| {
+                        let name = match axis {
+                            // A referenced component that transforms has a twin of its own, and the
+                            // wire surface names that twin; one that does not is identity in both
+                            // surfaces and keeps its single name.
+                            TypeAxis::Wire if target.transforms => target.wire_name(position),
+                            TypeAxis::Application | TypeAxis::Wire => target.variant_name(position),
+                        };
+                        self.local_import_name(name)
+                    },
                 ),
             SchemaNode::Primitive {
                 ty,
@@ -1489,10 +1627,17 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 ..
             } => {
                 let borrowed = borrow_properties(properties);
-                self.render_object_parts(&borrowed, additional_properties, position, indent, false)
+                self.render_object_parts(
+                    &borrowed,
+                    additional_properties,
+                    position,
+                    axis,
+                    indent,
+                    false,
+                )
             }
             SchemaNode::Array { items, .. } => {
-                let item = self.render_type(items, position, indent);
+                let item = self.render_type(items, position, axis, indent);
                 let mut item = parenthesize_array_item(item, items);
                 item.reserve(2);
                 item.push_str("[]");
@@ -1503,13 +1648,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             } => {
                 let mut items = prefix_items
                     .iter()
-                    .map(|item| self.render_type(item, position, indent))
+                    .map(|item| self.render_type(item, position, axis, indent))
                     .collect::<Vec<_>>();
                 match rest {
                     TupleRest::Allowed => items.push("...unknown[]".to_owned()),
                     TupleRest::Forbidden => {}
                     TupleRest::Schema(schema) => {
-                        let rest = self.render_type(schema, position, indent);
+                        let rest = self.render_type(schema, position, axis, indent);
                         let mut rest = parenthesize_array_item(rest, schema);
                         rest.reserve(5);
                         rest.insert_str(0, "...");
@@ -1530,6 +1675,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                             properties,
                             additional_properties,
                             position,
+                            axis,
                             indent,
                             false,
                         )
@@ -1542,7 +1688,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     let rendered = branches
                         .iter()
                         .filter_map(|branch| {
-                            let rendered = self.render_type(branch, position, indent);
+                            let rendered = self.render_type(branch, position, axis, indent);
                             if rendered == "unknown" {
                                 None
                             } else {
@@ -1565,7 +1711,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     // branches, and a set would clone every rendered branch to own its key.
                     let mut rendered_branches = Vec::with_capacity(branches.len());
                     for branch in branches {
-                        let rendered = self.render_type(branch, position, indent);
+                        let rendered = self.render_type(branch, position, axis, indent);
                         if !rendered_branches.contains(&rendered) {
                             rendered_branches.push(rendered);
                         }
@@ -1603,6 +1749,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         properties: &[BorrowedProperty<'_>],
         additional_properties: &AdditionalProperties,
         position: TypePosition,
+        axis: TypeAxis,
         indent: usize,
         interface_members: bool,
     ) -> String {
@@ -1636,7 +1783,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     output.push('?');
                 }
                 output.push_str(": ");
-                output.push_str(&self.render_type(schema, position, member_indent));
+                output.push_str(&self.render_type(schema, position, axis, member_indent));
                 output.push_str(";\n");
             }
             push_indent(&mut output, indent);
@@ -1646,7 +1793,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         match additional_properties {
             AdditionalProperties::Allowed(None) | AdditionalProperties::Forbidden => literal,
             AdditionalProperties::Allowed(Some(schema)) | AdditionalProperties::Schema(schema) => {
-                let value = self.render_type(schema, position, indent);
+                let value = self.render_type(schema, position, axis, indent);
                 if !has_included_properties {
                     format!("{{ [key: string]: {value} }}")
                 } else {
@@ -1923,15 +2070,22 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         &self,
         schema: &SchemaNode,
         position: TypePosition,
+        axis: TypeAxis,
         current_schema: usize,
         imports: &mut BTreeMap<String, BTreeSet<String>>,
     ) {
         self.walk_refs(schema, position, &mut |target| {
             if target.index != current_schema {
+                // Reads the same producer the reference site reads, so the import and the type it
+                // names can never spell the twin differently.
+                let name = match axis {
+                    TypeAxis::Wire if target.transforms => target.wire_name(position),
+                    TypeAxis::Application | TypeAxis::Wire => target.variant_name(position),
+                };
                 imports
                     .entry(target.file_base.clone())
                     .or_default()
-                    .insert(target.variant_name(position));
+                    .insert(name);
             }
         });
     }
@@ -2150,6 +2304,41 @@ impl SchemaTarget {
         self.response_differs
             .then(|| self.variant_name(TypePosition::Response))
     }
+
+    /// The name this position's wire twin exports under: the wire suffix composed onto
+    /// `variant_name(position)`, or the replacement a collision assigned.
+    ///
+    /// The suffix goes last and composes onto the *variant* name, never the derived one: a component
+    /// whose request variant was aliased to `PetRequestBody` yields `PetRequestBodyWire`. Composing
+    /// onto the derived name instead would have two modules exporting `PetRequestWire` with no
+    /// diagnostic at all.
+    pub(super) fn wire_name(&self, position: TypePosition) -> String {
+        self.wire_variants[position.index()]
+            .clone()
+            .unwrap_or_else(|| format!("{}Wire", self.variant_name(position)))
+    }
+
+    /// Whether this position declares anything of its own, ignoring transforms. Reads as the shape
+    /// question it is, so the wire pass and the emitters agree on which positions exist.
+    pub(super) fn wire_export_base(&self, position: TypePosition) -> Option<String> {
+        match position {
+            TypePosition::Neutral => Some(self.name.clone()),
+            TypePosition::Request => self.request_export(),
+            TypePosition::Response => self.response_export(),
+        }
+    }
+
+    /// The name this position's wire twin declares under, or `None` when the component reaches no
+    /// transform or the position declares nothing of its own. Every artifact emitting a twin reads
+    /// this rather than pairing `transforms` with its own `wire_name` call, so the flag and the name
+    /// cannot drift apart.
+    pub(super) fn wire_export(&self, position: TypePosition) -> Option<String> {
+        if !self.transforms {
+            return None;
+        }
+        self.wire_export_base(position)
+            .map(|_| self.wire_name(position))
+    }
 }
 
 impl Emitter<'_, '_, '_> {
@@ -2207,13 +2396,44 @@ impl Emitter<'_, '_, '_> {
         let mut content = self.header();
         let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
         for parameter in &operation.parameters {
-            self.collect_operation_imports(&parameter.schema, TypePosition::Request, &mut imports);
+            self.collect_operation_imports(
+                &parameter.schema,
+                TypePosition::Request,
+                TypeAxis::Application,
+                &mut imports,
+            );
         }
         if let Some(body) = &operation.request_body
             && let Some(media_type) = select_request_media(&body.media_types)
             && is_json(&media_type.essence)
         {
-            self.collect_operation_imports(&media_type.schema, TypePosition::Request, &mut imports);
+            self.collect_operation_imports(
+                &media_type.schema,
+                TypePosition::Request,
+                TypeAxis::Application,
+                &mut imports,
+            );
+        }
+        // The request twin names the wire form of every component its payload reaches.
+        if self.request_body_transforms(operation) {
+            for parameter in &operation.parameters {
+                self.collect_operation_imports(
+                    &parameter.schema,
+                    TypePosition::Request,
+                    TypeAxis::Wire,
+                    &mut imports,
+                );
+            }
+            if let Some(body) = &operation.request_body
+                && let Some(media_type) = select_request_media(&body.media_types)
+            {
+                self.collect_operation_imports(
+                    &media_type.schema,
+                    TypePosition::Request,
+                    TypeAxis::Wire,
+                    &mut imports,
+                );
+            }
         }
         for response in &operation.responses {
             for media_type in &response.media_types {
@@ -2221,14 +2441,24 @@ impl Emitter<'_, '_, '_> {
                     self.collect_operation_imports(
                         &media_type.schema,
                         TypePosition::Response,
+                        TypeAxis::Application,
                         &mut imports,
                     );
+                    if self.response_transforms(response) {
+                        self.collect_operation_imports(
+                            &media_type.schema,
+                            TypePosition::Response,
+                            TypeAxis::Wire,
+                            &mut imports,
+                        );
+                    }
                 }
             }
             for (_, header) in &response.headers {
                 self.collect_operation_imports(
                     &header.schema,
                     TypePosition::Response,
+                    TypeAxis::Application,
                     &mut imports,
                 );
             }
@@ -2260,8 +2490,19 @@ impl Emitter<'_, '_, '_> {
         content.push_str("export type ");
         content.push_str(&stem);
         content.push_str("Request = ");
-        content.push_str(&self.render_request(operation, 0));
+        content.push_str(&self.render_request(operation, TypeAxis::Application, 0));
         content.push_str(";\n\n");
+        // A payload twin is emitted for exactly the positions that convert, on the same rule the
+        // component twins follow: a payload reaching no transform is identity in both surfaces and
+        // declares one type.
+        if self.request_body_transforms(operation) {
+            write_source_metadata(&mut content, &operation.source, 0);
+            content.push_str("export type ");
+            content.push_str(&stem);
+            content.push_str("RequestWire = ");
+            content.push_str(&self.render_request(operation, TypeAxis::Wire, 0));
+            content.push_str(";\n\n");
+        }
 
         let mut response_names = Vec::new();
         for (response_name, response) in response_declarations {
@@ -2273,6 +2514,14 @@ impl Emitter<'_, '_, '_> {
             content.push_str(" = ");
             content.push_str(&self.render_response_entry(response));
             content.push_str(";\n\n");
+            if self.response_transforms(response) {
+                write_source_metadata(&mut content, &response.source, 0);
+                content.push_str("export type ");
+                content.push_str(&response_name);
+                content.push_str("Wire = ");
+                content.push_str(&self.render_response_entry_wire(response));
+                content.push_str(";\n\n");
+            }
             if !response.headers.is_empty() {
                 self.write_response_headers_interface(
                     &mut content,
@@ -2393,14 +2642,19 @@ impl Emitter<'_, '_, '_> {
                 // and schema+style headers render their typed schema.
                 output.push_str("string");
             } else {
-                output.push_str(&self.render_type(&header.schema, TypePosition::Response, 2));
+                output.push_str(&self.render_type(
+                    &header.schema,
+                    TypePosition::Response,
+                    TypeAxis::Application,
+                    2,
+                ));
             }
             output.push_str(";\n");
         }
         output.push_str("}\n\n");
     }
 
-    fn render_request(&self, operation: &Operation, indent: usize) -> String {
+    fn render_request(&self, operation: &Operation, axis: TypeAxis, indent: usize) -> String {
         let groups = [
             (ParamLocation::Path, "path"),
             (ParamLocation::Query, "query"),
@@ -2420,7 +2674,7 @@ impl Emitter<'_, '_, '_> {
             }
             has_members = true;
             let group_required = parameters.iter().any(|parameter| parameter.required);
-            let group = self.render_parameter_group(&parameters, indent + 2);
+            let group = self.render_parameter_group(&parameters, axis, indent + 2);
             push_indent(&mut output, indent + 2);
             if self.model.config.types.readonly {
                 output.push_str("readonly ");
@@ -2441,6 +2695,7 @@ impl Emitter<'_, '_, '_> {
                 &media_type.essence,
                 &media_type.schema,
                 TypePosition::Request,
+                axis,
             );
             if let Some(description) = &body.description {
                 let docs = SchemaDocs {
@@ -2476,7 +2731,12 @@ impl Emitter<'_, '_, '_> {
         output
     }
 
-    fn render_parameter_group(&self, parameters: &[&Param], indent: usize) -> String {
+    fn render_parameter_group(
+        &self,
+        parameters: &[&Param],
+        axis: TypeAxis,
+        indent: usize,
+    ) -> String {
         let mut output = String::from("{\n");
         for parameter in parameters {
             let docs = schema_field_docs(
@@ -2504,6 +2764,7 @@ impl Emitter<'_, '_, '_> {
             output.push_str(&self.render_type(
                 &parameter.schema,
                 TypePosition::Request,
+                axis,
                 indent + 2,
             ));
             output.push_str(";\n");
@@ -2511,6 +2772,43 @@ impl Emitter<'_, '_, '_> {
         push_indent(&mut output, indent);
         output.push('}');
         output
+    }
+
+    /// Whether any JSON media entry of this response converts, and so declares a payload twin.
+    pub(super) fn response_transforms(&self, response: &ResponseEntry) -> bool {
+        response.media_types.iter().any(|media_type| {
+            is_json(&media_type.essence) && self.model.transform_facts().reaches(&media_type.schema)
+        })
+    }
+
+    /// Whether this operation's selected JSON request body converts.
+    pub(super) fn request_body_transforms(&self, operation: &Operation) -> bool {
+        operation
+            .request_body
+            .as_ref()
+            .and_then(|body| select_request_media(&body.media_types))
+            .is_some_and(|media_type| {
+                is_json(&media_type.essence)
+                    && self.model.transform_facts().reaches(&media_type.schema)
+            })
+    }
+
+    /// The wire form of one response's payload union. Called only where `response_transforms`
+    /// answered true, which already establishes that a JSON media entry is present.
+    fn render_response_entry_wire(&self, response: &ResponseEntry) -> String {
+        let mut types = Vec::new();
+        for media_type in &response.media_types {
+            let rendered = self.media_payload_type(
+                &media_type.essence,
+                &media_type.schema,
+                TypePosition::Response,
+                TypeAxis::Wire,
+            );
+            if !types.contains(&rendered) {
+                types.push(rendered);
+            }
+        }
+        types.join(" | ")
     }
 
     fn render_response_entry(&self, response: &ResponseEntry) -> String {
@@ -2523,6 +2821,7 @@ impl Emitter<'_, '_, '_> {
                 &media_type.essence,
                 &media_type.schema,
                 TypePosition::Response,
+                TypeAxis::Application,
             );
             if !types.contains(&rendered) {
                 types.push(rendered);
@@ -2540,9 +2839,10 @@ impl Emitter<'_, '_, '_> {
         essence: &str,
         schema: &SchemaNode,
         position: TypePosition,
+        axis: TypeAxis,
     ) -> String {
         if is_json(essence) {
-            self.render_type(schema, position, 0)
+            self.render_type(schema, position, axis, 0)
         } else if essence.starts_with("text/") {
             "string".to_owned()
         } else {
@@ -2556,13 +2856,18 @@ impl Emitter<'_, '_, '_> {
         &self,
         schema: &SchemaNode,
         position: TypePosition,
+        axis: TypeAxis,
         imports: &mut BTreeMap<String, BTreeSet<String>>,
     ) {
         self.walk_refs(schema, position, &mut |target| {
+            let name = match axis {
+                TypeAxis::Wire if target.transforms => target.wire_name(position),
+                TypeAxis::Application | TypeAxis::Wire => target.variant_name(position),
+            };
             imports
                 .entry(target.file_base.clone())
                 .or_default()
-                .insert(target.variant_name(position));
+                .insert(name);
         });
     }
 }
@@ -4227,6 +4532,7 @@ mod tests {
             emitter.render_type(
                 &schema_ref("/unknown-ref", "/components/schemas/Unknown"),
                 TypePosition::Neutral,
+                TypeAxis::Application,
                 0,
             ),
             "unknown"
@@ -4235,6 +4541,7 @@ mod tests {
             emitter.render_type(
                 &primitive(PrimitiveType::Null, "/null"),
                 TypePosition::Neutral,
+                TypeAxis::Application,
                 0
             ),
             "null"
@@ -4288,7 +4595,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                emitter.render_type(&schema, TypePosition::Neutral, 0),
+                emitter.render_type(&schema, TypePosition::Neutral, TypeAxis::Application, 0),
                 expected
             );
         }
@@ -4311,6 +4618,7 @@ mod tests {
             "Fallback",
             &enum_schema,
             TypePosition::Neutral,
+            TypeAxis::Application,
             &source("/fallback-enum"),
         );
         assert!(declaration.contains("Value1: \"fallback\""));
@@ -4363,7 +4671,12 @@ mod tests {
             meta: meta("/all-of"),
         };
         assert_eq!(
-            emitter.render_type(&conjunction, TypePosition::Neutral, 0),
+            emitter.render_type(
+                &conjunction,
+                TypePosition::Neutral,
+                TypeAxis::Application,
+                0
+            ),
             "{\n  a?: string;\n}"
         );
 
@@ -4376,7 +4689,12 @@ mod tests {
             meta: meta("/duplicates"),
         };
         assert_eq!(
-            emitter.render_type(&duplicate_unknowns, TypePosition::Neutral, 0),
+            emitter.render_type(
+                &duplicate_unknowns,
+                TypePosition::Neutral,
+                TypeAxis::Application,
+                0
+            ),
             "unknown"
         );
 
@@ -4389,7 +4707,7 @@ mod tests {
             meta: meta("/distinct"),
         };
         assert_eq!(
-            emitter.render_type(&distinct, TypePosition::Neutral, 0),
+            emitter.render_type(&distinct, TypePosition::Neutral, TypeAxis::Application, 0),
             "string | number"
         );
 
@@ -4407,7 +4725,12 @@ mod tests {
             meta: meta("/boolean-schemas"),
         };
         assert_eq!(
-            emitter.render_type(&boolean_schemas, TypePosition::Neutral, 0),
+            emitter.render_type(
+                &boolean_schemas,
+                TypePosition::Neutral,
+                TypeAxis::Application,
+                0
+            ),
             "unknown | never | string"
         );
 
@@ -4418,7 +4741,12 @@ mod tests {
             meta: meta("/all-unknown"),
         };
         assert_eq!(
-            emitter.render_type(&only_unknown, TypePosition::Neutral, 0),
+            emitter.render_type(
+                &only_unknown,
+                TypePosition::Neutral,
+                TypeAxis::Application,
+                0
+            ),
             "unknown"
         );
     }
@@ -4481,7 +4809,12 @@ mod tests {
         };
 
         assert_eq!(
-            emitter.render_type(&conjunction, TypePosition::Neutral, 0),
+            emitter.render_type(
+                &conjunction,
+                TypePosition::Neutral,
+                TypeAxis::Application,
+                0
+            ),
             r#"string & (string | number) & (string | null) & ("a" | "b") & (string | number)[]"#,
         );
     }
@@ -4640,7 +4973,8 @@ mod tests {
         let emitter = Emitter::new(&mut model);
 
         // Terminates (no stack overflow) and the recursive branch is the bare named type.
-        let rendered = emitter.render_type(&recursive, TypePosition::Neutral, 0);
+        let rendered =
+            emitter.render_type(&recursive, TypePosition::Neutral, TypeAxis::Application, 0);
         assert!(rendered.contains("child"));
         assert!(
             rendered.contains("Loop"),
@@ -4823,6 +5157,7 @@ mod tests {
             "Status",
             &described,
             TypePosition::Neutral,
+            TypeAxis::Application,
             &source("/described-enum"),
         );
         assert!(output.contains("Ready to run."));
@@ -4834,6 +5169,7 @@ mod tests {
                     meta: meta("/empty-finite"),
                 },
                 TypePosition::Neutral,
+                TypeAxis::Application,
                 0,
             ),
             "unknown"
@@ -8025,6 +8361,28 @@ pub(super) fn media_tag(media: &str) -> String {
     }
     tag
 }
+
+/// Inserts the `esnext.temporal` lib reference into an assembled file that names a `Temporal` type.
+///
+/// Not a workaround for missing TypeScript support — the compiler ships `lib.esnext.temporal` — but
+/// how a generated file opts a consumer whose own `lib` predates it into the declarations this
+/// file's types need. Derived from the emitted text rather than from configuration, so a file that
+/// happens to name no Temporal type never carries one, and the two can never disagree.
+///
+/// It goes after the generated header, which is the first line of every emitted file: a triple-slash
+/// directive may be preceded by comments, and by nothing else.
+pub(super) fn insert_temporal_reference(content: String, header_len: usize) -> String {
+    if !content[header_len..].contains("Temporal.") {
+        return content;
+    }
+    let mut output = String::with_capacity(content.len() + TEMPORAL_REFERENCE.len());
+    output.push_str(&content[..header_len]);
+    output.push_str(TEMPORAL_REFERENCE);
+    output.push_str(&content[header_len..]);
+    output
+}
+
+const TEMPORAL_REFERENCE: &str = "/// <reference lib=\"esnext.temporal\" preserve=\"true\" />\n\n";
 
 pub(super) fn source_diagnostic(
     code: &'static str,

@@ -13,7 +13,11 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
 # '*.ts' does not cross '/', so runtime test data under test/ is excluded from coverage.
 if [[ -n "$(find "$repo_root/crates/oasts-core/runtime/test" -maxdepth 1 -name '*.test.ts' -print -quit)" ]]; then
-  (cd "$repo_root/crates/oasts-core/runtime" && node --test \
+  # --harmony-temporal is what makes the transform runtime's Temporal codecs reachable at all;
+  # without it every Temporal entry point returns its temporal-unavailable failure and its happy
+  # path is dead. The failure path stays covered in the same run, because the suite removes the
+  # global for the length of one test.
+  (cd "$repo_root/crates/oasts-core/runtime" && node --harmony-temporal --test \
     --experimental-test-coverage \
     --test-coverage-include='*.ts' \
     --test-coverage-lines=100 \

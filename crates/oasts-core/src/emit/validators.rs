@@ -33,10 +33,10 @@ use crate::semantic::{TargetCase, normalize_identifier};
 use super::model::EmissionModel;
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
-    Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypePosition, callback_operation,
-    callback_parent_operation, import_extension, lowercase_first, media_tag, property_in_position,
-    push_indent, render_json_compact, render_ts_string, response_status_type_suffix,
-    source_diagnostic, uppercase_first,
+    Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypeAxis, TypePosition,
+    callback_operation, callback_parent_operation, import_extension, lowercase_first, media_tag,
+    property_in_position, push_indent, render_json_compact, render_ts_string,
+    response_status_type_suffix, source_diagnostic, uppercase_first,
 };
 use crate::media::is_json;
 
@@ -1466,6 +1466,7 @@ fn emit_component(
                         export,
                         &schema.schema,
                         *position,
+                        TypeAxis::Application,
                         &schema.source,
                     );
                     imports.collect(&emitter, &schema.schema, *position, Some(schema_index));
@@ -1497,6 +1498,7 @@ fn emit_component(
                 name,
                 &schema.schema,
                 TypePosition::Neutral,
+                TypeAxis::Application,
                 &schema.source,
             );
             imports.collect(
@@ -1620,7 +1622,7 @@ fn emit_operation_file(
                 imports.collect(&emitter, schema, *position, None);
                 format!(
                     "export type {export_type} = {};\n",
-                    emitter.render_type(schema, *position, 0)
+                    emitter.render_type(schema, *position, TypeAxis::Application, 0)
                 )
             })
             .collect();

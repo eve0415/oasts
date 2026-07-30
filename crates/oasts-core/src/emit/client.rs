@@ -23,9 +23,10 @@ use super::model::EmissionModel;
 use super::runtime_assets::{RuntimeSelection, emit_runtime_files};
 use super::validators::operation_parameter_validator_names;
 use super::{
-    ClientDocKind, Emitter as TypesEmitter, GeneratedFile, TypePosition, assign_import_aliases,
-    encode_comment_text, import_clause, import_extension, push_indent, render_property_key,
-    render_ts_string, uppercase_first, write_client_operation_tsdoc, write_source_metadata,
+    ClientDocKind, Emitter as TypesEmitter, GeneratedFile, TypeAxis, TypePosition,
+    assign_import_aliases, encode_comment_text, import_clause, import_extension, push_indent,
+    render_property_key, render_ts_string, uppercase_first, write_client_operation_tsdoc,
+    write_source_metadata,
 };
 
 pub(crate) fn emit_client_from_model(
@@ -277,6 +278,7 @@ fn emit_operation(
             renderer.collect_operation_imports(
                 &parameter.schema,
                 TypePosition::Request,
+                TypeAxis::Application,
                 &mut component_imports,
             );
         }
@@ -293,6 +295,7 @@ fn emit_operation(
                     renderer.collect_operation_imports(
                         &entry.schema,
                         TypePosition::Response,
+                        TypeAxis::Application,
                         &mut component_imports,
                     );
                 }
@@ -980,7 +983,12 @@ fn collect_body_imports(
     match plan {
         BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
             for field in fields {
-                renderer.collect_operation_imports(&field.schema, TypePosition::Request, imports);
+                renderer.collect_operation_imports(
+                    &field.schema,
+                    TypePosition::Request,
+                    TypeAxis::Application,
+                    imports,
+                );
             }
         }
         BodyPlan::ContentTypeDiscriminated { arms, .. } => {
@@ -1045,6 +1053,7 @@ fn render_input(
                 output.push_str(&renderer.render_type(
                     &parameter_plan.schema,
                     TypePosition::Request,
+                    TypeAxis::Application,
                     4,
                 ));
             }
@@ -1155,9 +1164,13 @@ fn render_form_field_input(
         FieldSerializationPlan::Content { media, .. } if media.binary_upload => {
             "Blob | File".to_owned()
         }
-        FieldSerializationPlan::Style { .. } | FieldSerializationPlan::Content { .. } => {
-            renderer.render_type(&field.schema, TypePosition::Request, indent)
-        }
+        FieldSerializationPlan::Style { .. } | FieldSerializationPlan::Content { .. } => renderer
+            .render_type(
+                &field.schema,
+                TypePosition::Request,
+                TypeAxis::Application,
+                indent,
+            ),
     };
     if !field.wrapper.wrapped {
         return body;
@@ -1248,6 +1261,7 @@ fn push_response_result_arms(
                             media_essence(&entry.media),
                             &entry.schema,
                             TypePosition::Response,
+                            TypeAxis::Application,
                         ),
                     )
                 })

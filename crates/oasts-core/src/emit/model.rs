@@ -5,9 +5,12 @@ use crate::diag::DiagnosticSink;
 use crate::ir::{AdditionalProperties, SchemaNode, SourceRef, TupleRest};
 use crate::semantic::Analyzed;
 
+use crate::transform::TransformFacts;
+
 use super::{
     CODE_FILE_NAME, CODE_PATH_COLLISION, CODE_VARIANT_ALIAS, CODE_VARIANT_COLLISION,
-    file_base_name, shape_variants, source_diagnostic, warning_diagnostic,
+    CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, TypePosition, file_base_name, shape_variants,
+    source_diagnostic, warning_diagnostic,
 };
 
 #[derive(Clone, Debug)]
@@ -23,6 +26,13 @@ pub(crate) struct SchemaTarget {
     /// as it did before this field existed.
     pub(crate) request_variant: Option<String>,
     pub(crate) response_variant: Option<String>,
+    /// The name each position's wire twin exports under when the derived `{base}Wire` is already a
+    /// declared component's name, indexed by [`TypePosition::index`]. `None` — the overwhelmingly
+    /// common case — means `wire_name` derives it, so a document without a collision allocates
+    /// exactly as it did before this field existed.
+    pub(crate) wire_variants: [Option<String>; 3],
+    /// Whether this component reaches a date/time transform, and so declares wire twins at all.
+    pub(crate) transforms: bool,
 }
 
 /// Shared deterministic allocation product for all emitters.
@@ -40,6 +50,9 @@ pub(crate) struct EmissionModel<'input, 'sink> {
     /// `types/callbacks/`, or `None` if its name failed file-base validation.
     pub(crate) callback_files: Vec<Option<String>>,
     seen: HashMap<String, (String, SourceRef)>,
+    /// Which schemas reach a date/time transform, computed once here so every emitter reads one
+    /// answer rather than recomputing it or threading it through every render call.
+    transform_facts: TransformFacts<'input>,
     pub(crate) sink: &'sink mut DiagnosticSink,
 }
 
@@ -60,11 +73,112 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             webhook_files: vec![None; analyzed.webhook_names.len()],
             callback_files: vec![None; analyzed.callback_names.len()],
             seen: HashMap::new(),
+            transform_facts: TransformFacts::compute(&analyzed.ir, config),
             sink,
         };
         model.allocate_paths();
         model.resolve_variant_shapes();
+        // After variance, because a wire name composes onto `variant_name(position)` — including the
+        // alias a variant collision assigned — and never onto the derived name.
+        model.resolve_wire_names();
         model
+    }
+
+    /// The transform reachability this compile was configured for.
+    pub(crate) fn transform_facts(&self) -> &TransformFacts<'input> {
+        &self.transform_facts
+    }
+
+    /// Names each transforming component's wire twins, one per declaring position.
+    ///
+    /// The derived name is `{base}Wire` where `base` is `variant_name(position)`. That composition is
+    /// injective: bases are globally unique after variance resolution, and `x -> x + "Wire"` preserves
+    /// that, so two components can never derive the same twin name and no cross-component bookkeeping
+    /// is needed here. A derived name can only ever collide with a *declared* component, which is the
+    /// one thing this pass checks.
+    ///
+    /// It also cannot collide with another generated variant or alias: those end in `Request`,
+    /// `Response`, or `Body`, and this ends in `Wire`.
+    ///
+    /// Fast-reject: with no representation transforming, nothing declares a twin and the pass returns
+    /// before allocating, keeping a default-configured document allocation-identical.
+    fn resolve_wire_names(&mut self) {
+        if !self.transform_facts.enabled() {
+            return;
+        }
+        let declared: HashSet<&str> = self
+            .schema_targets
+            .values()
+            .flat_map(|by_pointer| by_pointer.values())
+            .map(|target| target.name.as_str())
+            .collect();
+        let mut diagnostics = Vec::new();
+        let mut assignments: Vec<(String, String, bool, [Option<String>; 3])> = Vec::new();
+        for allocated in &self.analyzed.schema_names {
+            let schema = &self.analyzed.ir.schemas[allocated.schema_index];
+            let Some(target) =
+                self.schema_target(&schema.source.source_id, &schema.source.json_pointer)
+            else {
+                continue;
+            };
+            let transforms = self.transform_facts.component(allocated.schema_index);
+            let mut wire_variants = [None, None, None];
+            if transforms {
+                for position in [
+                    TypePosition::Neutral,
+                    TypePosition::Request,
+                    TypePosition::Response,
+                ] {
+                    if target.wire_export_base(position).is_none() {
+                        continue;
+                    }
+                    let derived = format!("{}Wire", target.variant_name(position));
+                    if !declared.contains(derived.as_str()) {
+                        continue;
+                    }
+                    let replacement = format!("{derived}Value");
+                    if declared.contains(replacement.as_str()) {
+                        diagnostics.push(source_diagnostic(
+                            CODE_WIRE_COLLISION,
+                            format!(
+                                "generated wire type name '{derived}' for component '{owner}' collides with component '{derived}', and the replacement name '{replacement}' is already taken; rename one with naming.overrides",
+                                owner = target.name,
+                            ),
+                            &schema.source,
+                        ));
+                        continue;
+                    }
+                    diagnostics.push(warning_diagnostic(
+                        CODE_WIRE_ALIAS,
+                        format!(
+                            "generated wire type name '{derived}' for component '{owner}' collides with component '{derived}'; emitting it as '{replacement}'",
+                            owner = target.name,
+                        ),
+                        &schema.source,
+                    ));
+                    wire_variants[position.index()] = Some(replacement);
+                }
+            }
+            assignments.push((
+                schema.source.source_id.clone(),
+                schema.source.json_pointer.clone(),
+                transforms,
+                wire_variants,
+            ));
+        }
+        drop(declared);
+        for (source_id, json_pointer, transforms, wire_variants) in assignments {
+            // Infallible: the key came from a successful `schema_target` lookup above, and nothing
+            // between there and here removes an entry.
+            let target = self
+                .schema_targets
+                .get_mut(&source_id)
+                .and_then(|by_pointer| by_pointer.get_mut(&json_pointer))
+                .expect("a wire-named component resolves through the key it was found under");
+            target.transforms = transforms;
+            target.wire_variants = wire_variants;
+        }
+        self.sink.extend(diagnostics);
     }
 
     /// Propagates request/response variance across the component reference graph to a fixpoint.
@@ -341,6 +455,8 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                         response_differs,
                         request_variant: None,
                         response_variant: None,
+                        wire_variants: [None, None, None],
+                        transforms: false,
                     },
                 );
         }
@@ -515,6 +631,16 @@ mod tests {
     /// so the config's relative `input.path` still resolves), the resolved config, the analyzed
     /// IR, and the source digest.
     fn build_model_inputs(schemas: Value) -> (TempDir, ResolvedConfig, Analyzed, String) {
+        build_model_inputs_with(schemas, |_| {})
+    }
+
+    /// `build_model_inputs`, with `patch` applied to the resolved config before analysis. The config
+    /// guard still refuses a non-`string` date representation at load time, so a test wanting one
+    /// sets it here — which is what every later pass reads.
+    pub(super) fn build_model_inputs_with(
+        schemas: Value,
+        patch: fn(&mut ResolvedConfig),
+    ) -> (TempDir, ResolvedConfig, Analyzed, String) {
         let temp = TempDir::new().expect("temp directory");
         let input = temp.path().join("openapi.json");
         let config_path = temp.path().join("oasts.json");
@@ -539,7 +665,8 @@ mod tests {
             serde_json::to_vec(&config).expect("config JSON"),
         )
         .expect("write config");
-        let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
         let graph = load_graph(&resolved, &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
@@ -551,7 +678,10 @@ mod tests {
     /// Looks up the `SchemaTarget` allocated for the component named `name`. `schema_targets` is
     /// keyed by source_id/json_pointer, not name, so every by-name lookup in this module's tests
     /// scans the same way.
-    fn find_target<'a>(model: &'a EmissionModel<'_, '_>, name: &str) -> &'a SchemaTarget {
+    pub(super) fn find_target<'a>(
+        model: &'a EmissionModel<'_, '_>,
+        name: &str,
+    ) -> &'a SchemaTarget {
         model
             .schema_targets
             .values()
@@ -987,5 +1117,616 @@ mod tests {
             }
         });
         assert!(variant_collisions(schemas).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod wire_variant_tests {
+    use serde_json::{Value, json};
+
+    use super::tests::{build_model_inputs_with, find_target};
+    use super::*;
+    use crate::config::DateTimeRepresentation;
+    use crate::diag::Diagnostic;
+    use crate::emit::TypePosition;
+
+    /// A schema with one `date-time` property, so it reaches a transform.
+    fn timed() -> Value {
+        json!({
+            "type": "object",
+            "properties": { "at": { "type": "string", "format": "date-time" } }
+        })
+    }
+
+    /// Builds a model under `types.dateTime: date` and returns the wire export names of `component`
+    /// for each position, plus every diagnostic the construction produced.
+    fn wire_exports(schemas: Value, component: &str) -> (Vec<Option<String>>, Vec<Diagnostic>) {
+        exports_under(schemas, component, |config| {
+            config.types.date_time = DateTimeRepresentation::Date;
+        })
+    }
+
+    fn exports_under(
+        schemas: Value,
+        component: &str,
+        patch: fn(&mut ResolvedConfig),
+    ) -> (Vec<Option<String>>, Vec<Diagnostic>) {
+        let (_temp, resolved, analyzed, digest) = build_model_inputs_with(schemas, patch);
+        let mut sink = DiagnosticSink::new();
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        let target = find_target(&model, component);
+        let exports = [
+            TypePosition::Neutral,
+            TypePosition::Request,
+            TypePosition::Response,
+        ]
+        .into_iter()
+        .map(|position| target.wire_export(position))
+        .collect();
+        (exports, sink.into_sorted_vec())
+    }
+
+    fn codes(diagnostics: &[Diagnostic], code: &str) -> Vec<String> {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_suffix_goes_last() {
+        let (exports, diagnostics) = wire_exports(json!({ "Pet": timed() }), "Pet");
+        assert_eq!(exports[0].as_deref(), Some("PetWire"));
+        assert_eq!(exports[1], None, "the request position does not diverge");
+        assert_eq!(exports[2], None);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_position_split_component_names_a_twin_per_position() {
+        let (exports, diagnostics) = wire_exports(
+            json!({
+                "Pet": {
+                    "type": "object",
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" },
+                        "id": { "type": "string", "readOnly": true },
+                        "secret": { "type": "string", "writeOnly": true }
+                    }
+                }
+            }),
+            "Pet",
+        );
+        assert_eq!(exports[0].as_deref(), Some("PetWire"));
+        assert_eq!(exports[1].as_deref(), Some("PetRequestWire"));
+        assert_eq!(exports[2].as_deref(), Some("PetResponseWire"));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_component_reaching_no_transform_names_no_twin() {
+        let (exports, _diagnostics) = wire_exports(
+            json!({
+                "Plain": { "type": "object", "properties": { "id": { "type": "string" } } }
+            }),
+            "Plain",
+        );
+        assert_eq!(exports, vec![None, None, None]);
+    }
+
+    #[test]
+    fn string_mode_names_no_twin_at_all() {
+        let (exports, diagnostics) = exports_under(json!({ "Pet": timed() }), "Pet", |_| {});
+        assert_eq!(exports, vec![None, None, None]);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_declared_component_keeps_its_name_and_the_twin_yields() {
+        let (exports, diagnostics) = wire_exports(
+            json!({
+                "Pet": timed(),
+                "PetWire": { "type": "object", "properties": { "n": { "type": "integer" } } }
+            }),
+            "Pet",
+        );
+        assert_eq!(exports[0].as_deref(), Some("PetWireValue"));
+        let warnings = codes(&diagnostics, "OASTS1311");
+        assert_eq!(warnings.len(), 1, "{diagnostics:#?}");
+        assert!(warnings[0].contains("'PetWire'"));
+        assert!(warnings[0].contains("'PetWireValue'"));
+        assert!(codes(&diagnostics, "OASTS1312").is_empty());
+    }
+
+    #[test]
+    fn a_taken_replacement_is_fatal_rather_than_silently_shared() {
+        let (_exports, diagnostics) = wire_exports(
+            json!({
+                "Pet": timed(),
+                "PetWire": { "type": "object", "properties": { "n": { "type": "integer" } } },
+                "PetWireValue": { "type": "object", "properties": { "n": { "type": "integer" } } }
+            }),
+            "Pet",
+        );
+        let errors = codes(&diagnostics, "OASTS1312");
+        assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+        assert!(errors[0].contains("'PetWire'"));
+        assert!(errors[0].contains("'PetWireValue'"));
+        assert!(errors[0].contains("naming.overrides"));
+        assert!(codes(&diagnostics, "OASTS1311").is_empty());
+    }
+
+    #[test]
+    fn the_suffix_composes_onto_the_aliased_request_variant() {
+        // `Pet` needs a request variant, but `PetRequest` is declared, so OASTS1306 aliases the
+        // variant to `PetRequestBody`. The wire suffix must compose onto that alias — composing onto
+        // the derived name would have two modules exporting `PetRequestWire` with no diagnostic.
+        let (exports, diagnostics) = wire_exports(
+            json!({
+                "Pet": {
+                    "type": "object",
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" },
+                        "id": { "type": "string", "readOnly": true }
+                    }
+                },
+                "PetRequest": { "type": "object", "properties": { "n": { "type": "integer" } } }
+            }),
+            "Pet",
+        );
+        assert_eq!(exports[1].as_deref(), Some("PetRequestBodyWire"));
+        assert_eq!(
+            codes(&diagnostics, "OASTS1306").len(),
+            1,
+            "{diagnostics:#?}"
+        );
+        assert!(codes(&diagnostics, "OASTS1311").is_empty());
+        assert!(codes(&diagnostics, "OASTS1312").is_empty());
+    }
+
+    /// A component whose generated file name is invalid (a Windows reserved device name) never gets
+    /// a `SchemaTarget`, so the wire pass skips it rather than panicking on the missing lookup.
+    #[test]
+    fn an_unallocatable_component_is_skipped_rather_than_named() {
+        let (exports, diagnostics) = wire_exports(
+            json!({
+                "CON": timed(),
+                "Pet": timed()
+            }),
+            "Pet",
+        );
+        assert_eq!(exports[0].as_deref(), Some("PetWire"));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "OASTS1311" && diagnostic.code != "OASTS1312"),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn a_twin_of_a_twin_is_named_without_collision() {
+        // `PetWire` is itself a component that transforms, so it needs its own twin. Deriving from a
+        // unique base keeps the two apart with no alias needed.
+        let (exports, _diagnostics) =
+            wire_exports(json!({ "Pet": timed(), "PetWire": timed() }), "PetWire");
+        assert_eq!(exports[0].as_deref(), Some("PetWireWire"));
+    }
+}
+
+#[cfg(test)]
+mod wire_declaration_tests {
+    use serde_json::{Value, json};
+
+    use super::tests::build_model_inputs_with;
+    use super::*;
+    use crate::config::{DateRepresentation, DateTimeRepresentation};
+    use crate::emit::emit_types_from_model;
+
+    /// The emitted `types/components/<base>.ts` for the single-component documents below.
+    fn component_file(schemas: Value, base: &str, patch: fn(&mut ResolvedConfig)) -> String {
+        let (_temp, resolved, analyzed, digest) = build_model_inputs_with(schemas, patch);
+        let mut sink = DiagnosticSink::new();
+        let mut model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        let files = emit_types_from_model(&mut model);
+        files
+            .into_iter()
+            .find(|file| file.relative_path == format!("types/components/{base}.ts"))
+            .expect("component file")
+            .content
+    }
+
+    fn date_mode(config: &mut ResolvedConfig) {
+        config.types.date_time = DateTimeRepresentation::Date;
+    }
+
+    fn temporal_mode(config: &mut ResolvedConfig) {
+        config.types.date_time = DateTimeRepresentation::Temporal;
+        config.types.date = DateRepresentation::Temporal;
+    }
+
+    fn pet() -> Value {
+        json!({
+            "Pet": {
+                "type": "object",
+                "required": ["bornAt"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "bornAt": { "type": "string", "format": "date-time" }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_transforming_component_declares_both_surfaces() {
+        let content = component_file(pet(), "pet", date_mode);
+        assert!(content.contains("export interface Pet {"), "{content}");
+        assert!(content.contains("bornAt: Date;"), "{content}");
+        assert!(content.contains("export interface PetWire {"), "{content}");
+        assert!(content.contains("bornAt: string;"), "{content}");
+        // The twin sits after its application type, not before it.
+        assert!(
+            content.find("interface Pet ").unwrap() < content.find("interface PetWire ").unwrap()
+        );
+    }
+
+    #[test]
+    fn string_mode_declares_one_surface() {
+        let content = component_file(pet(), "pet", |_| {});
+        assert!(content.contains("bornAt: string;"), "{content}");
+        assert!(!content.contains("PetWire"), "{content}");
+        assert!(!content.contains("Date"), "{content}");
+    }
+
+    #[test]
+    fn a_component_reaching_no_transform_declares_one_surface() {
+        let content = component_file(
+            json!({ "Plain": { "type": "object", "properties": { "id": { "type": "string" } } } }),
+            "plain",
+            date_mode,
+        );
+        assert!(!content.contains("PlainWire"), "{content}");
+    }
+
+    #[test]
+    fn temporal_modes_name_their_types_and_carry_the_lib_reference() {
+        let content = component_file(
+            json!({
+                "Event": {
+                    "type": "object",
+                    "required": ["at", "on"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" },
+                        "on": { "type": "string", "format": "date" }
+                    }
+                }
+            }),
+            "event",
+            temporal_mode,
+        );
+        assert!(content.contains("at: Temporal.Instant;"), "{content}");
+        assert!(content.contains("on: Temporal.PlainDate;"), "{content}");
+        assert!(content.contains("at: string;"), "{content}");
+        assert!(
+            content.contains("/// <reference lib=\"esnext.temporal\" preserve=\"true\" />"),
+            "{content}"
+        );
+        // The header stays the first line; the directive follows it.
+        assert!(content.starts_with("// Generated by Oasts"), "{content}");
+    }
+
+    #[test]
+    fn the_date_mode_needs_no_lib_reference() {
+        let content = component_file(pet(), "pet", date_mode);
+        assert!(!content.contains("esnext.temporal"), "{content}");
+    }
+
+    #[test]
+    fn a_reference_names_the_twin_on_the_wire_surface_only() {
+        let content = component_file(
+            json!({
+                "Pet": {
+                    "type": "object",
+                    "required": ["bornAt"],
+                    "properties": { "bornAt": { "type": "string", "format": "date-time" } }
+                },
+                "Owner": {
+                    "type": "object",
+                    "required": ["pet", "id"],
+                    "properties": {
+                        "pet": { "$ref": "#/components/schemas/Pet" },
+                        "id": { "type": "string" }
+                    }
+                }
+            }),
+            "owner",
+            date_mode,
+        );
+        assert!(
+            content.contains("import type { Pet, PetWire } from \"./pet.js\";"),
+            "{content}"
+        );
+        assert!(content.contains("pet: Pet;"), "{content}");
+        assert!(content.contains("pet: PetWire;"), "{content}");
+    }
+
+    #[test]
+    fn a_reference_to_a_non_transforming_component_keeps_one_name() {
+        let content = component_file(
+            json!({
+                "Tag": { "type": "object", "properties": { "id": { "type": "string" } } },
+                "Pet": {
+                    "type": "object",
+                    "required": ["bornAt", "tag"],
+                    "properties": {
+                        "bornAt": { "type": "string", "format": "date-time" },
+                        "tag": { "$ref": "#/components/schemas/Tag" }
+                    }
+                }
+            }),
+            "pet",
+            date_mode,
+        );
+        assert!(
+            content.contains("import type { Tag } from \"./tag.js\";"),
+            "{content}"
+        );
+        assert!(!content.contains("TagWire"), "{content}");
+        // Both surfaces name the same referenced type, because it is identity in both.
+        assert_eq!(content.matches("tag: Tag;").count(), 2, "{content}");
+    }
+
+    #[test]
+    fn a_position_split_component_declares_a_twin_per_position() {
+        let content = component_file(
+            json!({
+                "Pet": {
+                    "type": "object",
+                    "required": ["bornAt", "id", "secret"],
+                    "properties": {
+                        "bornAt": { "type": "string", "format": "date-time" },
+                        "id": { "type": "string", "readOnly": true },
+                        "secret": { "type": "string", "writeOnly": true }
+                    }
+                }
+            }),
+            "pet",
+            date_mode,
+        );
+        for name in [
+            "Pet",
+            "PetRequest",
+            "PetResponse",
+            "PetWire",
+            "PetRequestWire",
+            "PetResponseWire",
+        ] {
+            assert!(
+                content.contains(&format!("export interface {name} ")),
+                "{name}: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recursive_component_names_its_own_twin() {
+        let content = component_file(
+            json!({
+                "Node": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" },
+                        "child": { "$ref": "#/components/schemas/Node" }
+                    }
+                }
+            }),
+            "node",
+            date_mode,
+        );
+        assert!(content.contains("child?: Node;"), "{content}");
+        assert!(content.contains("child?: NodeWire;"), "{content}");
+    }
+
+    #[test]
+    fn an_array_of_dates_transforms_element_wise_on_the_application_surface() {
+        let content = component_file(
+            json!({
+                "Log": {
+                    "type": "object",
+                    "required": ["stamps"],
+                    "properties": {
+                        "stamps": {
+                            "type": "array",
+                            "items": { "type": "string", "format": "date-time" }
+                        }
+                    }
+                }
+            }),
+            "log",
+            date_mode,
+        );
+        assert!(content.contains("stamps: Date[];"), "{content}");
+        assert!(content.contains("stamps: string[];"), "{content}");
+    }
+
+    #[test]
+    fn an_enum_of_date_strings_keeps_its_literal_union_on_both_surfaces() {
+        let content = component_file(
+            json!({
+                "Milestone": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": {
+                        "at": {
+                            "type": "string",
+                            "format": "date-time",
+                            "enum": ["2024-01-01T00:00:00Z"]
+                        }
+                    }
+                }
+            }),
+            "milestone",
+            date_mode,
+        );
+        assert!(
+            content.contains("at: \"2024-01-01T00:00:00Z\";"),
+            "{content}"
+        );
+        assert!(!content.contains("MilestoneWire"), "{content}");
+        assert!(!content.contains("Date"), "{content}");
+    }
+
+    #[test]
+    fn an_operation_payload_declares_a_twin_when_it_converts() {
+        let (_temp, resolved, analyzed, digest) = build_model_inputs_with(json!({}), date_mode);
+        drop((resolved, analyzed, digest));
+        let content = operation_file(
+            json!({
+                "/pets": {
+                    "post": {
+                        "operationId": "createPet",
+                        "parameters": [
+                            { "name": "since", "in": "query",
+                              "schema": { "type": "string", "format": "date-time" } }
+                        ],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/Pet" }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": "#/components/schemas/Pet" }
+                                    }
+                                }
+                            },
+                            "404": {
+                                "description": "missing",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "object",
+                                                    "properties": { "message": { "type": "string" } } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "Pet": {
+                    "type": "object",
+                    "required": ["bornAt"],
+                    "properties": { "bornAt": { "type": "string", "format": "date-time" } }
+                }
+            }),
+            "createpet",
+            date_mode,
+        );
+        assert!(
+            content.contains("export type CreatePetRequestWire = {"),
+            "{content}"
+        );
+        assert!(content.contains("since?: Date;"), "{content}");
+        assert!(content.contains("since?: string;"), "{content}");
+        assert!(
+            content.contains("export type CreatePetResponse200Wire = PetWire;"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("CreatePetResponse404Wire"),
+            "a response reaching no transform declares one type: {content}"
+        );
+        assert!(
+            content.contains("import type { Pet, PetWire } from \"../components/pet.js\";"),
+            "{content}"
+        );
+    }
+
+    /// The emitted `types/operations/<base>.ts` for a document with paths.
+    fn operation_file(
+        paths: Value,
+        schemas: Value,
+        base: &str,
+        patch: fn(&mut ResolvedConfig),
+    ) -> String {
+        use std::fs;
+        use tempfile::TempDir;
+
+        use crate::config::load_config;
+        use crate::emit::source_digest;
+        use crate::loader::load_graph;
+        use crate::parse::parse;
+        use crate::semantic::analyze;
+
+        let temp = TempDir::new().expect("temp directory");
+        let input = temp.path().join("openapi.json");
+        let config_path = temp.path().join("oasts.json");
+        fs::write(
+            &input,
+            serde_json::to_vec(&json!({
+                "openapi": "3.1.0",
+                "info": { "title": "t", "version": "1" },
+                "paths": paths,
+                "components": { "schemas": schemas }
+            }))
+            .expect("document JSON"),
+        )
+        .expect("write document");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated"
+            }))
+            .expect("config JSON"),
+        )
+        .expect("write config");
+        let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        patch(&mut resolved);
+        let mut sink = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let ir = parse(&graph, &mut sink).expect("input parses");
+        let analyzed = analyze(ir, &resolved, &mut sink);
+        let digest = source_digest(&graph.source_tuples());
+        let mut model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        emit_types_from_model(&mut model)
+            .into_iter()
+            .find(|file| file.relative_path == format!("types/operations/{base}.ts"))
+            .expect("operation file")
+            .content
+    }
+
+    #[test]
+    fn a_nullable_date_stays_nullable_on_both_surfaces() {
+        let content = component_file(
+            json!({
+                "Slot": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": {
+                        "at": {
+                            "anyOf": [
+                                { "type": "string", "format": "date-time" },
+                                { "type": "null" }
+                            ]
+                        }
+                    }
+                }
+            }),
+            "slot",
+            date_mode,
+        );
+        assert!(content.contains("at: Date | null;"), "{content}");
+        assert!(content.contains("at: string | null;"), "{content}");
     }
 }

@@ -10,6 +10,7 @@ pub mod parse;
 pub mod pipeline;
 pub mod semantic;
 mod syntax;
+pub mod transform;
 pub mod writer;
 
 /// Crate version string embedded in generated file headers.
