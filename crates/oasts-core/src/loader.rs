@@ -1,7 +1,7 @@
 //! Local OpenAPI document loading and reference resolution.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -67,6 +67,47 @@ pub struct NodeLocation {
 
 type AnchorRegistry = HashMap<(String, String), NodeLocation>;
 
+/// Every identifier the schema resources in a graph declare.
+///
+/// The three dynamic maps are ordered, not hashed: the dynamic-reference analysis *iterates* them
+/// to count how many resources declare one anchor name, and an iteration order that varies between
+/// runs would make generated output vary with it. `anchors` stays a `HashMap` because it is only
+/// ever point-queried.
+#[derive(Clone, Debug, Default)]
+struct IdentifierRegistry {
+    /// Keyed `(resource base URI, anchor name)`, populated by both `$anchor` and `$dynamicAnchor`
+    /// — a `$dynamicAnchor` also creates an ordinary plain-name fragment, so `$ref: "#name"` finds
+    /// it. The reverse does not hold: a plain `$anchor` is never eligible for dynamic resolution.
+    anchors: AnchorRegistry,
+    /// Keyed `(anchor name, resource base URI)` — name first so all resources declaring one name
+    /// form a contiguous range.
+    dynamic_anchors: BTreeMap<(String, String), NodeLocation>,
+    /// Resource base URI -> the schema object carrying `$recursiveAnchor: true`.
+    recursive_anchors: BTreeMap<String, NodeLocation>,
+    /// Resource base URI -> the schema resource root declared by `$id`.
+    resources: BTreeMap<String, NodeLocation>,
+}
+
+/// What a `$dynamicRef` or `$recursiveRef` can be lowered to, decided at load time.
+///
+/// Dynamic resolution is only genuinely dynamic when two or more schema *resources* declare the
+/// same anchor — a resource being something `$id` creates. Every other shape collapses to a single
+/// target that no evaluation path can change, which is why the compiler can lower most of these
+/// keywords to an ordinary reference instead of refusing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DynamicResolution {
+    /// Exactly one schema object is the target on every evaluation path.
+    Pinned(NodeLocation),
+    /// The bookending condition failed, so the keyword behaves exactly like `$ref`.
+    Plain,
+    /// Two or more schema resources declare the anchor, so the target depends on the path taken
+    /// through the schema and no single schema can stand in for it.
+    PathDependent { declaring_resources: usize },
+    /// A `$recursiveRef` whose initial target is the document root of an OpenAPI document — the
+    /// OpenAPI Object, which is not a schema.
+    NonSchemaRoot,
+}
+
 /// Semantic position in which a reference appeared.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PositionKind {
@@ -101,7 +142,7 @@ struct AllowRoot {
 pub struct DocumentGraph {
     documents: Vec<Document>,
     path_to_id: HashMap<PathBuf, DocId>,
-    anchors: AnchorRegistry,
+    identifiers: IdentifierRegistry,
     entry_id: DocId,
     edges: Vec<ReferenceEdge>,
     workspace_root: PathBuf,
@@ -155,33 +196,52 @@ impl DocumentGraph {
 
     /// Resolves a reference against one document's retrieval URI.
     pub fn resolve(&self, base_doc: DocId, reference: &str) -> Result<Node<'_>, Diagnostic> {
+        self.resolve_from(base_doc, "", reference)
+    }
+
+    /// Resolves a reference written at `json_pointer` against the base URI in force *there*.
+    ///
+    /// The difference from [`Self::resolve`] is the `$id` chain. `$id` "identifies a schema
+    /// resource with its canonical URI" and "the absolute-URI also serves as the base URI for
+    /// relative URI-references in keywords within the schema resource" (2020-12 §8.2.1) — so a
+    /// reference inside an `$id`-bearing subtree resolves against that `$id`, not against the file
+    /// the subtree happens to live in.
+    ///
+    /// Identity is checked before retrieval: a URI naming a schema resource already in the graph is
+    /// answered from the resource registry and never reaches the filesystem. That is what lets a
+    /// bundled document carry an absolute `$id` without it being read as a request to fetch a
+    /// remote document. The path-authorization boundary is untouched — it still guards every
+    /// resolution that does reach the filesystem.
+    pub fn resolve_from(
+        &self,
+        base_doc: DocId,
+        json_pointer: &str,
+        reference: &str,
+    ) -> Result<Node<'_>, Diagnostic> {
         let Some(base_document) = self.document(base_doc) else {
-            return Err(input_error(
-                CODE_INVALID_REFERENCE,
-                format!(
-                    "document ID {} is not present in this graph",
-                    base_doc.index()
-                ),
-                None,
-                None,
-            ));
+            return Err(missing_document_error(base_doc));
         };
-        let base = file_url(&base_document.canonical_path).map_err(|message| {
-            input_error(
-                CODE_INVALID_REFERENCE,
-                message,
-                Some(&base_document.source_id),
-                None,
-            )
-        })?;
-        let target_url = resolve_uri(&base, reference, Some(&base_document.source_id), None)?;
+        let base = self.schema_base_at(base_doc, json_pointer)?;
+        let target_url = resolve_identity_uri(
+            &base,
+            reference,
+            Some(&base_document.source_id),
+            Some(json_pointer),
+        )?;
         if let Some(target) = registered_anchor_location(
             &target_url,
-            &self.anchors,
+            &self.identifiers.anchors,
             Some(&base_document.source_id),
             None,
         )? {
             return self.node_from_location(target);
+        }
+        if let Some(root) = registered_resource(&self.identifiers, &target_url) {
+            let within = pointer_from_url(&target_url, Some(&base_document.source_id), None)?;
+            return self.node_from_location(NodeLocation {
+                doc_id: root.doc_id,
+                json_pointer: format!("{}{within}", root.json_pointer),
+            });
         }
         let target_id = if reference.starts_with('#') {
             base_doc
@@ -222,11 +282,151 @@ impl DocumentGraph {
         let target = pointer_or_anchor(
             &target_url,
             target_id,
-            &self.anchors,
+            &self.identifiers.anchors,
             Some(&base_document.source_id),
             None,
         )?;
         self.node_from_location(target)
+    }
+
+    /// Resolves a `$dynamicRef` written at `json_pointer` to what it can be lowered to.
+    ///
+    /// JSON Schema 2020-12 §8.2.3.2: the value is first resolved against the current base URI, and
+    /// only *"if the initially resolved starting point URI includes a fragment that was created by
+    /// the `$dynamicAnchor` keyword"* does the dynamic walk happen at all — *"otherwise, its
+    /// behavior is identical to `$ref`"*. That condition is decidable at load time, and when it
+    /// holds, the walk's answer is fixed unless two or more resources declare the same name.
+    pub fn resolve_dynamic_ref(
+        &self,
+        base_doc: DocId,
+        json_pointer: &str,
+        reference: &str,
+    ) -> Result<DynamicResolution, Diagnostic> {
+        let base = self.schema_base_at(base_doc, json_pointer)?;
+        let source_id = self
+            .document(base_doc)
+            .map(|document| document.source_id.as_str());
+        let target_url = resolve_identity_uri(&base, reference, source_id, Some(json_pointer))?;
+        let Some(fragment) = target_url.fragment() else {
+            return Ok(DynamicResolution::Plain);
+        };
+        // A JSON Pointer fragment, or none at all, cannot have been created by `$dynamicAnchor`.
+        if fragment.is_empty() || fragment.starts_with('/') {
+            return Ok(DynamicResolution::Plain);
+        }
+        let name = percent_decode(fragment).map_err(|message| {
+            input_error(
+                CODE_INVALID_REFERENCE,
+                message,
+                source_id,
+                Some(json_pointer),
+            )
+        })?;
+        let resource = resource_base_uri(&target_url);
+        let Some(pinned) = self
+            .identifiers
+            .dynamic_anchors
+            .get(&(name.clone(), resource))
+        else {
+            // Bookending fails: the initial target is a plain `$anchor`, or nothing. Identical
+            // to `$ref`, and the caller lowers it through the ordinary reference path.
+            return Ok(DynamicResolution::Plain);
+        };
+        Ok(self.pin_or_defer(self.resources_declaring(&name), pinned))
+    }
+
+    /// Resolves a `$recursiveRef: "#"` written at `json_pointer`.
+    ///
+    /// JSON Schema 2019-09 §8.2.4.2.1 resolves `"#"` against the current base URI and then examines
+    /// *that* schema for `$recursiveAnchor`. Because the keyword's value is restricted to `"#"`,
+    /// the initial target is always a schema *resource root* — so an anchor sitting anywhere else
+    /// can never arm the mechanism, and in an OpenAPI document with no `$id` the root reached this
+    /// way is the OpenAPI Object rather than a schema at all.
+    pub fn resolve_recursive_ref(
+        &self,
+        base_doc: DocId,
+        json_pointer: &str,
+    ) -> Result<DynamicResolution, Diagnostic> {
+        let base = self.schema_base_at(base_doc, json_pointer)?;
+        let resource = resource_base_uri(&base);
+        let root = match self.identifiers.resources.get(&resource) {
+            Some(root) => root.clone(),
+            None => {
+                // No `$id` governs this position, so the resource is the whole document. In an
+                // OpenAPI document that root is the OpenAPI Object — a known non-schema, which
+                // §9.4.2 leaves as undefined behaviour rather than a resolvable target.
+                // `schema_base_at` above already indexed this document, so the ID is known good.
+                let document = &self.documents[base_doc.0];
+                if document.value.get("openapi").is_some() {
+                    return Ok(DynamicResolution::NonSchemaRoot);
+                }
+                NodeLocation {
+                    doc_id: base_doc,
+                    json_pointer: String::new(),
+                }
+            }
+        };
+        let armed = self
+            .node_at(root.doc_id, &root.json_pointer)
+            .and_then(|node| node.value.get("$recursiveAnchor").and_then(Value::as_bool))
+            .unwrap_or(false);
+        if !armed {
+            // "in the absence of $recursiveAnchor ... $recursiveRef's behavior is identical to
+            // that of $ref."
+            return Ok(DynamicResolution::Plain);
+        }
+        Ok(self.pin_or_defer(self.identifiers.recursive_anchors.len(), &root))
+    }
+
+    /// The base URI in force at a schema node.
+    ///
+    /// Walking the `$id` chain can only change the answer if some `$id` exists, and a document
+    /// that declares none — which is nearly all of them — always answers with its own file URI.
+    /// Checking the resource registry first keeps the common case free of the walk.
+    fn schema_base_at(&self, doc_id: DocId, json_pointer: &str) -> Result<Url, Diagnostic> {
+        if self.identifiers.resources.is_empty() {
+            // Indexed directly, exactly as `base_at` below would: a graph-local ID always names a
+            // loaded document, and a second fallible lookup would only add a branch nothing can
+            // reach.
+            let document = &self.documents[doc_id.0];
+            return file_url(&document.canonical_path).map_err(|message| {
+                input_error(
+                    CODE_INVALID_REFERENCE,
+                    message,
+                    Some(&document.source_id),
+                    Some(json_pointer),
+                )
+            });
+        }
+        base_at(&self.documents, doc_id, json_pointer, PositionKind::Schema)
+    }
+
+    /// Counts the schema resources declaring one `$dynamicAnchor` name.
+    ///
+    /// The map is keyed name-first precisely so this is a contiguous range scan.
+    fn resources_declaring(&self, name: &str) -> usize {
+        self.identifiers
+            .dynamic_anchors
+            .range((name.to_owned(), String::new())..)
+            .take_while(|((anchor, _), _)| anchor == name)
+            .count()
+    }
+
+    /// One declaring resource means the dynamic-scope walk has one candidate and therefore one
+    /// answer, whatever path evaluation took to get here; more than one means the answer genuinely
+    /// depends on that path.
+    ///
+    /// Deliberately conservative: it does not ask whether a second declaring resource can actually
+    /// reach this keyword, so it defers some references that a reachability analysis would pin.
+    /// Erring this way can only refuse work, never mis-resolve it.
+    fn pin_or_defer(&self, declaring_resources: usize, pinned: &NodeLocation) -> DynamicResolution {
+        if declaring_resources <= 1 {
+            DynamicResolution::Pinned(pinned.clone())
+        } else {
+            DynamicResolution::PathDependent {
+                declaring_resources,
+            }
+        }
     }
 
     fn node_from_location(&self, target: NodeLocation) -> Result<Node<'_>, Diagnostic> {
@@ -317,7 +517,7 @@ struct GraphBuilder<'a> {
     config: &'a ResolvedConfig,
     documents: Vec<Document>,
     path_to_id: HashMap<PathBuf, DocId>,
-    anchors: AnchorRegistry,
+    identifiers: IdentifierRegistry,
     edges: Vec<ReferenceEdge>,
     workspace_root: PathBuf,
     allow_roots: Vec<AllowRoot>,
@@ -355,7 +555,7 @@ impl<'a> GraphBuilder<'a> {
             config,
             documents: Vec::new(),
             path_to_id: HashMap::new(),
-            anchors: HashMap::new(),
+            identifiers: IdentifierRegistry::default(),
             edges: Vec::new(),
             workspace_root,
             allow_roots,
@@ -386,7 +586,7 @@ impl<'a> GraphBuilder<'a> {
             DocumentGraph {
                 documents: self.documents,
                 path_to_id: self.path_to_id,
-                anchors: self.anchors,
+                identifiers: self.identifiers,
                 entry_id,
                 edges: self.edges,
                 workspace_root: self.workspace_root,
@@ -462,25 +662,37 @@ impl<'a> GraphBuilder<'a> {
                 None,
             )
         })?;
-        // Fast-reject that gates the anchor tree walk over the *raw* file bytes. It must also fire
-        // on spellings that escape the `$`: a document can write the key with the dollar as a JSON
-        // or YAML unicode/hex character escape and still parse to the key `$anchor`. Missing one
-        // skips registration silently — later refs fail to resolve and duplicate-anchor validation
-        // never runs. Over-triggering is harmless (the walk just finds no `$anchor` keys); a false
-        // negative is not, so the three needles below need no false negatives, not exactness.
-        let contains_anchor = [
-            b"$anchor".as_slice(),
+        // Fast-reject that gates the identifier tree walk over the *raw* file bytes. It must also
+        // fire on spellings that escape the `$`: a document can write the key with the dollar as a
+        // JSON or YAML unicode/hex character escape and still parse to the key `$anchor`. Missing
+        // one skips registration silently — later refs fail to resolve and duplicate-anchor
+        // validation never runs. Over-triggering is harmless (the walk just finds no identifier
+        // keys); a false negative is not, so the pairs below need no false negatives, not exactness.
+        //
+        // `$id` earns its place despite matching plenty of unrelated text: it is what creates a
+        // schema resource, and resource registration must not depend on whether the document also
+        // happens to declare an anchor — that would make `$id` mean different things in two
+        // documents differing only in an unrelated keyword.
+        const DOLLAR_SPELLINGS: [&[u8]; 3] = [
+            b"$",
             // The dollar as the unicode escape U+0024 (JSON, and YAML double-quoted) — the literal
-            // bytes `\`, `u`, `0`, `0`, `2`, `4` followed by `anchor`.
-            [
-                0x5C, 0x75, 0x30, 0x30, 0x32, 0x34, b'a', b'n', b'c', b'h', b'o', b'r',
-            ]
-            .as_slice(),
-            // The dollar as the YAML hex escape \x24, followed by `anchor`.
-            br"\x24anchor".as_slice(),
-        ]
-        .iter()
-        .any(|needle| raw.windows(needle.len()).any(|window| window == *needle));
+            // bytes `\`, `u`, `0`, `0`, `2`, `4`.
+            &[0x5C, 0x75, 0x30, 0x30, 0x32, 0x34],
+            // The dollar as the YAML hex escape \x24.
+            br"\x24",
+        ];
+        const IDENTIFIER_SUFFIXES: [&[u8]; 4] =
+            [b"anchor", b"dynamicAnchor", b"recursiveAnchor", b"id"];
+        let contains_anchor = DOLLAR_SPELLINGS.iter().any(|dollar| {
+            raw.windows(dollar.len())
+                .enumerate()
+                .any(|(index, window)| {
+                    window == *dollar
+                        && IDENTIFIER_SUFFIXES
+                            .iter()
+                            .any(|suffix| raw[index + dollar.len()..].starts_with(suffix))
+                })
+        });
         let (value, warning) = parse_document(&canonical_path, &raw, &source_id)?;
         if let Some(warning) = warning {
             self.warnings.push(warning);
@@ -491,7 +703,7 @@ impl<'a> GraphBuilder<'a> {
         if contains_anchor {
             let base = file_url(&canonical_path)
                 .expect("a canonical filesystem path is representable as a file URI");
-            collect_anchors(&value, id, base, &source_id, &mut self.anchors)?;
+            collect_anchors(&value, id, base, &source_id, &mut self.identifiers)?;
         }
         self.documents.push(Document {
             id,
@@ -581,7 +793,7 @@ impl<'a> GraphBuilder<'a> {
                         Some(&append_pointer(&location.json_pointer, "$id")),
                     ));
                 };
-                effective_base = Rc::new(resolve_uri(
+                effective_base = Rc::new(resolve_identity_uri(
                     &effective_base,
                     id,
                     self.source_id(location.doc_id),
@@ -696,7 +908,7 @@ impl<'a> GraphBuilder<'a> {
         state: &mut TraversalState,
     ) -> Result<(), Diagnostic> {
         let reference_pointer = append_pointer(&from.json_pointer, "$ref");
-        let target_url = resolve_uri(
+        let target_url = resolve_identity_uri(
             base,
             reference,
             self.source_id(from.doc_id),
@@ -704,11 +916,23 @@ impl<'a> GraphBuilder<'a> {
         )?;
         let target = if let Some(target) = registered_anchor_location(
             &target_url,
-            &self.anchors,
+            &self.identifiers.anchors,
             self.source_id(from.doc_id),
             Some(&reference_pointer),
         )? {
             target
+        } else if let Some(root) = registered_resource(&self.identifiers, &target_url) {
+            // The URI names a schema resource already in the graph. Answer from the registry —
+            // reaching for the filesystem here is what turns an `$id` into a fetch attempt.
+            let within = pointer_from_url(
+                &target_url,
+                self.source_id(from.doc_id),
+                Some(&reference_pointer),
+            )?;
+            NodeLocation {
+                doc_id: root.doc_id,
+                json_pointer: format!("{}{within}", root.json_pointer),
+            }
         } else {
             let source_id = self.source_id(from.doc_id);
             let target_path =
@@ -726,7 +950,7 @@ impl<'a> GraphBuilder<'a> {
             pointer_or_anchor(
                 &target_url,
                 target_id,
-                &self.anchors,
+                &self.identifiers.anchors,
                 self.source_id(from.doc_id),
                 Some(&reference_pointer),
             )?
@@ -800,88 +1024,12 @@ impl<'a> GraphBuilder<'a> {
         target: &NodeLocation,
         expected_position: PositionKind,
     ) -> Result<Url, Diagnostic> {
-        let document = &self.documents[target.doc_id.0];
-        let mut base = file_url(&document.canonical_path).map_err(|message| {
-            input_error(
-                CODE_INVALID_REFERENCE,
-                message,
-                Some(&document.source_id),
-                Some(&target.json_pointer),
-            )
-        })?;
-        if target.json_pointer.is_empty() {
-            return Ok(base);
-        }
-
-        let mut value = &document.value;
-        let mut pointer = String::new();
-        let mut context = if document.value.get("openapi").is_some() {
-            WalkContext::NonSchema
-        } else {
-            match expected_position {
-                PositionKind::Schema => WalkContext::Schema,
-                PositionKind::NonSchema => WalkContext::NonSchema,
-            }
-        };
-        for encoded_token in target.json_pointer[1..].split('/') {
-            if context == WalkContext::Schema
-                && let Value::Object(object) = value
-                && let Some(id_value) = object.get("$id")
-            {
-                let Some(id) = id_value.as_str() else {
-                    return Err(input_error(
-                        CODE_INVALID_REFERENCE,
-                        "Schema Object $id must be a string URI reference",
-                        Some(&document.source_id),
-                        Some(&append_pointer(&pointer, "$id")),
-                    ));
-                };
-                let id_pointer = append_pointer(&pointer, "$id");
-                base = resolve_uri(&base, id, Some(&document.source_id), Some(&id_pointer))?;
-            }
-
-            let token = unescape_pointer_token_borrowed(encoded_token).map_err(|message| {
-                input_error(
-                    CODE_INVALID_REFERENCE,
-                    message,
-                    Some(&document.source_id),
-                    Some(&target.json_pointer),
-                )
-            })?;
-            let pointer_error = || {
-                input_error(
-                    CODE_POINTER,
-                    format!("JSON Pointer '{}' does not resolve", target.json_pointer),
-                    Some(&document.source_id),
-                    Some(&target.json_pointer),
-                )
-            };
-            let (child, next_context) = match value {
-                Value::Object(object) => {
-                    let child = object.get(token.as_ref()).ok_or_else(pointer_error)?;
-                    (
-                        child,
-                        child_context(context, &pointer, token.as_ref(), child),
-                    )
-                }
-                Value::Array(array) => {
-                    let child = token
-                        .parse::<usize>()
-                        .ok()
-                        .and_then(|index| array.get(index))
-                        .ok_or_else(pointer_error)?;
-                    let next_context = array_child_context(context);
-                    (child, next_context)
-                }
-                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-                    return Err(pointer_error());
-                }
-            };
-            context = next_context;
-            pointer = append_pointer(&pointer, token.as_ref());
-            value = child;
-        }
-        Ok(base)
+        base_at(
+            &self.documents,
+            target.doc_id,
+            &target.json_pointer,
+            expected_position,
+        )
     }
 
     fn source_id(&self, id: DocId) -> Option<&str> {
@@ -891,19 +1039,218 @@ impl<'a> GraphBuilder<'a> {
     }
 }
 
+/// Computes the base URI in force at one node, walking the `$id` chain down to it.
+///
+/// Shared by the graph builder (which needs it while walking references) and the finished graph
+/// (which needs it to resolve the dynamic-reference keywords), so it takes the document slice
+/// rather than either owner.
+fn base_at(
+    documents: &[Document],
+    doc_id: DocId,
+    json_pointer: &str,
+    expected_position: PositionKind,
+) -> Result<Url, Diagnostic> {
+    let document = &documents[doc_id.0];
+    let mut base = file_url(&document.canonical_path).map_err(|message| {
+        input_error(
+            CODE_INVALID_REFERENCE,
+            message,
+            Some(&document.source_id),
+            Some(json_pointer),
+        )
+    })?;
+    if json_pointer.is_empty() {
+        return Ok(base);
+    }
+
+    let mut value = &document.value;
+    let mut pointer = String::new();
+    let mut context = if document.value.get("openapi").is_some() {
+        WalkContext::NonSchema
+    } else {
+        match expected_position {
+            PositionKind::Schema => WalkContext::Schema,
+            PositionKind::NonSchema => WalkContext::NonSchema,
+        }
+    };
+    for encoded_token in json_pointer[1..].split('/') {
+        if context == WalkContext::Schema
+            && let Value::Object(object) = value
+            && let Some(id_value) = object.get("$id")
+        {
+            let Some(id) = id_value.as_str() else {
+                return Err(input_error(
+                    CODE_INVALID_REFERENCE,
+                    "Schema Object $id must be a string URI reference",
+                    Some(&document.source_id),
+                    Some(&append_pointer(&pointer, "$id")),
+                ));
+            };
+            let id_pointer = append_pointer(&pointer, "$id");
+            base = resolve_identity_uri(&base, id, Some(&document.source_id), Some(&id_pointer))?;
+        }
+
+        let token = unescape_pointer_token_borrowed(encoded_token).map_err(|message| {
+            input_error(
+                CODE_INVALID_REFERENCE,
+                message,
+                Some(&document.source_id),
+                Some(json_pointer),
+            )
+        })?;
+        let pointer_error = || {
+            input_error(
+                CODE_POINTER,
+                format!("JSON Pointer '{json_pointer}' does not resolve"),
+                Some(&document.source_id),
+                Some(json_pointer),
+            )
+        };
+        let (child, next_context) = match value {
+            Value::Object(object) => {
+                let child = object.get(token.as_ref()).ok_or_else(pointer_error)?;
+                (
+                    child,
+                    child_context(context, &pointer, token.as_ref(), child),
+                )
+            }
+            Value::Array(array) => {
+                let child = token
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| array.get(index))
+                    .ok_or_else(pointer_error)?;
+                let next_context = array_child_context(context);
+                (child, next_context)
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+                return Err(pointer_error());
+            }
+        };
+        context = next_context;
+        pointer = append_pointer(&pointer, token.as_ref());
+        value = child;
+    }
+    Ok(base)
+}
+
+/// The schema resource a URI names, if the graph holds one.
+///
+/// `resource_base_uri` copies the URI to strip its fragment, so the empty-registry check comes
+/// first: a document declaring no `$id` can never match, and every reference resolution passes
+/// through here.
+fn registered_resource<'a>(
+    identifiers: &'a IdentifierRegistry,
+    url: &Url,
+) -> Option<&'a NodeLocation> {
+    if identifiers.resources.is_empty() {
+        return None;
+    }
+    identifiers.resources.get(&resource_base_uri(url))
+}
+
+fn missing_document_error(id: DocId) -> Diagnostic {
+    input_error(
+        CODE_INVALID_REFERENCE,
+        format!("document ID {} is not present in this graph", id.index()),
+        None,
+        None,
+    )
+}
+
+/// Registers the two dynamic identifier keywords carried by one schema object.
+///
+/// `$dynamicAnchor` lands in two maps on purpose. §8.2.2 makes it create an ordinary plain-name
+/// fragment, so `$ref: "#name"` must find it exactly as it would an `$anchor`; and it lands in the
+/// dynamic map because the reverse does *not* hold — a plain `$anchor` is never eligible for
+/// dynamic-scope resolution, an asymmetry the 2020-12 test suite pins explicitly.
+fn collect_dynamic_identifiers(
+    object: &serde_json::Map<String, Value>,
+    doc_id: DocId,
+    pointer: &str,
+    base: &Url,
+    source_id: &str,
+    identifiers: &mut IdentifierRegistry,
+) -> Result<(), Diagnostic> {
+    let resource = resource_base_uri(base);
+    if let Some(anchor_value) = object.get("$dynamicAnchor") {
+        let anchor_pointer = append_pointer(pointer, "$dynamicAnchor");
+        let Some(name) = anchor_value.as_str() else {
+            return Err(input_error(
+                CODE_INVALID_REFERENCE,
+                "Schema Object $dynamicAnchor must be a valid plain name",
+                Some(source_id),
+                Some(&anchor_pointer),
+            ));
+        };
+        if !valid_anchor_name(name) {
+            return Err(input_error(
+                CODE_INVALID_REFERENCE,
+                format!("Schema Object $dynamicAnchor '{name}' is not a valid plain name"),
+                Some(source_id),
+                Some(&anchor_pointer),
+            ));
+        }
+        let location = NodeLocation {
+            doc_id,
+            json_pointer: pointer.to_owned(),
+        };
+        let plain_key = (resource.clone(), name.to_owned());
+        // §8.2.2: "The effect of specifying the same fragment name multiple times within the same
+        // resource, using any combination of $anchor and/or $dynamicAnchor, is undefined.
+        // Implementations MAY raise an error if such usage is detected." Raise it — the same call
+        // the plain `$anchor` path already makes.
+        if identifiers.anchors.contains_key(&plain_key) {
+            return Err(input_error(
+                CODE_INVALID_REFERENCE,
+                format!("duplicate $dynamicAnchor '{name}' in the same schema resource"),
+                Some(source_id),
+                Some(&anchor_pointer),
+            ));
+        }
+        identifiers.anchors.insert(plain_key, location.clone());
+        identifiers
+            .dynamic_anchors
+            .insert((name.to_owned(), resource.clone()), location);
+    }
+    if let Some(anchor_value) = object.get("$recursiveAnchor") {
+        let anchor_pointer = append_pointer(pointer, "$recursiveAnchor");
+        let Some(enabled) = anchor_value.as_bool() else {
+            return Err(input_error(
+                CODE_INVALID_REFERENCE,
+                "Schema Object $recursiveAnchor must be a boolean",
+                Some(source_id),
+                Some(&anchor_pointer),
+            ));
+        };
+        // "Omitting this keyword has the same behavior as a value of false" — so a `false` records
+        // nothing. The walk is pre-order, so the first hit in a resource is its outermost one.
+        if enabled {
+            identifiers
+                .recursive_anchors
+                .entry(resource)
+                .or_insert(NodeLocation {
+                    doc_id,
+                    json_pointer: pointer.to_owned(),
+                });
+        }
+    }
+    Ok(())
+}
+
 fn collect_anchors(
     value: &Value,
     doc_id: DocId,
     base: Url,
     source_id: &str,
-    anchors: &mut AnchorRegistry,
+    identifiers: &mut IdentifierRegistry,
 ) -> Result<(), Diagnostic> {
     let context = if value.get("openapi").is_some() {
         WalkContext::NonSchema
     } else {
         WalkContext::Schema
     };
-    collect_anchors_at(value, doc_id, "", context, base, source_id, anchors)
+    collect_anchors_at(value, doc_id, "", context, base, source_id, identifiers)
 }
 
 fn collect_anchors_at(
@@ -913,7 +1260,7 @@ fn collect_anchors_at(
     context: WalkContext,
     mut base: Url,
     source_id: &str,
-    anchors: &mut AnchorRegistry,
+    identifiers: &mut IdentifierRegistry,
 ) -> Result<(), Diagnostic> {
     if context == WalkContext::Skip {
         return Ok(());
@@ -926,7 +1273,7 @@ fn collect_anchors_at(
         let Some(id) = id_value.as_str() else {
             return Ok(());
         };
-        let Ok(resolved) = resolve_uri(
+        let Ok(resolved) = resolve_identity_uri(
             &base,
             id,
             Some(source_id),
@@ -935,6 +1282,22 @@ fn collect_anchors_at(
             return Ok(());
         };
         base = resolved;
+        // `$id` is what makes this subtree a schema *resource*, and resource identity is the unit
+        // the dynamic-scope walk counts in. Record the root so a dynamic reference resolving to
+        // this resource's URI can find the schema it names.
+        identifiers
+            .resources
+            .entry(resource_base_uri(&base))
+            .or_insert_with(|| NodeLocation {
+                doc_id,
+                json_pointer: pointer.to_owned(),
+            });
+    }
+
+    if context == WalkContext::Schema
+        && let Value::Object(object) = value
+    {
+        collect_dynamic_identifiers(object, doc_id, pointer, &base, source_id, identifiers)?;
     }
 
     if context == WalkContext::Schema
@@ -959,7 +1322,7 @@ fn collect_anchors_at(
             ));
         }
         let key = (resource_base_uri(&base), name.to_owned());
-        if anchors.contains_key(&key) {
+        if identifiers.anchors.contains_key(&key) {
             return Err(input_error(
                 CODE_INVALID_REFERENCE,
                 format!("duplicate $anchor '{name}' in the same schema resource"),
@@ -967,7 +1330,7 @@ fn collect_anchors_at(
                 Some(&anchor_pointer),
             ));
         }
-        anchors.insert(
+        identifiers.anchors.insert(
             key,
             NodeLocation {
                 doc_id,
@@ -988,7 +1351,7 @@ fn collect_anchors_at(
                         child_context,
                         base.clone(),
                         source_id,
-                        anchors,
+                        identifiers,
                     )?;
                 }
             }
@@ -1004,7 +1367,7 @@ fn collect_anchors_at(
                         child_context,
                         base.clone(),
                         source_id,
-                        anchors,
+                        identifiers,
                     )?;
                 }
             }
@@ -1400,32 +1763,26 @@ fn encode_relative_path(path: &Path) -> Result<String, String> {
     Ok(encoded_segments.join("/"))
 }
 
-fn resolve_uri(
+/// Joins a reference onto a base URI without asking whether the result is retrievable.
+///
+/// `$id` names a schema resource; it is not a request to fetch one. A bundled document that
+/// identifies its resources with `https://` URIs resolves entirely in memory, so the scheme check
+/// belongs at the point something is actually read — `local_path_from_url`, which every path that
+/// reaches the filesystem goes through, and which is where OASTS1002 now comes from.
+fn resolve_identity_uri(
     base: &Url,
     reference: &str,
     source_id: Option<&str>,
     pointer: Option<&str>,
 ) -> Result<Url, Diagnostic> {
-    let resolved = base.join(reference).map_err(|error| {
+    base.join(reference).map_err(|error| {
         input_error(
             CODE_INVALID_REFERENCE,
             format!("invalid URI reference '{reference}': {error}"),
             source_id,
             pointer,
         )
-    })?;
-    if resolved.scheme() != "file" {
-        return Err(input_error(
-            CODE_REMOTE_UNSUPPORTED,
-            format!(
-                "remote loading is not supported in this build: '{}'",
-                resolved.as_str()
-            ),
-            source_id,
-            pointer,
-        ));
-    }
-    Ok(resolved)
+    })
 }
 
 fn file_url(path: &Path) -> Result<Url, String> {
@@ -2585,6 +2942,225 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_reference_resolution_distinguishes_pinned_plain_and_path_dependent_targets() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Plain:\n      $anchor: Ordinary\n      type: string\n    Pinned:\n      $id: https://example.invalid/pinned\n      $dynamicAnchor: Only\n      $defs:\n        Reference:\n          $dynamicRef: '#Only'\n    First:\n      $id: https://example.invalid/first\n      $dynamicAnchor: Shared\n      $defs:\n        Reference:\n          $dynamicRef: '#Shared'\n    Second:\n      $id: https://example.invalid/second\n      $dynamicAnchor: Shared\n      type: number\n",
+        );
+        let config = resolved_config(directory.path(), "");
+        let graph = load_ok(&config);
+        let entry = graph.entry().id;
+
+        assert_eq!(
+            graph
+                .resolve_dynamic_ref(entry, "/components/schemas/Plain", "#Ordinary")
+                .expect("plain anchor should resolve like $ref"),
+            DynamicResolution::Plain
+        );
+        assert_eq!(
+            graph
+                .resolve_dynamic_ref(
+                    entry,
+                    "/components/schemas/Plain",
+                    "#/components/schemas/Pinned",
+                )
+                .expect("pointer fragment should resolve like $ref"),
+            DynamicResolution::Plain
+        );
+        assert_eq!(
+            graph
+                .resolve_dynamic_ref(
+                    entry,
+                    "/components/schemas/Plain",
+                    "https://example.invalid/pinned",
+                )
+                .expect("fragmentless reference should resolve like $ref"),
+            DynamicResolution::Plain
+        );
+        assert_eq!(
+            graph
+                .resolve_dynamic_ref(entry, "/components/schemas/Pinned/$defs/Reference", "#Only",)
+                .expect("one declaring resource pins the target"),
+            DynamicResolution::Pinned(NodeLocation {
+                doc_id: entry,
+                json_pointer: "/components/schemas/Pinned".to_owned(),
+            })
+        );
+        assert_eq!(
+            graph
+                .resolve_dynamic_ref(
+                    entry,
+                    "/components/schemas/First/$defs/Reference",
+                    "#Shared",
+                )
+                .expect("two declaring resources defer the target"),
+            DynamicResolution::PathDependent {
+                declaring_resources: 2,
+            }
+        );
+        assert_eq!(
+            graph
+                .resolve_dynamic_ref(entry, "/components/schemas/Pinned/$defs/Reference", "#%",)
+                .expect_err("invalid percent escape should fail")
+                .code,
+            CODE_INVALID_REFERENCE
+        );
+    }
+
+    #[test]
+    fn recursive_reference_resolution_distinguishes_all_resource_shapes() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    First:\n      $id: https://example.invalid/first\n      $recursiveAnchor: true\n      $defs:\n        Reference:\n          $recursiveRef: '#'\n    Second:\n      $id: https://example.invalid/second\n      $recursiveAnchor: true\n    Disabled:\n      $id: https://example.invalid/disabled\n      $recursiveAnchor: false\n      $defs:\n        Reference: {}\n",
+        );
+        let config = resolved_config(directory.path(), "");
+        let graph = load_ok(&config);
+        let entry = graph.entry().id;
+
+        assert_eq!(
+            graph
+                .resolve_recursive_ref(entry, "/components/schemas/First/$defs/Reference")
+                .expect("two recursive resources defer the target"),
+            DynamicResolution::PathDependent {
+                declaring_resources: 2,
+            }
+        );
+        assert_eq!(
+            graph
+                .resolve_recursive_ref(entry, "/components/schemas/Disabled/$defs/Reference")
+                .expect("false recursive anchor behaves like $ref"),
+            DynamicResolution::Plain
+        );
+        assert_eq!(
+            graph
+                .resolve_recursive_ref(entry, "/components/schemas")
+                .expect("OpenAPI root is not a schema resource"),
+            DynamicResolution::NonSchemaRoot
+        );
+
+        let schema_directory = TempDir::new().expect("tempdir should be created");
+        write(
+            schema_directory.path(),
+            "workspace/entry.yaml",
+            "$recursiveAnchor: true\n$recursiveRef: '#'\n",
+        );
+        let schema_config = resolved_config(schema_directory.path(), "");
+        let schema_graph = load_ok(&schema_config);
+        assert_eq!(
+            schema_graph
+                .resolve_recursive_ref(schema_graph.entry().id, "")
+                .expect("standalone schema root should pin"),
+            DynamicResolution::Pinned(NodeLocation {
+                doc_id: schema_graph.entry().id,
+                json_pointer: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn dynamic_identifier_shapes_and_duplicates_are_rejected() {
+        for schema in [
+            "Invalid:\n      $dynamicAnchor: 9bad\n",
+            "Invalid:\n      $dynamicAnchor: 7\n",
+            "First:\n      $dynamicAnchor: Same\n    Second:\n      $dynamicAnchor: Same\n",
+            "Invalid:\n      $recursiveAnchor: yes\n",
+        ] {
+            let directory = TempDir::new().expect("tempdir should be created");
+            write(
+                directory.path(),
+                "workspace/entry.yaml",
+                &format!("openapi: 3.1.0\ncomponents:\n  schemas:\n    {schema}"),
+            );
+            let config = resolved_config(directory.path(), "");
+
+            assert_load_code(&config, CODE_INVALID_REFERENCE);
+        }
+    }
+
+    #[test]
+    fn absolute_id_resolves_to_registered_resource_without_fetching() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Target:\n      $id: https://example.invalid/target\n      type: string\n    Holder:\n      $ref: https://example.invalid/target\n",
+        );
+        let config = resolved_config(directory.path(), "");
+
+        let graph = load_ok(&config);
+
+        assert_eq!(graph.documents().len(), 1);
+        assert_eq!(graph.edges().len(), 1);
+        assert_eq!(
+            graph.edges()[0].to.json_pointer,
+            "/components/schemas/Target"
+        );
+        let target = graph
+            .resolve_from(
+                graph.entry().id,
+                "/components/schemas/Holder",
+                "https://example.invalid/target",
+            )
+            .expect("registered absolute identity should resolve in-document");
+        assert_eq!(target.value["type"], "string");
+    }
+
+    #[test]
+    fn dynamic_resolution_propagates_invalid_base_pointer_and_uri_errors() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        // The `$id` matters: it registers a schema resource, which is what makes the base-URI walk
+        // run at all. A document declaring none takes the fast path that answers with the
+        // document's own URI without walking, so there is no pointer there to be invalid.
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Plain: { $id: 'plain', type: string }\n",
+        );
+        let config = resolved_config(directory.path(), "");
+        let graph = load_ok(&config);
+        let entry = graph.entry().id;
+
+        assert_eq!(
+            graph
+                .resolve_from(entry, "/components/schemas/Plain", "http://[")
+                .expect_err("invalid URI should fail")
+                .code,
+            CODE_INVALID_REFERENCE
+        );
+        assert_eq!(
+            graph
+                .resolve_dynamic_ref(entry, "/components/schemas/Missing", "#Node")
+                .expect_err("invalid dynamic reference location should fail")
+                .code,
+            CODE_POINTER
+        );
+        assert_eq!(
+            graph
+                .resolve_recursive_ref(entry, "/components/schemas/Missing")
+                .expect_err("invalid recursive reference location should fail")
+                .code,
+            CODE_POINTER
+        );
+    }
+
+    #[test]
+    fn registered_resource_rejects_an_invalid_pointer_fragment() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Target:\n      $id: https://example.invalid/target\n      type: string\n    Holder:\n      $ref: https://example.invalid/target#/%\n",
+        );
+        let config = resolved_config(directory.path(), "");
+
+        assert_load_code(&config, CODE_INVALID_REFERENCE);
+    }
+
+    #[test]
     fn invalid_anchor_name_is_fatal() {
         for anchor in ["9bad", "7"] {
             let directory = TempDir::new().expect("tempdir should be created");
@@ -2668,17 +3244,49 @@ mod tests {
             "allOf": [
                 { "$anchor": "ArrayTarget", "type": "string" },
                 { "$id": 7, "$anchor": 5 },
-                { "$id": "https://example.invalid/schema", "$anchor": 5 }
+                { "$id": "https://example.invalid/schema", "$anchor": "Remote" }
             ]
         });
-        let mut anchors = AnchorRegistry::new();
+        let mut identifiers = IdentifierRegistry::default();
 
-        collect_anchors(&value, DocId(4), base.clone(), "entry.yaml", &mut anchors)
-            .expect("invalid IDs should stop only their subtrees");
+        collect_anchors(
+            &value,
+            DocId(4),
+            base.clone(),
+            "entry.yaml",
+            &mut identifiers,
+        )
+        .expect("invalid IDs should stop only their subtrees");
 
-        assert_eq!(anchors.len(), 2);
+        assert_eq!(identifiers.anchors.len(), 3);
+        // An absolute `$id` names a schema resource; it is not a request to fetch one. The anchor
+        // beneath it registers against that resource URI rather than the enclosing document's.
         assert_eq!(
-            anchors
+            identifiers
+                .anchors
+                .get(&(
+                    "https://example.invalid/schema".to_owned(),
+                    "Remote".to_owned()
+                ))
+                .expect("absolute-$id anchor"),
+            &NodeLocation {
+                doc_id: DocId(4),
+                json_pointer: "/allOf/2".to_owned(),
+            }
+        );
+        assert_eq!(
+            identifiers
+                .resources
+                .get("https://example.invalid/schema")
+                .expect("absolute-$id resource"),
+            &NodeLocation {
+                doc_id: DocId(4),
+                json_pointer: "/allOf/2".to_owned(),
+            }
+        );
+        assert_eq!(
+            identifiers
+                .anchors
                 .get(&(resource_base_uri(&base), "ArrayTarget".to_owned()))
                 .expect("array anchor"),
             &NodeLocation {
@@ -2693,7 +3301,7 @@ mod tests {
             WalkContext::Skip,
             base.clone(),
             "entry.yaml",
-            &mut anchors,
+            &mut identifiers,
         )
         .expect("skipped contexts are ignored");
         collect_anchors_at(
@@ -2703,7 +3311,7 @@ mod tests {
             WalkContext::SchemaMap,
             base.clone(),
             "entry.yaml",
-            &mut anchors,
+            &mut identifiers,
         )
         .expect("schema-map arrays are ignored");
         assert_eq!(
@@ -2714,7 +3322,7 @@ mod tests {
                 WalkContext::Schema,
                 base,
                 "entry.yaml",
-                &mut anchors,
+                &mut identifiers,
             )
             .expect_err("non-string anchor should fail")
             .code,
@@ -2726,7 +3334,7 @@ mod tests {
                 DocId(4),
                 file_url(&directory.path().join("invalid.yaml")).expect("file URL"),
                 "invalid.yaml",
-                &mut anchors,
+                &mut identifiers,
             )
             .expect_err("array child errors should propagate")
             .code,
@@ -2735,24 +3343,24 @@ mod tests {
 
         let no_fragment = Url::parse("file:///entry.yaml").expect("URL");
         assert_eq!(
-            registered_anchor_location(&no_fragment, &anchors, None, None)
+            registered_anchor_location(&no_fragment, &identifiers.anchors, None, None)
                 .expect("lookup should succeed"),
             None
         );
         let pointer_fragment = Url::parse("file:///entry.yaml#/%").expect("URL");
         assert_eq!(
-            registered_anchor_location(&pointer_fragment, &anchors, None, None)
+            registered_anchor_location(&pointer_fragment, &identifiers.anchors, None, None)
                 .expect("lookup should succeed"),
             None
         );
         let encoded_pointer = Url::parse("file:///entry.yaml#%2Ftarget").expect("URL");
         assert_eq!(
-            registered_anchor_location(&encoded_pointer, &anchors, None, None)
+            registered_anchor_location(&encoded_pointer, &identifiers.anchors, None, None)
                 .expect("lookup should succeed"),
             None
         );
         assert_eq!(
-            pointer_or_anchor(&encoded_pointer, DocId(4), &anchors, None, None)
+            pointer_or_anchor(&encoded_pointer, DocId(4), &identifiers.anchors, None, None)
                 .expect("encoded pointer should resolve"),
             NodeLocation {
                 doc_id: DocId(4),
@@ -2761,14 +3369,14 @@ mod tests {
         );
         let invalid_percent = Url::parse("file:///entry.yaml#%").expect("URL");
         assert_eq!(
-            pointer_or_anchor(&invalid_percent, DocId(4), &anchors, None, None)
+            pointer_or_anchor(&invalid_percent, DocId(4), &identifiers.anchors, None, None)
                 .expect_err("invalid percent escape should fail")
                 .code,
             CODE_INVALID_REFERENCE
         );
         let invalid_pointer = Url::parse("file:///entry.yaml#%2Fbad~2escape").expect("URL");
         assert_eq!(
-            pointer_or_anchor(&invalid_pointer, DocId(4), &anchors, None, None)
+            pointer_or_anchor(&invalid_pointer, DocId(4), &identifiers.anchors, None, None)
                 .expect_err("invalid decoded pointer should fail")
                 .code,
             CODE_INVALID_REFERENCE
@@ -2954,7 +3562,7 @@ mod tests {
                 CODE_INVALID_REFERENCE,
             ),
             (
-                "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $id: https://example.invalid/schema.json\n      type: string\n",
+                "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $ref: https://example.invalid/schema.json\n",
                 CODE_REMOTE_UNSUPPORTED,
             ),
             // Invalid $id inside an allOf element: the diagnostic propagates back
@@ -3291,21 +3899,23 @@ mod tests {
     fn uri_and_pointer_helpers_cover_rejections_and_boundaries() {
         let base = Url::parse("file:///tmp/base.yaml").expect("base URL");
         assert_eq!(
-            resolve_uri(&base, "http://[", Some("source"), Some("/$ref"))
+            resolve_identity_uri(&base, "http://[", Some("source"), Some("/$ref"))
                 .expect_err("invalid URI")
                 .code,
             CODE_INVALID_REFERENCE
         );
+        // Joining is identity work and says nothing about retrievability — a remote URI joins
+        // cleanly here and is refused below, where something would actually be read.
         assert_eq!(
-            resolve_uri(
+            resolve_identity_uri(
                 &base,
                 "https://example.invalid/x",
                 Some("source"),
                 Some("/$ref"),
             )
-            .expect_err("remote URI")
-            .code,
-            CODE_REMOTE_UNSUPPORTED
+            .expect("remote URI joins")
+            .as_str(),
+            "https://example.invalid/x"
         );
         assert!(file_url(Path::new("relative/path")).is_err());
         let remote = Url::parse("https://example.invalid/x").expect("remote URL");
@@ -3501,7 +4111,7 @@ mod tests {
         let graph = DocumentGraph {
             documents: vec![document],
             path_to_id: HashMap::new(),
-            anchors: HashMap::new(),
+            identifiers: IdentifierRegistry::default(),
             entry_id: DocId(0),
             edges: Vec::new(),
             workspace_root: PathBuf::from("workspace"),

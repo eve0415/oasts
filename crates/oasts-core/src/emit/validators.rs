@@ -6232,8 +6232,11 @@ mod tests {
 
     #[test]
     fn every_rejected_validation_keyword_fails_the_run_naming_keyword_and_pointer() {
+        // Under 3.0 the dialect is not JSON Schema, so a dynamic reference is unrepresentable and
+        // rejected outright. Under 3.1 it is rejected only where the loader could not pin it —
+        // covered by `path_dependent_dynamic_ref_is_rejected_by_validators`.
         for keyword in ["$dynamicRef", "$recursiveRef"] {
-            let (_files, diagnostics) = compile(doc_31(json!({
+            let (_files, diagnostics) = compile(doc_30(json!({
                 "Rejected": { (keyword): true }
             })));
             let rejected = diagnostics
@@ -6255,6 +6258,71 @@ mod tests {
                     .count(),
                 1,
                 "rejected keyword '{keyword}' must raise exactly one validators diagnostic",
+            );
+        }
+    }
+
+    #[test]
+    fn path_dependent_dynamic_references_warn_and_refuse_validators() {
+        for (keyword, schemas, pointer) in [
+            (
+                "$dynamicRef",
+                json!({
+                    "First": {
+                        "$id": "https://example.invalid/dynamic-first",
+                        "$dynamicAnchor": "Node",
+                        "type": "object",
+                        "properties": {
+                            "next": { "$dynamicRef": "#Node" }
+                        }
+                    },
+                    "Second": {
+                        "$id": "https://example.invalid/dynamic-second",
+                        "$dynamicAnchor": "Node"
+                    }
+                }),
+                "/components/schemas/First/properties/next/$dynamicRef",
+            ),
+            (
+                "$recursiveRef",
+                json!({
+                    "First": {
+                        "$id": "https://example.invalid/recursive-first",
+                        "$recursiveAnchor": true,
+                        "type": "object",
+                        "properties": {
+                            "next": { "$recursiveRef": "#" }
+                        }
+                    },
+                    "Second": {
+                        "$id": "https://example.invalid/recursive-second",
+                        "$recursiveAnchor": true
+                    }
+                }),
+                "/components/schemas/First/properties/next/$recursiveRef",
+            ),
+        ] {
+            let (_files, diagnostics) = compile(doc_31(schemas));
+            let warning = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.code == "OASTS1118"
+                        && diagnostic.json_pointer.as_deref() == Some(pointer)
+                })
+                .expect("path-dependent dynamic reference should warn");
+            assert_eq!(warning.severity, Severity::Warning);
+            assert!(warning.message.contains("2 schema resources"));
+
+            let rejected = diagnostics
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.code == CODE_REJECTED_KEYWORD && diagnostic.message.contains(keyword)
+                })
+                .expect("validators should reject path-dependent resolution");
+            assert_eq!(rejected.severity, Severity::Error);
+            assert_eq!(
+                rejected.json_pointer.as_deref(),
+                Some("/components/schemas/First/properties/next")
             );
         }
     }

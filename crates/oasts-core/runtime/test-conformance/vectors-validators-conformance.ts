@@ -1327,4 +1327,66 @@ export const cases: readonly ConformanceCase[] = [
       issues: [{ message: "expected type boolean", path: [2] }],
     },
   },
+
+  // --- $dynamicRef (dynamicNodeValidator recursion) ---
+  {
+    id: "$dynamicRef/nested-nodes-valid",
+    matrixRow: "$dynamicRef",
+    validator: "dynamicNodeValidator",
+    input: {
+      value: "root",
+      children: [{ value: "outer", children: [{ value: "inner" }] }],
+    },
+    expected: { verdict: "pass" },
+  },
+  {
+    // Only the node at depth 2 is invalid. This cannot fail if $dynamicRef widens to unknown.
+    id: "$dynamicRef/depth-2-node-wrong-type",
+    matrixRow: "$dynamicRef",
+    validator: "dynamicNodeValidator",
+    input: {
+      value: "root",
+      children: [{ value: "outer", children: [{ value: 5 }] }],
+    },
+    expected: {
+      verdict: "fail",
+      issues: [
+        {
+          message: "expected type string",
+          path: ["children", 0, "children", 0, "value"],
+        },
+      ],
+    },
+  },
+
+  // --- $recursiveRef (recursiveNodeValidator recursion) ---
+  {
+    id: "$recursiveRef/nested-nodes-valid",
+    matrixRow: "$recursiveRef",
+    validator: "recursiveNodeValidator",
+    input: {
+      value: "root",
+      children: [{ value: "outer", children: [{ value: "inner" }] }],
+    },
+    expected: { verdict: "pass" },
+  },
+  {
+    // Only the node at depth 2 is invalid. This cannot fail if $recursiveRef widens to unknown.
+    id: "$recursiveRef/depth-2-node-wrong-type",
+    matrixRow: "$recursiveRef",
+    validator: "recursiveNodeValidator",
+    input: {
+      value: "root",
+      children: [{ value: "outer", children: [{ value: 5 }] }],
+    },
+    expected: {
+      verdict: "fail",
+      issues: [
+        {
+          message: "expected type string",
+          path: ["children", 0, "children", 0, "value"],
+        },
+      ],
+    },
+  },
 ];

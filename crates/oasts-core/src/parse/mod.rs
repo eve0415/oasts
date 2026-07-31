@@ -16,7 +16,9 @@ use crate::ir::{
     SegmentPart, ServerEntry, ServerVariable, SourceRef, StringConstraints, TupleRest,
     ValidationApplicators, Webhook, box_if_populated, is_root_component_pointer,
 };
-use crate::loader::{DocId, DocumentGraph, append_pointer, append_pointer_index};
+use crate::loader::{
+    DocId, DocumentGraph, DynamicResolution, append_pointer, append_pointer_index,
+};
 use crate::media::canonical_content_key;
 
 const CODE_VERSION: &str = "OASTS1101";
@@ -37,6 +39,14 @@ const CODE_REF_DEPTH: &str = "OASTS1114";
 /// quieter than a dangling one.
 const CODE_MAPPING_VALUE_SHAPE: &str = "OASTS1115";
 const CODE_OPERATION_REF: &str = "OASTS1116";
+/// A `$recursiveRef` written with any value other than `"#"`. JSON Schema 2019-09 §8.2.4.2.1:
+/// "The behavior of this keyword is defined only for the value '#'. Implementations MAY choose to
+/// consider other values to be errors."
+const CODE_RECURSIVE_REF_VALUE: &str = "OASTS1117";
+/// A dynamic reference whose target genuinely depends on the path evaluation took to reach it,
+/// because two or more schema resources declare the anchor it names. No single schema can stand in
+/// for it, so the node widens to unknown and the validators artifact refuses rather than guessing.
+const CODE_DYNAMIC_SCOPE: &str = "OASTS1118";
 const CODE_ENUM_RULE_14: &str = "OASTS1214";
 const CODE_SERVER_VAR_ENUM_EMPTY: &str = "OASTS1131";
 const CODE_SERVER_VAR_DEFAULT: &str = "OASTS1132";
@@ -50,7 +60,10 @@ const CODE_SECURITY_FLOWS_SHAPE: &str = "OASTS1438";
 const METHODS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
 ];
-const UNSUPPORTED_SCHEMA_KEYWORDS: [&str; 2] = ["$dynamicRef", "$recursiveRef"];
+/// The two reference keywords whose target is chosen by the dynamic scope of evaluation rather
+/// than by where they are written. OpenAPI 3.1 resolves them (see `parse_dynamic_ref`); OpenAPI
+/// 3.0's dialect is not JSON Schema at all, so there they stay unrepresentable.
+const DYNAMIC_REF_KEYWORDS: [&str; 2] = ["$dynamicRef", "$recursiveRef"];
 
 /// Detects the entry document's supported OpenAPI line.
 pub fn detect_version(graph: &DocumentGraph, sink: &mut DiagnosticSink) -> Option<OasVersion> {
@@ -2031,13 +2044,23 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 };
             }
         }
+        // A dynamic reference is an applicator, exactly like `$ref`, so it counts as one piece of
+        // the conjunction below. Under 3.0 it is not a keyword at all and falls through to the
+        // unsupported path instead.
+        let dynamic = if self.version == OasVersion::V3_1 {
+            DYNAMIC_REF_KEYWORDS
+                .iter()
+                .find_map(|keyword| object.get(*keyword).map(|value| (*keyword, value)))
+        } else {
+            None
+        };
         // Unsupported keywords are conjuncts like every other keyword on a schema object, so drop
         // only that unrepresentable conjunct while preserving any representable siblings. Without
         // a representable sibling, dropping it would widen the schema to `Any`; retain `Unknown` to
         // record the imprecision reported by the diagnostic.
-        if let Some(keyword) = UNSUPPORTED_SCHEMA_KEYWORDS
+        if let Some(keyword) = DYNAMIC_REF_KEYWORDS
             .iter()
-            .find(|keyword| object.contains_key(**keyword))
+            .find(|keyword| dynamic.is_none() && object.contains_key(**keyword))
         {
             self.sink.push(self.unsupported_diagnostic(
                 node.doc_id,
@@ -2068,12 +2091,14 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         // Only an applicator sibling can push a typed/constraint object to two pieces (the
         // conjunction path) or onto a 3.0 `$ref`'s sibling warning; a plain typed leaf never
         // consumes `has_typed`, so short-circuit past the content scan when no applicator is present.
-        let has_typed = (has_ref || has_allof || has_oneof || has_anyof)
+        let has_dynamic = dynamic.is_some();
+        let has_typed = (has_ref || has_allof || has_oneof || has_anyof || has_dynamic)
             && has_typed_or_constraint_content(object, self.version);
         let piece_count = usize::from(has_ref)
             + usize::from(has_allof)
             + usize::from(has_oneof)
             + usize::from(has_anyof)
+            + usize::from(has_dynamic)
             + usize::from(has_typed);
 
         // OpenAPI 3.0 substitutes a Reference Object for the whole schema, so `$ref` wins outright
@@ -2096,13 +2121,16 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         }
 
         if piece_count >= 2 {
-            return self.lower_conjunction(node, object, meta, has_typed);
+            return self.lower_conjunction(node, object, meta, has_typed, dynamic);
         }
 
         // piece_count <= 1: exactly the historical single-interpretation dispatch. Every existing
         // fixture parses through here unchanged — the determinism guard.
         if let Some(reference) = ref_str {
             return self.parse_schema_ref(node, reference, meta);
+        }
+        if let Some((keyword, value)) = dynamic {
+            return self.parse_dynamic_ref(node, keyword, value, meta);
         }
         if let Some(branches) = object.get("allOf") {
             return SchemaNode::AllOf {
@@ -2153,6 +2181,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         object: &'graph Map<String, Value>,
         meta: SchemaMeta,
         has_typed: bool,
+        dynamic: Option<(&'static str, &'graph Value)>,
     ) -> SchemaNode {
         let (wrapper_meta, typed_meta) = meta.split_for_conjunction();
         let mut branches = Vec::new();
@@ -2160,6 +2189,14 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             branches.push(self.parse_schema_ref(
                 node.clone(),
                 reference,
+                minimal_conjunction_meta(&wrapper_meta.source),
+            ));
+        }
+        if let Some((keyword, value)) = dynamic {
+            branches.push(self.parse_dynamic_ref(
+                node.clone(),
+                keyword,
+                value,
                 minimal_conjunction_meta(&wrapper_meta.source),
             ));
         }
@@ -2205,27 +2242,161 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         }
     }
 
+    /// Lowers `$dynamicRef` or `$recursiveRef` into an ordinary reference wherever the target is
+    /// the same on every evaluation path, and refuses where it is not.
+    ///
+    /// Most of the work is deciding which of those two it is, and the loader already did it. What
+    /// is left here is the one case the specs leave open: a `$recursiveRef: "#"` inside an OpenAPI
+    /// document that declares no `$id` resolves to the document root, which is the OpenAPI Object
+    /// and not a schema — "a reference target under a known keyword, for which the value is known
+    /// not to be a schema, results in undefined behavior" (2020-12 §9.4.2). Rather than leave it
+    /// undefined, re-target to the nearest enclosing `$recursiveAnchor: true`. That is what the
+    /// keyword is written to mean, it is the only reading under which the document says anything,
+    /// and no conforming extension of it is expressible anyway: `$recursiveRef` may only be `"#"`,
+    /// which can address nothing but a resource root.
+    fn parse_dynamic_ref(
+        &mut self,
+        node: NodeView<'graph>,
+        keyword: &str,
+        value: &Value,
+        mut meta: SchemaMeta,
+    ) -> SchemaNode {
+        let keyword_pointer = append_pointer(&node.pointer, keyword);
+        let Some(reference) = value.as_str() else {
+            self.shape_error(
+                node.doc_id,
+                &keyword_pointer,
+                format!("{keyword} must be a string"),
+            );
+            return SchemaNode::Unknown {
+                reason: format!("{keyword} is not a string"),
+                meta,
+            };
+        };
+        let resolution = if keyword == "$recursiveRef" {
+            if reference != "#" {
+                self.sink.push(self.input_diagnostic(
+                    CODE_RECURSIVE_REF_VALUE,
+                    node.doc_id,
+                    &keyword_pointer,
+                    format!("$recursiveRef is defined only for the value '#', not '{reference}'"),
+                ));
+                return SchemaNode::Unknown {
+                    reason: format!("unsupported $recursiveRef value {reference}"),
+                    meta,
+                };
+            }
+            self.graph.resolve_recursive_ref(node.doc_id, &node.pointer)
+        } else {
+            self.graph
+                .resolve_dynamic_ref(node.doc_id, &node.pointer, reference)
+        };
+        match resolution {
+            Ok(DynamicResolution::Pinned(target)) => {
+                self.schema_ref_node(target.doc_id, target.json_pointer, meta)
+            }
+            // Bookending failed, so the keyword is identical to `$ref` and takes the same path.
+            Ok(DynamicResolution::Plain) => self.parse_schema_ref(node, reference, meta),
+            Ok(DynamicResolution::NonSchemaRoot) => match self.enclosing_recursive_anchor(&node) {
+                Some(pointer) => self.schema_ref_node(node.doc_id, pointer, meta),
+                None => {
+                    self.sink.push(self.input_diagnostic(
+                        CODE_REFERENCE,
+                        node.doc_id,
+                        &keyword_pointer,
+                        "$recursiveRef resolves to the OpenAPI Object, which is not a schema, \
+                             and no enclosing schema declares '$recursiveAnchor: true'",
+                    ));
+                    SchemaNode::Unknown {
+                        reason: "unresolved $recursiveRef".to_owned(),
+                        meta,
+                    }
+                }
+            },
+            Ok(DynamicResolution::PathDependent {
+                declaring_resources,
+            }) => {
+                self.sink.push(self.warning_diagnostic(
+                    CODE_DYNAMIC_SCOPE,
+                    node.doc_id,
+                    &keyword_pointer,
+                    format!(
+                        "{keyword} target depends on the evaluation path because \
+                         {declaring_resources} schema resources declare the anchor it names; \
+                         widened to unknown"
+                    ),
+                ));
+                // The types artifact may keep the approximation with its warning; the validators
+                // artifact may not, and this is what makes it refuse.
+                meta.rejected_validation_keywords.push(keyword.to_owned());
+                SchemaNode::Unknown {
+                    reason: format!("path-dependent {keyword}"),
+                    meta,
+                }
+            }
+            Err(diagnostic) => {
+                self.sink.push(diagnostic);
+                self.sink.push(self.input_diagnostic(
+                    CODE_REFERENCE,
+                    node.doc_id,
+                    &keyword_pointer,
+                    format!("schema reference '{reference}' could not be resolved"),
+                ));
+                SchemaNode::Unknown {
+                    reason: format!("unresolved reference {reference}"),
+                    meta,
+                }
+            }
+        }
+    }
+
+    /// Finds the nearest schema object enclosing `node` — `node` itself included — that carries
+    /// `$recursiveAnchor: true`.
+    fn enclosing_recursive_anchor(&self, node: &NodeView<'graph>) -> Option<String> {
+        let mut pointer = node.pointer.as_str();
+        loop {
+            let anchored = self
+                .graph
+                .node_at(node.doc_id, pointer)
+                .and_then(|found| found.value.get("$recursiveAnchor").and_then(Value::as_bool))
+                .unwrap_or(false);
+            if anchored {
+                return Some(pointer.to_owned());
+            }
+            let cut = pointer.rfind('/')?;
+            pointer = &pointer[..cut];
+        }
+    }
+
+    fn schema_ref_node(
+        &mut self,
+        doc_id: DocId,
+        json_pointer: String,
+        meta: SchemaMeta,
+    ) -> SchemaNode {
+        if doc_id == self.graph.entry().id && !is_root_component_pointer(&json_pointer) {
+            self.entry_defs_referenced = true;
+        }
+        SchemaNode::Ref {
+            target: SchemaRef {
+                source_id: self.source_id(doc_id).to_owned(),
+                json_pointer,
+            },
+            meta,
+        }
+    }
+
     fn parse_schema_ref(
         &mut self,
         node: NodeView<'graph>,
         reference: &str,
         meta: SchemaMeta,
     ) -> SchemaNode {
-        match self.graph.resolve(node.doc_id, reference) {
-            Ok(target) => {
-                if target.doc_id == self.graph.entry().id
-                    && !is_root_component_pointer(&target.json_pointer)
-                {
-                    self.entry_defs_referenced = true;
-                }
-                SchemaNode::Ref {
-                    target: SchemaRef {
-                        source_id: self.source_id(target.doc_id).to_owned(),
-                        json_pointer: target.json_pointer,
-                    },
-                    meta,
-                }
-            }
+        match self
+            .graph
+            .resolve_from(node.doc_id, &node.pointer, reference)
+        {
+            Ok(target) => self.schema_ref_node(target.doc_id, target.json_pointer, meta),
             Err(diagnostic) => {
                 self.sink.push(diagnostic);
                 self.sink.push(
@@ -3057,12 +3228,14 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             array_constraints: box_if_populated(array_constraints),
             object_constraints: box_if_populated(object_constraints),
             validation_applicators: box_if_populated(validation_applicators),
+            // A dynamic reference is rejected only where it could not be pinned; `parse_dynamic_ref`
+            // adds it then. Under 3.0 it is not a keyword, so it is rejected outright.
             rejected_validation_keywords: object
                 .keys()
                 .filter(|key| {
-                    UNSUPPORTED_SCHEMA_KEYWORDS.contains(&key.as_str())
-                        || (self.version == OasVersion::V3_0
-                            && matches!(
+                    self.version == OasVersion::V3_0
+                        && (DYNAMIC_REF_KEYWORDS.contains(&key.as_str())
+                            || matches!(
                                 key.as_str(),
                                 "propertyNames"
                                     | "patternProperties"
@@ -5409,6 +5582,235 @@ mod tests {
             .iter()
             .filter(|diagnostic| diagnostic.code == CODE_REF_SIBLINGS)
             .collect()
+    }
+
+    #[test]
+    fn dynamic_reference_errors_name_the_keyword_and_retain_unknown_ir() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "BadRecursiveValue": { "$recursiveRef": "#other" },
+                "MissingRecursiveAnchor": { "$recursiveRef": "#" },
+                "BadDynamicShape": { "$dynamicRef": true },
+                "BadRecursiveShape": { "$recursiveRef": 7 },
+                "BrokenDynamicUri": { "$dynamicRef": "http://[" }
+            }),
+        );
+
+        let (_temp, ir, sink) = parse_value(&document);
+
+        for name in [
+            "BadRecursiveValue",
+            "MissingRecursiveAnchor",
+            "BadDynamicShape",
+            "BadRecursiveShape",
+            "BrokenDynamicUri",
+        ] {
+            assert!(matches!(
+                schema_named(&ir, name),
+                SchemaNode::Unknown { .. }
+            ));
+        }
+        for (code, pointer) in [
+            (
+                CODE_RECURSIVE_REF_VALUE,
+                "/components/schemas/BadRecursiveValue/$recursiveRef",
+            ),
+            (
+                CODE_REFERENCE,
+                "/components/schemas/MissingRecursiveAnchor/$recursiveRef",
+            ),
+            (
+                CODE_SHAPE,
+                "/components/schemas/BadDynamicShape/$dynamicRef",
+            ),
+            (
+                CODE_SHAPE,
+                "/components/schemas/BadRecursiveShape/$recursiveRef",
+            ),
+            (
+                CODE_REFERENCE,
+                "/components/schemas/BrokenDynamicUri/$dynamicRef",
+            ),
+        ] {
+            assert!(sink.as_slice().iter().any(|diagnostic| {
+                diagnostic.code == code && diagnostic.json_pointer.as_deref() == Some(pointer)
+            }));
+        }
+    }
+
+    #[test]
+    fn dynamic_references_remain_rejected_but_preserve_typed_siblings_in_openapi_30() {
+        let document = schemas_doc(
+            "3.0.3",
+            json!({
+                "Dynamic": { "$dynamicRef": "#Node", "type": "string" },
+                "Recursive": { "$recursiveRef": "#", "type": "string" }
+            }),
+        );
+
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "Dynamic"),
+            SchemaNode::Primitive { .. }
+        ));
+        assert!(matches!(
+            schema_named(&ir, "Recursive"),
+            SchemaNode::Primitive { .. }
+        ));
+        assert_eq!(
+            sink.as_slice()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn static_dynamic_references_lower_to_their_exact_schema_targets() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "PlainTarget": { "$anchor": "Plain", "type": "string" },
+                "BookendedAsPlain": { "$dynamicRef": "#Plain" },
+                "DynamicTarget": {
+                    "$id": "https://example.invalid/dynamic",
+                    "$dynamicAnchor": "Node",
+                    "type": "object",
+                    "properties": {
+                        "next": { "$dynamicRef": "#Node" }
+                    }
+                },
+                "RecursiveTarget": {
+                    "$id": "https://example.invalid/recursive",
+                    "$recursiveAnchor": true,
+                    "type": "object",
+                    "properties": {
+                        "next": { "$recursiveRef": "#" }
+                    }
+                },
+                "RecursivePlain": {
+                    "$id": "https://example.invalid/recursive-plain",
+                    "$recursiveAnchor": false,
+                    "type": "object",
+                    "properties": {
+                        "next": { "$recursiveRef": "#" }
+                    }
+                }
+            }),
+        );
+
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let mut refs = Vec::new();
+        collect_schema_refs(schema_named(&ir, "BookendedAsPlain"), &mut refs);
+        assert_eq!(refs[0].json_pointer, "/components/schemas/PlainTarget");
+
+        for name in ["DynamicTarget", "RecursiveTarget", "RecursivePlain"] {
+            let mut refs = Vec::new();
+            collect_schema_refs(schema_named(&ir, name), &mut refs);
+            assert!(
+                refs.iter()
+                    .any(|target| target.json_pointer == format!("/components/schemas/{name}")),
+                "{name}: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_ref_without_id_targets_the_nearest_lexical_anchor() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "LexicalOuter": {
+                    "$recursiveAnchor": true,
+                    "type": "object",
+                    "properties": {
+                        "inner": {
+                            "$recursiveAnchor": true,
+                            "type": "object",
+                            "properties": {
+                                "next": { "$recursiveRef": "#" }
+                            }
+                        }
+                    }
+                }
+            }),
+        );
+
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let mut refs = Vec::new();
+        collect_schema_refs(schema_named(&ir, "LexicalOuter"), &mut refs);
+        assert!(refs.iter().any(|target| {
+            target.json_pointer == "/components/schemas/LexicalOuter/properties/inner"
+        }));
+    }
+
+    #[test]
+    fn path_dependent_dynamic_references_warn_and_widen_to_unknown() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "DynamicFirst": {
+                    "$id": "https://example.invalid/dynamic-first",
+                    "$dynamicAnchor": "Node",
+                    "type": "object",
+                    "properties": {
+                        "next": { "$dynamicRef": "#Node" }
+                    }
+                },
+                "DynamicSecond": {
+                    "$id": "https://example.invalid/dynamic-second",
+                    "$dynamicAnchor": "Node"
+                },
+                "RecursiveFirst": {
+                    "$id": "https://example.invalid/recursive-first",
+                    "$recursiveAnchor": true,
+                    "type": "object",
+                    "properties": {
+                        "next": { "$recursiveRef": "#" }
+                    }
+                },
+                "RecursiveSecond": {
+                    "$id": "https://example.invalid/recursive-second",
+                    "$recursiveAnchor": true
+                }
+            }),
+        );
+
+        let (_temp, ir, sink) = parse_value(&document);
+
+        for (name, pointer) in [
+            (
+                "DynamicFirst",
+                "/components/schemas/DynamicFirst/properties/next/$dynamicRef",
+            ),
+            (
+                "RecursiveFirst",
+                "/components/schemas/RecursiveFirst/properties/next/$recursiveRef",
+            ),
+        ] {
+            assert!(
+                matches!(schema_named(&ir, name), SchemaNode::Object { properties, .. }
+                if properties.iter().any(|(property, schema, _)|
+                    property == "next" && matches!(schema, SchemaNode::Unknown { .. })))
+            );
+            let warning = sink
+                .as_slice()
+                .iter()
+                .find(|diagnostic| {
+                    diagnostic.code == CODE_DYNAMIC_SCOPE
+                        && diagnostic.json_pointer.as_deref() == Some(pointer)
+                })
+                .expect("path-dependent reference should warn");
+            assert_eq!(warning.severity, Severity::Warning);
+            assert!(warning.message.contains("2 schema resources"));
+        }
     }
 
     #[test]

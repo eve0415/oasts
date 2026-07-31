@@ -430,3 +430,28 @@ components:
           $ref: '#/components/schemas/UnevaluatedSequence'
         problem:
           $ref: '#/components/schemas/Problem'
+    RecursiveNode:
+      $recursiveAnchor: true
+      type: object
+      required:
+        - value
+      properties:
+        value:
+          type: string
+        children:
+          type: array
+          items:
+            $recursiveRef: '#'
+    DynamicNode:
+      $id: 'https://example.invalid/dynamic-node'
+      $dynamicAnchor: node
+      type: object
+      required:
+        - value
+      properties:
+        value:
+          type: string
+        children:
+          type: array
+          items:
+            $dynamicRef: '#node'

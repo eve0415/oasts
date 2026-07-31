@@ -160,6 +160,16 @@ rows:
       - "3.1"
     disposition: exact
     notes: Delegates to the referenced schema's validator, including recursive self-references.
+  - keyword: "$dynamicRef"
+    dialects:
+      - "3.1"
+    disposition: exact
+    notes: Delegates to the statically pinned target, including recursive checks; path-dependent dynamic scope refuses validators generation with OASTS1501.
+  - keyword: "$recursiveRef"
+    dialects:
+      - "3.1"
+    disposition: exact
+    notes: Delegates to the statically pinned target, including recursive checks; in an OpenAPI document with no $id, "#" is re-targeted to the nearest enclosing $recursiveAnchor because 2020-12 §9.4.2 leaves a reference from a known keyword to a known non-schema target undefined; path-dependent dynamic scope refuses validators generation with OASTS1501.
   - keyword: "format:date-time"
     dialects:
       - "3.0"
