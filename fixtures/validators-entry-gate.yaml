@@ -3,11 +3,11 @@
 # and are never edited afterward — the implementation is written to satisfy them.
 files:
   - path: fixtures/validators-keyword-matrix.yaml
-    sha256: 2eaebe80af84fad4c4057568c8ef8e1a9a7a649abe0c6d8b9e8cb59fa5f87811
+    sha256: 257cecb3260bb9978df2eec1405befebb06b5c5024cf3f6b0e99841c146cb585
   - path: crates/oasts-core/runtime/test-conformance/vectors-validators-conformance.ts
-    sha256: a78b4b3f4ea22ebfc2a358b28eb3be305e88d8c1a521ca61c362a06d72eb9191
+    sha256: b8d6f0d8f229d9ddac9f09e5a47376cc409e232fc48c6097ab95f174e8d3967a
   - path: fixtures/validators-showcase-3.1/openapi.yaml
-    sha256: 93a4005f2b2b029adfa194f65a8b62318b057bdeab4e214cbfbbf2b87fc2c13d
+    sha256: 398a6ca98995562f3ff5b6896e9af3deff346563bec11e1e44c006f9983ba683
   - path: fixtures/validators-showcase-3.1/oasts.yaml
     sha256: d45f0c75a2e5b163b6d86e676d72091a9fb3122b70adefd3f2dcacd004886ecd
   - path: fixtures/validators-showcase-3.1/oasts-client.yaml
@@ -15,6 +15,6 @@ files:
   - path: fixtures/petstore-3.0/oasts-validators.yaml
     sha256: cfd853905fcff3c04816e1ea2124c2f5a78d9752935eafb24c3cc8f957805f23
   - path: fixtures/validators-showcase-3.1/compile-assert/cases.ts
-    sha256: ed30babee9042ddf9847dfc99eb02af4645d09a5fc4db7c676d626a6d123b2d9
+    sha256: 914b426abbee3d2530d4bde87a73a647f9c1b0c22d0a02a9d5dcd0eec7b23d29
   - path: crates/oasts-core/runtime/validators-standard-schema.ts
     sha256: dee391633374d36011f9f997fd5e190c218f00f15865801327efb9ddb87561cf

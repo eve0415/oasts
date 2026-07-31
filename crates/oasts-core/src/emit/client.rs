@@ -1,18 +1,20 @@
 //! Fetch client artifact emission from the client planning IR.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 
 use crate::client_model::{
     AuthAlternative, AuthKind, AuthSchemeUse, BaseUrlPlan, BodyPlan, ClientModel, DecoderClass,
-    FieldSerializationPlan, FormFieldPlan, HelperId, OperationPlan, PartMediaPlan,
-    PayloadDisposition, PayloadKind, ResponseMatchKind, ResponsePlan,
+    FieldSerializationPlan, FormFieldPlan, HelperId, MultipartResponsePayload,
+    MultipartResponsePlan, MultipartResponseShape, OperationPlan, ParameterPlan, PartMediaPlan,
+    PayloadDisposition, PayloadKind, ResponseMatchKind, ResponseMediaPlan, ResponsePlan,
 };
 use crate::config::{
     AuthEnforcement, CacheMode, CredentialsMode, DocumentationConfig, FetchDefaults, RedirectMode,
     ReferrerPolicyValue, RequestModeValue, ValidationEngine,
 };
 use crate::ir::{
-    Operation, ParamLocation, ParamStyle, PrimitiveType, SchemaNode, SecKind, SegmentPart,
+    Operation, Param, ParamLocation, ParamStyle, PrimitiveType, SchemaNode, SecKind, SegmentPart,
     ServerVariable,
 };
 use crate::media::{is_json, media_essence};
@@ -56,6 +58,12 @@ pub(crate) fn emit_client_from_model(
                 .iter()
                 .map(|parameter| helper_region_id(parameter.resolved.helper).to_owned()),
         );
+        // The response decoder is a helper region like any serializer, so a document that declares
+        // no multipart response never carries it — and the operation modules that do declare one are
+        // the only ones importing it, which is what keeps it out of an unrelated operation's bundle.
+        if plan.response_table.iter().any(response_decodes_multipart) {
+            helper_ids.insert(MULTIPART_RESPONSE_REGION.to_owned());
+        }
         let relative_path = format!("client/operations/{file_base}.ts");
         model.register_path(&relative_path, &operation.source);
         files.push(GeneratedFile {
@@ -165,10 +173,11 @@ fn emit_aggregate(
 
 /// The generated per-document `client/auth.ts`: a `DocumentAuthProviders` interface with one
 /// property per client-usable security scheme, in the document's scheme-declaration order. An
-/// oauth2 scheme's declared scopes become a string-literal union so a provider implementation typed
-/// against the property narrows `AuthContext.scopes` (empty declared set → plain `AuthProvider`);
-/// every other kind stays a plain `AuthProvider`, and an http scheme's `bearerFormat` is surfaced
-/// as a per-property `@remarks` — which is why this is a per-property interface, not a mapped type.
+/// oauth2 scheme's declared scopes and scopes required by operations become a string-literal union
+/// so a provider implementation typed against the property narrows `AuthContext.scopes` (empty
+/// combined set → plain `AuthProvider`); every other kind stays a plain `AuthProvider`, and an http
+/// scheme's `bearerFormat` is surfaced as a per-property `@remarks` — which is why this is a
+/// per-property interface, not a mapped type.
 ///
 /// Type-only surface, no runtime constructor, by two independent reasons: the module is only
 /// typechecked (the conformance/e2e harness loads `runtime/transport.ts` and `client/api.ts`, never
@@ -214,7 +223,11 @@ fn emit_document_auth(
         body.push_str("  ");
         body.push_str(&render_property_key(&scheme.name));
         body.push_str(": ");
-        body.push_str(&document_auth_provider_type(&scheme.kind));
+        body.push_str(&document_auth_provider_type(
+            &scheme.name,
+            &scheme.kind,
+            client,
+        ));
         body.push_str(";\n");
     }
 
@@ -233,13 +246,26 @@ fn emit_document_auth(
     })
 }
 
-/// The `AuthProvider` type for one scheme property. Oauth2 carries its declared scopes as a
-/// first-seen string-literal union; every other kind (including openIdConnect, whose scopes are
-/// IdP-defined and invisible to the document) is a plain `AuthProvider`.
-fn document_auth_provider_type(kind: &SecKind) -> String {
+/// The `AuthProvider` type for one scheme property. Oauth2 carries its declared and required scopes
+/// as a first-seen string-literal union; every other kind (including openIdConnect, whose scopes
+/// are IdP-defined and invisible to the document) is a plain `AuthProvider`.
+fn document_auth_provider_type(name: &str, kind: &SecKind, client: &ClientModel) -> String {
     match kind {
         SecKind::OAuth2 { flows } => {
-            let scopes = flows.declared_scopes();
+            let mut scopes = flows.declared_scopes();
+            for plan in &client.operations {
+                for alternative in &plan.auth_plan {
+                    for scheme in alternative {
+                        if scheme.name == name {
+                            for scope in &scheme.scopes {
+                                if !scopes.contains(&scope.as_str()) {
+                                    scopes.push(scope);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if scopes.is_empty() {
                 "AuthProvider".to_owned()
             } else {
@@ -288,16 +314,11 @@ fn emit_operation(
         // A content-type-discriminated branch renders each media entry's own schema inline instead
         // of the status-wide alias, so those entries' component references import from here.
         for response in &plan.response_table {
-            if response.content_type_discriminated
+            if renders_payload_inline(response)
                 && matches!(response.payload, PayloadDisposition::Payload)
             {
                 for entry in &response.media {
-                    renderer.collect_operation_imports(
-                        &entry.schema,
-                        TypePosition::Response,
-                        TypeAxis::Application,
-                        &mut component_imports,
-                    );
+                    collect_response_entry_imports(&renderer, entry, &mut component_imports);
                 }
             }
         }
@@ -307,6 +328,7 @@ fn emit_operation(
         } else {
             assign_import_aliases(
                 &client_declarations(&stem, &operation_type_names),
+                client_module_bindings(),
                 &component_imports,
                 &operation.source,
             )
@@ -344,6 +366,7 @@ fn emit_operation(
         .validation
         .as_ref()
         .is_some_and(|validation| !validation.response);
+    let decoding_notes = multipart_decoding_notes(plan);
     let (validate_request, validate_response) = validation_flags(model);
     let request_checks = request_validation_checks(operation, plan, &stem, validate_request);
     let response_checks = response_validation_checks(plan, &stem, validate_response);
@@ -393,11 +416,14 @@ fn emit_operation(
         )));
         output.push_str(";\n");
     }
-    let helper_names = plan
+    let mut helper_names = plan
         .param_plans
         .iter()
         .map(|parameter| helper_export_name(parameter.resolved.helper))
         .collect::<BTreeSet<_>>();
+    if plan.response_table.iter().any(response_decodes_multipart) {
+        helper_names.insert(MULTIPART_RESPONSE_DECODER);
+    }
     if !helper_names.is_empty() {
         output.push_str("import { ");
         output.push_str(&helper_names.into_iter().collect::<Vec<_>>().join(", "));
@@ -440,6 +466,7 @@ fn emit_operation(
         &model.config.documentation,
         ClientDocKind::Declaration,
         unchecked_response,
+        &decoding_notes,
     );
     output.push_str("export type ");
     output.push_str(&stem);
@@ -454,6 +481,7 @@ fn emit_operation(
         &model.config.documentation,
         ClientDocKind::Declaration,
         unchecked_response,
+        &decoding_notes,
     );
     output.push_str(&result_type);
     output.push('\n');
@@ -472,6 +500,7 @@ fn emit_operation(
         &model.config.documentation,
         ClientDocKind::ResultFunction,
         unchecked_response,
+        &decoding_notes,
     );
     output.push_str("export async function ");
     output.push_str(allocated_name);
@@ -496,6 +525,7 @@ fn emit_operation(
         &model.config.documentation,
         ClientDocKind::ThrowFunction,
         unchecked_response,
+        &decoding_notes,
     );
     output.push_str("export async function ");
     output.push_str(allocated_name);
@@ -586,7 +616,8 @@ fn request_validation_checks(
     }
     let mut checks = Vec::new();
     let names = operation_parameter_validator_names(operation, stem);
-    for (parameter, type_name) in operation.parameters.iter().zip(&names) {
+    for (index, parameter, _) in planned_parameters(operation, plan) {
+        let type_name = &names[index];
         checks.push(RequestCheck {
             access: input_member(InputMember::Parameter {
                 location: parameter.location,
@@ -901,6 +932,48 @@ fn throw_function_body(name: &str, stem: &str, binding: bool) -> String {
     }
 }
 
+/// Names a client operation module binds without getting them from the types artifact: the runtime
+/// kernel identifiers it imports, and the TypeScript globals its own signatures name in type
+/// position. A component import carrying one of these collides with the binding — a duplicate
+/// identifier for the kernel names, and for a global the built-in silently stops resolving, so
+/// `Promise<Result>` against a document that declares a component named `Promise` is `TS2315: Type
+/// 'Promise' is not generic`.
+///
+/// Reserved unconditionally, for the same reason `Req` and `Missing` are: which kernel imports a
+/// module ends up writing depends on its resolved auth, parameter and validation shape, none of
+/// which is settled when the import block is built. Reserving the union costs an alias only when a
+/// component actually carries one of these names.
+///
+/// Only the globals emitted client code *names* belong here. `Readonly`, `Set`, `Omit` and the rest
+/// appear solely in the embedded runtime assets under `runtime/`, which never hold a user schema
+/// and so cannot be shadowed; `no_builtin_generics_in_schema_bearing_modules` is what keeps that
+/// true as the emitters change.
+const CLIENT_MODULE_BINDINGS: &[&str] = &[
+    // runtime/result
+    "RequestPhaseFailure",
+    "ResponseMeta",
+    "ResponsePhaseFailure",
+    "UnknownHttpError",
+    "unwrap",
+    // runtime/transport
+    "AmbientClientCertificate",
+    "AmbientCookieCredential",
+    "BasicCredential",
+    "CallOptions",
+    "OperationDescriptor",
+    "Transport",
+    "execute",
+    "executeOrThrow",
+    // runtime/serialize
+    "decodeMultipartResponse",
+    // validators/runtime
+    "Issue",
+    // types/headers
+    "TypedHeaders",
+    // TypeScript globals named by the emitted operation signatures.
+    "Promise",
+];
+
 /// Every name a client operation module declares or imports from the types artifact. A component
 /// import carrying one of these would be shadowed by the local declaration or duplicate the
 /// operation-type import, so `assign_import_aliases` renames it. `Req` and `Missing` are reserved
@@ -917,6 +990,21 @@ fn client_declarations(stem: &str, operation_type_names: &BTreeSet<String>) -> B
     ]);
     declared.extend(operation_type_names.iter().cloned());
     declared
+}
+
+/// `CLIENT_MODULE_BINDINGS` plus every parameter-serializer helper name, interned once for the
+/// process. Borrowed by `assign_import_aliases` rather than folded into the per-module declaration
+/// set: it is the same 36 constant names for every emitted operation module, and owning them there
+/// would allocate once per module for nothing.
+fn client_module_bindings() -> &'static BTreeSet<&'static str> {
+    static BINDINGS: OnceLock<BTreeSet<&'static str>> = OnceLock::new();
+    BINDINGS.get_or_init(|| {
+        CLIENT_MODULE_BINDINGS
+            .iter()
+            .copied()
+            .chain(HelperId::ALL.into_iter().map(helper_export_name))
+            .collect()
+    })
 }
 
 fn write_component_imports(
@@ -948,10 +1036,10 @@ fn operation_type_imports(plan: &OperationPlan, stem: &str) -> BTreeSet<String> 
         names.insert(format!("{stem}Request"));
     }
     for response in &plan.response_table {
-        // A content-type-discriminated branch renders each entry's own schema inline, so the
-        // status-wide alias has no reader and importing it would be an unused import.
+        // A branch that renders its payload inline has no reader for the status-wide alias, so
+        // importing it would be an unused import.
         if matches!(response.payload, PayloadDisposition::Payload)
-            && !response.content_type_discriminated
+            && !renders_payload_inline(response)
         {
             names.insert(response_type_name(stem, response));
         }
@@ -1011,8 +1099,7 @@ fn render_input(
     if plan.param_plans.is_empty() && plan.body_plan.is_none() {
         return "{}".to_owned();
     }
-    let parameters = operation.parameters.iter().collect::<Vec<_>>();
-    assert_eq!(parameters.len(), plan.param_plans.len());
+    let parameters = planned_parameters(operation, plan);
     let mut output = String::from("{\n");
     for location in [
         ParamLocation::Path,
@@ -1022,20 +1109,18 @@ fn render_input(
     ] {
         let group = parameters
             .iter()
-            .copied()
-            .zip(&plan.param_plans)
-            .filter(|(parameter, _)| parameter.location == location)
+            .filter(|(_, parameter, _)| parameter.location == location)
             .collect::<Vec<_>>();
         if group.is_empty() {
             continue;
         }
         output.push_str("  ");
         output.push_str(location_name(location));
-        if !group.iter().any(|(parameter, _)| parameter.required) {
+        if !group.iter().any(|(_, parameter, _)| parameter.required) {
             output.push('?');
         }
         output.push_str(": {\n");
-        for (parameter, parameter_plan) in group {
+        for (_, parameter, parameter_plan) in group {
             if let Some(description) = &parameter.description {
                 write_parameter_property_tsdoc(&mut output, description, documentation, 4);
             }
@@ -1076,6 +1161,24 @@ fn render_input(
     }
     output.push('}');
     output
+}
+
+fn planned_parameters<'operation>(
+    operation: &'operation Operation,
+    plan: &'operation OperationPlan,
+) -> Vec<(usize, &'operation Param, &'operation ParameterPlan)> {
+    plan.param_plans
+        .iter()
+        .map(|parameter_plan| {
+            operation
+                .parameters
+                .iter()
+                .enumerate()
+                .find(|(_, parameter)| parameter.source == parameter_plan.source)
+                .map(|(index, parameter)| (index, parameter, parameter_plan))
+                .expect("a client parameter plan originates from its operation")
+        })
+        .collect()
 }
 
 fn write_parameter_property_tsdoc(
@@ -1249,20 +1352,19 @@ fn push_response_result_arms(
     // never render the same entry differently. Everything else keeps the status-wide alias.
     let media: Vec<(Option<String>, String)> =
         if matches!(response.payload, PayloadDisposition::Payload)
-            && response.content_type_discriminated
+            && renders_payload_inline(response)
         {
             response
                 .media
                 .iter()
                 .map(|entry| {
                     (
-                        Some(entry.media.clone()),
-                        renderer.media_payload_type(
-                            media_essence(&entry.media),
-                            &entry.schema,
-                            TypePosition::Response,
-                            TypeAxis::Application,
-                        ),
+                        // A non-discriminated branch has exactly one concrete entry and carries no
+                        // `contentType` discriminant, so only the discriminated form names it.
+                        response
+                            .content_type_discriminated
+                            .then(|| entry.media.clone()),
+                        response_entry_payload_type(renderer, entry),
                     )
                 })
                 .collect()
@@ -1288,6 +1390,169 @@ fn push_response_result_arms(
             });
         }
     }
+}
+
+/// The TSDoc note each multipart response branch carries.
+///
+/// Every clause here is a decision the OpenAPI specification does not make — it scopes the Encoding
+/// Object to request bodies and says nothing about decoding a response — so the rule the generated
+/// client actually follows is written at the call site rather than left for a caller to discover
+/// from behaviour.
+fn multipart_decoding_notes(plan: &OperationPlan) -> Vec<String> {
+    let mut notes = Vec::new();
+    for response in &plan.response_table {
+        if !response_decodes_multipart(response) {
+            continue;
+        }
+        for entry in &response.media {
+            let Some(multipart) = &entry.multipart else {
+                continue;
+            };
+            notes.push(format!(
+                "- response {} {}: each part maps to the property named by its Content-Disposition name. A part naming no declared property is kept{}; a declared property with no part is absent; a repeated name is collected into an array property and rejected for any other property; a binary part decodes to Uint8Array. Part filenames and per-part headers are not surfaced.",
+                response.match_key,
+                entry.media,
+                if multipart.open {
+                    ""
+                } else {
+                    " even though the schema forbids it"
+                }
+            ));
+        }
+    }
+    notes
+}
+
+/// The payload type one declared media entry renders to. A multipart entry is the decoded object;
+/// everything else goes through the types artifact's own rule, so the two artifacts cannot render
+/// the same non-multipart entry differently.
+fn response_entry_payload_type(
+    renderer: &TypesEmitter<'_, '_, '_>,
+    entry: &ResponseMediaPlan,
+) -> String {
+    match &entry.multipart {
+        Some(multipart) => render_multipart_response_type(renderer, multipart, 0),
+        None => renderer.media_payload_type(
+            media_essence(&entry.media),
+            &entry.schema,
+            TypePosition::Response,
+            TypeAxis::Application,
+        ),
+    }
+}
+
+/// The component types the inline-rendered payload of one entry actually names. A binary part
+/// renders as `Uint8Array` and never reaches its schema, so walking the whole entry schema would
+/// import a component nothing reads.
+fn collect_response_entry_imports(
+    renderer: &TypesEmitter<'_, '_, '_>,
+    entry: &ResponseMediaPlan,
+    imports: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    let Some(multipart) = &entry.multipart else {
+        renderer.collect_operation_imports(
+            &entry.schema,
+            TypePosition::Response,
+            TypeAxis::Application,
+            imports,
+        );
+        return;
+    };
+    let shapes = multipart
+        .parts
+        .iter()
+        .map(|part| &part.shape)
+        .chain(multipart.open.then_some(&multipart.additional));
+    for shape in shapes {
+        if shape.payload != MultipartResponsePayload::Binary {
+            renderer.collect_operation_imports(
+                &shape.schema,
+                TypePosition::Response,
+                TypeAxis::Application,
+                imports,
+            );
+        }
+    }
+}
+
+/// The object type a decoded `multipart/form-data` body inhabits: one property per declared schema
+/// property, plus an index signature when the schema admits undeclared ones.
+///
+/// The index signature's type unions in every declared property type. TypeScript requires each
+/// declared property to be assignable to the index type, and a part-by-part classification routinely
+/// produces a mix (`Uint8Array` next to `string`) that no single member covers.
+fn render_multipart_response_type(
+    renderer: &TypesEmitter<'_, '_, '_>,
+    plan: &MultipartResponsePlan,
+    indent: usize,
+) -> String {
+    let parts = plan
+        .parts
+        .iter()
+        .map(|part| {
+            (
+                part,
+                render_multipart_part_type(renderer, &part.shape, indent + 2),
+            )
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() && !plan.open {
+        return "{}".to_owned();
+    }
+    let mut output = String::from("{\n");
+    for (part, rendered) in &parts {
+        push_indent(&mut output, indent + 2);
+        output.push_str(&render_property_key(&part.name));
+        if !part.required {
+            output.push('?');
+        }
+        output.push_str(": ");
+        output.push_str(rendered);
+        output.push_str(";\n");
+    }
+    if plan.open {
+        let fallback = render_multipart_part_type(renderer, &plan.additional, indent + 2);
+        // `unknown` absorbs every other member, so the widening union is only built when the
+        // fallback is something a declared property could fail to satisfy.
+        let mut members = vec![fallback.clone()];
+        if fallback != "unknown" {
+            for (_, rendered) in &parts {
+                if !members.contains(rendered) {
+                    members.push(rendered.clone());
+                }
+            }
+        }
+        push_indent(&mut output, indent + 2);
+        output.push_str("[key: string]: ");
+        output.push_str(&members.join(" | "));
+        output.push_str(";\n");
+    }
+    push_indent(&mut output, indent);
+    output.push('}');
+    output
+}
+
+/// One decoded part's type. Binary is the only kind whose runtime value leaves the JSON data model,
+/// so it is the only kind that overrides the schema's own rendering — matching the request side,
+/// where a binary upload field renders as `Blob | File` instead of its `type: string` schema.
+fn render_multipart_part_type(
+    renderer: &TypesEmitter<'_, '_, '_>,
+    shape: &MultipartResponseShape,
+    indent: usize,
+) -> String {
+    if shape.payload == MultipartResponsePayload::Binary {
+        return if shape.repeated {
+            "Uint8Array[]".to_owned()
+        } else {
+            "Uint8Array".to_owned()
+        };
+    }
+    renderer.render_type(
+        &shape.schema,
+        TypePosition::Response,
+        TypeAxis::Application,
+        indent,
+    )
 }
 
 fn render_result_type(arms: &[ResultArm], plan: &OperationPlan, stem: &str) -> String {
@@ -1462,13 +1727,12 @@ fn write_descriptor(
         output.push_str("],\n");
     }
     output.push_str("  ],\n  params: ");
-    let parameters = operation.parameters.iter().collect::<Vec<_>>();
-    assert_eq!(parameters.len(), plan.param_plans.len());
+    let parameters = planned_parameters(operation, plan);
     if parameters.is_empty() {
         output.push_str("[]");
     } else {
         output.push_str("[\n");
-        for (parameter, parameter_plan) in parameters.into_iter().zip(&plan.param_plans) {
+        for (_, parameter, parameter_plan) in parameters {
             output.push_str("    { name: ");
             output.push_str(&render_ts_string(&parameter_plan.name));
             output.push_str(", location: ");
@@ -1551,7 +1815,7 @@ fn write_descriptor(
                     format!(
                         "[{}, {}]",
                         render_ts_string(&media.media),
-                        render_ts_string(decoder_name(media.decoder))
+                        render_response_decoder(media)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -2215,13 +2479,52 @@ fn style_name(style: ParamStyle) -> &'static str {
     }
 }
 
+/// The descriptor's decoder slot for one media entry: a tag string for the three built-in decoders,
+/// and for multipart the decoder function itself alongside its plan. Shipping the function through
+/// the descriptor rather than tagging it is what keeps the parser out of every other client — the
+/// transport never names it, so nothing but a multipart operation module pulls it in.
+fn render_response_decoder(media: &ResponseMediaPlan) -> String {
+    let Some(plan) = &media.multipart else {
+        return render_ts_string(decoder_name(media.decoder));
+    };
+    let parts = plan
+        .parts
+        .iter()
+        .map(|part| {
+            format!(
+                "{{ name: {}, {} }}",
+                render_ts_string(&part.name),
+                render_multipart_shape(&part.shape)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{{ decode: {MULTIPART_RESPONSE_DECODER}, plan: {{ parts: [{parts}], additional: {{ {} }} }} }}",
+        render_multipart_shape(&plan.additional)
+    )
+}
+
+fn render_multipart_shape(shape: &MultipartResponseShape) -> String {
+    format!(
+        "payload: {}, repeated: {}",
+        render_ts_string(shape.payload.as_str()),
+        if shape.repeated { "true" } else { "false" }
+    )
+}
+
 fn decoder_name(decoder: DecoderClass) -> &'static str {
     match decoder {
         DecoderClass::Json => "json",
         DecoderClass::Text => "text",
         DecoderClass::Binary => "binary",
-        DecoderClass::Streaming | DecoderClass::Xml | DecoderClass::Multipart => {
-            unreachable!("unsupported response decoders are diagnosed before emission")
+        DecoderClass::Streaming
+        | DecoderClass::Xml
+        | DecoderClass::Multipart
+        | DecoderClass::MultipartUnnamed => {
+            unreachable!(
+                "multipart entries carry a plan, and undecodable media are diagnosed before emission"
+            )
         }
     }
 }
@@ -2248,6 +2551,24 @@ fn helper_region_id(helper: HelperId) -> &'static str {
         HelperId::ContentJsonQuery => "content-json-query",
         HelperId::ContentJsonHeader => "content-json-header",
     }
+}
+
+/// The `serialize.ts` region holding the multipart response decoder, and the name it exports.
+const MULTIPART_RESPONSE_REGION: &str = "multipart-response";
+const MULTIPART_RESPONSE_DECODER: &str = "decodeMultipartResponse";
+
+fn response_decodes_multipart(response: &ResponsePlan) -> bool {
+    matches!(response.payload, PayloadDisposition::Payload)
+        && response.media.iter().any(|media| media.multipart.is_some())
+}
+
+/// Whether a response branch renders its payload type in the operation module instead of reading
+/// the types artifact's status-wide alias. Content-type-discriminated branches always do (one arm
+/// per media entry); a multipart branch does because the decoded object type is a client-side
+/// notion the types artifact does not render — the same split multipart *request* bodies already
+/// take, where the types artifact says `unknown` and `render_form_input` owns the real shape.
+fn renders_payload_inline(response: &ResponsePlan) -> bool {
+    response.content_type_discriminated || response_decodes_multipart(response)
 }
 
 fn helper_export_name(helper: HelperId) -> &'static str {
@@ -2380,6 +2701,50 @@ mod tests {
     }
 
     const HEADER: &str = "// Generated by Oasts 0.0.0. Do not edit.\n// Config schema version: 1\n// Source digest: digest\n\n";
+
+    #[test]
+    fn dropped_cookie_header_never_appears_in_optional_or_required_call_inputs() {
+        for required in [false, true] {
+            let document = json!({
+                "openapi": "3.1.0",
+                "info": { "title": "test", "version": "1" },
+                "paths": {
+                    "/cookie-header": {
+                        "get": {
+                            "operationId": "cookieHeader",
+                            "parameters": [{
+                                "name": "Cookie",
+                                "in": "header",
+                                "required": required,
+                                "schema": { "type": "string" }
+                            }],
+                            "responses": { "204": { "description": "empty" } }
+                        }
+                    }
+                }
+            });
+            let (content, diagnostics) = emit_operation(document, "cookieheader");
+
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic.code == "OASTS1411"
+                            && diagnostic.severity == crate::diag::Severity::Warning
+                    })
+                    .count(),
+                1,
+                "{diagnostics:#?}"
+            );
+            assert!(content.contains("export type CookieHeaderInput = {};"));
+            assert!(content.contains("params: [],"));
+            assert!(content.contains(
+                "export async function cookieHeader<S extends string = never>(transport: Transport<S>, input: CookieHeaderInput,"
+            ));
+            assert!(!content.contains("Cookie:"));
+            assert!(!content.contains("name: \"Cookie\""));
+        }
+    }
 
     #[test]
     fn content_parameters_emit_typed_and_caller_serialized_inputs() {
@@ -3134,6 +3499,7 @@ mod tests {
             &config.documentation,
             ClientDocKind::ResultFunction,
             false,
+            &[],
         );
         assert!(flat_parameter_docs.contains("@param X-Trace - Line one."));
     }
@@ -3186,6 +3552,244 @@ mod tests {
                 .iter()
                 .all(|file| file.relative_path != "client/api.ts")
         );
+    }
+
+    // --- multipart response decoding ------------------------------------------------------------
+
+    /// Emits every client file for `document`, so a test can read both an operation module and the
+    /// helper-subset `serialize.ts` that operation's descriptor pulled in.
+    fn emit_all_client_files(document: &Value) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
+        let (_temp, analyzed, config, _source_tuples) = analyzed(document);
+        let mut sink = DiagnosticSink::new();
+        let client = build_client_model(&analyzed, &config, &mut sink);
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let files = emit_client_from_model(&mut model, &client);
+        drop(model);
+        (files, sink.into_sorted_vec())
+    }
+
+    fn runtime_file(files: &[GeneratedFile], name: &str) -> String {
+        files
+            .iter()
+            .find(|file| file.relative_path == format!("runtime/{name}"))
+            .expect("runtime file")
+            .content
+            .clone()
+    }
+
+    fn multipart_response_document(schema: Value) -> Value {
+        json!({
+            "openapi": "3.0.3",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/bundle": {
+                    "get": {
+                        "operationId": "getbundle",
+                        "responses": {
+                            "200": { "description": "ok", "content": { "multipart/form-data": { "schema": schema } } }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn multipart_response_emits_a_part_plan_and_the_decoded_object_type() {
+        let document = multipart_response_document(json!({
+            "type": "object",
+            "required": ["manifest", "archive"],
+            "additionalProperties": false,
+            "properties": {
+                "manifest": { "type": "object", "properties": { "name": { "type": "string" } } },
+                "readme": { "type": "string" },
+                "archive": { "type": "string", "format": "binary" },
+                "thumbnails": { "type": "array", "items": { "type": "string", "format": "binary" } },
+                "labels": { "type": "array", "items": { "type": "string" } },
+                "encoded": { "type": "string", "format": "byte" },
+                "extra": {}
+            }
+        }));
+        let (files, diagnostics) = emit_all_client_files(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let actual = operation_file(&files, "getbundle");
+
+        // Each declared property carries its own classification, and only binary overrides the
+        // schema's own type.
+        assert!(
+            actual.contains(
+                "data: {\n  manifest: {\n    name?: string;\n  };\n  readme?: string;\n  archive: Uint8Array;\n  thumbnails?: Uint8Array[];\n  labels?: string[];\n  encoded?: string;\n  extra?: unknown;\n}; meta: ResponseMeta"
+            ),
+            "{actual}"
+        );
+        // `additionalProperties: false` leaves the object closed, so no index signature.
+        assert!(!actual.contains("[key: string]"), "{actual}");
+        assert!(actual.contains(
+            "media: [[\"multipart/form-data\", { decode: decodeMultipartResponse, plan: { parts: [{ name: \"manifest\", payload: \"json\", repeated: false }, { name: \"readme\", payload: \"text\", repeated: false }, { name: \"archive\", payload: \"binary\", repeated: false }, { name: \"thumbnails\", payload: \"binary\", repeated: true }, { name: \"labels\", payload: \"text\", repeated: true }, { name: \"encoded\", payload: \"text\", repeated: false }, { name: \"extra\", payload: \"wire\", repeated: false }], additional: { payload: \"wire\", repeated: false } } }]]"
+        ), "{actual}");
+        assert!(
+            actual.contains(
+                "import { decodeMultipartResponse } from \"../../runtime/serialize.js\";"
+            ),
+            "{actual}"
+        );
+        // The status-wide alias renders as `unknown` in the types artifact, so the operation module
+        // must not import it.
+        assert!(!actual.contains("GetbundleResponse200"), "{actual}");
+        assert!(
+            runtime_file(&files, "serialize.ts")
+                .contains("export function decodeMultipartResponse"),
+        );
+    }
+
+    #[test]
+    fn multipart_response_widens_the_index_signature_over_declared_properties() {
+        let document = multipart_response_document(json!({
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "properties": { "archive": { "type": "string", "format": "binary" } }
+        }));
+        let (files, diagnostics) = emit_all_client_files(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let actual = operation_file(&files, "getbundle");
+
+        // A declared property must be assignable to the index type, and `Uint8Array` is not a
+        // `string`, so the index signature unions both.
+        assert!(
+            actual.contains("archive?: Uint8Array;\n  [key: string]: string | Uint8Array;\n}"),
+            "{actual}"
+        );
+        assert!(
+            actual.contains("additional: { payload: \"text\", repeated: false } } }"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn multipart_response_without_an_object_schema_is_a_bare_index_signature() {
+        let (files, diagnostics) = emit_all_client_files(&multipart_response_document(json!({})));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let actual = operation_file(&files, "getbundle");
+
+        assert!(
+            actual.contains("data: {\n  [key: string]: unknown;\n}"),
+            "{actual}"
+        );
+        assert!(
+            actual.contains(
+                "plan: { parts: [], additional: { payload: \"wire\", repeated: false } }"
+            ),
+            "{actual}"
+        );
+
+        // A closed object with no declared property admits nothing at all.
+        let (empty, diagnostics) = emit_all_client_files(&multipart_response_document(
+            json!({ "type": "object", "additionalProperties": false }),
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let empty = operation_file(&empty, "getbundle");
+        assert!(empty.contains("status: 200; data: {}; meta:"), "{empty}");
+    }
+
+    #[test]
+    fn multipart_response_documents_the_undefined_part_mapping_it_chose() {
+        let closed = multipart_response_document(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "readme": { "type": "string" } }
+        }));
+        let (closed, _) = emit_operation_with_documentation(closed, "getbundle", true);
+        assert!(
+            closed.contains(
+                "- response 200 multipart/form-data: each part maps to the property named by its Content-Disposition name. A part naming no declared property is kept even though the schema forbids it;"
+            ),
+            "{closed}"
+        );
+        assert!(
+            closed.contains("a repeated name is collected into an array property and rejected for any other property; a binary part decodes to Uint8Array. Part filenames and per-part headers are not surfaced."),
+            "{closed}"
+        );
+
+        let open = multipart_response_document(json!({ "type": "object" }));
+        let (open, _) = emit_operation_with_documentation(open, "getbundle", true);
+        assert!(
+            open.contains("A part naming no declared property is kept; a declared property"),
+            "{open}"
+        );
+    }
+
+    #[test]
+    fn multipart_response_shares_a_status_with_a_json_entry_and_narrows_on_content_type() {
+        let document = json!({
+            "openapi": "3.0.3",
+            "info": { "title": "t", "version": "1" },
+            "components": { "schemas": { "Manifest": { "type": "object", "properties": { "name": { "type": "string" } } } } },
+            "paths": {
+                "/mixed": {
+                    "get": {
+                        "operationId": "getmixed",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": { "$ref": "#/components/schemas/Manifest" },
+                                    "multipart/form-data": {
+                                        "schema": {
+                                            "type": "object",
+                                            "additionalProperties": false,
+                                            "properties": {
+                                                "manifest": { "$ref": "#/components/schemas/Manifest" },
+                                                "archive": { "type": "string", "format": "binary" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "getmixed");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+        assert!(
+            actual.contains("contentType: \"multipart/form-data\""),
+            "{actual}"
+        );
+        assert!(
+            actual.contains("manifest?: Manifest;\n  archive?: Uint8Array;\n}"),
+            "{actual}"
+        );
+        // The binary part never names its schema, so only the JSON-rendered part imports a
+        // component type.
+        assert!(
+            actual
+                .contains("import type { Manifest } from \"../../types/components/manifest.js\";"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn a_client_without_a_multipart_response_carries_no_decoder() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/ping": { "get": {
+                "operationId": "ping",
+                "responses": { "200": { "description": "ok", "content": { "application/json": { "schema": { "type": "object" } } } } }
+            } } }
+        });
+        let (files, diagnostics) = emit_all_client_files(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+        assert!(!operation_file(&files, "ping").contains("decodeMultipartResponse"));
+        // The plan types stay in the always-emitted core region (transport.ts type-imports them),
+        // but the decoder itself — the only part with a runtime cost — is gone.
+        let serialize = runtime_file(&files, "serialize.ts");
+        assert!(!serialize.contains("export function decodeMultipartResponse"));
+        assert!(!serialize.contains("Content-Disposition has no name parameter"));
+        assert!(serialize.contains("export type MultipartResponsePlan"));
     }
 
     fn string_schema(format: Option<&str>) -> SchemaNode {
@@ -3270,6 +3874,7 @@ mod tests {
         ResponseMediaPlan {
             media: media.to_owned(),
             decoder,
+            multipart: None,
             schema: string_schema(None),
             streaming_marked: false,
             source: SourceRef::default(),
@@ -3378,6 +3983,7 @@ mod tests {
             DecoderClass::Streaming,
             DecoderClass::Xml,
             DecoderClass::Multipart,
+            DecoderClass::MultipartUnnamed,
         ] {
             assert!(std::panic::catch_unwind(|| decoder_name(decoder)).is_err());
         }
@@ -4712,6 +5318,38 @@ mod tests {
             actual.expect("auth module"),
             format!(
                 "{HEADER}import type {{ AuthProvider }} from \"../runtime/transport.js\";\n\nexport interface DocumentAuthProviders {{\n  oauthScheme: AuthProvider<\"scope.a\" | \"scope.b\">;\n  bearerScheme: AuthProvider;\n  keyScheme: AuthProvider;\n  oidcScheme: AuthProvider;\n}}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn document_auth_provider_includes_undeclared_required_oauth_scope() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "components": {
+                "securitySchemes": {
+                    "oauthScheme": { "type": "oauth2", "flows": { "authorizationCode": {
+                        "authorizationUrl": "https://auth.example.test/authorize",
+                        "tokenUrl": "https://auth.example.test/token",
+                        "scopes": { "scope.a": "A" }
+                    } } }
+                }
+            },
+            "paths": { "/ping": { "get": {
+                "operationId": "ping",
+                "security": [{ "oauthScheme": ["scope.missing"] }],
+                "responses": { "200": { "description": "ok" } }
+            } } }
+        });
+        let (actual, diagnostics) = emit_auth_module(document);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, "OASTS1440");
+        assert_eq!(diagnostics[0].severity, Severity::Warning);
+        assert_eq!(
+            actual.expect("auth module"),
+            format!(
+                "{HEADER}import type {{ AuthProvider }} from \"../runtime/transport.js\";\n\nexport interface DocumentAuthProviders {{\n  oauthScheme: AuthProvider<\"scope.a\" | \"scope.missing\">;\n}}\n"
             )
         );
     }

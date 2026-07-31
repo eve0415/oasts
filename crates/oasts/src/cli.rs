@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn check_runs_emission_diagnostics_without_writing_output() {
+    fn check_reports_composition_warnings_and_emission_errors_without_writing_output() {
         let temp = raw_json_project(
             r#"{"openapi":"3.1.0","paths":{},"components":{"schemas":{"Impossible":{"allOf":[{"type":"string"},{"type":"integer"}]}}}}"#,
         );
@@ -442,9 +442,9 @@ mod tests {
         let (code, stdout, stderr) =
             invoke(&["oasts", "check", "--config", "oasts.json"], temp.path());
 
-        assert_eq!(code, 1, "{stderr}");
-        assert!(stdout.is_empty(), "{stdout}");
-        assert!(stderr.contains("error[OASTS1303]"), "{stderr}");
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(stdout, "check ok\n");
+        assert!(stderr.contains("warning[OASTS1303]"), "{stderr}");
         assert!(stderr.contains("disjoint primitive type sets"), "{stderr}");
         assert!(!temp.path().join("generated").exists());
 

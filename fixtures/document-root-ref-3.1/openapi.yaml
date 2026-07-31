@@ -1,0 +1,17 @@
+openapi: 3.1.0
+info:
+  title: Document root schema reference
+  version: 1.0.0
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        '200':
+          description: Pets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: './schemas/Pet.yaml'

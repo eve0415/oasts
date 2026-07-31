@@ -1,0 +1,26 @@
+openapi: 3.1.0
+info:
+  title: Identical validator delegate
+  version: 1.0.0
+paths:
+  /assist:
+    post:
+      operationId: assistV1Process
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssistV1ProcessRequestBody"
+      responses:
+        "204":
+          description: Processed
+components:
+  schemas:
+    AssistV1ProcessRequestBody:
+      type: object
+      required:
+        - prompt
+      properties:
+        prompt:
+          type: string

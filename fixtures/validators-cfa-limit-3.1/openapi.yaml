@@ -1,0 +1,189 @@
+openapi: 3.1.0
+info:
+  title: Validator CFA limit regression
+  version: "1"
+paths: {}
+components:
+  schemas:
+    Oversized:
+      type: object
+      properties:
+        branch0: &wide
+          type: object
+          properties: &wideProperties
+            field000: { type: string }
+            field001: { type: string }
+            field002: { type: string }
+            field003: { type: string }
+            field004: { type: string }
+            field005: { type: string }
+            field006: { type: string }
+            field007: { type: string }
+            field008: { type: string }
+            field009: { type: string }
+            field010: { type: string }
+            field011: { type: string }
+            field012: { type: string }
+            field013: { type: string }
+            field014: { type: string }
+            field015: { type: string }
+            field016: { type: string }
+            field017: { type: string }
+            field018: { type: string }
+            field019: { type: string }
+            field020: { type: string }
+            field021: { type: string }
+            field022: { type: string }
+            field023: { type: string }
+            field024: { type: string }
+            field025: { type: string }
+            field026: { type: string }
+            field027: { type: string }
+            field028: { type: string }
+            field029: { type: string }
+            field030: { type: string }
+            field031: { type: string }
+            field032: { type: string }
+            field033: { type: string }
+            field034: { type: string }
+            field035: { type: string }
+            field036: { type: string }
+            field037: { type: string }
+            field038: { type: string }
+            field039: { type: string }
+            field040: { type: string }
+            field041: { type: string }
+            field042: { type: string }
+            field043: { type: string }
+            field044: { type: string }
+            field045: { type: string }
+            field046: { type: string }
+            field047: { type: string }
+            field048: { type: string }
+            field049: { type: string }
+            field050: { type: string }
+            field051: { type: string }
+            field052: { type: string }
+            field053: { type: string }
+            field054: { type: string }
+            field055: { type: string }
+            field056: { type: string }
+            field057: { type: string }
+            field058: { type: string }
+            field059: { type: string }
+            field060: { type: string }
+            field061: { type: string }
+            field062: { type: string }
+            field063: { type: string }
+            field064: { type: string }
+            field065: { type: string }
+            field066: { type: string }
+            field067: { type: string }
+            field068: { type: string }
+            field069: { type: string }
+            field070: { type: string }
+            field071: { type: string }
+            field072: { type: string }
+            field073: { type: string }
+            field074: { type: string }
+            field075: { type: string }
+            field076: { type: string }
+            field077: { type: string }
+            field078: { type: string }
+            field079: { type: string }
+            field080: { type: string }
+            field081: { type: string }
+            field082: { type: string }
+            field083: { type: string }
+            field084: { type: string }
+            field085: { type: string }
+            field086: { type: string }
+            field087: { type: string }
+            field088: { type: string }
+            field089: { type: string }
+            field090: { type: string }
+            field091: { type: string }
+            field092: { type: string }
+            field093: { type: string }
+            field094: { type: string }
+            field095: { type: string }
+            field096: { type: string }
+            field097: { type: string }
+            field098: { type: string }
+            field099: { type: string }
+            field100: { type: string }
+            field101: { type: string }
+            field102: { type: string }
+            field103: { type: string }
+            field104: { type: string }
+            field105: { type: string }
+            field106: { type: string }
+            field107: { type: string }
+            field108: { type: string }
+            field109: { type: string }
+            field110: { type: string }
+            field111: { type: string }
+            field112: { type: string }
+            field113: { type: string }
+            field114: { type: string }
+            field115: { type: string }
+            field116: { type: string }
+            field117: { type: string }
+            field118: { type: string }
+            field119: { type: string }
+            field120: { type: string }
+            field121: { type: string }
+            field122: { type: string }
+            field123: { type: string }
+            field124: { type: string }
+            field125: { type: string }
+            field126: { type: string }
+            field127: { type: string }
+            field128: { type: string }
+            field129: { type: string }
+            field130: { type: string }
+            field131: { type: string }
+            field132: { type: string }
+            field133: { type: string }
+            field134: { type: string }
+            field135: { type: string }
+            field136: { type: string }
+            field137: { type: string }
+            field138: { type: string }
+            field139: { type: string }
+            field140: { type: string }
+            field141: { type: string }
+            field142: { type: string }
+            field143: { type: string }
+            field144: { type: string }
+            field145: { type: string }
+            field146: { type: string }
+            field147: { type: string }
+            field148: { type: string }
+            field149: { type: string }
+        branch1: *wide
+        branch2: *wide
+        deep:
+          type: object
+          properties:
+            level1:
+              type: object
+              properties:
+                level2:
+                  type: object
+                  properties:
+                    level3:
+                      type: object
+                      properties:
+                        level4: *wide
+    ClosedOversized:
+      type: object
+      properties: *wideProperties
+      required: [missing]
+      dependentRequired:
+        field001: [field002]
+      additionalProperties: false
+    TypedOversized:
+      type: object
+      properties: *wideProperties
+      additionalProperties: { type: string }

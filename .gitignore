@@ -44,3 +44,7 @@ fixtures/cloudflare-3.0/openapi.json
 fixtures/kubernetes-core-v1-3.0/openapi.json
 fixtures/kubernetes-apps-v1-3.0/openapi.json
 fixtures/kubernetes-apiextensions-v1-3.0/openapi.json
+
+# Conformance sweep downloads and generated report
+corpus/
+bench/sweep-report.yaml

@@ -661,7 +661,8 @@ impl Default for NamingConfig {
     )
 )]
 pub struct NameOverrides {
-    /// Keyed by the `components/schemas` key; the value is the final type identifier.
+    /// Keyed by a `components/schemas` key or a document-root schema's file stem; the value is the
+    /// final type identifier.
     pub schemas: BTreeMap<String, String>,
     /// Keyed by the `operationId`; the value is the final operation identifier.
     pub operations: BTreeMap<String, String>,

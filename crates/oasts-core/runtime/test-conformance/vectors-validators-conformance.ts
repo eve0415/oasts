@@ -52,6 +52,8 @@
 //   composition no anyOf branch matched
 //               expected exactly one oneOf branch to match
 //               (allOf has no message of its own; its branch issues surface at their paths)
+//   applicator   value matches not schema
+//               property name does not satisfy propertyNames schema
 //   format      invalid date-time format
 //               invalid date format
 //               invalid time format
@@ -236,7 +238,7 @@ export const cases: readonly ConformanceCase[] = [
     },
   },
 
-  // --- required (petValidator, tagValidator) ---
+  // --- required (petValidator, tagValidator, requiredOnlyValidator) ---
   {
     id: "required/pet-present",
     matrixRow: "required",
@@ -262,6 +264,30 @@ export const cases: readonly ConformanceCase[] = [
     expected: {
       verdict: "fail",
       issues: [{ message: "missing required property label", path: [] }],
+    },
+  },
+  {
+    id: "required/typeless-non-object-is-inert",
+    matrixRow: "required",
+    validator: "requiredOnlyValidator",
+    input: "not an object",
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "required/typeless-object-present",
+    matrixRow: "required",
+    validator: "requiredOnlyValidator",
+    input: { id: 1 },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "required/typeless-object-missing",
+    matrixRow: "required",
+    validator: "requiredOnlyValidator",
+    input: {},
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "missing required property id", path: [] }],
     },
   },
 
@@ -674,6 +700,83 @@ export const cases: readonly ConformanceCase[] = [
     },
   },
 
+  // --- not (notRequiredValidator, notNumberValidator, notObjectValidator) ---
+  {
+    id: "not/required-subschema-does-not-match",
+    matrixRow: "not",
+    validator: "notRequiredValidator",
+    input: {},
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "not/required-subschema-matches",
+    matrixRow: "not",
+    validator: "notRequiredValidator",
+    input: { id: 1 },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "value matches not schema", path: [] }],
+    },
+  },
+  {
+    id: "not/enum-does-not-match",
+    matrixRow: "not",
+    validator: "notNumberValidator",
+    input: 1,
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "not/enum-matches",
+    matrixRow: "not",
+    validator: "notNumberValidator",
+    input: 23456,
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "value matches not schema", path: [] }],
+    },
+  },
+  {
+    id: "not/object-properties-required-do-not-match",
+    matrixRow: "not",
+    validator: "notObjectValidator",
+    input: { type: "allowed" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "not/object-properties-required-match",
+    matrixRow: "not",
+    validator: "notObjectValidator",
+    input: { type: "blocked" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "value matches not schema", path: [] }],
+    },
+  },
+
+  // --- propertyNames (namedObjectValidator) ---
+  {
+    id: "propertyNames/all-names-match",
+    matrixRow: "propertyNames",
+    validator: "namedObjectValidator",
+    input: { valid: 1 },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "propertyNames/name-does-not-match",
+    matrixRow: "propertyNames",
+    validator: "namedObjectValidator",
+    input: { Invalid: 1 },
+    expected: {
+      verdict: "fail",
+      issues: [
+        {
+          message: "property name does not satisfy propertyNames schema",
+          path: ["Invalid"],
+        },
+      ],
+    },
+  },
+
   // --- anyOf (scalarValidator) ---
   {
     id: "anyOf/string-branch",
@@ -911,6 +1014,228 @@ export const cases: readonly ConformanceCase[] = [
     expected: {
       verdict: "fail",
       issues: [{ message: "out of int32 range", path: ["bigId"] }],
+    },
+  },
+
+  // --- patternProperties (patternBagValidator) ---
+  {
+    id: "patternProperties/declared-and-pattern-keys-valid",
+    matrixRow: "patternProperties",
+    validator: "patternBagValidator",
+    input: { fixed: "kept-string", "x-count": 3 },
+    expected: { verdict: "pass" },
+  },
+  {
+    // x-count matches both /^x-/u and /count$/u; both schemas apply, so the second maximum fails.
+    id: "patternProperties/name-matching-two-patterns",
+    matrixRow: "patternProperties",
+    validator: "patternBagValidator",
+    input: { fixed: "kept-string", "x-count": 6 },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "greater than maximum 5", path: ["x-count"] }],
+    },
+  },
+  {
+    // A key matched by patternProperties is not also processed by additionalProperties:false.
+    id: "patternProperties/matched-key-is-not-additional",
+    matrixRow: "patternProperties",
+    validator: "patternBagValidator",
+    input: { "x-extra": 2 },
+    expected: { verdict: "pass" },
+  },
+
+  // --- contains/minContains/maxContains ---
+  {
+    id: "contains/one-match",
+    matrixRow: "contains",
+    validator: "containsDefaultValidator",
+    input: ["no", 1],
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "contains/no-match",
+    matrixRow: "contains",
+    validator: "containsDefaultValidator",
+    input: ["no", false],
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "no array item matches contains schema", path: [] }],
+    },
+  },
+  {
+    id: "minContains/two-matches",
+    matrixRow: "minContains",
+    validator: "containsRangeValidator",
+    input: [1, "no", 2],
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "minContains/one-match",
+    matrixRow: "minContains",
+    validator: "containsRangeValidator",
+    input: [1, "no"],
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "fewer matching items than minContains 2", path: [] }],
+    },
+  },
+  {
+    id: "maxContains/three-matches",
+    matrixRow: "maxContains",
+    validator: "containsRangeValidator",
+    input: [1, 2, 3],
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "maxContains/four-matches",
+    matrixRow: "maxContains",
+    validator: "containsRangeValidator",
+    input: [1, 2, 3, 4],
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "more matching items than maxContains 3", path: [] }],
+    },
+  },
+  {
+    // minContains:0 makes contains itself pass even when the empty array has no matching item.
+    id: "minContains/zero-allows-no-match",
+    matrixRow: "minContains",
+    validator: "containsOptionalValidator",
+    input: [],
+    expected: { verdict: "pass" },
+  },
+  {
+    // maxContains remains active beside minContains:0.
+    id: "maxContains/zero-minimum-still-bounded",
+    matrixRow: "maxContains",
+    validator: "containsOptionalValidator",
+    input: ["one", "two"],
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "more matching items than maxContains 1", path: [] }],
+    },
+  },
+
+  // --- dependentSchemas (dependentAccountValidator) ---
+  {
+    id: "dependentSchemas/trigger-absent",
+    matrixRow: "dependentSchemas",
+    validator: "dependentAccountValidator",
+    input: { billingAddress: "x" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "dependentSchemas/trigger-present-and-dependent-schema-fails",
+    matrixRow: "dependentSchemas",
+    validator: "dependentAccountValidator",
+    input: { creditCard: "1234" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "missing required property billingAddress", path: [] }],
+    },
+  },
+  {
+    // The dependency schema applies to the whole object, so it can inspect billingAddress.
+    id: "dependentSchemas/whole-object-schema",
+    matrixRow: "dependentSchemas",
+    validator: "dependentAccountValidator",
+    input: { creditCard: "1234", billingAddress: "x" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "shorter than minLength 3", path: ["billingAddress"] }],
+    },
+  },
+
+  // --- if/then/else (conditionalProfileValidator) ---
+  {
+    // Failing `if` selects `else`; the failed condition is not itself an assertion failure.
+    id: "if/failed-condition-selects-valid-else",
+    matrixRow: "if",
+    validator: "conditionalProfileValidator",
+    input: { kind: "personal", personalName: "Ada" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "if/matched-condition-selects-failing-then",
+    matrixRow: "if",
+    validator: "conditionalProfileValidator",
+    input: { kind: "business" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "missing required property companyName", path: [] }],
+    },
+  },
+  {
+    id: "then/active-branch-satisfied",
+    matrixRow: "then",
+    validator: "conditionalProfileValidator",
+    input: { kind: "business", companyName: "Acme" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "then/active-branch-fails",
+    matrixRow: "then",
+    validator: "conditionalProfileValidator",
+    input: { kind: "business" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "missing required property companyName", path: [] }],
+    },
+  },
+  {
+    id: "else/active-branch-satisfied",
+    matrixRow: "else",
+    validator: "conditionalProfileValidator",
+    input: { kind: "personal", personalName: "Ada" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "else/active-branch-fails",
+    matrixRow: "else",
+    validator: "conditionalProfileValidator",
+    input: { kind: "personal" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "missing required property personalName", path: [] }],
+    },
+  },
+
+  // --- unevaluatedProperties / unevaluatedItems ---
+  {
+    // `alpha` is evaluated only by the successful first anyOf branch.
+    id: "unevaluatedProperties/successful-anyof-annotation-is-visible",
+    matrixRow: "unevaluatedProperties",
+    validator: "unevaluatedChoiceValidator",
+    input: { alpha: "kept" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "unevaluatedProperties/uncovered-property-rejected",
+    matrixRow: "unevaluatedProperties",
+    validator: "unevaluatedChoiceValidator",
+    input: { alpha: "kept", extra: true },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "value not allowed", path: ["extra"] }],
+    },
+  },
+  {
+    // Index 0 is evaluated by prefixItems and indexes 1 and 2 by successful contains matches.
+    id: "unevaluatedItems/prefix-and-contains-cover-array",
+    matrixRow: "unevaluatedItems",
+    validator: "unevaluatedSequenceValidator",
+    input: ["head", 1, 2],
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "unevaluatedItems/uncovered-index-rejected",
+    matrixRow: "unevaluatedItems",
+    validator: "unevaluatedSequenceValidator",
+    input: ["head", 1, "tail"],
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "value not allowed", path: [2] }],
     },
   },
 

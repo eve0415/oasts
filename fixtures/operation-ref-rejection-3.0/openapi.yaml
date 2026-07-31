@@ -1,0 +1,10 @@
+openapi: 3.0.4
+info:
+  title: Operation reference rejection
+  version: "1"
+paths:
+  /v2/vpcs/{vpc_id}:
+    get:
+      $ref: resources/vpcs/vpcs_get.yaml
+    put:
+      $ref: resources/vpcs/vpcs_update.yaml

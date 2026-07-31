@@ -1,0 +1,108 @@
+openapi: 3.0.3
+info:
+  title: Multipart response
+  version: 1.0.0
+servers:
+  - url: https://multipart.example.test
+paths:
+  /snippets/{name}/content:
+    get:
+      operationId: getSnippetContent
+      description: The open-ended shape a published description actually uses — no declared property at all, every part admitted by additionalProperties.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Return snippet content.
+          headers:
+            cf-entrypoint:
+              schema:
+                type: string
+          content:
+            multipart/form-data:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/SnippetFiles'
+  /bundle:
+    get:
+      operationId: getBundle
+      description: One declared property per part shape, with the object closed to undeclared names.
+      responses:
+        '200':
+          description: Bundle parts.
+          content:
+            multipart/form-data:
+              schema:
+                type: object
+                required:
+                  - manifest
+                  - readme
+                  - archive
+                additionalProperties: false
+                properties:
+                  manifest:
+                    $ref: '#/components/schemas/Manifest'
+                  readme:
+                    type: string
+                  archive:
+                    type: string
+                    format: binary
+                  thumbnails:
+                    type: array
+                    items:
+                      type: string
+                      format: binary
+                  labels:
+                    type: array
+                    items:
+                      type: string
+                  encoded:
+                    type: string
+                    format: byte
+                  extra: {}
+  /mixed:
+    get:
+      operationId: getMixedMedia
+      description: A multipart entry sharing one status with a JSON entry, so the branch narrows on contentType.
+      responses:
+        '200':
+          description: Either shape.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Manifest'
+            multipart/form-data:
+              schema:
+                type: object
+                properties:
+                  manifest:
+                    $ref: '#/components/schemas/Manifest'
+                  archive:
+                    type: string
+                    format: binary
+components:
+  schemas:
+    SnippetFiles:
+      title: Files
+      description: Contain files belonging to the snippet.
+      type: array
+      minItems: 1
+      items:
+        title: File
+        description: Specify a file belonging to the snippet.
+        type: string
+        format: binary
+    Manifest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+        size:
+          type: integer

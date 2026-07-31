@@ -153,7 +153,7 @@ pub fn write(
 /// Writes `contents` to `path` via a temp file in the same directory, then renames it into place, so
 /// a crash mid-write never leaves a truncated results file. The temp file must share the directory so
 /// the rename stays on one filesystem and is atomic.
-pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<(), Error> {
+pub fn atomic_write(path: &Path, contents: &str) -> Result<(), Error> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp = NamedTempFile::new_in(directory).map_err(|error| {
         Error::new(format!(

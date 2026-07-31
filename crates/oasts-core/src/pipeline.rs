@@ -53,7 +53,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use crate::config::{load_config, load_config_from_json};
 
@@ -173,6 +173,76 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_fetch_header_stays_in_types_and_is_dropped_only_from_the_client() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("openapi.yaml"),
+            r#"openapi: 3.0.4
+info: {title: t, version: 1.0.0}
+paths:
+  /things:
+    get:
+      operationId: listThings
+      parameters:
+        - {name: Cookie, in: header, required: true, schema: {type: string}}
+        - {name: X-Trace, in: header, required: true, schema: {type: string}}
+      responses: {'200': {description: ok}}
+"#,
+        )
+        .expect("OpenAPI document");
+        let config = |name: &str, client: bool| {
+            let mut raw = json!({
+                "schemaVersion": 1,
+                "input": { "path": "openapi.yaml" },
+                "output": format!("generated-{name}")
+            });
+            if client {
+                raw["artifacts"] = json!({ "types": true, "client": true });
+                raw["client"] = json!({ "authEnforcement": "types" });
+                raw["validation"] = json!({ "engine": "off", "unchecked": "allow" });
+            }
+            load_config_from_json(
+                &temp.path().join(format!("oasts-{name}.json")),
+                &serde_json::to_vec(&raw).expect("config JSON"),
+            )
+            .expect("resolved config")
+        };
+
+        let mut types_sink = DiagnosticSink::new();
+        let types = compile(&config("types", false), true, &mut types_sink)
+            .expect("types-only build emits");
+        let request_types = types
+            .iter()
+            .find(|file| file.relative_path == "types/operations/listthings.ts")
+            .expect("operation types");
+        assert!(request_types.content.contains("Cookie: string;"));
+        assert!(request_types.content.contains("\"X-Trace\": string;"));
+        assert!(types_sink.as_slice().is_empty());
+
+        let mut client_sink = DiagnosticSink::new();
+        let client =
+            compile(&config("client", true), true, &mut client_sink).expect("client build emits");
+        let request_types = client
+            .iter()
+            .find(|file| file.relative_path == "types/operations/listthings.ts")
+            .expect("client build operation types");
+        assert!(request_types.content.contains("Cookie: string;"));
+        let operation = client
+            .iter()
+            .find(|file| file.relative_path == "client/operations/listthings.ts")
+            .expect("client operation");
+        assert!(!operation.content.contains("\"Cookie\""));
+        assert!(operation.content.contains("\"X-Trace\""));
+        let diagnostics = client_sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1411")
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].severity, crate::diag::Severity::Warning);
+    }
+
+    #[test]
     fn client_enabled_tictactoe_plans_operation_auth() {
         use crate::client_model::{AuthKind, AuthSchemeUse};
 
@@ -245,6 +315,14 @@ mod tests {
         files: &[(&str, &str)],
         should_emit: bool,
     ) -> (DiagnosticSink, Option<Vec<GeneratedFile>>) {
+        compile_multifile_with_naming(files, None, should_emit)
+    }
+
+    fn compile_multifile_with_naming(
+        files: &[(&str, &str)],
+        naming: Option<Value>,
+        should_emit: bool,
+    ) -> (DiagnosticSink, Option<Vec<GeneratedFile>>) {
         let temp = tempfile::tempdir().expect("tempdir");
         for (relative, contents) in files {
             let path = temp.path().join(relative);
@@ -253,11 +331,14 @@ mod tests {
             }
             fs::write(&path, contents).expect("write spec file");
         }
-        let raw = json!({
+        let mut raw = json!({
             "schemaVersion": 1,
             "input": { "path": "openapi.yaml" },
             "output": "generated"
         });
+        if let Some(naming) = naming {
+            raw["naming"] = naming;
+        }
         let config = load_config_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&raw).expect("config JSON"),
@@ -464,6 +545,89 @@ components:
         let has_code = |code: &str| sink.as_slice().iter().any(|d| d.code == code);
         assert!(!has_code("OASTS1202"), "case-only diff must not be fatal");
         assert!(has_code("OASTS1302"), "path layer must still collide");
+    }
+
+    #[test]
+    fn pasted_schema_collision_suggestions_generate_without_a_path_collision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("openapi.yaml"),
+            r##"openapi: 3.1.0
+info: { title: collision, version: "1" }
+paths:
+  /lower:
+    get:
+      operationId: get-lower
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/createdAt" }
+  /upper:
+    get:
+      operationId: get-upper
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreatedAt" }
+components:
+  schemas:
+    createdAt: { type: string }
+    CreatedAt: { type: string }
+"##,
+        )
+        .expect("OpenAPI");
+        let base = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.yaml" },
+            "output": "generated"
+        });
+        let config = load_config_from_json(
+            &temp.path().join("oasts.json"),
+            &serde_json::to_vec(&base).expect("config JSON"),
+        )
+        .expect("config");
+        let mut sink = DiagnosticSink::new();
+        assert!(compile(&config, true, &mut sink).is_none());
+        let rendered = crate::diag::render_to_string(sink.into_sorted_vec());
+        assert!(rendered.contains("      'CreatedAt': 'CreatedAt_1'\n"));
+        assert!(rendered.contains("      'createdAt': 'CreatedAt_2'\n"));
+
+        let resolved = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.yaml" },
+            "output": "generated",
+            "naming": {
+                "overrides": {
+                    "schemas": {
+                        "CreatedAt": "CreatedAt_1",
+                        "createdAt": "CreatedAt_2"
+                    },
+                    "operations": {
+                        "get-lower": "fetchLower"
+                    }
+                }
+            }
+        });
+        let config = load_config_from_json(
+            &temp.path().join("oasts.json"),
+            &serde_json::to_vec(&resolved).expect("config JSON"),
+        )
+        .expect("resolved config");
+        let mut sink = DiagnosticSink::new();
+        let files = compile(&config, true, &mut sink).expect("suggestions resolve the collision");
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let paths = files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains("types/components/createdat-1.ts"));
+        assert!(paths.contains("types/components/createdat-2.ts"));
+        assert!(paths.contains("types/operations/fetchlower.ts"));
+        assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
     }
 
     #[test]
@@ -701,8 +865,10 @@ paths:
     }
 
     #[test]
-    fn fragment_less_external_ref_is_diagnosed_clearly() {
-        let openapi = r##"openapi: "3.1.0"
+    fn fragmentless_external_schema_document_is_materialized_in_both_oas_versions() {
+        for version in ["3.0.4", "3.1.1"] {
+            let openapi = format!(
+                r##"openapi: "{version}"
 info:
   title: nofrag
   version: "1"
@@ -716,19 +882,212 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "./schemas/part.yaml"
+                $ref: "./schemas/Pet.yaml"
+"##
+            );
+            let pet = r##"type: object
+required: [id]
+properties:
+  id: { type: string }
 "##;
-        let part = "Pet:\n  type: object\n  properties:\n    id: { type: string }\n";
+            let (sink, files) = compile_multifile(
+                &[("openapi.yaml", &openapi), ("schemas/Pet.yaml", pet)],
+                true,
+            );
+            assert!(!sink.has_errors(), "{version}: {:#?}", sink.as_slice());
+            let files = files.expect("fragmentless schema reference emits");
+            let pet = files
+                .iter()
+                .find(|file| file.relative_path == "types/components/pet.ts")
+                .expect("Pet component");
+            assert!(pet.content.contains("export interface Pet"));
+            assert!(pet.content.contains("id: string"));
+        }
+    }
+
+    #[test]
+    fn fragmentless_document_roots_with_the_same_stem_collide() {
+        let openapi = r##"openapi: "3.1.0"
+info: { title: collide, version: "1" }
+paths:
+  /a:
+    get:
+      operationId: get-a
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "./a/Pet.yaml"
+  /b:
+    get:
+      operationId: get-b
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "./b/Pet.yaml"
+"##;
         let (sink, files) = compile_multifile(
-            &[("openapi.yaml", openapi), ("schemas/part.yaml", part)],
+            &[
+                ("openapi.yaml", openapi),
+                ("a/Pet.yaml", "type: string\n"),
+                ("b/Pet.yaml", "type: integer\n"),
+            ],
             true,
         );
-        assert!(files.is_none(), "fragment-less external ref must not emit");
-        let emitted = format!("{:?}", sink.as_slice());
-        let diagnosed = sink.as_slice().iter().any(|diagnostic| {
-            diagnostic.code == "OASTS1106" && diagnostic.message.contains("fragment")
+        assert!(files.is_none(), "same-stem roots must not emit");
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == "OASTS1202"
+                && diagnostic.message.contains("collision")
+                && diagnostic.message.contains("'Pet'")
+        }));
+    }
+
+    #[test]
+    fn fragmentless_document_stems_normalize_and_can_be_overridden() {
+        let openapi = r##"openapi: "3.1.0"
+info: { title: names, version: "1" }
+paths:
+  /value:
+    get:
+      operationId: get-value
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "./schemas/my-schema.v2.yaml"
+"##;
+        let (sink, files) = compile_multifile(
+            &[
+                ("openapi.yaml", openapi),
+                ("schemas/my-schema.v2.yaml", "type: string\n"),
+            ],
+            true,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let files = files.expect("normalized stem emits");
+        assert!(files.iter().any(|file| {
+            file.relative_path == "types/components/my-schema-v2.ts"
+                && file.content.contains("export type MySchemaV2")
+        }));
+
+        let numeric_openapi = openapi.replace("my-schema.v2.yaml", "123.yaml");
+        let numeric_files = [
+            ("openapi.yaml", numeric_openapi.as_str()),
+            ("schemas/123.yaml", "type: string\n"),
+        ];
+        let (sink, files) = compile_multifile(&numeric_files, true);
+        assert!(files.is_none(), "a leading-digit stem must not emit");
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == "OASTS1202"
+                && diagnostic
+                    .message
+                    .contains("invalid schema identifier '123'")
+        }));
+
+        let naming = json!({
+            "overrides": {
+                "schemas": {
+                    "123": "Pet123"
+                }
+            }
         });
-        assert!(diagnosed, "expected fragment guidance: {emitted}");
+        let (sink, files) = compile_multifile_with_naming(&numeric_files, Some(naming), true);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        // The file name follows the override, not the raw stem: an override exists to resolve a
+        // name collision, and deriving the path from the name it replaced would just move the
+        // collision to the file layer.
+        assert!(files.expect("override emits").iter().any(|file| {
+            file.relative_path == "types/components/pet123.ts"
+                && file.content.contains("export type Pet123")
+        }));
+    }
+
+    #[test]
+    fn fragmentless_schema_self_reference_to_the_entry_document_terminates() {
+        let openapi = r##"openapi: "3.1.0"
+info: { title: self, version: "1" }
+paths:
+  /self:
+    get:
+      operationId: get-self
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "./openapi.yaml"
+"##;
+        let (sink, files) = compile_multifile(&[("openapi.yaml", openapi)], true);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert!(files.expect("self-reference emits").iter().any(|file| {
+            file.relative_path == "types/components/openapi.ts"
+                && file.content.contains("export type Openapi")
+        }));
+    }
+
+    #[test]
+    fn fragmentless_non_schema_references_use_the_object_resolution_path() {
+        let openapi = r##"openapi: "3.1.0"
+info: { title: objects, version: "1" }
+paths:
+  /pets:
+    $ref: "./paths/Pets.yaml"
+  /limited:
+    get:
+      operationId: get-limited
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+components:
+  parameters:
+    Limit:
+      $ref: "./parameters/Limit.yaml"
+  responses:
+    Ok:
+      $ref: "./responses/Ok.yaml"
+"##;
+        let path_item = r##"get:
+  operationId: list-pets
+  responses:
+    "200":
+      $ref: "../responses/Ok.yaml"
+"##;
+        let parameter = r##"name: limit
+in: query
+schema: { type: integer }
+"##;
+        let response = r##"description: ok
+content:
+  application/json:
+    schema: { type: string }
+"##;
+        let (sink, files) = compile_multifile(
+            &[
+                ("openapi.yaml", openapi),
+                ("paths/Pets.yaml", path_item),
+                ("parameters/Limit.yaml", parameter),
+                ("responses/Ok.yaml", response),
+            ],
+            true,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let paths = files
+            .expect("non-schema references emit")
+            .into_iter()
+            .map(|file| file.relative_path)
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains("types/operations/list-pets.ts"));
+        assert!(paths.contains("types/operations/get-limited.ts"));
     }
 
     #[test]
@@ -746,5 +1105,69 @@ paths:
                 .iter()
                 .any(|file| file.relative_path == "client/api.ts")
         );
+    }
+
+    #[test]
+    fn uninhabitable_allof_fixture_emits_every_artifact() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/uninhabitable-allof-3.0");
+        let config = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+            .expect("resolved fixture config");
+        let mut sink = DiagnosticSink::new();
+        let files = compile(&config, true, &mut sink).expect("warnings do not block emission");
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == crate::composition::CODE_COMPOSITION
+                && diagnostic.severity == crate::diag::Severity::Warning
+                && diagnostic.message.contains("closed object")
+        }));
+        assert!(
+            sink.as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.code == crate::composition::CODE_COMPOSITION)
+        );
+        let content = |path: &str| {
+            files
+                .iter()
+                .find(|file| file.relative_path == path)
+                .map(|file| file.content.as_str())
+                .expect("fixture artifact")
+        };
+        assert!(content("types/components/dog.ts").contains("export type Dog = never;"));
+        assert!(content("types/components/choice.ts").contains("export type Choice = Dog | Cat;"));
+        assert!(content("types/operations/exchangenever.ts").contains("body: never;\n"));
+        assert!(
+            content("types/operations/exchangenever.ts")
+                .contains("export type ExchangeNeverResponse200 = never;")
+        );
+        let client = content("client/operations/exchangenever.ts");
+        assert!(client.contains("body: ExchangeNeverRequest[\"body\"];"));
+        assert!(client.contains("validateExchangeNeverRequestBody(input.body"));
+        assert!(client.contains("validateExchangeNeverResponse200(result.data"));
+        assert!(
+            content("validators/components/dog.ts")
+                .contains("issues.push(issue(path, \"value not allowed\"));")
+        );
+    }
+
+    #[test]
+    fn operation_ref_rejection_fixture_emits_only_the_cause_and_no_files() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/operation-ref-rejection-3.0");
+        let config = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+            .expect("resolved rejection fixture config");
+        let mut sink = DiagnosticSink::new();
+        let files = compile(&config, true, &mut sink);
+
+        assert!(files.is_none());
+        assert_eq!(sink.worst_exit_code(), 1);
+        let diagnostics = sink.as_slice();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.code == "OASTS1116"
+                && diagnostic.message
+                    == "OpenAPI defines '$ref' on a Path Item Object but not on an Operation Object; bundle the document before compiling, or place '$ref' on the whole path item when its target is a Path Item Object"
+        }));
     }
 }

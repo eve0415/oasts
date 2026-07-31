@@ -24,9 +24,13 @@ import type {
   SyncStandardSchemaV1,
 } from "../generated/validators/standard-schema.js";
 import { petValidator } from "../generated/validators/components/pet.js";
+import { patternBagValidator } from "../generated/validators/components/patternbag.js";
 import { treeNodeValidator } from "../generated/validators/components/treenode.js";
 import { createPetResponse200Validator } from "../generated/validators/operations/createpet.js";
+import type { ConditionalProfile } from "../generated/types/components/conditionalprofile.js";
 import type { Pet } from "../generated/types/components/pet.js";
+import type { PatternBag } from "../generated/types/components/patternbag.js";
+import type { RequiredOnly } from "../generated/types/components/requiredonly.js";
 import type { TreeNode } from "../generated/types/components/treenode.js";
 import type { CreatePetResponse200 } from "../generated/types/operations/createpet.js";
 
@@ -40,6 +44,7 @@ export const petIsSync: SyncStandardSchemaV1<Pet> = petValidator;
 
 // 1. Each generated validator is assignable to StandardSchemaV1<T> for its structural type.
 export const petIsStandardSchema: StandardSchemaV1<Pet> = petValidator;
+export const patternBagIsStandardSchema: StandardSchemaV1<PatternBag> = patternBagValidator;
 export const treeIsStandardSchema: StandardSchemaV1<TreeNode> = treeNodeValidator;
 export const createPetResponseIsStandardSchema: StandardSchemaV1<CreatePetResponse200> =
   createPetResponse200Validator;
@@ -49,6 +54,10 @@ type AssertInferOutputPet = Expect<Equal<StandardSchemaV1.InferOutput<typeof pet
 type AssertInferInputPet = Expect<Equal<StandardSchemaV1.InferInput<typeof petValidator>, Pet>>;
 type AssertInferOutputTree = Expect<
   Equal<StandardSchemaV1.InferOutput<typeof treeNodeValidator>, TreeNode>
+>;
+type AssertBareRequiredTypeStaysUnknown = Expect<Equal<RequiredOnly, unknown>>;
+type AssertConditionalDoesNotWidenDeclaredProperty = Expect<
+  Equal<ConditionalProfile["companyName"], string | undefined>
 >;
 
 // 3 + 4. The validate result discriminates on `issues` and contains no Promise.
@@ -69,6 +78,8 @@ export type ValidatorTypeContracts = [
   AssertInferOutputPet,
   AssertInferInputPet,
   AssertInferOutputTree,
+  AssertBareRequiredTypeStaysUnknown,
+  AssertConditionalDoesNotWidenDeclaredProperty,
   AssertResultIsResultUnion,
   AssertResultHasNoPromise,
   AssertSuccessDiscriminatesToValue,

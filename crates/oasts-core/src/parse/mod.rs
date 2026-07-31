@@ -6,14 +6,15 @@ use serde_json::{Map, Value};
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
-    AdditionalProperties, ArrayConstraints, Body, Callback, CallbackExpression, Discriminator,
-    EncodingHeader, EncodingObject, EnumExtensionData, ExclusiveBound, FiniteConstraint, Ir, Link,
-    LinkTarget, MediaType, NamedSchema, NamedSecurityScheme, NumericConstraints, OAuthFlow,
-    OAuthFlows, OasVersion, ObjectConstraints, Operation, Param, ParamLocation, ParamStyle,
-    PrimitiveType, PropMeta, ResponseEntry, ResponseHeader, ResponseStatus, SchemaDocs, SchemaMeta,
-    SchemaNode, SchemaRef, SecKind, SecurityRequirement, Segment, SegmentPart, ServerEntry,
-    ServerVariable, SourceRef, StringConstraints, TupleRest, Webhook, box_if_populated,
-    is_root_component_pointer,
+    AdditionalProperties, ArrayConstraints, Body, Callback, CallbackExpression,
+    ConditionalApplicator, ContainsApplicator, Discriminator, EncodingHeader, EncodingObject,
+    EnumExtensionData, ExclusiveBound, FiniteConstraint, Ir, Link, LinkTarget, MediaType,
+    NamedSchema, NamedSecurityScheme, NumericConstraints, OAuthFlow, OAuthFlows, OasVersion,
+    ObjectConstraints, Operation, Param, ParamLocation, ParamStyle, PatternProperty,
+    PatternPropertyKey, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader, ResponseStatus,
+    SchemaDocs, SchemaMeta, SchemaNode, SchemaRef, SecKind, SecurityRequirement, Segment,
+    SegmentPart, ServerEntry, ServerVariable, SourceRef, StringConstraints, TupleRest,
+    ValidationApplicators, Webhook, box_if_populated, is_root_component_pointer,
 };
 use crate::loader::{DocId, DocumentGraph, append_pointer, append_pointer_index};
 use crate::media::canonical_content_key;
@@ -35,6 +36,8 @@ const CODE_REF_DEPTH: &str = "OASTS1114";
 /// out of tag resolution — diagnosed rather than dropped silently so a malformed entry is no
 /// quieter than a dangling one.
 const CODE_MAPPING_VALUE_SHAPE: &str = "OASTS1115";
+const CODE_OPERATION_REF: &str = "OASTS1116";
+const CODE_ENUM_RULE_14: &str = "OASTS1214";
 const CODE_SERVER_VAR_ENUM_EMPTY: &str = "OASTS1131";
 const CODE_SERVER_VAR_DEFAULT: &str = "OASTS1132";
 const CODE_HEADER_CONTENT_TYPE: &str = "OASTS1133";
@@ -47,37 +50,7 @@ const CODE_SECURITY_FLOWS_SHAPE: &str = "OASTS1438";
 const METHODS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
 ];
-const UNSUPPORTED_SCHEMA_KEYWORDS: [&str; 15] = [
-    "if",
-    "then",
-    "else",
-    "not",
-    "patternProperties",
-    "unevaluatedProperties",
-    "unevaluatedItems",
-    "contains",
-    "minContains",
-    "maxContains",
-    "dependentSchemas",
-    "propertyNames",
-    "additionalItems",
-    "$dynamicRef",
-    "$recursiveRef",
-];
-const REJECTED_VALIDATION_KEYWORDS: [&str; 12] = [
-    "if",
-    "then",
-    "else",
-    "not",
-    "dependentSchemas",
-    "unevaluatedProperties",
-    "unevaluatedItems",
-    "contains",
-    "minContains",
-    "maxContains",
-    "patternProperties",
-    "propertyNames",
-];
+const UNSUPPORTED_SCHEMA_KEYWORDS: [&str; 2] = ["$dynamicRef", "$recursiveRef"];
 
 /// Detects the entry document's supported OpenAPI line.
 pub fn detect_version(graph: &DocumentGraph, sink: &mut DiagnosticSink) -> Option<OasVersion> {
@@ -151,6 +124,79 @@ enum ContentSchema {
         schema: Box<SchemaNode>,
     },
     Invalid,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedFinite {
+    declared: bool,
+    enum_values: Option<Vec<Value>>,
+    const_value: Option<Value>,
+}
+
+impl ParsedFinite {
+    fn from_object(object: &Map<String, Value>, version: OasVersion) -> Self {
+        Self {
+            declared: object.contains_key("enum") || object.contains_key("const"),
+            enum_values: object.get("enum").and_then(Value::as_array).cloned(),
+            const_value: (version == OasVersion::V3_1)
+                .then(|| object.get("const").cloned())
+                .flatten(),
+        }
+    }
+
+    fn for_primitive(&self, ty: PrimitiveType) -> Option<Self> {
+        let enum_values = self.enum_values.as_ref().map(|values| {
+            values
+                .iter()
+                .filter(|value| value_matches_primitive(value, ty))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        if enum_values.as_ref().is_some_and(Vec::is_empty)
+            || self
+                .const_value
+                .as_ref()
+                .is_some_and(|value| !value_matches_primitive(value, ty))
+        {
+            return None;
+        }
+        Some(Self {
+            declared: self.declared,
+            enum_values,
+            const_value: self.const_value.clone(),
+        })
+    }
+}
+
+struct DomainFilter {
+    finite: ParsedFinite,
+    unsatisfiable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeclaredType {
+    String,
+    Number,
+    Integer,
+    Boolean,
+    Null,
+    Object,
+    Array,
+}
+
+impl DeclaredType {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "string" => Some(Self::String),
+            "number" => Some(Self::Number),
+            "integer" => Some(Self::Integer),
+            "boolean" => Some(Self::Boolean),
+            "null" => Some(Self::Null),
+            "object" => Some(Self::Object),
+            "array" => Some(Self::Array),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -261,13 +307,24 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             pointer: String::new(),
             value: &entry.value,
         };
-        let root_servers = root.value.get("servers").map_or_else(Vec::new, |value| {
-            self.parse_servers(NodeView {
+        let default_root_server = ServerEntry {
+            url: "/".to_owned(),
+            variables: Vec::new(),
+            source: self.source(root.doc_id, &root.pointer),
+        };
+        let root_servers = match root.value.get("servers") {
+            Some(Value::Array(servers)) if servers.is_empty() => {
+                vec![default_root_server]
+            }
+            None => {
+                vec![default_root_server]
+            }
+            Some(value) => self.parse_servers(NodeView {
                 doc_id: root.doc_id,
                 pointer: "/servers".to_owned(),
                 value,
-            })
-        });
+            }),
+        };
         let root_security = root.value.get("security").map_or_else(Vec::new, |value| {
             self.parse_security_requirements(NodeView {
                 doc_id: root.doc_id,
@@ -372,7 +429,13 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 .and_then(|&doc_id| self.graph.node_at(doc_id, &key.1))
                 .expect("the loader validated every reference target before parsing");
             let doc_id = node.doc_id;
-            let name = external_schema_name(&key.1);
+            let document_stem = self
+                .graph
+                .document(doc_id)
+                .and_then(|document| document.canonical_path.file_stem())
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default();
+            let name = external_schema_name(&key.1, document_stem);
             let source = self.source(doc_id, &key.1);
             let view = NodeView {
                 doc_id,
@@ -542,6 +605,15 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 );
                 continue;
             };
+            if operation_object.contains_key("$ref") {
+                self.sink.push(self.input_diagnostic(
+                    CODE_OPERATION_REF,
+                    operation_node.doc_id,
+                    &operation_node.pointer,
+                    "OpenAPI defines '$ref' on a Path Item Object but not on an Operation Object; bundle the document before compiling, or place '$ref' on the whole path item when its target is a Path Item Object",
+                ));
+                continue;
+            }
             operations.push(self.parse_operation(
                 method,
                 path_context,
@@ -1711,14 +1783,15 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         scheme_node: &NodeView<'graph>,
         scheme: &Map<String, Value>,
     ) -> OAuthFlows {
-        let empty = || OAuthFlows {
+        let empty = |declared| OAuthFlows {
+            declared,
             implicit: None,
             password: None,
             client_credentials: None,
             authorization_code: None,
         };
         let Some(value) = scheme.get("flows") else {
-            return empty();
+            return empty(false);
         };
         let flows_pointer = append_pointer(&scheme_node.pointer, "flows");
         let Some(flows) = value.as_object() else {
@@ -1727,9 +1800,12 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 &flows_pointer,
                 "OAuth2 flows must be an object",
             );
-            return empty();
+            return empty(true);
         };
         for key in flows.keys() {
+            if key.starts_with("x-") {
+                continue;
+            }
             if !matches!(
                 key.as_str(),
                 "implicit" | "password" | "clientCredentials" | "authorizationCode"
@@ -1743,6 +1819,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             }
         }
         OAuthFlows {
+            declared: true,
             implicit: self.parse_oauth_flow(scheme_node.doc_id, &flows_pointer, flows, "implicit"),
             password: self.parse_oauth_flow(scheme_node.doc_id, &flows_pointer, flows, "password"),
             client_credentials: self.parse_oauth_flow(
@@ -1838,18 +1915,54 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 "schema must be an object or an OpenAPI 3.1 boolean schema",
             );
         };
-        let meta = self.schema_meta(&node, Some(object));
+        let mut meta = self.schema_meta(&node, Some(object));
+        if object
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+            && !(self.version == OasVersion::V3_0
+                && object.get("$ref").and_then(Value::as_str).is_some())
+        {
+            let pointer = append_pointer(&node.pointer, "enum");
+            let message = match self.version {
+                OasVersion::V3_0 => "enum must contain at least one member in OpenAPI 3.0 (MUST)",
+                OasVersion::V3_1 => {
+                    "enum should contain at least one member in OpenAPI 3.1 (SHOULD); the schema admits no value and is lowered to never"
+                }
+            };
+            let diagnostic = match self.version {
+                OasVersion::V3_0 => {
+                    self.input_diagnostic(CODE_ENUM_RULE_14, node.doc_id, &pointer, message)
+                }
+                OasVersion::V3_1 => {
+                    self.warning_diagnostic(CODE_ENUM_RULE_14, node.doc_id, &pointer, message)
+                }
+            };
+            self.sink.push(diagnostic);
+            meta.nullable = false;
+            return SchemaNode::Never { meta };
+        }
         let dialect_unsupported = if self.version == OasVersion::V3_0 {
-            ["const", "prefixItems", "dependentRequired"]
-                .into_iter()
-                .find(|keyword| object.contains_key(*keyword))
-                .map(|keyword| (keyword, keyword))
-                .or_else(|| {
-                    object
-                        .get("type")
-                        .is_some_and(Value::is_array)
-                        .then_some(("type", "type array"))
-                })
+            [
+                "const",
+                "prefixItems",
+                "dependentRequired",
+                "propertyNames",
+                "patternProperties",
+                "contains",
+                "minContains",
+                "maxContains",
+                "dependentSchemas",
+            ]
+            .into_iter()
+            .find(|keyword| object.contains_key(*keyword))
+            .map(|keyword| (keyword, keyword))
+            .or_else(|| {
+                object
+                    .get("type")
+                    .is_some_and(Value::is_array)
+                    .then_some(("type", "type array"))
+            })
         } else {
             None
         };
@@ -1865,6 +1978,58 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 reason: format!("OpenAPI 3.0 does not support {display_keyword}"),
                 meta,
             };
+        }
+        if self.version == OasVersion::V3_1 {
+            for keyword in [
+                "contains",
+                "minContains",
+                "maxContains",
+                "dependentSchemas",
+                "if",
+                "then",
+                "else",
+                "unevaluatedProperties",
+                "unevaluatedItems",
+            ] {
+                if object.contains_key(keyword) {
+                    self.sink.push(self.unsupported_diagnostic(
+                        node.doc_id,
+                        &append_pointer(&node.pointer, keyword),
+                        format!(
+                            "schema keyword '{keyword}' has no faithful TypeScript representation and becomes unknown on the types surface"
+                        ),
+                    ));
+                }
+            }
+        }
+        if self.version == OasVersion::V3_0
+            && let Some(keyword) = [
+                "if",
+                "then",
+                "else",
+                "unevaluatedProperties",
+                "unevaluatedItems",
+                "additionalItems",
+            ]
+            .into_iter()
+            .find(|keyword| object.contains_key(*keyword))
+        {
+            self.sink.push(self.unsupported_diagnostic(
+                node.doc_id,
+                &append_pointer(&node.pointer, keyword),
+                format!("unsupported schema keyword '{keyword}' becomes unknown"),
+            ));
+            if !object.contains_key("$ref")
+                && !object.contains_key("allOf")
+                && !object.contains_key("oneOf")
+                && !object.contains_key("anyOf")
+                && !has_typed_or_constraint_content(object, self.version)
+            {
+                return SchemaNode::Unknown {
+                    reason: format!("unsupported keyword {keyword}"),
+                    meta,
+                };
+            }
         }
         // Unsupported keywords are conjuncts like every other keyword on a schema object, so drop
         // only that unrepresentable conjunct while preserving any representable siblings. Without
@@ -1926,6 +2091,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     "$ref ignores sibling keyword(s) in OpenAPI 3.0; move them under allOf to compose",
                 ));
             }
+            meta.validation_applicators = None;
             return self.parse_schema_ref(node, reference, meta);
         }
 
@@ -2046,25 +2212,6 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         meta: SchemaMeta,
     ) -> SchemaNode {
         match self.graph.resolve(node.doc_id, reference) {
-            Ok(target) if target.json_pointer.is_empty() => {
-                // A reference with no fragment resolves to a whole document, which names no schema.
-                // Left alone it would flow to materialization as an empty schema name and surface as
-                // an empty-identifier error pointing at nothing; diagnose it at the ref instead.
-                self.sink.push(
-                    Diagnostic::input(
-                        CODE_REFERENCE,
-                        format!(
-                            "schema reference '{reference}' points at a whole document, which names no schema; add a fragment naming the schema (e.g. '{reference}#/SchemaName')"
-                        ),
-                    )
-                    .with_source(self.source_id(node.doc_id))
-                    .with_json_pointer(&node.pointer),
-                );
-                SchemaNode::Unknown {
-                    reason: format!("reference {reference} has no schema fragment"),
-                    meta,
-                }
-            }
             Ok(target) => {
                 if target.doc_id == self.graph.entry().id
                     && !is_root_component_pointer(&target.json_pointer)
@@ -2166,6 +2313,8 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             && let Some(types) = object.get("type").and_then(Value::as_array)
         {
             let mut names = Vec::new();
+            let finite = ParsedFinite::from_object(object, self.version);
+            let mut domains = finite.declared.then(Vec::new);
             for value in types {
                 let Some(name) = value.as_str() else {
                     return self.unsupported_schema(
@@ -2174,21 +2323,44 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                         "schema type arrays must contain strings",
                     );
                 };
+                match (domains.as_mut(), DeclaredType::from_name(name)) {
+                    (Some(domains), Some(domain)) => domains.push(domain),
+                    (_, None) => domains = None,
+                    (None, Some(_)) => {}
+                }
                 if name == "null" {
                     meta.nullable = true;
                 } else {
                     names.push(name);
                 }
             }
+            let filtered = match (domains, finite.declared) {
+                (Some(domains), true) => {
+                    let display = types
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    self.filter_finite_values(&node, finite, &domains, &display, false, &mut meta)
+                }
+                (Some(_), false) | (None, _) => DomainFilter {
+                    finite,
+                    unsatisfiable: false,
+                },
+            };
             if meta.nullable {
-                meta.nullable = finite_constraints_admit(object, PrimitiveType::Null);
+                meta.nullable = finite_constraints_admit(&filtered.finite, PrimitiveType::Null);
+            }
+            if filtered.unsatisfiable {
+                meta.nullable = false;
+                return SchemaNode::Never { meta };
             }
             if names.is_empty() {
                 meta.nullable = false;
-                return self.parse_type_name(node, object, "null", meta);
+                return self.parse_type_name(node, object, "null", filtered.finite, meta);
             }
             if names.len() == 1 {
-                return self.parse_type_name(node, object, names[0], meta);
+                return self.parse_type_name(node, object, names[0], filtered.finite, meta);
             }
             let branches = names
                 .into_iter()
@@ -2220,25 +2392,8 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                             });
                         }
                     };
-                    let mut branch = object.clone();
-                    if let Some(values) = object.get("enum").and_then(Value::as_array) {
-                        let filtered = values
-                            .iter()
-                            .filter(|value| value_matches_primitive(value, ty))
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        if filtered.is_empty() {
-                            return None;
-                        }
-                        branch.insert("enum".to_owned(), Value::Array(filtered));
-                    }
-                    if object
-                        .get("const")
-                        .is_some_and(|value| !value_matches_primitive(value, ty))
-                    {
-                        return None;
-                    }
-                    Some(self.parse_primitive(&branch, ty, branch_meta))
+                    let finite = filtered.finite.for_primitive(ty)?;
+                    Some(self.parse_primitive(object, ty, finite, branch_meta))
                 })
                 .collect();
             return SchemaNode::AnyOf {
@@ -2248,27 +2403,126 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             };
         }
         if let Some(ty) = object.get("type").and_then(Value::as_str) {
-            return self.parse_type_name(node, object, ty, meta);
+            let finite = ParsedFinite::from_object(object, self.version);
+            let Some(domain) = DeclaredType::from_name(ty) else {
+                return self.parse_type_name(node, object, ty, finite, meta);
+            };
+            let nullable = self.version == OasVersion::V3_0
+                && object
+                    .get("nullable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            let filtered =
+                self.filter_finite_values(&node, finite, &[domain], ty, nullable, &mut meta);
+            if filtered.unsatisfiable {
+                let mut never_meta = meta.clone();
+                never_meta.nullable = false;
+                let _discarded = self.parse_type_name(node, object, ty, filtered.finite, meta);
+                return SchemaNode::Never { meta: never_meta };
+            }
+            return self.parse_type_name(node, object, ty, filtered.finite, meta);
         }
+        let finite = ParsedFinite::from_object(object, self.version);
         if object.contains_key("properties")
             || object.contains_key("additionalProperties")
             || (self.version == OasVersion::V3_1 && object.contains_key("dependentRequired"))
         {
-            return self.parse_object(node, object, meta);
+            return self.parse_object(node, object, finite, meta);
         }
         if object.contains_key("items") {
-            return self.parse_array(node, object, meta);
+            return self.parse_array(node, object, finite, meta);
         }
         if object.contains_key("enum") || object.contains_key("const") {
             return SchemaNode::Finite {
-                enum_values: object.get("enum").and_then(Value::as_array).cloned(),
-                const_value: (self.version == OasVersion::V3_1)
-                    .then(|| object.get("const").cloned())
-                    .flatten(),
+                enum_values: finite.enum_values,
+                const_value: finite.const_value,
                 meta,
             };
         }
         SchemaNode::Any { meta }
+    }
+
+    fn filter_finite_values(
+        &mut self,
+        node: &NodeView<'graph>,
+        mut finite: ParsedFinite,
+        domains: &[DeclaredType],
+        declared_type: &str,
+        nullable: bool,
+        meta: &mut SchemaMeta,
+    ) -> DomainFilter {
+        let track_extension_indices = meta.enum_extensions.is_some();
+        let mut retained_indices: Option<Vec<usize>> = None;
+        let mut original_enum_len = None;
+        let mut enum_became_empty = false;
+        if let Some(mut values) = finite.enum_values.take() {
+            let original_len = values.len();
+            original_enum_len = Some(original_len);
+            let mut index = 0;
+            values.retain(|value| {
+                let retained = value_in_declared_domain(value, domains, nullable);
+                if retained {
+                    if let Some(indices) = &mut retained_indices {
+                        indices.push(index);
+                    }
+                } else {
+                    if track_extension_indices && retained_indices.is_none() {
+                        retained_indices = Some((0..index).collect());
+                    }
+                    self.sink.push(self.warning_diagnostic(
+                        CODE_ENUM_RULE_14,
+                        node.doc_id,
+                        &node.pointer,
+                        format!(
+                            "enum member {} is outside declared type {declared_type} and can never validate; it is dropped from the generated type and validator",
+                            compact_json(value)
+                        ),
+                    ));
+                }
+                index += 1;
+                retained
+            });
+            enum_became_empty = original_len > 0 && values.is_empty();
+            finite.enum_values = Some(values);
+            if enum_became_empty {
+                self.sink.push(self.warning_diagnostic(
+                    CODE_ENUM_RULE_14,
+                    node.doc_id,
+                    &node.pointer,
+                    format!(
+                        "all enum members are outside declared type {declared_type}; the schema admits no value and is lowered to never"
+                    ),
+                ));
+            }
+        }
+
+        let const_outside = finite
+            .const_value
+            .as_ref()
+            .is_some_and(|value| !value_in_declared_domain(value, domains, nullable));
+        if const_outside && let Some(value) = finite.const_value.take() {
+            self.sink.push(self.warning_diagnostic(
+                CODE_ENUM_RULE_14,
+                node.doc_id,
+                &node.pointer,
+                format!(
+                    "const value {} is outside declared type {declared_type} and can never validate; the schema admits no value and is lowered to never",
+                    compact_json(&value)
+                ),
+            ));
+        }
+
+        let unsatisfiable = enum_became_empty || const_outside;
+        if unsatisfiable && track_extension_indices && original_enum_len.is_some() {
+            retained_indices = Some(Vec::new());
+        }
+        if let (Some(original_len), Some(indices)) = (original_enum_len, retained_indices) {
+            retain_enum_extensions(meta, original_len, &indices);
+        }
+        DomainFilter {
+            finite,
+            unsatisfiable,
+        }
     }
 
     fn parse_type_name(
@@ -2276,18 +2530,19 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         node: NodeView<'graph>,
         object: &'graph Map<String, Value>,
         ty: &str,
+        finite: ParsedFinite,
         meta: SchemaMeta,
     ) -> SchemaNode {
         match ty {
-            "string" => self.parse_primitive(object, PrimitiveType::String, meta),
-            "number" => self.parse_primitive(object, PrimitiveType::Number, meta),
-            "integer" => self.parse_primitive(object, PrimitiveType::Integer, meta),
-            "boolean" => self.parse_primitive(object, PrimitiveType::Boolean, meta),
+            "string" => self.parse_primitive(object, PrimitiveType::String, finite, meta),
+            "number" => self.parse_primitive(object, PrimitiveType::Number, finite, meta),
+            "integer" => self.parse_primitive(object, PrimitiveType::Integer, finite, meta),
+            "boolean" => self.parse_primitive(object, PrimitiveType::Boolean, finite, meta),
             "null" if self.version == OasVersion::V3_1 => {
-                self.parse_primitive(object, PrimitiveType::Null, meta)
+                self.parse_primitive(object, PrimitiveType::Null, finite, meta)
             }
-            "object" => self.parse_object(node, object, meta),
-            "array" => self.parse_array(node, object, meta),
+            "object" => self.parse_object(node, object, finite, meta),
+            "array" => self.parse_array(node, object, finite, meta),
             _ => {
                 self.sink.push(self.unsupported_diagnostic(
                     node.doc_id,
@@ -2306,6 +2561,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         &self,
         object: &Map<String, Value>,
         ty: PrimitiveType,
+        finite: ParsedFinite,
         meta: SchemaMeta,
     ) -> SchemaNode {
         SchemaNode::Primitive {
@@ -2314,26 +2570,19 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 .get("format")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            enum_values: object.get("enum").and_then(Value::as_array).cloned(),
-            const_value: (self.version == OasVersion::V3_1)
-                .then(|| object.get("const").cloned())
-                .flatten(),
+            enum_values: finite.enum_values,
+            const_value: finite.const_value,
             meta,
         }
     }
 
     /// The `enum`/`const` finite constraint carried by object/array/tuple schemas, `None` when the
     /// object declares neither. `const` is read only in OpenAPI 3.1 (3.0 has no `const` keyword).
-    fn parse_finite_constraint(
-        &self,
-        object: &Map<String, Value>,
-    ) -> Option<Box<FiniteConstraint>> {
-        (object.contains_key("enum") || object.contains_key("const")).then(|| {
+    fn parse_finite_constraint(&self, finite: ParsedFinite) -> Option<Box<FiniteConstraint>> {
+        finite.declared.then(|| {
             Box::new(FiniteConstraint {
-                enum_values: object.get("enum").and_then(Value::as_array).cloned(),
-                const_value: (self.version == OasVersion::V3_1)
-                    .then(|| object.get("const").cloned())
-                    .flatten(),
+                enum_values: finite.enum_values,
+                const_value: finite.const_value,
             })
         })
     }
@@ -2342,9 +2591,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         &mut self,
         node: NodeView<'graph>,
         object: &'graph Map<String, Value>,
+        finite: ParsedFinite,
         meta: SchemaMeta,
     ) -> SchemaNode {
-        let finite = self.parse_finite_constraint(object);
+        let finite = self.parse_finite_constraint(finite);
         let required_values = object
             .get("required")
             .and_then(Value::as_array)
@@ -2436,9 +2686,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         &mut self,
         node: NodeView<'graph>,
         object: &'graph Map<String, Value>,
+        finite: ParsedFinite,
         meta: SchemaMeta,
     ) -> SchemaNode {
-        let finite = self.parse_finite_constraint(object);
+        let finite = self.parse_finite_constraint(finite);
         let pointer = append_pointer(&node.pointer, "items");
         let items = match object.get("items") {
             None => SchemaNode::Any {
@@ -2464,9 +2715,40 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         &mut self,
         node: NodeView<'graph>,
         object: &'graph Map<String, Value>,
-        meta: SchemaMeta,
+        mut meta: SchemaMeta,
     ) -> SchemaNode {
-        let finite = self.parse_finite_constraint(object);
+        let finite = ParsedFinite::from_object(object, self.version);
+        let filtered = if finite.declared {
+            match declared_value_domain(object) {
+                // `nullable` cannot reach here: a tuple is only parsed under OpenAPI 3.1, where
+                // nullability is a `null` member of the type array rather than a sibling keyword.
+                Some((domains, display)) => {
+                    self.filter_finite_values(&node, finite, &domains, &display, false, &mut meta)
+                }
+                None => DomainFilter {
+                    finite,
+                    unsatisfiable: false,
+                },
+            }
+        } else {
+            DomainFilter {
+                finite,
+                unsatisfiable: false,
+            }
+        };
+        if self.version == OasVersion::V3_1
+            && object
+                .get("type")
+                .and_then(Value::as_array)
+                .is_some_and(|types| types.iter().any(|value| value.as_str() == Some("null")))
+        {
+            meta.nullable = finite_constraints_admit(&filtered.finite, PrimitiveType::Null);
+        }
+        if filtered.unsatisfiable {
+            meta.nullable = false;
+        }
+        let never_meta = filtered.unsatisfiable.then(|| meta.clone());
+        let finite = self.parse_finite_constraint(filtered.finite);
         let prefix_pointer = append_pointer(&node.pointer, "prefixItems");
         let prefix_items = object
             .get("prefixItems")
@@ -2501,18 +2783,22 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 })))
             }
         };
-        SchemaNode::Tuple {
+        let schema = SchemaNode::Tuple {
             prefix_items,
             rest,
             finite,
             meta,
+        };
+        match never_meta {
+            Some(meta) => SchemaNode::Never { meta },
+            None => schema,
         }
     }
 
     fn schema_meta(
         &mut self,
         node: &NodeView<'graph>,
-        object: Option<&Map<String, Value>>,
+        object: Option<&'graph Map<String, Value>>,
     ) -> SchemaMeta {
         let Some(object) = object else {
             return SchemaMeta {
@@ -2553,12 +2839,193 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         let array_constraints = collect_array_constraints(object);
         let object_constraints = collect_object_constraints(object);
         let constraints = collect_constraints(object, &numeric_constraints);
+        let validation_applicators = if self.version == OasVersion::V3_0
+            && object.contains_key("$ref")
+        {
+            ValidationApplicators::default()
+        } else {
+            let mut pattern_properties = Vec::new();
+            if self.version == OasVersion::V3_1
+                && let Some(value) = object.get("patternProperties")
+            {
+                let pointer = append_pointer(&node.pointer, "patternProperties");
+                if let Some(patterns) = value.as_object() {
+                    let schema_valued_additional = object
+                        .get("additionalProperties")
+                        .is_some_and(|value| !value.is_boolean());
+                    for (pattern, value) in patterns {
+                        let type_key = (!schema_valued_additional)
+                            .then(|| pattern_property_type_key(pattern))
+                            .flatten();
+                        if type_key.is_none() {
+                            self.sink.push(self.unsupported_diagnostic(
+                                    node.doc_id,
+                                    &append_pointer(&pointer, pattern),
+                                    format!(
+                                        "patternProperties regex '{pattern}' has no faithful TypeScript index-signature representation and becomes unknown on the types surface"
+                                    ),
+                                ));
+                        }
+                        pattern_properties.push(PatternProperty {
+                            pattern: pattern.clone(),
+                            schema: self.parse_schema(NodeView {
+                                doc_id: node.doc_id,
+                                pointer: append_pointer(&pointer, pattern),
+                                value,
+                            }),
+                            type_key,
+                        });
+                    }
+                    pattern_properties.sort_unstable_by(|left, right| {
+                        left.pattern.as_bytes().cmp(right.pattern.as_bytes())
+                    });
+                } else {
+                    self.shape_error(node.doc_id, &pointer, "patternProperties must be an object");
+                }
+            }
+            let min_contains = if self.version == OasVersion::V3_1 {
+                object.get("minContains").and_then(|value| {
+                    value.as_u64().or_else(|| {
+                        self.shape_error(
+                            node.doc_id,
+                            &append_pointer(&node.pointer, "minContains"),
+                            "minContains must be a non-negative integer",
+                        );
+                        None
+                    })
+                })
+            } else {
+                None
+            };
+            let max_contains = if self.version == OasVersion::V3_1 {
+                object.get("maxContains").and_then(|value| {
+                    value.as_u64().or_else(|| {
+                        self.shape_error(
+                            node.doc_id,
+                            &append_pointer(&node.pointer, "maxContains"),
+                            "maxContains must be a non-negative integer",
+                        );
+                        None
+                    })
+                })
+            } else {
+                None
+            };
+            let contains = (self.version == OasVersion::V3_1)
+                .then(|| object.get("contains"))
+                .flatten()
+                .map(|value| {
+                    Box::new(ContainsApplicator {
+                        schema: Box::new(self.parse_schema(NodeView {
+                            doc_id: node.doc_id,
+                            pointer: append_pointer(&node.pointer, "contains"),
+                            value,
+                        })),
+                        min_contains,
+                        max_contains,
+                    })
+                });
+            let mut dependent_schemas = Vec::new();
+            if self.version == OasVersion::V3_1
+                && let Some(value) = object.get("dependentSchemas")
+            {
+                let pointer = append_pointer(&node.pointer, "dependentSchemas");
+                if let Some(dependencies) = value.as_object() {
+                    dependent_schemas = dependencies
+                        .iter()
+                        .map(|(name, value)| {
+                            (
+                                name.clone(),
+                                self.parse_schema(NodeView {
+                                    doc_id: node.doc_id,
+                                    pointer: append_pointer(&pointer, name),
+                                    value,
+                                }),
+                            )
+                        })
+                        .collect();
+                } else {
+                    self.shape_error(node.doc_id, &pointer, "dependentSchemas must be an object");
+                }
+            }
+            let conditional = (self.version == OasVersion::V3_1)
+                .then(|| object.get("if"))
+                .flatten()
+                .map(|value| {
+                    Box::new(ConditionalApplicator {
+                        condition: Box::new(self.parse_schema(NodeView {
+                            doc_id: node.doc_id,
+                            pointer: append_pointer(&node.pointer, "if"),
+                            value,
+                        })),
+                        then_schema: object.get("then").map(|value| {
+                            Box::new(self.parse_schema(NodeView {
+                                doc_id: node.doc_id,
+                                pointer: append_pointer(&node.pointer, "then"),
+                                value,
+                            }))
+                        }),
+                        else_schema: object.get("else").map(|value| {
+                            Box::new(self.parse_schema(NodeView {
+                                doc_id: node.doc_id,
+                                pointer: append_pointer(&node.pointer, "else"),
+                                value,
+                            }))
+                        }),
+                    })
+                });
+            ValidationApplicators {
+                not: object.get("not").map(|value| {
+                    Box::new(self.parse_schema(NodeView {
+                        doc_id: node.doc_id,
+                        pointer: append_pointer(&node.pointer, "not"),
+                        value,
+                    }))
+                }),
+                property_names: (self.version == OasVersion::V3_1)
+                    .then(|| object.get("propertyNames"))
+                    .flatten()
+                    .map(|value| {
+                        Box::new(self.parse_schema(NodeView {
+                            doc_id: node.doc_id,
+                            pointer: append_pointer(&node.pointer, "propertyNames"),
+                            value,
+                        }))
+                    }),
+                pattern_properties,
+                contains,
+                dependent_schemas,
+                conditional,
+                unevaluated_properties: (self.version == OasVersion::V3_1)
+                    .then(|| object.get("unevaluatedProperties"))
+                    .flatten()
+                    .map(|value| {
+                        Box::new(self.parse_schema(NodeView {
+                            doc_id: node.doc_id,
+                            pointer: append_pointer(&node.pointer, "unevaluatedProperties"),
+                            value,
+                        }))
+                    }),
+                unevaluated_items: (self.version == OasVersion::V3_1)
+                    .then(|| object.get("unevaluatedItems"))
+                    .flatten()
+                    .map(|value| {
+                        Box::new(self.parse_schema(NodeView {
+                            doc_id: node.doc_id,
+                            pointer: append_pointer(&node.pointer, "unevaluatedItems"),
+                            value,
+                        }))
+                    }),
+            }
+        };
         SchemaMeta {
             nullable: self.version == OasVersion::V3_0
                 && object
                     .get("nullable")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+            additional_properties_present: object.contains_key("additionalProperties"),
+            items_present: object.contains_key("items"),
             read_only: object
                 .get("readOnly")
                 .and_then(Value::as_bool)
@@ -2589,9 +3056,28 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             string_constraints: box_if_populated(string_constraints),
             array_constraints: box_if_populated(array_constraints),
             object_constraints: box_if_populated(object_constraints),
+            validation_applicators: box_if_populated(validation_applicators),
             rejected_validation_keywords: object
                 .keys()
-                .filter(|key| REJECTED_VALIDATION_KEYWORDS.contains(&key.as_str()))
+                .filter(|key| {
+                    UNSUPPORTED_SCHEMA_KEYWORDS.contains(&key.as_str())
+                        || (self.version == OasVersion::V3_0
+                            && matches!(
+                                key.as_str(),
+                                "propertyNames"
+                                    | "patternProperties"
+                                    | "contains"
+                                    | "minContains"
+                                    | "maxContains"
+                                    | "dependentSchemas"
+                                    | "if"
+                                    | "then"
+                                    | "else"
+                                    | "unevaluatedProperties"
+                                    | "unevaluatedItems"
+                                    | "additionalItems"
+                            ))
+                })
                 .cloned()
                 .collect(),
             source: self.source(node.doc_id, &node.pointer),
@@ -2833,6 +3319,37 @@ fn collect_schema_refs(schema: &SchemaNode, out: &mut Vec<SchemaRef>) {
         | SchemaNode::Never { .. }
         | SchemaNode::Unknown { .. } => {}
     }
+    let applicators = schema.meta().validation_applicators();
+    if let Some(schema) = &applicators.not {
+        collect_schema_refs(schema, out);
+    }
+    if let Some(schema) = &applicators.property_names {
+        collect_schema_refs(schema, out);
+    }
+    for pattern in &applicators.pattern_properties {
+        collect_schema_refs(&pattern.schema, out);
+    }
+    if let Some(contains) = &applicators.contains {
+        collect_schema_refs(&contains.schema, out);
+    }
+    for (_, schema) in &applicators.dependent_schemas {
+        collect_schema_refs(schema, out);
+    }
+    if let Some(conditional) = &applicators.conditional {
+        collect_schema_refs(&conditional.condition, out);
+        if let Some(schema) = &conditional.then_schema {
+            collect_schema_refs(schema, out);
+        }
+        if let Some(schema) = &conditional.else_schema {
+            collect_schema_refs(schema, out);
+        }
+    }
+    if let Some(schema) = &applicators.unevaluated_properties {
+        collect_schema_refs(schema, out);
+    }
+    if let Some(schema) = &applicators.unevaluated_items {
+        collect_schema_refs(schema, out);
+    }
 }
 
 /// Collects `$ref` targets from the operation schemas that emission renders and
@@ -2871,7 +3388,7 @@ fn collect_operation_refs(operation: &Operation, out: &mut Vec<SchemaRef>) {
     }
 }
 
-const SCHEMA_NAME_STRUCTURAL_SEGMENTS: [&str; 7] = [
+const SCHEMA_NAME_STRUCTURAL_SEGMENTS: [&str; 10] = [
     "schema",
     "items",
     "additionalProperties",
@@ -2879,16 +3396,21 @@ const SCHEMA_NAME_STRUCTURAL_SEGMENTS: [&str; 7] = [
     "anyOf",
     "oneOf",
     "prefixItems",
+    "patternProperties",
+    "contains",
+    "dependentSchemas",
 ];
 
-/// Names an external schema from the named and structural context in its defining pointer.
+/// Names an external schema from its document stem or the named and structural context in its
+/// defining pointer.
 ///
-/// Container segments and media types are omitted. Remaining segments are JSON-Pointer
-/// unescaped (`~1` → `/`, `~0` → `~`), and structural roles have their first ASCII character
-/// uppercased before the parts are joined with spaces.
-fn external_schema_name(json_pointer: &str) -> String {
+/// A document-root schema uses the referenced file's stem. For a non-root schema, container
+/// segments and media types are omitted. Remaining segments are JSON-Pointer unescaped
+/// (`~1` → `/`, `~0` → `~`), and structural roles have their first ASCII character uppercased
+/// before the parts are joined with spaces.
+fn external_schema_name(json_pointer: &str, document_stem: &str) -> String {
     if json_pointer.is_empty() {
-        return String::new();
+        return document_stem.to_owned();
     }
 
     let segments = json_pointer
@@ -3008,19 +3530,74 @@ fn parse_response_status(value: &str) -> Option<ResponseStatus> {
     None
 }
 
-fn finite_constraints_admit(object: &Map<String, Value>, ty: PrimitiveType) -> bool {
-    let enum_admits = object
-        .get("enum")
-        .and_then(Value::as_array)
-        .is_none_or(|values| {
-            values
-                .iter()
-                .any(|value| value_matches_primitive(value, ty))
-        });
-    let const_admits = object
-        .get("const")
+fn finite_constraints_admit(finite: &ParsedFinite, ty: PrimitiveType) -> bool {
+    let enum_admits = finite.enum_values.as_deref().is_none_or(|values| {
+        values
+            .iter()
+            .any(|value| value_matches_primitive(value, ty))
+    });
+    let const_admits = finite
+        .const_value
+        .as_ref()
         .is_none_or(|value| value_matches_primitive(value, ty));
     enum_admits && const_admits
+}
+
+fn declared_value_domain(object: &Map<String, Value>) -> Option<(Vec<DeclaredType>, String)> {
+    match object.get("type")? {
+        Value::String(name) => Some((vec![DeclaredType::from_name(name)?], name.clone())),
+        Value::Array(values) => {
+            let names = values
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()?;
+            let domains = names
+                .iter()
+                .map(|name| DeclaredType::from_name(name))
+                .collect::<Option<Vec<_>>>()?;
+            Some((domains, names.join(" | ")))
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Object(_) => None,
+    }
+}
+
+fn value_in_declared_domain(value: &Value, domains: &[DeclaredType], nullable: bool) -> bool {
+    if value.is_null() && nullable {
+        return true;
+    }
+    domains.iter().any(|domain| match domain {
+        DeclaredType::String => value.is_string(),
+        DeclaredType::Number => value.is_number(),
+        DeclaredType::Integer => value
+            .as_number()
+            .is_some_and(json_number_is_mathematical_integer),
+        DeclaredType::Boolean => value.is_boolean(),
+        DeclaredType::Null => value.is_null(),
+        DeclaredType::Object => value.is_object(),
+        DeclaredType::Array => value.is_array(),
+    })
+}
+
+fn retain_enum_extensions(meta: &mut SchemaMeta, original_len: usize, indices: &[usize]) {
+    let Some(mut extensions) = meta.enum_extensions.take() else {
+        return;
+    };
+    for extension in [
+        &mut extensions.enum_varnames,
+        &mut extensions.enum_names,
+        &mut extensions.enum_descriptions,
+        &mut extensions.enum_descriptions_camel,
+    ] {
+        if let Some(Value::Array(values)) = extension
+            && values.len() == original_len
+        {
+            *values = indices
+                .iter()
+                .filter_map(|index| values.get(*index).cloned())
+                .collect();
+        }
+    }
+    meta.enum_extensions = box_if_populated(*extensions);
 }
 
 fn value_matches_primitive(value: &Value, ty: PrimitiveType) -> bool {
@@ -3106,9 +3683,19 @@ fn collect_array_constraints(object: &Map<String, Value>) -> ArrayConstraints {
 }
 
 fn collect_object_constraints(object: &Map<String, Value>) -> ObjectConstraints {
+    let mut seen_required = HashSet::new();
     ObjectConstraints {
         min_properties: object.get("minProperties").and_then(Value::as_u64),
         max_properties: object.get("maxProperties").and_then(Value::as_u64),
+        required: object
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|name| seen_required.insert(*name))
+            .map(str::to_owned)
+            .collect(),
     }
 }
 
@@ -3135,6 +3722,48 @@ fn collect_dependent_required(object: &Map<String, Value>) -> Vec<(String, Vec<S
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn pattern_property_type_key(pattern: &str) -> Option<PatternPropertyKey> {
+    let anchored_start = pattern.starts_with('^');
+    let without_start = pattern.strip_prefix('^').unwrap_or(pattern);
+    let anchored_end = without_start.ends_with('$') && !without_start.ends_with("\\$");
+    // ECMAScript `$` also matches immediately before a final line terminator, so neither `foo$`
+    // nor `^foo$` denotes a plain TypeScript suffix/exact key space. Keep those patterns on the
+    // validators-only path instead of emitting an index signature that excludes valid matches.
+    if pattern == "$" {
+        return Some(PatternPropertyKey::All);
+    }
+    if anchored_end {
+        return None;
+    }
+    let body = without_start;
+    let mut literal = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            let escaped = chars.next()?;
+            if !matches!(
+                escaped,
+                '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+            ) {
+                return None;
+            }
+            literal.push(escaped);
+        } else if matches!(
+            character,
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+        ) {
+            return None;
+        } else {
+            literal.push(character);
+        }
+    }
+    match (anchored_start, literal.is_empty()) {
+        (false, true) | (true, true) => Some(PatternPropertyKey::All),
+        (true, false) => Some(PatternPropertyKey::Prefix(literal)),
+        (false, false) => Some(PatternPropertyKey::Contains(literal)),
+    }
 }
 
 fn collect_constraints(object: &Map<String, Value>, numeric: &NumericConstraints) -> Vec<String> {
@@ -3192,9 +3821,10 @@ fn collect_constraints(object: &Map<String, Value>, numeric: &NumericConstraints
 /// `contentEncoding` are OpenAPI 3.1 only, so in 3.0 they do not count (and, being early-rejected
 /// dialect keywords, never reach here anyway).
 fn has_typed_or_constraint_content(object: &Map<String, Value>, version: OasVersion) -> bool {
-    const BOTH_VERSIONS: [&str; 19] = [
+    const BOTH_VERSIONS: [&str; 20] = [
         "type",
         "properties",
+        "required",
         "additionalProperties",
         "items",
         "enum",
@@ -3338,12 +3968,16 @@ mod tests {
                 "/components/schemas/Foo/properties/properties",
                 "Foo properties",
             ),
-            ("", ""),
         ];
 
         for (pointer, expected) in cases {
-            assert_eq!(external_schema_name(pointer), expected, "{pointer}");
+            assert_eq!(
+                external_schema_name(pointer, "unused"),
+                expected,
+                "{pointer}"
+            );
         }
+        assert_eq!(external_schema_name("", "my-schema.v2"), "my-schema.v2");
     }
 
     #[test]
@@ -3390,7 +4024,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                normalize_identifier(&external_schema_name(pointer), TargetCase::Pascal),
+                normalize_identifier(&external_schema_name(pointer, "unused"), TargetCase::Pascal),
                 Ok(expected.to_owned())
             );
         }
@@ -3643,6 +4277,243 @@ mod tests {
         (temp, files, sink)
     }
 
+    #[test]
+    fn declared_value_domain_helpers_cover_every_json_type() {
+        for (name, expected) in [
+            ("string", DeclaredType::String),
+            ("number", DeclaredType::Number),
+            ("integer", DeclaredType::Integer),
+            ("boolean", DeclaredType::Boolean),
+            ("null", DeclaredType::Null),
+            ("object", DeclaredType::Object),
+            ("array", DeclaredType::Array),
+        ] {
+            assert_eq!(DeclaredType::from_name(name), Some(expected));
+        }
+        assert_eq!(DeclaredType::from_name("unknown"), None);
+
+        for (value, domain) in [
+            (json!("value"), DeclaredType::String),
+            (json!(1.5), DeclaredType::Number),
+            (json!(1.0), DeclaredType::Integer),
+            (json!(true), DeclaredType::Boolean),
+            (Value::Null, DeclaredType::Null),
+            (json!({}), DeclaredType::Object),
+            (json!([]), DeclaredType::Array),
+        ] {
+            assert!(value_in_declared_domain(&value, &[domain], false));
+        }
+        assert!(!value_in_declared_domain(
+            &json!(1.5),
+            &[DeclaredType::Integer],
+            false
+        ));
+        assert!(value_in_declared_domain(
+            &Value::Null,
+            &[DeclaredType::String],
+            true
+        ));
+
+        let scalar = json!({ "type": "string" });
+        assert_eq!(
+            declared_value_domain(scalar.as_object().expect("object")),
+            Some((vec![DeclaredType::String], "string".to_owned()))
+        );
+        let union = json!({ "type": ["array", "null"] });
+        assert_eq!(
+            declared_value_domain(union.as_object().expect("object")),
+            Some((
+                vec![DeclaredType::Array, DeclaredType::Null],
+                "array | null".to_owned()
+            ))
+        );
+        for unrecognized in [
+            json!({}),
+            json!({ "type": "unknown" }),
+            json!({ "type": [1] }),
+            json!({ "type": true }),
+        ] {
+            assert_eq!(
+                declared_value_domain(unrecognized.as_object().expect("object")),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn enum_extension_filtering_tracks_retained_member_indices() {
+        let mut meta = SchemaMeta::default();
+        retain_enum_extensions(&mut meta, 2, &[1]);
+        assert!(meta.enum_extensions.is_none());
+
+        meta.enum_extensions = box_if_populated(EnumExtensionData {
+            enum_varnames: Some(json!(["First", "Second"])),
+            enum_names: Some(json!(["First", "Second"])),
+            enum_descriptions: Some(json!(["first", "second"])),
+            enum_descriptions_camel: Some(json!(["first", "second"])),
+        });
+        retain_enum_extensions(&mut meta, 2, &[1]);
+        let extensions = meta.enum_extensions();
+        assert_eq!(extensions.enum_varnames, Some(json!(["Second"])));
+        assert_eq!(extensions.enum_names, Some(json!(["Second"])));
+        assert_eq!(extensions.enum_descriptions, Some(json!(["second"])));
+        assert_eq!(extensions.enum_descriptions_camel, Some(json!(["second"])));
+
+        meta.enum_extensions = box_if_populated(EnumExtensionData {
+            enum_varnames: Some(json!("not an array")),
+            enum_names: Some(json!(["wrong length"])),
+            ..EnumExtensionData::default()
+        });
+        retain_enum_extensions(&mut meta, 2, &[0]);
+        let extensions = meta.enum_extensions();
+        assert_eq!(extensions.enum_varnames, Some(json!("not an array")));
+        assert_eq!(extensions.enum_names, Some(json!(["wrong length"])));
+    }
+
+    #[test]
+    fn tuple_finite_values_use_the_same_domain_filter() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Tuple": {
+                    "type": "array",
+                    "prefixItems": [{ "type": "string" }],
+                    "enum": [["value"], false]
+                },
+                "EmptyAndImpossible": {
+                    "type": "string",
+                    "enum": [],
+                    "const": false
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_ENUM_RULE_14
+                && diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("enum member false")
+        }));
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_ENUM_RULE_14
+                && diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("OpenAPI 3.1 (SHOULD)")
+        }));
+        assert!(matches!(ir.schemas[0].schema, SchemaNode::Tuple { .. }));
+        assert!(matches!(ir.schemas[1].schema, SchemaNode::Never { .. }));
+    }
+
+    #[test]
+    fn finite_type_array_and_tuple_paths_lower_to_never() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "UnknownUnion": {
+                    "type": ["string", "unknown"],
+                    "enum": ["value"]
+                },
+                "ImpossibleUnion": {
+                    "type": ["string", "null"],
+                    "enum": [false]
+                },
+                "TrackedConst": {
+                    "type": "string",
+                    "enum": ["value"],
+                    "const": false,
+                    "x-enum-varnames": ["Value"]
+                },
+                "UnknownTupleDomain": {
+                    "type": "unknown",
+                    "prefixItems": [{ "type": "string" }],
+                    "enum": [["value"]]
+                },
+                "NullableTuple": {
+                    "type": ["array", "null"],
+                    "prefixItems": [{ "type": "string" }],
+                    "enum": [null]
+                },
+                "ImpossibleTuple": {
+                    "type": "array",
+                    "prefixItems": [{ "type": "string" }],
+                    "enum": [false]
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert!(matches!(ir.schemas[0].schema, SchemaNode::AnyOf { .. }));
+        assert!(matches!(ir.schemas[1].schema, SchemaNode::Never { .. }));
+        assert!(matches!(ir.schemas[2].schema, SchemaNode::Never { .. }));
+        assert!(matches!(ir.schemas[3].schema, SchemaNode::Tuple { .. }));
+        assert!(matches!(ir.schemas[4].schema, SchemaNode::Tuple { .. }));
+        assert!(matches!(ir.schemas[5].schema, SchemaNode::Never { .. }));
+    }
+
+    #[test]
+    fn exhausted_domains_clear_nullability_on_every_lowering_path() {
+        let document = schemas_doc(
+            "3.0.4",
+            json!({
+                "Scalar": { "type": "string", "nullable": true, "enum": [false] },
+                "Empty": { "type": "string", "nullable": true, "enum": [] }
+            }),
+        );
+        let (_temp, ir, _sink) = parse_value(&document);
+        for schema in &ir.schemas {
+            assert!(matches!(schema.schema, SchemaNode::Never { .. }));
+            assert!(!schema.schema.is_nullable(), "{}", schema.name);
+        }
+
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "TypeArray": { "type": ["string", "null"], "enum": [false] },
+                "Tuple": {
+                    "type": ["array", "null"],
+                    "prefixItems": [{ "type": "string" }],
+                    "enum": [false]
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        for schema in &ir.schemas {
+            assert!(matches!(schema.schema, SchemaNode::Never { .. }));
+            assert!(!schema.schema.is_nullable(), "{}", schema.name);
+        }
+    }
+
+    #[test]
+    fn empty_schema_enum_obeys_version_rule_and_lowers_to_never() {
+        for (version, severity, rule) in [
+            ("3.0.3", Severity::Error, "OpenAPI 3.0 (MUST)"),
+            ("3.1.0", Severity::Warning, "OpenAPI 3.1 (SHOULD)"),
+        ] {
+            let document = schemas_doc(
+                version,
+                json!({
+                    "Empty": {
+                        "type": "string",
+                        "enum": []
+                    }
+                }),
+            );
+            let (_temp, ir, sink) = parse_value(&document);
+            let diagnostics = sink
+                .as_slice()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_ENUM_RULE_14)
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.len(), 1, "{version}: {:#?}", sink.as_slice());
+            assert_eq!(diagnostics[0].severity, severity);
+            assert!(diagnostics[0].message.contains(rule));
+            assert_eq!(
+                diagnostics[0].json_pointer.as_deref(),
+                Some("/components/schemas/Empty/enum")
+            );
+            assert!(matches!(ir.schemas[0].schema, SchemaNode::Never { .. }));
+        }
+    }
+
     fn entry_defs_document(definition_name: &str, component_name: Option<&str>) -> Value {
         let mut schemas = Map::new();
         if let Some(component_name) = component_name {
@@ -3856,6 +4727,111 @@ mod tests {
             diagnostic.code == CODE_SHAPE
                 && diagnostic.json_pointer.as_deref() == Some("/paths/~1pets/get")
                 && diagnostic.message == "operation is missing responses"
+        }));
+    }
+
+    #[test]
+    fn operation_refs_are_diagnosed_once_and_never_enter_the_ir() {
+        let document = json!({
+            "openapi": "3.0.4",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/pure/{id}": {
+                    "get": { "$ref": "#/x-operation" }
+                },
+                "/siblings/{id}": {
+                    "put": {
+                        "$ref": "#/x-operation",
+                        "responses": []
+                    }
+                }
+            },
+            "x-operation": {
+                "parameters": [
+                    {
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }
+                ],
+                "responses": { "204": { "description": "ok" } }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(ir.operations.is_empty());
+        let diagnostics = sink.as_slice();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.code == CODE_OPERATION_REF
+                && diagnostic.message
+                    == "OpenAPI defines '$ref' on a Path Item Object but not on an Operation Object; bundle the document before compiling, or place '$ref' on the whole path item when its target is a Path Item Object"
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.json_pointer.as_deref() == Some("/paths/~1pure~1{id}/get")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.json_pointer.as_deref() == Some("/paths/~1siblings~1{id}/put")
+        }));
+    }
+
+    #[test]
+    fn callback_and_webhook_operation_refs_use_the_same_rejection() {
+        let document = json!({
+            "openapi": "3.1.1",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/subscribe": {
+                    "post": {
+                        "callbacks": {
+                            "delivery": {
+                                "{$request.body#/callbackUrl}": {
+                                    "post": { "$ref": "#/x-operation" }
+                                }
+                            }
+                        },
+                        "responses": { "202": { "description": "accepted" } }
+                    }
+                }
+            },
+            "webhooks": {
+                "audit": {
+                    "put": {
+                        "$ref": "#/x-operation",
+                        "responses": { "204": { "description": "ignored sibling" } }
+                    }
+                }
+            },
+            "x-operation": {
+                "responses": { "204": { "description": "ok" } }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert_eq!(ir.operations.len(), 1);
+        assert!(
+            ir.operations[0].callbacks[0].expressions[0]
+                .operations
+                .is_empty()
+        );
+        assert_eq!(ir.webhooks.len(), 1);
+        assert!(ir.webhooks[0].operations.is_empty());
+        let diagnostics = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_OPERATION_REF)
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2, "{:#?}", sink.as_slice());
+        assert_eq!(sink.as_slice().len(), diagnostics.len());
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.json_pointer.as_deref()
+                == Some(
+                    "/paths/~1subscribe/post/callbacks/delivery/{$request.body#~1callbackUrl}/post",
+                )
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.json_pointer.as_deref() == Some("/webhooks/audit/put")
         }));
     }
 
@@ -4333,6 +5309,84 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn bare_required_stays_typeless_and_retains_presence_assertions() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "Thing": { "required": ["value", "description", "value"] } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::Any { meta }
+                if meta.object_constraints().required
+                    == ["value".to_owned(), "description".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn schema_ref_collection_descends_into_validation_applicators() {
+        let reference = |pointer: &str| {
+            Box::new(SchemaNode::Ref {
+                target: SchemaRef {
+                    source_id: "external.json".to_owned(),
+                    json_pointer: pointer.to_owned(),
+                },
+                meta: SchemaMeta::default(),
+            })
+        };
+        let schema = SchemaNode::Any {
+            meta: SchemaMeta {
+                validation_applicators: Some(Box::new(ValidationApplicators {
+                    not: Some(reference("/NotTarget")),
+                    property_names: Some(reference("/NameTarget")),
+                    pattern_properties: vec![PatternProperty {
+                        pattern: "^x".to_owned(),
+                        schema: *reference("/PatternTarget"),
+                        type_key: Some(PatternPropertyKey::Prefix("x".to_owned())),
+                    }],
+                    contains: Some(Box::new(ContainsApplicator {
+                        schema: reference("/ContainsTarget"),
+                        min_contains: None,
+                        max_contains: None,
+                    })),
+                    dependent_schemas: vec![("trigger".to_owned(), *reference("/DependentTarget"))],
+                    conditional: Some(Box::new(ConditionalApplicator {
+                        condition: reference("/IfTarget"),
+                        then_schema: Some(reference("/ThenTarget")),
+                        else_schema: Some(reference("/ElseTarget")),
+                    })),
+                    unevaluated_properties: Some(reference("/UnevaluatedPropertiesTarget")),
+                    unevaluated_items: Some(reference("/UnevaluatedItemsTarget")),
+                })),
+                ..SchemaMeta::default()
+            },
+        };
+        let mut refs = Vec::new();
+
+        collect_schema_refs(&schema, &mut refs);
+
+        assert_eq!(
+            refs.iter()
+                .map(|target| target.json_pointer.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "/NotTarget",
+                "/NameTarget",
+                "/PatternTarget",
+                "/ContainsTarget",
+                "/DependentTarget",
+                "/IfTarget",
+                "/ThenTarget",
+                "/ElseTarget",
+                "/UnevaluatedPropertiesTarget",
+                "/UnevaluatedItemsTarget"
+            ]
+        );
+    }
+
     fn schemas_doc(version: &str, schemas: Value) -> Value {
         json!({
             "openapi": version,
@@ -4749,6 +5803,59 @@ mod tests {
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.json_pointer.as_deref() == Some("/paths/~1headers/get/parameters/1")
         }));
+        assert!(!sink.has_errors());
+    }
+
+    #[test]
+    fn keeps_fetch_forbidden_header_parameters_in_the_ir() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/headers": {
+                    "parameters": [
+                        { "name": "Cookie", "in": "header", "schema": { "type": "string" } },
+                        { "name": "Host", "in": "header", "required": true, "schema": { "type": "string" } },
+                        { "name": "Accept", "in": "header", "schema": { "type": "string" } },
+                        { "name": "Cookie", "in": "cookie", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "get": {
+                        "parameters": [
+                            { "name": "cookie", "in": "header", "required": true, "schema": { "type": "string" } },
+                            { "name": "X-Safe", "in": "header", "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "empty" } }
+                    }
+                }
+            }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert_eq!(
+            ir.operations[0]
+                .parameters
+                .iter()
+                .map(|parameter| (parameter.name.as_str(), parameter.location))
+                .collect::<Vec<_>>(),
+            [
+                ("Cookie", ParamLocation::Header),
+                ("Host", ParamLocation::Header),
+                ("Cookie", ParamLocation::Cookie),
+                ("cookie", ParamLocation::Header),
+                ("X-Safe", ParamLocation::Header)
+            ]
+        );
+        assert!(
+            sink.as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.code != "OASTS1411")
+        );
+        assert_eq!(
+            sink.as_slice()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS1109")
+                .count(),
+            1
+        );
         assert!(!sink.has_errors());
     }
 
@@ -6007,6 +7114,22 @@ mod tests {
     }
 
     #[test]
+    fn synthesizes_default_root_server_when_servers_are_absent_or_empty() {
+        for document in [
+            json!({ "openapi": "3.1.0" }),
+            json!({ "openapi": "3.1.0", "servers": [] }),
+        ] {
+            let (_temp, ir, sink) = parse_value(&document);
+
+            assert_eq!(ir.root_servers.len(), 1);
+            assert_eq!(ir.root_servers[0].url, "/");
+            assert!(ir.root_servers[0].variables.is_empty());
+            assert_eq!(ir.root_servers[0].source.json_pointer, "");
+            assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        }
+    }
+
+    #[test]
     fn parses_root_servers_and_operation_over_path_server_inheritance() {
         let document = json!({
             "openapi": "3.1.0",
@@ -6304,6 +7427,7 @@ mod tests {
                 SecKind::Other,
                 SecKind::OAuth2 {
                     flows: OAuthFlows {
+                        declared: false,
                         implicit: None,
                         password: None,
                         client_credentials: None,
@@ -6357,6 +7481,7 @@ mod tests {
         });
         let (_temp, ir, sink) = parse_value(&document);
         let flows = OAuthFlows {
+            declared: true,
             implicit: Some(OAuthFlow {
                 authorization_url: Some(" https://example.test/authorize?raw=%2F ".to_owned()),
                 token_url: None,
@@ -6509,6 +7634,7 @@ mod tests {
             ir.security_schemes[0].kind,
             SecKind::OAuth2 {
                 flows: OAuthFlows {
+                    declared: false,
                     implicit: None,
                     password: None,
                     client_credentials: None,
@@ -6547,6 +7673,29 @@ mod tests {
             Some("/components/securitySchemes/oauth/flows/password")
         );
         assert_eq!(diagnostic.message, "OAuth2 flow requires a scopes map");
+    }
+
+    #[test]
+    fn oauth2_flows_skip_specification_extensions() {
+        let document = json!({
+            "openapi": "3.1.1",
+            "components": { "securitySchemes": { "oauth": {
+                "type": "oauth2",
+                "flows": {
+                    "x-vendor-note": "internal",
+                    "implicit": {
+                        "authorizationUrl": "https://example.test/authorize",
+                        "scopes": {}
+                    }
+                }
+            } } }
+        });
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(matches!(
+            &ir.security_schemes[0].kind,
+            SecKind::OAuth2 { flows } if flows.implicit.is_some()
+        ));
+        assert!(sink.as_slice().is_empty());
     }
 
     #[test]
@@ -6603,6 +7752,7 @@ mod tests {
             ir.security_schemes[0].kind,
             SecKind::OAuth2 {
                 flows: OAuthFlows {
+                    declared: true,
                     implicit: Some(OAuthFlow {
                         authorization_url: Some("https://example.test/authorize".to_owned()),
                         token_url: None,
@@ -7130,7 +8280,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_validation_keywords_preserve_document_order() {
+    fn new_validation_applicators_are_retained_without_validator_rejections() {
         let document: Value = serde_json::from_str(
             r#"{
                 "openapi": "3.1.0",
@@ -7157,24 +8307,23 @@ mod tests {
         .expect("valid OpenAPI document");
         let (_temp, ir, sink) = parse_value(&document);
         assert!(!sink.has_errors(), "{:?}", sink.as_slice());
-        assert!(matches!(ir.schemas[0].schema, SchemaNode::Unknown { .. }));
-        assert_eq!(
-            ir.schemas[0].schema.meta().rejected_validation_keywords,
-            [
-                "propertyNames",
-                "if",
-                "maxContains",
-                "dependentSchemas",
-                "then",
-                "patternProperties",
-                "contains",
-                "else",
-                "minContains",
-                "unevaluatedItems",
-                "not",
-                "unevaluatedProperties"
-            ]
+        assert!(matches!(ir.schemas[0].schema, SchemaNode::Any { .. }));
+        assert!(
+            ir.schemas[0]
+                .schema
+                .meta()
+                .rejected_validation_keywords
+                .is_empty()
         );
+        let applicators = ir.schemas[0].schema.meta().validation_applicators();
+        assert!(applicators.not.is_some());
+        assert!(applicators.property_names.is_some());
+        assert!(applicators.pattern_properties.is_empty());
+        assert!(applicators.contains.is_some());
+        assert!(applicators.dependent_schemas.is_empty());
+        assert!(applicators.conditional.is_some());
+        assert!(applicators.unevaluated_items.is_some());
+        assert!(applicators.unevaluated_properties.is_some());
     }
 
     #[test]
@@ -7270,7 +8419,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_condition_becomes_unknown_and_keeps_ir() {
+    fn conditional_keeps_the_type_approximation_diagnostic_and_validator_ir() {
         let document = json!({
             "openapi": "3.1.0",
             "components": { "schemas": { "Conditional": { "if": { "type": "string" } } } }
@@ -7280,11 +8429,19 @@ mod tests {
         let ir = parse(&graph, &mut sink).expect("IR");
         assert!(!sink.has_errors());
         assert!(!sink.as_slice().is_empty());
-        assert!(matches!(ir.schemas[0].schema, SchemaNode::Unknown { .. }));
+        assert!(matches!(ir.schemas[0].schema, SchemaNode::Any { .. }));
+        assert!(
+            ir.schemas[0]
+                .schema
+                .meta()
+                .validation_applicators()
+                .conditional
+                .is_some()
+        );
     }
 
     #[test]
-    fn unsupported_not_preserves_object_siblings() {
+    fn not_preserves_object_siblings_and_its_validator_subschema() {
         let document = schemas_doc(
             "3.1.0",
             json!({
@@ -7306,35 +8463,40 @@ mod tests {
                 if properties.iter().map(|(name, _, _)| name.as_str()).collect::<Vec<_>>()
                     == ["a", "b"]
         ));
-        let diagnostics = sink
-            .as_slice()
-            .iter()
-            .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
-            .collect::<Vec<_>>();
-        assert_eq!(diagnostics.len(), 1, "{:?}", sink.as_slice());
-        assert!(diagnostics[0].message.contains("'not'"));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+        assert!(matches!(
+            schema_named(&ir, "Thing")
+                .meta()
+                .validation_applicators()
+                .not
+                .as_deref(),
+            Some(SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            })
+        ));
     }
 
     #[test]
-    fn unsupported_not_without_representable_siblings_stays_unknown() {
+    fn not_without_type_siblings_retains_its_validator_subschema() {
         let document = schemas_doc("3.1.0", json!({ "Thing": { "not": { "type": "string" } } }));
         let (_temp, ir, sink) = parse_value(&document);
 
+        let schema = schema_named(&ir, "Thing");
+        assert!(matches!(schema, SchemaNode::Any { .. }));
         assert!(matches!(
-            schema_named(&ir, "Thing"),
-            SchemaNode::Unknown { .. }
+            schema.meta().validation_applicators().not.as_deref(),
+            Some(SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                meta,
+                ..
+            }) if meta.source.json_pointer == "/components/schemas/Thing/not"
         ));
-        let diagnostics = sink
-            .as_slice()
-            .iter()
-            .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
-            .collect::<Vec<_>>();
-        assert_eq!(diagnostics.len(), 1, "{:?}", sink.as_slice());
-        assert!(diagnostics[0].message.contains("'not'"));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
     }
 
     #[test]
-    fn unsupported_pattern_properties_preserves_object_siblings() {
+    fn pattern_properties_preserves_object_siblings_and_subschemas() {
         let document = schemas_doc(
             "3.1.0",
             json!({
@@ -7347,19 +8509,111 @@ mod tests {
         );
         let (_temp, ir, sink) = parse_value(&document);
 
+        let schema = schema_named(&ir, "Thing");
         assert!(matches!(
-            schema_named(&ir, "Thing"),
+            schema,
             SchemaNode::Object { properties, .. }
                 if properties.iter().map(|(name, _, _)| name.as_str()).collect::<Vec<_>>()
                     == ["a"]
         ));
-        let diagnostics = sink
-            .as_slice()
-            .iter()
-            .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
-            .collect::<Vec<_>>();
-        assert_eq!(diagnostics.len(), 1, "{:?}", sink.as_slice());
-        assert!(diagnostics[0].message.contains("'patternProperties'"));
+        assert!(matches!(
+            schema
+                .meta()
+                .validation_applicators()
+                .pattern_properties
+                .as_slice(),
+            [PatternProperty {
+                pattern,
+                schema: SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+                },
+                type_key: Some(PatternPropertyKey::Prefix(prefix)),
+            }] if pattern == "^x" && prefix == "x"
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    #[test]
+    fn pattern_property_type_keys_accept_only_faithful_literal_key_spaces() {
+        assert_eq!(
+            pattern_property_type_key(r"prefix\."),
+            Some(PatternPropertyKey::Contains("prefix.".to_owned()))
+        );
+        assert_eq!(
+            pattern_property_type_key("$"),
+            Some(PatternPropertyKey::All)
+        );
+        assert_eq!(pattern_property_type_key(r"\d"), None);
+        assert_eq!(pattern_property_type_key(r"trailing\"), None);
+    }
+
+    #[test]
+    fn new_applicator_maps_are_sorted_or_diagnosed_and_contains_retains_bounds() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Valid": {
+                    "patternProperties": {
+                        "^z": { "type": "string" },
+                        "^a": { "type": "integer" }
+                    },
+                    "contains": { "type": "number" },
+                    "minContains": 0,
+                    "maxContains": 2,
+                    "dependentSchemas": {
+                        "z": { "required": ["a"] },
+                        "a": { "required": ["z"] }
+                    }
+                },
+                "MalformedPatterns": {
+                    "patternProperties": []
+                },
+                "MalformedDependencies": {
+                    "dependentSchemas": []
+                },
+                "MalformedMinContains": {
+                    "minContains": -1
+                },
+                "MalformedMaxContains": {
+                    "maxContains": 1.5
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        let valid = schema_named(&ir, "Valid").meta().validation_applicators();
+        assert_eq!(
+            valid
+                .pattern_properties
+                .iter()
+                .map(|pattern| pattern.pattern.as_str())
+                .collect::<Vec<_>>(),
+            ["^a", "^z"]
+        );
+        assert!(matches!(
+            valid.contains.as_deref(),
+            Some(ContainsApplicator {
+                min_contains: Some(0),
+                max_contains: Some(2),
+                ..
+            })
+        ));
+        assert_eq!(
+            valid
+                .dependent_schemas
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "a"]
+        );
+        assert_eq!(
+            sink.as_slice()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_SHAPE)
+                .count(),
+            4
+        );
     }
 
     #[test]

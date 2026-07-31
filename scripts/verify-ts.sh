@@ -38,23 +38,36 @@ generate_and_verify() {
 }
 
 generate_and_verify anchors-3.1 oasts.yaml "$work/anchors-3.1" types "anchors-3.1"
+# Components named after TypeScript's global generics and after the client's own kernel imports.
+# Both configs matter: the types/validators artifacts break in the module that declares the
+# component, the client artifact in the operation module that imports one as a parameter type.
+generate_and_verify builtin-name-shadow-3.0 oasts.yaml "$work/builtin-name-shadow-3.0" types "builtin-name-shadow-3.0"
+generate_and_verify builtin-name-shadow-3.0 oasts-client.yaml "$work/client-builtin-name-shadow-3.0" client "builtin-name-shadow-3.0 (client)"
 generate_and_verify defs-entry-3.1 oasts.yaml "$work/defs-entry-3.1" types "defs-entry-3.1"
+generate_and_verify empty-enum-3.1 oasts.yaml "$work/empty-enum-3.1" types "empty-enum-3.1"
+generate_and_verify document-root-ref-3.1 oasts.yaml "$work/document-root-ref-3.1" types "document-root-ref-3.1"
 generate_and_verify inline-schema-names-3.0 oasts.yaml "$work/inline-schema-names-3.0" types "inline-schema-names-3.0"
 generate_and_verify operation-name-shadow-3.0 oasts.yaml "$work/operation-name-shadow-3.0" types "operation-name-shadow-3.0"
 generate_and_verify operation-name-shadow-3.0 oasts-client.yaml "$work/client-operation-name-shadow-3.0" client "operation-name-shadow-3.0 (client)"
+generate_and_verify reserved-word-escape-3.1 oasts.yaml "$work/reserved-word-escape-3.1" types "reserved-word-escape-3.1"
 generate_and_verify variant-name-shadow-3.0 oasts.yaml "$work/variant-name-shadow-3.0" types "variant-name-shadow-3.0"
 generate_and_verify variant-name-shadow-3.0 oasts-client.yaml "$work/client-variant-name-shadow-3.0" client "variant-name-shadow-3.0 (client)"
+generate_and_verify uninhabitable-allof-3.0 oasts.yaml "$work/uninhabitable-allof-3.0" client "uninhabitable-allof-3.0"
 
 # deepObject carries one document per conformance mode, because the extended-only shapes (array,
 # untyped) are a hard OASTS1419 under the strict default and so cannot share a document.
 generate_and_verify deep-object-3.0 oasts.yaml "$work/deep-object-strict" client "deep-object-3.0 (strict)"
 generate_and_verify deep-object-3.0 oasts-compat.yaml "$work/deep-object-extended" client "deep-object-3.0 (extended)"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-builtin-name-shadow-3.0/compile-assert/cases.ts"
+echo "compile-assert matrix ok: builtin-name-shadow-3.0"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/operation-name-shadow-3.0/compile-assert/cases.ts"
 echo "compile-assert matrix ok: operation-name-shadow-3.0"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/variant-name-shadow-3.0/compile-assert/cases.ts"
 echo "compile-assert matrix ok: variant-name-shadow-3.0"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/uninhabitable-allof-3.0/compile-assert/cases.ts"
+echo "compile-assert matrix ok: uninhabitable-allof-3.0"
 
-for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server-variables-enum-3.1 relative-server-3.1 wire-fidelity-3.1; do
+for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server-variables-enum-3.1 relative-server-3.1 wire-fidelity-3.1 media-classification-3.1 multipart-response-3.0; do
   # A fixture whose client config lives in a separate file says so on disk.
   fixture_config=oasts.yaml
   if [[ -f "fixtures/$f/oasts-client.yaml" ]]; then
@@ -75,6 +88,12 @@ echo "compile-assert matrix ok: server-variables-enum-3.1"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-relative-server-3.1/compile-assert/cases.ts"
 echo "compile-assert matrix ok: relative-server-3.1"
 
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-media-classification-3.1/compile-assert/cases.ts"
+echo "compile-assert matrix ok: media-classification-3.1"
+
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-multipart-response-3.0/compile-assert/cases.ts"
+echo "compile-assert matrix ok: multipart-response-3.0"
+
 # Webhooks showcase carries two configs. Run each with double-generation byte-identity: the
 # types-only config proves webhooks/callbacks emit in a client-free artifact; the client config
 # proves the same webhook/callback types coexist with the client and its typed response headers.
@@ -91,6 +110,9 @@ validators_runs=(
   "validators-showcase-3.1 oasts.yaml"
   "validators-showcase-3.1 oasts-client.yaml"
   "validators-readonly-3.1 oasts.yaml"
+  "validators-conjunction-ref-3.1 oasts.yaml"
+  "validators-cfa-limit-3.1 oasts.yaml"
+  "validators-identical-delegate-3.1 oasts.yaml"
   "variant-name-shadow-3.0 oasts.yaml"
   "petstore-3.0 oasts-validators.yaml"
   "webhooks-showcase-3.1 oasts-validators.yaml"

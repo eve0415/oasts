@@ -304,6 +304,8 @@ pub enum SecKind {
 /// The four OAuth 2.0 flow kinds declared by OpenAPI.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OAuthFlows {
+    /// Whether the required `flows` field was present on the Security Scheme Object.
+    pub declared: bool,
     pub implicit: Option<OAuthFlow>,
     pub password: Option<OAuthFlow>,
     pub client_credentials: Option<OAuthFlow>,
@@ -474,6 +476,54 @@ pub struct ArrayConstraints {
 pub struct ObjectConstraints {
     pub min_properties: Option<u64>,
     pub max_properties: Option<u64>,
+    /// Required names retained for a typeless schema such as `{required: ["id"]}`. Typed object
+    /// nodes keep their position-aware required data on properties/`extra_required`; validators
+    /// consult this copy only for `SchemaNode::Any`.
+    pub required: Vec<String>,
+}
+
+/// JSON Schema applicators retained solely for exact generated validation. The TypeScript type
+/// surface intentionally ignores the applicators without a faithful structural representation.
+/// `patternProperties` is the exception: the types emitter consumes it as structural index
+/// signatures while the validators emitter also applies each regex-keyed schema exactly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContainsApplicator {
+    pub schema: Box<SchemaNode>,
+    pub min_contains: Option<u64>,
+    pub max_contains: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PatternPropertyKey {
+    All,
+    Prefix(String),
+    Contains(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PatternProperty {
+    pub pattern: String,
+    pub schema: SchemaNode,
+    pub type_key: Option<PatternPropertyKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionalApplicator {
+    pub condition: Box<SchemaNode>,
+    pub then_schema: Option<Box<SchemaNode>>,
+    pub else_schema: Option<Box<SchemaNode>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ValidationApplicators {
+    pub not: Option<Box<SchemaNode>>,
+    pub property_names: Option<Box<SchemaNode>>,
+    pub pattern_properties: Vec<PatternProperty>,
+    pub contains: Option<Box<ContainsApplicator>>,
+    pub dependent_schemas: Vec<(String, SchemaNode)>,
+    pub conditional: Option<Box<ConditionalApplicator>>,
+    pub unevaluated_properties: Option<Box<SchemaNode>>,
+    pub unevaluated_items: Option<Box<SchemaNode>>,
 }
 
 /// A finite `enum`/`const` value restriction shared by structural container schemas.
@@ -494,10 +544,10 @@ pub fn finite_parts(finite: &Option<Box<FiniteConstraint>>) -> (Option<&[Value]>
 
 /// Per-node metadata carried by every [`SchemaNode`] variant.
 ///
-/// The five constraint/extension groups below are boxed because real specs populate them on well
+/// The six constraint/extension groups below are boxed because real specs populate them on well
 /// under 1% of nodes (measured on github/stripe/kubernetes corpora), yet each is large inline
 /// (`EnumExtensionData` 288 B, `NumericConstraints` 120 B, `StringConstraints` 56 B,
-/// `ArrayConstraints` 40 B, `ObjectConstraints` 32 B). Storing them as `Option<Box<…>>` keeps an
+/// `ArrayConstraints` 40 B, `ObjectConstraints` 56 B). Storing them as `Option<Box<…>>` keeps an
 /// unpopulated group at 8 bytes, so the common node stays small and the whole IR's peak heap drops
 /// — without adding an allocation to the overwhelmingly common empty case. Read them through the
 /// accessors ([`SchemaMeta::numeric_constraints`] etc.), which hand back a shared empty default
@@ -507,6 +557,13 @@ pub fn finite_parts(finite: &Option<Box<FiniteConstraint>>) -> (Option<&[Value]>
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SchemaMeta {
     pub nullable: bool,
+    /// Distinguishes an omitted `additionalProperties` from an explicit `true`/schema. Both
+    /// accept the same values, but only the explicit keyword produces evaluated-property
+    /// annotations for `unevaluatedProperties`.
+    pub additional_properties_present: bool,
+    /// Distinguishes an omitted `items` from an explicit `true`/schema for evaluated-item
+    /// annotation collection.
+    pub items_present: bool,
     /// OpenAPI `readOnly` on this schema node: the value is server-emitted only, never accepted
     /// from the client.
     pub read_only: bool,
@@ -521,6 +578,7 @@ pub struct SchemaMeta {
     pub string_constraints: Option<Box<StringConstraints>>,
     pub array_constraints: Option<Box<ArrayConstraints>>,
     pub object_constraints: Option<Box<ObjectConstraints>>,
+    pub validation_applicators: Option<Box<ValidationApplicators>>,
     pub rejected_validation_keywords: Vec<String>,
     pub source: SourceRef,
 }
@@ -551,8 +609,18 @@ static EMPTY_ARRAY_CONSTRAINTS: ArrayConstraints = ArrayConstraints {
 static EMPTY_OBJECT_CONSTRAINTS: ObjectConstraints = ObjectConstraints {
     min_properties: None,
     max_properties: None,
+    required: Vec::new(),
 };
-
+static EMPTY_VALIDATION_APPLICATORS: ValidationApplicators = ValidationApplicators {
+    not: None,
+    property_names: None,
+    pattern_properties: Vec::new(),
+    contains: None,
+    dependent_schemas: Vec::new(),
+    conditional: None,
+    unevaluated_properties: None,
+    unevaluated_items: None,
+};
 impl SchemaMeta {
     #[must_use]
     pub fn enum_extensions(&self) -> &EnumExtensionData {
@@ -589,23 +657,65 @@ impl SchemaMeta {
             .unwrap_or(&EMPTY_OBJECT_CONSTRAINTS)
     }
 
+    #[must_use]
+    pub fn validation_applicators(&self) -> &ValidationApplicators {
+        self.validation_applicators
+            .as_deref()
+            .unwrap_or(&EMPTY_VALIDATION_APPLICATORS)
+    }
+
     /// Splits this meta for conjunction lowering, where an object that carries applicators
     /// (`allOf`/`$ref`/`oneOf`/`anyOf`) alongside typed/constraint content is rewritten to a
     /// synthetic `AllOf` wrapping a typed branch. The wrapper node keeps everything read once at
     /// the conjunction — documentation, nullability, and read/write-only visibility — while the
-    /// typed branch takes the structured validation constraints it alone must enforce. The split is
-    /// what prevents double-application: TSDoc reads the wrapper's docs, validators walk the typed
-    /// branch's constraint groups, and no field lands on both sides. Both nodes point at the same
-    /// source. Returns `(wrapper, typed_branch)`.
+    /// typed branch takes the structured validation constraints it alone must enforce.
+    /// `unevaluatedProperties`/`unevaluatedItems` remain on the wrapper so they run after every
+    /// synthetic branch and see annotations produced by sibling `$ref`/composition pieces; the
+    /// other validation applicators stay with the typed branch. The split prevents
+    /// double-application: TSDoc reads the wrapper's docs, validators walk each constraint group
+    /// once, and both nodes point at the same source. Returns `(wrapper, typed_branch)`.
     #[must_use]
     pub fn split_for_conjunction(self) -> (SchemaMeta, SchemaMeta) {
+        let (wrapper_validation_applicators, typed_validation_applicators) = self
+            .validation_applicators
+            .map_or((None, None), |applicators| {
+                let ValidationApplicators {
+                    not,
+                    property_names,
+                    pattern_properties,
+                    contains,
+                    dependent_schemas,
+                    conditional,
+                    unevaluated_properties,
+                    unevaluated_items,
+                } = *applicators;
+                (
+                    box_if_populated(ValidationApplicators {
+                        unevaluated_properties,
+                        unevaluated_items,
+                        ..ValidationApplicators::default()
+                    }),
+                    box_if_populated(ValidationApplicators {
+                        not,
+                        property_names,
+                        pattern_properties,
+                        contains,
+                        dependent_schemas,
+                        conditional,
+                        ..ValidationApplicators::default()
+                    }),
+                )
+            });
         let typed = SchemaMeta {
             content_encoding: self.content_encoding,
+            additional_properties_present: self.additional_properties_present,
+            items_present: self.items_present,
             enum_extensions: self.enum_extensions,
             numeric_constraints: self.numeric_constraints,
             string_constraints: self.string_constraints,
             array_constraints: self.array_constraints,
             object_constraints: self.object_constraints,
+            validation_applicators: typed_validation_applicators,
             rejected_validation_keywords: self.rejected_validation_keywords,
             source: self.source.clone(),
             ..SchemaMeta::default()
@@ -615,6 +725,7 @@ impl SchemaMeta {
             read_only: self.read_only,
             write_only: self.write_only,
             docs: self.docs,
+            validation_applicators: wrapper_validation_applicators,
             source: self.source,
             ..SchemaMeta::default()
         };
@@ -784,11 +895,11 @@ mod tests {
 
     #[test]
     fn schema_node_and_meta_stay_small() {
-        // Guards the T3.9 layout win: boxing the five sparse constraint/extension groups (and
+        // Guards the T3.9 layout win: boxing the six sparse constraint/extension groups (and
         // `OneOf`'s discriminator) keeps `SchemaNode` far below its former 992 bytes. A regression
         // here means a large field was added inline again, re-inflating every stored node.
-        assert_eq!(size_of::<SchemaNode>(), 488);
-        assert_eq!(size_of::<SchemaMeta>(), 360);
+        assert_eq!(size_of::<SchemaNode>(), 496);
+        assert_eq!(size_of::<SchemaMeta>(), 368);
 
         // The boxed groups must each be an 8-byte null-optimized pointer inline.
         assert_eq!(size_of::<Option<Box<EnumExtensionData>>>(), 8);
@@ -796,6 +907,7 @@ mod tests {
         assert_eq!(size_of::<Option<Box<StringConstraints>>>(), 8);
         assert_eq!(size_of::<Option<Box<ArrayConstraints>>>(), 8);
         assert_eq!(size_of::<Option<Box<ObjectConstraints>>>(), 8);
+        assert_eq!(size_of::<Option<Box<ValidationApplicators>>>(), 8);
         assert_eq!(size_of::<Option<Box<Discriminator>>>(), 8);
 
         // The unboxed component sizes the design reasons about; a change here should be a
@@ -821,6 +933,41 @@ mod tests {
     }
 
     #[test]
+    fn conjunction_split_keeps_unevaluated_applicators_on_the_wrapper() {
+        let schema = || {
+            Box::new(SchemaNode::Any {
+                meta: SchemaMeta::default(),
+            })
+        };
+        let (wrapper, typed) = SchemaMeta {
+            validation_applicators: Some(Box::new(ValidationApplicators {
+                not: Some(schema()),
+                conditional: Some(Box::new(ConditionalApplicator {
+                    condition: schema(),
+                    then_schema: None,
+                    else_schema: None,
+                })),
+                unevaluated_properties: Some(schema()),
+                unevaluated_items: Some(schema()),
+                ..ValidationApplicators::default()
+            })),
+            ..SchemaMeta::default()
+        }
+        .split_for_conjunction();
+
+        let wrapper_applicators = wrapper.validation_applicators();
+        assert!(wrapper_applicators.unevaluated_properties.is_some());
+        assert!(wrapper_applicators.unevaluated_items.is_some());
+        assert!(wrapper_applicators.not.is_none());
+        assert!(wrapper_applicators.conditional.is_none());
+        let typed_applicators = typed.validation_applicators();
+        assert!(typed_applicators.not.is_some());
+        assert!(typed_applicators.conditional.is_some());
+        assert!(typed_applicators.unevaluated_properties.is_none());
+        assert!(typed_applicators.unevaluated_items.is_none());
+    }
+
+    #[test]
     fn constraint_accessors_return_the_shared_empty_default_when_absent() {
         let meta = SchemaMeta::default();
         assert_eq!(meta.enum_extensions(), &EnumExtensionData::default());
@@ -828,7 +975,10 @@ mod tests {
         assert_eq!(meta.string_constraints(), &StringConstraints::default());
         assert_eq!(meta.array_constraints(), &ArrayConstraints::default());
         assert_eq!(meta.object_constraints(), &ObjectConstraints::default());
-
+        assert_eq!(
+            meta.validation_applicators(),
+            &ValidationApplicators::default()
+        );
         let populated = SchemaMeta {
             numeric_constraints: box_if_populated(NumericConstraints {
                 minimum: Some(Number::from(2)),

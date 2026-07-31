@@ -1,0 +1,151 @@
+schemaVersion: 1
+specs:
+  - name: adyen
+    title: Adyen Checkout API
+    url: "https://raw.githubusercontent.com/Adyen/adyen-openapi/2f7d0e1961772ee974be4ed268282cf2ba8f6e03/json/CheckoutService-v71.json"
+    file: openapi.json
+    sha256: "435e08dcf6a22b2122ea1cbb59188244ae182c6a8dd8dcf87fd65ec4a0bd5eda"
+
+  - name: airbyte
+    title: Airbyte Config API
+    url: "https://raw.githubusercontent.com/airbytehq/airbyte-platform/cc525702cab2f89fda6d7eadaaa17bde78be0941/airbyte-api/server-api/src/main/openapi/config.yaml"
+    file: openapi.yaml
+    sha256: "2b3a7af5c0dfa7671dc7bbd435251a0d0acee87961aaed447cb0aa093f7c5a8a"
+
+  - name: algolia
+    title: Algolia Search API
+    url: "https://raw.githubusercontent.com/algolia/api-clients-automation/aa69a09fea4c24d617c3d85e80dbf82536521966/specs/bundled/search.yml"
+    file: openapi.yml
+    sha256: "4f17d7d803ec4c9a9ea95e6058fe8043d53969b35a6f87eb8642d026bb04f1f0"
+
+  - name: asana
+    title: Asana API
+    url: "https://raw.githubusercontent.com/Asana/openapi/c8fa791b9b971783c6cac6a3b3d228d63fa134b7/defs/asana_oas.yaml"
+    file: openapi.yaml
+    sha256: "91fbc8da08bc410e6317a4388623c51e79086152dabdc4c1283ed974b21fa414"
+
+  - name: box
+    title: Box Platform API
+    url: "https://raw.githubusercontent.com/box/box-openapi/14e37bb6149a73aabaa45853a5cdf6482af4dfeb/openapi.json"
+    file: openapi.json
+    sha256: "afcddce044ae4b8982adac38c09c100e81df71c186c9cd33046e2b0fc87eb4d6"
+
+  - name: datadog
+    title: Datadog API (v1)
+    url: "https://raw.githubusercontent.com/DataDog/datadog-api-client-python/08955aca245c733a393a41344fb2f5631be941f1/.generator/schemas/v1/openapi.yaml"
+    file: openapi.yaml
+    sha256: "948f897d5d9f67d34c293fa8005c74a5c103f37792560482def238e160005910"
+
+  - name: deepgram
+    title: Deepgram API
+    url: "https://raw.githubusercontent.com/deepgram/deepgram-api-specs/ea334393edf793b017b050f707dc973ea814af75/openapi.yml"
+    file: openapi.yml
+    sha256: "3292ff5a200b298c339505c41eb085a21f067bef7340ca679db9d0dd7c5e5e2c"
+
+  - name: discord
+    title: Discord API
+    url: "https://raw.githubusercontent.com/discord/discord-api-spec/74fda0fad044407ea280043a03ffc9bc64c4e49e/specs/openapi.json"
+    file: openapi.json
+    sha256: "8c1d0707ccdf8e380a86dfba04058820a66435c1b69d5ed82e04dd8c0520dd73"
+
+  - name: grafana
+    title: Grafana HTTP API
+    url: "https://raw.githubusercontent.com/grafana/grafana/6436dc5959e4a8c93d90e5b4b4f17630158703e4/public/openapi3.json"
+    file: openapi.json
+    sha256: "8d54e6ceb1aeef72ef8fe31213eed910d82d264b0d8328b7e53670ce4c88b46c"
+
+  - name: intercom
+    title: Intercom API
+    url: "https://raw.githubusercontent.com/intercom/Intercom-OpenAPI/090b035cade3ee114205b5012fbd1e866d98956e/descriptions/2.11/api.intercom.io.yaml"
+    file: openapi.yaml
+    sha256: "12ef03e4a6ae64ab216c210b59cdc2e97cb81452bbf614e4cbc074a9e07615f9"
+
+  - name: jira-cloud
+    title: Atlassian Jira Cloud Platform API
+    url: "https://developer.atlassian.com/cloud/jira/platform/swagger.v3.json"
+    file: openapi.json
+    sha256: "06ad5fce1da81883e4a859ed871212a5fef8bc5b31c5183f30799e98452e0e27"
+
+  - name: neon
+    title: Neon API
+    url: "https://neon.tech/api_spec/release/v2.json"
+    file: openapi.json
+    sha256: "8d4ac9809c6b106b1b9f3a9521c1d99d0e94a12b5550c1a2f5f8c4f1320b1d51"
+
+  - name: okta
+    title: Okta Management API
+    url: "https://raw.githubusercontent.com/okta/okta-management-openapi-spec/8f5de2b11403954de08891dd1e3054474430005e/dist/current/management-oneOfInheritance.yaml"
+    file: openapi.yaml
+    sha256: "f51ec93915957b7c9ce530898d608c73c8b52a4136fcacbd5027da00024f1ea5"
+
+  - name: openai
+    title: OpenAI API
+    url: "https://raw.githubusercontent.com/openai/openai-openapi/ef05a7d18e8361205342aa6c5bb9d77404c2c3ce/openapi.yaml"
+    file: openapi.yaml
+    sha256: "f41d8cd016e873f9c8e39d55347a7b2587726779012784e5e65e74d7859c51ca"
+
+  - name: ory-kratos
+    title: Ory Kratos API
+    url: "https://raw.githubusercontent.com/ory/kratos/b86338da04a040247a07f46100a86dcfb3875909/spec/api.json"
+    file: openapi.json
+    sha256: "b89835261389eac1cb6919b045c0b244375b1acfade88264c4d4c6399cbbe051"
+
+  - name: pagerduty
+    title: PagerDuty REST API
+    url: "https://raw.githubusercontent.com/PagerDuty/api-schema/c8109b5b3ecfd0cb95daac4374b6524849cd79e3/reference/REST/openapiv3.json"
+    file: openapi.json
+    sha256: "d0a44d5e127c25360d96137c527d060654f8a5039bf1f09edeb37e73c9493a6c"
+
+  - name: petstore
+    title: Swagger Petstore (reference example)
+    url: "https://raw.githubusercontent.com/swagger-api/swagger-petstore/8f0dd286987880b4af7bce552aca3813166f3049/src/main/resources/openapi.yaml"
+    file: openapi.yaml
+    sha256: "0d810997f6409d5cff6f0cf2c1466814ba52250a784cd841cacb93514c7a8502"
+
+  - name: plaid
+    title: Plaid API
+    url: "https://raw.githubusercontent.com/plaid/plaid-openapi/9902629742b5a6e1b3bbf912a607d36152492593/2020-09-14.yml"
+    file: openapi.yml
+    sha256: "64c4514ea59b82526a1206024684ebc6e91cf2a3d73276772a0f818c13d828d9"
+
+  - name: qdrant
+    title: Qdrant API
+    url: "https://raw.githubusercontent.com/qdrant/qdrant/db8fa43fcb6aedec1e739487e17a99731b74590a/docs/redoc/master/openapi.json"
+    file: openapi.json
+    sha256: "2798adcfea5204f1f82956cbe4ad05d7c201be79ee85ae22a80ccdfe16d1e2fa"
+
+  - name: sentry
+    title: Sentry API
+    url: "https://raw.githubusercontent.com/getsentry/sentry-api-schema/02ed99c976bc153254ce8774d18264c25efda79c/openapi-derefed.json"
+    file: openapi.json
+    sha256: "a4684559b3dca8e26de40150d2b848b60e6b876038bc958194bcacb4168be52a"
+
+  - name: supabase
+    title: Supabase Management API
+    url: "https://api.supabase.com/api/v1-json"
+    file: openapi.json
+    sha256: "1b26b43f6f4d13af7bca17c67554dc1de43a79987cc4943466f625d0e02747cc"
+
+  - name: twilio
+    title: Twilio API (2010 core)
+    url: "https://raw.githubusercontent.com/twilio/twilio-oai/97418cf0e4d6cf35b02333dd624090a8c62fa25d/spec/json/twilio_api_v2010.json"
+    file: openapi.json
+    sha256: "a6753266b8b05a201e8658734e332ee51d07a0913f2d419335d87bdb287643a2"
+
+  - name: typesense
+    title: Typesense API
+    url: "https://raw.githubusercontent.com/typesense/typesense-api-spec/cbdcaf9f3f6b94cfcaa15d53310f7bbbbb4b5cb2/openapi.yml"
+    file: openapi.yml
+    sha256: "1d9b3b61638e07832583376d2f977c9a2b8a4de878a7915b896b51074e0e5ba0"
+
+  - name: vercel
+    title: Vercel API
+    url: "https://openapi.vercel.sh/"
+    file: openapi.json
+    sha256: "c0e0f6c4e5151db124d82e79e38456d566ecd8184b9cab3cb518ea6432bbb175"
+
+  - name: xero
+    title: Xero Accounting API
+    url: "https://raw.githubusercontent.com/XeroAPI/Xero-OpenAPI/45ab7e8ceccbbbfb41a0487a47f9d1d00cbb4a0f/xero_accounting.yaml"
+    file: openapi.yaml
+    sha256: "dc231cafd8de7d93a1c0c8cc26944724a8af5f1e59cc54b684187ee22df36318"

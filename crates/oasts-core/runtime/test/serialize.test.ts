@@ -442,6 +442,7 @@ describe("serialize.ts region grammar", () => {
       ["oxs:helper:multipart", "encodeMultipart"],
       ["oxs:helper:multipart-cd", "escapeContentDispositionName"],
       ["oxs:helper:multipart-cd", "encodeContentDispositionFilename"],
+      ["oxs:helper:multipart-response", "decodeMultipartResponse"],
       ["oxs:helper:content-json-header", "serializeContentJsonHeader"],
       ["oxs:helper:content-json-path", "serializeContentJsonPath"],
       ["oxs:helper:content-json-query", "serializeContentJsonQuery"],

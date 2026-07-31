@@ -1720,7 +1720,6 @@ fn child_context(context: WalkContext, pointer: &str, name: &str, value: &Value)
             } else if matches!(
                 name,
                 "items"
-                    | "additionalItems"
                     | "contains"
                     | "not"
                     | "if"
@@ -3451,7 +3450,6 @@ mod tests {
         }
         for name in [
             "items",
-            "additionalItems",
             "contains",
             "not",
             "if",

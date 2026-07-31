@@ -1,0 +1,1553 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "builtin name shadow",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://api.example.test/v1"
+    }
+  ],
+  "paths": {
+    "/probe/record": {
+      "post": {
+        "operationId": "probeRecord",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/promise": {
+      "post": {
+        "operationId": "probePromise",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Promise"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PromiseHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PromiseHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/readonly": {
+      "post": {
+        "operationId": "probeReadonly",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Readonly"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReadonlyHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadonlyHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/set": {
+      "post": {
+        "operationId": "probeSet",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Set"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/omit": {
+      "post": {
+        "operationId": "probeOmit",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Omit"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OmitHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OmitHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/exclude": {
+      "post": {
+        "operationId": "probeExclude",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Exclude"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExcludeHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExcludeHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/extract": {
+      "post": {
+        "operationId": "probeExtract",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Extract"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtractHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/nonnullable": {
+      "post": {
+        "operationId": "probeNonNullable",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/NonNullable"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NonNullableHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NonNullableHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/uint8array": {
+      "post": {
+        "operationId": "probeUint8Array",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Uint8Array"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Uint8ArrayHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Uint8ArrayHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/readonlyarray": {
+      "post": {
+        "operationId": "probeReadonlyArray",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ReadonlyArray"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReadonlyArrayHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadonlyArrayHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/partial": {
+      "post": {
+        "operationId": "probePartial",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Partial"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PartialHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PartialHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/pick": {
+      "post": {
+        "operationId": "probePick",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Pick"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PickHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PickHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/map": {
+      "post": {
+        "operationId": "probeMap",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Map"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MapHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MapHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/array": {
+      "post": {
+        "operationId": "probeArray",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Array"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ArrayHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArrayHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/iterable": {
+      "post": {
+        "operationId": "probeIterable",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Iterable"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IterableHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IterableHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/required": {
+      "post": {
+        "operationId": "probeRequired",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Required"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequiredHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequiredHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/issue": {
+      "post": {
+        "operationId": "probeIssue",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Issue"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/transport": {
+      "post": {
+        "operationId": "probeTransport",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Transport"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TransportHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransportHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/calloptions": {
+      "post": {
+        "operationId": "probeCallOptions",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/CallOptions"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CallOptionsHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallOptionsHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/operationdescriptor": {
+      "post": {
+        "operationId": "probeOperationDescriptor",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OperationDescriptor"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationDescriptorHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationDescriptorHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/responsemeta": {
+      "post": {
+        "operationId": "probeResponseMeta",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ResponseMeta"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResponseMetaHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponseMetaHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/requestphasefailure": {
+      "post": {
+        "operationId": "probeRequestPhaseFailure",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RequestPhaseFailure"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestPhaseFailureHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestPhaseFailureHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/responsephasefailure": {
+      "post": {
+        "operationId": "probeResponsePhaseFailure",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ResponsePhaseFailure"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResponsePhaseFailureHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponsePhaseFailureHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/unknownhttperror": {
+      "post": {
+        "operationId": "probeUnknownHttpError",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/UnknownHttpError"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnknownHttpErrorHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnknownHttpErrorHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/probe/typedheaders": {
+      "post": {
+        "operationId": "probeTypedHeaders",
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TypedHeaders"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TypedHeadersHolder"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TypedHeadersHolder"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Record": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "RecordHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Record"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Promise": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "PromiseHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Promise"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Readonly": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "ReadonlyHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Readonly"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Set": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "SetHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Set"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Omit": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "OmitHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Omit"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Exclude": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "ExcludeHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Exclude"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Extract": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "ExtractHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Extract"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "NonNullable": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "NonNullableHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/NonNullable"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Uint8Array": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "Uint8ArrayHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Uint8Array"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "ReadonlyArray": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "ReadonlyArrayHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/ReadonlyArray"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Partial": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "PartialHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Partial"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Pick": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "PickHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Pick"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Map": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "MapHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Map"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Array": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "ArrayHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Array"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Iterable": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "IterableHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Iterable"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Required": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "RequiredHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Required"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Issue": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "IssueHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Issue"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "Transport": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "TransportHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/Transport"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "CallOptions": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "CallOptionsHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/CallOptions"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "OperationDescriptor": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "OperationDescriptorHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/OperationDescriptor"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "ResponseMeta": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "ResponseMetaHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/ResponseMeta"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "RequestPhaseFailure": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "RequestPhaseFailureHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/RequestPhaseFailure"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "ResponsePhaseFailure": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "ResponsePhaseFailureHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/ResponsePhaseFailure"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "UnknownHttpError": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "UnknownHttpErrorHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/UnknownHttpError"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "TypedHeaders": {
+        "type": "string",
+        "enum": [
+          "alpha",
+          "beta"
+        ]
+      },
+      "TypedHeadersHolder": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "nested": {
+            "$ref": "#/components/schemas/TypedHeaders"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

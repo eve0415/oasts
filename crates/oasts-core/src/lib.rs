@@ -1,7 +1,9 @@
 pub mod client_model;
+mod composition;
 pub mod config;
 pub mod diag;
 pub mod emit;
+mod headers;
 pub mod ir;
 pub mod loader;
 mod media;

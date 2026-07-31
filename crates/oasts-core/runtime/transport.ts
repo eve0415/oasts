@@ -14,6 +14,7 @@ import {
   serializeMediaType,
   serializeQueryFormExplode,
   type MultipartPart,
+  type MultipartResponsePlan,
   type ParamPrimitive,
   type ParamValue,
   type ParsedMediaType,
@@ -200,12 +201,28 @@ export type BodyPlan =
 // tag and no `'unmatched'` is assignable to it, so testing for one eliminates the HTTP arms.
 export type ResponseRangeKey = `${number}XX` | 'default';
 
+// A multipart response entry ships its decoder alongside its plan instead of a tag string, so the
+// decoder is reachable only from the descriptors that declare one. A tag would force the transport
+// to import it statically, and every generated client — multipart response or not — would carry the
+// parser. `decode` is always `decodeMultipartResponse`; keeping it a descriptor field rather than a
+// transport import is the whole point.
+export type MultipartResponseDecoder = {
+  readonly decode: (
+    bytes: Uint8Array,
+    parameters: ParsedMediaType['parameters'],
+    plan: MultipartResponsePlan,
+  ) => Readonly<Record<string, unknown>>;
+  readonly plan: MultipartResponsePlan;
+};
+
+export type ResponseMediaDecoder = 'json' | 'text' | 'binary' | MultipartResponseDecoder;
+
 export type ResponsePlan = {
   readonly match: string;
   readonly kind: 'exact' | 'range' | 'default';
   readonly status: number | null;
   readonly bodyless: boolean;
-  readonly media: readonly (readonly [string, 'json' | 'text' | 'binary'])[];
+  readonly media: readonly (readonly [string, ResponseMediaDecoder])[];
   readonly hasContentTypeDiscriminant: boolean;
 };
 
@@ -1384,10 +1401,17 @@ function matchedResponsePlan(
   return descriptor.responses.find((plan) => plan.kind === 'default') ?? null;
 }
 
+// The selected entry plus the parsed received media type, which the multipart branch needs for its
+// `boundary` parameter — the boundary is never declared, it only ever arrives on the wire.
+type SelectedResponseMedia = {
+  readonly entry: readonly [string, ResponseMediaDecoder];
+  readonly actual: ParsedMediaType;
+};
+
 function selectedResponseMedia(
   rawContentType: string | null,
   media: ResponsePlan['media'],
-): (readonly [string, 'json' | 'text' | 'binary']) | null {
+): SelectedResponseMedia | null {
   if (rawContentType === null) {
     return null;
   }
@@ -1399,7 +1423,7 @@ function selectedResponseMedia(
     actual,
     media.map((entry) => entry[0]),
   );
-  return index < 0 ? null : media[index];
+  return index < 0 ? null : { entry: media[index], actual };
 }
 
 async function decodedBody(
@@ -1414,6 +1438,7 @@ async function decodedBody(
   }
   return bytes;
 }
+
 
 function isJsonMediaType(parsed: ParsedMediaType): boolean {
   return parsed.type === 'application' &&
@@ -1597,12 +1622,18 @@ async function assembleResponse(
     );
   }
   try {
-    const payload = await decodedBody(read, selected[1]);
+    // The multipart decoder is reached only through the descriptor, so a client with no multipart
+    // response never links it. It takes the received media parameters because the boundary lives
+    // there and nowhere else.
+    const decoder = selected.entry[1];
+    const payload = typeof decoder === 'string'
+      ? await decodedBody(read, decoder)
+      : decoder.decode(new Uint8Array(read), selected.actual.parameters, decoder.plan);
     return matchedResponseResult(
       plan,
       response.status,
       payload,
-      selected[0],
+      selected.entry[0],
       responseMeta(provenanceUrl, response),
     );
   } catch (cause) {
@@ -1610,7 +1641,7 @@ async function assembleResponse(
       provenanceUrl,
       response,
       match,
-      `response body decoding failed for ${selected[0]}`,
+      `response body decoding failed for ${selected.entry[0]}`,
       cause,
     );
   }

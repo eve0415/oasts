@@ -1,21 +1,24 @@
 //! Semantic analysis, identifier normalization, and stable name allocation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use serde_json::{Number, Value};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::composition::lower_uninhabitable_all_ofs;
 use crate::config::{
-    EnumExtensions, EnumMemberCase, EnumRepresentation, NamingConfig, OperationCase,
+    EnumExtensions, EnumMemberCase, EnumRepresentation, FileCase, NamingConfig, OperationCase,
     ResolvedConfig, TypesConfig,
 };
-use crate::diag::{Diagnostic, DiagnosticSink, Severity};
+use crate::diag::{
+    Diagnostic, DiagnosticSink, NamingOverrideNamespace, NamingOverrideSuggestion, Severity,
+};
 use crate::ir::{
-    AdditionalProperties, Callback, ExclusiveBound, Ir, LinkTarget, NamedSchema, Operation,
-    ParamLocation, PrimitiveType, SchemaMeta, SchemaNode, SegmentPart, SourceRef, TupleRest,
-    Webhook, finite_parts, is_root_component_pointer,
+    AdditionalProperties, Callback, ExclusiveBound, Ir, LinkTarget, NamedSchema, OasVersion,
+    Operation, ParamLocation, SchemaMeta, SchemaNode, SegmentPart, SourceRef, TupleRest, Webhook,
+    finite_parts, is_root_component_pointer,
 };
 use crate::num::{finite_binary64, first_number_outside_binary64, render_number};
 
@@ -131,15 +134,40 @@ impl fmt::Display for NormalizeError {
 
 impl std::error::Error for NormalizeError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NameAllocation {
+    name: String,
+    escaped_reserved_word: Option<String>,
+}
+
 /// Applies the exact Unicode, tokenization, casing, and validation order.
 pub fn normalize_identifier(input: &str, case: TargetCase) -> Result<String, NormalizeError> {
+    normalize_identifier_allocation(input, case).map(|allocation| allocation.name)
+}
+
+fn normalize_identifier_allocation(
+    input: &str,
+    case: TargetCase,
+) -> Result<NameAllocation, NormalizeError> {
     let tokens = identifier_tokens(input)?;
     if tokens.is_empty() {
         return Err(NormalizeError::Empty);
     }
-    let normalized = transform_tokens(&tokens, case);
-    validate_normalized_identifier(&normalized)?;
-    Ok(normalized)
+    escape_reserved_word(transform_tokens(&tokens, case))
+}
+
+fn escape_reserved_word(identifier: String) -> Result<NameAllocation, NormalizeError> {
+    match validate_normalized_identifier(&identifier) {
+        Ok(()) => Ok(NameAllocation {
+            name: identifier,
+            escaped_reserved_word: None,
+        }),
+        Err(NormalizeError::ReservedWord(word)) => Ok(NameAllocation {
+            name: format!("{identifier}_"),
+            escaped_reserved_word: Some(word),
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -246,11 +274,13 @@ pub fn analyze(ir: Ir, config: &ResolvedConfig, sink: &mut DiagnosticSink) -> An
 
 /// Runs semantic analysis with the two option groups that affect Phase 3.
 pub fn analyze_with_options(
-    ir: Ir,
+    mut ir: Ir,
     naming: &NamingConfig,
     types: &TypesConfig,
     sink: &mut DiagnosticSink,
 ) -> Analyzed {
+    lower_uninhabitable_all_ofs(&mut ir, sink);
+    validate_unique_operation_ids(&ir, sink);
     let operation_names = allocate_operation_names(&ir, naming, sink);
     let webhook_names = allocate_webhook_names(&ir, sink);
     let callback_names = allocate_callback_names(&ir, &operation_names, &webhook_names, sink);
@@ -261,6 +291,7 @@ pub fn analyze_with_options(
     let mut enum_analysis = EnumAnalysis {
         naming,
         types,
+        version: ir.version,
         sink,
         tables: &mut enum_members,
     };
@@ -291,6 +322,50 @@ pub fn analyze_with_options(
         webhook_names,
         callback_names,
     }
+}
+
+fn for_each_operation<'ir>(ir: &'ir Ir, visit: &mut impl FnMut(&'ir Operation)) {
+    for operation in &ir.operations {
+        visit_operation_tree(operation, visit);
+    }
+    for webhook in &ir.webhooks {
+        for operation in &webhook.operations {
+            visit_operation_tree(operation, visit);
+        }
+    }
+}
+
+fn visit_operation_tree<'ir>(operation: &'ir Operation, visit: &mut impl FnMut(&'ir Operation)) {
+    visit(operation);
+    for callback in &operation.callbacks {
+        for expression in &callback.expressions {
+            for operation in &expression.operations {
+                visit_operation_tree(operation, visit);
+            }
+        }
+    }
+}
+
+fn validate_unique_operation_ids(ir: &Ir, sink: &mut DiagnosticSink) {
+    let mut seen: HashMap<&str, &SourceRef> = HashMap::new();
+    for_each_operation(ir, &mut |operation| {
+        let Some(operation_id) = operation.operation_id.as_deref() else {
+            return;
+        };
+        if let Some(previous_source) = seen.get(operation_id) {
+            sink.push(source_diagnostic(
+                CODE_OPERATION_NAME,
+                format!(
+                    "duplicate operationId '{operation_id}' declared at {} and {}; OpenAPI requires operationId to be unique among all operations",
+                    previous_source.display(),
+                    operation.source.display()
+                ),
+                &operation.source,
+            ));
+        } else {
+            seen.insert(operation_id, &operation.source);
+        }
+    });
 }
 
 fn resolve_links(ir: &Ir, sink: &mut DiagnosticSink) -> Vec<ResolvedLink> {
@@ -392,8 +467,15 @@ pub fn derive_operation_name(
     operation: &Operation,
     case: TargetCase,
 ) -> Result<String, NormalizeError> {
+    derive_operation_name_allocation(operation, case).map(|allocation| allocation.name)
+}
+
+fn derive_operation_name_allocation(
+    operation: &Operation,
+    case: TargetCase,
+) -> Result<NameAllocation, NormalizeError> {
     if let Some(operation_id) = &operation.operation_id {
-        return normalize_identifier(operation_id, case);
+        return normalize_identifier_allocation(operation_id, case);
     }
     let mut candidate = operation.method.to_ascii_lowercase();
     for segment in &operation.path_template {
@@ -410,7 +492,13 @@ pub fn derive_operation_name(
             }
         }
     }
-    normalize_identifier(&candidate, case)
+    normalize_identifier_allocation(&candidate, case)
+}
+
+struct PendingOperationName {
+    allocated: AllocatedOperationName,
+    operation_id: Option<String>,
+    overridden: bool,
 }
 
 fn allocate_operation_names(
@@ -422,8 +510,7 @@ fn allocate_operation_names(
         OperationCase::Camel => TargetCase::Camel,
         OperationCase::Preserve => TargetCase::Preserve,
     };
-    let mut names = Vec::new();
-    let mut seen: HashMap<String, (String, SourceRef)> = HashMap::new();
+    let mut pending = Vec::new();
     for (operation_index, operation) in ir.operations.iter().enumerate() {
         // An override keyed on operationId supplies the final name verbatim: the case transform
         // does not run on it and it must still validate and collide like any derived name.
@@ -433,9 +520,12 @@ fn allocate_operation_names(
             .and_then(|id| naming.overrides.operations.get(id));
         let allocation = match override_name {
             Some(name) => validate_final_identifier(name)
-                .map(|()| name.clone())
+                .map(|()| NameAllocation {
+                    name: name.clone(),
+                    escaped_reserved_word: None,
+                })
                 .map_err(|error| (name.clone(), error)),
-            None => derive_operation_name(operation, case).map_err(|error| {
+            None => derive_operation_name_allocation(operation, case).map_err(|error| {
                 (
                     operation
                         .operation_id
@@ -447,19 +537,25 @@ fn allocate_operation_names(
             }),
         };
         match allocation {
-            Ok(name) => {
-                report_collision(
-                    "operation",
-                    CODE_OPERATION_NAME,
-                    &name,
-                    &operation.source,
-                    &mut seen,
-                    sink,
-                );
-                names.push(AllocatedOperationName {
-                    operation_index,
-                    name,
-                    source: operation.source.clone(),
+            Ok(allocation) => {
+                if let Some(word) = &allocation.escaped_reserved_word {
+                    push_reserved_word_warning(
+                        CODE_OPERATION_NAME,
+                        "operation",
+                        word,
+                        &allocation.name,
+                        &operation.source,
+                        sink,
+                    );
+                }
+                pending.push(PendingOperationName {
+                    allocated: AllocatedOperationName {
+                        operation_index,
+                        name: allocation.name,
+                        source: operation.source.clone(),
+                    },
+                    operation_id: operation.operation_id.clone(),
+                    overridden: override_name.is_some(),
                 });
             }
             Err((input, error)) => push_name_error(
@@ -472,7 +568,106 @@ fn allocate_operation_names(
             ),
         }
     }
+
+    // Borrowed keys, and the whole remedy pass gated on an actual collision — see the matching
+    // note in `allocate_schema_names`: suggestions only ever reach a user through a collision
+    // diagnostic, so a clean document must not pay to build them.
+    let mut groups = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, operation) in pending.iter().enumerate() {
+        groups
+            .entry(operation.allocated.name.as_str())
+            .or_default()
+            .push(index);
+    }
+    let mut group_suggestions = HashMap::new();
+    if groups.values().any(|indices| indices.len() > 1) {
+        let existing_file_names = pending.iter().filter_map(|operation| {
+            let source_name = if operation.overridden {
+                operation.allocated.name.as_str()
+            } else {
+                operation
+                    .operation_id
+                    .as_deref()
+                    .unwrap_or(&operation.allocated.name)
+            };
+            crate::emit::file_base_name(source_name, naming.file_case).ok()
+        });
+        let mut suggester = OverrideSuggester::new(
+            naming.file_case,
+            pending
+                .iter()
+                .map(|operation| operation.allocated.name.as_str()),
+            existing_file_names,
+        );
+        for (name, indices) in &groups {
+            if indices.len() < 2 {
+                continue;
+            }
+            let raw_names = indices
+                .iter()
+                .filter_map(|index| pending[*index].operation_id.as_deref())
+                .collect::<Vec<_>>();
+            let unique = raw_names.iter().copied().collect::<HashSet<_>>();
+            if raw_names.len() == indices.len() && unique.len() == indices.len() {
+                group_suggestions.insert(
+                    (*name).to_owned(),
+                    suggester.allocate(NamingOverrideNamespace::Operations, name, raw_names),
+                );
+            }
+        }
+    }
+
+    let mut names = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for operation in pending {
+        if let Some(previous_index) = seen.get(&operation.allocated.name).copied() {
+            let previous = &names[previous_index];
+            let diagnostic = operation_collision_diagnostic(
+                &operation,
+                previous,
+                group_suggestions
+                    .get(&operation.allocated.name)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            if let Some(diagnostic) = diagnostic {
+                sink.push(diagnostic);
+            }
+        } else {
+            seen.insert(operation.allocated.name.clone(), names.len());
+        }
+        names.push(operation);
+    }
     names
+        .into_iter()
+        .map(|operation| operation.allocated)
+        .collect()
+}
+
+fn operation_collision_diagnostic(
+    operation: &PendingOperationName,
+    previous: &PendingOperationName,
+    suggestions: Vec<NamingOverrideSuggestion>,
+) -> Option<Diagnostic> {
+    if matches!(
+        (&previous.operation_id, &operation.operation_id),
+        (Some(previous_id), Some(operation_id)) if previous_id == operation_id
+    ) {
+        return None;
+    }
+    Some(
+        source_diagnostic(
+            CODE_OPERATION_NAME,
+            format!(
+                "operation name collision: '{}' allocated at {} and {}",
+                operation.allocated.name,
+                previous.allocated.source.display(),
+                operation.allocated.source.display()
+            ),
+            &operation.allocated.source,
+        )
+        .with_naming_override_suggestions(suggestions),
+    )
 }
 
 /// Allocates one name stem per webhook operation, in a collision scope entirely separate from
@@ -698,28 +893,30 @@ fn derive_callback_stem(
     ))
 }
 
-/// Whether a schema is one the document declares under `components/schemas`, as opposed to one
-/// materialized at an inline pointer (a media type's `schema`, a `oneOf` branch, a `$defs` entry).
+/// Whether a schema has a stable raw name that can key `naming.overrides.schemas`.
 ///
-/// `naming.overrides.schemas` keys address declared components only, because that is how OpenAPI
-/// itself addresses them — by their map key. An inline schema has no such key; it is addressed by
-/// JSON Pointer, and its generated identifier is derived, so matching an override against that
-/// derived name would be matching a name the document never wrote. The trailing-segment test keeps
+/// Declared components use their map key. A materialized document-root schema uses its file stem,
+/// which is likewise stable and user-addressable. Other materialized schemas are named from their
+/// pointer context, so they remain outside the override namespace. The root-component test keeps
 /// `/components/schemas/Foo/properties/bar` — an inline schema that merely lives under a declared
 /// one — out.
-fn is_declared_component(source: &SourceRef) -> bool {
-    is_root_component_pointer(&source.json_pointer)
+fn is_overrideable_schema(source: &SourceRef) -> bool {
+    source.json_pointer.is_empty() || is_root_component_pointer(&source.json_pointer)
 }
 
-/// The override entry that renames `schema`, if the document declares it as a component and the
-/// user named it.
-fn declared_component_override<'naming>(
+/// The override entry that renames `schema`, if its raw name is user-addressable.
+fn schema_override<'naming>(
     naming: &'naming NamingConfig,
     schema: &NamedSchema,
 ) -> Option<&'naming String> {
-    is_declared_component(&schema.source)
+    is_overrideable_schema(&schema.source)
         .then(|| naming.overrides.schemas.get(&schema.name))
         .flatten()
+}
+
+struct PendingSchemaName {
+    allocated: AllocatedSchemaName,
+    overridden: bool,
 }
 
 fn allocate_schema_names(
@@ -727,38 +924,38 @@ fn allocate_schema_names(
     naming: &NamingConfig,
     sink: &mut DiagnosticSink,
 ) -> Vec<AllocatedSchemaName> {
-    let mut names = Vec::new();
-    let mut seen: HashMap<String, (String, SourceRef)> = HashMap::new();
+    let mut pending = Vec::new();
     for (schema_index, schema) in ir.schemas.iter().enumerate() {
         // An override supplies the complete identifier: typePrefix/typeSuffix are not applied on
         // top, but the value must still validate and collide like any generated name.
-        let allocation = match declared_component_override(naming, schema) {
+        let allocation = match schema_override(naming, schema) {
             Some(name) => validate_final_identifier(name)
-                .map(|()| name.clone())
+                .map(|()| NameAllocation {
+                    name: name.clone(),
+                    escaped_reserved_word: None,
+                })
                 .map_err(|error| (name.clone(), error)),
             None => normalize_identifier(&schema.name, TargetCase::Pascal)
                 .and_then(|base| {
                     let candidate = format!("{}{}{}", naming.type_prefix, base, naming.type_suffix);
                     validate_final_identifier(&candidate)?;
-                    Ok(candidate)
+                    Ok(NameAllocation {
+                        name: candidate,
+                        escaped_reserved_word: None,
+                    })
                 })
                 .map_err(|error| (schema.name.clone(), error)),
         };
         match allocation {
-            Ok(name) => {
-                report_collision(
-                    "schema",
-                    CODE_TYPE_NAME,
-                    &name,
-                    &schema.source,
-                    &mut seen,
-                    sink,
-                );
-                names.push(AllocatedSchemaName {
-                    schema_index,
-                    wire_name: schema.name.clone(),
-                    name,
-                    source: schema.source.clone(),
+            Ok(allocation) => {
+                pending.push(PendingSchemaName {
+                    allocated: AllocatedSchemaName {
+                        schema_index,
+                        wire_name: schema.name.clone(),
+                        name: allocation.name,
+                        source: schema.source.clone(),
+                    },
+                    overridden: schema_override(naming, schema).is_some(),
                 });
             }
             Err((input, error)) => push_name_error(
@@ -771,7 +968,159 @@ fn allocate_schema_names(
             ),
         }
     }
+
+    // Keyed on borrowed names: every document pays for this grouping, and almost none of them
+    // collide, so the common run must not allocate a String per schema to learn that.
+    let mut groups = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, schema) in pending.iter().enumerate() {
+        groups
+            .entry(schema.allocated.name.as_str())
+            .or_default()
+            .push(index);
+    }
+    let mut all_suggestions = Vec::new();
+    // Suggestions only ever reach the user attached to an OASTS1202, so a document with no
+    // identifier collision can never be shown one. Everything below — indexing every allocated
+    // name, deriving a file base per schema, grouping those — is remedy machinery, and skipping
+    // it outright is what keeps the overwhelmingly common clean run from paying for it.
+    if groups.values().any(|indices| indices.len() > 1) {
+        let mut suggested_sources = HashSet::new();
+        let existing_file_names = pending.iter().filter_map(|schema| {
+            let source_name = if schema.overridden {
+                schema.allocated.name.as_str()
+            } else {
+                &schema.allocated.wire_name
+            };
+            crate::emit::file_base_name(source_name, naming.file_case).ok()
+        });
+        let mut suggester = OverrideSuggester::new(
+            naming.file_case,
+            pending.iter().map(|schema| schema.allocated.name.as_str()),
+            existing_file_names,
+        );
+        collect_schema_override_suggestions(
+            &pending,
+            naming,
+            &groups,
+            &mut suggester,
+            &mut suggested_sources,
+            &mut all_suggestions,
+        );
+    }
+
+    let mut names = Vec::new();
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for schema in &pending {
+        if let Some(previous_index) = seen.get(schema.allocated.name.as_str()).copied() {
+            let previous: &&PendingSchemaName = &names[previous_index];
+            let message = format!(
+                "schema name collision: '{}' allocated at {} and {}",
+                schema.allocated.name,
+                previous.allocated.source.display(),
+                schema.allocated.source.display()
+            );
+            sink.push(
+                source_diagnostic(CODE_TYPE_NAME, message, &schema.allocated.source)
+                    .with_naming_override_suggestions(all_suggestions.clone()),
+            );
+        } else {
+            seen.insert(schema.allocated.name.as_str(), names.len());
+        }
+        names.push(schema);
+    }
     names
+        .into_iter()
+        .map(|schema| schema.allocated.clone())
+        .collect()
+}
+
+/// The paste-ready `naming.overrides.schemas` block for a run that collided, covering both the
+/// identifier collisions themselves and the latent file-path collisions a pasted override would
+/// otherwise uncover on the next run.
+fn collect_schema_override_suggestions(
+    pending: &[PendingSchemaName],
+    naming: &NamingConfig,
+    groups: &BTreeMap<&str, Vec<usize>>,
+    suggester: &mut OverrideSuggester,
+    suggested_sources: &mut HashSet<String>,
+    all_suggestions: &mut Vec<NamingOverrideSuggestion>,
+) {
+    for (name, indices) in groups {
+        if indices.len() < 2
+            || !indices
+                .iter()
+                .all(|index| is_overrideable_schema(&pending[*index].allocated.source))
+        {
+            continue;
+        }
+        let raw_names = indices
+            .iter()
+            .map(|index| pending[*index].allocated.wire_name.as_str())
+            .collect::<Vec<_>>();
+        let unique = raw_names.iter().copied().collect::<HashSet<_>>();
+        if unique.len() == indices.len() {
+            let suggestions = suggester.allocate(NamingOverrideNamespace::Schemas, name, raw_names);
+            suggested_sources.extend(
+                suggestions
+                    .iter()
+                    .map(|suggestion| suggestion.source_name.clone()),
+            );
+            all_suggestions.extend(suggestions);
+        }
+    }
+
+    // A pasted identifier override also becomes that declaration's file-base source. Include
+    // latent raw-name path collisions in the same block so resolving OASTS1202 cannot merely
+    // uncover OASTS1302 on the next run.
+    let mut file_groups = BTreeMap::<String, Vec<usize>>::new();
+    for (index, schema) in pending.iter().enumerate() {
+        if !is_overrideable_schema(&schema.allocated.source) {
+            continue;
+        }
+        let source_name = if schema.overridden {
+            schema.allocated.name.as_str()
+        } else {
+            &schema.allocated.wire_name
+        };
+        if let Ok(file_base) = crate::emit::file_base_name(source_name, naming.file_case) {
+            file_groups
+                .entry(file_base.to_ascii_lowercase())
+                .or_default()
+                .push(index);
+        }
+    }
+    for indices in file_groups.values().filter(|indices| indices.len() > 1) {
+        let raw_names = indices
+            .iter()
+            .map(|index| pending[*index].allocated.wire_name.as_str())
+            .collect::<Vec<_>>();
+        let unique = raw_names.iter().copied().collect::<HashSet<_>>();
+        if unique.len() != indices.len()
+            || raw_names
+                .iter()
+                .any(|source_name| suggested_sources.contains(*source_name))
+        {
+            continue;
+        }
+        let suggestions = suggester.allocate_with_bases(
+            NamingOverrideNamespace::Schemas,
+            indices
+                .iter()
+                .map(|index| {
+                    (
+                        pending[*index].allocated.wire_name.as_str(),
+                        pending[*index].allocated.name.as_str(),
+                    )
+                })
+                .collect(),
+        );
+        suggested_sources.extend(
+            suggestions
+                .iter()
+                .map(|suggestion| suggestion.source_name.clone()),
+        );
+        all_suggestions.extend(suggestions);
+    }
 }
 
 /// Reports every override key that names no declaration in the document.
@@ -785,7 +1134,7 @@ fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut Diagnos
         if !ir
             .schemas
             .iter()
-            .any(|schema| &schema.name == key && is_declared_component(&schema.source))
+            .any(|schema| &schema.name == key && is_overrideable_schema(&schema.source))
         {
             sink.push(unmatched_override_diagnostic("schema", "schemas", key));
         }
@@ -819,6 +1168,77 @@ fn unmatched_override_diagnostic(kind: &str, namespace: &str, key: &str) -> Diag
 /// Escapes a single JSON Pointer reference token per RFC 6901 (`~` -> `~0`, `/` -> `~1`).
 fn escape_json_pointer_token(token: &str) -> String {
     token.replace('~', "~0").replace('/', "~1")
+}
+
+struct OverrideSuggester {
+    file_case: FileCase,
+    taken_identifiers: HashSet<String>,
+    taken_file_bases: HashSet<String>,
+}
+
+impl OverrideSuggester {
+    fn new<'name>(
+        file_case: FileCase,
+        identifiers: impl IntoIterator<Item = &'name str>,
+        file_bases: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            file_case,
+            taken_identifiers: identifiers.into_iter().map(str::to_owned).collect(),
+            taken_file_bases: file_bases
+                .into_iter()
+                .map(|file_base| file_base.to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    fn allocate(
+        &mut self,
+        namespace: NamingOverrideNamespace,
+        base: &str,
+        source_names: Vec<&str>,
+    ) -> Vec<NamingOverrideSuggestion> {
+        self.allocate_with_bases(
+            namespace,
+            source_names
+                .into_iter()
+                .map(|source_name| (source_name, base))
+                .collect(),
+        )
+    }
+
+    fn allocate_with_bases(
+        &mut self,
+        namespace: NamingOverrideNamespace,
+        mut entries: Vec<(&str, &str)>,
+    ) -> Vec<NamingOverrideSuggestion> {
+        entries.sort_unstable_by_key(|(source_name, _)| *source_name);
+        entries
+            .into_iter()
+            .map(|(source_name, base)| {
+                let mut suffix = 1_u64;
+                loop {
+                    let identifier = format!("{base}_{suffix}");
+                    suffix += 1;
+                    let file_base = crate::emit::file_base_name(&identifier, self.file_case)
+                        .expect("a valid TypeScript identifier always produces a safe file base")
+                        .to_ascii_lowercase();
+                    if self.taken_identifiers.contains(&identifier)
+                        || self.taken_file_bases.contains(&file_base)
+                    {
+                        continue;
+                    }
+                    self.taken_identifiers.insert(identifier.clone());
+                    self.taken_file_bases.insert(file_base);
+                    break NamingOverrideSuggestion {
+                        namespace,
+                        source_name: source_name.to_owned(),
+                        identifier,
+                    };
+                }
+            })
+            .collect()
+    }
 }
 
 fn report_collision(
@@ -871,9 +1291,29 @@ fn push_name_error(
     ));
 }
 
+fn push_reserved_word_warning(
+    code: &'static str,
+    kind: &str,
+    original: &str,
+    emitted: &str,
+    source: &SourceRef,
+    sink: &mut DiagnosticSink,
+) {
+    let mut diagnostic = source_diagnostic(
+        code,
+        format!(
+            "{kind} identifier '{original}' is a TypeScript reserved word; emitted as '{emitted}'"
+        ),
+        source,
+    );
+    diagnostic.severity = Severity::Warning;
+    sink.push(diagnostic);
+}
+
 struct EnumAnalysis<'options, 'output> {
     naming: &'options NamingConfig,
     types: &'options TypesConfig,
+    version: OasVersion,
     sink: &'output mut DiagnosticSink,
     tables: &'output mut Vec<EnumMemberTable>,
 }
@@ -883,29 +1323,16 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
     validate_annotation_domain(schema.meta(), analysis.sink);
     match schema {
         SchemaNode::Primitive {
-            ty,
             enum_values,
             const_value,
             meta,
             ..
-        } => analyze_finite_values(
-            Some(*ty),
-            enum_values.as_deref(),
-            const_value.as_ref(),
-            meta,
-            analysis,
-        ),
+        } => analyze_finite_values(enum_values.as_deref(), const_value.as_ref(), meta, analysis),
         SchemaNode::Finite {
             enum_values,
             const_value,
             meta,
-        } => analyze_finite_values(
-            None,
-            enum_values.as_deref(),
-            const_value.as_ref(),
-            meta,
-            analysis,
-        ),
+        } => analyze_finite_values(enum_values.as_deref(), const_value.as_ref(), meta, analysis),
         SchemaNode::Object {
             properties,
             additional_properties,
@@ -914,7 +1341,7 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
             ..
         } => {
             let (enum_values, const_value) = finite_parts(finite);
-            analyze_finite_values(None, enum_values, const_value, meta, analysis);
+            analyze_finite_values(enum_values, const_value, meta, analysis);
             for (_, property, _) in properties {
                 analyze_schema_enums(property, analysis);
             }
@@ -933,7 +1360,7 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
             ..
         } => {
             let (enum_values, const_value) = finite_parts(finite);
-            analyze_finite_values(None, enum_values, const_value, meta, analysis);
+            analyze_finite_values(enum_values, const_value, meta, analysis);
             analyze_schema_enums(items, analysis);
         }
         SchemaNode::Tuple {
@@ -943,7 +1370,7 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
             meta,
         } => {
             let (enum_values, const_value) = finite_parts(finite);
-            analyze_finite_values(None, enum_values, const_value, meta, analysis);
+            analyze_finite_values(enum_values, const_value, meta, analysis);
             for item in prefix_items {
                 analyze_schema_enums(item, analysis);
             }
@@ -965,6 +1392,37 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
         | SchemaNode::Unknown { meta, .. } => {
             validate_enum_extensions(None, meta, analysis.types, analysis.sink);
         }
+    }
+    let applicators = schema.meta().validation_applicators();
+    if let Some(schema) = &applicators.not {
+        analyze_schema_enums(schema, analysis);
+    }
+    if let Some(schema) = &applicators.property_names {
+        analyze_schema_enums(schema, analysis);
+    }
+    for pattern in &applicators.pattern_properties {
+        analyze_schema_enums(&pattern.schema, analysis);
+    }
+    if let Some(contains) = &applicators.contains {
+        analyze_schema_enums(&contains.schema, analysis);
+    }
+    for (_, schema) in &applicators.dependent_schemas {
+        analyze_schema_enums(schema, analysis);
+    }
+    if let Some(conditional) = &applicators.conditional {
+        analyze_schema_enums(&conditional.condition, analysis);
+        if let Some(schema) = &conditional.then_schema {
+            analyze_schema_enums(schema, analysis);
+        }
+        if let Some(schema) = &conditional.else_schema {
+            analyze_schema_enums(schema, analysis);
+        }
+    }
+    if let Some(schema) = &applicators.unevaluated_properties {
+        analyze_schema_enums(schema, analysis);
+    }
+    if let Some(schema) = &applicators.unevaluated_items {
+        analyze_schema_enums(schema, analysis);
     }
 }
 
@@ -1022,7 +1480,6 @@ fn validate_annotation_domain(meta: &SchemaMeta, sink: &mut DiagnosticSink) {
 }
 
 fn analyze_finite_values(
-    ty: Option<PrimitiveType>,
     enum_values: Option<&[Value]>,
     const_value: Option<&Value>,
     meta: &SchemaMeta,
@@ -1032,23 +1489,22 @@ fn analyze_finite_values(
         validate_enum_extensions(enum_values, meta, analysis.types, analysis.sink);
     if let Some(values) = enum_values {
         if values.is_empty() {
-            enum_error(meta, "enum must contain at least one member", analysis.sink);
-        }
-        if let Some(ty) = ty {
-            validate_value_domain(values, ty, meta, "enum", analysis.sink);
+            match analysis.version {
+                OasVersion::V3_0 => enum_error(
+                    meta,
+                    "enum must contain at least one member in OpenAPI 3.0 (MUST)",
+                    analysis.sink,
+                ),
+                OasVersion::V3_1 => enum_warning(
+                    meta,
+                    "enum should contain at least one member in OpenAPI 3.1 (SHOULD); the schema admits no value and is lowered to never",
+                    analysis.sink,
+                ),
+            }
         }
         validate_numeric_members(values, meta, true, analysis.sink);
     }
     if let Some(value) = const_value {
-        if let Some(ty) = ty {
-            validate_value_domain(
-                std::slice::from_ref(value),
-                ty,
-                meta,
-                "const",
-                analysis.sink,
-            );
-        }
         validate_numeric_members(std::slice::from_ref(value), meta, false, analysis.sink);
     }
 
@@ -1084,10 +1540,10 @@ fn analyze_finite_values(
         };
         let name_result = match explicit_name {
             Some(name) => validate_explicit_enum_name(name.clone()),
-            None => derive_enum_member_name(value, analysis.naming.enum_member_case),
+            None => derive_enum_member_name_allocation(value, analysis.naming.enum_member_case),
         };
-        let name = match name_result {
-            Ok(name) => name,
+        let allocation = match name_result {
+            Ok(allocation) => allocation,
             Err(error) => {
                 enum_error(
                     meta,
@@ -1097,6 +1553,17 @@ fn analyze_finite_values(
                 continue;
             }
         };
+        if let Some(word) = &allocation.escaped_reserved_word {
+            push_reserved_word_warning(
+                CODE_ENUM_RULE_14,
+                "enum member",
+                word,
+                &allocation.name,
+                &meta.source,
+                analysis.sink,
+            );
+        }
+        let name = allocation.name;
         let (folded, collision) = casefold_collision(&name, &seen, |previous| {
             format!("enum member names '{previous}' and '{name}' collide after case folding")
         });
@@ -1111,6 +1578,7 @@ fn analyze_finite_values(
                 enum_index
                     .and_then(|index| descriptions.get(index))
                     .cloned()
+                    .flatten()
             });
         members.push(EnumMember {
             name,
@@ -1127,7 +1595,7 @@ fn analyze_finite_values(
 #[derive(Default)]
 struct ValidatedExtensions {
     names: Option<Vec<String>>,
-    descriptions: Option<Vec<String>>,
+    descriptions: Option<Vec<Option<String>>>,
 }
 
 fn validate_enum_extensions(
@@ -1166,6 +1634,7 @@ fn validate_enum_extensions(
         expected_len,
         meta,
         sink,
+        str::to_owned,
     );
     let second_names = validate_extension_array(
         "x-enumNames",
@@ -1173,6 +1642,7 @@ fn validate_enum_extensions(
         expected_len,
         meta,
         sink,
+        str::to_owned,
     );
     let first_descriptions = validate_extension_array(
         "x-enum-descriptions",
@@ -1180,11 +1650,11 @@ fn validate_enum_extensions(
         expected_len,
         meta,
         sink,
+        |description| Some(description.to_owned()),
     );
-    let second_descriptions = validate_extension_array(
-        "x-enumDescriptions",
+    let second_descriptions = validate_camel_enum_descriptions(
+        enum_values,
         enum_ext.enum_descriptions_camel.as_ref(),
-        expected_len,
         meta,
         sink,
     );
@@ -1212,27 +1682,88 @@ fn validate_enum_extensions(
     }
 }
 
-fn validate_extension_array(
+fn validate_camel_enum_descriptions(
+    enum_values: Option<&[Value]>,
+    value: Option<&Value>,
+    meta: &SchemaMeta,
+    sink: &mut DiagnosticSink,
+) -> Option<Vec<Option<String>>> {
+    let value = value?;
+    let enum_values = enum_values.unwrap_or_default();
+    match value {
+        Value::Array(_) => validate_extension_array(
+            "x-enumDescriptions",
+            Some(value),
+            enum_values.len(),
+            meta,
+            sink,
+            |description| Some(description.to_owned()),
+        ),
+        Value::Object(entries) => {
+            let Some(entries) = entries
+                .iter()
+                .map(|(name, description)| Some((name, description.as_str()?)))
+                .collect::<Option<Vec<_>>>()
+            else {
+                enum_extension_warning(
+                    meta,
+                    "enum extension 'x-enumDescriptions' must map enum values to description strings; it is ignored",
+                    sink,
+                );
+                return None;
+            };
+            let mut descriptions = vec![None; enum_values.len()];
+            for (name, description) in entries {
+                let Some(index) = enum_values
+                    .iter()
+                    .position(|value| value.as_str() == Some(name))
+                else {
+                    enum_extension_warning(
+                        meta,
+                        format!(
+                            "enum extension 'x-enumDescriptions' key '{name}' does not name a string enum member; the entry is ignored"
+                        ),
+                        sink,
+                    );
+                    continue;
+                };
+                descriptions[index] = Some(description.to_owned());
+            }
+            Some(descriptions)
+        }
+        _ => {
+            enum_extension_warning(
+                meta,
+                "enum extension 'x-enumDescriptions' must be an array or a map; it is ignored",
+                sink,
+            );
+            None
+        }
+    }
+}
+
+fn validate_extension_array<T>(
     name: &str,
     value: Option<&Value>,
     expected_len: usize,
     meta: &SchemaMeta,
     sink: &mut DiagnosticSink,
-) -> Option<Vec<String>> {
+    convert: impl FnMut(&str) -> T,
+) -> Option<Vec<T>> {
     let value = value?;
     let Some(array) = value.as_array() else {
-        enum_error(
+        enum_extension_warning(
             meta,
-            format!("enum extension '{name}' must be an array"),
+            format!("enum extension '{name}' must be an array; it is ignored"),
             sink,
         );
         return None;
     };
     if array.len() != expected_len {
-        enum_error(
+        enum_extension_warning(
             meta,
             format!(
-                "enum extension '{name}' has length {}, expected {expected_len}",
+                "enum extension '{name}' has length {}, expected {expected_len}; it is ignored",
                 array.len()
             ),
             sink,
@@ -1240,14 +1771,14 @@ fn validate_extension_array(
         return None;
     }
     let Some(strings) = array.iter().map(Value::as_str).collect::<Option<Vec<_>>>() else {
-        enum_error(
+        enum_extension_warning(
             meta,
-            format!("enum extension '{name}' must contain only strings"),
+            format!("enum extension '{name}' must contain only strings; it is ignored"),
             sink,
         );
         return None;
     };
-    Some(strings.into_iter().map(str::to_owned).collect())
+    Some(strings.into_iter().map(convert).collect())
 }
 
 fn validate_explicit_name_set(names: &[String], meta: &SchemaMeta, sink: &mut DiagnosticSink) {
@@ -1270,56 +1801,11 @@ fn validate_explicit_name_set(names: &[String], meta: &SchemaMeta, sink: &mut Di
     }
 }
 
-fn validate_explicit_enum_name(name: String) -> Result<String, NormalizeError> {
+fn validate_explicit_enum_name(name: String) -> Result<NameAllocation, NormalizeError> {
     if let Some(character) = name.chars().find(|character| !character.is_ascii()) {
         return Err(NormalizeError::NonAscii(character));
     }
-    validate_final_identifier(&name)?;
-    Ok(name)
-}
-
-fn validate_value_domain(
-    values: &[Value],
-    ty: PrimitiveType,
-    meta: &SchemaMeta,
-    keyword: &str,
-    sink: &mut DiagnosticSink,
-) {
-    for value in values {
-        if !value_in_domain(value, ty, meta.nullable) {
-            let mut message = format!(
-                "{keyword} member {} contradicts declared type {ty:?}",
-                compact_json(value)
-            );
-            if value.is_boolean() && ty == PrimitiveType::String {
-                message.push_str(
-                    "; likely a YAML 1.1 boolean coercion (bare off/on/yes/no), quote the value as a string",
-                );
-            }
-            enum_error(meta, message, sink);
-        }
-    }
-}
-
-fn value_in_domain(value: &Value, ty: PrimitiveType, nullable: bool) -> bool {
-    if value.is_null() {
-        return ty == PrimitiveType::Null || nullable;
-    }
-    match ty {
-        PrimitiveType::String => value.is_string(),
-        PrimitiveType::Number => value.is_number(),
-        PrimitiveType::Integer => value.as_number().is_some_and(number_is_integer),
-        PrimitiveType::Boolean => value.is_boolean(),
-        PrimitiveType::Null => false,
-    }
-}
-
-fn number_is_integer(number: &Number) -> bool {
-    number.is_i64()
-        || number.is_u64()
-        || number
-            .as_f64()
-            .is_some_and(|value| value.is_finite() && value.fract() == 0.0)
+    validate_final_identifier_allocation(name)
 }
 
 fn validate_numeric_members(
@@ -1419,10 +1905,18 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
+#[cfg(test)]
 fn derive_enum_member_name(
     value: &Value,
     enum_case: EnumMemberCase,
 ) -> Result<String, NormalizeError> {
+    derive_enum_member_name_allocation(value, enum_case).map(|allocation| allocation.name)
+}
+
+fn derive_enum_member_name_allocation(
+    value: &Value,
+    enum_case: EnumMemberCase,
+) -> Result<NameAllocation, NormalizeError> {
     let tokens = match value {
         Value::String(value) => {
             let mut tokens = identifier_tokens(value)?;
@@ -1453,8 +1947,7 @@ fn derive_enum_member_name(
         EnumMemberCase::Preserve => TargetCase::Preserve,
     };
     let name = transform_tokens(&tokens, case);
-    validate_normalized_identifier(&name)?;
-    Ok(name)
+    escape_reserved_word(name)
 }
 
 fn numeric_name_tokens(number: &Number) -> Result<Vec<String>, NormalizeError> {
@@ -1626,6 +2119,18 @@ fn validate_normalized_identifier(identifier: &str) -> Result<(), NormalizeError
 }
 
 fn validate_final_identifier(identifier: &str) -> Result<(), NormalizeError> {
+    validate_final_identifier_characters(identifier)?;
+    validate_normalized_identifier(identifier)
+}
+
+fn validate_final_identifier_allocation(
+    identifier: String,
+) -> Result<NameAllocation, NormalizeError> {
+    validate_final_identifier_characters(&identifier)?;
+    escape_reserved_word(identifier)
+}
+
+fn validate_final_identifier_characters(identifier: &str) -> Result<(), NormalizeError> {
     if let Some(character) = identifier.chars().find(|character| !character.is_ascii()) {
         return Err(NormalizeError::NonAscii(character));
     }
@@ -1635,11 +2140,25 @@ fn validate_final_identifier(identifier: &str) -> Result<(), NormalizeError> {
     {
         return Err(NormalizeError::InvalidIdentifierCharacter(character));
     }
-    validate_normalized_identifier(identifier)
+    Ok(())
 }
 
 fn enum_error(meta: &SchemaMeta, message: impl Into<String>, sink: &mut DiagnosticSink) {
     sink.push(source_diagnostic(CODE_ENUM_RULE_14, message, &meta.source));
+}
+
+fn enum_extension_warning(
+    meta: &SchemaMeta,
+    message: impl Into<String>,
+    sink: &mut DiagnosticSink,
+) {
+    enum_warning(meta, message, sink);
+}
+
+fn enum_warning(meta: &SchemaMeta, message: impl Into<String>, sink: &mut DiagnosticSink) {
+    let mut diagnostic = source_diagnostic(CODE_ENUM_RULE_14, message, &meta.source);
+    diagnostic.severity = Severity::Warning;
+    sink.push(diagnostic);
 }
 
 fn source_diagnostic(
@@ -1656,10 +2175,6 @@ fn source_diagnostic(
     diagnostic
 }
 
-fn compact_json(value: &Value) -> String {
-    serde_json::to_string(value).expect("serializing a JSON value cannot fail")
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1674,7 +2189,7 @@ mod tests {
     use crate::diag::{Category, Severity};
     use crate::ir::{
         CallbackExpression, FiniteConstraint, Link, NamedSchema, Param, ParamLocation,
-        ResponseEntry, ResponseStatus, SchemaDocs, SchemaRef, Segment,
+        PrimitiveType, ResponseEntry, ResponseStatus, SchemaDocs, SchemaRef, Segment,
     };
     use crate::loader::load_graph;
     use crate::parse::parse;
@@ -2142,10 +2657,10 @@ mod tests {
             normalize_identifier("2fast", TargetCase::Pascal),
             Err(NormalizeError::LeadingDigit)
         );
-        assert!(matches!(
+        assert_eq!(
             normalize_identifier("class", TargetCase::Camel),
-            Err(NormalizeError::ReservedWord(_))
-        ));
+            Ok("class_".to_owned())
+        );
         assert_eq!(
             normalize_identifier("pet_status", TargetCase::Pascal),
             Ok("PetStatus".to_owned())
@@ -2285,7 +2800,7 @@ mod tests {
     }
 
     #[test]
-    fn webhook_name_matching_operation_name_is_no_collision() {
+    fn operation_id_uniqueness_is_global_but_name_scopes_stay_separate() {
         let mut path_operation = operation(Vec::new());
         path_operation.operation_id = Some("PetsGet".to_owned());
         path_operation.source = source("/paths/~1pets/get");
@@ -2307,7 +2822,18 @@ mod tests {
         };
         let mut sink = DiagnosticSink::new();
         let analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
-        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let diagnostics = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_OPERATION_NAME)
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1, "{:#?}", sink.as_slice());
+        assert!(diagnostics[0].message.contains("duplicate operationId"));
+        assert!(
+            sink.as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.code != CODE_WEBHOOK_NAME)
+        );
         assert_eq!(
             analyzed
                 .operation_names
@@ -2323,6 +2849,70 @@ mod tests {
                 .map(|allocated| allocated.stem.as_str())
                 .collect::<Vec<_>>(),
             ["PetsGet"]
+        );
+    }
+
+    #[test]
+    fn operation_id_uniqueness_descends_into_callbacks() {
+        let mut path_operation = operation(Vec::new());
+        path_operation.operation_id = Some("shared".to_owned());
+        path_operation.source = source("/paths/~1a/get");
+
+        let mut callback_operation =
+            callback_leaf_operation("post", "/paths/~1subscribe/post/callbacks/delivery/0/post");
+        callback_operation.operation_id = Some("shared".to_owned());
+        let mut callback_parent = operation(Vec::new());
+        callback_parent.operation_id = Some("subscribe".to_owned());
+        callback_parent.source = source("/paths/~1subscribe/post");
+        callback_parent.callbacks = vec![Callback {
+            name: "delivery".to_owned(),
+            expressions: vec![CallbackExpression {
+                expression: "{$request.body#/callbackUrl}".to_owned(),
+                operations: vec![callback_operation],
+                source: source("/paths/~1subscribe/post/callbacks/delivery/0"),
+            }],
+            source: source("/paths/~1subscribe/post/callbacks/delivery"),
+        }];
+
+        let mut webhook_operation = operation(Vec::new());
+        webhook_operation.operation_id = Some("shared".to_owned());
+        webhook_operation.source = source("/webhooks/ping/post");
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            Ir {
+                operations: vec![path_operation, callback_parent],
+                webhooks: vec![Webhook {
+                    name: "ping".to_owned(),
+                    operations: vec![webhook_operation],
+                    source: source("/webhooks/ping"),
+                }],
+                ..Ir::default()
+            },
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        let diagnostics = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == CODE_OPERATION_NAME
+                    && diagnostic
+                        .message
+                        .contains("duplicate operationId 'shared'")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2, "{:#?}", sink.as_slice());
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.json_pointer.as_deref())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                "/webhooks/ping/post",
+                "/paths/~1subscribe/post/callbacks/delivery/0/post"
+            ])
         );
     }
 
@@ -2809,6 +3399,86 @@ mod tests {
     }
 
     #[test]
+    fn schema_collision_suggestions_are_stable_distinct_and_path_safe() {
+        let ir = Ir {
+            schemas: vec![
+                named_schema("Foo Bar"),
+                named_schema("FooBar"),
+                named_schema("FooBar_1"),
+                named_schema("userID"),
+                named_schema("userId"),
+            ],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_TYPE_NAME)
+            .expect("schema collision");
+        assert_eq!(
+            diagnostic.naming_override_suggestions.as_deref(),
+            Some(&vec![
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Schemas,
+                    source_name: "Foo Bar".to_owned(),
+                    identifier: "FooBar_2".to_owned(),
+                },
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Schemas,
+                    source_name: "FooBar".to_owned(),
+                    identifier: "FooBar_3".to_owned(),
+                },
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Schemas,
+                    source_name: "userID".to_owned(),
+                    identifier: "UserID_1".to_owned(),
+                },
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Schemas,
+                    source_name: "userId".to_owned(),
+                    identifier: "UserId_2".to_owned(),
+                },
+            ])
+        );
+        let rendered = crate::diag::render_to_string(sink.into_sorted_vec());
+        assert!(rendered.contains("    schemas:\n"));
+        assert!(rendered.contains("      'Foo Bar': 'FooBar_2'\n"));
+        assert!(rendered.contains("      'FooBar': 'FooBar_3'\n"));
+        assert!(rendered.contains("      'userID': 'UserID_1'\n"));
+        assert!(rendered.contains("      'userId': 'UserId_2'\n"));
+    }
+
+    #[test]
+    fn duplicate_raw_schema_name_has_no_unusable_map_suggestion() {
+        let ir = Ir {
+            schemas: vec![named_schema("duplicate"), named_schema("duplicate")],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        let collision = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_TYPE_NAME)
+            .expect("schema collision");
+        assert!(collision.naming_override_suggestions.is_none());
+    }
+
+    #[test]
     fn a_schema_override_renames_a_declared_component() {
         let ir = Ir {
             schemas: vec![named_schema("widget")],
@@ -2822,6 +3492,23 @@ mod tests {
             &mut sink,
         );
         assert_eq!(analyzed.schema_names[0].name, "Gadget");
+        assert!(sink.as_slice().is_empty());
+    }
+
+    #[test]
+    fn a_schema_override_renames_a_materialized_document_root() {
+        let ir = Ir {
+            schemas: vec![materialized_schema("123", "")],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &schema_overrides(&[("123", "Pet123")]),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert_eq!(analyzed.schema_names[0].name, "Pet123");
         assert!(sink.as_slice().is_empty());
     }
 
@@ -2992,6 +3679,215 @@ mod tests {
     }
 
     #[test]
+    fn reserved_operation_id_is_escaped_with_a_warning() {
+        let mut op = operation(Vec::new());
+        op.operation_id = Some("delete".to_owned());
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            Ir {
+                operations: vec![op],
+                ..Ir::default()
+            },
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        assert_eq!(analyzed.operation_names[0].name, "delete_");
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_OPERATION_NAME)
+            .expect("reserved-word warning");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(
+            diagnostic.message,
+            "operation identifier 'delete' is a TypeScript reserved word; emitted as 'delete_'"
+        );
+    }
+
+    #[test]
+    fn reserved_operation_escape_participates_in_collision_detection() {
+        let mut reserved = operation(Vec::new());
+        reserved.operation_id = Some("delete".to_owned());
+        reserved.source = source("/paths/~1reserved/delete");
+        let mut supplied = operation(Vec::new());
+        supplied.operation_id = Some("delete_".to_owned());
+        supplied.source = source("/paths/~1supplied/delete");
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            Ir {
+                operations: vec![reserved, supplied],
+                ..Ir::default()
+            },
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        assert_eq!(
+            analyzed
+                .operation_names
+                .iter()
+                .map(|operation| operation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["delete_", "delete_"]
+        );
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic.message
+                    == "operation name collision: 'delete_' allocated at openapi.yaml#/paths/~1reserved/delete and openapi.yaml#/paths/~1supplied/delete"
+        }));
+    }
+
+    #[test]
+    fn reserved_operation_override_wins_without_escape_or_warning() {
+        let mut op = operation(Vec::new());
+        op.operation_id = Some("delete".to_owned());
+        let naming = NamingConfig {
+            overrides: NameOverrides {
+                operations: BTreeMap::from([("delete".to_owned(), "remove".to_owned())]),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            Ir {
+                operations: vec![op],
+                ..Ir::default()
+            },
+            &naming,
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        assert_eq!(analyzed.operation_names[0].name, "remove");
+        assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn duplicate_literal_operation_ids_name_the_document_violation() {
+        let mut first = operation(Vec::new());
+        first.operation_id = Some("update".to_owned());
+        first.source = source("/paths/~1first/put");
+        let mut second = operation(Vec::new());
+        second.operation_id = Some("update".to_owned());
+        second.source = source("/paths/~1second/patch");
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            Ir {
+                operations: vec![first, second],
+                ..Ir::default()
+            },
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.severity == Severity::Error)
+            .expect("duplicate operationId error");
+        assert_eq!(
+            diagnostic.message,
+            "duplicate operationId 'update' declared at openapi.yaml#/paths/~1first/put and openapi.yaml#/paths/~1second/patch; OpenAPI requires operationId to be unique among all operations"
+        );
+        assert!(diagnostic.naming_override_suggestions.is_none());
+    }
+
+    /// The suggestion pass only runs once something collides, and it then walks *every* operation
+    /// to index the names already in use — including the ones that did not collide and the ones
+    /// the user already renamed. This pins that walk.
+    #[test]
+    fn the_operation_suggestion_pass_indexes_uncollided_and_overridden_names() {
+        let mut first = operation(Vec::new());
+        first.operation_id = Some("get-pet".to_owned());
+        first.source = source("/paths/~1first/get");
+        let mut second = operation(Vec::new());
+        second.operation_id = Some("get_pet".to_owned());
+        second.source = source("/paths/~1second/get");
+        let mut untouched = operation(Vec::new());
+        untouched.operation_id = Some("listPets".to_owned());
+        untouched.source = source("/paths/~1third/get");
+        let mut renamed = operation(Vec::new());
+        renamed.operation_id = Some("deletePet".to_owned());
+        renamed.source = source("/paths/~1fourth/delete");
+
+        let naming = NamingConfig {
+            overrides: NameOverrides {
+                operations: [("deletePet".to_owned(), "removePet".to_owned())]
+                    .into_iter()
+                    .collect(),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            Ir {
+                operations: vec![first, second, untouched, renamed],
+                ..Ir::default()
+            },
+            &naming,
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        let names = analyzed
+            .operation_names
+            .iter()
+            .map(|allocated| allocated.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"listPets"));
+        assert!(names.contains(&"removePet"));
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.severity == Severity::Error)
+            .expect("the normalization collision still errors");
+        assert!(diagnostic.naming_override_suggestions.is_some());
+    }
+
+    #[test]
+    fn distinct_operation_ids_that_normalize_together_keep_collision_wording() {
+        let mut first = operation(Vec::new());
+        first.operation_id = Some("get-pet".to_owned());
+        first.source = source("/paths/~1first/get");
+        let mut second = operation(Vec::new());
+        second.operation_id = Some("get_pet".to_owned());
+        second.source = source("/paths/~1second/get");
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            Ir {
+                operations: vec![first, second],
+                ..Ir::default()
+            },
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.severity == Severity::Error)
+            .expect("normalization collision");
+        assert_eq!(
+            diagnostic.message,
+            "operation name collision: 'getPet' allocated at openapi.yaml#/paths/~1first/get and openapi.yaml#/paths/~1second/get"
+        );
+        assert_eq!(
+            diagnostic
+                .naming_override_suggestions
+                .as_deref()
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn operation_override_value_is_validated_like_any_generated_name() {
         let mut op = operation(Vec::new());
         op.operation_id = Some("deleteWebhook".to_owned());
@@ -3020,6 +3916,49 @@ mod tests {
             .expect("override value rejection");
         assert!(diagnostic.message.contains("class"));
         assert!(diagnostic.message.contains("reserved word"));
+    }
+
+    #[test]
+    fn reserved_enum_members_are_escaped_and_collide_with_supplied_underscore() {
+        let schema = enum_schema(
+            vec![json!("delete"), json!("delete_")],
+            PrimitiveType::String,
+            Some(json!(["delete", "delete_"])),
+            "/reserved-enum",
+        );
+        let naming = NamingConfig {
+            enum_member_case: EnumMemberCase::Camel,
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            Ir {
+                schemas: vec![schema],
+                ..Ir::default()
+            },
+            &naming,
+            &const_types(),
+            &mut sink,
+        );
+
+        assert_eq!(
+            analyzed.enum_members[0]
+                .members
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            ["delete_", "delete_"]
+        );
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic
+                    .message
+                    .contains("enum member identifier 'delete'")
+        }));
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic.message.contains("collide after case folding")
+        }));
     }
 
     fn enum_schema(
@@ -3107,6 +4046,152 @@ mod tests {
                 .map(|member| member.name.as_str())
                 .eq(["AvailableWire", "SoldWire"])
         }));
+    }
+
+    #[test]
+    fn enum_description_extensions_accept_documented_map_and_existing_array_forms() {
+        let mut mapped = enum_schema(
+            vec![json!("ACTIVE"), json!("INACTIVE")],
+            PrimitiveType::String,
+            None,
+            "/mapped",
+        );
+        if let SchemaNode::Primitive { meta, .. } = &mut mapped.schema {
+            meta.enum_extensions = crate::ir::box_if_populated(crate::ir::EnumExtensionData {
+                enum_descriptions_camel: Some(json!({
+                    "INACTIVE": "disabled",
+                    "ACTIVE": "enabled",
+                    "MISSING": "ignored"
+                })),
+                ..Default::default()
+            });
+        }
+        let mut array = enum_schema(
+            vec![json!("ACTIVE"), json!("INACTIVE")],
+            PrimitiveType::String,
+            None,
+            "/array",
+        );
+        if let SchemaNode::Primitive { meta, .. } = &mut array.schema {
+            meta.enum_extensions = crate::ir::box_if_populated(crate::ir::EnumExtensionData {
+                enum_descriptions: Some(json!(["enabled", "disabled"])),
+                ..Default::default()
+            });
+        }
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            Ir {
+                schemas: vec![mapped, array],
+                ..Ir::default()
+            },
+            &NamingConfig::default(),
+            &const_types(),
+            &mut sink,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let warning = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("key 'MISSING'"))
+            .expect("unknown map key warning");
+        assert_eq!(warning.severity, Severity::Warning);
+        assert!(warning.message.ends_with("the entry is ignored"));
+        for table in &analyzed.enum_members {
+            assert_eq!(
+                table
+                    .members
+                    .iter()
+                    .map(|member| member.description.as_deref())
+                    .collect::<Vec<_>>(),
+                vec![Some("enabled"), Some("disabled")]
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_enum_extensions_warn_and_are_ignored_unless_config_rejects_them() {
+        for value in [
+            json!("not-an-array-or-map"),
+            json!(7),
+            json!({ "ACTIVE": 7 }),
+        ] {
+            let meta = SchemaMeta {
+                enum_extensions: crate::ir::box_if_populated(crate::ir::EnumExtensionData {
+                    enum_descriptions_camel: Some(value),
+                    ..Default::default()
+                }),
+                source: source("/enum"),
+                ..SchemaMeta::default()
+            };
+            let mut sink = DiagnosticSink::new();
+            let validated = validate_enum_extensions(
+                Some(&[json!("ACTIVE")]),
+                &meta,
+                &const_types(),
+                &mut sink,
+            );
+            assert!(validated.descriptions.is_none());
+            assert_eq!(sink.as_slice().len(), 1);
+            assert_eq!(sink.as_slice()[0].severity, Severity::Warning);
+            assert!(sink.as_slice()[0].message.contains("it is ignored"));
+
+            let mut rejected_types = const_types();
+            rejected_types.enum_extensions = EnumExtensions::Reject;
+            let mut rejected_sink = DiagnosticSink::new();
+            let rejected = validate_enum_extensions(
+                Some(&[json!("ACTIVE")]),
+                &meta,
+                &rejected_types,
+                &mut rejected_sink,
+            );
+            assert!(rejected.descriptions.is_none());
+            assert_eq!(rejected_sink.as_slice().len(), 1);
+            assert_eq!(rejected_sink.as_slice()[0].severity, Severity::Error);
+            assert!(
+                rejected_sink.as_slice()[0]
+                    .message
+                    .contains("is rejected by config")
+            );
+        }
+    }
+
+    #[test]
+    fn competing_enum_description_spellings_keep_kebab_precedence() {
+        let mut schema = enum_schema(
+            vec![json!("ACTIVE")],
+            PrimitiveType::String,
+            None,
+            "/competing-descriptions",
+        );
+        if let SchemaNode::Primitive { meta, .. } = &mut schema.schema {
+            meta.enum_extensions = crate::ir::box_if_populated(crate::ir::EnumExtensionData {
+                enum_descriptions: Some(json!(["kebab"])),
+                enum_descriptions_camel: Some(json!({ "ACTIVE": "camel" })),
+                ..Default::default()
+            });
+        }
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            Ir {
+                schemas: vec![schema],
+                ..Ir::default()
+            },
+            &NamingConfig::default(),
+            &const_types(),
+            &mut sink,
+        );
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.message == "x-enum-descriptions and x-enumDescriptions disagree"
+            })
+            .expect("competing description diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            analyzed.enum_members[0].members[0].description.as_deref(),
+            Some("kebab")
+        );
     }
 
     #[test]
@@ -3530,7 +4615,7 @@ mod tests {
     }
 
     #[test]
-    fn finite_value_validation_covers_empty_domains_names_and_descriptions() {
+    fn finite_value_validation_covers_empty_names_and_descriptions() {
         let mut empty = enum_schema(Vec::new(), PrimitiveType::String, None, "/empty");
         let mut collision = enum_schema(
             vec![json!("a-b"), json!("a_b")],
@@ -3578,56 +4663,34 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("collide"))
         );
-        assert!(
-            sink.as_slice()
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("contradicts"))
-        );
-    }
 
-    #[test]
-    fn domain_violation_names_the_yaml_cause_only_for_booleans_under_string() {
-        let meta = SchemaMeta {
-            source: source("/yaml-bug"),
-            ..SchemaMeta::default()
-        };
-        let mut sink = DiagnosticSink::new();
-        validate_value_domain(
-            &[json!(false), json!("redaction")],
-            PrimitiveType::String,
-            &meta,
-            "enum",
-            &mut sink,
+        let mut v30_sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            Ir {
+                schemas: vec![enum_schema(
+                    Vec::new(),
+                    PrimitiveType::String,
+                    None,
+                    "/empty-3.0",
+                )],
+                version: OasVersion::V3_0,
+                ..Ir::default()
+            },
+            &NamingConfig::default(),
+            &const_types(),
+            &mut v30_sink,
         );
-        assert!(sink.as_slice().iter().any(|diagnostic| {
-            diagnostic.message.contains("contradicts declared type")
-                && diagnostic.message.contains("YAML 1.1")
-                && diagnostic.message.contains("quote the value as a string")
-        }));
-
-        let meta = SchemaMeta {
-            source: source("/non-boolean"),
-            ..SchemaMeta::default()
-        };
-        let mut sink = DiagnosticSink::new();
-        validate_value_domain(&[json!(1)], PrimitiveType::String, &meta, "enum", &mut sink);
-        assert!(sink.as_slice().iter().any(|diagnostic| {
-            diagnostic.message.contains("contradicts declared type")
-                && !diagnostic.message.contains("YAML")
-        }));
+        let diagnostic = v30_sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("at least one"))
+            .expect("OpenAPI 3.0 empty enum diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(diagnostic.message.contains("OpenAPI 3.0 (MUST)"));
     }
 
     #[test]
     fn value_numeric_and_intersection_helpers_cover_boundaries() {
-        assert!(value_in_domain(&Value::Null, PrimitiveType::Null, false));
-        assert!(value_in_domain(&Value::Null, PrimitiveType::String, true));
-        assert!(!value_in_domain(&json!("x"), PrimitiveType::Null, false));
-        assert!(value_in_domain(&json!("x"), PrimitiveType::String, false));
-        assert!(value_in_domain(&json!(1.5), PrimitiveType::Number, false));
-        assert!(value_in_domain(&json!(1.0), PrimitiveType::Integer, false));
-        assert!(!value_in_domain(&json!(1.5), PrimitiveType::Integer, false));
-        assert!(value_in_domain(&json!(true), PrimitiveType::Boolean, false));
-
         assert_eq!(finite_intersection(None, None), Some(Vec::new()));
         let one = json!(1);
         let two = json!(2);
@@ -3738,6 +4801,5 @@ mod tests {
         };
         let diagnostic = source_diagnostic("TEST", "message", &located);
         assert_eq!((diagnostic.line, diagnostic.col), (Some(3), Some(5)));
-        assert_eq!(compact_json(&json!({ "x": 1 })), "{\"x\":1}");
     }
 }

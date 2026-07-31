@@ -429,13 +429,54 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             | SchemaNode::Never { .. }
             | SchemaNode::Unknown { .. } => {}
         }
+        let applicators = schema.meta().validation_applicators();
+        if let Some(schema) = &applicators.not {
+            self.collect_ref_edges(schema, edges);
+        }
+        if let Some(schema) = &applicators.property_names {
+            self.collect_ref_edges(schema, edges);
+        }
+        for pattern in &applicators.pattern_properties {
+            self.collect_ref_edges(&pattern.schema, edges);
+        }
+        if let Some(contains) = &applicators.contains {
+            self.collect_ref_edges(&contains.schema, edges);
+        }
+        for (_, schema) in &applicators.dependent_schemas {
+            self.collect_ref_edges(schema, edges);
+        }
+        if let Some(conditional) = &applicators.conditional {
+            self.collect_ref_edges(&conditional.condition, edges);
+            if let Some(schema) = &conditional.then_schema {
+                self.collect_ref_edges(schema, edges);
+            }
+            if let Some(schema) = &conditional.else_schema {
+                self.collect_ref_edges(schema, edges);
+            }
+        }
+        if let Some(schema) = &applicators.unevaluated_properties {
+            self.collect_ref_edges(schema, edges);
+        }
+        if let Some(schema) = &applicators.unevaluated_items {
+            self.collect_ref_edges(schema, edges);
+        }
     }
 
     fn allocate_paths(&mut self) {
         for allocated in &self.analyzed.schema_names {
             let schema = &self.analyzed.ir.schemas[allocated.schema_index];
-            let Some(file_base) = self.allocate_file_base(&allocated.wire_name, &schema.source)
-            else {
+            let source_name = if self
+                .config
+                .naming
+                .overrides
+                .schemas
+                .contains_key(&allocated.wire_name)
+            {
+                &allocated.name
+            } else {
+                &allocated.wire_name
+            };
+            let Some(file_base) = self.allocate_file_base(source_name, &schema.source) else {
                 continue;
             };
             let relative = format!("types/components/{file_base}.ts");
@@ -462,7 +503,23 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         }
         for allocated in &self.analyzed.operation_names {
             let operation = &self.analyzed.ir.operations[allocated.operation_index];
-            let source_name = operation.operation_id.as_deref().unwrap_or(&allocated.name);
+            let source_name =
+                operation
+                    .operation_id
+                    .as_deref()
+                    .map_or(allocated.name.as_str(), |operation_id| {
+                        if self
+                            .config
+                            .naming
+                            .overrides
+                            .operations
+                            .contains_key(operation_id)
+                        {
+                            &allocated.name
+                        } else {
+                            operation_id
+                        }
+                    });
             let Some(file_base) = self.allocate_file_base(source_name, &operation.source) else {
                 continue;
             };
@@ -858,6 +915,78 @@ mod tests {
             (true, false)
         );
         assert_eq!(variant_flags(schemas, "OneOfComponent"), (true, false));
+    }
+
+    #[test]
+    fn ref_transitivity_through_validation_applicators() {
+        let schemas = json!({
+            "NotComponent": {
+                "not": { "$ref": "#/components/schemas/Pet" }
+            },
+            "PropertyNamesComponent": {
+                "propertyNames": { "$ref": "#/components/schemas/Pet" }
+            },
+            "PatternPropertiesComponent": {
+                "patternProperties": {
+                    "^x": { "$ref": "#/components/schemas/Pet" }
+                }
+            },
+            "ContainsComponent": {
+                "contains": { "$ref": "#/components/schemas/Pet" }
+            },
+            "DependentSchemasComponent": {
+                "dependentSchemas": {
+                    "trigger": { "$ref": "#/components/schemas/Pet" }
+                }
+            },
+            "ConditionalComponent": {
+                "if": { "$ref": "#/components/schemas/Pet" },
+                "then": { "$ref": "#/components/schemas/Pet" },
+                "else": { "$ref": "#/components/schemas/Pet" }
+            },
+            "UnevaluatedPropertiesComponent": {
+                "unevaluatedProperties": { "$ref": "#/components/schemas/Pet" }
+            },
+            "UnevaluatedItemsComponent": {
+                "unevaluatedItems": { "$ref": "#/components/schemas/Pet" }
+            },
+            "Pet": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "readOnly": true } }
+            }
+        });
+        assert_eq!(
+            variant_flags(schemas.clone(), "NotComponent"),
+            (true, false)
+        );
+        assert_eq!(
+            variant_flags(schemas.clone(), "PropertyNamesComponent"),
+            (true, false)
+        );
+        assert_eq!(
+            variant_flags(schemas.clone(), "PatternPropertiesComponent"),
+            (true, false)
+        );
+        assert_eq!(
+            variant_flags(schemas.clone(), "ContainsComponent"),
+            (true, false)
+        );
+        assert_eq!(
+            variant_flags(schemas.clone(), "DependentSchemasComponent"),
+            (true, false)
+        );
+        assert_eq!(
+            variant_flags(schemas.clone(), "ConditionalComponent"),
+            (true, false)
+        );
+        assert_eq!(
+            variant_flags(schemas.clone(), "UnevaluatedPropertiesComponent"),
+            (true, false)
+        );
+        assert_eq!(
+            variant_flags(schemas, "UnevaluatedItemsComponent"),
+            (true, false)
+        );
     }
 
     /// `additionalProperties: <schema>` from real input always parses to `AdditionalProperties::

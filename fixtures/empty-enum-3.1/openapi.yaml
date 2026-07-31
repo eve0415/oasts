@@ -1,0 +1,10 @@
+openapi: 3.1.0
+info:
+  title: Empty enum
+  version: "1"
+paths: {}
+components:
+  schemas:
+    Empty:
+      type: string
+      enum: []

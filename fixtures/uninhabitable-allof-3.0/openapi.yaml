@@ -1,0 +1,79 @@
+openapi: 3.0.4
+info:
+  title: Uninhabitable allOf
+  version: 1.0.0
+paths:
+  /exchange:
+    post:
+      operationId: exchangeNever
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - type: string
+                - type: boolean
+      responses:
+        '200':
+          description: An impossible response.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - type: number
+                    minimum: 2
+                  - type: number
+                    maximum: 2
+                    exclusiveMaximum: true
+components:
+  schemas:
+    Base:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          type: string
+    Dog:
+      allOf:
+        - $ref: '#/components/schemas/Base'
+        - type: object
+          required: [bark]
+          properties:
+            bark:
+              type: boolean
+    DisjointPrimitive:
+      allOf:
+        - type: string
+        - type: integer
+    EmptyFinite:
+      allOf:
+        - type: string
+          enum: [left]
+        - type: string
+          enum: [right]
+    EmptyInterval:
+      allOf:
+        - type: number
+          minimum: 10
+        - type: number
+          maximum: 9
+    NeverDated:
+      allOf:
+        - type: string
+          format: date-time
+        - type: number
+    Cat:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [Dog]
+    Choice:
+      oneOf:
+        - $ref: '#/components/schemas/Dog'
+        - $ref: '#/components/schemas/Cat'
+      discriminator:
+        propertyName: kind

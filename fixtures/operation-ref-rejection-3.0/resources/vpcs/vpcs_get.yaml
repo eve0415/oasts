@@ -1,0 +1,10 @@
+operationId: get-vpc
+parameters:
+  - name: vpc_id
+    in: path
+    required: true
+    schema:
+      type: string
+responses:
+  "200":
+    description: VPC details

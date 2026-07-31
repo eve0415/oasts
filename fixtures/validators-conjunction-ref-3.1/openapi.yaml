@@ -1,0 +1,49 @@
+openapi: 3.0.4
+info:
+  title: Conjunction-wrapped reference
+  version: 1.0.0
+paths:
+  /items:
+    get:
+      operationId: listItems
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+components:
+  schemas:
+    # The idiom this fixture exists for: OpenAPI 3.0 ignores keywords beside a
+    # $ref, so a description is attached by wrapping the reference in an allOf.
+    # The type surface merges that away; the validator still delegates to the
+    # referenced component's function, and so must import it.
+    Item:
+      type: object
+      required:
+        - detail
+      properties:
+        detail:
+          allOf:
+            - $ref: '#/components/schemas/Detail'
+          description: Reached only through a single-branch allOf.
+        nested:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/Detail'
+            description: The same shape one level down, under items.
+        keyed:
+          type: object
+          additionalProperties:
+            allOf:
+              - $ref: '#/components/schemas/Detail'
+            description: And again under additionalProperties.
+    Detail:
+      type: object
+      required:
+        - value
+      properties:
+        value:
+          type: string

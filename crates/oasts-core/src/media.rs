@@ -84,11 +84,12 @@ pub(crate) fn media_essence(media: &str) -> &str {
         .trim_end()
 }
 
-/// Whether a media type is JSON-family (RFC 8259 `application/json` or any `+json` structured
-/// suffix), keyed on the essence so a parameterized value classifies by its base type.
+/// Whether a media type is JSON-family (RFC 8259 `application/json`, the de-facto `text/json`
+/// alias, or any `+json` structured suffix), keyed on the essence so a parameterized value
+/// classifies by its base type.
 pub(crate) fn is_json(media: &str) -> bool {
     let essence = media_essence(media);
-    essence == "application/json"
+    matches!(essence, "application/json" | "text/json")
         || essence
             .rsplit_once('/')
             .is_some_and(|(_, subtype)| subtype.ends_with("+json"))
@@ -286,9 +287,24 @@ pub(crate) fn is_tchar(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MediaRangeKind, canonical_content_key, canonical_encoding_content_type,
+        MediaRangeKind, canonical_content_key, canonical_encoding_content_type, is_json,
         parse_parameter_value, split_media_type_list, split_quoted,
     };
+
+    #[test]
+    fn recognizes_only_the_declared_json_families() {
+        for media in [
+            "application/json",
+            "application/problem+json",
+            "text/json",
+            "text/json; charset=utf-8",
+        ] {
+            assert!(is_json(media), "{media}");
+        }
+        for media in ["text/plain", "text/x-json", "application/json-seq"] {
+            assert!(!is_json(media), "{media}");
+        }
+    }
 
     #[test]
     fn splits_media_type_lists_outside_quoted_strings_in_source_order() {

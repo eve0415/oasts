@@ -1,0 +1,91 @@
+openapi: 3.1.0
+info:
+  title: Media classification
+  version: 1.0.0
+servers:
+  - url: https://media.example.test
+paths:
+  /opaque/application-xml:
+    post:
+      operationId: roundTripApplicationXml
+      requestBody:
+        required: true
+        content:
+          application/xml: {}
+      responses:
+        '200':
+          description: Opaque application XML bytes.
+          content:
+            application/xml: {}
+  /opaque/text-xml:
+    post:
+      operationId: roundTripTextXml
+      requestBody:
+        required: true
+        content:
+          text/xml: {}
+      responses:
+        '200':
+          description: Opaque text XML bytes.
+          content:
+            text/xml: {}
+  /opaque/svg:
+    post:
+      operationId: roundTripSvg
+      requestBody:
+        required: true
+        content:
+          image/svg+xml: {}
+      responses:
+        '200':
+          description: Opaque SVG bytes.
+          content:
+            image/svg+xml: {}
+  /json:
+    post:
+      operationId: sendTextJson
+      requestBody:
+        required: true
+        content:
+          text/json:
+            schema:
+              $ref: '#/components/schemas/TextJsonRequest'
+      responses:
+        '202':
+          description: JSON accepted through its text/json alias.
+          content:
+            text/json:
+              schema:
+                $ref: '#/components/schemas/TextJsonResponse'
+  /plain:
+    post:
+      operationId: sendPlainText
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+      responses:
+        '200':
+          description: Plain text remains plain text.
+          content:
+            text/plain:
+              schema:
+                type: string
+components:
+  schemas:
+    TextJsonRequest:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+    TextJsonResponse:
+      type: object
+      required:
+        - accepted
+      properties:
+        accepted:
+          type: boolean

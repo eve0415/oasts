@@ -6,10 +6,11 @@ use serde_json::Value;
 
 use crate::config::{DeepObjectEncoding, ResolvedBaseUrl, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
+use crate::headers::forbidden_request_header_name;
 use crate::ir::{
-    EncodingObject, Ir, MediaType, NamedSecurityScheme, OAuthFlow, OasVersion, Operation,
-    ParamLocation, ParamStyle, PrimitiveType, ResponseStatus, SchemaNode, SecKind,
-    SecurityRequirement, ServerEntry, SourceRef,
+    AdditionalProperties, EncodingObject, Ir, MediaType, NamedSecurityScheme, OAuthFlow,
+    OasVersion, Operation, ParamLocation, ParamStyle, PrimitiveType, ResponseStatus, SchemaNode,
+    SecKind, SecurityRequirement, ServerEntry, SourceRef,
 };
 use crate::loader::append_pointer;
 use crate::media::{MediaRangeKind, is_json, is_xml, media_essence};
@@ -131,6 +132,32 @@ pub enum HelperId {
 }
 
 impl HelperId {
+    /// Every variant, in declaration order. The client emitter reserves each helper's exported
+    /// name against component imports, and that reservation is only sound if this covers the enum;
+    /// `helper_id_all_lists_every_variant` fails to compile when a variant is added without being
+    /// listed here.
+    pub(crate) const ALL: [Self; 19] = [
+        Self::PathSimple,
+        Self::PathSimpleExplode,
+        Self::PathLabel,
+        Self::PathLabelExplode,
+        Self::PathMatrix,
+        Self::PathMatrixExplode,
+        Self::QueryForm,
+        Self::QueryFormExplode,
+        Self::QuerySpaceDelimited,
+        Self::QuerySpaceDelimitedObject,
+        Self::QueryPipeDelimited,
+        Self::QueryPipeDelimitedObject,
+        Self::QueryDeepObject,
+        Self::QueryDeepObjectExtended,
+        Self::HeaderSimple,
+        Self::HeaderSimpleExplode,
+        Self::ContentJsonPath,
+        Self::ContentJsonQuery,
+        Self::ContentJsonHeader,
+    ];
+
     /// Whether this helper is a content-sourced JSON serializer, which the runtime feeds the raw
     /// typed value (not a pre-validated `ParamValue`) so its descriptor entry carries `content: true`.
     #[must_use]
@@ -350,8 +377,73 @@ pub struct ResponseMediaPlan {
     /// unconstrained default here rather than erasing it, so the client renders the same payload
     /// type the types artifact does for that entry.
     pub schema: SchemaNode,
+    /// Per-part decoding plan, present exactly when `decoder` is `Multipart`. Both the emitted
+    /// descriptor and the emitted payload type read it, so the bytes the runtime produces and the
+    /// type the caller sees are derived from one classification.
+    pub multipart: Option<MultipartResponsePlan>,
     pub streaming_marked: bool,
     pub source: SourceRef,
+}
+
+/// How one property of a decoded `multipart/form-data` response object is produced from its part.
+///
+/// The kind is fixed at generation time from the declared schema rather than sniffed from the wire,
+/// because the decoded value has to inhabit the TypeScript type that same schema renders. The
+/// classification mirrors the request encoder's (`default_part_media` + `content_payload_kind`) so
+/// a round trip through both directions agrees on what a part carries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MultipartResponsePayload {
+    Json,
+    Text,
+    Binary,
+    /// The schema constrains nothing, so the property's type is `unknown` and there is no shape to
+    /// classify from. The part's own `Content-Type` decides at runtime, defaulting to `text/plain`
+    /// (RFC 7578 §4.4). This is the one place the wire, not the description, picks the decoding.
+    Wire,
+}
+
+impl MultipartResponsePayload {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Text => "text",
+            Self::Binary => "binary",
+            Self::Wire => "wire",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultipartResponseShape {
+    pub payload: MultipartResponsePayload,
+    /// The declared schema is an array, so every part carrying this name contributes one element in
+    /// wire order and a single occurrence still decodes to a one-element array. One level deep,
+    /// exactly like the request encoder's `repeated`.
+    pub repeated: bool,
+    /// The schema the property's TypeScript type renders from — the array itself when `repeated`,
+    /// since the array type is already what the caller receives.
+    pub schema: SchemaNode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultipartResponsePartPlan {
+    pub name: String,
+    pub required: bool,
+    pub shape: MultipartResponseShape,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultipartResponsePlan {
+    /// Declared properties in schema order; a part's `Content-Disposition` name selects one.
+    pub parts: Vec<MultipartResponsePartPlan>,
+    /// The shape a part naming no declared property decodes under. Present whatever the schema says
+    /// about `additionalProperties`, because an unexpected part is kept and decoded either way —
+    /// the same thing a JSON body does with an undeclared member.
+    pub additional: MultipartResponseShape,
+    /// Whether the declared schema admits undeclared properties, i.e. whether the emitted object
+    /// type carries an index signature. Distinct from `additional`, which is the decoding rule.
+    pub open: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,7 +451,12 @@ pub enum DecoderClass {
     Streaming,
     Json,
     Xml,
+    /// `multipart/form-data`, whose parts carry the `Content-Disposition` `name` that maps them
+    /// onto the declared object's properties (RFC 7578 §4.2).
     Multipart,
+    /// Any other `multipart/*` media or range. Legal to declare, but no part-naming convention
+    /// exists for it, so there is nothing to map parts onto — diagnosed rather than guessed.
+    MultipartUnnamed,
     Text,
     Binary,
 }
@@ -427,7 +524,7 @@ pub fn build_client_model(
                     servers: effective_servers,
                 },
             };
-            diagnose_parameters(operation, &projector, deep_object, sink);
+            let param_plans = plan_parameters(operation, &projector, deep_object, sink);
             diagnose_security(operation, &effective_security, &analyzed.ir, sink);
             let auth_plan = plan_auth(
                 operation,
@@ -443,16 +540,11 @@ pub fn build_client_model(
                     diagnose_form_media(media, &projector, deep_object, sink);
                 }
             }
-            let param_plans = operation
-                .parameters
-                .iter()
-                .map(|parameter| parameter_plan(parameter, &projector, deep_object))
-                .collect();
             let body_plan = operation
                 .request_body
                 .as_ref()
                 .and_then(|body| build_body_plan(&body.media_types, &projector));
-            let response_table = response_table(operation, &projector, sink);
+            let response_table = response_table(operation, oas_version, &projector, sink);
             let accept = build_accept(operation.responses.iter().flat_map(|response| {
                 response
                     .media_types
@@ -487,9 +579,17 @@ fn diagnose_security_schemes(ir: &Ir, sink: &mut DiagnosticSink) {
                 if flows.is_empty() {
                     sink.push(source_diagnostic(
                         CODE_OAUTH2_EMPTY_FLOWS,
-                        "oauth2 scheme declares no flows",
+                        if flows.declared {
+                            "oauth2 scheme declares no flows"
+                        } else {
+                            "oauth2 scheme requires flows"
+                        },
                         &scheme.source,
-                        Severity::Error,
+                        if flows.declared {
+                            Severity::Warning
+                        } else {
+                            Severity::Error
+                        },
                     ));
                 }
                 diagnose_oauth_flow(
@@ -529,10 +629,10 @@ fn diagnose_security_schemes(ir: &Ir, sink: &mut DiagnosticSink) {
                         &scheme.source,
                         Severity::Error,
                     ));
-                } else if !is_absolute_url(url) {
+                } else if !is_uri_reference(url) {
                     sink.push(source_diagnostic(
                         CODE_OPENID_CONNECT_URL,
-                        format!("openIdConnectUrl '{url}' is not an absolute URL"),
+                        format!("openIdConnectUrl '{url}' is not an RFC 3986 URI-reference"),
                         &scheme.source,
                         Severity::Error,
                     ));
@@ -582,8 +682,8 @@ fn diagnose_oauth_flow(
     };
     let source = oauth_flow_source(scheme, key);
     // `refreshUrl` is never a required flow URL, so it carries a literal `false`; the other two ask
-    // the caller's list. Both the missing-required and non-absolute checks run per field — a field is
-    // never both (a missing URL cannot fail the absolute check) so a single pass over one table emits
+    // the caller's list. Both the missing-required and malformed-reference checks run per field — a
+    // field is never both (a missing URL cannot be malformed) so a single pass over one table emits
     // the same diagnostics the two separate passes did.
     for (field, required, value) in [
         (
@@ -606,10 +706,10 @@ fn diagnose_oauth_flow(
                 Severity::Error,
             ));
         }
-        if let Some(value) = value.filter(|value| !is_absolute_url(value)) {
+        if let Some(value) = value.filter(|value| !is_uri_reference(value)) {
             sink.push(source_diagnostic(
                 CODE_OAUTH2_FLOW_URL,
-                format!("{key} {field} '{value}' is not an absolute URL"),
+                format!("{key} {field} '{value}' is not an RFC 3986 URI-reference"),
                 &source,
                 Severity::Error,
             ));
@@ -623,6 +723,15 @@ fn oauth_flow_source(scheme: &NamedSecurityScheme, key: &str) -> SourceRef {
         json_pointer: append_pointer(&flows_pointer, key),
         ..scheme.source.clone()
     }
+}
+
+fn is_uri_reference(value: &str) -> bool {
+    // OAS 3.0.4 §4.6 and 3.1.1 §4.7 permit every URL field to be an RFC 3986
+    // relative reference unless that field says otherwise; OAuth flow URLs and
+    // `openIdConnectUrl` do not. Do not restore an absolute-URI check based on an
+    // OAS 3.1 JSON Schema revision's `format: uri`: that schema is non-normative,
+    // and the specification makes its prose authoritative when they differ.
+    fluent_uri::UriRef::parse(value).is_ok()
 }
 
 fn is_absolute_url(value: &str) -> bool {
@@ -1095,8 +1204,127 @@ fn default_part_media_impl(
     }
 }
 
+/// Plans how each property of a `multipart/form-data` response object decodes.
+///
+/// The declared object's `properties` become the named parts and its `additionalProperties` becomes
+/// the rule for a part naming none of them. A schema that is not object-shaped at all (an absent
+/// `schema` keyword, `type: string`, a broken `$ref`) declares no property to map onto, so every
+/// part falls to the open fallback and the emitted type is a bare index signature.
+fn multipart_response_plan(
+    schema: &SchemaNode,
+    version: OasVersion,
+    projector: &PrimitiveDomainProjector<'_>,
+) -> MultipartResponsePlan {
+    // Nothing constrains the part, so the property renders as `unknown` and the wire classifies it.
+    // The node is synthesized rather than borrowed from the object: the object's own schema would
+    // render as the whole decoded type, which is not what an undeclared part carries.
+    let open_fallback = |schema: &SchemaNode| MultipartResponseShape {
+        payload: MultipartResponsePayload::Wire,
+        repeated: false,
+        schema: SchemaNode::Any {
+            meta: SchemaNode::meta(schema).clone(),
+        },
+    };
+    let Some(SchemaNode::Object {
+        properties,
+        additional_properties,
+        ..
+    }) = projector.resolve_schema(schema)
+    else {
+        return MultipartResponsePlan {
+            parts: Vec::new(),
+            additional: open_fallback(schema),
+            open: true,
+        };
+    };
+    let parts = properties
+        .iter()
+        .map(|(name, property, meta)| MultipartResponsePartPlan {
+            name: name.clone(),
+            required: meta.required,
+            shape: multipart_response_shape(property, version, projector),
+        })
+        .collect();
+    let (additional, open) = match additional_properties {
+        AdditionalProperties::Schema(additional)
+        | AdditionalProperties::Allowed(Some(additional)) => (
+            multipart_response_shape(additional, version, projector),
+            true,
+        ),
+        AdditionalProperties::Allowed(None) => (open_fallback(schema), true),
+        // A closed schema still decodes an unexpected part rather than dropping it — the same thing
+        // `JSON.parse` does with an undeclared member — so the fallback shape survives; only the
+        // emitted index signature goes away.
+        AdditionalProperties::Forbidden => (open_fallback(schema), false),
+    };
+    MultipartResponsePlan {
+        parts,
+        additional,
+        open,
+    }
+}
+
+fn multipart_response_shape(
+    schema: &SchemaNode,
+    version: OasVersion,
+    projector: &PrimitiveDomainProjector<'_>,
+) -> MultipartResponseShape {
+    let mut visited = HashSet::new();
+    let repeated = matches!(
+        projector.resolve_schema(schema).unwrap_or(schema),
+        SchemaNode::Array { .. }
+    );
+    MultipartResponseShape {
+        payload: multipart_response_payload(schema, version, projector, &mut visited),
+        repeated,
+        schema: schema.clone(),
+    }
+}
+
+/// Classifies one part's payload, descending through `$ref` and array `items` exactly as the
+/// request encoder's classifier does — a part carries one element of a repeated property, so the
+/// item schema, not the array, is what decides.
+///
+/// The two arms that diverge from `default_part_media` are deliberate, because that function answers
+/// "what may a caller hand in", and this one answers "what does the decoder produce":
+///   - an unconstrained schema is `Wire` rather than a binary upload, since its rendered type is
+///     `unknown` and a `Uint8Array` claim would be unfounded;
+///   - a bare `enum`/`const` without a declared type stays a value, never bytes.
+fn multipart_response_payload(
+    schema: &SchemaNode,
+    version: OasVersion,
+    projector: &PrimitiveDomainProjector<'_>,
+    visited: &mut HashSet<(String, String)>,
+) -> MultipartResponsePayload {
+    let resolved = projector.resolve_schema(schema).unwrap_or(schema);
+    match resolved {
+        SchemaNode::Any { .. } | SchemaNode::Unknown { .. } => MultipartResponsePayload::Wire,
+        SchemaNode::Array { items, .. } if enter_array_items(items, visited) => {
+            multipart_response_payload(items, version, projector, visited)
+        }
+        // OAS 3.0's only binary spelling. OAS 3.1 replaced it with `contentEncoding`, which says the
+        // string arrives already encoded and therefore stays text — the same reading the request
+        // encoder takes (`default_part_media`), where `contentEncoding` clears `binary_upload`.
+        SchemaNode::Primitive {
+            ty: PrimitiveType::String,
+            format,
+            ..
+        } if version == OasVersion::V3_0 && format.as_deref() == Some("binary") => {
+            MultipartResponsePayload::Binary
+        }
+        _ => {
+            let (media, _) = default_part_media(resolved, version, projector, visited);
+            match content_payload_kind(resolved, media, projector, visited) {
+                PayloadKind::Json => MultipartResponsePayload::Json,
+                PayloadKind::Text | PayloadKind::Binary => MultipartResponsePayload::Text,
+            }
+        }
+    }
+}
+
 fn response_table(
     operation: &crate::ir::Operation,
+    oas_version: OasVersion,
     projector: &PrimitiveDomainProjector<'_>,
     sink: &mut DiagnosticSink,
 ) -> Vec<ResponsePlan> {
@@ -1115,15 +1343,22 @@ fn response_table(
             let media = response
                 .media_types
                 .iter()
-                .map(|media| ResponseMediaPlan {
+                .map(|media| {
                     // The runtime discriminates response arms on the canonical full media type, so a
                     // parameter-differing key (e.g. `application/json;stream=watch`) produces a
-                    // distinct arm. Decoding stays essence-keyed via `classify_response_media`.
-                    media: media.full.clone(),
-                    decoder: classify_response_media(media),
-                    schema: media.schema.clone(),
-                    streaming_marked: media.streaming_marked,
-                    source: media.source.clone(),
+                    // distinct arm. Decoding uses the essence plus the schema projection for the
+                    // XML-family opaque-vs-structural distinction.
+                    let decoder = classify_response_media(media, projector);
+                    ResponseMediaPlan {
+                        media: media.full.clone(),
+                        decoder,
+                        multipart: (decoder == DecoderClass::Multipart).then(|| {
+                            multipart_response_plan(&media.schema, oas_version, projector)
+                        }),
+                        schema: media.schema.clone(),
+                        streaming_marked: media.streaming_marked,
+                        source: media.source.clone(),
+                    }
                 })
                 .collect::<Vec<_>>();
             let static_bodyless = operation.method.eq_ignore_ascii_case("head")
@@ -1160,66 +1395,84 @@ fn response_table(
 const CODE_DEEP_OBJECT_FALSE_EXPLODE: &str = "OASTS1442";
 const CODE_CONTENT_CALLER_SERIALIZED: &str = "OASTS1443";
 
-fn diagnose_parameters(
+fn plan_parameters(
     operation: &Operation,
     projector: &PrimitiveDomainProjector<'_>,
     deep_object: DeepObjectEncoding,
     sink: &mut DiagnosticSink,
-) {
-    for parameter in &operation.parameters {
-        if parameter.location == ParamLocation::Header && forbidden_header_name(&parameter.name) {
-            sink.push(source_diagnostic(
-                "OASTS1411",
-                format!(
-                    "header parameter '{}' is unconditionally forbidden by Fetch",
-                    parameter.name
-                ),
-                &parameter.source,
-                Severity::Error,
-            ));
-        }
+) -> Vec<ParameterPlan> {
+    operation
+        .parameters
+        .iter()
+        .filter_map(|parameter| {
+            if parameter.location == ParamLocation::Header
+                && forbidden_request_header_name(&parameter.name)
+            {
+                sink.push(source_diagnostic(
+                    "OASTS1411",
+                    format!(
+                        "header parameter '{}' is dropped from the generated client because Fetch forbids setting that request header",
+                        parameter.name
+                    ),
+                    &parameter.source,
+                    Severity::Warning,
+                ));
+                return None;
+            }
         // A content media the client cannot serialize is carried as the caller's pre-serialized
         // string; the media type is present on this class by construction.
-        if let Some(media) = &parameter.content_media_type
-            && classify_param_content(parameter, projector) == ParamContentClass::CallerSerialized
-        {
-            sink.push(source_diagnostic(
-                CODE_CONTENT_CALLER_SERIALIZED,
-                format!(
-                    "parameter '{}' media type '{media}' is caller-serialized; input is the pre-serialized string",
-                    parameter.name
-                ),
-                &parameter.source,
-                Severity::Warning,
-            ));
-        }
-        let resolved = parameter_plan(parameter, projector, deep_object).resolved;
-        if resolved.style == ParamStyle::DeepObject && parameter.explode == Some(false) {
-            sink.push(source_diagnostic(
-                CODE_DEEP_OBJECT_FALSE_EXPLODE,
-                "explode: false with deepObject is undefined in OAS; treating as deepObject",
-                &parameter.source,
-                Severity::Warning,
-            ));
-        }
-        if invalid_style_combination(
-            resolved.location,
-            resolved.style,
-            resolved.explode,
-            projector.project(&parameter.schema),
-            deep_object,
-        ) {
-            sink.push(source_diagnostic(
-                "OASTS1419",
-                format!(
-                    "parameter '{}' has an unsupported {:?} serialization combination",
-                    parameter.name, resolved.style
-                ),
-                &parameter.source,
-                Severity::Error,
-            ));
-        }
-    }
+            if let Some(media) = &parameter.content_media_type
+                && classify_param_content(parameter, projector)
+                    == ParamContentClass::CallerSerialized
+            {
+                sink.push(source_diagnostic(
+                    CODE_CONTENT_CALLER_SERIALIZED,
+                    format!(
+                        "parameter '{}' media type '{media}' is caller-serialized; input is the pre-serialized string",
+                        parameter.name
+                    ),
+                    &parameter.source,
+                    Severity::Warning,
+                ));
+            }
+            let plan = parameter_plan(parameter, projector, deep_object);
+            if plan.resolved.style == ParamStyle::DeepObject && parameter.explode == Some(false) {
+                sink.push(source_diagnostic(
+                    CODE_DEEP_OBJECT_FALSE_EXPLODE,
+                    "explode: false with deepObject is undefined in OAS; treating as deepObject",
+                    &parameter.source,
+                    Severity::Warning,
+                ));
+            }
+            let projection = projector.project(&parameter.schema);
+            if invalid_style_combination(
+                plan.resolved.location,
+                plan.resolved.style,
+                plan.resolved.explode,
+                projection,
+                deep_object,
+            ) {
+                sink.push(source_diagnostic(
+                    "OASTS1419",
+                    format!(
+                        "parameter '{}' has an unsupported {:?} serialization combination{}",
+                        parameter.name,
+                        plan.resolved.style,
+                        extended_remedy(
+                            plan.resolved.location,
+                            plan.resolved.style,
+                            plan.resolved.explode,
+                            projection,
+                            deep_object,
+                        )
+                    ),
+                    &parameter.source,
+                    Severity::Error,
+                ));
+            }
+            Some(plan)
+        })
+        .collect()
 }
 
 fn invalid_style_combination(
@@ -1271,6 +1524,33 @@ fn invalid_style_combination(
     }
 }
 
+/// The remedy clause appended to `OASTS1419` when the only thing rejecting this combination is the
+/// strict `deepObject` reading — the one axis a user can move without editing a document they may
+/// not own. Every other rejection (an illegal location/style pair, `explode: false`, a delimited
+/// style over a scalar) is unaffected by the compat setting, so naming it there would send the
+/// reader after a switch that cannot help.
+fn extended_remedy(
+    location: ParamLocation,
+    style: ParamStyle,
+    explode: bool,
+    projection: Projection,
+    deep_object: DeepObjectEncoding,
+) -> &'static str {
+    if deep_object == DeepObjectEncoding::Strict
+        && !invalid_style_combination(
+            location,
+            style,
+            explode,
+            projection,
+            DeepObjectEncoding::Extended,
+        )
+    {
+        "; OpenAPI leaves deepObject undefined for arrays and scalars, so it is rejected by default — set compat.deepObjectEncoding: extended to encode it as a bracket path"
+    } else {
+        ""
+    }
+}
+
 fn domain_is_required_with_optional_null(domain: Domain, required: Domain) -> bool {
     domain.contains(required) && domain.intersect(required.union(Domain::NULL)) == domain
 }
@@ -1288,7 +1568,7 @@ fn diagnose_security(
             name,
         } = &scheme.kind
         {
-            if forbidden_header_name(name) {
+            if forbidden_request_header_name(name) {
                 sink.push(source_diagnostic(
                     "OASTS1411",
                     format!(
@@ -1462,7 +1742,7 @@ fn auth_scheme_use(
                             scheme.name
                         ),
                         &operation.source,
-                        Severity::Error,
+                        Severity::Warning,
                     ));
                 }
             }
@@ -1566,36 +1846,6 @@ fn wire_names_equal(location: ParamLocation, left: &str, right: &str) -> bool {
     } else {
         left == right
     }
-}
-
-fn forbidden_header_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("proxy-")
-        || lower.starts_with("sec-")
-        || matches!(
-            lower.as_str(),
-            "accept-charset"
-                | "accept-encoding"
-                | "access-control-request-headers"
-                | "access-control-request-method"
-                | "connection"
-                | "content-length"
-                | "cookie"
-                | "cookie2"
-                | "date"
-                | "dnt"
-                | "expect"
-                | "host"
-                | "keep-alive"
-                | "origin"
-                | "referer"
-                | "set-cookie"
-                | "te"
-                | "trailer"
-                | "transfer-encoding"
-                | "upgrade"
-                | "via"
-        )
 }
 
 fn diagnose_base_url(operation: &Operation, base_url: &BaseUrlPlan, sink: &mut DiagnosticSink) {
@@ -1752,17 +2002,25 @@ fn diagnose_form_media(
             }
             let style = encoding.style.unwrap_or(ParamStyle::Form);
             let explode = encoding.explode.unwrap_or(style == ParamStyle::Form);
+            let projection = projector.project(schema);
             if invalid_style_combination(
                 ParamLocation::Query,
                 style,
                 explode,
-                projector.project(schema),
+                projection,
                 deep_object,
             ) {
+                let remedy = extended_remedy(
+                    ParamLocation::Query,
+                    style,
+                    explode,
+                    projection,
+                    deep_object,
+                );
                 sink.push(source_diagnostic(
                     "OASTS1419",
                     format!(
-                        "encoding for field '{name}' has an unsupported {style:?} serialization combination"
+                        "encoding for field '{name}' has an unsupported {style:?} serialization combination{remedy}"
                     ),
                     &encoding.source,
                     Severity::Error,
@@ -2047,7 +2305,7 @@ fn diagnose_request_media(
                 &media.source,
                 Severity::Error,
             ));
-        } else if is_xml(&media.essence) {
+        } else if xml_requires_structural_mapping(media, projector) {
             sink.push(source_diagnostic(
                 "OASTS1403",
                 format!(
@@ -2058,6 +2316,7 @@ fn diagnose_request_media(
                 Severity::Error,
             ));
         } else if media.essence.starts_with("text/")
+            && !is_json(&media.essence)
             && media.schema_present
             && projection_excludes_string(projector.project(&media.schema))
         {
@@ -2094,7 +2353,7 @@ fn diagnose_response(
             ));
             continue;
         }
-        match classify_response_media(media) {
+        match classify_response_media(media, projector) {
             DecoderClass::Streaming => sink.push(source_diagnostic(
                 "OASTS1402",
                 format!(
@@ -2113,10 +2372,10 @@ fn diagnose_response(
                 &media.source,
                 Severity::Error,
             )),
-            DecoderClass::Multipart => sink.push(source_diagnostic(
+            DecoderClass::MultipartUnnamed => sink.push(source_diagnostic(
                 "OASTS1404",
                 format!(
-                    "multipart response media '{}' is not supported",
+                    "multipart response media '{}' has no part-to-property mapping; only multipart/form-data names its parts (RFC 7578 §4.2 Content-Disposition), so nothing decides which declared property a part belongs to",
                     media.essence
                 ),
                 &media.source,
@@ -2136,7 +2395,10 @@ fn diagnose_response(
                     Severity::Error,
                 ));
             }
-            DecoderClass::Json | DecoderClass::Text | DecoderClass::Binary => {}
+            DecoderClass::Json
+            | DecoderClass::Multipart
+            | DecoderClass::Text
+            | DecoderClass::Binary => {}
         }
     }
 }
@@ -2150,6 +2412,24 @@ fn response_status_name(status: &ResponseStatus) -> &str {
 
 fn projection_excludes_string(projection: Projection) -> bool {
     matches!(projection, Projection::Known(domain) if !domain.contains(Domain::STRING))
+}
+
+fn xml_requires_structural_mapping(
+    media: &MediaType,
+    projector: &PrimitiveDomainProjector<'_>,
+) -> bool {
+    if !is_xml(&media.essence) {
+        return false;
+    }
+    if !media.schema_present {
+        return false;
+    }
+    match projector.project(&media.schema) {
+        Projection::Known(domain) => !domain_is_required_with_optional_null(domain, Domain::STRING),
+        // The schema diagnostic owns an unsupported projection; do not add an unproven structural
+        // XML claim to it.
+        Projection::Unsupported => false,
+    }
 }
 
 fn source_diagnostic(
@@ -2182,15 +2462,22 @@ fn response_sort_key(status: &ResponseStatus) -> (u8, u16) {
     }
 }
 
-fn classify_response_media(media: &MediaType) -> DecoderClass {
+fn classify_response_media(
+    media: &MediaType,
+    projector: &PrimitiveDomainProjector<'_>,
+) -> DecoderClass {
     if media.streaming_marked || media.essence == "text/event-stream" {
         DecoderClass::Streaming
     } else if is_json(&media.essence) {
         DecoderClass::Json
-    } else if is_xml(&media.essence) {
+    } else if xml_requires_structural_mapping(media, projector) {
         DecoderClass::Xml
-    } else if media.essence.starts_with("multipart/") {
+    } else if is_xml(&media.essence) {
+        DecoderClass::Binary
+    } else if media.essence == "multipart/form-data" {
         DecoderClass::Multipart
+    } else if media.essence.starts_with("multipart/") {
+        DecoderClass::MultipartUnnamed
     } else if media.essence == "application/x-www-form-urlencoded"
         || media.essence.starts_with("text/")
     {
@@ -2201,10 +2488,10 @@ fn classify_response_media(media: &MediaType) -> DecoderClass {
 }
 
 /// Whether a response header's declared value is an opaque wire string rather than its typed schema.
-/// A content-sourced header whose media type is not JSON-family (RFC 8259, plus the `+json`
-/// structured suffix) transmits a caller-parsed string on the wire, so both the emitted header type
-/// and its validator treat it as a bare `string`; JSON-family and schema+style headers keep their
-/// schema.
+/// A content-sourced header whose media type is not JSON-family (`application/json`, `text/json`,
+/// or a `+json` structured suffix) transmits a caller-parsed string on the wire, so both the emitted
+/// header type and its validator treat it as a bare `string`; JSON-family and schema+style headers
+/// keep their schema.
 pub(crate) fn response_header_is_opaque_string(header: &crate::ir::ResponseHeader) -> bool {
     header
         .content_media_type
@@ -2616,6 +2903,203 @@ mod tests {
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
         (temp, analyzed, config, sink)
+    }
+
+    /// The single response media plan a one-operation document produces.
+    fn response_media_plan(document: &Value) -> ResponseMediaPlan {
+        let (_temp, analyzed, config) = analyzed(
+            document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        model.operations[0].response_table[0].media[0].clone()
+    }
+
+    fn multipart_document(version: &str, schema: Value) -> Value {
+        json!({
+            "openapi": version,
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/bundle": { "get": {
+                "operationId": "getbundle",
+                "responses": { "200": { "description": "ok", "content": { "multipart/form-data": { "schema": schema } } } }
+            } } }
+        })
+    }
+
+    /// The payload kind one declared property is planned with.
+    fn part_payload(version: &str, property: Value) -> MultipartResponsePayload {
+        let plan = response_media_plan(&multipart_document(
+            version,
+            json!({ "type": "object", "properties": { "field": property } }),
+        ))
+        .multipart
+        .expect("multipart plan");
+        plan.parts[0].shape.payload
+    }
+
+    #[test]
+    fn multipart_response_parts_classify_by_shape_not_by_the_wire() {
+        // OAS 3.0's binary spelling is the only one that leaves the JSON data model.
+        assert_eq!(
+            part_payload("3.0.3", json!({ "type": "string", "format": "binary" })),
+            MultipartResponsePayload::Binary
+        );
+        // `format: byte` is base64 *text* on the wire, exactly as the request encoder reads it.
+        assert_eq!(
+            part_payload("3.0.3", json!({ "type": "string", "format": "byte" })),
+            MultipartResponsePayload::Text
+        );
+        // OAS 3.1 `contentEncoding` says the string arrives already encoded, so it stays text —
+        // 3.1 has no binary part spelling this classifier can see.
+        assert_eq!(
+            part_payload(
+                "3.1.0",
+                json!({ "type": "string", "contentEncoding": "base64" })
+            ),
+            MultipartResponsePayload::Text
+        );
+        assert_eq!(
+            part_payload("3.1.0", json!({ "type": "object" })),
+            MultipartResponsePayload::Json
+        );
+        assert_eq!(
+            part_payload("3.1.0", json!({ "type": "integer" })),
+            MultipartResponsePayload::Text
+        );
+        // A bare enum without a declared type is a value, never bytes — the arm where this
+        // classifier deliberately parts company with `default_part_media`.
+        assert_eq!(
+            part_payload("3.1.0", json!({ "enum": ["a", "b"] })),
+            MultipartResponsePayload::Text
+        );
+        // An unconstrained property renders as `unknown`, so the part's own Content-Type decides.
+        assert_eq!(
+            part_payload("3.1.0", json!({})),
+            MultipartResponsePayload::Wire
+        );
+        // An array classifies by its items and repeats; nothing deeper changes the repeat flag.
+        let arrays = response_media_plan(&multipart_document(
+            "3.0.3",
+            json!({
+                "type": "object",
+                "properties": {
+                    "files": { "type": "array", "items": { "type": "string", "format": "binary" } },
+                    "labels": { "type": "array", "items": { "type": "string" } }
+                }
+            }),
+        ))
+        .multipart
+        .expect("multipart plan");
+        assert_eq!(
+            arrays.parts[0].shape.payload,
+            MultipartResponsePayload::Binary
+        );
+        assert!(arrays.parts[0].shape.repeated);
+        assert_eq!(
+            arrays.parts[1].shape.payload,
+            MultipartResponsePayload::Text
+        );
+        assert!(arrays.parts[1].shape.repeated);
+    }
+
+    #[test]
+    fn multipart_response_parts_follow_refs_and_survive_a_ref_cycle() {
+        let document = json!({
+            "openapi": "3.0.3",
+            "info": { "title": "t", "version": "1" },
+            "components": { "schemas": {
+                "File": { "type": "string", "format": "binary" },
+                "Tree": { "type": "array", "items": { "$ref": "#/components/schemas/Tree" } }
+            } },
+            "paths": { "/bundle": { "get": {
+                "operationId": "getbundle",
+                "responses": { "200": { "description": "ok", "content": { "multipart/form-data": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "file": { "$ref": "#/components/schemas/File" },
+                        "tree": { "$ref": "#/components/schemas/Tree" }
+                    }
+                } } } } }
+            } } }
+        });
+        let plan = response_media_plan(&document)
+            .multipart
+            .expect("multipart plan");
+
+        assert_eq!(
+            plan.parts[0].shape.payload,
+            MultipartResponsePayload::Binary
+        );
+        assert!(!plan.parts[0].shape.repeated);
+        // A ref cycle through `items` bottoms out at the text fallback instead of recursing.
+        assert_eq!(plan.parts[1].shape.payload, MultipartResponsePayload::Text);
+        assert!(plan.parts[1].shape.repeated);
+    }
+
+    #[test]
+    fn multipart_response_additional_properties_decide_the_open_fallback() {
+        // The published open-ended shape: no declared property, every part admitted.
+        let cloudflare = response_media_plan(&multipart_document(
+            "3.0.3",
+            json!({
+                "type": "object",
+                "additionalProperties": { "type": "array", "items": { "type": "string", "format": "binary" } }
+            }),
+        ))
+        .multipart
+        .expect("multipart plan");
+        assert!(cloudflare.parts.is_empty());
+        assert!(cloudflare.open);
+        assert_eq!(
+            cloudflare.additional.payload,
+            MultipartResponsePayload::Binary
+        );
+        assert!(cloudflare.additional.repeated);
+
+        // A closed schema keeps a decoding rule for an unexpected part; only the type closes.
+        let closed = response_media_plan(&multipart_document(
+            "3.0.3",
+            json!({ "type": "object", "additionalProperties": false }),
+        ))
+        .multipart
+        .expect("multipart plan");
+        assert!(!closed.open);
+        assert_eq!(closed.additional.payload, MultipartResponsePayload::Wire);
+
+        // `additionalProperties: true` and an omitted keyword both leave an unconstrained fallback.
+        for additional in [json!(true), json!(null)] {
+            let mut schema = json!({ "type": "object" });
+            if !additional.is_null() {
+                schema["additionalProperties"] = additional;
+            }
+            let plan = response_media_plan(&multipart_document("3.0.3", schema))
+                .multipart
+                .expect("multipart plan");
+            assert!(plan.open);
+            assert_eq!(plan.additional.payload, MultipartResponsePayload::Wire);
+        }
+
+        // A response schema that is not object-shaped declares no property to map onto.
+        let opaque = response_media_plan(&multipart_document("3.0.3", json!({ "type": "string" })))
+            .multipart
+            .expect("multipart plan");
+        assert!(opaque.parts.is_empty());
+        assert!(opaque.open);
+        assert_eq!(opaque.additional.payload, MultipartResponsePayload::Wire);
+    }
+
+    #[test]
+    fn payload_kind_names_are_the_emitted_descriptor_values() {
+        for (payload, name) in [
+            (MultipartResponsePayload::Json, "json"),
+            (MultipartResponsePayload::Text, "text"),
+            (MultipartResponsePayload::Binary, "binary"),
+            (MultipartResponsePayload::Wire, "wire"),
+        ] {
+            assert_eq!(payload.as_str(), name);
+        }
     }
 
     fn client_diagnostics(document: &Value) -> Vec<Diagnostic> {
@@ -4657,15 +5141,20 @@ mod tests {
 
     #[test]
     fn response_classifier_matches_every_frozen_classifier_class() {
+        let ir = Ir::default();
+        let projector = PrimitiveDomainProjector::new(&ir);
         for (media, marked, expected) in [
             ("text/event-stream", false, DecoderClass::Streaming),
             ("application/stream+json", true, DecoderClass::Streaming),
             ("application/json", false, DecoderClass::Json),
+            ("text/json", false, DecoderClass::Json),
             ("application/vnd.api+json", false, DecoderClass::Json),
-            ("application/xml", false, DecoderClass::Xml),
-            ("text/xml", false, DecoderClass::Xml),
-            ("application/atom+xml", false, DecoderClass::Xml),
-            ("multipart/mixed", false, DecoderClass::Multipart),
+            ("application/xml", false, DecoderClass::Binary),
+            ("text/xml", false, DecoderClass::Binary),
+            ("application/atom+xml", false, DecoderClass::Binary),
+            ("multipart/form-data", false, DecoderClass::Multipart),
+            ("multipart/mixed", false, DecoderClass::MultipartUnnamed),
+            ("multipart/*", false, DecoderClass::MultipartUnnamed),
             (
                 "application/x-www-form-urlencoded",
                 false,
@@ -4678,11 +5167,22 @@ mod tests {
             ("application/pdf", false, DecoderClass::Binary),
         ] {
             assert_eq!(
-                classify_response_media(&classifier_media(media, marked)),
+                classify_response_media(&classifier_media(media, marked), &projector),
                 expected,
                 "{media}"
             );
         }
+
+        let mut unsupported_xml = classifier_media("text/xml", false);
+        unsupported_xml.schema_present = true;
+        unsupported_xml.schema = SchemaNode::Unknown {
+            reason: "test".to_owned(),
+            meta: test_meta("/unsupported-xml"),
+        };
+        assert_eq!(
+            classify_response_media(&unsupported_xml, &projector),
+            DecoderClass::Binary
+        );
     }
 
     #[test]
@@ -4739,7 +5239,117 @@ mod tests {
     }
 
     #[test]
-    fn oasts1403_rejects_xml_requests_and_responses() {
+    fn schemaless_xml_requests_and_responses_are_opaque_binary() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/opaque": {
+                    "post": {
+                        "operationId": "opaqueXml",
+                        "requestBody": {
+                            "content": {
+                                "application/xml": {},
+                                "text/xml": {},
+                                "image/svg+xml": {}
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "opaque",
+                                "content": {
+                                    "application/xml": {},
+                                    "text/xml": {},
+                                    "image/svg+xml": {}
+                                }
+                            }
+                        }
+                    }
+                },
+                "/string": {
+                    "post": {
+                        "operationId": "stringXml",
+                        "requestBody": {
+                            "content": {
+                                "text/xml": { "schema": { "type": ["string", "null"] } }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "opaque string",
+                                "content": {
+                                    "text/xml": { "schema": { "type": "string", "format": "binary" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+
+        assert!(sink.as_slice().is_empty());
+        let opaque = model
+            .operations
+            .iter()
+            .find(|plan| {
+                analyzed
+                    .ir
+                    .operations
+                    .get(plan.operation_index)
+                    .and_then(|operation| operation.operation_id.as_deref())
+                    == Some("opaqueXml")
+            })
+            .expect("opaque operation");
+        let (arms, _) = opaque
+            .body_plan
+            .as_ref()
+            .and_then(BodyPlan::discriminated_arms)
+            .expect("discriminated opaque body");
+        assert!(
+            arms.iter()
+                .all(|(_, plan)| matches!(plan, BodyPlan::TopLevelBinary { .. }))
+        );
+        assert!(
+            opaque.response_table[0]
+                .media
+                .iter()
+                .all(|media| media.decoder == DecoderClass::Binary)
+        );
+
+        let string = model
+            .operations
+            .iter()
+            .find(|plan| {
+                analyzed
+                    .ir
+                    .operations
+                    .get(plan.operation_index)
+                    .and_then(|operation| operation.operation_id.as_deref())
+                    == Some("stringXml")
+            })
+            .expect("string operation");
+        let expected_binary_variant = BodyPlan::TopLevelBinary {
+            media: String::new(),
+            schema: None,
+            source: test_meta("/expected-binary").source,
+        };
+        assert_eq!(
+            std::mem::discriminant(string.body_plan.as_ref().expect("string request body")),
+            std::mem::discriminant(&expected_binary_variant)
+        );
+        assert_eq!(
+            string.response_table[0].media[0].decoder,
+            DecoderClass::Binary
+        );
+    }
+
+    #[test]
+    fn oasts1403_rejects_structural_xml_requests_and_responses() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -4747,7 +5357,7 @@ mod tests {
                     "post": {
                         "requestBody": {
                             "content": {
-                                "application/xml": { "schema": { "type": "string" } },
+                                "text/xml": { "schema": { "type": "object" } },
                                 "application/json": { "schema": { "type": "object" } }
                             }
                         },
@@ -4755,13 +5365,19 @@ mod tests {
                             "200": {
                                 "description": "xml",
                                 "content": {
-                                    "application/atom+xml": { "schema": { "type": "string" } }
+                                    "application/atom+xml": { "schema": { "type": "object" } }
                                 }
                             },
                             "201": {
                                 "description": "json sibling",
                                 "content": {
                                     "application/json": { "schema": { "type": "object" } }
+                                }
+                            },
+                            "202": {
+                                "description": "text xml",
+                                "content": {
+                                    "text/xml": { "schema": { "type": "object" } }
                                 }
                             }
                         }
@@ -4776,7 +5392,7 @@ mod tests {
                 .iter()
                 .filter(|diagnostic| diagnostic.code == "OASTS1403")
                 .count(),
-            2
+            3
         );
     }
 
@@ -4804,6 +5420,12 @@ mod tests {
                                 "content": {
                                     "application/octet-stream": { "schema": { "type": "string" } }
                                 }
+                            },
+                            "202": {
+                                "description": "decodable form-data sibling",
+                                "content": {
+                                    "multipart/form-data": { "schema": { "type": "object" } }
+                                }
                             }
                         }
                     }
@@ -4812,12 +5434,69 @@ mod tests {
         });
         let diagnostics = client_diagnostics(&document);
 
+        // Only the subtype with no part-naming convention is rejected: `multipart/form-data` names
+        // its parts, so it decodes, and the multipart *request* body was never in question.
+        let rejected = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1404")
+            .collect::<Vec<_>>();
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].message.contains("multipart/mixed"));
+    }
+
+    #[test]
+    fn text_json_uses_json_request_and_response_plans_with_declared_headers() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/json": {
+                    "post": {
+                        "operationId": "textJson",
+                        "requestBody": {
+                            "content": {
+                                "text/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": { "message": { "type": "string" } }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "202": {
+                                "description": "accepted",
+                                "content": {
+                                    "text/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": { "accepted": { "type": "boolean" } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+
+        assert!(sink.as_slice().is_empty());
+        let operation = &model.operations[0];
+        assert!(matches!(
+            operation.body_plan,
+            Some(BodyPlan::Json { ref media, .. }) if media == "text/json"
+        ));
+        assert_eq!(operation.accept.as_deref(), Some("text/json"));
+        assert_eq!(operation.response_table[0].media[0].media, "text/json");
         assert_eq!(
-            diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1404")
-                .count(),
-            1
+            operation.response_table[0].media[0].decoder,
+            DecoderClass::Json
         );
     }
 
@@ -4830,7 +5509,7 @@ mod tests {
                     "post": {
                         "requestBody": {
                             "content": {
-                                "text/plain": { "schema": { "type": "integer" } },
+                                "text/plain": { "schema": { "type": "object" } },
                                 "application/json": { "schema": { "type": "object" } }
                             }
                         },
@@ -4873,7 +5552,7 @@ mod tests {
                             "200": {
                                 "description": "unsupported schema",
                                 "content": {
-                                    "text/plain": { "schema": { "not": { "type": "integer" } } }
+                                    "text/plain": { "schema": { "if": { "type": "integer" } } }
                                 }
                             }
                         }
@@ -5190,7 +5869,7 @@ mod tests {
     }
 
     #[test]
-    fn oasts1411_rejects_unconditionally_forbidden_operation_headers() {
+    fn oasts1411_drops_forbidden_parameters_and_rejects_active_header_api_keys() {
         let document = json!({
             "openapi": "3.1.0",
             "security": [{ "proxyKey": [] }],
@@ -5213,7 +5892,13 @@ mod tests {
                 }
             }
         });
-        let diagnostics = client_diagnostics(&document);
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let diagnostics = sink.as_slice();
 
         assert_eq!(
             diagnostics
@@ -5222,11 +5907,84 @@ mod tests {
                 .count(),
             2
         );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "OASTS1411"
+                && diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("Content-Length")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "OASTS1411"
+                && diagnostic.severity == Severity::Error
+                && diagnostic.message.contains("proxyKey")
+        }));
         assert!(!diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "OASTS1411"
                 && (diagnostic.message.contains("X-HTTP-Method")
                     || diagnostic.message.contains("inactive"))
         }));
+        assert_eq!(
+            model.operations[0]
+                .param_plans
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>(),
+            ["X-HTTP-Method", "X-Safe"]
+        );
+    }
+
+    #[test]
+    fn fetch_header_filter_does_not_apply_to_webhooks_or_callbacks() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/subscribe": {
+                    "post": {
+                        "operationId": "subscribe",
+                        "callbacks": {
+                            "delivery": {
+                                "{$request.body#/url}": {
+                                    "post": {
+                                        "operationId": "deliver",
+                                        "parameters": [
+                                            { "name": "Cookie", "in": "header", "required": true, "schema": { "type": "string" } }
+                                        ],
+                                        "responses": { "204": { "description": "ok" } }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            },
+            "webhooks": {
+                "ping": {
+                    "post": {
+                        "operationId": "ping",
+                        "parameters": [
+                            { "name": "Host", "in": "header", "required": true, "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        assert_eq!(
+            analyzed.ir.webhooks[0].operations[0].parameters[0].name,
+            "Host"
+        );
+        assert_eq!(
+            analyzed.ir.operations[0].callbacks[0].expressions[0].operations[0].parameters[0].name,
+            "Cookie"
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        assert_eq!(model.operations.len(), 1);
+        assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
     }
 
     #[test]
@@ -5570,7 +6328,7 @@ mod tests {
                                         "field": {
                                             "headers": {
                                                 "Content-Transfer-Encoding": {
-                                                    "schema": { "not": { "const": "8bit" } }
+                                                    "schema": { "if": { "const": "8bit" } }
                                                 }
                                             }
                                         }
@@ -6003,6 +6761,47 @@ mod tests {
                 .iter()
                 .all(|(_, helper)| *helper == HelperId::QueryDeepObject),
             "{helpers:?}"
+        );
+    }
+
+    /// The strict rejection is the one a user can lift without editing the document, so it is the
+    /// one that has to say so. Every other rejection must stay silent about compat — pointing a
+    /// reader at a switch that would not have helped is worse than saying nothing.
+    #[test]
+    fn strict_deep_object_rejection_names_the_compat_setting() {
+        let (_, diagnostics) =
+            deep_object_plan(&deep_object_document(), DeepObjectEncoding::Strict);
+        let deep_object: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1419")
+            .collect();
+        assert!(
+            deep_object.iter().all(|diagnostic| diagnostic
+                .message
+                .contains("compat.deepObjectEncoding: extended")),
+            "{deep_object:#?}"
+        );
+
+        let unrelated = client_diagnostics(&json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/styles": {
+                    "get": {
+                        "parameters": [
+                            { "name": "querySimple", "in": "query", "style": "simple", "schema": { "type": "string" } }
+                        ],
+                        "responses": { "200": { "description": "ok" } }
+                    }
+                }
+            }
+        }));
+        let illegal_style = unrelated
+            .iter()
+            .find(|diagnostic| diagnostic.code == "OASTS1419")
+            .expect("an illegal query style is still rejected");
+        assert!(
+            !illegal_style.message.contains("compat"),
+            "{illegal_style:#?}"
         );
     }
 
@@ -6453,7 +7252,6 @@ mod tests {
     fn oasts1420_only_rejects_an_out_of_range_server_index() {
         let document = json!({
             "openapi": "3.1.0",
-            "servers": [{ "url": "https://root.example.test" }],
             "paths": {
                 "/missing": {
                     "get": { "responses": { "200": { "description": "missing index" } } }
@@ -6503,6 +7301,45 @@ mod tests {
                     .message
                     .contains("operation has no effective server at index 1")
         }));
+    }
+
+    #[test]
+    fn operation_empty_servers_inherits_the_synthesized_root_server() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/status": {
+                    "get": {
+                        "servers": [],
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({
+                "authEnforcement": "types",
+                "baseUrl": { "source": "server", "index": 0 }
+            }),
+        );
+
+        assert_eq!(analyzed.ir.root_servers.len(), 1);
+        assert_eq!(analyzed.ir.root_servers[0].url, "/");
+        assert!(analyzed.ir.operations[0].servers.is_empty());
+
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+
+        assert!(matches!(
+            &model.operations[0].base_url,
+            BaseUrlPlan::Server { index: 0, servers }
+                if servers.len() == 1
+                    && servers[0].url == "/"
+                    && servers[0].variables.is_empty()
+        ));
+        assert!(model.base_url_required);
+        assert!(sink.as_slice().is_empty());
     }
 
     #[test]
@@ -6563,9 +7400,53 @@ mod tests {
     }
 
     #[test]
-    fn oauth2_empty_flows_errors_1435() {
+    fn oauth2_empty_flows_warn_and_remain_a_token_auth_alternative() {
         let document = json!({
-            "openapi": "3.1.0",
+            "openapi": "3.1.1",
+            "components": { "securitySchemes": {
+                "oauth": { "type": "oauth2", "flows": {} }
+            }},
+            "security": [{ "oauth": [] }],
+            "paths": {
+                "/secured": {
+                    "get": { "responses": { "204": { "description": "ok" } } }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_OAUTH2_EMPTY_FLOWS)
+            .expect("empty OAuth2 flows diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/components/securitySchemes/oauth")
+        );
+        assert_eq!(diagnostic.message, "oauth2 scheme declares no flows");
+        assert!(!sink.has_errors());
+        assert!(matches!(
+            model.operations[0].auth_plan.as_slice(),
+            [alternative]
+                if matches!(
+                    alternative.as_slice(),
+                    [AuthSchemeUse { name, kind: AuthKind::OAuth2, scopes }]
+                        if name == "oauth" && scopes.is_empty()
+                )
+        ));
+        assert_eq!(model.operations[0].credential_headers, ["authorization"]);
+    }
+
+    #[test]
+    fn oauth2_missing_flows_still_errors_1435() {
+        let document = json!({
+            "openapi": "3.1.1",
             "components": { "securitySchemes": {
                 "oauth": { "type": "oauth2" }
             }}
@@ -6574,13 +7455,13 @@ mod tests {
         let diagnostic = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == CODE_OAUTH2_EMPTY_FLOWS)
-            .expect("empty OAuth2 flows diagnostic");
+            .expect("missing OAuth2 flows diagnostic");
         assert_eq!(diagnostic.severity, Severity::Error);
         assert_eq!(
             diagnostic.json_pointer.as_deref(),
             Some("/components/securitySchemes/oauth")
         );
-        assert_eq!(diagnostic.message, "oauth2 scheme declares no flows");
+        assert_eq!(diagnostic.message, "oauth2 scheme requires flows");
     }
 
     #[test]
@@ -6659,52 +7540,84 @@ mod tests {
     }
 
     #[test]
-    fn flow_url_not_absolute_errors_1437() {
+    fn relative_oauth_flow_urls_are_valid_uri_references() {
+        for version in ["3.0.4", "3.1.1"] {
+            let document = json!({
+                "openapi": version,
+                "components": { "securitySchemes": {
+                    "oauth": {
+                        "type": "oauth2",
+                        "flows": { "authorizationCode": {
+                            "authorizationUrl": "/oauth/authorize",
+                            "tokenUrl": "oauth/token?next=%2F",
+                            "refreshUrl": "urn:example:refresh",
+                            "scopes": {}
+                        }}
+                    }
+                }}
+            });
+            let diagnostics = client_diagnostics(&document);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_oauth_flow_url_errors_1437() {
         let document = json!({
-            "openapi": "3.1.0",
+            "openapi": "3.1.1",
             "components": { "securitySchemes": {
                 "oauth": {
                     "type": "oauth2",
                     "flows": { "authorizationCode": {
-                        "authorizationUrl": "relative",
-                        "tokenUrl": "urn:example",
-                        "refreshUrl": "https://example.test/refresh",
+                        "authorizationUrl": "%",
+                        "tokenUrl": "/oauth/token",
                         "scopes": {}
                     }}
                 }
             }}
         });
         let diagnostics = client_diagnostics(&document);
-        let hits = diagnostics
+        let diagnostic = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == CODE_OAUTH2_FLOW_URL)
-            .collect::<Vec<_>>();
-        assert_eq!(hits.len(), 2);
-        for diagnostic in &hits {
-            assert_eq!(diagnostic.severity, Severity::Error);
-            assert_eq!(
-                diagnostic.json_pointer.as_deref(),
-                Some("/components/securitySchemes/oauth/flows/authorizationCode")
-            );
-        }
-        assert!(hits.iter().any(|diagnostic| {
-            diagnostic.message
-                == "authorizationCode authorizationUrl 'relative' is not an absolute URL"
-        }));
-        assert!(hits.iter().any(|diagnostic| {
-            diagnostic.message == "authorizationCode tokenUrl 'urn:example' is not an absolute URL"
-        }));
+            .find(|diagnostic| diagnostic.code == CODE_OAUTH2_FLOW_URL)
+            .expect("malformed OAuth2 flow URL diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/components/securitySchemes/oauth/flows/authorizationCode")
+        );
+        assert_eq!(
+            diagnostic.message,
+            "authorizationCode authorizationUrl '%' is not an RFC 3986 URI-reference"
+        );
     }
 
     #[test]
-    fn openidconnect_url_missing_or_invalid_errors_1439() {
+    fn relative_openidconnect_url_is_a_valid_uri_reference() {
+        for version in ["3.0.4", "3.1.1"] {
+            let document = json!({
+                "openapi": version,
+                "components": { "securitySchemes": {
+                    "oidc": {
+                        "type": "openIdConnect",
+                        "openIdConnectUrl": "/.well-known/openid-configuration"
+                    }
+                }}
+            });
+            let diagnostics = client_diagnostics(&document);
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn openidconnect_url_missing_or_malformed_errors_1439() {
         let document = json!({
-            "openapi": "3.1.0",
+            "openapi": "3.1.1",
             "components": { "securitySchemes": {
                 "missing": { "type": "openIdConnect" },
-                "invalid": {
+                "malformed": {
                     "type": "openIdConnect",
-                    "openIdConnectUrl": "urn:example"
+                    "openIdConnectUrl": "%"
                 }
             }}
         });
@@ -6721,17 +7634,17 @@ mod tests {
             missing.json_pointer.as_deref(),
             Some("/components/securitySchemes/missing")
         );
-        let invalid = diagnostics
+        let malformed = diagnostics
             .iter()
             .find(|diagnostic| {
-                diagnostic.message == "openIdConnectUrl 'urn:example' is not an absolute URL"
+                diagnostic.message == "openIdConnectUrl '%' is not an RFC 3986 URI-reference"
             })
-            .expect("invalid OpenID Connect URL diagnostic");
-        assert_eq!(invalid.code, CODE_OPENID_CONNECT_URL);
-        assert_eq!(invalid.severity, Severity::Error);
+            .expect("malformed OpenID Connect URL diagnostic");
+        assert_eq!(malformed.code, CODE_OPENID_CONNECT_URL);
+        assert_eq!(malformed.severity, Severity::Error);
         assert_eq!(
-            invalid.json_pointer.as_deref(),
-            Some("/components/securitySchemes/invalid")
+            malformed.json_pointer.as_deref(),
+            Some("/components/securitySchemes/malformed")
         );
     }
 
@@ -7249,7 +8162,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth2_requirement_scope_outside_union_errors_1440() {
+    fn oauth2_requirement_scope_outside_declared_map_warns_1440() {
         let document = json!({
             "openapi": "3.1.0",
             "components": { "securitySchemes": {
@@ -7280,7 +8193,7 @@ mod tests {
             .filter(|diagnostic| diagnostic.code == CODE_OAUTH2_REQUIREMENT_SCOPE)
             .collect::<Vec<_>>();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].severity, Severity::Error);
+        assert_eq!(hits[0].severity, Severity::Warning);
         assert_eq!(hits[0].source_id.as_deref(), Some("workspace/openapi.json"));
         assert_eq!(hits[0].json_pointer.as_deref(), Some("/paths/~1p/get"));
         assert_eq!(
@@ -7319,7 +8232,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth2_scheme_use_survives_scope_error() {
+    fn oauth2_scheme_use_preserves_undeclared_scope() {
         let document = json!({
             "openapi": "3.1.0",
             "components": { "securitySchemes": {
@@ -7338,11 +8251,12 @@ mod tests {
             }}}
         });
         let (_analyzed, model, sink) = runtime_plan(&document);
-        assert!(
-            sink.as_slice()
-                .iter()
-                .any(|diagnostic| diagnostic.code == CODE_OAUTH2_REQUIREMENT_SCOPE)
-        );
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_OAUTH2_REQUIREMENT_SCOPE)
+            .expect("undeclared scope warning");
+        assert_eq!(diagnostic.severity, Severity::Warning);
         assert_eq!(
             model.operations[0].auth_plan,
             vec![vec![AuthSchemeUse {
@@ -7440,6 +8354,37 @@ mod tests {
                 .filter(|diagnostic| diagnostic.code == CODE_NON_OAUTH_REQUIREMENT_SCOPES)
                 .count();
             assert_eq!(hits, expected, "version {version}: {diagnostics:#?}");
+        }
+    }
+
+    /// `HelperId::ALL` feeds the client emitter's reserved-name set, so a variant missing from it
+    /// would leave that helper's exported name shadowable by a component import. The match below
+    /// is exhaustive: adding a variant stops this compiling until `ALL` is extended too.
+    #[test]
+    fn helper_id_all_lists_every_variant() {
+        for helper in HelperId::ALL {
+            let position = match helper {
+                HelperId::PathSimple => 0,
+                HelperId::PathSimpleExplode => 1,
+                HelperId::PathLabel => 2,
+                HelperId::PathLabelExplode => 3,
+                HelperId::PathMatrix => 4,
+                HelperId::PathMatrixExplode => 5,
+                HelperId::QueryForm => 6,
+                HelperId::QueryFormExplode => 7,
+                HelperId::QuerySpaceDelimited => 8,
+                HelperId::QuerySpaceDelimitedObject => 9,
+                HelperId::QueryPipeDelimited => 10,
+                HelperId::QueryPipeDelimitedObject => 11,
+                HelperId::QueryDeepObject => 12,
+                HelperId::QueryDeepObjectExtended => 13,
+                HelperId::HeaderSimple => 14,
+                HelperId::HeaderSimpleExplode => 15,
+                HelperId::ContentJsonPath => 16,
+                HelperId::ContentJsonQuery => 17,
+                HelperId::ContentJsonHeader => 18,
+            };
+            assert_eq!(HelperId::ALL[position], helper);
         }
     }
 }

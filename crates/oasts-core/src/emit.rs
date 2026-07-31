@@ -20,14 +20,17 @@ use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::client_model::ClientModel;
+#[cfg(test)]
+use crate::composition::CODE_COMPOSITION;
+use crate::composition::{finite_values, json_equal};
 use crate::config::{DocumentationConfig, EnumRepresentation, FileCase, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
-    AdditionalProperties, Discriminator, ExclusiveBound, Ir, MediaType, NumericConstraints,
-    Operation, Param, ParamLocation, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader,
+    AdditionalProperties, Discriminator, Ir, MediaType, Operation, Param, ParamLocation,
+    PatternProperty, PatternPropertyKey, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader,
     ResponseStatus, SchemaDocs, SchemaNode, SchemaRef, SourceRef, TupleRest, finite_parts,
 };
-use crate::media::is_json;
+use crate::media::{is_json, is_xml};
 use crate::num::{first_number_outside_binary64, render_number_value};
 use crate::semantic::{
     AllocatedCallbackName, AllocatedSchemaName, Analyzed, CallbackParent, EnumMember, ResolvedLink,
@@ -43,7 +46,6 @@ use model::{EmissionModel, SchemaTarget};
 
 const CODE_FILE_NAME: &str = "OASTS1301";
 const CODE_PATH_COLLISION: &str = "OASTS1302";
-const CODE_COMPOSITION: &str = "OASTS1303";
 const CODE_DISCRIMINATOR: &str = "OASTS1304";
 const CODE_REFERENCE: &str = "OASTS1305";
 const CODE_VARIANT_COLLISION: &str = "OASTS1306";
@@ -99,6 +101,11 @@ type BorrowedProperty<'a> = (&'a str, &'a SchemaNode, &'a PropMeta);
 /// properties are shared via `Rc` so a cache hit is a refcount bump, not a `Vec` clone,
 /// and are borrowed at the model lifetime because the IR outlives the emitter.
 type CachedAllOf<'a> = Option<(Rc<[BorrowedProperty<'a>]>, &'a AdditionalProperties)>;
+
+struct ObjectShape<'a> {
+    properties: &'a [(String, SchemaNode, PropMeta)],
+    additional_properties: &'a AdditionalProperties,
+}
 
 /// Views an owned property slice as `BorrowedProperty` tuples. The direct-object
 /// callers own their properties while the `allOf`-merge caller already holds
@@ -852,9 +859,6 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     ));
                 }
             }
-            SchemaNode::AllOf { branches, meta } => {
-                self.validate_all_of(branches, meta, diagnostics);
-            }
             SchemaNode::OneOf {
                 branches,
                 discriminator: Some(discriminator),
@@ -872,100 +876,6 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         self.for_each_schema_child(schema, SchemaChildMode::Validation, &mut |child| {
             self.validate_schema(child, diagnostics);
         });
-    }
-
-    fn validate_all_of(
-        &self,
-        branches: &[SchemaNode],
-        meta: &crate::ir::SchemaMeta,
-        diagnostics: &mut Vec<Diagnostic>,
-    ) {
-        let domains = branches
-            .iter()
-            .filter_map(|branch| self.primitive_domain(branch, &mut HashSet::new()))
-            .collect::<Vec<_>>();
-        if domains.len() >= 2 {
-            let mut intersection = domains[0].clone();
-            for domain in &domains[1..] {
-                intersection.retain(|atom| domain.contains(atom));
-            }
-            if intersection.is_empty() {
-                diagnostics.push(source_diagnostic(
-                    CODE_COMPOSITION,
-                    "allOf has disjoint primitive type sets",
-                    &meta.source,
-                ));
-            }
-        }
-
-        let finite_sets = branches
-            .iter()
-            .filter_map(|branch| self.finite_constraint(branch, &mut HashSet::new()))
-            .collect::<Vec<_>>();
-        if finite_sets.len() >= 2 {
-            let mut intersection = finite_sets[0].clone();
-            for values in &finite_sets[1..] {
-                intersection.retain(|value| values.iter().any(|other| json_equal(value, other)));
-            }
-            if intersection.is_empty() {
-                diagnostics.push(source_diagnostic(
-                    CODE_COMPOSITION,
-                    "allOf has incompatible const or finite-enum constraints",
-                    &meta.source,
-                ));
-            }
-        }
-
-        let bounds = branches
-            .iter()
-            .filter_map(|branch| self.numeric_bounds(branch, &mut HashSet::new()))
-            .collect::<Vec<_>>();
-        if let Some(combined) = bounds.into_iter().reduce(NumericBounds::intersect)
-            && combined.is_empty()
-        {
-            diagnostics.push(source_diagnostic(
-                CODE_COMPOSITION,
-                "allOf has an empty numeric interval",
-                &meta.source,
-            ));
-        }
-
-        let objects = branches
-            .iter()
-            .filter_map(|branch| self.object_shape(branch, &mut HashSet::new()))
-            .collect::<Vec<_>>();
-        let required = objects
-            .iter()
-            .flat_map(|object| {
-                object
-                    .properties
-                    .iter()
-                    .filter(|(_, _, meta)| meta.required)
-                    .map(|(name, _, _)| name.clone())
-            })
-            .collect::<BTreeSet<_>>();
-        for object in &objects {
-            if object.additional_properties != &AdditionalProperties::Forbidden {
-                continue;
-            }
-            let declared = object
-                .properties
-                .iter()
-                .map(|(name, _, _)| name.as_str())
-                .collect::<HashSet<_>>();
-            for name in &required {
-                if !declared.contains(name.as_str()) {
-                    diagnostics.push(source_diagnostic(
-                        CODE_COMPOSITION,
-                        format!(
-                            "allOf requires property '{}' that a closed object branch forbids",
-                            name
-                        ),
-                        &meta.source,
-                    ));
-                }
-            }
-        }
     }
 
     fn resolve_ref<'a>(
@@ -988,47 +898,28 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         self.resolve_ref(resolved, visited)
     }
 
-    fn primitive_domain<'a>(
+    fn object_shape<'a>(
         &'a self,
         schema: &'a SchemaNode,
         visited: &mut HashSet<(&'a str, &'a str)>,
-    ) -> Option<BTreeSet<PrimitiveAtom>> {
+    ) -> Option<ObjectShape<'a>> {
         let schema = self.resolve_ref(schema, visited)?;
-        match schema {
-            SchemaNode::Primitive { ty, meta, .. } => {
-                let mut domain = BTreeSet::new();
-                match ty {
-                    PrimitiveType::String => {
-                        domain.insert(PrimitiveAtom::String);
-                    }
-                    PrimitiveType::Number => {
-                        domain.insert(PrimitiveAtom::Number);
-                        domain.insert(PrimitiveAtom::Integer);
-                    }
-                    PrimitiveType::Integer => {
-                        domain.insert(PrimitiveAtom::Integer);
-                    }
-                    PrimitiveType::Boolean => {
-                        domain.insert(PrimitiveAtom::Boolean);
-                    }
-                    PrimitiveType::Null => {
-                        domain.insert(PrimitiveAtom::Null);
-                    }
-                }
-                if meta.nullable {
-                    domain.insert(PrimitiveAtom::Null);
-                }
-                Some(domain)
-            }
-            SchemaNode::AnyOf { branches, .. } | SchemaNode::OneOf { branches, .. } => {
-                let mut domain = BTreeSet::new();
-                for branch in branches {
-                    domain.extend(self.primitive_domain(branch, visited)?);
-                }
-                Some(domain)
-            }
-            _ => None,
-        }
+        let SchemaNode::Object {
+            properties,
+            additional_properties,
+            meta,
+            ..
+        } = schema
+        else {
+            return None;
+        };
+        meta.validation_applicators()
+            .pattern_properties
+            .is_empty()
+            .then_some(ObjectShape {
+                properties,
+                additional_properties,
+            })
     }
 
     fn finite_constraint<'a>(
@@ -1051,41 +942,6 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             _ => return None,
         };
         finite_values(enum_values.as_deref(), const_value.as_ref())
-    }
-
-    fn numeric_bounds<'a>(
-        &'a self,
-        schema: &'a SchemaNode,
-        visited: &mut HashSet<(&'a str, &'a str)>,
-    ) -> Option<NumericBounds> {
-        let schema = self.resolve_ref(schema, visited)?;
-        let SchemaNode::Primitive { ty, meta, .. } = schema else {
-            return None;
-        };
-        if !matches!(ty, PrimitiveType::Number | PrimitiveType::Integer) {
-            return None;
-        }
-        NumericBounds::from_constraints(meta.numeric_constraints())
-    }
-
-    fn object_shape<'a>(
-        &'a self,
-        schema: &'a SchemaNode,
-        visited: &mut HashSet<(&'a str, &'a str)>,
-    ) -> Option<ObjectShape<'a>> {
-        let schema = self.resolve_ref(schema, visited)?;
-        let SchemaNode::Object {
-            properties,
-            additional_properties,
-            ..
-        } = schema
-        else {
-            return None;
-        };
-        Some(ObjectShape {
-            properties,
-            additional_properties,
-        })
     }
 
     /// Diagnoses a discriminated `oneOf`/`anyOf` (one shared path for both, since the discriminator
@@ -1152,6 +1008,15 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut proven: Vec<Vec<String>> = Vec::with_capacity(branches.len());
         for branch in branches {
+            if matches!(
+                self.resolve_ref(branch, &mut HashSet::new()),
+                Some(SchemaNode::Never { .. })
+            ) {
+                // An empty branch contributes no possible discriminator literal. Preserve its
+                // position for transform dispatch, whose empty tag set naturally emits no arm.
+                proven.push(Vec::new());
+                continue;
+            }
             let branch_index = self.branch_target_index(branch);
             let mapping_tags: Vec<&str> = mapping_targets
                 .iter()
@@ -1514,12 +1379,14 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         if let SchemaNode::Object {
             properties,
             additional_properties,
+            meta,
             ..
         } = schema
             && !matches!(
                 additional_properties,
                 AdditionalProperties::Schema(_) | AdditionalProperties::Allowed(Some(_))
             )
+            && meta.validation_applicators().pattern_properties.is_empty()
             && !schema.is_nullable()
         {
             output.push_str("export interface ");
@@ -1624,16 +1491,24 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             SchemaNode::Object {
                 properties,
                 additional_properties,
+                meta,
                 ..
             } => {
                 let borrowed = borrow_properties(properties);
-                self.render_object_parts(
+                let literal = self.render_object_parts(
                     &borrowed,
                     additional_properties,
                     position,
                     axis,
                     indent,
                     false,
+                );
+                self.render_pattern_properties(
+                    literal,
+                    &meta.validation_applicators().pattern_properties,
+                    position,
+                    axis,
+                    indent,
                 )
             }
             SchemaNode::Array { items, .. } => {
@@ -1794,13 +1669,54 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             AdditionalProperties::Allowed(None) | AdditionalProperties::Forbidden => literal,
             AdditionalProperties::Allowed(Some(schema)) | AdditionalProperties::Schema(schema) => {
                 let value = self.render_type(schema, position, axis, indent);
+                // Both arms spell the index signature structurally rather than reaching for
+                // `Record<string, V>`. A document may declare a component named `Record`, and the
+                // emitted module that declares (or imports) it then resolves `Record` to that
+                // non-generic type instead of the built-in — `TS2315: Type 'Record' is not
+                // generic`. The structural form cannot be shadowed. See
+                // `builtin_name_shadow_3_0` and `scripts/verify-ts.sh`.
                 if !has_included_properties {
                     format!("{{ [key: string]: {value} }}")
                 } else {
-                    format!("{literal} & Record<string, {value}>")
+                    format!("{literal} & {{ [key: string]: {value} }}")
                 }
             }
         }
+    }
+
+    fn render_pattern_properties(
+        &self,
+        literal: String,
+        pattern_properties: &[PatternProperty],
+        position: TypePosition,
+        axis: TypeAxis,
+        indent: usize,
+    ) -> String {
+        pattern_properties
+            .iter()
+            .filter_map(|pattern| {
+                let key = pattern.type_key.as_ref()?;
+                let value = self.render_type(&pattern.schema, position, axis, indent);
+                let signature = match key {
+                    PatternPropertyKey::All => format!("{{ [key: string]: {value} }}"),
+                    PatternPropertyKey::Prefix(prefix) => format!(
+                        "{{ [key: `{}${{string}}`]: {value} }}",
+                        render_ts_template_component(prefix)
+                    ),
+                    PatternPropertyKey::Contains(infix) => format!(
+                        "{{ [key: `${{string}}{}${{string}}`]: {value} }}",
+                        render_ts_template_component(infix)
+                    ),
+                };
+                Some(signature)
+            })
+            .fold(literal, |rendered, signature| {
+                if rendered == "{}" {
+                    signature
+                } else {
+                    format!("{rendered} & {signature}")
+                }
+            })
     }
 
     /// Target keys of the `allOf` branches that are direct `$ref`s — the branches
@@ -1901,11 +1817,15 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 let SchemaNode::Object {
                     properties,
                     additional_properties,
+                    meta,
                     ..
                 } = resolved
                 else {
                     return None;
                 };
+                if !meta.validation_applicators().pattern_properties.is_empty() {
+                    return None;
+                }
                 Some(ObjectShape {
                     properties,
                     additional_properties,
@@ -2039,6 +1959,37 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             | SchemaNode::Any { .. }
             | SchemaNode::Never { .. }
             | SchemaNode::Unknown { .. } => {}
+        }
+        let applicators = schema.meta().validation_applicators();
+        if let Some(schema) = &applicators.not {
+            self.prewarm_all_of(schema);
+        }
+        if let Some(schema) = &applicators.property_names {
+            self.prewarm_all_of(schema);
+        }
+        for pattern in &applicators.pattern_properties {
+            self.prewarm_all_of(&pattern.schema);
+        }
+        if let Some(contains) = &applicators.contains {
+            self.prewarm_all_of(&contains.schema);
+        }
+        for (_, schema) in &applicators.dependent_schemas {
+            self.prewarm_all_of(schema);
+        }
+        if let Some(conditional) = &applicators.conditional {
+            self.prewarm_all_of(&conditional.condition);
+            if let Some(schema) = &conditional.then_schema {
+                self.prewarm_all_of(schema);
+            }
+            if let Some(schema) = &conditional.else_schema {
+                self.prewarm_all_of(schema);
+            }
+        }
+        if let Some(schema) = &applicators.unevaluated_properties {
+            self.prewarm_all_of(schema);
+        }
+        if let Some(schema) = &applicators.unevaluated_items {
+            self.prewarm_all_of(schema);
         }
     }
 
@@ -2187,6 +2138,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             | SchemaNode::Never { .. }
             | SchemaNode::Unknown { .. } => {}
         }
+        if matches!(mode, SchemaChildMode::References(_)) {
+            for pattern in &schema.meta().validation_applicators().pattern_properties {
+                if pattern.type_key.is_some() {
+                    visit(&pattern.schema);
+                }
+            }
+        }
     }
 
     fn write_imports(
@@ -2221,11 +2179,14 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
 /// declarations shadow. A shadowed import is silently retyped to the local declaration, so the
 /// emitted module is not merely uncompilable — where it does compile, it is wrong.
 ///
-/// The colliding name is by construction one of the module's own declarations, so appending `Body`
-/// names the reference site's role exactly (`<Stem>RequestBody`, `<Stem>Response200Body`,
-/// `<Stem>InputBody`). The component and the declaration are two legitimate public types in two
-/// different modules and the rename is file-local, so no exported name changes; refusing the
-/// document instead would reject input that generates perfectly valid TypeScript.
+/// Appending `Body` names the reference site's role exactly for the operation-derived declarations
+/// that make up most collisions (`<Stem>RequestBody`, `<Stem>Response200Body`, `<Stem>InputBody`).
+/// The client emitter also reserves its runtime-kernel imports and the TypeScript globals its
+/// signatures name, where the suffix reads as a bare disambiguator rather than a role — one alias
+/// rule is worth more than a second suffix, because the alias is file-local and never exported.
+/// The component and the declaration are two legitimate public types in two different modules and
+/// the rename is file-local, so no exported name changes; refusing the document instead would
+/// reject input that generates perfectly valid TypeScript.
 ///
 /// The residual case — the role name is itself taken by another import or declaration here — is a
 /// genuine two-way collision with no local remedy, so it is fatal and points at `naming.overrides`.
@@ -2233,17 +2194,23 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
 /// defers them, while the client emitter owns a sink at that point.
 pub(super) fn assign_import_aliases(
     declared: &BTreeSet<String>,
+    reserved: &BTreeSet<&str>,
     imports: &BTreeMap<String, BTreeSet<String>>,
     source: &SourceRef,
 ) -> (HashMap<String, String>, Vec<Diagnostic>) {
     let mut aliases = HashMap::new();
     let mut diagnostics = Vec::new();
+    // `reserved` is the caller's fixed set — the identifiers its emitter injects into every module
+    // and the built-ins its signatures name. It is passed borrowed and separate from `declared`
+    // rather than merged into it because merging would own ~35 constant strings per emitted
+    // module, and the module-specific half is the only part that varies.
+    let binds = |name: &str| declared.contains(name) || reserved.contains(name);
     // Fast-reject: the overwhelming majority of modules import nothing carrying a declaration's
     // name, and this runs once per emitted module.
     let shadowed = imports
         .values()
         .flatten()
-        .filter(|name| declared.contains(name.as_str()))
+        .filter(|name| binds(name.as_str()))
         .collect::<Vec<_>>();
     if shadowed.is_empty() {
         return (aliases, diagnostics);
@@ -2251,7 +2218,7 @@ pub(super) fn assign_import_aliases(
     let imported = imports.values().flatten().collect::<BTreeSet<_>>();
     for name in shadowed {
         let alias = format!("{name}Body");
-        if declared.contains(&alias) || imported.contains(&alias) {
+        if binds(&alias) || imported.contains(&alias) {
             diagnostics.push(source_diagnostic(
                 CODE_IMPORT_ALIAS,
                 format!(
@@ -2477,7 +2444,7 @@ impl Emitter<'_, '_, '_> {
                     declared.insert(format!("{response_name}Headers"));
                 }
             }
-            assign_import_aliases(&declared, &imports, &operation.source)
+            assign_import_aliases(&declared, &BTreeSet::new(), &imports, &operation.source)
         };
         self.set_import_aliases(aliases);
         self.deferred_diagnostics
@@ -2843,7 +2810,7 @@ impl Emitter<'_, '_, '_> {
     ) -> String {
         if is_json(essence) {
             self.render_type(schema, position, axis, 0)
-        } else if essence.starts_with("text/") {
+        } else if essence.starts_with("text/") && !is_xml(essence) {
             "string".to_owned()
         } else {
             // Binary and custom media stay unknown in the types-only artifact;
@@ -2997,31 +2964,6 @@ fn schema_finite_values(schema: &SchemaNode) -> Option<Vec<Value>> {
     finite_values(enum_values.as_deref(), const_value.as_ref())
 }
 
-fn finite_values(enum_values: Option<&[Value]>, const_value: Option<&Value>) -> Option<Vec<Value>> {
-    match (enum_values, const_value) {
-        (None, None) => None,
-        (Some(values), None) => Some(values.to_vec()),
-        (None, Some(value)) => Some(vec![value.clone()]),
-        (Some(values), Some(value)) => Some(
-            if values.iter().any(|candidate| json_equal(candidate, value)) {
-                vec![value.clone()]
-            } else {
-                Vec::new()
-            },
-        ),
-    }
-}
-
-fn json_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left
-            .as_f64()
-            .zip(right.as_f64())
-            .is_some_and(|(left, right)| left == right),
-        _ => left == right,
-    }
-}
-
 /// The finite value set an object schema fixes itself to via the `finite` box b9e3b24 added (a
 /// whole-object `const`/`enum`). Used for a discriminator tag property typed as an object, whose
 /// fixed value lives in that box rather than a primitive `const`/`enum`; `None` for any other kind.
@@ -3095,6 +3037,13 @@ pub fn render_ts_string(value: &str) -> String {
         encoded = encoded.replace('\u{2029}', "\\u2029");
     }
     encoded
+}
+
+fn render_ts_template_component(value: &str) -> String {
+    let quoted = render_ts_string(value);
+    quoted[1..quoted.len() - 1]
+        .replace('`', "\\`")
+        .replace("${", "\\${")
 }
 
 /// Emits a wire property key verbatim, quoting anything outside ASCII identifier syntax.
@@ -3423,6 +3372,10 @@ pub(super) fn write_client_operation_tsdoc(
     config: &DocumentationConfig,
     kind: ClientDocKind,
     unchecked_response: bool,
+    // Per-response notes the client emitter owns because they describe runtime decoding, not the
+    // declared schema — the multipart part-mapping rules, whose behaviour the specification leaves
+    // undefined and which therefore has to be readable at the call site.
+    decoding_notes: &[String],
 ) {
     if !config.enabled && matches!(kind, ClientDocKind::Declaration) {
         return;
@@ -3448,6 +3401,12 @@ pub(super) fn write_client_operation_tsdoc(
                     ))
                     .collect::<Vec<_>>()
                     .join("\n")
+            ));
+        }
+        if config.constraints && !decoding_notes.is_empty() {
+            tsdoc.remarks.push(format!(
+                "Response decoding\n\n{}",
+                decoding_notes.join("\n")
             ));
         }
         if config.deprecated && operation.deprecated {
@@ -3966,6 +3925,186 @@ fn response_status_label(status: &ResponseStatus) -> &str {
     }
 }
 
+/// Whether a component needs a Request variant (some reachable node — including the schema's own
+/// root — carries `readOnly`, dropped in request position) and/or a Response variant (same for
+/// `writeOnly`, dropped in response position). The traversal mirrors the position-aware renderer
+/// exactly: it descends every inline structure the renderer inlines — nested objects,
+/// `additionalProperties`, array items, tuple members, and `allOf`/`anyOf`/`oneOf` branches — so the
+/// decision agrees with what the renderer produces. A mismatch would emit a dead export or a
+/// dangling import.
+///
+/// A `$ref` is a graph edge, not crossed here: the referenced component renders as its own named
+/// (possibly variant) type, and variance flows across refs in a separate propagation pass. Stack-only
+/// with no heap allocation, so a marker-free component returns `(false, false)` doing zero
+/// allocation, exactly as the pre-recursion decision did.
+fn shape_variants(schema: &SchemaNode) -> (bool, bool) {
+    let mut acc = (false, false);
+    accumulate_shape_variants(schema, &mut acc);
+    acc
+}
+
+fn accumulate_shape_variants(schema: &SchemaNode, acc: &mut (bool, bool)) {
+    if acc.0 && acc.1 {
+        return;
+    }
+    acc.0 |= schema.meta().read_only;
+    acc.1 |= schema.meta().write_only;
+    match schema {
+        SchemaNode::Object {
+            properties,
+            additional_properties,
+            ..
+        } => {
+            for (_, property, meta) in properties {
+                acc.0 |= meta.read_only;
+                acc.1 |= meta.write_only;
+                accumulate_shape_variants(property, acc);
+                if acc.0 && acc.1 {
+                    return;
+                }
+            }
+            if let AdditionalProperties::Allowed(Some(schema))
+            | AdditionalProperties::Schema(schema) = additional_properties
+            {
+                accumulate_shape_variants(schema, acc);
+            }
+        }
+        SchemaNode::Array { items, .. } => accumulate_shape_variants(items, acc),
+        SchemaNode::Tuple {
+            prefix_items, rest, ..
+        } => {
+            for item in prefix_items {
+                accumulate_shape_variants(item, acc);
+                if acc.0 && acc.1 {
+                    return;
+                }
+            }
+            if let TupleRest::Schema(schema) = rest {
+                accumulate_shape_variants(schema, acc);
+            }
+        }
+        SchemaNode::AllOf { branches, .. }
+        | SchemaNode::AnyOf { branches, .. }
+        | SchemaNode::OneOf { branches, .. } => {
+            for branch in branches {
+                accumulate_shape_variants(branch, acc);
+                if acc.0 && acc.1 {
+                    return;
+                }
+            }
+        }
+        SchemaNode::Ref { .. }
+        | SchemaNode::Primitive { .. }
+        | SchemaNode::Finite { .. }
+        | SchemaNode::Any { .. }
+        | SchemaNode::Never { .. }
+        | SchemaNode::Unknown { .. } => {}
+    }
+    let applicators = schema.meta().validation_applicators();
+    if let Some(schema) = &applicators.not {
+        accumulate_shape_variants(schema, acc);
+    }
+    if let Some(schema) = &applicators.property_names {
+        accumulate_shape_variants(schema, acc);
+    }
+    for pattern in &applicators.pattern_properties {
+        accumulate_shape_variants(&pattern.schema, acc);
+    }
+    if let Some(contains) = &applicators.contains {
+        accumulate_shape_variants(&contains.schema, acc);
+    }
+    for (_, schema) in &applicators.dependent_schemas {
+        accumulate_shape_variants(schema, acc);
+    }
+    if let Some(conditional) = &applicators.conditional {
+        accumulate_shape_variants(&conditional.condition, acc);
+        if let Some(schema) = &conditional.then_schema {
+            accumulate_shape_variants(schema, acc);
+        }
+        if let Some(schema) = &conditional.else_schema {
+            accumulate_shape_variants(schema, acc);
+        }
+    }
+    if let Some(schema) = &applicators.unevaluated_properties {
+        accumulate_shape_variants(schema, acc);
+    }
+    if let Some(schema) = &applicators.unevaluated_items {
+        accumulate_shape_variants(schema, acc);
+    }
+}
+
+/// The exported-name fragment identifying one media entry, mangled from its canonical full media
+/// string: `*` becomes `Wildcard`, every other non-alphanumeric ASCII byte is a token separator,
+/// and each token is uppercase-first and concatenated (`application/vnd.api+json` →
+/// `ApplicationVndApiJson`). Total by construction — it never invents a disambiguating suffix, so a
+/// collision between two distinct media strings is a diagnostic rather than a silent rename.
+pub(super) fn media_tag(media: &str) -> String {
+    let mut tag = String::with_capacity(media.len());
+    let mut fresh = true;
+    for byte in media.chars() {
+        if byte == '*' {
+            tag.push_str("Wildcard");
+            fresh = true;
+        } else if byte.is_ascii_alphanumeric() {
+            if fresh {
+                tag.extend(byte.to_uppercase());
+            } else {
+                tag.push(byte);
+            }
+            fresh = false;
+        } else {
+            fresh = true;
+        }
+    }
+    tag
+}
+
+/// Inserts the `esnext.temporal` lib reference into an assembled file that names a `Temporal` type.
+///
+/// Not a workaround for missing TypeScript support — the compiler ships `lib.esnext.temporal` — but
+/// how a generated file opts a consumer whose own `lib` predates it into the declarations this
+/// file's types need. Derived from the emitted text rather than from configuration, so a file that
+/// happens to name no Temporal type never carries one, and the two can never disagree.
+///
+/// It goes after the generated header, which is the first line of every emitted file: a triple-slash
+/// directive may be preceded by comments, and by nothing else.
+pub(super) fn insert_temporal_reference(content: String, header_len: usize) -> String {
+    if !content[header_len..].contains("Temporal.") {
+        return content;
+    }
+    let mut output = String::with_capacity(content.len() + TEMPORAL_REFERENCE.len());
+    output.push_str(&content[..header_len]);
+    output.push_str(TEMPORAL_REFERENCE);
+    output.push_str(&content[header_len..]);
+    output
+}
+
+const TEMPORAL_REFERENCE: &str = "/// <reference lib=\"esnext.temporal\" preserve=\"true\" />\n\n";
+
+pub(super) fn source_diagnostic(
+    code: &'static str,
+    message: impl Into<String>,
+    source: &SourceRef,
+) -> Diagnostic {
+    let mut diagnostic = Diagnostic::input(code, message)
+        .with_source(&source.source_id)
+        .with_json_pointer(&source.json_pointer);
+    if let (Some(line), Some(col)) = (source.line, source.col) {
+        diagnostic = diagnostic.with_location(line, col);
+    }
+    diagnostic
+}
+
+pub(super) fn warning_diagnostic(
+    code: &'static str,
+    message: impl Into<String>,
+    source: &SourceRef,
+) -> Diagnostic {
+    let mut diagnostic = source_diagnostic(code, message, source);
+    diagnostic.severity = Severity::Warning;
+    diagnostic
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -3981,6 +4120,339 @@ mod tests {
     use crate::loader::load_graph;
     use crate::parse::parse;
     use crate::semantic::{AllocatedOperationName, EnumMemberTable, analyze};
+
+    /// Generic types TypeScript declares globally. Emitted code that names one of these inside a
+    /// module that also declares or imports a component type gets the component instead of the
+    /// built-in — `TS2315: Type 'X' is not generic` — because a local binding wins over a global.
+    /// Qdrant declares a component named `Record`, and that is exactly what broke.
+    ///
+    /// The emitters stay clear of these two ways: an index signature is spelled structurally rather
+    /// than as `Record<string, V>`, and the client aliases a component import that carries a name
+    /// its own signatures use (`CLIENT_MODULE_BINDINGS`). Neither is self-enforcing, so this test
+    /// is what keeps a newly written emitter from reintroducing the bug.
+    const TS_GLOBAL_GENERICS: &[&str] = &[
+        "Array",
+        "AsyncGenerator",
+        "AsyncIterable",
+        "AsyncIterableIterator",
+        "AsyncIterator",
+        "Awaited",
+        "Exclude",
+        "Extract",
+        "Generator",
+        "InstanceType",
+        "Iterable",
+        "IterableIterator",
+        "Iterator",
+        "Map",
+        "NoInfer",
+        "NonNullable",
+        "Omit",
+        "OmitThisParameter",
+        "Parameters",
+        "Partial",
+        "Pick",
+        "Promise",
+        "PromiseLike",
+        "Readonly",
+        "ReadonlyArray",
+        "ReadonlyMap",
+        "ReadonlySet",
+        "Record",
+        "Required",
+        "ReturnType",
+        "Set",
+        "ThisParameterType",
+        "ThisType",
+        "Uint8Array",
+        "WeakMap",
+        "WeakRef",
+        "WeakSet",
+    ];
+
+    /// Drops comments so a schema `description` echoed into TSDoc cannot read as emitted code.
+    fn strip_ts_comments(source: &str) -> String {
+        let mut out = String::with_capacity(source.len());
+        let bytes = source.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index..].starts_with(b"//") {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            } else if bytes[index..].starts_with(b"/*") {
+                index += 2;
+                while index < bytes.len() && !bytes[index..].starts_with(b"*/") {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            } else {
+                out.push(char::from(bytes[index]));
+                index += 1;
+            }
+        }
+        out
+    }
+
+    /// Every `Name<` in `code` whose `Name` is a global generic, ignoring occurrences that are the
+    /// tail of a longer identifier (`SyncStandardSchemaV1<` must not read as a `Set<`).
+    fn builtin_generic_references(code: &str) -> Vec<&'static str> {
+        let bytes = code.as_bytes();
+        let mut found = Vec::new();
+        for name in TS_GLOBAL_GENERICS {
+            let mut from = 0;
+            while let Some(offset) = code[from..].find(&format!("{name}<")) {
+                let start = from + offset;
+                let preceded_by_identifier = start > 0
+                    && (bytes[start - 1].is_ascii_alphanumeric()
+                        || bytes[start - 1] == b'_'
+                        || bytes[start - 1] == b'$'
+                        || bytes[start - 1] == b'.');
+                if !preceded_by_identifier {
+                    found.push(*name);
+                    break;
+                }
+                from = start + name.len();
+            }
+        }
+        found
+    }
+
+    /// Every identifier an emitted module binds in its own scope: the local name of each named
+    /// import (an `A as B` clause binds `B`, not `A`) and each top-level declaration. Emitted code
+    /// is machine-written and one declaration per line, so this reads it directly rather than
+    /// pulling in a parser.
+    fn module_bindings(code: &str) -> BTreeSet<&str> {
+        let mut bound = BTreeSet::new();
+        for line in code.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("import ") {
+                // Named-import clauses only. The emitters write no default or namespace import, so
+                // a line without braces contributes nothing; reading it as empty keeps that case
+                // off a branch of its own.
+                let names = rest
+                    .split_once('{')
+                    .and_then(|(_, tail)| tail.split_once('}'))
+                    .map_or("", |(names, _)| names);
+                for clause in names.split(',') {
+                    let clause = clause.trim().strip_prefix("type ").unwrap_or(clause.trim());
+                    let name = clause.rsplit(" as ").next().unwrap_or(clause).trim();
+                    if !name.is_empty() {
+                        bound.insert(name);
+                    }
+                }
+                continue;
+            }
+            let declaration = line.strip_prefix("export ").unwrap_or(line);
+            let declaration = declaration
+                .strip_prefix("declare ")
+                .unwrap_or(declaration)
+                .strip_prefix("async ")
+                .unwrap_or(declaration);
+            for keyword in [
+                "interface ",
+                "type ",
+                "function ",
+                "const ",
+                "let ",
+                "var ",
+                "class ",
+                "enum ",
+            ] {
+                let Some(rest) = declaration.strip_prefix(keyword) else {
+                    continue;
+                };
+                let name = rest
+                    .split(|character: char| {
+                        !character.is_ascii_alphanumeric() && character != '_' && character != '$'
+                    })
+                    .next()
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    bound.insert(name);
+                }
+                break;
+            }
+        }
+        bound
+    }
+
+    /// A document whose components carry the names of TypeScript's global generics, reached through
+    /// every position that puts a component type into a module: a `$ref` parameter, a request body,
+    /// a response body, and a property of another component. The `properties` + `additionalProperties`
+    /// pair is what reaches the intersection spelling, and the `date-time` property is what reaches
+    /// the transform axis.
+    fn builtin_named_document() -> Value {
+        let mut schemas = serde_json::Map::new();
+        let mut paths = serde_json::Map::new();
+        for name in TS_GLOBAL_GENERICS {
+            schemas.insert(
+                (*name).to_owned(),
+                json!({ "type": "string", "enum": ["a", "b"] }),
+            );
+            schemas.insert(
+                format!("{name}Holder"),
+                json!({
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "at": { "type": "string", "format": "date-time" },
+                        "nested": { "$ref": format!("#/components/schemas/{name}") }
+                    },
+                    "additionalProperties": { "type": "number" }
+                }),
+            );
+            paths.insert(
+                format!("/probe/{}", name.to_lowercase()),
+                json!({
+                    "post": {
+                        "operationId": format!("probe{name}"),
+                        "parameters": [{
+                            "name": "mode",
+                            "in": "query",
+                            "required": true,
+                            "schema": { "$ref": format!("#/components/schemas/{name}") }
+                        }],
+                        "requestBody": {
+                            "required": true,
+                            "content": { "application/json": {
+                                "schema": { "$ref": format!("#/components/schemas/{name}Holder") }
+                            } }
+                        },
+                        "responses": { "200": {
+                            "description": "ok",
+                            "content": { "application/json": {
+                                "schema": { "$ref": format!("#/components/schemas/{name}Holder") }
+                            } }
+                        } }
+                    }
+                }),
+            );
+        }
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "builtin names", "version": "1" },
+            "servers": [{ "url": "https://api.example.test" }],
+            "paths": Value::Object(paths),
+            "components": { "schemas": Value::Object(schemas) }
+        })
+    }
+
+    /// Compiles `document` with every artifact on, `patch` applied to the resolved config after it
+    /// loads. The patch seam exists because the date/time transform is refused by config validation
+    /// in this build, and its emitted modules still have to be held to the invariant.
+    fn compile_all_artifacts(
+        document: Value,
+        patch: fn(&mut ResolvedConfig),
+    ) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
+        let temp = TempDir::new().expect("temp directory");
+        let input = temp.path().join("openapi.json");
+        let config_path = temp.path().join("oasts.json");
+        fs::write(
+            &input,
+            serde_json::to_vec(&document).expect("document JSON"),
+        )
+        .expect("write document");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "validators": true },
+                "client": { "baseUrl": { "source": "server", "index": 0 } },
+                "validation": { "engine": "generated", "request": true, "response": true, "unchecked": "allow" }
+            }))
+            .expect("config JSON"),
+        )
+        .expect("write config");
+        let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        patch(&mut resolved);
+        let mut sink = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let ir = parse(&graph, &mut sink).expect("input parses");
+        let analyzed = analyze(ir, &resolved, &mut sink);
+        let client = crate::client_model::build_client_model(&analyzed, &resolved, &mut sink);
+        let files = emit_artifacts(
+            &analyzed,
+            &resolved,
+            &graph.source_tuples(),
+            Some(&client),
+            &mut sink,
+        );
+        (files, sink.into_sorted_vec())
+    }
+
+    /// No emitted module may both bind a name and use that name as a generic: the local binding
+    /// wins over the global, and the built-in stops resolving (`TS2315`). Naming a built-in is
+    /// fine on its own — `client/operations/*` writes `Promise<Result>` and stays correct because
+    /// a colliding component import is aliased away — so the invariant is the co-occurrence, not
+    /// the reference.
+    ///
+    /// Stated over emitted output rather than over the emitters, so it holds no matter which
+    /// mechanism a given emitter uses to stay clear: the structural index signature in the types
+    /// and validators artifacts, `CLIENT_MODULE_BINDINGS` in the client. Run against a document
+    /// that names every global generic, so a regression fails here rather than on a user's corpus.
+    #[test]
+    fn no_builtin_generics_in_schema_bearing_modules() {
+        let (files, diagnostics) = compile_all_artifacts(builtin_named_document(), |config| {
+            config.types.date_time = crate::config::DateTimeRepresentation::Date;
+        });
+        // Asserted as "no diagnostics at all" rather than "no errors": a predicate over an empty
+        // list never runs its closure, and the coverage gate reads that as a dead line.
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        // One report line per module that names a global generic at all, listing the ones it also
+        // binds. Built for every such module rather than only for offenders, so the reporting path
+        // runs on a passing run — a report assembled only on failure is dead code the coverage
+        // gate rejects, and is also the shape most likely to be broken when it finally runs.
+        let mut report = Vec::new();
+        let mut shadowing = 0usize;
+        for file in &files {
+            let code = strip_ts_comments(&file.content);
+            let referenced = builtin_generic_references(&code);
+            if referenced.is_empty() {
+                continue;
+            }
+            let bound = module_bindings(&code);
+            let shadowed = referenced
+                .iter()
+                .filter(|name| bound.contains(*name))
+                .copied()
+                .collect::<Vec<_>>();
+            shadowing += usize::from(!shadowed.is_empty());
+            report.push(format!(
+                "{}: uses {} / shadows {}",
+                file.relative_path,
+                referenced.join(", "),
+                shadowed.join(", ")
+            ));
+        }
+        let message = report.join("\n");
+        assert!(
+            !report.is_empty(),
+            "no emitted module names a global generic at all, so this test proves nothing"
+        );
+        assert_eq!(
+            shadowing, 0,
+            "emitted modules bind a name they also use as a TypeScript global generic:\n{message}"
+        );
+
+        // Positive controls, so a broken reader cannot pass this test by finding nothing. The
+        // document guarantees both files exist and both are exactly the shapes that used to break.
+        let record = find_file(&files, "types/components/recordholder.ts");
+        assert!(record.content.contains("} & { [key: string]: number };"));
+        let client = find_file(&files, "client/operations/probepromise.ts");
+        assert!(
+            client
+                .content
+                .contains("import type { Promise as PromiseBody } from")
+        );
+        assert!(
+            builtin_generic_references(&strip_ts_comments(&client.content)).contains(&"Promise")
+        );
+    }
 
     fn compile(document: Value, config_patch: Value) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
         let temp = TempDir::new().expect("temp directory");
@@ -4300,65 +4772,12 @@ mod tests {
             "(string | null)"
         );
 
-        let bounds = NumericBounds::from_constraints(&NumericConstraints {
-            exclusive_minimum: Some(ExclusiveBound::Number(serde_json::Number::from(1))),
-            exclusive_maximum: Some(ExclusiveBound::Number(serde_json::Number::from(3))),
-            ..NumericConstraints::default()
-        })
-        .expect("numeric bounds");
-        assert_eq!(
-            bounds.lower,
-            Some(Bound {
-                value: 1.0,
-                exclusive: true
-            })
-        );
-        assert!(!NumericBounds::default().is_empty());
-        let low = Bound {
-            value: 1.0,
-            exclusive: false,
-        };
-        let high = Bound {
-            value: 2.0,
-            exclusive: false,
-        };
-        assert_eq!(stricter_lower(Some(high), Some(low)), Some(high));
-        assert_eq!(stricter_lower(Some(low), Some(high)), Some(high));
-        assert_eq!(
-            stricter_lower(
-                Some(low),
-                Some(Bound {
-                    exclusive: true,
-                    ..low
-                })
-            ),
-            Some(Bound {
-                exclusive: true,
-                ..low
-            })
-        );
-        assert_eq!(stricter_upper(Some(low), Some(high)), Some(low));
-        assert_eq!(stricter_upper(Some(high), Some(low)), Some(low));
-        assert_eq!(
-            stricter_upper(
-                Some(low),
-                Some(Bound {
-                    exclusive: true,
-                    ..low
-                })
-            ),
-            Some(Bound {
-                exclusive: true,
-                ..low
-            })
-        );
-
         let diagnostic = source_diagnostic("TEST", "located", &source("/located"));
         assert_eq!((diagnostic.line, diagnostic.col), (Some(3), Some(5)));
     }
 
     #[test]
-    fn emitter_validates_nested_refs_discriminators_and_primitive_domains() {
+    fn emitter_validates_nested_refs_and_discriminators() {
         fn tagged(pointer: &str, value: &str) -> SchemaNode {
             SchemaNode::Object {
                 properties: vec![(
@@ -4460,35 +4879,6 @@ mod tests {
             },
             &mut diagnostics,
         );
-
-        for schema in [
-            primitive(PrimitiveType::Boolean, "/boolean"),
-            primitive(PrimitiveType::Null, "/null"),
-            SchemaNode::AnyOf {
-                branches: vec![
-                    primitive(PrimitiveType::String, "/string"),
-                    primitive(PrimitiveType::Integer, "/integer"),
-                ],
-                discriminator: None,
-                meta: meta("/any-of"),
-            },
-        ] {
-            assert!(
-                emitter
-                    .primitive_domain(&schema, &mut HashSet::new())
-                    .is_some()
-            );
-        }
-        let mut nullable = primitive(PrimitiveType::String, "/nullable-domain");
-        if let SchemaNode::Primitive { meta, .. } = &mut nullable {
-            meta.nullable = true;
-        }
-        assert!(
-            emitter
-                .primitive_domain(&nullable, &mut HashSet::new())
-                .expect("nullable domain")
-                .contains(&PrimitiveAtom::Null)
-        );
     }
 
     #[test]
@@ -4524,10 +4914,9 @@ mod tests {
         let emitter = Emitter::new(&mut model);
         assert!(
             emitter
-                .primitive_domain(&self_ref, &mut HashSet::new())
+                .resolve_ref(&self_ref, &mut HashSet::new())
                 .is_none()
         );
-
         assert_eq!(
             emitter.render_type(
                 &schema_ref("/unknown-ref", "/components/schemas/Unknown"),
@@ -4862,7 +5251,7 @@ mod tests {
         // {type:"string", oneOf:[number, integer]} lowers to AllOf[OneOf(number|integer), string].
         // The primitive domains are disjoint, so the existing composition check now fires OASTS1303 on
         // a spec that used to be silently wrong.
-        let (_files, diagnostics) = compile(
+        let (files, diagnostics) = compile(
             openapi(json!({
                 "Thing": {
                     "type": "string",
@@ -4874,6 +5263,18 @@ mod tests {
         assert!(
             composition_diagnostic_count(&diagnostics) >= 1,
             "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.code != CODE_COMPOSITION
+                    || diagnostic.severity == crate::diag::Severity::Warning
+            }),
+            "{diagnostics:?}"
+        );
+        assert!(
+            schema_file(&files, "thing")
+                .content
+                .contains("export type Thing = never;")
         );
     }
 
@@ -5680,8 +6081,125 @@ mod tests {
             bodies["types/components/map.ts"]
                 .contains("export type Map = { [key: string]: number };")
         );
-        assert!(bodies["types/components/mixed.ts"].contains("} & Record<string, number>;"));
+        // The index-signature half is written structurally, not as `Record<string, number>` —
+        // see `render_object_literal`. A component named `Record` declares a non-generic type in
+        // this same module, and the built-in would resolve to it (TS2315).
+        assert!(bodies["types/components/mixed.ts"].contains("} & { [key: string]: number };"));
         assert!(bodies["types/components/closed.ts"].contains("export interface Closed"));
+    }
+
+    #[test]
+    fn pattern_properties_emit_intersected_index_signatures_without_widening_declared_members() {
+        let document = openapi(json!({
+            "Patterned": {
+                "type": "object",
+                "properties": {
+                    "fixed": { "type": "string" }
+                },
+                "patternProperties": {
+                    "^x-": { "type": "number" },
+                    "flag": { "type": "boolean" }
+                }
+            },
+            "OnlyPattern": {
+                "type": "object",
+                "patternProperties": {
+                    "^x-": { "type": "number" }
+                }
+            },
+            "PatternedAllOf": {
+                "allOf": [
+                    {
+                        "type": "object",
+                        "patternProperties": {
+                            "^x-": { "type": "number" }
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "fixed": { "type": "string" }
+                        }
+                    }
+                ]
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let patterned = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("patterned.ts"))
+            .expect("Patterned file");
+        let body = generated_body(patterned);
+        assert!(body.contains("export type Patterned = {"));
+        assert!(body.contains("fixed?: string;"));
+        assert!(body.contains("& { [key: `x-${string}`]: number }"));
+        assert!(body.contains("& { [key: `${string}flag${string}`]: boolean };"));
+        assert!(!body.contains("fixed?: string |"));
+        let only_pattern = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("onlypattern.ts"))
+            .expect("OnlyPattern file");
+        assert!(
+            generated_body(only_pattern)
+                .contains("export type OnlyPattern = { [key: `x-${string}`]: number };")
+        );
+        let patterned_all_of = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("patternedallof.ts"))
+            .expect("PatternedAllOf file");
+        let all_of_body = generated_body(patterned_all_of);
+        assert!(all_of_body.contains("{ [key: `x-${string}`]: number } & {"));
+        assert!(all_of_body.contains("fixed?: string;"));
+    }
+
+    #[test]
+    fn pattern_property_type_keys_cover_faithful_literal_regex_forms_and_skip_end_anchors() {
+        let document = openapi(json!({
+            "Forms": {
+                "type": "object",
+                "patternProperties": {
+                    "": { "type": "string" },
+                    "^exact$": { "type": "number" },
+                    "mid": { "type": "boolean" },
+                    "tail$": { "type": "null" },
+                    "[a-z]": { "type": "integer" }
+                }
+            },
+            "SchemaAdditional": {
+                "type": "object",
+                "patternProperties": {
+                    "^x": { "type": "string" }
+                },
+                "additionalProperties": { "type": "number" }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS1103")
+                .count(),
+            4,
+            "{diagnostics:?}"
+        );
+        let forms = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("forms.ts"))
+            .expect("Forms file");
+        let body = generated_body(forms);
+        assert!(body.contains("{ [key: string]: string }"));
+        assert!(body.contains("{ [key: `${string}mid${string}`]: boolean }"));
+        assert!(!body.contains("exact?: number"));
+        assert!(!body.contains("${string}tail"));
+        assert!(!body.contains("integer"));
+        let schema_additional = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("schemaadditional.ts"))
+            .expect("SchemaAdditional file");
+        let body = generated_body(schema_additional);
+        assert!(body.contains("{ [key: string]: number }"));
+        assert!(!body.contains("x-${string}"));
     }
 
     #[test]
@@ -6388,6 +6906,171 @@ mod tests {
     }
 
     #[test]
+    fn enum_members_outside_declared_types_are_warned_and_filtered() {
+        let document = openapi(json!({
+            "StringChoice": {
+                "type": "string",
+                "enum": ["on", "off", false]
+            },
+            "IntegerChoice": {
+                "type": "integer",
+                "enum": [1, "one"]
+            },
+            "BooleanChoice": {
+                "type": "boolean",
+                "enum": [true, 1]
+            },
+            "FilteredIntersection": {
+                "type": "string",
+                "enum": ["keep", false],
+                "const": "keep"
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        let warnings = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1214")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 4);
+        assert!(warnings.iter().all(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("can never validate")
+                && diagnostic.message.contains("generated type and validator")
+                && !diagnostic.message.contains("YAML")
+        }));
+        for (file_name, expected) in [
+            (
+                "stringchoice.ts",
+                "export type StringChoice = \"on\" | \"off\";\n",
+            ),
+            ("integerchoice.ts", "export type IntegerChoice = 1;\n"),
+            ("booleanchoice.ts", "export type BooleanChoice = true;\n"),
+            (
+                "filteredintersection.ts",
+                "export type FilteredIntersection = \"keep\";\n",
+            ),
+        ] {
+            let file = files
+                .iter()
+                .find(|file| file.relative_path.ends_with(file_name))
+                .expect("generated type");
+            assert!(generated_body(file).ends_with(expected), "{file_name}");
+        }
+    }
+
+    #[test]
+    fn nullable_enum_null_survives_without_a_warning() {
+        let document = json!({
+            "openapi": "3.0.3",
+            "info": { "title": "test", "version": "1" },
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "NullableChoice": {
+                        "type": "string",
+                        "nullable": true,
+                        "enum": ["value", null]
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            generated_body(&files[0]).ends_with("export type NullableChoice = \"value\" | null;\n")
+        );
+    }
+
+    #[test]
+    fn exhausted_enum_and_out_of_domain_const_lower_to_never() {
+        let document = openapi(json!({
+            "Exhausted": {
+                "type": "string",
+                "enum": [false]
+            },
+            "ImpossibleConst": {
+                "type": "integer",
+                "const": "one"
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        let warnings = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1214")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 3);
+        assert!(
+            warnings
+                .iter()
+                .all(|diagnostic| diagnostic.severity == Severity::Warning)
+        );
+        assert!(
+            warnings
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("admits no value"))
+                .count()
+                == 2
+        );
+        for file in files.iter().filter(|file| {
+            file.relative_path.ends_with("exhausted.ts")
+                || file.relative_path.ends_with("impossibleconst.ts")
+        }) {
+            assert!(generated_body(file).ends_with(" = never;\n"));
+        }
+    }
+
+    #[test]
+    fn literally_empty_enum_warns_and_emits_never_in_openapi_31() {
+        let (files, diagnostics) = compile(
+            openapi(json!({
+                "Empty": {
+                    "type": "string",
+                    "enum": []
+                }
+            })),
+            json!({}),
+        );
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "OASTS1214")
+            .expect("empty enum diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert!(diagnostic.message.contains("OpenAPI 3.1 (SHOULD)"));
+        assert!(generated_body(&files[0]).ends_with("export type Empty = never;\n"));
+    }
+
+    #[test]
+    fn filtering_keeps_enum_extension_names_aligned_with_survivors() {
+        let document = openapi(json!({
+            "Mode": {
+                "type": "string",
+                "enum": ["on", false, "off"],
+                "x-enum-varnames": ["Enabled", "Wrong", "Disabled"],
+                "x-enumNames": ["Enabled", "Wrong", "Disabled"],
+                "x-enum-descriptions": ["enabled", "wrong", "disabled"],
+                "x-enumDescriptions": ["enabled", "wrong", "disabled"]
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({ "types": { "enum": "const" } }));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS1214")
+                .count(),
+            1
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("enum extension") })
+        );
+        let body = generated_body(&files[0]);
+        assert!(body.contains("Enabled: \"on\""));
+        assert!(body.contains("Disabled: \"off\""));
+        assert!(!body.contains("Wrong"));
+    }
+
+    #[test]
     fn typeless_enum_and_const_emit_literal_types_without_an_invented_domain() {
         let document = openapi(json!({
             "Choice": {
@@ -6739,6 +7422,48 @@ mod tests {
     }
 
     #[test]
+    fn discriminator_ignores_never_branch_literal_space() {
+        let (files, diagnostics) = compile(
+            openapi(json!({
+                "Dead": {
+                    "allOf": [
+                        { "type": "string" },
+                        { "type": "number" }
+                    ]
+                },
+                "Live": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                        "kind": { "type": "string", "const": "Dead" }
+                    }
+                },
+                "Choice": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/Dead" },
+                        { "$ref": "#/components/schemas/Live" }
+                    ],
+                    "discriminator": { "propertyName": "kind" }
+                }
+            })),
+            json!({}),
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CODE_COMPOSITION
+                && diagnostic.severity == crate::diag::Severity::Warning
+        }));
+        assert!(
+            discriminator_diagnostics(&diagnostics).is_empty(),
+            "{diagnostics:?}"
+        );
+        assert!(
+            schema_file(&files, "choice")
+                .content
+                .contains("export type Choice = Dead | Live;")
+        );
+    }
+
+    #[test]
     fn discriminator_join_relative_source_normalizes_segments() {
         assert_eq!(
             join_relative_source("workspace/nested/openapi.json", "./sibling/../shared.json"),
@@ -6787,14 +7512,17 @@ mod tests {
             ),
         ];
         for (positive, negative, message) in cases {
-            let (_, diagnostics) = compile(openapi(json!({ "Proof": positive })), json!({}));
+            let (files, diagnostics) = compile(openapi(json!({ "Proof": positive })), json!({}));
             assert!(
                 diagnostics
                     .iter()
                     .any(|diagnostic| diagnostic.code == CODE_COMPOSITION
+                        && diagnostic.severity == crate::diag::Severity::Warning
                         && diagnostic.message.contains(message)),
                 "{message}: {diagnostics:?}"
             );
+            let proof = schema_file(&files, "proof");
+            assert!(proof.content.contains("export type Proof = never;"));
             let (_, diagnostics) = compile(openapi(json!({ "NoProof": negative })), json!({}));
             assert!(diagnostics.is_empty(), "{message}: {diagnostics:?}");
         }
@@ -8156,254 +8884,4 @@ mod tests {
                 .any(|file| file.relative_path.starts_with("types/callbacks/"))
         );
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum PrimitiveAtom {
-    String,
-    Number,
-    Integer,
-    Boolean,
-    Null,
-}
-
-struct ObjectShape<'a> {
-    properties: &'a [(String, SchemaNode, PropMeta)],
-    additional_properties: &'a AdditionalProperties,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct NumericBounds {
-    lower: Option<Bound>,
-    upper: Option<Bound>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Bound {
-    value: f64,
-    exclusive: bool,
-}
-
-impl NumericBounds {
-    fn from_constraints(constraints: &NumericConstraints) -> Option<Self> {
-        let minimum = constraints.minimum.as_ref().and_then(number_bound);
-        let maximum = constraints.maximum.as_ref().and_then(number_bound);
-        let exclusive_minimum = exclusive_bound(constraints.exclusive_minimum.as_ref(), minimum);
-        let exclusive_maximum = exclusive_bound(constraints.exclusive_maximum.as_ref(), maximum);
-        let lower = stricter_lower(minimum, exclusive_minimum);
-        let upper = stricter_upper(maximum, exclusive_maximum);
-        (lower.is_some() || upper.is_some()).then_some(Self { lower, upper })
-    }
-
-    fn intersect(self, other: Self) -> Self {
-        Self {
-            lower: stricter_lower(self.lower, other.lower),
-            upper: stricter_upper(self.upper, other.upper),
-        }
-    }
-
-    fn is_empty(self) -> bool {
-        let (Some(lower), Some(upper)) = (self.lower, self.upper) else {
-            return false;
-        };
-        lower.value > upper.value
-            || (lower.value == upper.value && (lower.exclusive || upper.exclusive))
-    }
-}
-
-fn number_bound(number: &serde_json::Number) -> Option<Bound> {
-    number
-        .as_f64()
-        .filter(|value| value.is_finite())
-        .map(|value| Bound {
-            value,
-            exclusive: false,
-        })
-}
-
-fn exclusive_bound(exclusive: Option<&ExclusiveBound>, inclusive: Option<Bound>) -> Option<Bound> {
-    match exclusive {
-        Some(ExclusiveBound::Boolean(true)) => inclusive.map(|bound| Bound {
-            exclusive: true,
-            ..bound
-        }),
-        Some(ExclusiveBound::Number(number)) => number_bound(number).map(|bound| Bound {
-            exclusive: true,
-            ..bound
-        }),
-        Some(ExclusiveBound::Boolean(false)) | None => None,
-    }
-}
-
-fn stricter_lower(left: Option<Bound>, right: Option<Bound>) -> Option<Bound> {
-    match (left, right) {
-        (None, bound) | (bound, None) => bound,
-        (Some(left), Some(right)) if left.value > right.value => Some(left),
-        (Some(left), Some(right)) if right.value > left.value => Some(right),
-        (Some(left), Some(right)) => Some(Bound {
-            value: left.value,
-            exclusive: left.exclusive || right.exclusive,
-        }),
-    }
-}
-
-fn stricter_upper(left: Option<Bound>, right: Option<Bound>) -> Option<Bound> {
-    match (left, right) {
-        (None, bound) | (bound, None) => bound,
-        (Some(left), Some(right)) if left.value < right.value => Some(left),
-        (Some(left), Some(right)) if right.value < left.value => Some(right),
-        (Some(left), Some(right)) => Some(Bound {
-            value: left.value,
-            exclusive: left.exclusive || right.exclusive,
-        }),
-    }
-}
-
-/// Whether a component needs a Request variant (some reachable node — including the schema's own
-/// root — carries `readOnly`, dropped in request position) and/or a Response variant (same for
-/// `writeOnly`, dropped in response position). The traversal mirrors the position-aware renderer
-/// exactly: it descends every inline structure the renderer inlines — nested objects,
-/// `additionalProperties`, array items, tuple members, and `allOf`/`anyOf`/`oneOf` branches — so the
-/// decision agrees with what the renderer produces. A mismatch would emit a dead export or a
-/// dangling import.
-///
-/// A `$ref` is a graph edge, not crossed here: the referenced component renders as its own named
-/// (possibly variant) type, and variance flows across refs in a separate propagation pass. Stack-only
-/// with no heap allocation, so a marker-free component returns `(false, false)` doing zero
-/// allocation, exactly as the pre-recursion decision did.
-fn shape_variants(schema: &SchemaNode) -> (bool, bool) {
-    let mut acc = (false, false);
-    accumulate_shape_variants(schema, &mut acc);
-    acc
-}
-
-fn accumulate_shape_variants(schema: &SchemaNode, acc: &mut (bool, bool)) {
-    if acc.0 && acc.1 {
-        return;
-    }
-    acc.0 |= schema.meta().read_only;
-    acc.1 |= schema.meta().write_only;
-    match schema {
-        SchemaNode::Object {
-            properties,
-            additional_properties,
-            ..
-        } => {
-            for (_, property, meta) in properties {
-                acc.0 |= meta.read_only;
-                acc.1 |= meta.write_only;
-                accumulate_shape_variants(property, acc);
-                if acc.0 && acc.1 {
-                    return;
-                }
-            }
-            if let AdditionalProperties::Allowed(Some(schema))
-            | AdditionalProperties::Schema(schema) = additional_properties
-            {
-                accumulate_shape_variants(schema, acc);
-            }
-        }
-        SchemaNode::Array { items, .. } => accumulate_shape_variants(items, acc),
-        SchemaNode::Tuple {
-            prefix_items, rest, ..
-        } => {
-            for item in prefix_items {
-                accumulate_shape_variants(item, acc);
-                if acc.0 && acc.1 {
-                    return;
-                }
-            }
-            if let TupleRest::Schema(schema) = rest {
-                accumulate_shape_variants(schema, acc);
-            }
-        }
-        SchemaNode::AllOf { branches, .. }
-        | SchemaNode::AnyOf { branches, .. }
-        | SchemaNode::OneOf { branches, .. } => {
-            for branch in branches {
-                accumulate_shape_variants(branch, acc);
-                if acc.0 && acc.1 {
-                    return;
-                }
-            }
-        }
-        SchemaNode::Ref { .. }
-        | SchemaNode::Primitive { .. }
-        | SchemaNode::Finite { .. }
-        | SchemaNode::Any { .. }
-        | SchemaNode::Never { .. }
-        | SchemaNode::Unknown { .. } => {}
-    }
-}
-
-/// The exported-name fragment identifying one media entry, mangled from its canonical full media
-/// string: `*` becomes `Wildcard`, every other non-alphanumeric ASCII byte is a token separator,
-/// and each token is uppercase-first and concatenated (`application/vnd.api+json` →
-/// `ApplicationVndApiJson`). Total by construction — it never invents a disambiguating suffix, so a
-/// collision between two distinct media strings is a diagnostic rather than a silent rename.
-pub(super) fn media_tag(media: &str) -> String {
-    let mut tag = String::with_capacity(media.len());
-    let mut fresh = true;
-    for byte in media.chars() {
-        if byte == '*' {
-            tag.push_str("Wildcard");
-            fresh = true;
-        } else if byte.is_ascii_alphanumeric() {
-            if fresh {
-                tag.extend(byte.to_uppercase());
-            } else {
-                tag.push(byte);
-            }
-            fresh = false;
-        } else {
-            fresh = true;
-        }
-    }
-    tag
-}
-
-/// Inserts the `esnext.temporal` lib reference into an assembled file that names a `Temporal` type.
-///
-/// Not a workaround for missing TypeScript support — the compiler ships `lib.esnext.temporal` — but
-/// how a generated file opts a consumer whose own `lib` predates it into the declarations this
-/// file's types need. Derived from the emitted text rather than from configuration, so a file that
-/// happens to name no Temporal type never carries one, and the two can never disagree.
-///
-/// It goes after the generated header, which is the first line of every emitted file: a triple-slash
-/// directive may be preceded by comments, and by nothing else.
-pub(super) fn insert_temporal_reference(content: String, header_len: usize) -> String {
-    if !content[header_len..].contains("Temporal.") {
-        return content;
-    }
-    let mut output = String::with_capacity(content.len() + TEMPORAL_REFERENCE.len());
-    output.push_str(&content[..header_len]);
-    output.push_str(TEMPORAL_REFERENCE);
-    output.push_str(&content[header_len..]);
-    output
-}
-
-const TEMPORAL_REFERENCE: &str = "/// <reference lib=\"esnext.temporal\" preserve=\"true\" />\n\n";
-
-pub(super) fn source_diagnostic(
-    code: &'static str,
-    message: impl Into<String>,
-    source: &SourceRef,
-) -> Diagnostic {
-    let mut diagnostic = Diagnostic::input(code, message)
-        .with_source(&source.source_id)
-        .with_json_pointer(&source.json_pointer);
-    if let (Some(line), Some(col)) = (source.line, source.col) {
-        diagnostic = diagnostic.with_location(line, col);
-    }
-    diagnostic
-}
-
-pub(super) fn warning_diagnostic(
-    code: &'static str,
-    message: impl Into<String>,
-    source: &SourceRef,
-) -> Diagnostic {
-    let mut diagnostic = source_diagnostic(code, message, source);
-    diagnostic.severity = Severity::Warning;
-    diagnostic
 }

@@ -86,7 +86,7 @@ fn compare_generated(first: &BTreeMap<String, PathBuf>, second: &Path) -> Result
 
 /// Maps each file under a `generated*` directory to its absolute path, keyed by the path relative to
 /// `workdir` (sorted, so the first reported difference is deterministic).
-pub(crate) fn generated_files(workdir: &Path) -> Result<BTreeMap<String, PathBuf>, Error> {
+pub fn generated_files(workdir: &Path) -> Result<BTreeMap<String, PathBuf>, Error> {
     let mut files = BTreeMap::new();
     for entry in read_dir(workdir)? {
         let entry =

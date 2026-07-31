@@ -5,6 +5,7 @@
 //! Input and semantic diagnostics use the reserved `OASTS1xxx` range.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 /// The severity of a diagnostic.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -31,6 +32,30 @@ impl Category {
     }
 }
 
+/// A deterministic naming override shown after the run's diagnostics.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct NamingOverrideSuggestion {
+    pub namespace: NamingOverrideNamespace,
+    pub source_name: String,
+    pub identifier: String,
+}
+
+/// One supported `naming.overrides` namespace.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum NamingOverrideNamespace {
+    Schemas,
+    Operations,
+}
+
+impl NamingOverrideNamespace {
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Schemas => "schemas",
+            Self::Operations => "operations",
+        }
+    }
+}
+
 /// A stable, sortable diagnostic emitted by Oasts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Diagnostic {
@@ -42,6 +67,7 @@ pub struct Diagnostic {
     pub col: Option<u32>,
     pub json_pointer: Option<String>,
     pub category: Category,
+    pub naming_override_suggestions: Option<Box<Vec<NamingOverrideSuggestion>>>,
 }
 
 impl Diagnostic {
@@ -57,6 +83,7 @@ impl Diagnostic {
             col: None,
             json_pointer: None,
             category: Category::Config,
+            naming_override_suggestions: None,
         }
     }
 
@@ -72,6 +99,7 @@ impl Diagnostic {
             col: None,
             json_pointer: None,
             category: Category::Input,
+            naming_override_suggestions: None,
         }
     }
 
@@ -96,6 +124,16 @@ impl Diagnostic {
         self.json_pointer = Some(pointer.into());
         self
     }
+
+    /// Attaches run-level naming remedies without changing the diagnostic's own message.
+    #[must_use]
+    pub fn with_naming_override_suggestions(
+        mut self,
+        suggestions: Vec<NamingOverrideSuggestion>,
+    ) -> Self {
+        self.naming_override_suggestions = (!suggestions.is_empty()).then(|| Box::new(suggestions));
+        self
+    }
 }
 
 impl Ord for Diagnostic {
@@ -109,6 +147,10 @@ impl Ord for Diagnostic {
             .then_with(|| self.severity.cmp(&other.severity))
             .then_with(|| self.category.cmp(&other.category))
             .then_with(|| self.json_pointer.cmp(&other.json_pointer))
+            .then_with(|| {
+                self.naming_override_suggestions
+                    .cmp(&other.naming_override_suggestions)
+            })
     }
 }
 
@@ -184,7 +226,17 @@ pub fn render(
 pub fn render_to_string(mut diagnostics: Vec<Diagnostic>) -> String {
     diagnostics.sort();
     let mut rendered = String::new();
+    let mut suggestions = BTreeMap::<NamingOverrideNamespace, BTreeMap<String, String>>::new();
     for diagnostic in diagnostics {
+        if let Some(diagnostic_suggestions) = diagnostic.naming_override_suggestions {
+            for suggestion in *diagnostic_suggestions {
+                suggestions
+                    .entry(suggestion.namespace)
+                    .or_default()
+                    .entry(suggestion.source_name)
+                    .or_insert(suggestion.identifier);
+            }
+        }
         let severity = match diagnostic.severity {
             Severity::Error => "error",
             Severity::Warning => "warning",
@@ -205,7 +257,25 @@ pub fn render_to_string(mut diagnostics: Vec<Diagnostic>) -> String {
             rendered.push_str(&format!("  --> <config>:1:1 {pointer}\n"));
         }
     }
+    if !suggestions.is_empty() {
+        rendered.push_str("help: add these deterministic naming overrides to oasts.yaml:\n");
+        rendered.push_str("naming:\n  overrides:\n");
+        for (namespace, entries) in suggestions {
+            rendered.push_str(&format!("    {}:\n", namespace.key()));
+            for (source_name, identifier) in entries {
+                rendered.push_str(&format!(
+                    "      '{}': '{}'\n",
+                    yaml_single_quote(&source_name),
+                    yaml_single_quote(&identifier)
+                ));
+            }
+        }
+    }
     rendered
+}
+
+fn yaml_single_quote(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 #[cfg(test)]
@@ -228,6 +298,7 @@ mod tests {
             col,
             json_pointer: None,
             category: Category::Config,
+            naming_override_suggestions: None,
         }
     }
 
@@ -240,6 +311,28 @@ mod tests {
         assert!(rendered.contains("warning[OASTS1999]"));
         assert!(rendered.contains("source.yaml:1:1"));
         assert!(rendered.contains("<config>:1:1 /config"));
+    }
+
+    #[test]
+    fn render_appends_one_yaml_safe_run_level_override_block() {
+        let schemas = Diagnostic::input("OASTS1202", "schema collision")
+            .with_naming_override_suggestions(vec![NamingOverrideSuggestion {
+                namespace: NamingOverrideNamespace::Schemas,
+                source_name: "Owner's pet".to_owned(),
+                identifier: "OwnersPet_1".to_owned(),
+            }]);
+        let operations = Diagnostic::input("OASTS1201", "operation collision")
+            .with_naming_override_suggestions(vec![NamingOverrideSuggestion {
+                namespace: NamingOverrideNamespace::Operations,
+                source_name: "get-pet".to_owned(),
+                identifier: "getPet_1".to_owned(),
+            }]);
+
+        let rendered = render_to_string(vec![operations, schemas]);
+        assert!(rendered.contains("help: add these deterministic naming overrides"));
+        assert!(rendered.contains("      'Owner''s pet': 'OwnersPet_1'\n"));
+        assert!(rendered.contains("      'get-pet': 'getPet_1'\n"));
+        assert_eq!(rendered.matches("naming:\n  overrides:\n").count(), 1);
     }
 
     struct FailingWriter;

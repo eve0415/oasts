@@ -133,7 +133,8 @@ fn fetch_one(
     Ok(FetchStatus::Downloaded)
 }
 
-fn sha256_hex(path: &Path) -> Result<String, Error> {
+/// Hashes a downloaded file without loading a potentially large corpus document into memory.
+pub fn sha256_hex(path: &Path) -> Result<String, Error> {
     let mut file = std::fs::File::open(path)
         .map_err(|error| Error::new(format!("opening {}: {error}", path.display())))?;
     let mut hasher = Sha256::new();

@@ -345,61 +345,61 @@ rows:
   - keyword: if
     dialects:
       - "3.1"
-    disposition: reject
-    notes: Conditional application; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: Its verdict selects then or else without becoming an issue; an incomplete condition fails validators generation with OASTS1503.
   - keyword: then
     dialects:
       - "3.1"
-    disposition: reject
-    notes: Conditional application; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: Applied only when a sibling if succeeds; without if it is ignored, and an incomplete active subschema fails validators generation with OASTS1503.
   - keyword: else
     dialects:
       - "3.1"
-    disposition: reject
-    notes: Conditional application; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: Applied only when a sibling if fails; without if it is ignored, and an incomplete active subschema fails validators generation with OASTS1503.
   - keyword: not
     dialects:
       - "3.0"
       - "3.1"
-    disposition: reject
-    notes: Negation; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: Exact negation when every declared subschema keyword emits a check; an incomplete subschema fails validators generation with OASTS1503 instead of emitting a negation.
   - keyword: dependentSchemas
     dialects:
       - "3.1"
-    disposition: reject
-    notes: Schema-valued dependencies; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: A present trigger applies its subschema to the whole object; an incomplete subschema fails validators generation with OASTS1503.
   - keyword: unevaluatedProperties
     dialects:
       - "3.1"
-    disposition: reject
-    notes: Annotation-dependent evaluation; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: Collects successful evaluated-property annotations from every supported in-place applicator and static ref at the same location; an incomplete annotation source or applied subschema fails validators generation with OASTS1503.
   - keyword: unevaluatedItems
     dialects:
       - "3.1"
-    disposition: reject
-    notes: Annotation-dependent evaluation; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: Collects successful evaluated-item annotations from every supported in-place applicator and static ref at the same location; an incomplete annotation source or applied subschema fails validators generation with OASTS1503.
   - keyword: contains
     dialects:
       - "3.1"
-    disposition: reject
-    notes: Existential array constraint; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: Counts every array item that validates against the subschema; the default minimum is one, and an incomplete subschema fails validators generation with OASTS1503.
   - keyword: minContains
     dialects:
       - "3.1"
-    disposition: reject
-    notes: Existential array constraint; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: Lower bound on contains matches; zero makes contains itself always pass while leaving maxContains active.
   - keyword: maxContains
     dialects:
       - "3.1"
-    disposition: reject
-    notes: Existential array constraint; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: Upper bound on contains matches; inert without an adjacent contains keyword.
   - keyword: patternProperties
     dialects:
       - "3.1"
-    disposition: reject
-    notes: Regex-keyed property schemas; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: Every ECMA-262 Unicode regex match applies its schema, multiple matches all apply, and matched names are excluded from additionalProperties; an incomplete subschema fails with OASTS1503.
   - keyword: propertyNames
     dialects:
       - "3.1"
-    disposition: reject
-    notes: Key-name schema; validators generation fails with a diagnostic.
+    disposition: exact
+    notes: Each key is checked when every declared subschema keyword emits a check; an incomplete subschema fails validators generation with OASTS1503 instead of emitting propertyNames.

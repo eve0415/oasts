@@ -11,6 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+fluent-uri = "=0.4.1"
 itoa = "=1.0.18"
 serde = { version = "=1.0.229", features = ["derive"] }
 ryu = "=1.0.23"

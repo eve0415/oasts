@@ -1238,6 +1238,30 @@ mod tests {
     }
 
     #[test]
+    fn uninhabitable_all_of_discards_unreachable_transforms() {
+        let mut fx = fixture(
+            doc(json!({
+                "Impossible": {
+                    "allOf": [
+                        { "type": "string", "format": "date-time" },
+                        { "type": "number" }
+                    ]
+                }
+            })),
+            date_mode(),
+        );
+        let mut sink = DiagnosticSink::new();
+        crate::composition::lower_uninhabitable_all_ofs(&mut fx.ir, &mut sink);
+        assert!(matches!(fx.root("Impossible"), SchemaNode::Never { .. }));
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == crate::composition::CODE_COMPOSITION
+                && diagnostic.severity == crate::diag::Severity::Warning
+        }));
+        let computed = fx.facts();
+        assert!(!transforms(&fx.ir, &computed, "Impossible"));
+    }
+
+    #[test]
     fn an_inline_node_is_asked_directly_rather_than_through_a_component() {
         let fx = fixture(
             doc(json!({

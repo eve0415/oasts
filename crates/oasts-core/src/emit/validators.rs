@@ -21,11 +21,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Number, Value};
+use sha2::{Digest, Sha256};
 
 use crate::diag::Diagnostic;
 use crate::ir::{
-    AdditionalProperties, ExclusiveBound, FiniteConstraint, Operation, ParamLocation,
-    PrimitiveType, PropMeta, ResponseEntry, SchemaMeta, SchemaNode, TupleRest, finite_parts,
+    AdditionalProperties, ConditionalApplicator, ContainsApplicator, ExclusiveBound,
+    FiniteConstraint, Operation, ParamLocation, PatternProperty, PrimitiveType, PropMeta,
+    ResponseEntry, SchemaMeta, SchemaNode, SourceRef, TupleRest, finite_parts,
 };
 use crate::num::render_number_value;
 use crate::semantic::{TargetCase, normalize_identifier};
@@ -50,8 +52,17 @@ const VALIDATORS_STANDARD_SCHEMA_TS: &str =
 const CODE_REJECTED_KEYWORD: &str = "OASTS1501";
 /// A schema degraded to an unknown leaf, so no faithful validator can be emitted for it.
 const CODE_UNKNOWN_LEAF: &str = "OASTS1502";
+/// An applicator's subschema is not fully checkable, so emitting the outer check would be unsound.
+const CODE_INCOMPLETE_APPLICATOR: &str = "OASTS1503";
 /// Two JSON media entries on one response mangle to the same validator-name fragment.
 const CODE_MEDIA_TAG_COLLISION: &str = "OASTS1400";
+
+/// TypeScript aborts control-flow analysis at 2,000 recursive flow-node visits. The estimate below
+/// counts the flow-producing bindings, conditions, merges, mutations, and effectful calls emitted
+/// for a schema. Keep each generated body at no more than half that hard limit: a compound
+/// condition can contribute both its narrowing edge and its branch merge, so two compiler flow
+/// nodes per estimated unit is the conservative bound.
+const VALIDATOR_CFA_BUDGET: usize = 1_000;
 
 /// The response-body validators for one declared response: its JSON media entries paired with the
 /// exported names the client will call.
@@ -263,7 +274,7 @@ fn collect_rejects(emitter: &Emitter<'_, '_, '_>, schema: &SchemaNode, out: &mut
     // One rejected keyword is one root cause: it drives OASTS1501, and the same parse degrades the
     // node to an unknown leaf. Surfacing OASTS1502 as well would double-report it against the frozen
     // matrix's single-diagnostic contract, so the unknown-leaf code fires only for nodes that
-    // reached Unknown without carrying a rejected keyword (e.g. `$dynamicRef`, an unknown `type`).
+    // reached Unknown without carrying a rejected keyword (e.g. an unknown `type`).
     if meta.rejected_validation_keywords.is_empty() {
         if let SchemaNode::Unknown { reason, meta } = schema {
             out.push(source_diagnostic(
@@ -321,58 +332,416 @@ fn collect_operation_rejects(
 /// File-scoped state accumulated while generating a file's validate bodies: the runtime value
 /// imports actually used, whether the record/array narrowing guards are needed, and the lazily
 /// cached regex patterns (slot = index).
-#[derive(Default)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IncompleteApplicator {
+    keyword: &'static str,
+    source: SourceRef,
+}
+
+#[derive(Clone, Default)]
 struct FileScope {
     runtime_values: BTreeSet<&'static str>,
     needs_is_record: bool,
     needs_is_array: bool,
-    patterns: Vec<String>,
+    patterns: Vec<(String, bool)>,
+    incomplete_applicators: Vec<IncompleteApplicator>,
 }
 
 impl FileScope {
     /// Returns the module-scope cache slot for a pattern string, deduplicating equal patterns.
-    fn pattern_slot(&mut self, pattern: &str) -> usize {
+    fn pattern_slot(&mut self, pattern: &str, unicode: bool) -> usize {
         if let Some(index) = self
             .patterns
             .iter()
-            .position(|existing| existing == pattern)
+            .position(|existing| existing.0 == pattern && existing.1 == unicode)
         {
             return index;
         }
-        self.patterns.push(pattern.to_owned());
+        self.patterns.push((pattern.to_owned(), unicode));
         self.patterns.len() - 1
     }
+
+    fn record_incomplete_applicator(&mut self, keyword: &'static str, source: &SourceRef) {
+        let incomplete = IncompleteApplicator {
+            keyword,
+            source: source.clone(),
+        };
+        if !self.incomplete_applicators.contains(&incomplete) {
+            self.incomplete_applicators.push(incomplete);
+        }
+    }
+}
+
+fn report_incomplete_applicators(sink: &mut crate::diag::DiagnosticSink, scope: &FileScope) {
+    for incomplete in &scope.incomplete_applicators {
+        sink.push(source_diagnostic(
+            CODE_INCOMPLETE_APPLICATOR,
+            format!(
+                "validators cannot emit '{}' because a required subschema is not fully checkable",
+                incomplete.keyword
+            ),
+            &incomplete.source,
+        ));
+    }
+}
+
+/// A saturated estimate of the maximum TypeScript control-flow depth contributed by an emitted
+/// schema. It models the constructs the binder turns into flow nodes rather than source lines:
+/// initialized locals, narrowing conditions and their merges, mutations, loop labels, and dotted
+/// assertion calls. Saturation keeps the walk O(schema size) without allowing arithmetic overflow;
+/// callers only need to know whether a subtree crosses the split budget.
+fn validation_flow_cost(schema: &SchemaNode, position: TypePosition) -> usize {
+    let cap = VALIDATOR_CFA_BUDGET + 1;
+    let add = |left: usize, right: usize| left.saturating_add(right).min(cap);
+    let checks = |count: usize| count.saturating_mul(3).min(cap);
+    let meta = schema.meta();
+    let typeless = || {
+        let numeric = meta.numeric_constraints().minimum.is_some() as usize
+            + meta.numeric_constraints().maximum.is_some() as usize
+            + meta.numeric_constraints().exclusive_minimum.is_some() as usize
+            + meta.numeric_constraints().exclusive_maximum.is_some() as usize
+            + meta.numeric_constraints().multiple_of.is_some() as usize;
+        let string = meta.string_constraints().min_length.is_some() as usize
+            + meta.string_constraints().max_length.is_some() as usize
+            + meta.string_constraints().pattern.is_some() as usize;
+        let array = meta.array_constraints().min_items.is_some() as usize
+            + meta.array_constraints().max_items.is_some() as usize
+            + usize::from(meta.array_constraints().unique_items) * 4;
+        let object = meta.object_constraints().min_properties.is_some() as usize
+            + meta.object_constraints().max_properties.is_some() as usize
+            + meta.object_constraints().required.len();
+        checks(numeric + string + array + object)
+    };
+    let base = match schema {
+        SchemaNode::Ref { .. } | SchemaNode::Unknown { .. } => 0,
+        SchemaNode::Primitive {
+            ty,
+            format,
+            enum_values,
+            const_value,
+            ..
+        } => {
+            let constraints = match ty {
+                PrimitiveType::String => {
+                    meta.string_constraints().min_length.is_some() as usize
+                        + meta.string_constraints().max_length.is_some() as usize
+                        + meta.string_constraints().pattern.is_some() as usize
+                        + usize::from(
+                            format
+                                .as_deref()
+                                .and_then(string_format_predicate)
+                                .is_some(),
+                        )
+                }
+                PrimitiveType::Number | PrimitiveType::Integer => {
+                    meta.numeric_constraints().minimum.is_some() as usize
+                        + meta.numeric_constraints().maximum.is_some() as usize
+                        + meta.numeric_constraints().exclusive_minimum.is_some() as usize
+                        + meta.numeric_constraints().exclusive_maximum.is_some() as usize
+                        + meta.numeric_constraints().multiple_of.is_some() as usize
+                        + usize::from(
+                            matches!(ty, PrimitiveType::Integer)
+                                && format.as_deref() == Some("int32"),
+                        )
+                }
+                PrimitiveType::Boolean | PrimitiveType::Null => 0,
+            };
+            let finite = enum_values
+                .as_ref()
+                .map_or(0, |values| values.len().max(1).saturating_add(2))
+                + usize::from(const_value.is_some()) * 3;
+            add(3, add(checks(constraints), finite))
+        }
+        SchemaNode::Finite {
+            enum_values,
+            const_value,
+            ..
+        } => enum_values
+            .as_ref()
+            .map_or(0, |values| values.len().max(1).saturating_add(2))
+            .saturating_add(usize::from(const_value.is_some()) * 3)
+            .min(cap),
+        SchemaNode::Object {
+            properties,
+            additional_properties,
+            dependent_required,
+            finite,
+            extra_required,
+            ..
+        } => {
+            let mut cost = 11;
+            for (_, property, property_meta) in properties {
+                if !property_in_position(property_meta, position) {
+                    continue;
+                }
+                let property_cost = if is_noop_schema(property) {
+                    usize::from(property_meta.required) * 3
+                } else {
+                    add(4, validation_flow_cost(property, position))
+                };
+                cost = add(cost, property_cost);
+            }
+            cost = add(cost, checks(extra_required.len()));
+            for (_, dependents) in dependent_required {
+                cost = add(cost, add(2, checks(dependents.len())));
+            }
+            cost = add(
+                cost,
+                match additional_properties {
+                    AdditionalProperties::Forbidden => add(
+                        add(5, properties.len()),
+                        meta.validation_applicators().pattern_properties.len(),
+                    ),
+                    AdditionalProperties::Schema(sub) if !is_noop_schema(sub) => add(
+                        add(
+                            add(6, properties.len()),
+                            meta.validation_applicators().pattern_properties.len(),
+                        ),
+                        validation_flow_cost(sub, position),
+                    ),
+                    AdditionalProperties::Schema(_) | AdditionalProperties::Allowed(_) => 0,
+                },
+            );
+            cost = add(
+                cost,
+                checks(
+                    meta.object_constraints().min_properties.is_some() as usize
+                        + meta.object_constraints().max_properties.is_some() as usize,
+                ),
+            );
+            let (enum_values, const_value) = finite_parts(finite);
+            add(
+                cost,
+                enum_values.map_or(0, |values| values.len().max(1).saturating_add(2))
+                    + usize::from(const_value.is_some()) * 3,
+            )
+        }
+        SchemaNode::Array { items, finite, .. } => {
+            let item_cost = if is_noop_schema(items) {
+                0
+            } else {
+                add(4, validation_flow_cost(items, position))
+            };
+            let constraints = meta.array_constraints().min_items.is_some() as usize
+                + meta.array_constraints().max_items.is_some() as usize
+                + usize::from(meta.array_constraints().unique_items) * 4;
+            let (enum_values, const_value) = finite_parts(finite);
+            add(
+                add(8, add(item_cost, checks(constraints))),
+                enum_values.map_or(0, |values| values.len().max(1).saturating_add(2))
+                    + usize::from(const_value.is_some()) * 3,
+            )
+        }
+        SchemaNode::Tuple {
+            prefix_items,
+            rest,
+            finite,
+            ..
+        } => {
+            let mut cost = 13;
+            for prefix in prefix_items {
+                if !is_noop_schema(prefix) {
+                    cost = add(cost, add(4, validation_flow_cost(prefix, position)));
+                }
+            }
+            cost = add(
+                cost,
+                match rest {
+                    TupleRest::Schema(sub) if !is_noop_schema(sub) => {
+                        add(4, validation_flow_cost(sub, position))
+                    }
+                    TupleRest::Forbidden => 3,
+                    TupleRest::Schema(_) | TupleRest::Allowed => 0,
+                },
+            );
+            let constraints = meta.array_constraints().min_items.is_some() as usize
+                + meta.array_constraints().max_items.is_some() as usize
+                + usize::from(meta.array_constraints().unique_items) * 4;
+            cost = add(cost, checks(constraints));
+            let (enum_values, const_value) = finite_parts(finite);
+            add(
+                cost,
+                enum_values.map_or(0, |values| values.len().max(1).saturating_add(2))
+                    + usize::from(const_value.is_some()) * 3,
+            )
+        }
+        SchemaNode::AllOf { branches, .. } => branches.iter().fold(0, |cost, branch| {
+            add(cost, validation_flow_cost(branch, position))
+        }),
+        SchemaNode::AnyOf { branches, .. } | SchemaNode::OneOf { branches, .. } => {
+            branches.iter().fold(4, |cost, branch| {
+                add(cost, add(16, validation_flow_cost(branch, position)))
+            })
+        }
+        SchemaNode::Never { .. } => 1,
+        SchemaNode::Any { .. } => typeless(),
+    };
+    let applicators = meta.validation_applicators();
+    let with_not = applicators
+        .not
+        .as_ref()
+        .map_or(0, |schema| add(4, validation_flow_cost(schema, position)));
+    let with_property_names = applicators
+        .property_names
+        .as_ref()
+        .map_or(0, |schema| add(7, validation_flow_cost(schema, position)));
+    let with_pattern_properties = applicators
+        .pattern_properties
+        .iter()
+        .fold(0, |cost, pattern| {
+            add(
+                cost,
+                add(7, validation_flow_cost(&pattern.schema, position)),
+            )
+        });
+    let with_contains = applicators.contains.as_ref().map_or(0, |contains| {
+        let bounds = usize::from(contains.min_contains.is_some())
+            + usize::from(contains.max_contains.is_some());
+        add(
+            add(10, checks(bounds.max(1))),
+            validation_flow_cost(&contains.schema, position),
+        )
+    });
+    let with_dependent_schemas = applicators
+        .dependent_schemas
+        .iter()
+        .fold(0, |cost, (_, schema)| {
+            add(cost, add(4, validation_flow_cost(schema, position)))
+        });
+    let with_conditional = applicators.conditional.as_ref().map_or(0, |conditional| {
+        let condition = add(12, validation_flow_cost(&conditional.condition, position));
+        let then_schema = conditional
+            .then_schema
+            .as_ref()
+            .map_or(0, |schema| validation_flow_cost(schema, position));
+        let else_schema = conditional
+            .else_schema
+            .as_ref()
+            .map_or(0, |schema| validation_flow_cost(schema, position));
+        add(condition, add(then_schema, else_schema))
+    });
+    let with_unevaluated_properties = applicators
+        .unevaluated_properties
+        .as_ref()
+        .map_or(0, |schema| add(12, validation_flow_cost(schema, position)));
+    let with_unevaluated_items = applicators
+        .unevaluated_items
+        .as_ref()
+        .map_or(0, |schema| add(12, validation_flow_cost(schema, position)));
+    add(
+        base,
+        add(
+            add(with_not, with_property_names),
+            add(
+                with_pattern_properties,
+                add(
+                    with_contains,
+                    add(
+                        with_dependent_schemas,
+                        add(
+                            with_conditional,
+                            add(with_unevaluated_properties, with_unevaluated_items),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+}
+
+fn schema_path_digest(path: &[String]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hasher = Sha256::new();
+    for segment in path {
+        hasher.update(
+            u64::try_from(segment.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        hasher.update(segment.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 // --- validate-body code generation -------------------------------------------------------------
 
 /// One validate-function body under construction: indented output plus a monotonic counter that
 /// names locals uniquely across the whole function so nested scopes never shadow. Borrows the
-/// file-scoped `FileScope` (imports/guards/patterns accumulate across the file's declarations) and
-/// the immutable emission `model` (for `$ref` target resolution); `position` is the fixed wire
+/// file-scoped runtime state and sibling imports (both accumulate across the file's declarations)
+/// plus the immutable emission `model` (for `$ref` target resolution); `position` is the fixed wire
 /// variant of the declaration being generated.
 struct FnBody<'scope, 'model, 'input, 'sink> {
     out: String,
+    helpers: Vec<String>,
     indent: usize,
     counter: usize,
+    helper_prefix: String,
+    schema_path: Vec<String>,
     scope: &'scope mut FileScope,
+    imports: &'scope mut SiblingImports,
     model: &'model EmissionModel<'input, 'sink>,
     position: TypePosition,
+    completeness: Vec<bool>,
+    probing_refs: HashSet<(String, String)>,
+}
+
+#[derive(Clone, Default)]
+struct EvaluationCallbacks {
+    property: Option<String>,
+    item: Option<String>,
+}
+
+struct BranchEvaluation {
+    callbacks: EvaluationCallbacks,
+    properties: Option<String>,
+    items: Option<String>,
+}
+
+impl EvaluationCallbacks {
+    fn root() -> Self {
+        Self {
+            property: Some("evaluatedProperty".to_owned()),
+            item: Some("evaluatedItem".to_owned()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.property.is_none() && self.item.is_none()
+    }
+
+    fn argument(callback: &Option<String>) -> &str {
+        callback.as_deref().unwrap_or("undefined")
+    }
 }
 
 impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
     fn new(
         scope: &'scope mut FileScope,
+        imports: &'scope mut SiblingImports,
         model: &'model EmissionModel<'input, 'sink>,
         position: TypePosition,
+        helper_prefix: &str,
+        root_path: String,
     ) -> Self {
         Self {
             out: String::new(),
+            helpers: Vec::new(),
             indent: 1,
             counter: 0,
+            helper_prefix: helper_prefix.to_owned(),
+            schema_path: vec![root_path],
             scope,
+            imports,
             model,
             position,
+            completeness: Vec::new(),
+            probing_refs: HashSet::new(),
         }
     }
 
@@ -398,6 +767,82 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         let value = self.counter;
         self.counter += 1;
         value
+    }
+
+    fn finish(self) -> (String, String) {
+        debug_assert!(self.completeness.is_empty());
+        (self.helpers.concat(), self.out)
+    }
+
+    fn mark_incomplete(&mut self) {
+        if let Some(complete) = self.completeness.last_mut() {
+            *complete = false;
+        }
+    }
+
+    fn finish_completeness(&mut self) -> bool {
+        let complete = self
+            .completeness
+            .pop()
+            .expect("schema emission starts a completeness scope");
+        if !complete {
+            self.mark_incomplete();
+        }
+        complete
+    }
+
+    fn branch_evaluation(
+        &mut self,
+        evaluation: &EvaluationCallbacks,
+        suffix: &str,
+    ) -> BranchEvaluation {
+        let mut callbacks = EvaluationCallbacks::default();
+        let properties = evaluation.property.as_ref().map(|_| {
+            let values = format!("branchProperties{suffix}");
+            let callback = format!("recordBranchProperty{suffix}");
+            self.line(&format!("const {values}: string[] = [];"));
+            self.line(&format!(
+                "const {callback} = (key: string): void => {{ {values}.push(key); }};"
+            ));
+            callbacks.property = Some(callback);
+            values
+        });
+        let items = evaluation.item.as_ref().map(|_| {
+            let values = format!("branchItems{suffix}");
+            let callback = format!("recordBranchItem{suffix}");
+            self.line(&format!("const {values}: number[] = [];"));
+            self.line(&format!(
+                "const {callback} = (index: number): void => {{ {values}.push(index); }};"
+            ));
+            callbacks.item = Some(callback);
+            values
+        });
+        BranchEvaluation {
+            callbacks,
+            properties,
+            items,
+        }
+    }
+
+    fn merge_branch_evaluation(
+        &mut self,
+        branch: &BranchEvaluation,
+        evaluation: &EvaluationCallbacks,
+    ) {
+        if let (Some(values), Some(callback)) =
+            (branch.properties.as_deref(), evaluation.property.as_deref())
+        {
+            self.open(&format!("for (const key of {values}) {{"));
+            self.line(&format!("{callback}?.(key);"));
+            self.close("}");
+        }
+        if let (Some(values), Some(callback)) =
+            (branch.items.as_deref(), evaluation.item.as_deref())
+        {
+            self.open(&format!("for (const index of {values}) {{"));
+            self.line(&format!("{callback}?.(index);"));
+            self.close("}");
+        }
     }
 
     /// Emits a single `if (condition) { issues.push(issue(path, message)); }` check.
@@ -437,7 +882,122 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         self.close("}");
     }
 
-    fn gen_schema(&mut self, schema: &SchemaNode, val: &str, path: &str, iss: &str) {
+    fn helper_name(&self, role: &str, part: Option<usize>) -> String {
+        let digest = schema_path_digest(&self.schema_path);
+        let suffix = part.map_or_else(String::new, |index| format!("Part{index}"));
+        format!("validate{}{}{}{}", self.helper_prefix, role, digest, suffix)
+    }
+
+    fn gen_root_schema(&mut self, schema: &SchemaNode, val: &str, path: &str, iss: &str) -> bool {
+        self.gen_schema_inline(schema, val, path, iss, &EvaluationCallbacks::root())
+    }
+
+    fn gen_schema(
+        &mut self,
+        schema: &SchemaNode,
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) -> bool {
+        if validation_flow_cost(schema, self.position) > VALIDATOR_CFA_BUDGET {
+            self.gen_schema_helper(schema, val, path, iss, evaluation)
+        } else {
+            self.gen_schema_inline(schema, val, path, iss, evaluation)
+        }
+    }
+
+    fn gen_child_schema(
+        &mut self,
+        segment: String,
+        schema: &SchemaNode,
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) -> bool {
+        self.schema_path.push(segment);
+        let complete = self.gen_schema(schema, val, path, iss, evaluation);
+        self.schema_path.pop();
+        complete
+    }
+
+    fn gen_schema_helper(
+        &mut self,
+        schema: &SchemaNode,
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) -> bool {
+        let name = self.helper_name("At", None);
+        let parent_out = std::mem::take(&mut self.out);
+        let parent_indent = self.indent;
+        let parent_counter = self.counter;
+        self.indent = 1;
+        self.counter = 0;
+        let complete = self.gen_schema_inline(
+            schema,
+            "value",
+            "path",
+            "issues",
+            &EvaluationCallbacks::root(),
+        );
+        let helper_body = std::mem::replace(&mut self.out, parent_out);
+        self.indent = parent_indent;
+        self.counter = parent_counter;
+        self.helpers.push(format!(
+            "function {name}(value: unknown, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): void {{\n{helper_body}}}\n\n"
+        ));
+        if evaluation.is_empty() {
+            self.line(&format!("{name}({val}, {path}, {iss});"));
+        } else {
+            self.line(&format!(
+                "{name}({val}, {path}, {iss}, {}, {});",
+                EvaluationCallbacks::argument(&evaluation.property),
+                EvaluationCallbacks::argument(&evaluation.item)
+            ));
+        }
+        complete
+    }
+
+    fn gen_schema_inline(
+        &mut self,
+        schema: &SchemaNode,
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) -> bool {
+        self.completeness.push(true);
+        if !schema.meta().rejected_validation_keywords.is_empty() {
+            self.mark_incomplete();
+        }
+        let applicators = schema.meta().validation_applicators();
+        let outer_evaluation = evaluation.clone();
+        let mut active_evaluation = evaluation.clone();
+        let local_properties = applicators.unevaluated_properties.as_ref().map(|_| {
+            let index = self.fresh();
+            let values = format!("evaluatedProperties{index}");
+            let callback = format!("recordProperty{index}");
+            self.line(&format!("const {values}: string[] = [];"));
+            self.line(&format!(
+                "const {callback} = (key: string): void => {{ {values}.push(key); }};"
+            ));
+            active_evaluation.property = Some(callback);
+            values
+        });
+        let local_items = applicators.unevaluated_items.as_ref().map(|_| {
+            let index = self.fresh();
+            let values = format!("evaluatedItems{index}");
+            let callback = format!("recordItem{index}");
+            self.line(&format!("const {values}: number[] = [];"));
+            self.line(&format!(
+                "const {callback} = (index: number): void => {{ {values}.push(index); }};"
+            ));
+            active_evaluation.item = Some(callback);
+            values
+        });
         match schema {
             SchemaNode::Ref { target, .. } => {
                 if let Some(resolved) = self
@@ -448,10 +1008,32 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                     // `validate{Name}Request`, which does not demand the `readOnly` properties the
                     // request shape drops. `variant_name(Neutral)` is the bare name, so neutral bodies
                     // are unaffected.
-                    self.line(&format!(
-                        "validate{}({val}, {path}, {iss});",
-                        resolved.variant_name(self.position)
-                    ));
+                    let validator = format!("validate{}", resolved.variant_name(self.position));
+                    self.imports.record_validator(
+                        resolved.index,
+                        &resolved.file_base,
+                        validator.clone(),
+                    );
+                    if active_evaluation.is_empty() {
+                        self.line(&format!("{validator}({val}, {path}, {iss});"));
+                    } else {
+                        self.line(&format!(
+                            "{validator}({val}, {path}, {iss}, {}, {});",
+                            EvaluationCallbacks::argument(&active_evaluation.property),
+                            EvaluationCallbacks::argument(&active_evaluation.item)
+                        ));
+                    }
+                    let key = (target.source_id.clone(), target.json_pointer.clone());
+                    if self.probing_refs.insert(key.clone()) {
+                        let referenced = &self.model.analyzed.ir.schemas[resolved.index].schema;
+                        let complete = self.probe_schema(referenced);
+                        self.probing_refs.remove(&key);
+                        if !complete {
+                            self.mark_incomplete();
+                        }
+                    }
+                } else {
+                    self.mark_incomplete();
                 }
                 // An unresolved reference is already reported as OASTS1305 by the types pass.
             }
@@ -480,17 +1062,22 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 extra_required,
                 meta,
             } => {
+                let force_split =
+                    validation_flow_cost(schema, self.position) > VALIDATOR_CFA_BUDGET;
                 self.gen_object(
                     ObjectParts {
                         properties,
                         additional_properties,
+                        additional_properties_present: meta.additional_properties_present,
                         dependent_required,
                         extra_required,
                         meta,
                     },
+                    force_split,
                     val,
                     path,
                     iss,
+                    &active_evaluation,
                 );
                 self.gen_finite_constraint(finite, val, path, iss);
             }
@@ -500,7 +1087,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 meta,
                 ..
             } => {
-                self.gen_array(items, meta, val, path, iss);
+                self.gen_array(items, meta, val, path, iss, &active_evaluation);
                 self.gen_finite_constraint(finite, val, path, iss);
             }
             SchemaNode::Tuple {
@@ -509,19 +1096,38 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 finite,
                 meta,
             } => {
-                self.gen_tuple(prefix_items, rest, meta, val, path, iss);
+                self.gen_tuple(
+                    TupleParts { prefix_items, rest },
+                    meta,
+                    val,
+                    path,
+                    iss,
+                    &active_evaluation,
+                );
                 self.gen_finite_constraint(finite, val, path, iss);
             }
             SchemaNode::AllOf { branches, .. } => {
-                for branch in branches {
-                    self.gen_schema(branch, val, path, iss);
-                }
+                self.gen_all_of(branches, val, path, iss, &active_evaluation);
             }
             SchemaNode::AnyOf { branches, .. } => {
-                self.gen_composition(branches, val, path, iss, Composition::AnyOf);
+                self.gen_composition(
+                    branches,
+                    val,
+                    path,
+                    iss,
+                    Composition::AnyOf,
+                    &active_evaluation,
+                );
             }
             SchemaNode::OneOf { branches, .. } => {
-                self.gen_composition(branches, val, path, iss, Composition::OneOf);
+                self.gen_composition(
+                    branches,
+                    val,
+                    path,
+                    iss,
+                    Composition::OneOf,
+                    &active_evaluation,
+                );
             }
             SchemaNode::Never { .. } => {
                 // A `false` schema admits nothing; an empty body would accept every input. Reject
@@ -540,8 +1146,758 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 // walk already failed the run for it).
                 self.gen_typeless_constraints(meta, val, path, iss);
             }
-            SchemaNode::Unknown { .. } => {}
+            SchemaNode::Unknown { .. } => self.mark_incomplete(),
         }
+        self.gen_validation_applicators(ApplicatorParts {
+            meta: schema.meta(),
+            val,
+            path,
+            iss,
+            evaluation: &active_evaluation,
+            evaluated_properties: local_properties.as_deref(),
+            evaluated_items: local_items.as_deref(),
+        });
+        if let (Some(values), Some(callback)) = (
+            local_properties.as_deref(),
+            outer_evaluation.property.as_deref(),
+        ) {
+            self.open(&format!("for (const key of {values}) {{"));
+            self.line(&format!("{callback}?.(key);"));
+            self.close("}");
+        }
+        if let (Some(values), Some(callback)) =
+            (local_items.as_deref(), outer_evaluation.item.as_deref())
+        {
+            self.open(&format!("for (const index of {values}) {{"));
+            self.line(&format!("{callback}?.(index);"));
+            self.close("}");
+        }
+        self.finish_completeness()
+    }
+
+    /// Runs the real child emitter transactionally and discards every generated byte/import/helper.
+    /// The returned completeness bit therefore comes from the same branches that produce code,
+    /// including checks reached through `$ref`, without maintaining a parallel capability table.
+    fn probe_schema(&mut self, schema: &SchemaNode) -> bool {
+        let parent_out = std::mem::take(&mut self.out);
+        let parent_helpers = std::mem::take(&mut self.helpers);
+        let parent_indent = self.indent;
+        let parent_counter = self.counter;
+        let parent_scope = self.scope.clone();
+        let parent_imports = self.imports.clone();
+
+        let complete = self.gen_schema(
+            schema,
+            "value",
+            "path",
+            "issues",
+            &EvaluationCallbacks::default(),
+        );
+
+        self.out = parent_out;
+        self.helpers = parent_helpers;
+        self.indent = parent_indent;
+        self.counter = parent_counter;
+        *self.scope = parent_scope;
+        *self.imports = parent_imports;
+        complete
+    }
+
+    fn gen_validation_applicators(&mut self, parts: ApplicatorParts<'_>) {
+        let ApplicatorParts {
+            meta,
+            val,
+            path,
+            iss,
+            evaluation,
+            evaluated_properties,
+            evaluated_items,
+        } = parts;
+        let applicators = meta.validation_applicators();
+        if let Some(schema) = &applicators.not {
+            self.gen_not(schema, val, path, iss);
+        }
+        if let Some(schema) = &applicators.property_names {
+            self.gen_property_names(schema, val, path, iss);
+        }
+        if !applicators.pattern_properties.is_empty() {
+            self.gen_pattern_properties(
+                &applicators.pattern_properties,
+                val,
+                path,
+                iss,
+                evaluation,
+            );
+        }
+        if let Some(contains) = &applicators.contains {
+            self.gen_contains(contains, val, path, iss, evaluation);
+        }
+        if !applicators.dependent_schemas.is_empty() {
+            self.gen_dependent_schemas(&applicators.dependent_schemas, val, path, iss, evaluation);
+        }
+        if let Some(conditional) = &applicators.conditional {
+            self.gen_conditional(conditional, val, path, iss, evaluation);
+        }
+        let annotation_sources_complete = self
+            .completeness
+            .last()
+            .copied()
+            .expect("validation applicators run inside a completeness scope");
+        if let (Some(schema), Some(evaluated)) = (
+            applicators.unevaluated_properties.as_deref(),
+            evaluated_properties,
+        ) {
+            if annotation_sources_complete {
+                self.gen_unevaluated_properties(schema, evaluated, val, path, iss, evaluation);
+            } else {
+                self.scope
+                    .record_incomplete_applicator("unevaluatedProperties", &schema.meta().source);
+            }
+        }
+        if let (Some(schema), Some(evaluated)) =
+            (applicators.unevaluated_items.as_deref(), evaluated_items)
+        {
+            if annotation_sources_complete {
+                self.gen_unevaluated_items(schema, evaluated, val, path, iss, evaluation);
+            } else {
+                self.scope
+                    .record_incomplete_applicator("unevaluatedItems", &schema.meta().source);
+            }
+        }
+    }
+
+    fn gen_not(&mut self, schema: &SchemaNode, val: &str, path: &str, iss: &str) {
+        let out_len = self.out.len();
+        let helpers_len = self.helpers.len();
+        let parent_indent = self.indent;
+        let parent_counter = self.counter;
+        let parent_scope = self.scope.clone();
+        let parent_imports = self.imports.clone();
+
+        self.scope.runtime_values.insert("issue");
+        let scratch = format!("issues{}", self.fresh());
+        self.line(&format!("const {scratch}: Issue[] = [];"));
+        let complete = self.gen_child_schema(
+            "not".to_owned(),
+            schema,
+            val,
+            path,
+            &scratch,
+            &EvaluationCallbacks::default(),
+        );
+        if !complete {
+            self.out.truncate(out_len);
+            self.helpers.truncate(helpers_len);
+            self.indent = parent_indent;
+            self.counter = parent_counter;
+            *self.scope = parent_scope;
+            *self.imports = parent_imports;
+            self.scope
+                .record_incomplete_applicator("not", &schema.meta().source);
+            return;
+        }
+        self.open(&format!("if ({scratch}.length === 0) {{"));
+        self.line(&format!(
+            "{iss}.push(issue({path}, \"value matches not schema\"));"
+        ));
+        self.close("}");
+    }
+
+    fn gen_property_names(&mut self, schema: &SchemaNode, val: &str, path: &str, iss: &str) {
+        let out_len = self.out.len();
+        let helpers_len = self.helpers.len();
+        let parent_indent = self.indent;
+        let parent_counter = self.counter;
+        let parent_scope = self.scope.clone();
+        let parent_imports = self.imports.clone();
+
+        self.scope.needs_is_record = true;
+        self.scope.runtime_values.insert("appendKey");
+        self.scope.runtime_values.insert("issue");
+        self.open(&format!("if (isRecord({val})) {{"));
+        self.open(&format!("for (const key of Object.keys({val})) {{"));
+        let scratch = format!("issues{}", self.fresh());
+        let child_path = format!("appendKey({path}, key)");
+        self.line(&format!("const {scratch}: Issue[] = [];"));
+        let complete = self.gen_child_schema(
+            "propertyNames".to_owned(),
+            schema,
+            "key",
+            &child_path,
+            &scratch,
+            &EvaluationCallbacks::default(),
+        );
+        if !complete {
+            self.out.truncate(out_len);
+            self.helpers.truncate(helpers_len);
+            self.indent = parent_indent;
+            self.counter = parent_counter;
+            *self.scope = parent_scope;
+            *self.imports = parent_imports;
+            self.scope
+                .record_incomplete_applicator("propertyNames", &schema.meta().source);
+            return;
+        }
+        self.open(&format!("if ({scratch}.length > 0) {{"));
+        self.line(&format!(
+            "{iss}.push(issue({child_path}, \"property name does not satisfy propertyNames schema\"));"
+        ));
+        self.close("}");
+        self.close("}");
+        self.close("}");
+    }
+
+    fn gen_pattern_properties(
+        &mut self,
+        pattern_properties: &[PatternProperty],
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) {
+        let total = pattern_properties.iter().fold(0usize, |cost, pattern| {
+            let child = validation_flow_cost(&pattern.schema, self.position);
+            let entry = 7 + usize::from(child <= VALIDATOR_CFA_BUDGET) * child;
+            cost.saturating_add(entry).min(VALIDATOR_CFA_BUDGET + 1)
+        });
+        if total > VALIDATOR_CFA_BUDGET {
+            self.gen_pattern_properties_bounded(pattern_properties, val, path, iss);
+            self.gen_pattern_property_annotations(pattern_properties, val, evaluation);
+            return;
+        }
+
+        let out_len = self.out.len();
+        let helpers_len = self.helpers.len();
+        let parent_indent = self.indent;
+        let parent_counter = self.counter;
+        let parent_scope = self.scope.clone();
+        let parent_imports = self.imports.clone();
+
+        self.scope.needs_is_record = true;
+        self.scope.runtime_values.insert("appendKey");
+        self.open(&format!("if (isRecord({val})) {{"));
+        self.open(&format!("for (const key of Object.keys({val})) {{"));
+        for pattern_property in pattern_properties {
+            let pattern = &pattern_property.pattern;
+            let schema = &pattern_property.schema;
+            let slot = self.scope.pattern_slot(pattern, true);
+            self.open(&format!("if (pattern{slot}Regex().test(key)) {{"));
+            let index = self.fresh();
+            let child = format!("value{index}");
+            let child_path = format!("path{index}");
+            self.line(&format!("const {child}: unknown = {val}[key];"));
+            self.line(&format!("const {child_path} = appendKey({path}, key);"));
+            let complete = self.gen_child_schema(
+                format!("patternProperties/{pattern}"),
+                schema,
+                &child,
+                &child_path,
+                iss,
+                &EvaluationCallbacks::default(),
+            );
+            if !complete {
+                self.out.truncate(out_len);
+                self.helpers.truncate(helpers_len);
+                self.indent = parent_indent;
+                self.counter = parent_counter;
+                *self.scope = parent_scope;
+                *self.imports = parent_imports;
+                self.scope
+                    .record_incomplete_applicator("patternProperties", &schema.meta().source);
+                return;
+            }
+            self.close("}");
+        }
+        self.close("}");
+        self.close("}");
+        self.gen_pattern_property_annotations(pattern_properties, val, evaluation);
+    }
+
+    fn gen_pattern_properties_bounded(
+        &mut self,
+        pattern_properties: &[PatternProperty],
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        for pattern_property in pattern_properties {
+            if !self.probe_schema(&pattern_property.schema) {
+                self.scope.record_incomplete_applicator(
+                    "patternProperties",
+                    &pattern_property.schema.meta().source,
+                );
+                return;
+            }
+        }
+
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        let mut cost = 0usize;
+        for (index, pattern_property) in pattern_properties.iter().enumerate() {
+            let child = validation_flow_cost(&pattern_property.schema, self.position);
+            let next = 7 + usize::from(child <= VALIDATOR_CFA_BUDGET) * child;
+            if cost > 0 && cost.saturating_add(next) > VALIDATOR_CFA_BUDGET {
+                chunks.push((start, index));
+                start = index;
+                cost = 0;
+            }
+            cost = cost.saturating_add(next).min(VALIDATOR_CFA_BUDGET + 1);
+        }
+        chunks.push((start, pattern_properties.len()));
+
+        self.scope.needs_is_record = true;
+        self.scope.runtime_values.insert("appendKey");
+        let mut calls = Vec::new();
+        for (part, (start, end)) in chunks.into_iter().enumerate() {
+            let name = self.helper_name("PatternProperties", Some(part));
+            let parent_out = std::mem::take(&mut self.out);
+            let parent_indent = self.indent;
+            let parent_counter = self.counter;
+            self.indent = 1;
+            self.counter = 0;
+            self.open("for (const key of keys) {");
+            for pattern_property in &pattern_properties[start..end] {
+                let pattern = &pattern_property.pattern;
+                let slot = self.scope.pattern_slot(pattern, true);
+                self.open(&format!("if (pattern{slot}Regex().test(key)) {{"));
+                let index = self.fresh();
+                let child = format!("value{index}");
+                let child_path = format!("path{index}");
+                self.line(&format!("const {child}: unknown = value[key];"));
+                self.line(&format!("const {child_path} = appendKey(path, key);"));
+                self.gen_child_schema(
+                    format!("patternProperties/{pattern}"),
+                    &pattern_property.schema,
+                    &child,
+                    &child_path,
+                    "issues",
+                    &EvaluationCallbacks::default(),
+                );
+                self.close("}");
+            }
+            self.close("}");
+            let helper_body = std::mem::replace(&mut self.out, parent_out);
+            self.indent = parent_indent;
+            self.counter = parent_counter;
+            self.helpers.push(format!(
+                "function {name}(value: {{ [key: string]: unknown }}, keys: readonly string[], path: readonly (string | number)[], issues: Issue[]): void {{\n{helper_body}}}\n\n"
+            ));
+            calls.push(name);
+        }
+
+        self.open(&format!("if (isRecord({val})) {{"));
+        let keys = format!("keys{}", self.fresh());
+        self.line(&format!("const {keys} = Object.keys({val});"));
+        for name in calls {
+            self.line(&format!("{name}({val}, {keys}, {path}, {iss});"));
+        }
+        self.close("}");
+    }
+
+    fn gen_pattern_property_annotations(
+        &mut self,
+        pattern_properties: &[PatternProperty],
+        val: &str,
+        evaluation: &EvaluationCallbacks,
+    ) {
+        let Some(callback) = &evaluation.property else {
+            return;
+        };
+        let condition = pattern_properties
+            .iter()
+            .map(|pattern_property| {
+                let slot = self.scope.pattern_slot(&pattern_property.pattern, true);
+                format!("pattern{slot}Regex().test(key)")
+            })
+            .collect::<Vec<_>>()
+            .join(" || ");
+        self.scope.needs_is_record = true;
+        self.open(&format!("if ({callback} !== undefined) {{"));
+        self.open(&format!("if (isRecord({val})) {{"));
+        self.open(&format!("for (const key of Object.keys({val})) {{"));
+        self.open(&format!("if ({condition}) {{"));
+        self.line(&format!("{callback}(key);"));
+        self.close("}");
+        self.close("}");
+        self.close("}");
+        self.close("}");
+    }
+
+    fn gen_contains(
+        &mut self,
+        contains: &ContainsApplicator,
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) {
+        let out_len = self.out.len();
+        let helpers_len = self.helpers.len();
+        let parent_indent = self.indent;
+        let parent_counter = self.counter;
+        let parent_scope = self.scope.clone();
+        let parent_imports = self.imports.clone();
+
+        self.scope.needs_is_array = true;
+        self.scope.runtime_values.insert("issue");
+        self.open(&format!("if (isArray({val})) {{"));
+        let count = format!("matches{}", self.fresh());
+        self.line(&format!("let {count} = 0;"));
+        self.open(&format!(
+            "for (let index = 0; index < {val}.length; index += 1) {{"
+        ));
+        let scratch = format!("issues{}", self.fresh());
+        let child_path = format!("[...{path}, index]");
+        self.line(&format!("const {scratch}: Issue[] = [];"));
+        let complete = self.gen_child_schema(
+            "contains".to_owned(),
+            &contains.schema,
+            &format!("{val}[index]"),
+            &child_path,
+            &scratch,
+            &EvaluationCallbacks::default(),
+        );
+        if !complete {
+            self.out.truncate(out_len);
+            self.helpers.truncate(helpers_len);
+            self.indent = parent_indent;
+            self.counter = parent_counter;
+            *self.scope = parent_scope;
+            *self.imports = parent_imports;
+            self.scope
+                .record_incomplete_applicator("contains", &contains.schema.meta().source);
+            return;
+        }
+        self.open(&format!("if ({scratch}.length === 0) {{"));
+        self.line(&format!("{count} += 1;"));
+        if let Some(callback) = &evaluation.item {
+            self.line(&format!("{callback}?.(index);"));
+        }
+        self.close("}");
+        self.close("}");
+
+        let minimum = contains.min_contains.unwrap_or(1);
+        if minimum > 0 {
+            let message = if contains.min_contains.is_some() {
+                format!("fewer matching items than minContains {minimum}")
+            } else {
+                "no array item matches contains schema".to_owned()
+            };
+            self.push_issue(&format!("{count} < {minimum}"), path, iss, &message);
+        }
+        if let Some(maximum) = contains.max_contains {
+            self.push_issue(
+                &format!("{count} > {maximum}"),
+                path,
+                iss,
+                &format!("more matching items than maxContains {maximum}"),
+            );
+        }
+        self.close("}");
+    }
+
+    fn gen_dependent_schemas(
+        &mut self,
+        dependent_schemas: &[(String, SchemaNode)],
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) {
+        let total = dependent_schemas.iter().fold(0usize, |cost, (_, schema)| {
+            let child = validation_flow_cost(schema, self.position);
+            let entry = 4 + usize::from(child <= VALIDATOR_CFA_BUDGET) * child;
+            cost.saturating_add(entry).min(VALIDATOR_CFA_BUDGET + 1)
+        });
+        if total > VALIDATOR_CFA_BUDGET {
+            self.gen_dependent_schemas_bounded(dependent_schemas, val, path, iss, evaluation);
+            return;
+        }
+
+        let out_len = self.out.len();
+        let helpers_len = self.helpers.len();
+        let parent_indent = self.indent;
+        let parent_counter = self.counter;
+        let parent_scope = self.scope.clone();
+        let parent_imports = self.imports.clone();
+
+        self.scope.needs_is_record = true;
+        self.open(&format!("if (isRecord({val})) {{"));
+        for (trigger, schema) in dependent_schemas {
+            self.open(&format!(
+                "if (Object.hasOwn({val}, {})) {{",
+                render_ts_string(trigger)
+            ));
+            let complete = self.gen_child_schema(
+                format!("dependentSchemas/{trigger}"),
+                schema,
+                val,
+                path,
+                iss,
+                evaluation,
+            );
+            if !complete {
+                self.out.truncate(out_len);
+                self.helpers.truncate(helpers_len);
+                self.indent = parent_indent;
+                self.counter = parent_counter;
+                *self.scope = parent_scope;
+                *self.imports = parent_imports;
+                self.scope
+                    .record_incomplete_applicator("dependentSchemas", &schema.meta().source);
+                return;
+            }
+            self.close("}");
+        }
+        self.close("}");
+    }
+
+    fn gen_dependent_schemas_bounded(
+        &mut self,
+        dependent_schemas: &[(String, SchemaNode)],
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) {
+        for (_, schema) in dependent_schemas {
+            if !self.probe_schema(schema) {
+                self.scope
+                    .record_incomplete_applicator("dependentSchemas", &schema.meta().source);
+                return;
+            }
+        }
+
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        let mut cost = 0usize;
+        for (index, (_, schema)) in dependent_schemas.iter().enumerate() {
+            let child = validation_flow_cost(schema, self.position);
+            let next = 4 + usize::from(child <= VALIDATOR_CFA_BUDGET) * child;
+            if cost > 0 && cost.saturating_add(next) > VALIDATOR_CFA_BUDGET {
+                chunks.push((start, index));
+                start = index;
+                cost = 0;
+            }
+            cost = cost.saturating_add(next).min(VALIDATOR_CFA_BUDGET + 1);
+        }
+        chunks.push((start, dependent_schemas.len()));
+
+        self.scope.needs_is_record = true;
+        let mut calls = Vec::new();
+        for (part, (start, end)) in chunks.into_iter().enumerate() {
+            let name = self.helper_name("DependentSchemas", Some(part));
+            let parent_out = std::mem::take(&mut self.out);
+            let parent_indent = self.indent;
+            let parent_counter = self.counter;
+            self.indent = 1;
+            self.counter = 0;
+            for (trigger, schema) in &dependent_schemas[start..end] {
+                self.open(&format!(
+                    "if (Object.hasOwn(value, {})) {{",
+                    render_ts_string(trigger)
+                ));
+                self.gen_child_schema(
+                    format!("dependentSchemas/{trigger}"),
+                    schema,
+                    "value",
+                    "path",
+                    "issues",
+                    &EvaluationCallbacks::root(),
+                );
+                self.close("}");
+            }
+            let helper_body = std::mem::replace(&mut self.out, parent_out);
+            self.indent = parent_indent;
+            self.counter = parent_counter;
+            self.helpers.push(format!(
+                "function {name}(value: {{ [key: string]: unknown }}, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): void {{\n{helper_body}}}\n\n"
+            ));
+            calls.push(name);
+        }
+
+        self.open(&format!("if (isRecord({val})) {{"));
+        for name in calls {
+            self.line(&format!(
+                "{name}({val}, {path}, {iss}, {}, {});",
+                EvaluationCallbacks::argument(&evaluation.property),
+                EvaluationCallbacks::argument(&evaluation.item)
+            ));
+        }
+        self.close("}");
+    }
+
+    fn gen_conditional(
+        &mut self,
+        conditional: &ConditionalApplicator,
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) {
+        let out_len = self.out.len();
+        let helpers_len = self.helpers.len();
+        let parent_indent = self.indent;
+        let parent_counter = self.counter;
+        let parent_scope = self.scope.clone();
+        let parent_imports = self.imports.clone();
+
+        let scratch = format!("issues{}", self.fresh());
+        self.line(&format!("const {scratch}: Issue[] = [];"));
+        let condition_evaluation = self.branch_evaluation(evaluation, &scratch);
+        let complete = self.gen_child_schema(
+            "if".to_owned(),
+            &conditional.condition,
+            val,
+            path,
+            &scratch,
+            &condition_evaluation.callbacks,
+        );
+        if !complete {
+            self.out.truncate(out_len);
+            self.helpers.truncate(helpers_len);
+            self.indent = parent_indent;
+            self.counter = parent_counter;
+            *self.scope = parent_scope;
+            *self.imports = parent_imports;
+            self.scope
+                .record_incomplete_applicator("if", &conditional.condition.meta().source);
+            return;
+        }
+
+        self.open(&format!("if ({scratch}.length === 0) {{"));
+        self.merge_branch_evaluation(&condition_evaluation, evaluation);
+        if let Some(schema) = &conditional.then_schema {
+            let complete =
+                self.gen_child_schema("then".to_owned(), schema, val, path, iss, evaluation);
+            if !complete {
+                self.out.truncate(out_len);
+                self.helpers.truncate(helpers_len);
+                self.indent = parent_indent;
+                self.counter = parent_counter;
+                *self.scope = parent_scope;
+                *self.imports = parent_imports;
+                self.scope
+                    .record_incomplete_applicator("then", &schema.meta().source);
+                return;
+            }
+        }
+        if let Some(schema) = &conditional.else_schema {
+            self.indent -= 1;
+            self.open("} else {");
+            let complete =
+                self.gen_child_schema("else".to_owned(), schema, val, path, iss, evaluation);
+            if !complete {
+                self.out.truncate(out_len);
+                self.helpers.truncate(helpers_len);
+                self.indent = parent_indent;
+                self.counter = parent_counter;
+                *self.scope = parent_scope;
+                *self.imports = parent_imports;
+                self.scope
+                    .record_incomplete_applicator("else", &schema.meta().source);
+                return;
+            }
+        }
+        self.close("}");
+    }
+
+    fn gen_unevaluated_properties(
+        &mut self,
+        schema: &SchemaNode,
+        evaluated: &str,
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) {
+        let out_len = self.out.len();
+        let helpers_len = self.helpers.len();
+        let parent_indent = self.indent;
+        let parent_counter = self.counter;
+        let parent_scope = self.scope.clone();
+        let parent_imports = self.imports.clone();
+
+        self.scope.needs_is_record = true;
+        self.scope.runtime_values.insert("appendKey");
+        self.open(&format!("if (isRecord({val})) {{"));
+        self.open(&format!("for (const key of Object.keys({val})) {{"));
+        self.open(&format!("if (!{evaluated}.includes(key)) {{"));
+        let child_path = format!("appendKey({path}, key)");
+        let complete = self.gen_child_schema(
+            "unevaluatedProperties".to_owned(),
+            schema,
+            &format!("{val}[key]"),
+            &child_path,
+            iss,
+            &EvaluationCallbacks::default(),
+        );
+        if !complete {
+            self.out.truncate(out_len);
+            self.helpers.truncate(helpers_len);
+            self.indent = parent_indent;
+            self.counter = parent_counter;
+            *self.scope = parent_scope;
+            *self.imports = parent_imports;
+            self.scope
+                .record_incomplete_applicator("unevaluatedProperties", &schema.meta().source);
+            return;
+        }
+        if let Some(callback) = &evaluation.property {
+            self.line(&format!("{callback}?.(key);"));
+        }
+        self.close("}");
+        self.close("}");
+        self.close("}");
+    }
+
+    fn gen_unevaluated_items(
+        &mut self,
+        schema: &SchemaNode,
+        evaluated: &str,
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) {
+        let out_len = self.out.len();
+        let helpers_len = self.helpers.len();
+        let parent_indent = self.indent;
+        let parent_counter = self.counter;
+        let parent_scope = self.scope.clone();
+        let parent_imports = self.imports.clone();
+
+        self.scope.needs_is_array = true;
+        self.open(&format!("if (isArray({val})) {{"));
+        self.open(&format!(
+            "for (let index = 0; index < {val}.length; index += 1) {{"
+        ));
+        self.open(&format!("if (!{evaluated}.includes(index)) {{"));
+        let complete = self.gen_child_schema(
+            "unevaluatedItems".to_owned(),
+            schema,
+            &format!("{val}[index]"),
+            &format!("[...{path}, index]"),
+            iss,
+            &EvaluationCallbacks::default(),
+        );
+        if !complete {
+            self.out.truncate(out_len);
+            self.helpers.truncate(helpers_len);
+            self.indent = parent_indent;
+            self.counter = parent_counter;
+            *self.scope = parent_scope;
+            *self.imports = parent_imports;
+            self.scope
+                .record_incomplete_applicator("unevaluatedItems", &schema.meta().source);
+            return;
+        }
+        if let Some(callback) = &evaluation.item {
+            self.line(&format!("{callback}?.(index);"));
+        }
+        self.close("}");
+        self.close("}");
+        self.close("}");
     }
 
     fn gen_response_headers(&mut self, response: &ResponseEntry) {
@@ -581,7 +1937,14 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                     let decoded = format!("d{index}");
                     self.open("try {");
                     self.line(&format!("const {decoded}: unknown = JSON.parse({val});"));
-                    self.gen_schema(&header.schema, &decoded, &child_path, "issues");
+                    self.gen_child_schema(
+                        format!("headers/{name}"),
+                        &header.schema,
+                        &decoded,
+                        &child_path,
+                        "issues",
+                        &EvaluationCallbacks::default(),
+                    );
                     self.indent -= 1;
                     self.open("} catch {");
                     self.line(&format!(
@@ -592,7 +1955,14 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 } else {
                     // Schema-style header values arrive as wire strings, so non-string schema domains
                     // over-report by design.
-                    self.gen_schema(&header.schema, &val, &child_path, "issues");
+                    self.gen_child_schema(
+                        format!("headers/{name}"),
+                        &header.schema,
+                        &val,
+                        &child_path,
+                        "issues",
+                        &EvaluationCallbacks::default(),
+                    );
                 }
                 self.close("}");
             }
@@ -634,6 +2004,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             self.scope.needs_is_record = true;
             self.open(&format!("if (isRecord({val})) {{"));
             let constraints = meta.object_constraints();
+            self.gen_extra_required(&constraints.required, val, path, iss);
             self.gen_property_count_bounds(
                 constraints.min_properties,
                 constraints.max_properties,
@@ -675,7 +2046,11 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             PrimitiveType::Number | PrimitiveType::Integer => {
                 self.gen_number_constraints(ty, format, meta, val, path, iss);
             }
-            PrimitiveType::Boolean | PrimitiveType::Null => {}
+            PrimitiveType::Boolean | PrimitiveType::Null => {
+                if format.is_some() {
+                    self.mark_incomplete();
+                }
+            }
         }
         self.close_type_gate(widen_null, val, path, iss, type_name);
     }
@@ -719,7 +2094,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             );
         }
         if let Some(pattern) = &constraints.pattern {
-            let slot = self.scope.pattern_slot(pattern);
+            let slot = self.scope.pattern_slot(pattern, false);
             self.push_issue(
                 &format!("!pattern{slot}Regex().test({val})"),
                 path,
@@ -727,11 +2102,13 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 "does not match pattern",
             );
         }
-        if let Some(format) = format
-            && let Some((predicate, message)) = string_format_predicate(format)
-        {
-            self.scope.runtime_values.insert(predicate);
-            self.push_issue(&format!("!{predicate}({val})"), path, iss, message);
+        if let Some(format) = format {
+            if let Some((predicate, message)) = string_format_predicate(format) {
+                self.scope.runtime_values.insert(predicate);
+                self.push_issue(&format!("!{predicate}({val})"), path, iss, message);
+            } else {
+                self.mark_incomplete();
+            }
         }
     }
 
@@ -750,6 +2127,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         if matches!(ty, PrimitiveType::Integer) && format == Some("int32") {
             self.scope.runtime_values.insert("isInt32");
             self.push_issue(&format!("!isInt32({val})"), path, iss, "out of int32 range");
+        } else if format.is_some() {
+            self.mark_incomplete();
         }
     }
 
@@ -887,6 +2266,26 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             self.scope.runtime_values.insert("deepEqual");
             let condition = if values.is_empty() {
                 "true".to_owned()
+            } else if values.len() > VALIDATOR_CFA_BUDGET {
+                let mut calls = Vec::new();
+                for (part, chunk) in values.chunks(VALIDATOR_CFA_BUDGET).enumerate() {
+                    let name = self.helper_name("Enum", Some(part));
+                    let members = chunk
+                        .iter()
+                        .map(|value| {
+                            format!(
+                                "deepEqual(value, {})",
+                                render_json_compact(value, ObjectKeyMode::ProtoSafe)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" || ");
+                    self.helpers.push(format!(
+                        "function {name}(value: unknown): boolean {{\n  return {members};\n}}\n\n"
+                    ));
+                    calls.push(format!("{name}({val})"));
+                }
+                format!("!({})", calls.join(" || "))
             } else {
                 let members = values
                     .iter()
@@ -916,10 +2315,19 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         }
     }
 
-    fn gen_object(&mut self, parts: ObjectParts<'_>, val: &str, path: &str, iss: &str) {
+    fn gen_object(
+        &mut self,
+        parts: ObjectParts<'_>,
+        force_split: bool,
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) {
         let ObjectParts {
             properties,
             additional_properties,
+            additional_properties_present,
             dependent_required,
             extra_required,
             meta,
@@ -927,6 +2335,264 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         self.scope.needs_is_record = true;
         self.open(&format!("if (isRecord({val})) {{"));
 
+        self.gen_object_properties_bounded(properties, force_split, val, path, iss);
+        self.gen_extra_required_bounded(extra_required, force_split, val, path, iss);
+        self.gen_dependent_required_bounded(dependent_required, force_split, val, path, iss);
+
+        // `Object.keys(value)` backs the additional-properties iteration and each of
+        // minProperties/maxProperties. When at least two of those consume it, evaluate it once into
+        // a local and reuse; a lone consumer keeps the inline call to avoid a needless binding.
+        let keys_iteration = match additional_properties {
+            AdditionalProperties::Forbidden => true,
+            AdditionalProperties::Schema(sub) => !is_noop_schema(sub),
+            AdditionalProperties::Allowed(_) => false,
+        };
+        let min = meta.object_constraints().min_properties;
+        let max = meta.object_constraints().max_properties;
+        let keys_uses = keys_iteration as usize + min.is_some() as usize + max.is_some() as usize;
+        let keys_expr = if keys_uses >= 2 {
+            let index = self.fresh();
+            let name = format!("keys{index}");
+            self.line(&format!("const {name} = Object.keys({val});"));
+            name
+        } else {
+            format!("Object.keys({val})")
+        };
+
+        self.gen_additional_properties_bounded(
+            AdditionalPropertiesParts {
+                additional: additional_properties,
+                properties,
+                pattern_properties: &meta.validation_applicators().pattern_properties,
+                force_split,
+                keys_expr: &keys_expr,
+            },
+            val,
+            path,
+            iss,
+        );
+        if additional_properties_present && let Some(callback) = &evaluation.property {
+            let condition = self.unknown_key_condition_inline(
+                properties,
+                &meta.validation_applicators().pattern_properties,
+            );
+            self.open(&format!("if ({callback} !== undefined) {{"));
+            self.open(&format!("for (const key of Object.keys({val})) {{"));
+            self.open(&format!("if ({condition}) {{"));
+            self.line(&format!("{callback}(key);"));
+            self.close("}");
+            self.close("}");
+            self.close("}");
+        }
+
+        self.gen_property_count_bounds(min, max, &keys_expr, path, iss);
+        if let Some(callback) = &evaluation.property
+            && !properties.is_empty()
+        {
+            let declared = properties
+                .iter()
+                .filter(|(_, _, meta)| property_in_position(meta, self.position))
+                .map(|(name, _, _)| render_ts_string(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.open(&format!("if ({callback} !== undefined) {{"));
+            self.line(&format!(
+                "const declaredProperties: readonly string[] = [{declared}];"
+            ));
+            self.open("for (const key of declaredProperties) {");
+            self.open(&format!("if (Object.hasOwn({val}, key)) {{"));
+            self.line(&format!("{callback}(key);"));
+            self.close("}");
+            self.close("}");
+            self.close("}");
+        }
+
+        self.close_type_gate(meta.nullable, val, path, iss, "object");
+    }
+
+    fn gen_object_properties_bounded(
+        &mut self,
+        properties: &[(String, SchemaNode, PropMeta)],
+        force_split: bool,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        let property_cost = |property: &SchemaNode, meta: &PropMeta| {
+            if is_noop_schema(property) {
+                usize::from(meta.required) * 3
+            } else {
+                let child = validation_flow_cost(property, self.position);
+                // An oversized child is replaced by one plain helper call before this object body
+                // reaches TypeScript, so only its property-presence scaffold contributes here.
+                4 + usize::from(child <= VALIDATOR_CFA_BUDGET) * child
+            }
+        };
+        let total = properties
+            .iter()
+            .filter(|(_, _, meta)| property_in_position(meta, self.position))
+            .fold(0usize, |cost, (_, property, meta)| {
+                cost.saturating_add(property_cost(property, meta))
+                    .min(VALIDATOR_CFA_BUDGET + 1)
+            });
+        if total == 0 {
+            return;
+        }
+        if total <= VALIDATOR_CFA_BUDGET && !force_split {
+            self.gen_object_properties(properties, val, path, iss);
+            return;
+        }
+
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        let mut cost = 0usize;
+        for (index, (_, property, meta)) in properties.iter().enumerate() {
+            if !property_in_position(meta, self.position) {
+                continue;
+            }
+            let next = property_cost(property, meta);
+            if cost > 0 && cost.saturating_add(next) > VALIDATOR_CFA_BUDGET {
+                chunks.push((start, index));
+                start = index;
+                cost = 0;
+            }
+            cost = cost.saturating_add(next).min(VALIDATOR_CFA_BUDGET + 1);
+        }
+        chunks.push((start, properties.len()));
+
+        for (part, (start, end)) in chunks.into_iter().enumerate() {
+            let name = self.helper_name("Object", Some(part));
+            let parent_out = std::mem::take(&mut self.out);
+            let parent_indent = self.indent;
+            let parent_counter = self.counter;
+            self.indent = 1;
+            self.counter = 0;
+            self.gen_object_properties(&properties[start..end], "value", "path", "issues");
+            let helper_body = std::mem::replace(&mut self.out, parent_out);
+            self.indent = parent_indent;
+            self.counter = parent_counter;
+            self.helpers.push(format!(
+                "function {name}(value: {{ [key: string]: unknown }}, path: readonly (string | number)[], issues: Issue[]): void {{\n{helper_body}}}\n\n"
+            ));
+            self.line(&format!("{name}({val}, {path}, {iss});"));
+        }
+    }
+
+    fn gen_extra_required_bounded(
+        &mut self,
+        extra_required: &[String],
+        force_split: bool,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        if extra_required.is_empty() {
+            return;
+        }
+        if !force_split {
+            self.gen_extra_required(extra_required, val, path, iss);
+            return;
+        }
+
+        let name = self.helper_name("Required", None);
+        let required = extra_required
+            .iter()
+            .map(|property| render_ts_string(property))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.scope.runtime_values.insert("issue");
+        self.helpers.push(format!(
+            "function {name}(value: {{ [key: string]: unknown }}, path: readonly (string | number)[], issues: Issue[]): void {{\n  const required: readonly string[] = [{required}];\n  for (const key of required) {{\n    if (!Object.hasOwn(value, key)) {{\n      issues.push(issue(path, `missing required property ${{key}}`));\n    }}\n  }}\n}}\n\n"
+        ));
+        self.line(&format!("{name}({val}, {path}, {iss});"));
+    }
+
+    fn gen_extra_required(&mut self, extra_required: &[String], val: &str, path: &str, iss: &str) {
+        for name in extra_required {
+            let key = render_ts_string(name);
+            self.scope.runtime_values.insert("issue");
+            self.open(&format!("if (!Object.hasOwn({val}, {key})) {{"));
+            self.line(&format!(
+                "{iss}.push(issue({path}, {}));",
+                render_ts_string(&format!("missing required property {name}"))
+            ));
+            self.close("}");
+        }
+    }
+
+    fn gen_dependent_required_bounded(
+        &mut self,
+        dependent_required: &[(String, Vec<String>)],
+        force_split: bool,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        if dependent_required.is_empty() {
+            return;
+        }
+        if !force_split {
+            self.gen_dependent_required(dependent_required, val, path, iss);
+            return;
+        }
+
+        let name = self.helper_name("Dependent", None);
+        let requirements = dependent_required
+            .iter()
+            .map(|(trigger, dependents)| {
+                let dependents = dependents
+                    .iter()
+                    .map(|dependent| render_ts_string(dependent))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("[{}, [{dependents}]]", render_ts_string(trigger))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.scope.runtime_values.insert("issue");
+        self.helpers.push(format!(
+            "function {name}(value: {{ [key: string]: unknown }}, path: readonly (string | number)[], issues: Issue[]): void {{\n  const requirements: readonly (readonly [string, readonly string[]])[] = [{requirements}];\n  for (const [trigger, dependents] of requirements) {{\n    if (Object.hasOwn(value, trigger)) {{\n      for (const dependent of dependents) {{\n        if (!Object.hasOwn(value, dependent)) {{\n          issues.push(issue(path, `missing required property ${{dependent}}`));\n        }}\n      }}\n    }}\n  }}\n}}\n\n"
+        ));
+        self.line(&format!("{name}({val}, {path}, {iss});"));
+    }
+
+    fn gen_dependent_required(
+        &mut self,
+        dependent_required: &[(String, Vec<String>)],
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        for (trigger, dependents) in dependent_required {
+            // Own-property presence (see the property-presence site): `in` would let an inherited
+            // trigger/dependent name forge or defeat a dependentRequired constraint.
+            self.open(&format!(
+                "if (Object.hasOwn({val}, {})) {{",
+                render_ts_string(trigger)
+            ));
+            for dependent in dependents {
+                self.scope.runtime_values.insert("issue");
+                self.open(&format!(
+                    "if (!Object.hasOwn({val}, {})) {{",
+                    render_ts_string(dependent)
+                ));
+                self.line(&format!(
+                    "{iss}.push(issue({path}, {}));",
+                    render_ts_string(&format!("missing required property {dependent}"))
+                ));
+                self.close("}");
+            }
+            self.close("}");
+        }
+    }
+
+    fn gen_object_properties(
+        &mut self,
+        properties: &[(String, SchemaNode, PropMeta)],
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
         for (name, property, property_meta) in properties {
             if !property_in_position(property_meta, self.position) {
                 continue;
@@ -958,7 +2624,14 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             self.line(&format!("const {child}: unknown = {val}[{key}];"));
             self.scope.runtime_values.insert("appendKey");
             self.line(&format!("const {child_path} = appendKey({path}, {key});"));
-            self.gen_schema(property, &child, &child_path, iss);
+            self.gen_child_schema(
+                format!("properties/{name}"),
+                property,
+                &child,
+                &child_path,
+                iss,
+                &EvaluationCallbacks::default(),
+            );
             if property_meta.required {
                 self.indent -= 1;
                 self.open("} else {");
@@ -972,72 +2645,6 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 self.close("}");
             }
         }
-
-        for name in extra_required {
-            let key = render_ts_string(name);
-            self.scope.runtime_values.insert("issue");
-            self.open(&format!("if (!Object.hasOwn({val}, {key})) {{"));
-            self.line(&format!(
-                "{iss}.push(issue({path}, {}));",
-                render_ts_string(&format!("missing required property {name}"))
-            ));
-            self.close("}");
-        }
-
-        for (trigger, dependents) in dependent_required {
-            // Own-property presence (see the property-presence site): `in` would let an inherited
-            // trigger/dependent name forge or defeat a dependentRequired constraint.
-            self.open(&format!(
-                "if (Object.hasOwn({val}, {})) {{",
-                render_ts_string(trigger)
-            ));
-            for dependent in dependents {
-                self.scope.runtime_values.insert("issue");
-                self.open(&format!(
-                    "if (!Object.hasOwn({val}, {})) {{",
-                    render_ts_string(dependent)
-                ));
-                self.line(&format!(
-                    "{iss}.push(issue({path}, {}));",
-                    render_ts_string(&format!("missing required property {dependent}"))
-                ));
-                self.close("}");
-            }
-            self.close("}");
-        }
-
-        // `Object.keys(value)` backs the additional-properties iteration and each of
-        // minProperties/maxProperties. When at least two of those consume it, evaluate it once into
-        // a local and reuse; a lone consumer keeps the inline call to avoid a needless binding.
-        let keys_iteration = match additional_properties {
-            AdditionalProperties::Forbidden => true,
-            AdditionalProperties::Schema(sub) => !is_noop_schema(sub),
-            AdditionalProperties::Allowed(_) => false,
-        };
-        let min = meta.object_constraints().min_properties;
-        let max = meta.object_constraints().max_properties;
-        let keys_uses = keys_iteration as usize + min.is_some() as usize + max.is_some() as usize;
-        let keys_expr = if keys_uses >= 2 {
-            let index = self.fresh();
-            let name = format!("keys{index}");
-            self.line(&format!("const {name} = Object.keys({val});"));
-            name
-        } else {
-            format!("Object.keys({val})")
-        };
-
-        self.gen_additional_properties(
-            additional_properties,
-            properties,
-            val,
-            path,
-            iss,
-            &keys_expr,
-        );
-
-        self.gen_property_count_bounds(min, max, &keys_expr, path, iss);
-
-        self.close_type_gate(meta.nullable, val, path, iss, "object");
     }
 
     /// Emits the minProperties/maxProperties count checks against a prepared `Object.keys(...)`
@@ -1069,18 +2676,104 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         }
     }
 
-    fn gen_additional_properties(
+    fn gen_additional_properties_bounded(
         &mut self,
-        additional: &AdditionalProperties,
-        properties: &[(String, SchemaNode, PropMeta)],
+        parts: AdditionalPropertiesParts<'_>,
         val: &str,
         path: &str,
         iss: &str,
-        keys_expr: &str,
     ) {
+        let AdditionalPropertiesParts {
+            additional,
+            properties,
+            pattern_properties,
+            force_split,
+            keys_expr,
+        } = parts;
+        let validates_keys = match additional {
+            AdditionalProperties::Forbidden => true,
+            AdditionalProperties::Schema(sub) => !is_noop_schema(sub),
+            AdditionalProperties::Allowed(_) => false,
+        };
+        if !force_split || !validates_keys {
+            self.gen_additional_properties(
+                AdditionalPropertiesParts {
+                    additional,
+                    properties,
+                    pattern_properties,
+                    force_split,
+                    keys_expr,
+                },
+                val,
+                path,
+                iss,
+            );
+            return;
+        }
+
+        let name = self.helper_name("Additional", None);
+        let known = properties
+            .iter()
+            .map(|(property, _, _)| render_ts_string(property))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let pattern_condition = self.pattern_key_condition(pattern_properties, "key");
+        let parent_out = std::mem::take(&mut self.out);
+        let parent_indent = self.indent;
+        let parent_counter = self.counter;
+        self.indent = 1;
+        self.counter = 0;
+        self.line(&format!("const known: readonly string[] = [{known}];"));
+        self.open("for (const key of keys) {");
+        self.open(&format!("if (!known.includes(key){pattern_condition}) {{"));
+        if let AdditionalProperties::Schema(sub) = additional {
+            let index = self.fresh();
+            let child = format!("value{index}");
+            let child_path = format!("path{index}");
+            self.line(&format!("const {child}: unknown = value[key];"));
+            self.scope.runtime_values.insert("appendKey");
+            self.line(&format!("const {child_path} = appendKey(path, key);"));
+            self.gen_child_schema(
+                "additionalProperties".to_owned(),
+                sub,
+                &child,
+                &child_path,
+                "issues",
+                &EvaluationCallbacks::default(),
+            );
+        } else {
+            self.scope.runtime_values.insert("issue");
+            self.scope.runtime_values.insert("appendKey");
+            self.line("issues.push(issue(appendKey(path, key), \"unexpected property\"));");
+        }
+        self.close("}");
+        self.close("}");
+        let helper_body = std::mem::replace(&mut self.out, parent_out);
+        self.indent = parent_indent;
+        self.counter = parent_counter;
+        self.helpers.push(format!(
+            "function {name}(value: {{ [key: string]: unknown }}, keys: readonly string[], path: readonly (string | number)[], issues: Issue[]): void {{\n{helper_body}}}\n\n"
+        ));
+        self.line(&format!("{name}({val}, {keys_expr}, {path}, {iss});"));
+    }
+
+    fn gen_additional_properties(
+        &mut self,
+        parts: AdditionalPropertiesParts<'_>,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        let AdditionalPropertiesParts {
+            additional,
+            properties,
+            pattern_properties,
+            force_split: _,
+            keys_expr,
+        } = parts;
         match additional {
             AdditionalProperties::Forbidden => {
-                let condition = unknown_key_condition(properties);
+                let condition = self.unknown_key_condition(properties, pattern_properties);
                 self.open(&format!("for (const key of {keys_expr}) {{"));
                 self.scope.runtime_values.insert("issue");
                 self.scope.runtime_values.insert("appendKey");
@@ -1094,7 +2787,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             // A no-op additional schema (`additionalProperties: {}`) validates every extra key
             // against nothing, so the whole iteration is dead — treat it like the permissive default.
             AdditionalProperties::Schema(sub) if !is_noop_schema(sub) => {
-                let condition = unknown_key_condition(properties);
+                let condition = self.unknown_key_condition(properties, pattern_properties);
                 self.open(&format!("for (const key of {keys_expr}) {{"));
                 self.open(&format!("if ({condition}) {{"));
                 let index = self.fresh();
@@ -1103,12 +2796,65 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 self.line(&format!("const {child}: unknown = {val}[key];"));
                 self.scope.runtime_values.insert("appendKey");
                 self.line(&format!("const {child_path} = appendKey({path}, key);"));
-                self.gen_schema(sub, &child, &child_path, iss);
+                self.gen_child_schema(
+                    "additionalProperties".to_owned(),
+                    sub,
+                    &child,
+                    &child_path,
+                    iss,
+                    &EvaluationCallbacks::default(),
+                );
                 self.close("}");
                 self.close("}");
             }
             AdditionalProperties::Schema(_) | AdditionalProperties::Allowed(_) => {}
         }
+    }
+
+    fn unknown_key_condition(
+        &mut self,
+        properties: &[(String, SchemaNode, PropMeta)],
+        pattern_properties: &[PatternProperty],
+    ) -> String {
+        let declared = unknown_key_condition(properties);
+        let patterns = self.pattern_key_condition(pattern_properties, "key");
+        format!("{declared}{patterns}")
+    }
+
+    fn unknown_key_condition_inline(
+        &mut self,
+        properties: &[(String, SchemaNode, PropMeta)],
+        pattern_properties: &[PatternProperty],
+    ) -> String {
+        let mut conditions = vec![unknown_key_condition(properties)];
+        conditions.extend(pattern_properties.iter().map(|pattern_property| {
+            let slot = self.scope.pattern_slot(&pattern_property.pattern, true);
+            format!("!pattern{slot}Regex().test(key)")
+        }));
+        conditions.join(" && ")
+    }
+
+    fn pattern_key_condition(
+        &mut self,
+        pattern_properties: &[PatternProperty],
+        key: &str,
+    ) -> String {
+        if pattern_properties.is_empty() {
+            return String::new();
+        }
+        let matchers = pattern_properties
+            .iter()
+            .map(|pattern_property| {
+                let slot = self.scope.pattern_slot(&pattern_property.pattern, true);
+                format!("pattern{slot}Regex")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let name = self.helper_name("PatternKey", None);
+        self.helpers.push(format!(
+            "const {name}Matchers: readonly (() => RegExp)[] = [{matchers}];\n\nfunction {name}(key: string): boolean {{\n  return {name}Matchers.some((matcher) => matcher().test(key));\n}}\n\n"
+        ));
+        format!(" && !{name}({key})")
     }
 
     fn gen_array(
@@ -1118,6 +2864,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         val: &str,
         path: &str,
         iss: &str,
+        evaluation: &EvaluationCallbacks,
     ) {
         self.scope.needs_is_array = true;
         self.open(&format!("if (isArray({val})) {{"));
@@ -1136,44 +2883,44 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             self.line(&format!(
                 "const {element_path} = appendKey({path}, index{index});"
             ));
-            self.gen_schema(items, &element, &element_path, iss);
+            self.gen_child_schema(
+                "items".to_owned(),
+                items,
+                &element,
+                &element_path,
+                iss,
+                &EvaluationCallbacks::default(),
+            );
             self.close("}");
         }
         self.gen_array_constraints(meta, val, path, iss);
+        if meta.items_present
+            && let Some(callback) = &evaluation.item
+        {
+            self.open(&format!("if ({callback} !== undefined) {{"));
+            self.open(&format!(
+                "for (let index = 0; index < {val}.length; index += 1) {{"
+            ));
+            self.line(&format!("{callback}(index);"));
+            self.close("}");
+            self.close("}");
+        }
         self.close_type_gate(meta.nullable, val, path, iss, "array");
     }
 
     fn gen_tuple(
         &mut self,
-        prefix_items: &[SchemaNode],
-        rest: &TupleRest,
+        parts: TupleParts<'_>,
         meta: &SchemaMeta,
         val: &str,
         path: &str,
         iss: &str,
+        evaluation: &EvaluationCallbacks,
     ) {
+        let TupleParts { prefix_items, rest } = parts;
         self.scope.needs_is_array = true;
         self.open(&format!("if (isArray({val})) {{"));
-        for (position_index, prefix) in prefix_items.iter().enumerate() {
-            // A no-op prefix schema validates its position against nothing, so both the
-            // length-guard block and its value/path scaffold are dead — skip the whole position.
-            if is_noop_schema(prefix) {
-                continue;
-            }
-            self.open(&format!("if ({val}.length > {position_index}) {{"));
-            let index = self.fresh();
-            let element = format!("value{index}");
-            let element_path = format!("path{index}");
-            self.line(&format!(
-                "const {element}: unknown = {val}[{position_index}];"
-            ));
-            self.scope.runtime_values.insert("appendKey");
-            self.line(&format!(
-                "const {element_path} = appendKey({path}, {position_index});"
-            ));
-            self.gen_schema(prefix, &element, &element_path, iss);
-            self.close("}");
-        }
+        self.gen_tuple_prefixes_bounded(prefix_items, val, path, iss);
         let prefix_len = prefix_items.len();
         match rest {
             // A no-op rest schema validates trailing elements against nothing, so the rest loop is
@@ -1190,7 +2937,14 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 self.line(&format!(
                     "const {element_path} = appendKey({path}, index{index});"
                 ));
-                self.gen_schema(sub, &element, &element_path, iss);
+                self.gen_child_schema(
+                    "items".to_owned(),
+                    sub,
+                    &element,
+                    &element_path,
+                    iss,
+                    &EvaluationCallbacks::default(),
+                );
                 self.close("}");
             }
             TupleRest::Schema(_) => {}
@@ -1210,7 +2964,119 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         // meta.array_constraints for tuple nodes); emit them after the element checks, matching
         // gen_array's relative order so issue order stays consistent between the two array shapes.
         self.gen_array_constraints(meta, val, path, iss);
+        if let Some(callback) = &evaluation.item {
+            self.open(&format!("if ({callback} !== undefined) {{"));
+            self.open(&format!(
+                "for (let index = 0; index < Math.min({val}.length, {}); index += 1) {{",
+                prefix_items.len()
+            ));
+            self.line(&format!("{callback}(index);"));
+            self.close("}");
+            if meta.items_present {
+                self.open(&format!(
+                    "for (let index = {}; index < {val}.length; index += 1) {{",
+                    prefix_items.len()
+                ));
+                self.line(&format!("{callback}(index);"));
+                self.close("}");
+            }
+            self.close("}");
+        }
         self.close_type_gate(meta.nullable, val, path, iss, "array");
+    }
+
+    fn gen_tuple_prefixes_bounded(
+        &mut self,
+        prefix_items: &[SchemaNode],
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        let prefix_cost = |prefix: &SchemaNode| {
+            if is_noop_schema(prefix) {
+                0
+            } else {
+                let child = validation_flow_cost(prefix, self.position);
+                4 + usize::from(child <= VALIDATOR_CFA_BUDGET) * child
+            }
+        };
+        let total = prefix_items.iter().fold(0usize, |cost, prefix| {
+            cost.saturating_add(prefix_cost(prefix))
+                .min(VALIDATOR_CFA_BUDGET + 1)
+        });
+        if total <= VALIDATOR_CFA_BUDGET {
+            self.gen_tuple_prefixes(prefix_items, 0, val, path, iss);
+            return;
+        }
+
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        let mut cost = 0usize;
+        for (index, prefix) in prefix_items.iter().enumerate() {
+            let next = prefix_cost(prefix);
+            if cost > 0 && cost.saturating_add(next) > VALIDATOR_CFA_BUDGET {
+                chunks.push((start, index));
+                start = index;
+                cost = 0;
+            }
+            cost = cost.saturating_add(next).min(VALIDATOR_CFA_BUDGET + 1);
+        }
+        chunks.push((start, prefix_items.len()));
+
+        for (part, (start, end)) in chunks.into_iter().enumerate() {
+            let name = self.helper_name("Tuple", Some(part));
+            let parent_out = std::mem::take(&mut self.out);
+            let parent_indent = self.indent;
+            let parent_counter = self.counter;
+            self.indent = 1;
+            self.counter = 0;
+            self.gen_tuple_prefixes(&prefix_items[start..end], start, "value", "path", "issues");
+            let helper_body = std::mem::replace(&mut self.out, parent_out);
+            self.indent = parent_indent;
+            self.counter = parent_counter;
+            self.helpers.push(format!(
+                "function {name}(value: readonly unknown[], path: readonly (string | number)[], issues: Issue[]): void {{\n{helper_body}}}\n\n"
+            ));
+            self.line(&format!("{name}({val}, {path}, {iss});"));
+        }
+    }
+
+    fn gen_tuple_prefixes(
+        &mut self,
+        prefix_items: &[SchemaNode],
+        offset: usize,
+        val: &str,
+        path: &str,
+        iss: &str,
+    ) {
+        for (index, prefix) in prefix_items.iter().enumerate() {
+            let position_index = offset + index;
+            // A no-op prefix schema validates its position against nothing, so both the
+            // length-guard block and its value/path scaffold are dead — skip the whole position.
+            if is_noop_schema(prefix) {
+                continue;
+            }
+            self.open(&format!("if ({val}.length > {position_index}) {{"));
+            let index = self.fresh();
+            let element = format!("value{index}");
+            let element_path = format!("path{index}");
+            self.line(&format!(
+                "const {element}: unknown = {val}[{position_index}];"
+            ));
+            self.scope.runtime_values.insert("appendKey");
+            self.line(&format!(
+                "const {element_path} = appendKey({path}, {position_index});"
+            ));
+            self.gen_child_schema(
+                format!("prefixItems/{position_index}"),
+                prefix,
+                &element,
+                &element_path,
+                iss,
+                &EvaluationCallbacks::default(),
+            );
+            self.close("}");
+        }
     }
 
     fn gen_array_constraints(&mut self, meta: &SchemaMeta, val: &str, path: &str, iss: &str) {
@@ -1256,6 +3122,91 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         }
     }
 
+    fn gen_all_of(
+        &mut self,
+        branches: &[SchemaNode],
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) {
+        let branch_cost = |branch: &SchemaNode| {
+            let cost = validation_flow_cost(branch, self.position);
+            usize::from(cost <= VALIDATOR_CFA_BUDGET) * cost
+        };
+        let total = branches.iter().fold(0usize, |cost, branch| {
+            cost.saturating_add(branch_cost(branch))
+                .min(VALIDATOR_CFA_BUDGET + 1)
+        });
+        if total <= VALIDATOR_CFA_BUDGET {
+            self.gen_all_of_branches(branches, 0, val, path, iss, evaluation);
+            return;
+        }
+
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        let mut cost = 0usize;
+        for (index, branch) in branches.iter().enumerate() {
+            let next = branch_cost(branch);
+            if cost > 0 && cost.saturating_add(next) > VALIDATOR_CFA_BUDGET {
+                chunks.push((start, index));
+                start = index;
+                cost = 0;
+            }
+            cost = cost.saturating_add(next).min(VALIDATOR_CFA_BUDGET + 1);
+        }
+        chunks.push((start, branches.len()));
+
+        for (part, (start, end)) in chunks.into_iter().enumerate() {
+            let name = self.helper_name("AllOf", Some(part));
+            let parent_out = std::mem::take(&mut self.out);
+            let parent_indent = self.indent;
+            let parent_counter = self.counter;
+            self.indent = 1;
+            self.counter = 0;
+            self.gen_all_of_branches(
+                &branches[start..end],
+                start,
+                "value",
+                "path",
+                "issues",
+                &EvaluationCallbacks::root(),
+            );
+            let helper_body = std::mem::replace(&mut self.out, parent_out);
+            self.indent = parent_indent;
+            self.counter = parent_counter;
+            self.helpers.push(format!(
+                "function {name}(value: unknown, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): void {{\n{helper_body}}}\n\n"
+            ));
+            self.line(&format!(
+                "{name}({val}, {path}, {iss}, {}, {});",
+                EvaluationCallbacks::argument(&evaluation.property),
+                EvaluationCallbacks::argument(&evaluation.item)
+            ));
+        }
+    }
+
+    fn gen_all_of_branches(
+        &mut self,
+        branches: &[SchemaNode],
+        offset: usize,
+        val: &str,
+        path: &str,
+        iss: &str,
+        evaluation: &EvaluationCallbacks,
+    ) {
+        for (index, branch) in branches.iter().enumerate() {
+            self.gen_child_schema(
+                format!("allOf/{}", offset + index),
+                branch,
+                val,
+                path,
+                iss,
+                evaluation,
+            );
+        }
+    }
+
     fn gen_composition(
         &mut self,
         branches: &[SchemaNode],
@@ -1263,30 +3214,88 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         path: &str,
         iss: &str,
         kind: Composition,
+        evaluation: &EvaluationCallbacks,
     ) {
         self.scope.runtime_values.insert("issue");
         let index = self.fresh();
         let counter = format!("matches{index}");
         self.line(&format!("let {counter} = 0;"));
-        // Once the verdict is decided, stop probing: anyOf passes at the first match, and oneOf
-        // fails as soon as a second match appears. The guard limit is that decisive count. This is
-        // semantics-neutral — branch issues go to discarded scratch arrays, and the surfaced verdict
-        // and single composition issue depend only on whether `matches` is 0 / exactly 1 / >= 2,
-        // which the early exit preserves.
         let limit = match kind {
+            // Annotation collection must examine every successful anyOf branch. Without an
+            // annotation consumer the first success still decides the assertion verdict.
+            Composition::AnyOf if !evaluation.is_empty() => branches.len().saturating_add(1),
             Composition::AnyOf => 1,
             Composition::OneOf => 2,
         };
-        for branch in branches {
-            self.open(&format!("if ({counter} < {limit}) {{"));
-            let scratch_index = self.fresh();
-            let scratch = format!("issues{scratch_index}");
-            self.line(&format!("const {scratch}: Issue[] = [];"));
-            self.gen_schema(branch, val, path, &scratch);
-            self.open(&format!("if ({scratch}.length === 0) {{"));
-            self.line(&format!("{counter} += 1;"));
-            self.close("}");
-            self.close("}");
+        let branch_cost = |branch: &SchemaNode| {
+            let child = validation_flow_cost(branch, self.position);
+            let annotations = usize::from(!evaluation.is_empty()) * 10;
+            6 + annotations + usize::from(child <= VALIDATOR_CFA_BUDGET) * child
+        };
+        let total = branches.iter().fold(4usize, |cost, branch| {
+            cost.saturating_add(branch_cost(branch))
+                .min(VALIDATOR_CFA_BUDGET + 1)
+        });
+        if total <= VALIDATOR_CFA_BUDGET {
+            self.gen_composition_branches(CompositionParts {
+                branches,
+                offset: 0,
+                val,
+                path,
+                counter: &counter,
+                limit: &limit.to_string(),
+                kind,
+                evaluation,
+            });
+        } else {
+            let mut chunks = Vec::new();
+            let mut start = 0;
+            let mut cost = 0usize;
+            for (branch_index, branch) in branches.iter().enumerate() {
+                let next = branch_cost(branch);
+                if cost > 0 && cost.saturating_add(next) > VALIDATOR_CFA_BUDGET {
+                    chunks.push((start, branch_index));
+                    start = branch_index;
+                    cost = 0;
+                }
+                cost = cost.saturating_add(next).min(VALIDATOR_CFA_BUDGET + 1);
+            }
+            chunks.push((start, branches.len()));
+
+            for (part, (start, end)) in chunks.into_iter().enumerate() {
+                let name = self.helper_name(kind.helper_role(), Some(part));
+                let parent_out = std::mem::take(&mut self.out);
+                let parent_indent = self.indent;
+                let parent_counter = self.counter;
+                self.indent = 1;
+                self.counter = 0;
+                let helper_counter = format!("matches{}", self.fresh());
+                self.line(&format!("let {helper_counter} = 0;"));
+                self.gen_composition_branches(CompositionParts {
+                    branches: &branches[start..end],
+                    offset: start,
+                    val: "value",
+                    path: "path",
+                    counter: &helper_counter,
+                    limit: "limit",
+                    kind,
+                    evaluation: &EvaluationCallbacks::root(),
+                });
+                self.line(&format!("return {helper_counter};"));
+                let helper_body = std::mem::replace(&mut self.out, parent_out);
+                self.indent = parent_indent;
+                self.counter = parent_counter;
+                self.helpers.push(format!(
+                    "function {name}(value: unknown, path: readonly (string | number)[], limit: number, evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): number {{\n{helper_body}}}\n\n"
+                ));
+                self.open(&format!("if ({counter} < {limit}) {{"));
+                self.line(&format!(
+                    "{counter} += {name}({val}, {path}, {limit} - {counter}, {}, {});",
+                    EvaluationCallbacks::argument(&evaluation.property),
+                    EvaluationCallbacks::argument(&evaluation.item)
+                ));
+                self.close("}");
+            }
         }
         let (condition, message) = match kind {
             Composition::AnyOf => (format!("{counter} === 0"), "no anyOf branch matched"),
@@ -1302,6 +3311,39 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         ));
         self.close("}");
     }
+
+    fn gen_composition_branches(&mut self, parts: CompositionParts<'_>) {
+        let CompositionParts {
+            branches,
+            offset,
+            val,
+            path,
+            counter,
+            limit,
+            kind,
+            evaluation,
+        } = parts;
+        for (branch_index, branch) in branches.iter().enumerate() {
+            self.open(&format!("if ({counter} < {limit}) {{"));
+            let scratch_index = self.fresh();
+            let scratch = format!("issues{scratch_index}");
+            self.line(&format!("const {scratch}: Issue[] = [];"));
+            let branch_evaluation = self.branch_evaluation(evaluation, &scratch);
+            self.gen_child_schema(
+                format!("{}/{}", kind.keyword(), offset + branch_index),
+                branch,
+                val,
+                path,
+                &scratch,
+                &branch_evaluation.callbacks,
+            );
+            self.open(&format!("if ({scratch}.length === 0) {{"));
+            self.line(&format!("{counter} += 1;"));
+            self.merge_branch_evaluation(&branch_evaluation, evaluation);
+            self.close("}");
+            self.close("}");
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1310,13 +3352,64 @@ enum Composition {
     OneOf,
 }
 
+impl Composition {
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::AnyOf => "anyOf",
+            Self::OneOf => "oneOf",
+        }
+    }
+
+    fn helper_role(self) -> &'static str {
+        match self {
+            Self::AnyOf => "AnyOf",
+            Self::OneOf => "OneOf",
+        }
+    }
+}
+
 /// The borrowed pieces of a `SchemaNode::Object`, grouped so object generation takes one argument.
 struct ObjectParts<'a> {
     properties: &'a [(String, SchemaNode, PropMeta)],
     additional_properties: &'a AdditionalProperties,
+    additional_properties_present: bool,
     dependent_required: &'a [(String, Vec<String>)],
     extra_required: &'a [String],
     meta: &'a SchemaMeta,
+}
+
+struct TupleParts<'a> {
+    prefix_items: &'a [SchemaNode],
+    rest: &'a TupleRest,
+}
+
+struct ApplicatorParts<'a> {
+    meta: &'a SchemaMeta,
+    val: &'a str,
+    path: &'a str,
+    iss: &'a str,
+    evaluation: &'a EvaluationCallbacks,
+    evaluated_properties: Option<&'a str>,
+    evaluated_items: Option<&'a str>,
+}
+
+struct AdditionalPropertiesParts<'a> {
+    additional: &'a AdditionalProperties,
+    properties: &'a [(String, SchemaNode, PropMeta)],
+    pattern_properties: &'a [PatternProperty],
+    force_split: bool,
+    keys_expr: &'a str,
+}
+
+struct CompositionParts<'a> {
+    branches: &'a [SchemaNode],
+    offset: usize,
+    val: &'a str,
+    path: &'a str,
+    counter: &'a str,
+    limit: &'a str,
+    kind: Composition,
+    evaluation: &'a EvaluationCallbacks,
 }
 
 /// A schema whose validate body is empty, so descending into it emits only dead scaffold. A plain
@@ -1327,8 +3420,10 @@ struct ObjectParts<'a> {
 /// the no-op case.
 fn is_noop_schema(schema: &SchemaNode) -> bool {
     match schema {
-        SchemaNode::Any { meta } => !has_typeless_constraints(meta),
-        other => matches!(other, SchemaNode::Unknown { .. }),
+        SchemaNode::Any { meta } => {
+            !has_typeless_constraints(meta) && meta.validation_applicators.is_none()
+        }
+        _ => false,
     }
 }
 
@@ -1412,7 +3507,40 @@ impl BoundDirection {
 /// trio built from an already-generated validate body.
 struct Decl {
     type_declaration: String,
+    helpers: String,
     validator: String,
+}
+
+type SiblingBindings = BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>;
+
+/// A direct component `$ref` whose positioned component name already is this operation export needs
+/// no operation-local declaration: its structural type and validator are exactly the component's.
+/// Returning the component file lets the caller preserve the operation module's public surface with
+/// a direct re-export instead of emitting a self-referential alias and recursive wrapper.
+fn identical_component_delegate(
+    emitter: &Emitter<'_, '_, '_>,
+    export_type: &str,
+    schema: &SchemaNode,
+    position: TypePosition,
+) -> Option<String> {
+    let SchemaNode::Ref { target, meta } = schema else {
+        return None;
+    };
+    let resolved = emitter
+        .model
+        .schema_target(&target.source_id, &target.json_pointer)?;
+    let applicators = meta.validation_applicators();
+    (applicators.not.is_none()
+        && applicators.property_names.is_none()
+        && applicators.pattern_properties.is_empty()
+        && applicators.contains.is_none()
+        && applicators.dependent_schemas.is_empty()
+        && applicators.conditional.is_none()
+        && applicators.unevaluated_properties.is_none()
+        && applicators.unevaluated_items.is_none()
+        && emitter.model.transform_facts().site(schema).is_none()
+        && emitter.render_type(schema, position, TypeAxis::Application, 0) == export_type)
+        .then(|| resolved.file_base.clone())
 }
 
 fn emit_component(
@@ -1437,7 +3565,10 @@ fn emit_component(
     };
 
     let mut scope = FileScope::default();
-    let mut imports = SiblingImports::default();
+    let mut imports = SiblingImports {
+        skip_self: Some(schema_index),
+        ..SiblingImports::default()
+    };
 
     let declarations = if request_variant.is_some() || response_variant.is_some() {
         // One full validator triplet per needed position. Fixed order — Neutral, then Request, then
@@ -1469,7 +3600,7 @@ fn emit_component(
                         TypeAxis::Application,
                         &schema.source,
                     );
-                    imports.collect(&emitter, &schema.schema, *position, Some(schema_index));
+                    imports.collect_types(&emitter, &schema.schema, *position);
                     declaration
                 })
                 .collect()
@@ -1479,11 +3610,20 @@ fn emit_component(
         // dropped emitter); the position drives which properties the body checks.
         let mut declarations = Vec::with_capacity(variants.len());
         for ((export, position), type_declaration) in variants.iter().zip(type_declarations) {
-            let mut body = FnBody::new(&mut scope, model, *position);
-            body.gen_schema(&schema.schema, "value", "path", "issues");
+            let mut body = FnBody::new(
+                &mut scope,
+                &mut imports,
+                model,
+                *position,
+                export,
+                schema.schema.meta().source.display(),
+            );
+            body.gen_root_schema(&schema.schema, "value", "path", "issues");
+            let (helpers, body) = body.finish();
             declarations.push(Decl {
                 type_declaration,
-                validator: render_validator(export, &body.out),
+                helpers,
+                validator: render_validator(export, &body),
             });
         }
         declarations
@@ -1501,23 +3641,29 @@ fn emit_component(
                 TypeAxis::Application,
                 &schema.source,
             );
-            imports.collect(
-                &emitter,
-                &schema.schema,
-                TypePosition::Neutral,
-                Some(schema_index),
-            );
+            imports.collect_types(&emitter, &schema.schema, TypePosition::Neutral);
             declaration
         };
-        let mut body = FnBody::new(&mut scope, model, TypePosition::Neutral);
-        body.gen_schema(&schema.schema, "value", "path", "issues");
+        let mut body = FnBody::new(
+            &mut scope,
+            &mut imports,
+            model,
+            TypePosition::Neutral,
+            name,
+            schema.schema.meta().source.display(),
+        );
+        body.gen_root_schema(&schema.schema, "value", "path", "issues");
+        let (helpers, body) = body.finish();
         vec![Decl {
             type_declaration,
-            validator: render_validator(name, &body.out),
+            helpers,
+            validator: render_validator(name, &body),
         }]
     };
 
-    let content = assemble_file(model, "./", &imports, &scope, &declarations);
+    let reexports = SiblingBindings::new();
+    let content = assemble_file(model, "./", &imports, &reexports, &scope, &declarations);
+    report_incomplete_applicators(model.sink, &scope);
     let relative_path = format!("validators/components/{file_base}.ts");
     model.register_path(&relative_path, &schema.source);
     Some(GeneratedFile {
@@ -1610,27 +3756,37 @@ fn emit_operation_file(
 
     let mut scope = FileScope::default();
     let mut imports = SiblingImports::default();
+    let mut reexports = SiblingBindings::new();
 
     // Phase 1: render each position's type alias and collect sibling imports. One emitter serves
     // both the value and header declarations — its merge/link caches carry across the two loops —
     // and the block scopes its borrow of `model` so phase 2 can reborrow `model` mutably.
-    let (type_declarations, header_type_declarations): (Vec<String>, Vec<String>) = {
+    let (type_declarations, header_type_declarations): (Vec<Option<String>>, Vec<String>) = {
         let emitter = Emitter::new(model);
         let type_declarations = positions
             .iter()
             .map(|(export_type, schema, position)| {
-                imports.collect(&emitter, schema, *position, None);
-                format!(
+                if let Some(file_base) =
+                    identical_component_delegate(&emitter, export_type, schema, *position)
+                {
+                    let (types, values) = reexports.entry(file_base).or_default();
+                    types.insert(export_type.clone());
+                    values.insert(format!("{}Validator", lowercase_first(export_type)));
+                    values.insert(format!("validate{export_type}"));
+                    return None;
+                }
+                imports.collect_types(&emitter, schema, *position);
+                Some(format!(
                     "export type {export_type} = {};\n",
                     emitter.render_type(schema, *position, TypeAxis::Application, 0)
-                )
+                ))
             })
             .collect();
         let header_type_declarations = header_positions
             .iter()
             .map(|(export_type, response)| {
                 for (_, header) in &response.headers {
-                    imports.collect(&emitter, &header.schema, TypePosition::Response, None);
+                    imports.collect_types(&emitter, &header.schema, TypePosition::Response);
                 }
                 let mut declaration = String::new();
                 emitter.write_response_headers_interface(&mut declaration, export_type, response);
@@ -1645,25 +3801,54 @@ fn emit_operation_file(
     for ((export_type, schema, position), type_declaration) in
         positions.iter().zip(type_declarations)
     {
-        let mut body = FnBody::new(&mut scope, model, *position);
-        body.gen_schema(schema, "value", "path", "issues");
+        let Some(type_declaration) = type_declaration else {
+            continue;
+        };
+        let mut body = FnBody::new(
+            &mut scope,
+            &mut imports,
+            model,
+            *position,
+            export_type,
+            schema.meta().source.display(),
+        );
+        body.gen_root_schema(schema, "value", "path", "issues");
+        let (helpers, body) = body.finish();
         declarations.push(Decl {
             type_declaration,
-            validator: render_validator(export_type, &body.out),
+            helpers,
+            validator: render_validator(export_type, &body),
         });
     }
     for ((export_type, response), type_declaration) in
         header_positions.iter().zip(header_type_declarations)
     {
-        let mut body = FnBody::new(&mut scope, model, TypePosition::Response);
+        let mut body = FnBody::new(
+            &mut scope,
+            &mut imports,
+            model,
+            TypePosition::Response,
+            export_type,
+            response.source.display(),
+        );
         body.gen_response_headers(response);
+        let (helpers, body) = body.finish();
         declarations.push(Decl {
             type_declaration,
-            validator: render_validator(export_type, &body.out),
+            helpers,
+            validator: render_validator(export_type, &body),
         });
     }
 
-    let content = assemble_file(model, "../components/", &imports, &scope, &declarations);
+    let content = assemble_file(
+        model,
+        "../components/",
+        &imports,
+        &reexports,
+        &scope,
+        &declarations,
+    );
+    report_incomplete_applicators(model.sink, &scope);
     let relative_path = format!("validators/{directory}/{file_base}.ts");
     model.register_path(&relative_path, &operation.source);
     Some(GeneratedFile {
@@ -1964,7 +4149,7 @@ fn render_validator(export_type: &str, body: &str) -> String {
     let const_name = format!("{}Validator", lowercase_first(export_type));
     let mut output = String::new();
     output.push_str(&format!(
-        "export function validate{export_type}(value: unknown, path: readonly (string | number)[], issues: Issue[]): void {{\n"
+        "export function validate{export_type}(value: unknown, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): void {{\n"
     ));
     output.push_str(body);
     output.push_str("}\n\n");
@@ -1992,34 +4177,39 @@ fn render_validator(export_type: &str, body: &str) -> String {
 // --- sibling import collection -----------------------------------------------------------------
 
 /// Per-file-base type names and validate-function names imported from sibling validator files.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SiblingImports {
     files: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>,
+    skip_self: Option<usize>,
 }
 
 impl SiblingImports {
-    /// Records the type + validate imports for every `$ref` reachable from `schema` in `position`.
-    /// `skip_self` excludes a component's self-reference (its own type and validate live locally).
-    fn collect(
+    /// Records the type imports for every `$ref` the structural type surface reaches in `position`.
+    /// A component's self-reference is local and therefore excluded.
+    fn collect_types(
         &mut self,
         emitter: &Emitter<'_, '_, '_>,
         schema: &SchemaNode,
         position: TypePosition,
-        skip_self: Option<usize>,
     ) {
         emitter.walk_refs(schema, position, &mut |target| {
-            if Some(target.index) == skip_self {
+            if Some(target.index) == self.skip_self {
                 return;
             }
             let entry = self.files.entry(target.file_base.clone()).or_default();
-            // Both the type name and the validate name resolve through the position variant, so the
-            // import matches the name the body calls and the export the component actually emits —
-            // `variant_name(Neutral)` is the bare name, leaving neutral imports unchanged.
             entry.0.insert(target.variant_name(position));
-            entry
-                .1
-                .insert(format!("validate{}", target.variant_name(position)));
         });
+    }
+
+    /// Records the exact sibling identifier at the point the validator body emits its call.
+    fn record_validator(&mut self, target_index: usize, file_base: &str, validator: String) {
+        if Some(target_index) != self.skip_self {
+            self.files
+                .entry(file_base.to_owned())
+                .or_default()
+                .1
+                .insert(validator);
+        }
     }
 }
 
@@ -2029,24 +4219,27 @@ fn assemble_file(
     model: &EmissionModel<'_, '_>,
     sibling_prefix: &str,
     imports: &SiblingImports,
+    reexports: &SiblingBindings,
     scope: &FileScope,
     declarations: &[Decl],
 ) -> String {
     let extension = import_extension(model);
     let mut output = model.header();
 
-    output.push_str(&format!(
-        "import type {{ SyncStandardSchemaV1 }} from {};\n",
-        render_ts_string(&format!("../standard-schema{extension}"))
-    ));
-    let runtime_values = std::iter::once("type Issue".to_owned())
-        .chain(scope.runtime_values.iter().map(|value| (*value).to_owned()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    output.push_str(&format!(
-        "import {{ {runtime_values} }} from {};\n",
-        render_ts_string(&format!("../runtime{extension}"))
-    ));
+    if !declarations.is_empty() {
+        output.push_str(&format!(
+            "import type {{ SyncStandardSchemaV1 }} from {};\n",
+            render_ts_string(&format!("../standard-schema{extension}"))
+        ));
+        let runtime_values = std::iter::once("type Issue".to_owned())
+            .chain(scope.runtime_values.iter().map(|value| (*value).to_owned()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(
+            "import {{ {runtime_values} }} from {};\n",
+            render_ts_string(&format!("../runtime{extension}"))
+        ));
+    }
     for (file_base, (type_names, value_names)) in &imports.files {
         let specifiers = type_names
             .iter()
@@ -2059,11 +4252,29 @@ fn assemble_file(
             render_ts_string(&format!("{sibling_prefix}{file_base}{extension}"))
         ));
     }
+    for (file_base, (type_names, value_names)) in reexports {
+        let specifiers = type_names
+            .iter()
+            .map(|name| format!("type {name}"))
+            .chain(value_names.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(
+            "export {{ {specifiers} }} from {};\n",
+            render_ts_string(&format!("{sibling_prefix}{file_base}{extension}"))
+        ));
+    }
     output.push('\n');
 
     if scope.needs_is_record {
+        // Every index-signature type this emitter writes is spelled structurally rather than as
+        // `Record<string, unknown>`: validator modules declare and import component types, so a
+        // document with a component named `Record` puts a non-generic `Record` in this scope and
+        // the built-in stops resolving (`TS2315: Type 'Record' is not generic`). Reserving the
+        // name instead would rename the user's exported type; the structural form costs nothing
+        // and cannot be shadowed. `no_builtin_generics_in_schema_bearing_modules` pins this.
         output.push_str(
-            "function isRecord(value: unknown): value is Record<string, unknown> {\n  return typeof value === \"object\" && value !== null && !Array.isArray(value);\n}\n\n",
+            "function isRecord(value: unknown): value is { [key: string]: unknown } {\n  return typeof value === \"object\" && value !== null && !Array.isArray(value);\n}\n\n",
         );
     }
     if scope.needs_is_array {
@@ -2071,12 +4282,13 @@ fn assemble_file(
             "function isArray(value: unknown): value is readonly unknown[] {\n  return Array.isArray(value);\n}\n\n",
         );
     }
-    for (slot, pattern) in scope.patterns.iter().enumerate() {
+    for (slot, (pattern, unicode)) in scope.patterns.iter().enumerate() {
         output.push_str(&format!("let pattern{slot}: RegExp | undefined;\n"));
         output.push_str(&format!("function pattern{slot}Regex(): RegExp {{\n"));
+        let flags = if *unicode { ", \"u\"" } else { "" };
         output.push_str(&format!(
-            "  return (pattern{slot} ??= new RegExp({}));\n",
-            render_ts_string(pattern)
+            "  return (pattern{slot} ??= new RegExp({}{flags}));\n",
+            render_ts_string(pattern),
         ));
         output.push_str("}\n\n");
     }
@@ -2084,6 +4296,7 @@ fn assemble_file(
     for (index, declaration) in declarations.iter().enumerate() {
         output.push_str(&declaration.type_declaration);
         output.push('\n');
+        output.push_str(&declaration.helpers);
         output.push_str(&declaration.validator);
         if index + 1 < declarations.len() {
             output.push('\n');
@@ -2096,13 +4309,14 @@ fn assemble_file(
 mod tests {
     use std::fs;
 
-    use serde_json::{Value, json};
+    use serde_json::{Map, Value, json};
     use tempfile::TempDir;
 
     use super::*;
     use crate::config::load_config;
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
     use crate::emit::emit_artifacts;
+    use crate::ir::SchemaRef;
     use crate::loader::load_graph;
     use crate::parse::parse;
     use crate::semantic::analyze;
@@ -2153,6 +4367,43 @@ mod tests {
         })
     }
 
+    #[test]
+    fn validation_flow_cost_includes_every_validation_applicator() {
+        let schema = SchemaNode::Any {
+            meta: SchemaMeta {
+                validation_applicators: Some(Box::new(crate::ir::ValidationApplicators {
+                    not: Some(Box::new(SchemaNode::Any {
+                        meta: SchemaMeta::default(),
+                    })),
+                    property_names: Some(Box::new(SchemaNode::Any {
+                        meta: SchemaMeta::default(),
+                    })),
+                    conditional: Some(Box::new(ConditionalApplicator {
+                        condition: Box::new(SchemaNode::Any {
+                            meta: SchemaMeta::default(),
+                        }),
+                        then_schema: Some(Box::new(SchemaNode::Never {
+                            meta: SchemaMeta::default(),
+                        })),
+                        else_schema: Some(Box::new(SchemaNode::Never {
+                            meta: SchemaMeta::default(),
+                        })),
+                    })),
+                    unevaluated_properties: Some(Box::new(SchemaNode::Any {
+                        meta: SchemaMeta::default(),
+                    })),
+                    unevaluated_items: Some(Box::new(SchemaNode::Never {
+                        meta: SchemaMeta::default(),
+                    })),
+                    ..crate::ir::ValidationApplicators::default()
+                })),
+                ..SchemaMeta::default()
+            },
+        };
+
+        assert_eq!(validation_flow_cost(&schema, TypePosition::Neutral), 50);
+    }
+
     fn doc_30(schemas: Value) -> Value {
         json!({
             "openapi": "3.0.3",
@@ -2169,6 +4420,213 @@ mod tests {
             .expect("component validator file")
             .content
             .clone()
+    }
+
+    #[test]
+    fn oversized_inline_object_is_split_by_its_own_stable_path() {
+        let mut properties = Map::new();
+        for index in 0..260 {
+            properties.insert(
+                format!("field{index:03}"),
+                json!({ "type": "string", "readOnly": index == 0 }),
+            );
+        }
+        let typed_properties = properties.clone();
+        let evaluated_properties = properties.clone();
+        let document = doc_31(json!({
+            "Wide": {
+                "type": "object",
+                "properties": {
+                    "nestedClosed": {
+                        "type": "object",
+                        "properties": Value::Object(properties),
+                        "required": ["missing"],
+                        "dependentRequired": { "field001": ["field002"] },
+                        "additionalProperties": false
+                    },
+                    "nestedTyped": {
+                        "type": "object",
+                        "properties": Value::Object(typed_properties),
+                        "additionalProperties": { "type": "string" }
+                    }
+                }
+            },
+            "EvaluatedWide": {
+                "allOf": [{
+                    "type": "object",
+                    "properties": Value::Object(evaluated_properties)
+                }],
+                "unevaluatedProperties": false
+            }
+        }));
+        let (first_files, first_diagnostics) = compile(document.clone());
+        let (second_files, second_diagnostics) = compile(document);
+        assert_eq!(first_diagnostics, second_diagnostics);
+        assert_eq!(first_files, second_files);
+
+        let content = component(&first_files, "wide");
+        assert!(content.contains("function validateWideObject"));
+        assert!(content.contains("function validateWideAt"));
+        assert!(content.contains("function validateWideRequired"));
+        assert!(content.contains("function validateWideDependent"));
+        assert!(content.contains("function validateWideAdditional"));
+        assert!(content.contains("export function validateWide(value: unknown,"));
+        assert!(content.contains("function checkedWide(value: unknown,"));
+        assert!(content.contains("export const wideValidator: SyncStandardSchemaV1<Wide> = {"));
+        let evaluated = component(&first_files, "evaluatedwide");
+        assert!(
+            evaluated.contains("(value, path, issues, recordProperty0, evaluatedItem);"),
+            "{evaluated}"
+        );
+    }
+
+    #[test]
+    fn oversized_schema_sequences_use_bounded_helpers() {
+        let strings = vec![json!({ "type": "string" }); 340];
+        let tuple = vec![json!({ "type": "string" }); 150];
+        let alternatives = vec![json!({ "type": "string" }); 120];
+        let enum_values = (0..1_001)
+            .map(|index| Value::String(format!("value{index}")))
+            .collect::<Vec<_>>();
+        let (files, diagnostics) = compile(doc_31(json!({
+            "ManyAllOf": { "allOf": strings },
+            "ManyTuple": {
+                "type": "array",
+                "prefixItems": tuple,
+                "items": false
+            },
+            "ManyAnyOf": { "anyOf": alternatives },
+            "ManyOneOf": { "oneOf": vec![json!({ "type": "string" }); 120] },
+            "ManyEnum": { "type": "string", "enum": enum_values },
+            "CostMatrix": {
+                "type": "object",
+                "properties": {
+                    "closedObject": {
+                        "type": "object",
+                        "properties": { "free": {} },
+                        "required": ["free"],
+                        "dependentRequired": { "free": ["dependent"] },
+                        "additionalProperties": false,
+                        "minProperties": 1,
+                        "maxProperties": 2,
+                        "enum": [{}],
+                        "const": {}
+                    },
+                    "schemaObject": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "noopArray": {
+                        "type": "array",
+                        "items": {},
+                        "minItems": 1,
+                        "maxItems": 2,
+                        "uniqueItems": true,
+                        "enum": [[]],
+                        "const": []
+                    },
+                    "schemaTuple": {
+                        "type": "array",
+                        "prefixItems": [{ "type": "string" }],
+                        "items": { "type": "number" },
+                        "minItems": 1,
+                        "maxItems": 2,
+                        "uniqueItems": true,
+                        "enum": [[]],
+                        "const": []
+                    },
+                    "forbiddenTuple": {
+                        "type": "array",
+                        "prefixItems": [{ "type": "string" }],
+                        "items": false
+                    },
+                    "allowedTuple": {
+                        "type": "array",
+                        "prefixItems": [{}, { "type": "string" }],
+                        "items": true
+                    },
+                    "all": { "allOf": [{ "type": "string" }] },
+                    "any": { "anyOf": [{ "type": "string" }] },
+                    "one": { "oneOf": [{ "type": "string" }] },
+                    "finite": { "enum": ["value"] },
+                    "never": false
+                }
+            }
+        })));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(component(&files, "manyallof").contains("ManyAllOfAllOf"));
+        assert!(component(&files, "manytuple").contains("ManyTupleTuple"));
+        assert!(component(&files, "manyanyof").contains("ManyAnyOfAnyOf"));
+        assert!(component(&files, "manyoneof").contains("ManyOneOfOneOf"));
+        assert!(component(&files, "manyenum").contains("ManyEnumEnum"));
+    }
+
+    #[test]
+    fn oversized_pattern_and_dependent_schema_applicators_use_bounded_helpers() {
+        let mut patterns = Map::new();
+        let mut dependencies = Map::new();
+        for index in 0..160 {
+            patterns.insert(
+                format!("^p{index:03}-"),
+                json!({ "type": "string", "minLength": 1 }),
+            );
+            dependencies.insert(
+                format!("trigger{index:03}"),
+                json!({ "required": [format!("dependent{index:03}")] }),
+            );
+        }
+        let (files, diagnostics) = compile(doc_31(json!({
+            "ManyApplicators": {
+                "type": "object",
+                "patternProperties": Value::Object(patterns),
+                "dependentSchemas": Value::Object(dependencies),
+                "additionalProperties": false
+            }
+        })));
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.code == "OASTS1103" && diagnostic.severity == Severity::Warning
+            }),
+            "{diagnostics:?}"
+        );
+        let content = component(&files, "manyapplicators");
+        assert!(content.contains("ManyApplicatorsPatternProperties"));
+        assert!(content.contains("ManyApplicatorsDependentSchemas"));
+        assert!(content.contains("ManyApplicatorsPatternKey"));
+    }
+
+    #[test]
+    fn oversized_incomplete_applicators_fail_before_emitting_bounded_helpers() {
+        let mut patterns = Map::new();
+        let mut dependencies = Map::new();
+        for index in 0..160 {
+            let schema = if index == 0 {
+                json!({ "type": "string", "format": "unknown-format" })
+            } else {
+                json!({ "type": "string", "minLength": 1 })
+            };
+            patterns.insert(format!("^p{index:03}-"), schema.clone());
+            dependencies.insert(format!("trigger{index:03}"), schema);
+        }
+        let (files, diagnostics) = compile(doc_31(json!({
+            "IncompletePatterns": {
+                "patternProperties": Value::Object(patterns)
+            },
+            "IncompleteDependencies": {
+                "dependentSchemas": Value::Object(dependencies)
+            }
+        })));
+        for keyword in ["patternProperties", "dependentSchemas"] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CODE_INCOMPLETE_APPLICATOR
+                        && diagnostic.message.contains(keyword)
+                }),
+                "{keyword}: {diagnostics:?}"
+            );
+        }
+        assert!(!component(&files, "incompletepatterns").contains("PatternPropertiesPart"));
+        assert!(!component(&files, "incompletedependencies").contains("DependentSchemasPart"));
     }
 
     /// `reserve_names` renames `Issue` (a kernel identifier this artifact injects) to `Issue2`
@@ -2809,8 +5267,8 @@ mod tests {
         );
         assert!(closed.contains("issues.push(issue(path, \"missing required property label\"));"));
         let bag = component(&files, "bag");
-        // The additional-properties iteration and both property-count bounds share `Object.keys`, so
-        // it is evaluated once into a local and reused; it never recurs inline.
+        // The validation iteration and both property-count bounds share one key list. A second,
+        // callback-guarded iteration reports the explicit additionalProperties annotation.
         assert!(bag.contains("const keys1 = Object.keys(value);"));
         assert!(bag.contains("for (const key of keys1) {"));
         assert!(bag.contains("if (key !== \"kind\") {"));
@@ -2820,7 +5278,8 @@ mod tests {
             bag.contains("issues.push(issue(path, \"fewer properties than minProperties 1\"));")
         );
         assert!(bag.contains("if (keys1.length > 3) {"));
-        assert_eq!(bag.matches("Object.keys(value)").count(), 1);
+        assert_eq!(bag.matches("Object.keys(value)").count(), 2);
+        assert!(bag.contains("if (evaluatedProperty !== undefined) {"));
         assert!(
             bag.contains("issues.push(issue(path, \"more properties than maxProperties 3\"));")
         );
@@ -2955,6 +5414,45 @@ mod tests {
     }
 
     #[test]
+    fn all_of_wrapped_ref_imports_the_validator_call_the_inlined_type_does_not_name() {
+        let (files, diagnostics) = compile(doc_30(json!({
+            "Target": {
+                "type": "object",
+                "required": ["id"],
+                "properties": { "id": { "type": "string" } }
+            },
+            "Wrapper": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "allOf": [{ "$ref": "#/components/schemas/Target" }],
+                        "description": "A described reference in OpenAPI 3.0."
+                    }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "wrapper");
+        let imports = content
+            .lines()
+            .filter(|line| line.starts_with("import "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            [
+                "import type { SyncStandardSchemaV1 } from \"../standard-schema.js\";",
+                "import { type Issue, appendKey, issue } from \"../runtime.js\";",
+                "import { validateTarget } from \"./target.js\";",
+            ],
+            "{content}"
+        );
+        assert!(
+            content.contains("validateTarget(value0, path0, issues);"),
+            "{content}"
+        );
+    }
+
+    #[test]
     fn all_of_aggregates_each_branch_at_the_same_path() {
         let (files, diagnostics) = compile(doc_31(json!({
             "Combined": {
@@ -2987,8 +5485,9 @@ mod tests {
         assert_clean(&diagnostics);
         let content = component(&files, "scalar");
         assert!(content.contains("let matches0 = 0;"));
-        // Each branch probe is guarded so anyOf stops once a branch has matched (matches0 >= 1).
-        assert_eq!(content.matches("if (matches0 < 1) {").count(), 2);
+        // Annotation collection examines every successful branch, so the guard stays above the
+        // maximum possible match count instead of stopping at the first success.
+        assert_eq!(content.matches("if (matches0 < 3) {").count(), 2);
         assert!(content.contains("const issues1: Issue[] = [];"));
         assert!(content.contains("if (issues1.length === 0) {"));
         assert!(content.contains("if (matches0 === 0) {"));
@@ -3030,8 +5529,8 @@ mod tests {
         );
         // The discriminator is never consulted: no property-name routing appears in the validator.
         assert!(!content.contains("kind"));
-        assert!(content.contains("validateCircle(value, path, issues1);"));
-        assert!(content.contains("validateSquare(value, path, issues2);"));
+        assert!(content.contains("validateCircle(value, path, issues1,"));
+        assert!(content.contains("validateSquare(value, path, issues2,"));
     }
 
     #[test]
@@ -3152,21 +5651,588 @@ mod tests {
     }
 
     #[test]
-    fn every_rejected_validation_keyword_fails_the_run_naming_keyword_and_pointer() {
-        for keyword in [
-            "if",
-            "then",
-            "else",
-            "not",
-            "dependentSchemas",
-            "unevaluatedProperties",
-            "unevaluatedItems",
-            "contains",
-            "minContains",
-            "maxContains",
-            "patternProperties",
-            "propertyNames",
+    fn bare_required_emits_a_type_conditional_presence_check_but_keeps_unknown_type() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "RequiredOnly": { "required": ["value", "description"] }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "requiredonly");
+        assert!(content.contains("export type RequiredOnly = unknown;"));
+        assert!(content.contains("if (isRecord(value)) {"));
+        assert!(content.contains("\"missing required property value\""));
+        assert!(content.contains("\"missing required property description\""));
+    }
+
+    #[test]
+    fn not_emits_only_for_complete_required_enum_and_object_subschemas() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "NotRequired": { "not": { "required": ["id"] } },
+            "NotEnum": { "not": { "enum": [23456] } },
+            "NotObject": {
+                "not": {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {
+                        "type": { "type": "string", "enum": ["blocked"] }
+                    }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+
+        let required = component(&files, "notrequired");
+        assert!(required.contains("if (isRecord(value)) {"));
+        assert!(required.contains("\"missing required property id\""));
+        assert!(required.contains("if (issues0.length === 0) {"));
+        assert!(required.contains("\"value matches not schema\""));
+
+        let finite = component(&files, "notenum");
+        assert!(finite.contains("deepEqual(value, 23456)"));
+        assert!(finite.contains("if (issues0.length === 0) {"));
+
+        let object = component(&files, "notobject");
+        assert!(object.contains("if (isRecord(value)) {"));
+        assert!(object.contains("\"missing required property type\""));
+        assert!(object.contains("if (issues0.length === 0) {"));
+    }
+
+    #[test]
+    fn not_required_is_supported_in_both_openapi_dialects() {
+        for document in [
+            doc_30(json!({ "NotRequired": { "not": { "required": ["id"] } } })),
+            doc_31(json!({ "NotRequired": { "not": { "required": ["id"] } } })),
         ] {
+            let (files, diagnostics) = compile(document);
+            assert_clean(&diagnostics);
+            let content = component(&files, "notrequired");
+            assert!(content.contains("\"missing required property id\""));
+            assert!(content.contains("\"value matches not schema\""));
+        }
+    }
+
+    #[test]
+    fn not_of_an_empty_schema_is_complete_and_rejects_every_value() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "RejectAll": { "not": {} }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "rejectall");
+        assert!(content.contains("const issues0: Issue[] = [];"));
+        assert!(content.contains("if (issues0.length === 0) {"));
+        assert!(content.contains("\"value matches not schema\""));
+    }
+
+    #[test]
+    fn incomplete_not_is_diagnosed_and_the_negation_is_not_emitted() {
+        for inner in [
+            json!({ "type": "string", "format": "email" }),
+            json!({ "type": "number", "format": "float" }),
+            json!({ "type": "boolean", "format": "custom" }),
+            json!({ "type": "string", "$dynamicRef": "#thing" }),
+        ] {
+            let (files, diagnostics) = compile(doc_31(json!({
+                "Incomplete": { "not": inner }
+            })));
+            let incomplete = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == CODE_INCOMPLETE_APPLICATOR)
+                .expect("incomplete not has a named diagnostic");
+            assert!(incomplete.message.contains("'not'"));
+            assert_eq!(
+                incomplete.json_pointer.as_deref(),
+                Some("/components/schemas/Incomplete/not")
+            );
+            let content = component(&files, "incomplete");
+            assert!(!content.contains("value matches not schema"));
+            assert!(!content.contains("const issues0"));
+        }
+    }
+
+    #[test]
+    fn incomplete_not_follows_refs_with_the_real_emitter() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Email": { "type": "string", "format": "email" },
+            "Incomplete": {
+                "not": { "$ref": "#/components/schemas/Email" }
+            }
+        })));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_INCOMPLETE_APPLICATOR)
+        );
+        let content = component(&files, "incomplete");
+        assert!(!content.contains("validateEmail"));
+        assert!(!content.contains("value matches not schema"));
+    }
+
+    #[test]
+    fn incomplete_nested_applicator_propagates_to_the_outer_not() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Incomplete": {
+                "not": {
+                    "propertyNames": { "type": "string", "format": "email" }
+                }
+            }
+        })));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_INCOMPLETE_APPLICATOR)
+                .count(),
+            1
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == CODE_INCOMPLETE_APPLICATOR)
+                .and_then(|diagnostic| diagnostic.json_pointer.as_deref()),
+            Some("/components/schemas/Incomplete/not")
+        );
+        let content = component(&files, "incomplete");
+        assert!(!content.contains("value matches not schema"));
+        assert!(!content.contains("property name does not satisfy"));
+    }
+
+    #[test]
+    fn property_names_emits_only_for_a_complete_subschema_in_openapi_31() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Named": {
+                "propertyNames": { "type": "string", "pattern": "^[a-z]+$" }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "named");
+        assert!(content.contains("for (const key of Object.keys(value)) {"));
+        assert!(content.contains("pattern0Regex().test(key)"));
+        assert!(content.contains("property name does not satisfy propertyNames schema"));
+
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Incomplete": {
+                "propertyNames": { "type": "string", "format": "email" }
+            }
+        })));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_INCOMPLETE_APPLICATOR
+                    && diagnostic.message.contains("'propertyNames'"))
+        );
+        let content = component(&files, "incomplete");
+        assert!(!content.contains("for (const key of Object.keys(value))"));
+        assert!(!content.contains("property name does not satisfy"));
+    }
+
+    #[test]
+    fn property_names_remains_rejected_in_openapi_30() {
+        let (_files, diagnostics) = compile(doc_30(json!({
+            "Rejected": { "propertyNames": { "type": "string" } }
+        })));
+        let rejected = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == CODE_REJECTED_KEYWORD
+                    && diagnostic.message.contains("'propertyNames'")
+            })
+            .expect("OpenAPI 3.0 propertyNames stays rejected");
+        assert_eq!(rejected.severity, Severity::Error);
+    }
+
+    #[test]
+    fn pattern_properties_apply_every_matching_schema_and_exclude_matches_from_additional() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Patterned": {
+                "type": "object",
+                "properties": {
+                    "fixed": { "type": "string" },
+                    "x-count": { "type": "integer" }
+                },
+                "patternProperties": {
+                    "^x-": { "type": "integer" },
+                    "count$": { "minimum": 2 }
+                },
+                "additionalProperties": false
+            },
+            "NegatedPattern": {
+                "not": {
+                    "patternProperties": {
+                        "^x-": { "type": "string" }
+                    }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "patterned");
+        assert!(content.contains("new RegExp(\"^x-\", \"u\")"));
+        assert!(content.contains("new RegExp(\"count$\", \"u\")"));
+        assert!(content.contains("const validatePatternedPatternKey"));
+        assert!(
+            content
+                .contains("Matchers: readonly (() => RegExp)[] = [pattern0Regex, pattern1Regex];")
+        );
+        assert!(
+            content.contains(
+                "key !== \"fixed\" && key !== \"x-count\" && !validatePatternedPatternKey"
+            )
+        );
+        assert!(content.contains("pattern0Regex().test(key)"));
+        assert!(content.contains("pattern1Regex().test(key)"));
+        assert!(component(&files, "negatedpattern").contains("value matches not schema"));
+    }
+
+    #[test]
+    fn contains_counts_all_matches_and_honors_zero_minimum_and_maximum() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Bounded": {
+                "type": "array",
+                "contains": { "type": "integer" },
+                "minContains": 2,
+                "maxContains": 3
+            },
+            "Optional": {
+                "type": "array",
+                "contains": { "type": "string" },
+                "minContains": 0,
+                "maxContains": 1
+            },
+            "DefaultMinimum": {
+                "type": "array",
+                "contains": { "const": "hit" }
+            },
+            "BoundsWithoutContains": {
+                "type": "array",
+                "minContains": 2,
+                "maxContains": 3
+            }
+        })));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == "OASTS1103"),
+            "{diagnostics:?}"
+        );
+        let bounded = component(&files, "bounded");
+        assert!(bounded.contains("let matches0 = 0;"));
+        assert!(bounded.contains("matches0 += 1;"));
+        assert!(bounded.contains("if (matches0 < 2) {"));
+        assert!(bounded.contains("if (matches0 > 3) {"));
+        let optional = component(&files, "optional");
+        assert!(!optional.contains("matches0 < 0"));
+        assert!(optional.contains("if (matches0 > 1) {"));
+        let default_minimum = component(&files, "defaultminimum");
+        assert!(default_minimum.contains("if (matches0 < 1) {"));
+        assert!(default_minimum.contains("no array item matches contains schema"));
+        let standalone_bounds = component(&files, "boundswithoutcontains");
+        assert!(!standalone_bounds.contains("matches"));
+        assert!(!standalone_bounds.contains("minContains"));
+        assert!(!standalone_bounds.contains("maxContains"));
+    }
+
+    #[test]
+    fn dependent_schemas_validate_the_whole_object_only_when_the_trigger_is_present() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Account": {
+                "type": "object",
+                "properties": {
+                    "creditCard": { "type": "string" },
+                    "billingAddress": { "type": "string" }
+                },
+                "dependentSchemas": {
+                    "creditCard": {
+                        "required": ["billingAddress"]
+                    }
+                }
+            }
+        })));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == "OASTS1103"),
+            "{diagnostics:?}"
+        );
+        let content = component(&files, "account");
+        assert!(content.contains("if (Object.hasOwn(value, \"creditCard\")) {"));
+        assert!(content.contains("if (!Object.hasOwn(value, \"billingAddress\")) {"));
+        assert!(
+            content.contains(
+                "issues.push(issue(path, \"missing required property billingAddress\"));"
+            )
+        );
+    }
+
+    #[test]
+    fn conditional_emits_a_private_verdict_and_ignores_branches_without_if() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Conditional": {
+                "if": { "required": ["kind"] },
+                "then": { "required": ["selectedThen"] },
+                "else": { "required": ["selectedElse"] }
+            },
+            "NoCondition": {
+                "then": { "required": ["ignoredThen"] },
+                "else": { "required": ["ignoredElse"] }
+            },
+            "ConditionOnly": {
+                "if": { "required": ["probe"] }
+            }
+        })));
+        assert_clean(&diagnostics);
+
+        let conditional = component(&files, "conditional");
+        assert!(conditional.contains("const issues0: Issue[] = [];"));
+        assert!(conditional.contains("if (issues0.length === 0) {"));
+        assert!(conditional.contains("\"missing required property selectedThen\""));
+        assert!(conditional.contains("} else {"));
+        assert!(conditional.contains("\"missing required property selectedElse\""));
+        let no_condition = component(&files, "nocondition");
+        assert!(!no_condition.contains("ignoredThen"));
+        assert!(!no_condition.contains("ignoredElse"));
+        let condition_only = component(&files, "conditiononly");
+        assert!(condition_only.contains("const issues0: Issue[] = [];"));
+        assert!(!condition_only.contains("issues.push("));
+    }
+
+    #[test]
+    fn each_incomplete_conditional_subschema_has_its_own_diagnostic() {
+        for (keyword, schema) in [
+            (
+                "if",
+                json!({
+                    "if": { "type": "string", "format": "email" },
+                    "then": false
+                }),
+            ),
+            (
+                "then",
+                json!({
+                    "if": true,
+                    "then": { "type": "string", "format": "email" }
+                }),
+            ),
+            (
+                "else",
+                json!({
+                    "if": false,
+                    "else": { "type": "string", "format": "email" }
+                }),
+            ),
+        ] {
+            let (files, diagnostics) = compile(doc_31(json!({ "Incomplete": schema })));
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CODE_INCOMPLETE_APPLICATOR
+                        && diagnostic.message.contains(&format!("'{keyword}'"))
+                }),
+                "{keyword}: {diagnostics:?}"
+            );
+            let content = component(&files, "incomplete");
+            assert!(!content.contains("const issues0"), "{keyword}: {content}");
+        }
+    }
+
+    #[test]
+    fn unevaluated_applicators_collect_sibling_and_nested_annotations() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Choice": {
+                "type": "object",
+                "anyOf": [
+                    {
+                        "required": ["alpha"],
+                        "properties": { "alpha": { "type": "string" } }
+                    },
+                    {
+                        "required": ["beta"],
+                        "properties": { "beta": { "type": "integer" } }
+                    }
+                ],
+                "unevaluatedProperties": false
+            },
+            "Sequence": {
+                "type": "array",
+                "prefixItems": [{ "type": "string" }],
+                "contains": { "type": "integer" },
+                "unevaluatedItems": false
+            },
+            "Referenced": {
+                "$ref": "#/components/schemas/ReferencedProperties",
+                "unevaluatedProperties": false
+            },
+            "ReferencedProperties": {
+                "properties": { "fromRef": { "type": "string" } }
+            }
+        })));
+        assert_clean(&diagnostics);
+
+        let choice = component(&files, "choice");
+        let collector = choice.find("const evaluatedProperties").expect("collector");
+        let any_of = choice.find("let matches").expect("anyOf");
+        let unevaluated = choice
+            .rfind("evaluatedProperties0.includes(key)")
+            .expect("unevaluatedProperties");
+        assert!(collector < any_of && any_of < unevaluated, "{choice}");
+        assert!(choice.contains("branchPropertiesissues"));
+        assert!(choice.contains("recordProperty0?.(key);"));
+
+        let sequence = component(&files, "sequence");
+        assert!(sequence.contains("const evaluatedItems0: number[] = [];"));
+        assert!(sequence.contains("recordItem0(index);"));
+        assert!(sequence.contains("recordItem0?.(index);"));
+        assert!(sequence.contains("!evaluatedItems0.includes(index)"));
+
+        let referenced = component(&files, "referenced");
+        assert!(referenced.contains(
+            "validateReferencedProperties(value, path, issues, recordProperty0, evaluatedItem);"
+        ));
+        assert!(referenced.contains("!evaluatedProperties0.includes(key)"));
+    }
+
+    #[test]
+    fn incomplete_unevaluated_subschemas_are_diagnosed_without_emitting_checks() {
+        for (keyword, value) in [
+            (
+                "unevaluatedProperties",
+                json!({ "type": "string", "format": "email" }),
+            ),
+            (
+                "unevaluatedItems",
+                json!({ "type": "string", "format": "email" }),
+            ),
+        ] {
+            let (files, diagnostics) = compile(doc_31(json!({
+                "Incomplete": { (keyword): value }
+            })));
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CODE_INCOMPLETE_APPLICATOR
+                        && diagnostic.message.contains(keyword)
+                }),
+                "{keyword}: {diagnostics:?}"
+            );
+            let content = component(&files, "incomplete");
+            assert!(!content.contains(".includes("), "{keyword}: {content}");
+        }
+
+        for (keyword, schema) in [
+            (
+                "unevaluatedProperties",
+                json!({
+                    "properties": {
+                        "known": { "type": "string", "format": "email" }
+                    },
+                    "unevaluatedProperties": false
+                }),
+            ),
+            (
+                "unevaluatedItems",
+                json!({
+                    "items": { "type": "string", "format": "email" },
+                    "unevaluatedItems": false
+                }),
+            ),
+        ] {
+            let (files, diagnostics) = compile(doc_31(json!({ "Incomplete": schema })));
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CODE_INCOMPLETE_APPLICATOR
+                        && diagnostic.message.contains(keyword)
+                }),
+                "{keyword}: {diagnostics:?}"
+            );
+            assert!(
+                !component(&files, "incomplete").contains(".includes("),
+                "{keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn additional_items_is_an_unknown_annotation_in_31_and_rejected_in_30() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Annotated": {
+                "type": "string",
+                "additionalItems": { "$ref": "#/components/schemas/Missing" }
+            }
+        })));
+        assert_clean(&diagnostics);
+        assert!(!component(&files, "annotated").contains("Missing"));
+
+        let (files, diagnostics) = compile(doc_30(json!({
+            "Rejected": {
+                "type": "string",
+                "additionalItems": {}
+            }
+        })));
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == CODE_REJECTED_KEYWORD
+                    && diagnostic.message.contains("'additionalItems'")
+            }),
+            "{diagnostics:?}"
+        );
+        assert!(type_component(&files, "rejected").contains("export type Rejected = string;"));
+    }
+
+    #[test]
+    fn new_2020_12_keywords_remain_rejected_in_openapi_30() {
+        for (keyword, value) in [
+            ("patternProperties", json!({ "^x": {} })),
+            ("contains", json!({})),
+            ("minContains", json!(0)),
+            ("maxContains", json!(1)),
+            ("dependentSchemas", json!({ "x": {} })),
+            ("if", json!({})),
+            ("then", json!({})),
+            ("else", json!({})),
+            ("unevaluatedProperties", json!(false)),
+            ("unevaluatedItems", json!(false)),
+        ] {
+            let (_files, diagnostics) = compile(doc_30(json!({
+                "Rejected": { (keyword): value }
+            })));
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CODE_REJECTED_KEYWORD && diagnostic.message.contains(keyword)
+                }),
+                "{keyword}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_applicator_subschemas_participate_in_not_completeness() {
+        for (keyword, value) in [
+            (
+                "patternProperties",
+                json!({ "^x": { "type": "string", "format": "email" } }),
+            ),
+            ("contains", json!({ "type": "string", "format": "email" })),
+            (
+                "dependentSchemas",
+                json!({ "trigger": { "type": "string", "format": "email" } }),
+            ),
+        ] {
+            let (files, diagnostics) = compile(doc_31(json!({
+                "Incomplete": {
+                    "not": { (keyword): value }
+                }
+            })));
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CODE_INCOMPLETE_APPLICATOR
+                        && diagnostic.message.contains("'not'")
+                }),
+                "{keyword}: {diagnostics:?}"
+            );
+            assert!(
+                !component(&files, "incomplete").contains("value matches not schema"),
+                "{keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_rejected_validation_keyword_fails_the_run_naming_keyword_and_pointer() {
+        for keyword in ["$dynamicRef", "$recursiveRef"] {
             let (_files, diagnostics) = compile(doc_31(json!({
                 "Rejected": { (keyword): true }
             })));
@@ -3196,14 +6262,14 @@ mod tests {
     #[test]
     fn unknown_leaf_degradation_fails_the_run_naming_the_construct_and_pointer() {
         let (_files, diagnostics) = compile(doc_31(json!({
-            "Degraded": { "$dynamicRef": "#thing" }
+            "Degraded": { "type": "mystery" }
         })));
         let unknown = diagnostics
             .iter()
             .find(|d| d.code == "OASTS1502")
             .expect("unknown leaf fails with OASTS1502");
         assert_eq!(unknown.severity, Severity::Error);
-        assert!(unknown.message.contains("$dynamicRef"));
+        assert!(unknown.message.contains("unsupported type mystery"));
         assert_eq!(
             unknown.json_pointer.as_deref(),
             Some("/components/schemas/Degraded")
@@ -3495,9 +6561,99 @@ mod tests {
         assert!(!first.contains("HeadersValidator"), "{first}");
     }
 
-    /// The reported bug: a `$ref` from a request body must delegate to the referent's Request-variant
-    /// validator, not the Neutral one, which would demand a `readOnly` property the request type
-    /// dropped. Symmetrically, a `$ref` from a response delegates to the Response variant.
+    /// When the operation-derived name already is the component's positioned export, the component
+    /// triplet remains available from the operation module without a meaningless local wrapper.
+    #[test]
+    fn identical_operation_delegate_is_reexported() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/assist": {
+                    "post": {
+                        "operationId": "assistV1Process",
+                        "parameters": [{
+                            "name": "mode",
+                            "in": "query",
+                            "schema": {
+                                "$ref": "#/components/schemas/AssistV1ProcessQueryMode"
+                            }
+                        }],
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/AssistV1ProcessRequestBody"
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "processed",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "$ref": "#/components/schemas/AssistV1ProcessResponse200"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "AssistV1ProcessQueryMode": {
+                        "type": "string"
+                    },
+                    "AssistV1ProcessRequestBody": {
+                        "type": "object",
+                        "required": ["prompt"],
+                        "properties": {
+                            "prompt": { "type": "string" }
+                        }
+                    },
+                    "AssistV1ProcessResponse200": {
+                        "type": "object",
+                        "required": ["accepted"],
+                        "properties": {
+                            "accepted": { "type": "boolean" }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document);
+        assert_clean(&diagnostics);
+        let content = operation(&files, "assistv1process");
+        assert!(content.contains(
+            "export { type AssistV1ProcessQueryMode, assistV1ProcessQueryModeValidator, validateAssistV1ProcessQueryMode } from \"../components/assistv1processquerymode.js\";"
+        ));
+        assert!(content.contains(
+            "export { type AssistV1ProcessRequestBody, assistV1ProcessRequestBodyValidator, validateAssistV1ProcessRequestBody } from \"../components/assistv1processrequestbody.js\";"
+        ));
+        assert!(content.contains(
+            "export { type AssistV1ProcessResponse200, assistV1ProcessResponse200Validator, validateAssistV1ProcessResponse200 } from \"../components/assistv1processresponse200.js\";"
+        ));
+        assert!(
+            !content
+                .contains("export type AssistV1ProcessRequestBody = AssistV1ProcessRequestBody;"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("export function validateAssistV1ProcessRequestBody("),
+            "{content}"
+        );
+        assert!(!content.contains("../standard-schema.js"), "{content}");
+        assert!(!content.contains("../runtime.js"), "{content}");
+    }
+
+    /// A `$ref` from a request body must delegate to the referent's Request-variant validator, not
+    /// the Neutral one, which would demand a `readOnly` property the request type dropped.
+    /// Symmetrically, a `$ref` from a response delegates to the Response variant.
     #[test]
     fn request_body_ref_calls_request_validator() {
         let document = json!({
@@ -3546,11 +6702,31 @@ mod tests {
         let content = operation(&files, "createpet");
         // Request body position delegates to the Request variant; response to the Response variant.
         assert!(
-            content.contains("validatePetRequest(value, path, issues);"),
+            content.contains(
+                "validatePetRequest(value, path, issues, evaluatedProperty, evaluatedItem);"
+            ),
             "{content}"
         );
         assert!(
-            content.contains("validatePetResponse(value, path, issues);"),
+            content.contains(
+                "validatePetResponse(value, path, issues, evaluatedProperty, evaluatedItem);"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("export type CreatePetRequestBody = PetRequest;"),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function validateCreatePetRequestBody("),
+            "{content}"
+        );
+        assert!(
+            content.contains("export type CreatePetResponse200 = PetResponse;"),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function validateCreatePetResponse200("),
             "{content}"
         );
         // The Neutral validator is never called from a positioned body.
@@ -4044,13 +7220,71 @@ mod tests {
         let mut sink = DiagnosticSink::new();
         let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
         let mut scope = FileScope::default();
-        let mut body = FnBody::new(&mut scope, &model, TypePosition::Neutral);
+        let mut imports = SiblingImports::default();
+        let mut body = FnBody::new(
+            &mut scope,
+            &mut imports,
+            &model,
+            TypePosition::Neutral,
+            "Finite",
+            "workspace/openapi.json#/finite".to_owned(),
+        );
         body.gen_finite(Some(&[]), None, "value", "path", "issues");
         assert!(body.out.contains("if (true) {"));
         assert!(
             body.out
                 .contains("issues.push(issue(path, \"value not in enum\"));")
         );
+    }
+
+    #[test]
+    fn unresolved_ref_marks_the_emission_incomplete() {
+        let temp = TempDir::new().expect("temp directory");
+        fs::write(temp.path().join("openapi.json"), "{}").expect("write input");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "./openapi.json" },
+            "output": "./generated",
+            "artifacts": { "validators": true }
+        });
+        fs::write(
+            temp.path().join("oasts.json"),
+            serde_json::to_vec(&config).expect("config JSON"),
+        )
+        .expect("write config");
+        let resolved =
+            load_config(Some(&temp.path().join("oasts.json")), temp.path()).expect("config");
+        let analyzed = crate::semantic::Analyzed {
+            ir: crate::ir::Ir::default(),
+            operation_names: Vec::new(),
+            schema_names: Vec::new(),
+            enum_members: Vec::new(),
+            link_targets: Vec::new(),
+            webhook_names: Vec::new(),
+            callback_names: Vec::new(),
+        };
+        let mut sink = DiagnosticSink::new();
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let mut scope = FileScope::default();
+        let mut imports = SiblingImports::default();
+        let mut body = FnBody::new(
+            &mut scope,
+            &mut imports,
+            &model,
+            TypePosition::Neutral,
+            "Ref",
+            "workspace/openapi.json#/ref".to_owned(),
+        );
+        let schema = SchemaNode::Ref {
+            target: SchemaRef {
+                source_id: "missing.json".to_owned(),
+                json_pointer: "/Missing".to_owned(),
+            },
+            meta: SchemaMeta::default(),
+        };
+
+        assert!(!body.gen_root_schema(&schema, "value", "path", "issues"));
+        assert!(body.out.is_empty());
     }
 
     #[test]
@@ -4359,6 +7593,86 @@ mod tests {
     }
 
     #[test]
+    fn uninhabitable_all_of_rejects_every_value() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Nope": {
+                "allOf": [
+                    { "type": "string" },
+                    { "type": "boolean" }
+                ]
+            }
+        })));
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == crate::composition::CODE_COMPOSITION
+                    && diagnostic.severity == Severity::Warning
+            }),
+            "{diagnostics:?}"
+        );
+        assert!(!diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == crate::composition::CODE_COMPOSITION
+                && diagnostic.severity == Severity::Error
+        }));
+        let content = component(&files, "nope");
+        assert!(content.contains("export type Nope = never;"));
+        assert!(content.contains("issues.push(issue(path, \"value not allowed\"));"));
+    }
+
+    #[test]
+    fn filtered_finite_values_drive_generated_validators() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Survivor": {
+                "type": "string",
+                "enum": ["on", false]
+            },
+            "Exhausted": {
+                "type": "boolean",
+                "enum": [1]
+            },
+            "ImpossibleConst": {
+                "type": "string",
+                "const": false
+            },
+            "ObjectChoice": {
+                "type": "object",
+                "enum": [{ "value": 1 }, false]
+            },
+            "ArrayChoice": {
+                "type": "array",
+                "items": { "type": "integer" },
+                "enum": [[1], "wrong"]
+            }
+        })));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS1214")
+                .count(),
+            6
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity == Severity::Warning)
+        );
+
+        let survivor = component(&files, "survivor");
+        assert!(survivor.contains("if (!(deepEqual(value, \"on\"))) {"));
+        assert!(!survivor.contains("deepEqual(value, false)"));
+        for base in ["exhausted", "impossibleconst"] {
+            let content = component(&files, base);
+            assert!(content.contains("issues.push(issue(path, \"value not allowed\"));"));
+            assert!(!content.contains("deepEqual(value"));
+        }
+        let object = component(&files, "objectchoice");
+        assert!(object.contains("deepEqual(value, {\"value\":1})"));
+        assert!(!object.contains("deepEqual(value, false)"));
+        let array = component(&files, "arraychoice");
+        assert!(array.contains("deepEqual(value, [1])"));
+        assert!(!array.contains("deepEqual(value, \"wrong\")"));
+    }
+
+    #[test]
     fn tuple_emits_array_constraints_like_a_plain_array() {
         // Fix F: gen_tuple dropped minItems/maxItems/uniqueItems even though the parser populates
         // them for tuple nodes. A plain tuple emits none.
@@ -4451,13 +7765,15 @@ mod tests {
         // A free-form array element keeps the array type gate but emits no per-element loop.
         let any_items = component(&files, "anyitems");
         assert!(any_items.contains("if (isArray(value)) {"));
-        assert!(!any_items.contains("for (let index"));
+        assert!(any_items.contains("if (evaluatedItem !== undefined) {"));
+        assert!(any_items.contains("for (let index"));
         assert!(!any_items.contains("value0"));
-        // A free-form additionalProperties schema emits no key iteration.
+        // A free-form additionalProperties schema emits only its dormant annotation iteration.
         let open_bag = component(&files, "openbag");
         assert!(open_bag.contains("if (isRecord(value)) {"));
-        assert!(!open_bag.contains("Object.keys(value)"));
-        assert!(!open_bag.contains("for (const key"));
+        assert!(open_bag.contains("if (evaluatedProperty !== undefined) {"));
+        assert!(open_bag.contains("Object.keys(value)"));
+        assert!(!open_bag.contains("const value"));
     }
 
     #[test]
@@ -4522,8 +7838,10 @@ mod tests {
         assert!(!content.contains("if (value.length > 0) {"));
         assert!(content.contains("if (value.length > 1) {"));
         assert!(content.contains("const value0: unknown = value[1];"));
-        // The free-form rest schema emits no trailing-element loop.
-        assert!(!content.contains("for (let index"));
+        // The free-form rest schema emits no value-validation loop; the remaining loop only
+        // reports prefix/items annotations when an enclosing unevaluatedItems asks for them.
+        assert!(content.contains("if (evaluatedItem !== undefined) {"));
+        assert_eq!(content.matches("const value").count(), 1);
     }
 
     /// A component whose request shape drops a `readOnly` property emits a full Request-variant
@@ -4551,7 +7869,7 @@ mod tests {
         );
         assert!(
             content.contains(
-                "export function validatePetRequest(value: unknown, path: readonly (string | number)[], issues: Issue[]): void {"
+                "export function validatePetRequest(value: unknown, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?:"
             ),
             "{content}"
         );
@@ -4604,7 +7922,7 @@ mod tests {
         );
         assert!(
             content.contains(
-                "export function validatePetResponse(value: unknown, path: readonly (string | number)[], issues: Issue[]): void {"
+                "export function validatePetResponse(value: unknown, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?:"
             ),
             "{content}"
         );

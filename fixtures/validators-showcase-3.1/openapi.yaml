@@ -254,6 +254,31 @@ components:
           properties:
             b:
               type: integer
+    RequiredOnly:
+      required:
+        - id
+    NotRequired:
+      not:
+        required:
+          - id
+    NotNumber:
+      not:
+        enum:
+          - 23456
+    NotObject:
+      not:
+        type: object
+        required:
+          - type
+        properties:
+          type:
+            type: string
+            enum:
+              - blocked
+    NamedObject:
+      propertyNames:
+        type: string
+        pattern: '^[a-z]+$'
     Account:
       type: object
       properties:
@@ -264,6 +289,94 @@ components:
       dependentRequired:
         creditCard:
           - billingAddress
+    PatternBag:
+      type: object
+      additionalProperties: false
+      properties:
+        fixed:
+          type: string
+        x-count:
+          type: integer
+      patternProperties:
+        '^x-':
+          type: integer
+          minimum: 1
+        'count$':
+          type: integer
+          maximum: 5
+    ContainsDefault:
+      type: array
+      contains:
+        type: integer
+    ContainsRange:
+      type: array
+      contains:
+        type: integer
+      minContains: 2
+      maxContains: 3
+    ContainsOptional:
+      type: array
+      contains:
+        type: string
+      minContains: 0
+      maxContains: 1
+    DependentAccount:
+      type: object
+      properties:
+        creditCard:
+          type: string
+        billingAddress:
+          type: string
+      dependentSchemas:
+        creditCard:
+          required:
+            - billingAddress
+          properties:
+            billingAddress:
+              minLength: 3
+    ConditionalProfile:
+      type: object
+      properties:
+        kind:
+          type: string
+        companyName:
+          type: string
+        personalName:
+          type: string
+      if:
+        required:
+          - kind
+        properties:
+          kind:
+            const: business
+      then:
+        required:
+          - companyName
+      else:
+        required:
+          - personalName
+    UnevaluatedChoice:
+      type: object
+      anyOf:
+        - required:
+            - alpha
+          properties:
+            alpha:
+              type: string
+        - required:
+            - beta
+          properties:
+            beta:
+              type: integer
+      unevaluatedProperties: false
+    UnevaluatedSequence:
+      type: array
+      prefixItems:
+        - type: string
+      contains:
+        type: integer
+      minContains: 1
+      unevaluatedItems: false
     Problem:
       type: object
       required:
@@ -299,5 +412,21 @@ components:
           $ref: '#/components/schemas/Combined'
         account:
           $ref: '#/components/schemas/Account'
+        patternBag:
+          $ref: '#/components/schemas/PatternBag'
+        containsDefault:
+          $ref: '#/components/schemas/ContainsDefault'
+        containsRange:
+          $ref: '#/components/schemas/ContainsRange'
+        containsOptional:
+          $ref: '#/components/schemas/ContainsOptional'
+        dependentAccount:
+          $ref: '#/components/schemas/DependentAccount'
+        conditionalProfile:
+          $ref: '#/components/schemas/ConditionalProfile'
+        unevaluatedChoice:
+          $ref: '#/components/schemas/UnevaluatedChoice'
+        unevaluatedSequence:
+          $ref: '#/components/schemas/UnevaluatedSequence'
         problem:
           $ref: '#/components/schemas/Problem'
