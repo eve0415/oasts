@@ -6,6 +6,7 @@ import { isRequestPhaseFailure, requestFailure } from "./result-narrowing.ts";
 import {
   createTransport,
   execute,
+  jsonBody,
   type OperationDescriptor,
   type ParamPlan,
 } from "../transport.ts";
@@ -59,7 +60,7 @@ function cookieOperation(params: readonly ParamPlan[]): OperationDescriptor {
     body: null,
     accept: null,
     credentialHeaders: [],
-    security: [],
+    security: null,
     responses: [],
     baseUrl: { kind: "literal", value: `${SAME_ORIGIN}/v1` },
     fetchDefaults: {},
@@ -168,7 +169,7 @@ describe("cookie parameter dispatch", () => {
     const descriptor: OperationDescriptor = {
       ...cookieOperation([sid, theme]),
       method: "POST",
-      body: { kind: "json", contentType: "application/json" },
+      body: jsonBody("application/json"),
     };
     const payload = { name: "Ada", nested: { count: 2 } };
 

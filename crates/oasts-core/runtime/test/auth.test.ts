@@ -5,13 +5,24 @@ import type { RequestPhaseFailure } from "../result.ts";
 import {
   AmbientClientCertificate,
   AmbientCookieCredential,
+  authAlternatives,
+  basicCredential,
+  bearerCredential,
+  cookieKeyCredential,
   createTransport,
   execute,
+  headerKeyCredential,
+  httpSchemeCredential,
+  jsonBody,
+  mutualTlsCredential,
+  queryKeyCredential,
   type AuthContext,
   type AuthCredential,
   type AuthOverrides,
   type AuthProvider,
+  type CredentialApplier,
   type ExecutionResult,
+  type SecurityUse,
   type OperationContext,
   type OperationDescriptor,
 } from "../transport.ts";
@@ -44,7 +55,7 @@ function operation(overrides: Partial<OperationDescriptor> = {}): OperationDescr
     body: null,
     accept: null,
     credentialHeaders: ["Authorization", "X-API-Key"],
-    security: [],
+    security: null,
     responses: [],
     baseUrl: { kind: "literal", value: "https://auth.example/api" },
     fetchDefaults: {},
@@ -70,8 +81,26 @@ function assertVectorFailure(
   assert.equal(requests.length, 0);
 }
 
-function security(name: string, kind: SchemeKind, param?: string): OperationDescriptor["security"] {
-  return [[{ name, kind, param, scopes: [] }]];
+// The frozen selection vectors name a scheme kind; the descriptor now carries the applier that
+// kind serializes with, so the harness maps one to the other.
+const APPLIERS = {
+  apiKeyCookie: cookieKeyCredential,
+  apiKeyHeader: headerKeyCredential,
+  apiKeyQuery: queryKeyCredential,
+  basic: basicCredential,
+  bearer: bearerCredential,
+  httpScheme: httpSchemeCredential,
+  mutualTls: mutualTlsCredential,
+  oauth2: bearerCredential,
+  openIdConnect: bearerCredential,
+} as const satisfies Record<SchemeKind | "httpScheme" | "mutualTls", CredentialApplier>;
+
+function security(
+  name: string,
+  kind: keyof typeof APPLIERS,
+  param?: string,
+): readonly (readonly SecurityUse[])[] {
+  return [[{ name, apply: APPLIERS[kind], param, scopes: [] }]];
 }
 
 async function executeWithCredential(
@@ -139,11 +168,11 @@ function schemeUse(scenario: AuthSelectionScenario, name: string): SchemeUse {
   throw new Error(`missing scheme use for ${name}`);
 }
 
-function scenarioSecurity(scenario: AuthSelectionScenario): OperationDescriptor["security"] {
+function scenarioSecurity(scenario: AuthSelectionScenario): readonly (readonly SecurityUse[])[] {
   return scenario.alternatives.map((alternative) =>
     alternative.map((use) => ({
       name: use.scheme,
-      kind: use.kind,
+      apply: APPLIERS[use.kind],
       param: use.param,
       scopes: use.scopes ?? [],
     })),
@@ -166,7 +195,7 @@ describe("frozen auth serialization vectors", () => {
     for (const vector of BEARER_VECTORS) {
       test(`${kind}: ${vector.name}`, async () => {
         const { result, requests } = await executeWithCredential(
-          operation({ security: security("scheme", kind) }),
+          operation({ security: authAlternatives(security("scheme", kind)) }),
           vector.input.token,
         );
         if (typeof vector.expected !== "string") {
@@ -184,7 +213,7 @@ describe("frozen auth serialization vectors", () => {
   for (const vector of BASIC_VECTORS) {
     test(`basic: ${vector.name}`, async () => {
       const { result, requests } = await executeWithCredential(
-        operation({ security: security("scheme", "basic") }),
+        operation({ security: authAlternatives(security("scheme", "basic")) }),
         vector.input,
       );
       if (typeof vector.expected !== "string") {
@@ -203,7 +232,7 @@ describe("frozen auth serialization vectors", () => {
       const { result, requests } = await executeWithCredential(
         operation({
           credentialHeaders: [vector.input.headerName],
-          security: security("scheme", "apiKeyHeader", vector.input.headerName),
+          security: authAlternatives(security("scheme", "apiKeyHeader", vector.input.headerName)),
         }),
         vector.input.value,
       );
@@ -240,7 +269,7 @@ describe("frozen auth serialization vectors", () => {
       const { result, requests } = await executeWithCredential(
         operation({
           params,
-          security: security("scheme", "apiKeyQuery", vector.input.keyName),
+          security: authAlternatives(security("scheme", "apiKeyQuery", vector.input.keyName)),
         }),
         vector.input.keyValue,
         input,
@@ -263,7 +292,7 @@ describe("frozen auth serialization vectors", () => {
       const { result, requests } = await executeWithCredential(
         operation({
           credentialHeaders: [],
-          security: security("scheme", "apiKeyCookie", "session"),
+          security: authAlternatives(security("scheme", "apiKeyCookie", "session")),
         }),
         credential,
       );
@@ -290,9 +319,16 @@ describe("frozen auth serialization vectors", () => {
             };
       const { result, requests } = await executeWithCredential(
         operation({
-          security: [
-            [{ name: "scheme", kind: "httpScheme", scheme: vector.input.scheme, scopes: [] }],
-          ],
+          security: authAlternatives([
+            [
+              {
+                name: "scheme",
+                apply: httpSchemeCredential,
+                scheme: vector.input.scheme,
+                scopes: [],
+              },
+            ],
+          ]),
         }),
         credential,
       );
@@ -316,7 +352,9 @@ describe("frozen auth serialization vectors", () => {
       const { result, requests } = await executeWithCredential(
         operation({
           credentialHeaders: [],
-          security: [[{ name: "scheme", kind: "mutualTls", scopes: [] }]],
+          security: authAlternatives([
+            [{ name: "scheme", apply: mutualTlsCredential, scopes: [] }],
+          ]),
         }),
         credential,
       );
@@ -371,7 +409,7 @@ describe("frozen auth selection scenarios", () => {
             return new Response(null, { status: 200 });
           },
         }),
-        operation({ security: scenarioSecurity(scenario) }),
+        operation({ security: authAlternatives(scenarioSecurity(scenario)) }),
         {},
         { auth: scenarioOverrides(scenario) },
       );
@@ -424,7 +462,7 @@ describe("auth runtime boundaries", () => {
     const { result, requests } = await executeWithCredential(
       operation({
         credentialHeaders: [],
-        security: [[{ name: "scheme", kind: "mutualTls", scopes: [] }]],
+        security: authAlternatives([[{ name: "scheme", apply: mutualTlsCredential, scopes: [] }]]),
       }),
       AmbientCookieCredential,
     );
@@ -438,9 +476,16 @@ describe("auth runtime boundaries", () => {
   test("rejects header-control injection in the generic HTTP scheme name", async () => {
     const { result, requests } = await executeWithCredential(
       operation({
-        security: [
-          [{ name: "scheme", kind: "httpScheme", scheme: "Digest\r\nX-Injected: yes", scopes: [] }],
-        ],
+        security: authAlternatives([
+          [
+            {
+              name: "scheme",
+              apply: httpSchemeCredential,
+              scheme: "Digest\r\nX-Injected: yes",
+              scopes: [],
+            },
+          ],
+        ]),
       }),
       { credentials: "proof" },
     );
@@ -451,7 +496,9 @@ describe("auth runtime boundaries", () => {
   test("rejects a non-object generic HTTP credential", async () => {
     const { result, requests } = await executeWithCredential(
       operation({
-        security: [[{ name: "scheme", kind: "httpScheme", scheme: "Digest", scopes: [] }]],
+        security: authAlternatives([
+          [{ name: "scheme", apply: httpSchemeCredential, scheme: "Digest", scopes: [] }],
+        ]),
       }),
       "not-an-object",
     );
@@ -496,7 +543,9 @@ describe("auth runtime boundaries", () => {
   ] as const) {
     test(`rejects ${boundary.name} as auth`, async () => {
       const { result, requests } = await executeWithCredential(
-        operation({ security: security("scheme", boundary.kind, boundary.param) }),
+        operation({
+          security: authAlternatives(security("scheme", boundary.kind, boundary.param)),
+        }),
         boundary.credential,
       );
       const failure = authFailure(result);
@@ -511,7 +560,7 @@ describe("auth runtime boundaries", () => {
   ] as const) {
     test(`rejects ${boundary.kind} without its declared parameter name`, async () => {
       const { result, requests } = await executeWithCredential(
-        operation({ security: security("scheme", boundary.kind) }),
+        operation({ security: authAlternatives(security("scheme", boundary.kind)) }),
         "key",
       );
       const failure = authFailure(result);
@@ -530,7 +579,11 @@ describe("auth runtime boundaries", () => {
         },
       }),
       operation({
-        security: [[{ name: "bearerAuth", kind: "bearer", scopes: [] }], [], []],
+        security: authAlternatives([
+          [{ name: "bearerAuth", apply: bearerCredential, scopes: [] }],
+          [],
+          [],
+        ]),
       }),
       {},
     );
@@ -543,7 +596,7 @@ describe("auth runtime boundaries", () => {
 
   test("accepts an empty header API key without normalization", async () => {
     const { requests } = await executeWithCredential(
-      operation({ security: security("scheme", "apiKeyHeader", "X-API-Key") }),
+      operation({ security: authAlternatives(security("scheme", "apiKeyHeader", "X-API-Key")) }),
       "",
     );
     assert.equal(requests.length, 1);
@@ -562,12 +615,12 @@ describe("auth runtime boundaries", () => {
         },
       }),
       operation({
-        security: [
+        security: authAlternatives([
           [
-            { name: "first", kind: "apiKeyQuery", param: "first_key", scopes: [] },
-            { name: "second", kind: "apiKeyQuery", param: "second_key", scopes: [] },
+            { name: "first", apply: queryKeyCredential, param: "first_key", scopes: [] },
+            { name: "second", apply: queryKeyCredential, param: "second_key", scopes: [] },
           ],
-        ],
+        ]),
       }),
       {},
       { auth: { first: "one", second: "two" } },
@@ -578,21 +631,26 @@ describe("auth runtime boundaries", () => {
     assert.equal(new URL(request.url).search, "?first_key=one&second_key=two");
   });
 
-  test("fails closed when a descriptor carries an unrecognized scheme kind", async () => {
-    // The kind union is closed at generation time; a drifted or hand-built descriptor smuggled
-    // past the static type must fail closed, never silently skip the member's credential.
-    const drifted = new Proxy(
-      operation({ security: security("scheme", "apiKeyCookie", "session") }),
+  test("fails closed when a descriptor carries no credential serializer", async () => {
+    // The applier is written by the generator; a drifted or hand-built descriptor smuggled past
+    // the static type must fail closed, never throw out of execute and never silently skip the
+    // member's credential.
+    const driftedUse = new Proxy(
+      {
+        name: "scheme",
+        apply: cookieKeyCredential,
+        param: "session",
+        scopes: [],
+      } satisfies SecurityUse,
       {
         get: (target, property, receiver) =>
-          property === "security"
-            ? [[{ name: "scheme", kind: "unrecognized", scopes: [] }]]
-            : Reflect.get(target, property, receiver),
+          property === "apply" ? undefined : Reflect.get(target, property, receiver),
       },
     );
+    const drifted = operation({ security: authAlternatives([[driftedUse]]) });
     const { result, requests } = await executeWithCredential(drifted, AmbientCookieCredential);
     const failure = authFailure(result);
-    assert.match(failure.message, /unrecognized/u);
+    assert.match(failure.message, /no credential serializer/u);
     assert.equal(requests.length, 0);
   });
 
@@ -610,7 +668,7 @@ describe("auth runtime boundaries", () => {
           return new Response(null, { status: 200 });
         },
       }),
-      operation({ security: [...security("scheme", "bearer"), []] }),
+      operation({ security: authAlternatives([...security("scheme", "bearer"), []]) }),
       {},
     );
     const failure = authFailure(result);
@@ -629,7 +687,7 @@ describe("auth runtime boundaries", () => {
           return new Response(null, { status: 200 });
         },
       }),
-      operation({ security: security("scheme", "bearer") }),
+      operation({ security: authAlternatives(security("scheme", "bearer")) }),
       {},
     );
     const failure = authFailure(result);
@@ -648,20 +706,20 @@ describe("auth runtime boundaries", () => {
       }),
       operation({
         method: "POST",
-        body: { kind: "json", contentType: "application/json" },
+        body: jsonBody("application/json"),
         accept: "application/json",
         credentialHeaders: ["Accept", "Content-Type"],
-        security: [
+        security: authAlternatives([
           [
-            { name: "acceptKey", kind: "apiKeyHeader", param: "Accept", scopes: [] },
+            { name: "acceptKey", apply: headerKeyCredential, param: "Accept", scopes: [] },
             {
               name: "contentKey",
-              kind: "apiKeyHeader",
+              apply: headerKeyCredential,
               param: "Content-Type",
               scopes: [],
             },
           ],
-        ],
+        ]),
       }),
       { body: { value: true } },
       { auth: { acceptKey: "auth-accept", contentKey: "auth-content" } },
@@ -699,7 +757,7 @@ describe("auth runtime boundaries", () => {
             allowReserved: false,
           },
         ],
-        security: security("scheme", "apiKeyQuery", "token"),
+        security: authAlternatives(security("scheme", "apiKeyQuery", "token")),
       }),
       { query: { ordinary: true } },
     );
@@ -723,10 +781,10 @@ describe("auth runtime boundaries", () => {
         },
       }),
       operation({
-        security: [
-          [{ name: "bearerA", kind: "bearer", scopes: [] }],
-          [{ name: "basicB", kind: "basic", scopes: [] }],
-        ],
+        security: authAlternatives([
+          [{ name: "bearerA", apply: bearerCredential, scopes: [] }],
+          [{ name: "basicB", apply: basicCredential, scopes: [] }],
+        ]),
       }),
       {},
       { auth: { basicB: "not-basic" } },

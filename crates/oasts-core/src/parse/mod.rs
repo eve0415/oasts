@@ -8575,7 +8575,7 @@ mod tests {
             + start;
         assert_eq!(
             &client.content[start..end],
-            "  security: [\n    [{ name: \"oauth\", kind: \"oauth2\", scopes: [\"read\"] }],\n    [{ name: \"http\", kind: \"bearer\", scopes: [] }],\n    [{ name: \"oidc\", kind: \"openIdConnect\", scopes: [] }],\n  ],\n"
+            "  security: authAlternatives([\n    [{ name: \"oauth\", apply: bearerCredential, scopes: [\"read\"] }],\n    [{ name: \"http\", apply: bearerCredential, scopes: [] }],\n    [{ name: \"oidc\", apply: bearerCredential, scopes: [] }],\n  ]),\n"
         );
     }
 

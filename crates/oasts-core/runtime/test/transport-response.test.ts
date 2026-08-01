@@ -33,7 +33,7 @@ function operation(overrides: Partial<OperationDescriptor> = {}): OperationDescr
     body: null,
     accept: "application/json",
     credentialHeaders: ["Authorization"],
-    security: [],
+    security: null,
     responses: [responsePlan()],
     baseUrl: { kind: "literal", value: "https://example.com/api" },
     fetchDefaults: {},

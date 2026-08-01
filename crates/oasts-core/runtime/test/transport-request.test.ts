@@ -4,8 +4,14 @@ import { describe, test } from "node:test";
 import type { RequestPhaseFailure } from "../result.ts";
 import { requestFailure as narrowRequestFailure } from "./result-narrowing.ts";
 import {
+  binaryBody,
   createTransport,
+  discriminatedBody,
   execute,
+  jsonBody,
+  multipartBody,
+  textBody,
+  urlencodedBody,
   type ExecutionResult,
   type OperationDescriptor,
 } from "../transport.ts";
@@ -25,7 +31,7 @@ function operation(overrides: Partial<OperationDescriptor> = {}): OperationDescr
     body: null,
     accept: null,
     credentialHeaders: ["Authorization"],
-    security: [],
+    security: null,
     responses: [],
     baseUrl: { kind: "literal", value: "https://descriptor.example/api" },
     fetchDefaults: {},
@@ -82,7 +88,7 @@ describe("request serialization and fetch contract", () => {
             allowReserved: false,
           },
         ],
-        body: { kind: "json", contentType: "application/json" },
+        body: jsonBody("application/json"),
         accept: "application/json, text/*",
         fetchDefaults: { credentials: "same-origin", redirect: "follow" },
       }),
@@ -261,14 +267,10 @@ describe("request serialization and fetch contract", () => {
       transport,
       operation({
         method: "POST",
-        body: {
-          kind: "form-urlencoded",
-          contentType: "application/x-www-form-urlencoded",
-          fields: [
-            { name: "name", required: true },
-            { name: "tag", required: false, explode: true },
-          ],
-        },
+        body: urlencodedBody("application/x-www-form-urlencoded", [
+          { name: "name", required: true },
+          { name: "tag", required: false, explode: true },
+        ]),
       }),
       { body: { name: "A B", tag: ["one", "two"] } },
     );
@@ -277,7 +279,7 @@ describe("request serialization and fetch contract", () => {
       transport,
       operation({
         method: "POST",
-        body: { kind: "binary", contentType: "application/octet-stream" },
+        body: binaryBody("application/octet-stream"),
       }),
       { body: bytes },
     );
@@ -299,21 +301,17 @@ describe("request serialization and fetch contract", () => {
       transport,
       operation({
         method: "POST",
-        body: {
-          kind: "form-urlencoded",
-          contentType: "application/x-www-form-urlencoded",
-          fields: [
-            { name: "profile", required: false, payloads: ["json"] },
-            {
-              name: "icon",
-              required: false,
-              payloads: ["text", "text"],
-              contentType: { kind: "selected", admitted: ["image/png", "image/jpeg"] },
-            },
-            { name: "f", required: false, payloads: ["text"] },
-            { name: "n", required: false, payloads: ["text"] },
-          ],
-        },
+        body: urlencodedBody("application/x-www-form-urlencoded", [
+          { name: "profile", required: false, payloads: ["json"] },
+          {
+            name: "icon",
+            required: false,
+            payloads: ["text", "text"],
+            contentType: { kind: "selected", admitted: ["image/png", "image/jpeg"] },
+          },
+          { name: "f", required: false, payloads: ["text"] },
+          { name: "n", required: false, payloads: ["text"] },
+        ]),
       }),
       {
         body: {
@@ -350,18 +348,14 @@ describe("request serialization and fetch contract", () => {
     });
     const wrapped = operation({
       method: "POST",
-      body: {
-        kind: "form-urlencoded",
-        contentType: "application/x-www-form-urlencoded",
-        fields: [
-          {
-            name: "data",
-            required: true,
-            payloads: ["json", "text"],
-            contentType: { kind: "selected", admitted: ["application/json", "text/plain"] },
-          },
-        ],
-      },
+      body: urlencodedBody("application/x-www-form-urlencoded", [
+        {
+          name: "data",
+          required: true,
+          payloads: ["json", "text"],
+          contentType: { kind: "selected", admitted: ["application/json", "text/plain"] },
+        },
+      ]),
     });
 
     await execute(transport, wrapped, {
@@ -388,38 +382,35 @@ describe("request serialization and fetch contract", () => {
       transport,
       operation({
         method: "POST",
-        body: {
-          kind: "multipart",
-          fields: [
-            {
-              name: "note",
-              required: true,
-              repeated: false,
-              wrapper: true,
-              payload: "text",
-              contentType: { kind: "selected", admitted: ["text/*"] },
-              filename: true,
-            },
-            {
-              name: "tags",
-              required: true,
-              repeated: true,
-              wrapper: false,
-              payload: "text",
-              contentType: { kind: "fixed", value: "text/plain" },
-              filename: false,
-            },
-            {
-              name: "optional",
-              required: false,
-              repeated: false,
-              wrapper: false,
-              payload: "text",
-              contentType: { kind: "none" },
-              filename: false,
-            },
-          ],
-        },
+        body: multipartBody([
+          {
+            name: "note",
+            required: true,
+            repeated: false,
+            wrapper: true,
+            payload: "text",
+            contentType: { kind: "selected", admitted: ["text/*"] },
+            filename: true,
+          },
+          {
+            name: "tags",
+            required: true,
+            repeated: true,
+            wrapper: false,
+            payload: "text",
+            contentType: { kind: "fixed", value: "text/plain" },
+            filename: false,
+          },
+          {
+            name: "optional",
+            required: false,
+            repeated: false,
+            wrapper: false,
+            payload: "text",
+            contentType: { kind: "none" },
+            filename: false,
+          },
+        ]),
       }),
       {
         body: {
@@ -459,21 +450,18 @@ describe("request serialization and fetch contract", () => {
     });
     const wrapped = operation({
       method: "POST",
-      body: {
-        kind: "multipart",
-        fields: [
-          {
-            name: "data",
-            required: true,
-            repeated: false,
-            wrapper: true,
-            payload: "json",
-            payloads: ["json", "text"],
-            contentType: { kind: "selected", admitted: ["application/json", "text/plain"] },
-            filename: false,
-          },
-        ],
-      },
+      body: multipartBody([
+        {
+          name: "data",
+          required: true,
+          repeated: false,
+          wrapper: true,
+          payload: "json",
+          payloads: ["json", "text"],
+          contentType: { kind: "selected", admitted: ["application/json", "text/plain"] },
+          filename: false,
+        },
+      ]),
     });
 
     await execute(transport, wrapped, {
@@ -504,13 +492,10 @@ describe("request serialization and fetch contract", () => {
       transport,
       operation({
         method: "POST",
-        body: {
-          kind: "content-discriminated",
-          arms: [
-            ["application/*", { kind: "json", contentType: "application/json" }],
-            ["*/*", { kind: "text", contentType: "text/plain" }],
-          ],
-        },
+        body: discriminatedBody([
+          ["application/*", jsonBody("application/json")],
+          ["*/*", textBody("text/plain")],
+        ]),
       }),
       { body: { contentType: "Application/Problem+JSON; Charset=UTF-8", body: { code: 4 } } },
     );
@@ -550,10 +535,7 @@ describe("request failures", () => {
   test("returns request-encode for missing, malformed, range, or unmatched content selections", async () => {
     const descriptor = operation({
       method: "POST",
-      body: {
-        kind: "content-discriminated",
-        arms: [["application/json", { kind: "json", contentType: "application/json" }]],
-      },
+      body: discriminatedBody([["application/json", jsonBody("application/json")]]),
     });
     for (const body of [
       { body: {} },
@@ -603,7 +585,7 @@ describe("request failures", () => {
       contentType: { kind: "fixed" as const, value: "text/plain" },
       filename: false,
     };
-    const descriptor = operation({ method: "POST", body: { kind: "multipart", fields: [field] } });
+    const descriptor = operation({ method: "POST", body: multipartBody([field]) });
 
     const result = requestFailure(
       await execute(createTransport({}), descriptor, { body: { note: null } }),

@@ -6,7 +6,13 @@ import { isRequestPhaseFailure, requestFailure } from "./result-narrowing.ts";
 import {
   createTransport,
   execute,
-  type BodyPlan,
+  type BodyEncoder,
+  binaryBody,
+  discriminatedBody,
+  jsonBody,
+  multipartBody,
+  textBody,
+  urlencodedBody,
   type ExecutionResult,
   type MultipartFieldPlan,
   type OperationDescriptor,
@@ -27,7 +33,7 @@ function operation(overrides: Partial<OperationDescriptor> = {}): OperationDescr
     body: null,
     accept: null,
     credentialHeaders: [],
-    security: [],
+    security: null,
     responses: [],
     baseUrl: { kind: "literal", value: "https://example.com/api" },
     fetchDefaults: {},
@@ -48,7 +54,7 @@ function multipartField(overrides: Partial<MultipartFieldPlan> = {}): MultipartF
   };
 }
 
-async function requestEncode(body: BodyPlan, value: unknown): Promise<ExecutionResult> {
+async function requestEncode(body: BodyEncoder, value: unknown): Promise<ExecutionResult> {
   return execute(
     createTransport({ fetch: async () => new Response(null, { status: 404 }) }),
     operation({ body }),
@@ -309,14 +315,10 @@ describe("descriptor boundary validation", () => {
   });
 
   test("validates form-urlencoded body shape and fields", async () => {
-    const plan: BodyPlan = {
-      kind: "form-urlencoded",
-      contentType: "application/x-www-form-urlencoded",
-      fields: [
-        { name: "required", required: true },
-        { name: "optional", required: false },
-      ],
-    };
+    const plan: BodyEncoder = urlencodedBody("application/x-www-form-urlencoded", [
+      { name: "required", required: true },
+      { name: "optional", required: false },
+    ]);
     for (const value of ["not an object", {}, { required: null }]) {
       const result = requestFailure(await requestEncode(plan, value));
       assert.equal(result.outcome, "request-encode");
@@ -337,18 +339,14 @@ describe("descriptor boundary validation", () => {
   });
 
   test("validates content-based urlencoded wrappers, media, and payload kinds", async () => {
-    const wrapped: BodyPlan = {
-      kind: "form-urlencoded",
-      contentType: "application/x-www-form-urlencoded",
-      fields: [
-        {
-          name: "icon",
-          required: false,
-          payloads: ["text", "text"],
-          contentType: { kind: "selected", admitted: ["image/png", "image/jpeg"] },
-        },
-      ],
-    };
+    const wrapped: BodyEncoder = urlencodedBody("application/x-www-form-urlencoded", [
+      {
+        name: "icon",
+        required: false,
+        payloads: ["text", "text"],
+        contentType: { kind: "selected", admitted: ["image/png", "image/jpeg"] },
+      },
+    ]);
     // A non-object wrapper is rejected; a contentType outside the admitted list does not select.
     for (const value of [
       { icon: "not a wrapper" },
@@ -358,22 +356,18 @@ describe("descriptor boundary validation", () => {
     }
 
     // A plan whose payloads list has no entry for the selected media type has no payload kind.
-    const missingKind: BodyPlan = {
-      kind: "form-urlencoded",
-      contentType: "application/x-www-form-urlencoded",
-      fields: [{ name: "x", required: false, payloads: [] }],
-    };
+    const missingKind: BodyEncoder = urlencodedBody("application/x-www-form-urlencoded", [
+      { name: "x", required: false, payloads: [] },
+    ]);
     assert.equal(
       requestFailure(await requestEncode(missingKind, { x: "v" })).outcome,
       "request-encode",
     );
 
     // A text payload requires a ParamValue, and a required content field cannot be missing.
-    const text: BodyPlan = {
-      kind: "form-urlencoded",
-      contentType: "application/x-www-form-urlencoded",
-      fields: [{ name: "note", required: true, payloads: ["text"] }],
-    };
+    const text: BodyEncoder = urlencodedBody("application/x-www-form-urlencoded", [
+      { name: "note", required: true, payloads: ["text"] },
+    ]);
     assert.equal(
       requestFailure(await requestEncode(text, { note: { deep: { x: 1 } } })).outcome,
       "request-encode",
@@ -382,17 +376,11 @@ describe("descriptor boundary validation", () => {
   });
 
   test("validates primitive top-level body plans", async () => {
-    const cases: readonly (readonly [BodyPlan, unknown])[] = [
-      [{ kind: "json", contentType: "application/json" }, undefined],
-      [{ kind: "text", contentType: "text/plain" }, 1],
-      [{ kind: "binary", contentType: "application/octet-stream" }, "bytes"],
-      [
-        {
-          kind: "content-discriminated",
-          arms: [["application/json", { kind: "json", contentType: "application/json" }]],
-        },
-        "not a wrapper",
-      ],
+    const cases: readonly (readonly [BodyEncoder, unknown])[] = [
+      [jsonBody("application/json"), undefined],
+      [textBody("text/plain"), 1],
+      [binaryBody("application/octet-stream"), "bytes"],
+      [discriminatedBody([["application/json", jsonBody("application/json")]]), "not a wrapper"],
     ];
     for (const [plan, value] of cases) {
       const result = requestFailure(await requestEncode(plan, value));
@@ -407,7 +395,7 @@ describe("descriptor boundary validation", () => {
           return new Response(null, { status: 404 });
         },
       }),
-      operation({ body: { kind: "text", contentType: "text/plain" } }),
+      operation({ body: textBody("text/plain") }),
       { body: "plain" },
     );
     assert.equal(text, "plain");
@@ -425,28 +413,25 @@ describe("multipart descriptor boundary", () => {
         },
       }),
       operation({
-        body: {
-          kind: "multipart",
-          fields: [
-            multipartField({
-              name: "selected",
-              wrapper: true,
-              contentType: { kind: "fixed", value: "text/plain; charset=utf-8" },
-            }),
-            multipartField({
-              name: "files",
-              repeated: true,
-              payload: "binary",
-              contentType: { kind: "fixed", value: "application/octet-stream" },
-              filename: true,
-            }),
-            multipartField({
-              name: "json",
-              payload: "json",
-              contentType: { kind: "none" },
-            }),
-          ],
-        },
+        body: multipartBody([
+          multipartField({
+            name: "selected",
+            wrapper: true,
+            contentType: { kind: "fixed", value: "text/plain; charset=utf-8" },
+          }),
+          multipartField({
+            name: "files",
+            repeated: true,
+            payload: "binary",
+            contentType: { kind: "fixed", value: "application/octet-stream" },
+            filename: true,
+          }),
+          multipartField({
+            name: "json",
+            payload: "json",
+            contentType: { kind: "none" },
+          }),
+        ]),
       }),
       {
         body: {
@@ -511,16 +496,12 @@ describe("multipart descriptor boundary", () => {
       ],
     ];
 
-    const notObject = requestFailure(
-      await requestEncode({ kind: "multipart", fields: [] }, "not an object"),
-    );
+    const notObject = requestFailure(await requestEncode(multipartBody([]), "not an object"));
     assert.equal(notObject.outcome, "request-encode");
 
     for (const [field, value] of cases) {
       const body = value === undefined ? {} : { value };
-      const result = requestFailure(
-        await requestEncode({ kind: "multipart", fields: [field] }, body),
-      );
+      const result = requestFailure(await requestEncode(multipartBody([field]), body));
       assert.equal(result.outcome, "request-encode");
     }
   });

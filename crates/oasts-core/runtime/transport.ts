@@ -181,20 +181,12 @@ export type MultipartFieldPlan = {
   readonly filename: boolean;
 };
 
-export type BodyPlan =
-  | { readonly kind: 'json'; readonly contentType: string }
-  | { readonly kind: 'text'; readonly contentType: string }
-  | { readonly kind: 'binary'; readonly contentType: string }
-  | {
-      readonly kind: 'form-urlencoded';
-      readonly contentType: string;
-      readonly fields: readonly UrlencodedFieldPlan[];
-    }
-  | { readonly kind: 'multipart'; readonly fields: readonly MultipartFieldPlan[] }
-  | {
-      readonly kind: 'content-discriminated';
-      readonly arms: readonly (readonly [string, BodyPlan])[];
-    };
+// A request body ships its encoder rather than a `kind` tag, for the same reason a multipart
+// response entry ships its decoder (see `MultipartResponseDecoder`): a tag would force `execute` to
+// name every branch statically, so every generated client — JSON body, no body at all — would carry
+// the multipart and urlencoded encoders. Reached only through the descriptor, an operation links the
+// one encoder it declares and a bodyless operation links none.
+export type BodyEncoder = (input: unknown) => Promise<SerializedBody>;
 
 // The non-exact half of the response-key space, statically known to the runtime. Keeping it a
 // literal space rather than plain `string` is what keeps an `outcome` check narrowing: no failure
@@ -236,19 +228,10 @@ export type OperationDescriptor = {
   readonly method: string;
   readonly path: readonly (readonly PathPart[])[];
   readonly params: readonly ParamPlan[];
-  readonly body: BodyPlan | null;
+  readonly body: BodyEncoder | null;
   readonly accept: string | null;
   readonly credentialHeaders: readonly string[];
-  readonly security: readonly (readonly ({
-    readonly name: string;
-    readonly scopes: readonly string[];
-  } & (
-    | {
-        readonly kind: 'basic' | 'bearer' | 'apiKeyHeader' | 'apiKeyQuery' | 'apiKeyCookie' | 'oauth2' | 'openIdConnect' | 'mutualTls';
-        readonly param?: string;
-      }
-    | { readonly kind: 'httpScheme'; readonly scheme: string }
-  ))[])[];
+  readonly security: AuthResolver | null;
   readonly responses: readonly ResponsePlan[];
   readonly baseUrl:
     | { readonly kind: 'runtime' }
@@ -310,7 +293,7 @@ function isTimeoutReason(reason: unknown): boolean {
   return reason instanceof DOMException && reason.name === 'TimeoutError';
 }
 
-type SerializedBody = {
+export type SerializedBody = {
   readonly body: BodyInit | null;
   readonly contentType: string | null;
 };
@@ -368,7 +351,81 @@ function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-type SecurityUse = OperationDescriptor['security'][number][number];
+// A security requirement member carries its own credential serializer instead of a scheme-kind tag,
+// for the same reason the body carries its encoder: a tag would make `serializeSelectedAuth` name
+// every scheme statically, so a bearer-only client would still link RFC 7617 basic encoding, the
+// query-key percent encoder and the ambient-credential sentinels. `param` is the declared API key
+// parameter name and `scheme` the generic HTTP auth-scheme token; each applier reads the one it needs.
+export type SecurityUse = {
+  readonly name: string;
+  readonly scopes: readonly string[];
+  readonly apply: CredentialApplier;
+  readonly param?: string;
+  readonly scheme?: string;
+};
+
+/** What one credential puts on the request. An ambiently delivered credential contributes neither. */
+export type AppliedCredential = {
+  readonly headers?: readonly (readonly [string, string])[];
+  // [declared parameter name, already-percent-encoded `name=value` component]
+  readonly query?: readonly (readonly [string, string])[];
+};
+
+/** Validates one credential and says what it contributes, or returns the failure message. */
+export type CredentialApplier = (
+  use: SecurityUse,
+  credential: unknown,
+) => AppliedCredential | string;
+
+// What `execute` needs back from an operation's security requirement: the credential headers to
+// merge, and the scheme names the selected alternative used (null when the call went out
+// anonymous) for the middleware context. A failure short-circuits the whole request.
+export type AuthResolution =
+  | {
+      readonly kind: 'resolved';
+      readonly headers: readonly (readonly [string, string])[];
+      readonly selected: readonly string[] | null;
+    }
+  | { readonly kind: 'failure'; readonly result: RequestPhaseFailure };
+
+// An operation's security requirement ships as a resolver rather than the alternatives table, for
+// the same reason its body ships as an encoder: selection and credential serialization would
+// otherwise be named statically by `execute`, so an operation with no security requirement at all
+// would still link provider selection, RFC 6750 token validation, RFC 7617 basic encoding and the
+// rest. `descriptor.security` is null for such an operation and nothing above is reachable.
+export type AuthResolver = (
+  transport: Transport,
+  operationId: string,
+  options: CallOptions | undefined,
+  url: URL,
+) => Promise<AuthResolution>;
+
+/** Resolves a credential for the first satisfiable alternative, in declared order. */
+export function authAlternatives(
+  alternatives: readonly (readonly SecurityUse[])[],
+): AuthResolver {
+  return async (transport, operationId, options, url) => {
+    const selection = await selectAuth(transport, alternatives, operationId, options, url);
+    if (selection.kind === 'failure') {
+      return selection;
+    }
+    const members = selection.kind === 'selected' ? selection.members : [];
+    const serialized = serializeSelectedAuth(url, members);
+    if (typeof serialized === 'string') {
+      return {
+        kind: 'failure',
+        result: authFailureResult(serialized, selection.triedAlternatives),
+      };
+    }
+    return {
+      kind: 'resolved',
+      headers: serialized.headers,
+      selected: selection.kind === 'selected'
+        ? selection.members.map((member) => member.use.name)
+        : null,
+    };
+  };
+}
 
 type SelectedAuthMember = {
   readonly use: SecurityUse;
@@ -448,18 +505,15 @@ function authSource<S extends string>(
     : { kind: 'provider', use, provider: provider.provider };
 }
 
-async function selectAuth<S extends string>(
-  transport: Transport<S>,
-  descriptor: OperationDescriptor,
+async function selectAuth(
+  transport: Transport,
+  security: readonly (readonly SecurityUse[])[],
+  operationId: string,
   options: CallOptions | undefined,
   url: URL,
 ): Promise<AuthSelection> {
-  if (descriptor.security.length === 0) {
-    return { kind: 'anonymous', triedAlternatives: [] };
-  }
-
   const perCall = perCallAuth(options);
-  for (const [index, alternative] of descriptor.security.entries()) {
+  for (const [index, alternative] of security.entries()) {
     if (
       alternative.length !== 0 &&
       perCall !== undefined &&
@@ -468,7 +522,7 @@ async function selectAuth<S extends string>(
       return {
         kind: 'selected',
         members: alternative.map((use) => ({ use, credential: perCall[use.name] })),
-        triedAlternatives: descriptor.security
+        triedAlternatives: security
           .slice(0, index + 1)
           .filter((candidate) => candidate.length !== 0)
           .map(alternativeNames),
@@ -481,7 +535,7 @@ async function selectAuth<S extends string>(
   // a source — including members after a missing one — so a missing member marks the alternative
   // ineligible without ending the presence scan.
   let sawAnySource = false;
-  for (const alternative of descriptor.security) {
+  for (const alternative of security) {
     if (alternative.length === 0) {
       continue;
     }
@@ -517,7 +571,7 @@ async function selectAuth<S extends string>(
         };
       }
       const context: AuthContext = Object.freeze({
-        operationId: descriptor.operationId,
+        operationId,
         scheme: source.use.name,
         scopes: source.use.scopes,
         url: url.toString(),
@@ -546,7 +600,7 @@ async function selectAuth<S extends string>(
     }
   }
 
-  const anonymousCount = descriptor.security.filter(
+  const anonymousCount = security.filter(
     (alternative) => alternative.length === 0,
   ).length;
   if (anonymousCount > 0 && (!sawAnySource || options?.auth === 'anonymous')) {
@@ -600,6 +654,108 @@ type SerializedAuth = {
   readonly headers: readonly (readonly [string, string])[];
 };
 
+/** RFC 6750 bearer tokens — HTTP bearer, OAuth 2.0 and OpenID Connect serialize identically. */
+export function bearerCredential(use: SecurityUse, credential: unknown): AppliedCredential | string {
+  if (typeof credential !== 'string' || !/^[A-Za-z0-9._~+/-]+=*$/u.test(credential)) {
+    return `Authentication scheme ${use.name} requires an RFC 6750 b64token`;
+  }
+  return { headers: [['Authorization', `Bearer ${credential}`]] };
+}
+
+/** RFC 7617 basic credentials: NFC normalize, reject control characters and a colon, then Base64. */
+export function basicCredential(use: SecurityUse, credential: unknown): AppliedCredential | string {
+  if (!isBasicCredential(credential)) {
+    return `Authentication scheme ${use.name} requires a basic username and password credential`;
+  }
+  const username = credential.username.normalize('NFC');
+  const password = credential.password.normalize('NFC');
+  if (containsBasicControl(username) || containsBasicControl(password)) {
+    return `Authentication scheme ${use.name} basic credential contains a control character`;
+  }
+  if (username.includes(':')) {
+    return `Authentication scheme ${use.name} basic username contains a colon`;
+  }
+  return { headers: [['Authorization', `Basic ${utf8Base64(`${username}:${password}`)}`]] };
+}
+
+/** A generic `Authorization: <scheme> <credentials>` for an HTTP scheme this client cannot compute. */
+export function httpSchemeCredential(
+  use: SecurityUse,
+  credential: unknown,
+): AppliedCredential | string {
+  if (!isHttpSchemeCredential(credential)) {
+    return `Authentication scheme ${use.name} requires a credentials string`;
+  }
+  if (use.scheme === undefined) {
+    return `Authentication scheme ${use.name} has no declared auth-scheme token`;
+  }
+  if (containsHeaderControl(use.scheme) || containsHeaderControl(credential.credentials)) {
+    return `Authentication scheme ${use.name} contains a control character`;
+  }
+  return { headers: [['Authorization', `${use.scheme} ${credential.credentials}`]] };
+}
+
+/** A header API key, checked against the Headers value contract before Request construction. */
+export function headerKeyCredential(
+  use: SecurityUse,
+  credential: unknown,
+): AppliedCredential | string {
+  if (typeof credential !== 'string') {
+    return `Authentication scheme ${use.name} header API key must be a string`;
+  }
+  if (containsHeaderControl(credential)) {
+    return `Authentication scheme ${use.name} header API key contains a control character`;
+  }
+  for (let index = 0; index < credential.length; index += 1) {
+    if (credential.charCodeAt(index) > 0xff) {
+      return `Authentication scheme ${use.name} header API key violates ByteString`;
+    }
+  }
+  if (/^[ \t]|[ \t]$/u.test(credential)) {
+    return `Authentication scheme ${use.name} header API key has edge whitespace`;
+  }
+  if (use.param === undefined) {
+    return `Authentication scheme ${use.name} has no declared header name`;
+  }
+  return { headers: [[use.param, credential]] };
+}
+
+/** A query API key, percent-encoded by the ordinary scalar form-style query encoder. */
+export function queryKeyCredential(
+  use: SecurityUse,
+  credential: unknown,
+): AppliedCredential | string {
+  if (typeof credential !== 'string') {
+    return `Authentication scheme ${use.name} query API key must be a string`;
+  }
+  if (use.param === undefined) {
+    return `Authentication scheme ${use.name} has no declared query name`;
+  }
+  return { query: [[use.param, serializeQueryFormExplode(use.param, credential, false)]] };
+}
+
+/** A cookie API key: WHATWG Fetch forbids a `Cookie` request header, so the cookie store supplies it. */
+export function cookieKeyCredential(
+  use: SecurityUse,
+  credential: unknown,
+): AppliedCredential | string {
+  if (credential !== AmbientCookieCredential) {
+    return `Authentication scheme ${use.name} requires the ambient cookie credential`;
+  }
+  return {};
+}
+
+/** Mutual TLS: the certificate is threaded through a custom fetch, so nothing goes on the request. */
+export function mutualTlsCredential(
+  use: SecurityUse,
+  credential: unknown,
+): AppliedCredential | string {
+  if (credential !== AmbientClientCertificate) {
+    return `Authentication scheme ${use.name} requires the ambient client certificate credential`;
+  }
+  return {};
+}
+
 function serializeSelectedAuth(
   url: URL,
   members: readonly SelectedAuthMember[],
@@ -608,92 +764,26 @@ function serializeSelectedAuth(
   const query: string[] = [];
   let occupiedQueryNames: Set<string> | undefined;
   for (const { use, credential } of members) {
-    if (use.kind === 'bearer' || use.kind === 'oauth2' || use.kind === 'openIdConnect') {
-      if (
-        typeof credential !== 'string' ||
-        !/^[A-Za-z0-9._~+/-]+=*$/u.test(credential)
-      ) {
-        return `Authentication scheme ${use.name} requires an RFC 6750 b64token`;
-      }
-      headers.push(['Authorization', `Bearer ${credential}`]);
-      continue;
+    // A hand-built or drifted descriptor must fail closed rather than throw out of `execute` or
+    // silently send the request without this member's credential.
+    if (typeof use.apply !== 'function') {
+      return `Authentication scheme ${use.name} has no credential serializer`;
     }
-    if (use.kind === 'basic') {
-      if (!isBasicCredential(credential)) {
-        return `Authentication scheme ${use.name} requires a basic username and password credential`;
-      }
-      const username = credential.username.normalize('NFC');
-      const password = credential.password.normalize('NFC');
-      if (containsBasicControl(username) || containsBasicControl(password)) {
-        return `Authentication scheme ${use.name} basic credential contains a control character`;
-      }
-      if (username.includes(':')) {
-        return `Authentication scheme ${use.name} basic username contains a colon`;
-      }
-      headers.push(['Authorization', `Basic ${utf8Base64(`${username}:${password}`)}`]);
-      continue;
+    const applied = use.apply(use, credential);
+    if (typeof applied === 'string') {
+      return applied;
     }
-    if (use.kind === 'httpScheme') {
-      if (!isHttpSchemeCredential(credential)) {
-        return `Authentication scheme ${use.name} requires a credentials string`;
-      }
-      if (containsHeaderControl(use.scheme) || containsHeaderControl(credential.credentials)) {
-        return `Authentication scheme ${use.name} contains a control character`;
-      }
-      headers.push(['Authorization', `${use.scheme} ${credential.credentials}`]);
-      continue;
+    if (applied.headers !== undefined) {
+      headers.push(...applied.headers);
     }
-    if (use.kind === 'apiKeyHeader') {
-      if (typeof credential !== 'string') {
-        return `Authentication scheme ${use.name} header API key must be a string`;
-      }
-      if (containsHeaderControl(credential)) {
-        return `Authentication scheme ${use.name} header API key contains a control character`;
-      }
-      for (let index = 0; index < credential.length; index += 1) {
-        if (credential.charCodeAt(index) > 0xff) {
-          return `Authentication scheme ${use.name} header API key violates ByteString`;
-        }
-      }
-      if (/^[ \t]|[ \t]$/u.test(credential)) {
-        return `Authentication scheme ${use.name} header API key has edge whitespace`;
-      }
-      if (use.param === undefined) {
-        return `Authentication scheme ${use.name} has no declared header name`;
-      }
-      headers.push([use.param, credential]);
-      continue;
-    }
-    if (use.kind === 'apiKeyQuery') {
-      if (typeof credential !== 'string') {
-        return `Authentication scheme ${use.name} query API key must be a string`;
-      }
-      if (use.param === undefined) {
-        return `Authentication scheme ${use.name} has no declared query name`;
-      }
+    for (const [name, component] of applied.query ?? []) {
       occupiedQueryNames ??= new Set(url.searchParams.keys());
-      if (occupiedQueryNames.has(use.param)) {
-        return `Authentication query parameter ${use.param} is already present`;
+      if (occupiedQueryNames.has(name)) {
+        return `Authentication query parameter ${name} is already present`;
       }
-      query.push(serializeQueryFormExplode(use.param, credential, false));
-      occupiedQueryNames.add(use.param);
-      continue;
+      query.push(component);
+      occupiedQueryNames.add(name);
     }
-    if (use.kind === 'apiKeyCookie') {
-      if (credential !== AmbientCookieCredential) {
-        return `Authentication scheme ${use.name} requires the ambient cookie credential`;
-      }
-      continue;
-    }
-    if (use.kind === 'mutualTls') {
-      if (credential !== AmbientClientCertificate) {
-        return `Authentication scheme ${use.name} requires the ambient client certificate credential`;
-      }
-      continue;
-    }
-    // The kind union is closed at generation time; a hand-built or drifted descriptor must
-    // fail closed rather than silently send the request without this member's credential.
-    return `Authentication scheme ${use.name} uses an unrecognized security scheme kind`;
   }
   if (query.length !== 0) {
     const prefix = url.search.length === 0 ? '' : `${url.search.slice(1)}&`;
@@ -962,15 +1052,24 @@ function selectedMediaType(
   throw new TypeError('contentType does not match an admitted media type');
 }
 
-function urlencodedBody(
-  plan: Extract<BodyPlan, { readonly kind: 'form-urlencoded' }>,
+/** A `application/x-www-form-urlencoded` request body over the declared fields. */
+export function urlencodedBody(
+  contentType: string,
+  fields: readonly UrlencodedFieldPlan[],
+): BodyEncoder {
+  return (input) => Promise.resolve(serializeUrlencoded(contentType, fields, input));
+}
+
+function serializeUrlencoded(
+  contentType: string,
+  plan: readonly UrlencodedFieldPlan[],
   input: unknown,
 ): SerializedBody {
   if (!isRecord(input)) {
     throw new TypeError('form-urlencoded body must be an object');
   }
   const fields: UrlencodedField[] = [];
-  for (const field of plan.fields) {
+  for (const field of plan) {
     const value = input[field.name];
     if (value === undefined) {
       if (field.required) {
@@ -1026,7 +1125,7 @@ function urlencodedBody(
       allowReserved: field.allowReserved,
     });
   }
-  return { body: encodeFormUrlencodedBody(fields), contentType: plan.contentType };
+  return { body: encodeFormUrlencodedBody(fields), contentType };
 }
 
 function urlencodedWrapper(value: unknown): {
@@ -1133,15 +1232,20 @@ async function multipartPart(plan: MultipartFieldPlan, value: unknown): Promise<
   };
 }
 
-async function multipartBody(
-  plan: Extract<BodyPlan, { readonly kind: 'multipart' }>,
+/** A `multipart/form-data` request body over the declared fields. */
+export function multipartBody(fields: readonly MultipartFieldPlan[]): BodyEncoder {
+  return (input) => serializeMultipart(fields, input);
+}
+
+async function serializeMultipart(
+  plan: readonly MultipartFieldPlan[],
   input: unknown,
 ): Promise<SerializedBody> {
   if (!isRecord(input)) {
     throw new TypeError('multipart body must be an object');
   }
   const parts: MultipartPart[] = [];
-  for (const field of plan.fields) {
+  for (const field of plan) {
     const value = input[field.name];
     if (value === undefined) {
       if (field.required) {
@@ -1167,45 +1271,55 @@ async function multipartBody(
   return { body: Uint8Array.from(encoded.body), contentType: encoded.contentTypeHeader };
 }
 
-async function serializeBody(plan: BodyPlan | null, input: unknown): Promise<SerializedBody> {
-  if (plan === null) {
-    return { body: null, contentType: null };
-  }
-  if (plan.kind === 'content-discriminated') {
+/** A JSON request body under the declared media type. */
+export function jsonBody(contentType: string): BodyEncoder {
+  return (input) => {
+    const body = JSON.stringify(input);
+    if (body === undefined) {
+      throw new TypeError('JSON body is not serializable');
+    }
+    return Promise.resolve({ body, contentType });
+  };
+}
+
+/** A text request body under the declared media type. */
+export function textBody(contentType: string): BodyEncoder {
+  return (input) => {
+    if (typeof input !== 'string') {
+      throw new TypeError('text body must be a string');
+    }
+    return Promise.resolve({ body: input, contentType });
+  };
+}
+
+/** A binary request body under the declared media type. */
+export function binaryBody(contentType: string): BodyEncoder {
+  return (input) => {
+    if (!(input instanceof Uint8Array)) {
+      throw new TypeError('binary body must be a Uint8Array');
+    }
+    return Promise.resolve({ body: Uint8Array.from(input), contentType });
+  };
+}
+
+// The caller picks the wire media type, so the arm encoders are the union of body kinds this one
+// operation declares — an arm the document never names is still never linked.
+/** A request body whose media type the caller selects from the declared arms. */
+export function discriminatedBody(
+  arms: readonly (readonly [string, BodyEncoder])[],
+): BodyEncoder {
+  return async (input) => {
     if (!isRecord(input)) {
       throw new TypeError('content-discriminated body requires a wrapper');
     }
     const selected = selectedMediaType(
       input.contentType,
-      plan.arms.map(([contentType]) => contentType),
+      arms.map(([contentType]) => contentType),
     );
-    const arm = plan.arms[selected.index];
-    const encoded = await serializeBody(arm[1], input.body);
+    const arm = arms[selected.index];
+    const encoded = await arm[1](input.body);
     return { body: encoded.body, contentType: selected.concrete };
-  }
-  if (plan.kind === 'form-urlencoded') {
-    return urlencodedBody(plan, input);
-  }
-  if (plan.kind === 'multipart') {
-    return multipartBody(plan, input);
-  }
-  if (plan.kind === 'json') {
-    const body = JSON.stringify(input);
-    if (body === undefined) {
-      throw new TypeError('JSON body is not serializable');
-    }
-    return { body, contentType: plan.contentType };
-  }
-  if (plan.kind === 'text') {
-    if (typeof input !== 'string') {
-      throw new TypeError('text body must be a string');
-    }
-    return { body: input, contentType: plan.contentType };
-  }
-  if (!(input instanceof Uint8Array)) {
-    throw new TypeError('binary body must be a Uint8Array');
-  }
-  return { body: Uint8Array.from(input), contentType: plan.contentType };
+  };
 }
 
 function headersFromPairs(pairs: readonly (readonly [string, string])[]): Headers {
@@ -1798,14 +1912,17 @@ export async function execute<S extends string = never>(
     return encodeFailure(cause);
   }
 
-  const selection = await selectAuth(transport, descriptor, options, url);
-  if (selection.kind === 'failure') {
-    return selection.result;
-  }
-  const members = selection.kind === 'selected' ? selection.members : [];
-  const serializedAuth = serializeSelectedAuth(url, members);
-  if (typeof serializedAuth === 'string') {
-    return authFailureResult(serializedAuth, selection.triedAlternatives);
+  // An operation with no security requirement carries no resolver, so nothing here reaches the
+  // selection and credential-serialization machinery.
+  let authHeaders: readonly (readonly [string, string])[] = [];
+  let selectedAuth: readonly string[] | null = null;
+  if (descriptor.security !== null) {
+    const resolved = await descriptor.security(transport, descriptor.operationId, options, url);
+    if (resolved.kind === 'failure') {
+      return resolved.result;
+    }
+    authHeaders = resolved.headers;
+    selectedAuth = resolved.selected;
   }
 
   let finalRequest: Request;
@@ -1813,14 +1930,16 @@ export async function execute<S extends string = never>(
   let context: OperationContext;
   let cookies: readonly CookieParam[];
   try {
-    const serialized = await serializeBody(descriptor.body, input.body);
+    const serialized: SerializedBody = descriptor.body === null
+      ? { body: null, contentType: null }
+      : await descriptor.body(input.body);
     const headers = mergedHeaders(
       transport,
       descriptor,
       input,
       options,
       serialized.contentType,
-      serializedAuth.headers,
+      authHeaders,
     );
     cookies = operationCookieParams(descriptor, input);
     const splitOptions = fetchOptions(transport, descriptor, options);
@@ -1839,9 +1958,7 @@ export async function execute<S extends string = never>(
       operationId: descriptor.operationId,
       method: descriptor.method,
       url: new URL(finalRequest.url),
-      selectedAuth: selection.kind === 'selected'
-        ? selection.members.map((member) => member.use.name)
-        : null,
+      selectedAuth,
     });
   } catch (cause) {
     return encodeFailure(cause);
