@@ -27,3 +27,24 @@ if [[ "$status" -ne 0 ]]; then
   exit 1
 fi
 echo "zod-gate: all $count frozen files match"
+
+# The supported zod range lives in two places that cannot see each other: the peer range consumers
+# install against, and the constant the generator warns from. They only stay honest if something
+# compares them.
+source=crates/oasts-core/src/zod_peer.rs
+declared=$(node -e 'process.stdout.write(require("./packages/oasts/package.json").peerDependencies.zod)')
+major=$(sed -n 's/^const SUPPORTED_MAJOR: u64 = \([0-9]\+\);$/\1/p' "$source")
+minor=$(sed -n 's/^const MINIMUM_MINOR: u64 = \([0-9]\+\);$/\1/p' "$source")
+if [[ -z "$major" || -z "$minor" ]]; then
+  echo "zod-gate: could not read the supported zod version from $source" >&2
+  exit 1
+fi
+if [[ "$declared" != "^$major.$minor.0" ]]; then
+  echo "zod-gate: peer range '$declared' does not match $source's '^$major.$minor.0'" >&2
+  exit 1
+fi
+if ! grep -qF "needs \`zod\` $declared in your project" README.md; then
+  echo "zod-gate: README does not name the supported zod range '$declared'" >&2
+  exit 1
+fi
+echo "zod-gate: peer range, generator, and README agree on $declared"

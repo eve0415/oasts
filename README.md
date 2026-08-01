@@ -28,7 +28,7 @@ Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtim
 | --- | --- |
 | TypeScript types | ✅ |
 | Typed fetch client | ✅ |
-| Zod schemas | ✅ |
+| Zod schemas | ✅ — needs `zod` ^4.4.0 in your project |
 | Standalone validators | ✅ |
 | TanStack Query hooks | Planned |
 | MSW handlers | Planned |

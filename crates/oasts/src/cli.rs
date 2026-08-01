@@ -14,6 +14,7 @@ use oasts_core::diag::{self, Diagnostic, DiagnosticSink};
 use oasts_core::emit::GeneratedFile;
 use oasts_core::pipeline;
 use oasts_core::writer::{DriftState, check_drift, write};
+use oasts_core::zod_peer;
 
 const CODE_CURRENT_DIR: &str = "OASTS0001";
 
@@ -154,6 +155,14 @@ fn generate(
             let _ = writeln!(stderr, "{}: {}", entry.state, entry.relative_path);
         }
         return 1;
+    }
+
+    // Only on the write path: `--check` compares bytes for CI, where the consumer's node_modules
+    // is neither inspected nor relevant.
+    if config.artifacts.zod.enabled
+        && let Some(diagnostic) = zod_peer::diagnose(&config.output)
+    {
+        let _ = render_diagnostics(vec![diagnostic], stderr);
     }
 
     let generated_count = files.len();
@@ -835,5 +844,83 @@ mod tests {
         let (code, _, stderr) = invoke(&["oasts", "generate"], temp.path());
         assert_eq!(code, 2);
         assert!(stderr.contains("OASTS0011"));
+    }
+
+    /// A project with `zod` installed at `version`, emitting the artifacts named by `artifacts`.
+    fn project_with_installed_zod(artifacts: &str, version: &str) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("openapi.json"),
+            r#"{"openapi":"3.1.0","paths":{},"components":{"schemas":{"Thing":{"type":"string"}}}}"#,
+        )
+        .expect("OpenAPI JSON");
+        fs::write(
+            temp.path().join("oasts.json"),
+            format!(
+                r#"{{"schemaVersion":1,"input":{{"path":"./openapi.json"}},"output":"./generated","artifacts":{artifacts}}}"#
+            ),
+        )
+        .expect("config JSON");
+        let package = temp.path().join("node_modules").join("zod");
+        fs::create_dir_all(&package).expect("package directory");
+        fs::write(
+            package.join("package.json"),
+            format!("{{\"name\":\"zod\",\"version\":\"{version}\"}}"),
+        )
+        .expect("package manifest");
+        temp
+    }
+
+    #[test]
+    fn generate_warns_when_the_installed_zod_is_out_of_range() {
+        let temp = project_with_installed_zod(r#"{"types":true,"zod":true}"#, "4.1.0");
+        let (code, _, stderr) = invoke(
+            &["oasts", "generate", "--config", "oasts.json"],
+            temp.path(),
+        );
+        assert_eq!(code, 0);
+        assert!(stderr.contains("OASTS0241"), "{stderr}");
+        assert!(stderr.contains("^4.4.0"), "{stderr}");
+    }
+
+    #[test]
+    fn generate_stays_quiet_when_the_installed_zod_is_supported() {
+        let temp = project_with_installed_zod(r#"{"types":true,"zod":true}"#, "4.4.0");
+        let (code, _, stderr) = invoke(
+            &["oasts", "generate", "--config", "oasts.json"],
+            temp.path(),
+        );
+        assert_eq!(code, 0);
+        assert!(!stderr.contains("OASTS0241"), "{stderr}");
+    }
+
+    #[test]
+    fn check_mode_does_not_inspect_the_installed_zod() {
+        let temp = project_with_installed_zod(r#"{"types":true,"zod":true}"#, "4.1.0");
+        assert_eq!(
+            invoke(
+                &["oasts", "generate", "--config", "oasts.json"],
+                temp.path()
+            )
+            .0,
+            0
+        );
+        let (code, _, stderr) = invoke(
+            &["oasts", "generate", "--config", "oasts.json", "--check"],
+            temp.path(),
+        );
+        assert_eq!(code, 0);
+        assert!(!stderr.contains("OASTS0241"), "{stderr}");
+    }
+
+    #[test]
+    fn a_run_without_the_zod_artifact_ignores_the_installed_zod() {
+        let temp = project_with_installed_zod(r#"{"types":true}"#, "4.1.0");
+        let (code, _, stderr) = invoke(
+            &["oasts", "generate", "--config", "oasts.json"],
+            temp.path(),
+        );
+        assert_eq!(code, 0);
+        assert!(!stderr.contains("OASTS0241"), "{stderr}");
     }
 }

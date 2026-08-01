@@ -13,6 +13,7 @@ use oasts_core::config::{self, ResolvedConfig};
 use oasts_core::diag::{Diagnostic, DiagnosticSink, Severity};
 use oasts_core::pipeline;
 use oasts_core::writer::{DriftState, check_drift, write};
+use oasts_core::zod_peer;
 
 /// A config discovery result exposed to the Node CLI.
 #[napi(object)]
@@ -182,8 +183,8 @@ pub fn run(options: RunOptions) -> RunResult {
         return failure(sink);
     }
     let warnings = sink.into_sorted_vec();
-    let rendered_warnings = oasts_core::diag::render_to_string(warnings.clone());
-    let diagnostics_js = warnings.iter().map(to_diagnostic_js).collect::<Vec<_>>();
+    let mut rendered_warnings = oasts_core::diag::render_to_string(warnings.clone());
+    let mut diagnostics_js = warnings.iter().map(to_diagnostic_js).collect::<Vec<_>>();
 
     if !should_emit {
         return RunResult {
@@ -225,6 +226,17 @@ pub fn run(options: RunOptions) -> RunResult {
             rendered_stderr: drift_lines,
             diagnostics: diagnostics_js,
         };
+    }
+
+    // Only on the write path: `--check` compares bytes for CI, where the consumer's node_modules
+    // is neither inspected nor relevant.
+    if config.artifacts.zod.enabled
+        && let Some(diagnostic) = zod_peer::diagnose(&config.output)
+    {
+        rendered_warnings.push_str(&oasts_core::diag::render_to_string(vec![
+            diagnostic.clone(),
+        ]));
+        diagnostics_js.push(to_diagnostic_js(&diagnostic));
     }
 
     let generated_count = files.len();
@@ -441,5 +453,61 @@ mod tests {
         assert_eq!(converted.source_id.as_deref(), Some("config.yaml"));
         assert_eq!((converted.line, converted.col), (Some(3), Some(7)));
         assert_eq!(converted.json_pointer.as_deref(), Some("/input"));
+    }
+
+    /// A zod-artifact project with an out-of-range `zod` installed beside it.
+    fn project_with_outdated_zod() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("openapi.yaml"),
+            "openapi: 3.1.0\npaths: {}\ncomponents:\n  schemas:\n    Thing:\n      type: string\n",
+        )
+        .expect("OpenAPI YAML");
+        fs::write(
+            temp.path().join("oasts.yaml"),
+            "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\noutput: ./generated\nartifacts:\n  types: true\n  zod: true\n",
+        )
+        .expect("config YAML");
+        let package = temp.path().join("node_modules").join("zod");
+        fs::create_dir_all(&package).expect("package directory");
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"zod","version":"4.1.0"}"#,
+        )
+        .expect("package manifest");
+        temp
+    }
+
+    #[test]
+    fn run_surfaces_the_zod_peer_warning_on_the_write_path() {
+        let temp = project_with_outdated_zod();
+        let generated = run(options(&temp, "generate", false));
+        assert_eq!(generated.exit_code, 0, "{}", generated.rendered_stderr);
+        assert!(
+            generated
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "OASTS0241"),
+            "{}",
+            generated.rendered_stderr
+        );
+        assert!(generated.rendered_stderr.contains("^4.4.0"));
+    }
+
+    #[test]
+    fn run_omits_the_zod_peer_warning_in_check_mode() {
+        let temp = project_with_outdated_zod();
+        assert_eq!(run(options(&temp, "generate", false)).exit_code, 0);
+
+        let checked = run(options(&temp, "generate", true));
+        assert_eq!(checked.exit_code, 0, "{}", checked.rendered_stderr);
+        assert!(
+            !checked
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "OASTS0241"),
+            "{}",
+            checked.rendered_stderr
+        );
     }
 }

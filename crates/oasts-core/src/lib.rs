@@ -14,6 +14,7 @@ pub mod semantic;
 mod syntax;
 pub mod transform;
 pub mod writer;
+pub mod zod_peer;
 
 /// Crate version string embedded in generated file headers.
 pub fn version() -> &'static str {
