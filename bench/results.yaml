@@ -10,19 +10,19 @@ metadata:
     rustc: "rustc 1.97.1 (8bab26f4f 2026-07-14)"
     node: "v24.18.1"
     tsc: "Version 7.0.2"
-  manifestCommit: "cdbf8f1552efba7c22d6d630710191f0e73c6dd4"
-  measuredAt: "2026-08-01T01:26:51Z"
+  manifestCommit: "7cb09ddf3bec48f1d3c644cb3fe7ba0c9b5ce759"
+  measuredAt: "2026-08-01T13:44:46Z"
 results:
   - fixture: "github-3.0"
     config: "oasts.yaml"
     class: "large"
-    coldMs: 96.286919
-    warmP50MsRound1: 82.507943
-    warmP50MsRound2: 80.323982
-    warmP50MsGated: 82.507943
-    peakRssBytes: 134787072
-    tscMs: 429.198655
-    outputBytes: 5358614
+    coldMs: 97.761362
+    warmP50MsRound1: 80.44298900000001
+    warmP50MsRound2: 79.183905
+    warmP50MsGated: 80.44298900000001
+    peakRssBytes: 135815168
+    tscMs: 434.730107
+    outputBytes: 5358666
     outputFiles: 1431
     gates:
       warmP50: true
@@ -32,13 +32,13 @@ results:
   - fixture: "stripe-3.0"
     config: "oasts.yaml"
     class: "large"
-    coldMs: 80.91694100000001
-    warmP50MsRound1: 56.978743
-    warmP50MsRound2: 57.726535000000005
-    warmP50MsGated: 57.726535000000005
-    peakRssBytes: 98512896
-    tscMs: 358.837769
-    outputBytes: 3590893
+    coldMs: 80.601989
+    warmP50MsRound1: 56.226326
+    warmP50MsRound2: 59.675825
+    warmP50MsGated: 59.675825
+    peakRssBytes: 98504704
+    tscMs: 402.89898600000004
+    outputBytes: 3591031
     outputFiles: 2019
     gates:
       warmP50: true
@@ -48,12 +48,12 @@ results:
   - fixture: "kubernetes-core-v1-3.0"
     config: "oasts.yaml"
     class: "large"
-    coldMs: 26.922785
-    warmP50MsRound1: 18.480733
-    warmP50MsRound2: 19.694318
-    warmP50MsGated: 19.694318
-    peakRssBytes: 50343936
-    tscMs: 330.55269
+    coldMs: 47.064327000000006
+    warmP50MsRound1: 18.938456
+    warmP50MsRound2: 18.669872
+    warmP50MsGated: 18.938456
+    peakRssBytes: 51220480
+    tscMs: 339.744953
     outputBytes: 6181736
     outputFiles: 500
     gates:
@@ -64,12 +64,12 @@ results:
   - fixture: "kubernetes-apps-v1-3.0"
     config: "oasts.yaml"
     class: "large"
-    coldMs: 18.587941999999998
-    warmP50MsRound1: 13.715727000000001
-    warmP50MsRound2: 14.52927
-    warmP50MsGated: 14.52927
-    peakRssBytes: 44740608
-    tscMs: 342.035414
+    coldMs: 17.939539
+    warmP50MsRound1: 13.645498
+    warmP50MsRound2: 13.210082
+    warmP50MsGated: 13.645498
+    peakRssBytes: 45314048
+    tscMs: 327.70970500000004
     outputBytes: 6103020
     outputFiles: 241
     gates:
@@ -80,14 +80,30 @@ results:
   - fixture: "kubernetes-apiextensions-v1-3.0"
     config: "oasts.yaml"
     class: "large"
-    coldMs: 4.991381
-    warmP50MsRound1: 3.7106719999999997
-    warmP50MsRound2: 3.639255
-    warmP50MsGated: 3.7106719999999997
-    peakRssBytes: 11268096
-    tscMs: 317.809173
+    coldMs: 4.740083
+    warmP50MsRound1: 3.751916
+    warmP50MsRound2: 3.6953329999999998
+    warmP50MsGated: 3.751916
+    peakRssBytes: 11403264
+    tscMs: 315.176332
     outputBytes: 466327
     outputFiles: 55
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "github-3.0-zod"
+    config: "oasts-zod.yaml"
+    class: "large"
+    coldMs: 137.14043900000001
+    warmP50MsRound1: 99.442445
+    warmP50MsRound2: 100.250569
+    warmP50MsGated: 100.250569
+    peakRssBytes: 138170368
+    tscMs: 1048.071563
+    outputBytes: 10340610
+    outputFiles: 2858
     gates:
       warmP50: true
       peakRss: true
@@ -96,14 +112,30 @@ results:
   - fixture: "petstore-3.0"
     config: "oasts.yaml"
     class: "small"
-    coldMs: 1.606627
-    warmP50MsRound1: 1.23021
-    warmP50MsRound2: 1.227294
-    warmP50MsGated: 1.23021
-    peakRssBytes: 5369856
-    tscMs: 326.454977
+    coldMs: 1.764791
+    warmP50MsRound1: 1.265542
+    warmP50MsRound2: 1.172249
+    warmP50MsGated: 1.265542
+    peakRssBytes: 5709824
+    tscMs: 321.07233099999996
     outputBytes: 4806
     outputFiles: 8
+    gates:
+      warmP50: true
+      peakRss: true
+      tsc: true
+      repeatability: true
+  - fixture: "petstore-3.0-zod"
+    config: "oasts-zod.yaml"
+    class: "small"
+    coldMs: 1.939709
+    warmP50MsRound1: 1.338292
+    warmP50MsRound2: 1.292541
+    warmP50MsGated: 1.338292
+    peakRssBytes: 5709824
+    tscMs: 339.27828700000003
+    outputBytes: 35687
+    outputFiles: 15
     gates:
       warmP50: true
       peakRss: true
@@ -112,13 +144,13 @@ results:
   - fixture: "petstore-3.0-client"
     config: "oasts-client.yaml"
     class: "small"
-    coldMs: 2.301878
-    warmP50MsRound1: 1.47521
-    warmP50MsRound2: 1.483794
-    warmP50MsGated: 1.483794
-    peakRssBytes: 5861376
-    tscMs: 346.984212
-    outputBytes: 109934
+    coldMs: 2.1
+    warmP50MsRound1: 1.5329169999999999
+    warmP50MsRound2: 1.523874
+    warmP50MsGated: 1.5329169999999999
+    peakRssBytes: 5709824
+    tscMs: 323.737247
+    outputBytes: 114924
     outputFiles: 15
     gates:
       warmP50: true
@@ -128,12 +160,12 @@ results:
   - fixture: "tictactoe-3.1"
     config: "oasts.yaml"
     class: "small"
-    coldMs: 2.161044
-    warmP50MsRound1: 1.455335
-    warmP50MsRound2: 1.4857939999999998
-    warmP50MsGated: 1.4857939999999998
-    peakRssBytes: 5652480
-    tscMs: 318.38275799999997
+    coldMs: 1.936708
+    warmP50MsRound1: 1.496458
+    warmP50MsRound2: 1.4300840000000001
+    warmP50MsGated: 1.496458
+    peakRssBytes: 5509120
+    tscMs: 314.04429
     outputBytes: 10929
     outputFiles: 15
     gates:
@@ -144,13 +176,13 @@ results:
   - fixture: "client-showcase-3.1"
     config: "oasts.yaml"
     class: "small"
-    coldMs: 2.679712
-    warmP50MsRound1: 2.310044
-    warmP50MsRound2: 2.407711
-    warmP50MsGated: 2.407711
-    peakRssBytes: 6889472
-    tscMs: 332.553359
-    outputBytes: 156582
+    coldMs: 2.586041
+    warmP50MsRound1: 2.3799989999999998
+    warmP50MsRound2: 2.330499
+    warmP50MsGated: 2.3799989999999998
+    peakRssBytes: 7372800
+    tscMs: 326.185539
+    outputBytes: 161561
     outputFiles: 33
     gates:
       warmP50: true
@@ -160,13 +192,13 @@ results:
   - fixture: "auth-showcase-3.1"
     config: "oasts.yaml"
     class: "small"
-    coldMs: 2.2944620000000002
-    warmP50MsRound1: 1.763419
-    warmP50MsRound2: 1.7014179999999999
-    warmP50MsGated: 1.763419
-    peakRssBytes: 6156288
-    tscMs: 327.905394
-    outputBytes: 138264
+    coldMs: 2.318625
+    warmP50MsRound1: 1.782208
+    warmP50MsRound2: 1.748416
+    warmP50MsGated: 1.782208
+    peakRssBytes: 6148096
+    tscMs: 322.459206
+    outputBytes: 143959
     outputFiles: 29
     gates:
       warmP50: true
@@ -176,12 +208,12 @@ results:
   - fixture: "pathological-3.1"
     config: "oasts.yaml"
     class: "small"
-    coldMs: 3.712755
-    warmP50MsRound1: 3.019379
-    warmP50MsRound2: 2.944337
-    warmP50MsGated: 3.019379
+    coldMs: 3.714791
+    warmP50MsRound1: 3.067333
+    warmP50MsRound2: 2.905333
+    warmP50MsGated: 3.067333
     peakRssBytes: 8458240
-    tscMs: 346.494128
+    tscMs: 311.663916
     outputBytes: 35110
     outputFiles: 55
     gates:

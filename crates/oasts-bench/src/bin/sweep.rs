@@ -674,6 +674,7 @@ fn measure_spec(spec: &CorpusSpec, context: &RunContext<'_>) -> Result<SpecRepor
 
     let workdir =
         tempfile::tempdir().map_err(|error| Error::new(format!("creating workdir: {error}")))?;
+    oasts_bench::link_node_modules(workdir.path(), context.workspace_root)?;
     let staged = workdir.path().join(&spec.file);
     std::fs::copy(&source, &staged).map_err(|error| {
         Error::new(format!(
@@ -980,7 +981,10 @@ fn write_config(
                 "    source: server\n    index: 0\n"
             };
             format!(
-                "schemaVersion: 1\ninput:\n  path: {input}\noutput: ./generated-full\nartifacts:\n  types: true\n  client: true\n  validators: true\nclient:\n  baseUrl:\n{base_url}validation:\n  engine: generated\n  request: true\n  response: true\n  unchecked: allow\n"
+                // zod rides the full config as a standalone artifact rather than as the bound
+                // engine: the client binds one engine, and generating both here is what makes the
+                // sweep report any construct one emitter rejects and the other accepts.
+                "schemaVersion: 1\ninput:\n  path: {input}\noutput: ./generated-full\nartifacts:\n  types: true\n  client: true\n  validators: true\n  zod: true\nclient:\n  baseUrl:\n{base_url}validation:\n  engine: generated\n  request: true\n  response: true\n  unchecked: allow\n"
             )
         }
     };

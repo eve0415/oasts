@@ -38,8 +38,7 @@ const CODE_VALIDATION_ENGINE_REQUIRED: &str = "OASTS0152";
 const CODE_VALIDATION_WITHOUT_CLIENT: &str = "OASTS0161";
 const CODE_OFF_VALIDATION_DIRECTIONS: &str = "OASTS0162";
 const CODE_VALIDATION_DIRECTION_REQUIRED: &str = "OASTS0163";
-const CODE_VALIDATION_ENGINE_UNSUPPORTED: &str = "OASTS0164";
-const CODE_VALIDATION_ENGINE_REQUIRES_VALIDATORS: &str = "OASTS0165";
+const CODE_VALIDATION_ENGINE_REQUIRES_ARTIFACT: &str = "OASTS0165";
 const CODE_UNCHECKED_RESPONSE: &str = "OASTS0171";
 const CODE_UNCHECKED_RESPONSE_WARNING: &str = "OASTS0172";
 const CODE_BASE_URL: &str = "OASTS0181";
@@ -1520,23 +1519,21 @@ fn validate_validation_options(
                     ));
                 }
             }
-            // zod remains unbuilt in this crate; generated is the implemented non-off engine and
-            // binds to the standalone validators artifact, so it must be enabled alongside it.
-            ValidationEngine::Zod => {
+            // Every non-off engine binds to a standalone artifact, so that artifact must be
+            // enabled alongside it. One rule over the engine domain rather than a per-engine arm,
+            // so an engine added later cannot be wired up without declaring its artifact.
+            ValidationEngine::Zod | ValidationEngine::Generated => {
                 require_validation_direction(request, response, source, sink);
-                sink.push(config_error(
-                    CODE_VALIDATION_ENGINE_UNSUPPORTED,
-                    "validation engine 'zod' is not supported in this build",
-                    Some(source),
-                    Some("/validation/engine"),
-                ));
-            }
-            ValidationEngine::Generated => {
-                require_validation_direction(request, response, source, sink);
-                if !artifacts.validators.enabled {
+                let (engine_name, artifact_name, artifact_enabled) = match engine {
+                    ValidationEngine::Zod => ("zod", "zod", artifacts.zod.enabled),
+                    _ => ("generated", "validators", artifacts.validators.enabled),
+                };
+                if !artifact_enabled {
                     sink.push(config_error(
-                        CODE_VALIDATION_ENGINE_REQUIRES_VALIDATORS,
-                        "validation engine 'generated' requires the validators artifact to be enabled",
+                        CODE_VALIDATION_ENGINE_REQUIRES_ARTIFACT,
+                        format!(
+                            "validation engine '{engine_name}' requires the {artifact_name} artifact to be enabled"
+                        ),
                         Some(source),
                         Some("/validation/engine"),
                     ));
@@ -1692,13 +1689,13 @@ fn resolve_artifacts(
 
     // One row per artifact is the single source of truth for both the "at least one enabled" check
     // and the unsupported-artifact check. `supported: false` marks a framework adapter that still
-    // has no emitter — enabling it is a config error. The standalone validators artifact is
-    // supported alongside types and client. A future artifact added here cannot land in one check
+    // has no emitter — enabling it is a config error. The standalone zod and validators artifacts
+    // are supported alongside types and client. A future artifact added here cannot land in one check
     // and be missed by the other, which two hand-kept lists allowed.
     let artifacts = [
         ("types", &states.types, true),
         ("client", &states.client, true),
-        ("zod", &states.zod, false),
+        ("zod", &states.zod, true),
         ("validators", &states.validators, true),
         ("tanstack", &states.tanstack, false),
         ("msw", &states.msw, false),
@@ -2716,7 +2713,7 @@ mod tests {
 
     #[test]
     fn unavailable_framework_artifacts_report_named_unsupported_error() {
-        for artifact in ["zod", "tanstack", "msw"] {
+        for artifact in ["tanstack", "msw"] {
             let mut value = valid_json_value();
             value["artifacts"] = json!({ (artifact): true });
             let diagnostics = assert_code(load_json(&value), CODE_UNSUPPORTED_ARTIFACT);
@@ -2744,6 +2741,36 @@ mod tests {
         let resolved = load_json(&with_types).expect("types+validators config should resolve");
         assert!(resolved.artifacts.types.enabled);
         assert!(resolved.artifacts.validators.enabled);
+    }
+
+    #[test]
+    fn zod_artifact_resolves_standalone_and_with_types() {
+        let mut standalone = valid_json_value();
+        standalone["artifacts"] = json!({ "types": false, "zod": true });
+        let resolved = load_json(&standalone).expect("zod-only config should resolve");
+        assert!(resolved.artifacts.zod.enabled);
+        assert!(!resolved.artifacts.types.enabled);
+        assert_eq!(
+            resolved.artifacts.zod.directory,
+            resolved.output.join("zod")
+        );
+
+        let mut with_types = valid_json_value();
+        with_types["artifacts"] = json!({ "types": true, "zod": true });
+        let resolved = load_json(&with_types).expect("types+zod config should resolve");
+        assert!(resolved.artifacts.types.enabled);
+        assert!(resolved.artifacts.zod.enabled);
+    }
+
+    #[test]
+    fn zod_artifact_does_not_unlock_the_zod_validation_engine() {
+        // Enabling the standalone artifact must not imply the client binding: `validation.engine:
+        // zod` stays unsupported until the client seam lands, and a zod artifact without a client
+        // leaves validation untouched.
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "types": true, "zod": true });
+        let resolved = load_json(&value).expect("zod without validation should resolve");
+        assert!(resolved.validation.is_none());
     }
 
     #[test]
@@ -3055,7 +3082,7 @@ mod tests {
         assert!(
             zod_diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == CODE_VALIDATION_ENGINE_UNSUPPORTED)
+                .any(|diagnostic| diagnostic.code == CODE_VALIDATION_ENGINE_REQUIRES_ARTIFACT)
         );
 
         // `generated` with no direction and without the validators artifact enabled.
@@ -3074,28 +3101,56 @@ mod tests {
         assert!(
             generated_diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == CODE_VALIDATION_ENGINE_REQUIRES_VALIDATORS)
+                .any(|diagnostic| diagnostic.code == CODE_VALIDATION_ENGINE_REQUIRES_ARTIFACT)
         );
     }
 
     #[test]
-    fn zod_engine_stays_unsupported_rule_16() {
-        // zod is still unbuilt: a directioned zod config is an unsupported-engine error.
-        let mut with_direction = valid_client_json_value();
-        with_direction["validation"] = json!({
+    fn zod_engine_requires_the_zod_artifact_rule_16() {
+        // zod binds to the standalone zod artifact, so without it the engine binds against nothing.
+        let mut without_zod = valid_client_json_value();
+        without_zod["validation"] = json!({
             "engine": "zod",
             "request": true,
             "unchecked": "allow"
         });
         let diagnostics = assert_code(
-            load_json(&with_direction),
-            CODE_VALIDATION_ENGINE_UNSUPPORTED,
+            load_json(&without_zod),
+            CODE_VALIDATION_ENGINE_REQUIRES_ARTIFACT,
         );
         assert!(
             !diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == CODE_VALIDATION_DIRECTION_REQUIRED)
         );
+
+        // The correspondence is per engine: the validators artifact does not satisfy zod.
+        let mut crossed = valid_client_json_value();
+        crossed["artifacts"] = json!({ "types": true, "client": true, "validators": true });
+        crossed["validation"] = json!({
+            "engine": "zod",
+            "request": true,
+            "unchecked": "allow"
+        });
+        assert_code(
+            load_json(&crossed),
+            CODE_VALIDATION_ENGINE_REQUIRES_ARTIFACT,
+        );
+
+        // client + zod + the zod artifact resolves cleanly.
+        let mut with_zod = valid_client_json_value();
+        with_zod["artifacts"] = json!({ "types": true, "client": true, "zod": true });
+        with_zod["validation"] = json!({
+            "engine": "zod",
+            "request": true,
+            "response": true,
+            "unchecked": "allow"
+        });
+        let resolved = load_json(&with_zod).expect("zod + the zod artifact should resolve");
+        let validation = resolved.validation.expect("validation should be present");
+        assert_eq!(validation.engine, ValidationEngine::Zod);
+        assert!(validation.request);
+        assert!(validation.response);
     }
 
     #[test]
@@ -3110,12 +3165,12 @@ mod tests {
         });
         let diagnostics = assert_code(
             load_json(&without_validators),
-            CODE_VALIDATION_ENGINE_REQUIRES_VALIDATORS,
+            CODE_VALIDATION_ENGINE_REQUIRES_ARTIFACT,
         );
         assert!(
             !diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == CODE_VALIDATION_ENGINE_UNSUPPORTED)
+                .any(|diagnostic| diagnostic.code == CODE_VALIDATION_DIRECTION_REQUIRED)
         );
 
         // client + generated + the validators artifact resolves cleanly with typed values.

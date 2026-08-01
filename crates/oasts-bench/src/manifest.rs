@@ -347,8 +347,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_twelve_fixtures() {
-        assert_eq!(load_real().fixtures.len(), 12);
+    fn parses_every_fixture_including_the_shared_directory_keys() {
+        let manifest = load_real();
+        assert_eq!(manifest.fixtures.len(), 14);
+        // A key may share another key's fixture directory under a different config; the zod keys
+        // and the petstore client key are the cases, and `dir` is what keeps them distinct.
+        let zod = manifest
+            .fixtures
+            .iter()
+            .find(|fixture| fixture.name == "github-3.0-zod")
+            .expect("github zod fixture present");
+        assert_eq!(zod.dir, "github-3.0");
+        assert_eq!(zod.config, "oasts-zod.yaml");
     }
 
     #[test]

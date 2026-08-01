@@ -27,6 +27,7 @@ packages/oasts/config.ts
 fixtures/*/generated/
 fixtures/*/generated-client/
 fixtures/*/generated-validators/
+fixtures/*/generated-zod/
 
 # Node
 node_modules/
@@ -36,6 +37,9 @@ packages/oasts/dist/
 
 # Local git worktrees for delegated work
 .worktrees/
+
+# Ad-hoc scratch trees for generating a spec outside the fixture set
+.zod*/
 
 # Fetched corpus specs (pinned by URL+SHA-256 in bench/manifest.yaml; fetched by oasts-bench fetch)
 fixtures/github-3.0/openapi.json

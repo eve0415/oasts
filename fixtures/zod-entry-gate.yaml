@@ -1,0 +1,21 @@
+# SHA-256 manifest of the zod-artifact frozen entry-gate files; scripts/zod-gate.sh verifies it.
+# These files were authored from the pinned zod contract before any implementation existed and are
+# never edited afterward — the implementation is written to satisfy them.
+#
+# The keyword capability matrix is deliberately the SAME file the generated-validators engine pins,
+# byte-for-byte and unedited: every validation engine shares one capability matrix, so a
+# second zod-specific matrix would let the two engines drift on the very rows the dual-engine
+# conformance suite exists to keep identical. Its hash therefore matches the entry in
+# fixtures/validators-entry-gate.yaml.
+#
+# The showcase document is likewise shared, and reached through its own sibling config rather than
+# a copy, so both engines are exercised against one document and can be compared pairwise.
+files:
+  - path: fixtures/validators-keyword-matrix.yaml
+    sha256: 015c2cf5316c8b76c8103a92a91d7b0bfa88713b6e5921a6a1c1fda78a0ace18
+  - path: crates/oasts-core/runtime/test-conformance/vectors-zod-conformance.ts
+    sha256: 9da25181475b4aff87594e5cc6700f1b2c2925130038177e7291f94079cd8f37
+  - path: fixtures/validators-showcase-3.1/openapi.yaml
+    sha256: a22cab2669a29940a5b5e533c23388ce7e64e9ea091e1ab5c3e83e61c6b1bc56
+  - path: fixtures/validators-showcase-3.1/oasts-zod.yaml
+    sha256: 7d4d065d4373aeb1337ef7d17f9b94db3ae9aa5576eab4b2790355e84dfee659

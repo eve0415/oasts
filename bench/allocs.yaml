@@ -19,10 +19,10 @@ keys:
         deallocs: 19134
         allocBytes: 1201887
       - stage: "emit"
-        allocs: 285621
-        reallocs: 89150
-        deallocs: 282760
-        allocBytes: 38671236
+        allocs: 285653
+        reallocs: 89153
+        deallocs: 282792
+        allocBytes: 38679368
     informational:
       peakBytes: 95101476
   - fixture: "stripe-3.0"
@@ -44,10 +44,10 @@ keys:
         deallocs: 24010
         allocBytes: 1748336
       - stage: "emit"
-        allocs: 184617
-        reallocs: 63941
-        deallocs: 180580
-        allocBytes: 22122896
+        allocs: 184379
+        reallocs: 63955
+        deallocs: 180342
+        allocBytes: 22099600
     informational:
       peakBytes: 65134373
   - fixture: "kubernetes-core-v1-3.0"
@@ -69,10 +69,10 @@ keys:
         deallocs: 7080
         allocBytes: 701616
       - stage: "emit"
-        allocs: 123395
+        allocs: 123391
         reallocs: 49479
-        deallocs: 122396
-        allocBytes: 55769163
+        deallocs: 122392
+        allocBytes: 55768699
     informational:
       peakBytes: 19881827
   - fixture: "kubernetes-apps-v1-3.0"
@@ -94,10 +94,10 @@ keys:
         deallocs: 4255
         allocBytes: 393616
       - stage: "emit"
-        allocs: 102821
+        allocs: 102825
         reallocs: 42919
-        deallocs: 102340
-        allocBytes: 70837648
+        deallocs: 102344
+        allocBytes: 70838112
     informational:
       peakBytes: 15507207
   - fixture: "kubernetes-apiextensions-v1-3.0"
@@ -125,6 +125,31 @@ keys:
         allocBytes: 3516219
     informational:
       peakBytes: 1607469
+  - fixture: "github-3.0-zod"
+    config: "oasts-zod.yaml"
+    stages:
+      - stage: "loadGraph"
+        allocs: 718340
+        reallocs: 53712
+        deallocs: 218220
+        allocBytes: 85208839
+      - stage: "parse"
+        allocs: 436524
+        reallocs: 44559
+        deallocs: 157062
+        allocBytes: 69167447
+      - stage: "analyze"
+        allocs: 23992
+        reallocs: 6914
+        deallocs: 19134
+        allocBytes: 1201887
+      - stage: "emit"
+        allocs: 666544
+        reallocs: 277703
+        deallocs: 660829
+        allocBytes: 107734105
+    informational:
+      peakBytes: 95101476
   - fixture: "petstore-3.0"
     config: "oasts.yaml"
     stages:
@@ -148,6 +173,31 @@ keys:
         reallocs: 130
         deallocs: 415
         allocBytes: 30838
+    informational:
+      peakBytes: 93424
+  - fixture: "petstore-3.0-zod"
+    config: "oasts-zod.yaml"
+    stages:
+      - stage: "loadGraph"
+        allocs: 1316
+        reallocs: 87
+        deallocs: 998
+        allocBytes: 139839
+      - stage: "parse"
+        allocs: 352
+        reallocs: 45
+        deallocs: 158
+        allocBytes: 73732
+      - stage: "analyze"
+        allocs: 53
+        reallocs: 4
+        deallocs: 30
+        allocBytes: 2788
+      - stage: "emit"
+        allocs: 874
+        reallocs: 261
+        deallocs: 845
+        allocBytes: 98452
     informational:
       peakBytes: 93424
   - fixture: "petstore-3.0-client"

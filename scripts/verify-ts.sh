@@ -26,7 +26,7 @@ shopt -s globstar
 generate_and_verify() {
   local f=$1 cfg=$2 d=$3 label=$4 message=$5
   cp -r "fixtures/$f" "$d"
-  rm -rf "$d"/generated "$d"/generated-client "$d"/generated-validators
+  rm -rf "$d"/generated "$d"/generated-client "$d"/generated-validators "$d"/generated-zod "$d"/generated-zod-client
   (cd "$d" && "$OLDPWD/$bin" generate --config "$cfg")
   pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$d"/generated*/**/*.ts
   echo "tsc --strict $label ok: $message"
@@ -141,5 +141,39 @@ echo "validators conformance ok: validators-readonly-3.1"
 
 OASTS_VALIDATORS_GENERATED_ROOT="$work/validators-webhooks-showcase-3.1-oasts-validators/generated-validators" OASTS_VALIDATORS_CONFORMANCE_FIXTURE=webhooks node --test crates/oasts-core/runtime/test-conformance/
 echo "validators conformance ok: webhooks-showcase-3.1"
+
+# Zod gets its own block rather than joining the loop above: emitted zod schemas import `zod`, so
+# both tsc and node need a node_modules that resolves it, and the package lives in the runtime
+# workspace rather than the repo root. Symlinking it into the work tree is what makes the generated
+# output loadable from a temp directory at all.
+repo=$PWD
+zod_work="$work/zod-validators-showcase-3.1"
+cp -r fixtures/validators-showcase-3.1 "$zod_work"
+rm -rf "$zod_work"/generated "$zod_work"/generated-client "$zod_work"/generated-validators "$zod_work"/generated-zod "$zod_work"/generated-zod-client
+ln -s "$repo/crates/oasts-core/runtime/node_modules" "$zod_work/node_modules"
+(cd "$zod_work" && "$repo/$bin" generate --config oasts-zod.yaml)
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$zod_work"/generated-zod/**/*.ts
+echo "tsc --strict zod ok: validators-showcase-3.1"
+
+cp -r fixtures/validators-showcase-3.1 "$zod_work-repeat"
+rm -rf "$zod_work-repeat"/generated "$zod_work-repeat"/generated-client "$zod_work-repeat"/generated-validators "$zod_work-repeat"/generated-zod "$zod_work-repeat"/generated-zod-client
+(cd "$zod_work-repeat" && "$repo/$bin" generate --config oasts-zod.yaml)
+diff -r "$zod_work"/generated-zod "$zod_work-repeat"/generated-zod
+echo "double-generation byte identity ok: validators-showcase-3.1 (zod)"
+
+# The client bound to the zod engine. Emitted client bytes differ from the generated-engine build
+# only in the two import lines per operation module, so this proves the binding is a directory swap
+# and nothing else — and that the emitted client still typechecks against zod's entry points.
+(cd "$zod_work" && "$repo/$bin" generate --config oasts-zod-client.yaml)
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$zod_work"/generated-zod-client/**/*.ts
+echo "tsc --strict zod-client ok: validators-showcase-3.1"
+
+# The zod artifact's own vectors, plus the dual-engine suite. Both roots come from the same showcase
+# document under two configs, which is what makes the pairwise verdict/value comparison meaningful:
+# the engines are compared against each other, not each against its own expectations.
+OASTS_ZOD_GENERATED_ROOT="$zod_work/generated-zod" \
+  OASTS_VALIDATORS_GENERATED_ROOT="$work/validators-validators-showcase-3.1-oasts/generated" \
+  node --test crates/oasts-core/runtime/test-conformance/zod-runner.ts
+echo "zod + dual-engine conformance ok: validators-showcase-3.1"
 
 node --test crates/oasts-core/runtime/test-e2e/

@@ -28,6 +28,26 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Points a measurement workdir at the runtime workspace's `node_modules`, so a bare import in
+/// emitted output resolves during the typecheck.
+///
+/// Every workdir here is a temp directory with no path back to the checkout, and TypeScript resolves
+/// modules from the importing file rather than the compiler's working directory — so without this
+/// the zod artifact's `import { z } from "zod"` cannot be typechecked at all. The link is invisible
+/// to the rest of the harness: the output walk descends only into top-level `generated*` entries,
+/// and the workdir's location is unchanged, so no timing or RSS measurement moves.
+///
+/// The workspace root is resolved from this crate's compile-time location, so the harness must run
+/// against the same checkout it was built from.
+pub fn link_node_modules(workdir: &Path, workspace_root: &Path) -> Result<(), Error> {
+    let modules = workspace_root.join("crates/oasts-core/runtime/node_modules");
+    if !modules.is_dir() {
+        return Ok(());
+    }
+    std::os::unix::fs::symlink(&modules, workdir.join("node_modules"))
+        .map_err(|error| Error::new(format!("linking node_modules into the workdir: {error}")))
+}
+
 /// The workspace root, resolved from this crate's compile-time location (`crates/oasts-bench`).
 ///
 /// The harness reads `bench/manifest.yaml`, the committed fixtures, and the release binary relative
@@ -81,12 +101,16 @@ impl From<std::io::Error> for Error {
 /// every top-level entry whose name starts with `generated` is skipped, and the staged workdir is
 /// checked to hold none before it is used — a hard error rather than a debug assertion, because the
 /// harness runs release builds where `debug_assert!` is compiled out.
+///
+/// `node_modules` is skipped for the same reason and one more: the workdir carries it as a symlink
+/// to a directory (see [`link_node_modules`]), which is neither a regular file nor a symlink to one,
+/// so copying it verbatim fails outright — and it is derived input that no fixture ever owns.
 pub(crate) fn copy_fixture(source: &Path, destination: &Path) -> io::Result<()> {
     std::fs::create_dir_all(destination)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         let name = entry.file_name();
-        if is_generated(&name) {
+        if is_generated(&name) || name == "node_modules" {
             continue;
         }
         let target = destination.join(&name);
@@ -165,6 +189,26 @@ mod tests {
         assert!(destination.path().join("oasts.yaml").is_file());
         assert!(!destination.path().join("generated").exists());
         assert!(!destination.path().join("generated-client").exists());
+    }
+
+    #[test]
+    fn copy_fixture_skips_a_linked_node_modules() {
+        // The double-generation determinism check re-stages the workdir, which carries
+        // `node_modules` as a symlink to a directory. Copying that verbatim fails outright — it is
+        // neither a regular file nor a symlink to one — so the whole determinism check reports a
+        // harness failure instead of a verdict.
+        let source = tempfile::tempdir().expect("source");
+        let root = source.path();
+        std::fs::write(root.join("openapi.yaml"), b"openapi: 3.0.0\n").expect("spec");
+        let modules = tempfile::tempdir().expect("modules");
+        std::fs::write(modules.path().join("marker"), b"x").expect("marker");
+        std::os::unix::fs::symlink(modules.path(), root.join("node_modules")).expect("link");
+
+        let destination = tempfile::tempdir().expect("destination");
+        copy_fixture(root, destination.path()).expect("stage fixture past the link");
+
+        assert!(destination.path().join("openapi.yaml").is_file());
+        assert!(!destination.path().join("node_modules").exists());
     }
 
     #[test]

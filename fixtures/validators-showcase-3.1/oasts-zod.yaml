@@ -1,0 +1,7 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-zod
+artifacts:
+  types: true
+  zod: true

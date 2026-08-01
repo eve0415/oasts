@@ -10,7 +10,8 @@
     "oxlint-tsgolint": "7.0.2001",
     "rollup": "4.62.3",
     "typescript": "7.0.2",
-    "vite": "8.2.0"
+    "vite": "8.2.0",
+    "zod": "4.4.3"
   },
   "engines": {
     "node": ">=24"

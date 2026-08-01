@@ -3518,7 +3518,7 @@ type SiblingBindings = BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>;
 /// no operation-local declaration: its structural type and validator are exactly the component's.
 /// Returning the component file lets the caller preserve the operation module's public surface with
 /// a direct re-export instead of emitting a self-referential alias and recursive wrapper.
-fn identical_component_delegate(
+pub(super) fn identical_component_delegate(
     emitter: &Emitter<'_, '_, '_>,
     export_type: &str,
     schema: &SchemaNode,

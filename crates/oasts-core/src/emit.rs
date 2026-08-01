@@ -43,6 +43,7 @@ mod model;
 pub(crate) mod runtime_assets;
 mod transform;
 mod validators;
+mod zod;
 
 use model::{EmissionModel, SchemaTarget};
 
@@ -331,7 +332,7 @@ pub(crate) fn emit_types_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Ge
     files
 }
 
-/// Emits every enabled artifact (types, client, validators) for one compile.
+/// Emits every enabled artifact (types, client, validators, zod) for one compile.
 ///
 /// Public so out-of-crate harnesses can run the emission stage exactly as
 /// `pipeline::compile` does, including a client model when one was built.
@@ -352,6 +353,9 @@ pub fn emit_artifacts(
     }
     if config.artifacts.validators.enabled {
         files.extend(validators::emit_validators_from_model(&mut model));
+    }
+    if config.artifacts.zod.enabled {
+        files.extend(zod::emit_zod_from_model(&mut model));
     }
     files.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
     files
@@ -3106,11 +3110,16 @@ fn add_nullable(mut rendered: String, schema: &SchemaNode) -> String {
 }
 
 fn parenthesize_array_item(mut rendered: String, schema: &SchemaNode) -> String {
+    // The rendered-text check matters for the same reason it does in
+    // `parenthesize_intersection_member`: an `enum`/`const` primitive and a `Finite` node render a
+    // top-level union without being a `OneOf`/`AnyOf` or nullable node, and `[]` binds tighter than
+    // `|`, so `"a" | "b"[]` is a union of `"a"` and `"b"[]` rather than an array of the union.
     if schema.is_nullable()
         || matches!(
             schema,
             SchemaNode::AllOf { .. } | SchemaNode::OneOf { .. } | SchemaNode::AnyOf { .. }
         )
+        || renders_top_level_union(&rendered)
     {
         rendered.reserve(2);
         rendered.insert(0, '(');
@@ -5274,6 +5283,26 @@ mod tests {
                 0
             ),
             r#"string & (string | number) & (string | null) & ("a" | "b") & (string | number)[]"#,
+        );
+
+        // `[]` binds tighter than `|`, so an enum item has to be parenthesized: without it
+        // `"a" | "b"[]` reads as a union of `"a"` and `"b"[]` rather than an array of the union.
+        // An `enum` primitive is neither a composition node nor nullable, so the node-kind test
+        // alone misses it — real specs (stripe's `available_payout_methods`) hit this.
+        let enum_array = SchemaNode::Array {
+            items: Box::new(SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                format: None,
+                enum_values: Some(vec![json!("instant"), json!("standard")]),
+                const_value: None,
+                meta: meta("/enum-item"),
+            }),
+            finite: None,
+            meta: meta("/enum-array"),
+        };
+        assert_eq!(
+            emitter.render_type(&enum_array, TypePosition::Neutral, TypeAxis::Application, 0),
+            r#"("instant" | "standard")[]"#,
         );
     }
 

@@ -482,6 +482,7 @@ fn emit_operation(
             &response_checks,
             file_base,
             &extension,
+            validation_artifact_dir(model),
         );
     }
     output.push('\n');
@@ -619,14 +620,32 @@ struct ResponseCheck {
     headers_validator: Option<String>,
 }
 
-/// `(validate_request, validate_response)` — both false unless the resolved engine is `generated`,
-/// which keeps the emitted client bytes identical to today for `engine: off`.
+/// `(validate_request, validate_response)` — both false unless a non-off engine is resolved, which
+/// keeps the emitted client bytes identical to today for `engine: off`.
 fn validation_flags(model: &EmissionModel<'_, '_>) -> (bool, bool) {
     match model.config.validation.as_ref() {
-        Some(validation) if validation.engine == ValidationEngine::Generated => {
+        Some(validation)
+            if matches!(
+                validation.engine,
+                ValidationEngine::Generated | ValidationEngine::Zod
+            ) =>
+        {
             (validation.request, validation.response)
         }
         _ => (false, false),
+    }
+}
+
+/// The artifact directory the bound engine's checks are imported from.
+///
+/// Both engines expose the same `validate{Name}(value, path, issues)` entry points and the same
+/// `Issue` type, so the engine selects a directory and changes nothing else about the emitted body —
+/// and because the client forwards the value it already decoded rather than the validator's return,
+/// which engine is bound is invisible in `data`.
+fn validation_artifact_dir(model: &EmissionModel<'_, '_>) -> &'static str {
+    match model.config.validation.as_ref() {
+        Some(validation) if validation.engine == ValidationEngine::Zod => "zod",
+        _ => "validators",
     }
 }
 
@@ -774,17 +793,18 @@ fn input_member(member: InputMember<'_>) -> String {
     }
 }
 
-/// The `Issue` type import plus the per-operation validators pulled from the validators artifact.
+/// The `Issue` type import plus the per-operation checks pulled from the bound engine's artifact.
 fn write_validator_imports(
     output: &mut String,
     request: &[RequestCheck],
     response: &[ResponseCheck],
     file_base: &str,
     extension: &str,
+    artifact: &str,
 ) {
     output.push_str("import type { Issue } from ");
     output.push_str(&render_ts_string(&format!(
-        "../../validators/runtime{extension}"
+        "../../{artifact}/runtime{extension}"
     )));
     output.push_str(";\n");
     let validators = request
@@ -805,7 +825,7 @@ fn write_validator_imports(
     output.push_str(&validators.into_iter().collect::<Vec<_>>().join(", "));
     output.push_str(" } from ");
     output.push_str(&render_ts_string(&format!(
-        "../../validators/operations/{file_base}{extension}"
+        "../../{artifact}/operations/{file_base}{extension}"
     )));
     output.push_str(";\n");
 }

@@ -506,6 +506,20 @@ describe("auth runtime boundaries", () => {
     assert.equal(requests.length, 0);
   });
 
+  test("rejects a generic HTTP scheme with no declared auth-scheme token", async () => {
+    // `scheme` is what the Authorization header is built from, so without it there is nothing to
+    // send. The credential is well-formed here, which is what isolates this guard from the
+    // non-object rejection above.
+    const { result, requests } = await executeWithCredential(
+      operation({
+        security: authAlternatives([[{ name: "scheme", apply: httpSchemeCredential, scopes: [] }]]),
+      }),
+      { credentials: "abc" },
+    );
+    assert.match(authFailure(result).message, /no declared auth-scheme token/u);
+    assert.equal(requests.length, 0);
+  });
+
   for (const boundary of [
     {
       name: "string for basic",

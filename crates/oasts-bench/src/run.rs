@@ -134,7 +134,7 @@ fn measure_key(fixture: &FixtureEntry, ctx: &KeyContext) -> Result<KeyResult, Er
         }
     }
 
-    let workdir = fresh_workdir(&source_dir)?;
+    let workdir = fresh_workdir(&source_dir, ctx.workspace_root)?;
     let mut peak_rss_bytes = 0u64;
 
     let cold = generate_once(ctx.binary, &fixture.config, workdir.path())?;
@@ -286,12 +286,13 @@ fn progress_line(result: &KeyResult) -> String {
     )
 }
 
-fn fresh_workdir(source_dir: &Path) -> Result<TempDir, Error> {
+fn fresh_workdir(source_dir: &Path, workspace_root: &Path) -> Result<TempDir, Error> {
     let workdir =
         tempfile::tempdir().map_err(|error| Error::new(format!("creating workdir: {error}")))?;
     copy_fixture(source_dir, workdir.path()).map_err(|error| {
         Error::new(format!("copying fixture {}: {error}", source_dir.display()))
     })?;
+    crate::link_node_modules(workdir.path(), workspace_root)?;
     Ok(workdir)
 }
 

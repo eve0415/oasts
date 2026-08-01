@@ -28,8 +28,8 @@ Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtim
 | --- | --- |
 | TypeScript types | ✅ |
 | Typed fetch client | ✅ |
-| Zod schemas | Planned |
-| Standalone validators | Planned |
+| Zod schemas | ✅ |
+| Standalone validators | ✅ |
 | TanStack Query hooks | Planned |
 | MSW handlers | Planned |
 
@@ -165,7 +165,6 @@ pnpm -C packages/oasts build            # bundle the npm package
 - Typed auth providers with runtime enforcement
 - Streaming request/response bodies
 - Transform layer (e.g. `date-time` → `Date`)
-- Zod schemas and standalone validators
 - TanStack Query hooks and MSW handlers
 
 ## License
