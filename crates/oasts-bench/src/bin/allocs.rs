@@ -190,6 +190,14 @@ fn main() -> ExitCode {
         Mode::Check
     };
 
+    // rayon builds its global pool lazily on first use, and that construction allocates. Left
+    // alone, the pool is built inside whichever fixture is measured first -- and `--update`
+    // walks every present fixture while `--check` walks only the committed ones, so the two do
+    // not start on the same key and their counters disagree by the pool's allocations. Force the
+    // pool into existence outside every measurement window so the recorded numbers describe the
+    // pipeline rather than the key set.
+    rayon::broadcast(|_| ());
+
     let root = workspace_root();
     let manifest = match Manifest::load(&root.join("bench/manifest.yaml")) {
         Ok(manifest) => manifest,
@@ -316,6 +324,12 @@ fn measure_key(entry: &FixtureEntry, fixture_dir: &Path) -> Result<KeySnapshot, 
         return Err(stage_failure(&key_label, "parse", sink));
     };
 
+    // Production retains only the owned source digest inputs after parse, so mirror that lifetime
+    // here before measuring analysis. `source_tuples` historically belongs to the emit allocation
+    // snapshot; the equivalent clone in that window below keeps the gated counters comparable.
+    let source_tuples = graph.source_tuples();
+    drop(graph);
+
     let analyzed = run_stage(&mut stages, "analyze", || analyze(ir, &config, &mut sink));
 
     let client_model = if config.artifacts.client.enabled {
@@ -330,9 +344,10 @@ fn measure_key(entry: &FixtureEntry, fixture_dir: &Path) -> Result<KeySnapshot, 
         return Err(stage_failure(&key_label, "analyze/clientModel", sink));
     }
 
-    // `source_tuples` runs inside the emit window, matching `pipeline::compile`.
     let files = run_stage(&mut stages, "emit", || {
-        let source_tuples = graph.source_tuples();
+        // Cloning performs the same Vec/String allocations as `DocumentGraph::source_tuples` did
+        // in the historical emit snapshot, without retaining the document graph through emit.
+        let source_tuples = source_tuples.clone();
         emit_artifacts(
             &analyzed,
             &config,

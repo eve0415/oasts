@@ -11,6 +11,7 @@ use oasts_core::loader::{DocumentGraph, load_graph as run_load_graph};
 use oasts_core::parse::parse as run_parse;
 use oasts_core::pipeline::compile as run_compile;
 use oasts_core::semantic::{Analyzed, analyze as run_analyze};
+use oasts_core::writer::{check_drift as run_check_drift, write as run_write};
 
 const SAMPLE_COUNT: u32 = 10;
 
@@ -137,6 +138,19 @@ fn prepared_analysis(fixture: &Fixture) -> Analyzed {
     analyzed
 }
 
+fn prepared_files(fixture: &Fixture) -> Vec<oasts_core::emit::GeneratedFile> {
+    let mut sink = DiagnosticSink::new();
+    let files = run_compile(&fixture.config, true, &mut sink)
+        .unwrap_or_else(|| panic!("failed to compile {}: {:#?}", fixture.name, sink.as_slice()));
+    assert!(
+        !sink.has_errors(),
+        "compile diagnostics for {}: {:#?}",
+        fixture.name,
+        sink.as_slice()
+    );
+    files
+}
+
 #[divan::bench(args = fixtures(), sample_count = SAMPLE_COUNT)]
 fn load_graph(bencher: Bencher, fixture: &Fixture) {
     bencher
@@ -222,5 +236,45 @@ fn compile(bencher: Bencher, fixture: &Fixture) {
         .bench_values(|mut sink| {
             let files = run_compile(&fixture.config, true, &mut sink);
             (files, sink)
+        });
+}
+
+#[divan::bench(args = fixtures(), sample_count = SAMPLE_COUNT)]
+fn write(bencher: Bencher, fixture: &Fixture) {
+    let files = prepared_files(fixture);
+
+    // The CLI's important write case is steady-state regeneration. Set up a
+    // fresh output tree outside the timer, then measure the unchanged write.
+    bencher
+        .with_inputs(|| {
+            let temp = tempfile::tempdir().expect("benchmark tempdir");
+            let output = temp.path().join("generated");
+            run_write(&output, files.clone()).unwrap_or_else(|diagnostics| {
+                panic!("failed to prepare {}: {diagnostics:#?}", fixture.name)
+            });
+            (temp, output, files.clone())
+        })
+        .bench_values(|(temp, output, files)| {
+            let report = run_write(&output, files);
+            (temp, report)
+        });
+}
+
+#[divan::bench(args = fixtures(), sample_count = SAMPLE_COUNT)]
+fn check_drift(bencher: Bencher, fixture: &Fixture) {
+    let files = prepared_files(fixture);
+
+    bencher
+        .with_inputs(|| {
+            let temp = tempfile::tempdir().expect("benchmark tempdir");
+            let output = temp.path().join("generated");
+            run_write(&output, files.clone()).unwrap_or_else(|diagnostics| {
+                panic!("failed to prepare {}: {diagnostics:#?}", fixture.name)
+            });
+            (temp, output, files.clone())
+        })
+        .bench_values(|(temp, output, files)| {
+            let report = run_check_drift(&output, files);
+            (temp, report)
         });
 }

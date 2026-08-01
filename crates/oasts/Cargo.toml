@@ -11,10 +11,11 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-clap = { version = "=4.6.2", features = ["derive"] }
+clap = { version = "=4.6.4", features = ["derive"] }
+mimalloc = "=0.1.52"
 oasts-core = { path = "../oasts-core" }
 
 [dev-dependencies]
-serde_json = { version = "=1.0.150", features = ["arbitrary_precision", "preserve_order"] }
-sha2 = "=0.10.9"
-tempfile = "=3.23.0"
+serde_json = { version = "=1.0.151", features = ["arbitrary_precision", "preserve_order"] }
+sha2 = "=0.11.0"
+tempfile = "=3.27.0"

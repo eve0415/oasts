@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use foldhash::{HashMap, HashMapExt, HashSet};
 
 use crate::config::ResolvedConfig;
 use crate::diag::DiagnosticSink;

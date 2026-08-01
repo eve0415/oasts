@@ -3,6 +3,15 @@
 //! This crate is a measurement tool: its correctness gates are its own unit tests, and its
 //! process-spawning pipeline is exercised by running the harness itself rather than by line
 //! coverage (see `scripts/coverage.sh`).
+//!
+//! CPU profiles use release-equivalent code with symbols and forced frame pointers (needed for
+//! reliable aarch64 unwinding): `RUSTFLAGS="-Cforce-frame-pointers=yes" cargo run --profile
+//! profiling -p oasts-bench --features cpu-profile --bin oasts-cpu-profile -- github-3.0`. Pass
+//! `stripe-3.0` for Stripe; SVGs default to `target/profiles/<fixture>-cpu.svg`. Heap profiles use
+//! `cargo run --profile profiling -p oasts-bench --features heap-profile --bin oasts-heap-profile
+//! -- github-3.0`; the command prints peak heap totals and the leading sites by bytes live at the
+//! global peak and by allocation call count, and writes `target/profiles/github-3.0-heap.json` for
+//! <https://nnethercote.github.io/dh_view/dh_view.html>.
 
 pub mod alloc_track;
 pub mod conformance;
@@ -11,6 +20,9 @@ pub mod manifest;
 pub mod results;
 pub mod run;
 pub mod sample;
+
+#[cfg(any(feature = "cpu-profile", feature = "heap-profile"))]
+pub mod profile;
 
 use std::fmt;
 use std::io;

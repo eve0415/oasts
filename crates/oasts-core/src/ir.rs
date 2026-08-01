@@ -746,16 +746,13 @@ pub fn box_if_populated<T: Default + PartialEq>(value: T) -> Option<Box<T>> {
     (value != T::default()).then(|| Box::new(value))
 }
 
+/// Metadata belonging to the object-property edge. Schema annotations stay on the child node's
+/// [`SchemaMeta`] so each property does not duplicate owned documentation values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PropMeta {
     pub required: bool,
     pub read_only: bool,
     pub write_only: bool,
-    pub deprecated: bool,
-    pub description: Option<String>,
-    pub default: Option<Value>,
-    pub examples: Vec<Value>,
-    pub source: SourceRef,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -900,6 +897,7 @@ mod tests {
         // here means a large field was added inline again, re-inflating every stored node.
         assert_eq!(size_of::<SchemaNode>(), 496);
         assert_eq!(size_of::<SchemaMeta>(), 368);
+        assert_eq!(size_of::<PropMeta>(), 3);
 
         // The boxed groups must each be an 8-byte null-optimized pointer inline.
         assert_eq!(size_of::<Option<Box<EnumExtensionData>>>(), 8);

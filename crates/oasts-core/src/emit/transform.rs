@@ -1063,8 +1063,8 @@ mod tests {
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let facts = TransformFacts::compute(&analyzed.ir, &resolved);
-        let mut model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
-        let emitter = Emitter::new(&mut model);
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&model);
         let node = &analyzed
             .ir
             .schemas

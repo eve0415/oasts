@@ -209,6 +209,10 @@ impl DiagnosticSink {
     pub fn as_slice(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
+
+    pub(crate) fn into_vec(self) -> Vec<Diagnostic> {
+        self.diagnostics
+    }
 }
 
 /// Renders diagnostics in the stable `severity[CODE]: message` stderr format.

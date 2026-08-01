@@ -1,7 +1,8 @@
 //! Client artifact planning over the normalized OpenAPI IR.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde_json::Value;
 
 use crate::config::{DeepObjectEncoding, ResolvedBaseUrl, ResolvedConfig};
@@ -1950,14 +1951,14 @@ fn diagnose_form_media(
     else {
         return;
     };
-    for (name, schema, property) in properties {
+    for (name, schema, _) in properties {
         if multipart && contains_control(name) {
             sink.push(source_diagnostic(
                 "OASTS1414",
                 format!(
                     "multipart field name {name:?} contains a control byte and cannot be represented"
                 ),
-                &property.source,
+                &schema.meta().source,
                 Severity::Error,
             ));
         }
@@ -2079,7 +2080,7 @@ fn diagnose_form_media(
                     format!(
                         "form field '{name}' has a binary payload that application/x-www-form-urlencoded cannot represent; use multipart/form-data for binary uploads or base64-encode the value (type: string, contentEncoding: base64url)"
                     ),
-                    &property.source,
+                    &schema.meta().source,
                     Severity::Error,
                 ));
             }
@@ -2109,7 +2110,7 @@ fn diagnose_form_media(
                         format!(
                             "form field '{name}' declares a text media type but its schema is an object; use application/json (or a *+json media type) for structured urlencoded values"
                         ),
-                        &property.source,
+                        &schema.meta().source,
                         Severity::Error,
                     ));
                 }

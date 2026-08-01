@@ -17,3 +17,10 @@ categories = ["command-line-utilities", "development-tools"]
 codegen-units = 1
 lto = "fat"
 strip = "symbols"
+
+# Release-equivalent code generation with symbols retained for the feature-gated
+# oasts-bench CPU and heap profilers.
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"

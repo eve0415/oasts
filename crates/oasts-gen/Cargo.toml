@@ -12,4 +12,4 @@ categories.workspace = true
 
 [dependencies]
 oasts-core = { path = "../oasts-core", features = ["json-schema"] }
-serde_json = { version = "=1.0.150", features = ["arbitrary_precision", "preserve_order"] }
+serde_json = { version = "=1.0.151", features = ["arbitrary_precision", "preserve_order"] }

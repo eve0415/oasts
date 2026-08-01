@@ -1,8 +1,9 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use crate::config::ResolvedBaseUrl;
 use crate::ir::{ServerVariable, SourceRef};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 use super::model::EmissionModel;
 use super::{GeneratedFile, render_property_key, render_ts_string};
@@ -76,7 +77,10 @@ pub(crate) fn emit_runtime_files(selection: RuntimeSelection<'_, '_, '_>) -> Vec
         selection.source,
         &runtime_directory,
         "result.ts",
-        rewrite_relative_ts_imports(&render_regions(&assets.result, |_| true), &import_extension),
+        rewrite_relative_ts_imports(
+            &render_regions(&assets.result, &|_| true),
+            &import_extension,
+        ),
     );
 
     push_runtime_file(
@@ -86,7 +90,7 @@ pub(crate) fn emit_runtime_files(selection: RuntimeSelection<'_, '_, '_>) -> Vec
         &runtime_directory,
         "standard-schema.ts",
         rewrite_relative_ts_imports(
-            &render_regions(&assets.standard_schema, |_| true),
+            &render_regions(&assets.standard_schema, &|_| true),
             &import_extension,
         ),
     );
@@ -309,7 +313,7 @@ fn render_serialize(
         );
     }
 
-    render_regions(asset, |id| match id {
+    render_regions(asset, &|id| match id {
         RegionId::Core => true,
         RegionId::Helper(helper) => selected.contains(helper),
         RegionId::Auth => false,
@@ -321,7 +325,7 @@ fn specialize_transport(
     runtime_base_url: bool,
     server_variables: &[(String, ServerVariable)],
 ) -> String {
-    let transport = render_regions(asset, |_| true);
+    let transport = render_regions(asset, &|_| true);
     let transport = substitute_frozen_once(
         transport,
         FROZEN_TRANSPORT_BASE_URL_OPTIONAL,
@@ -422,7 +426,7 @@ fn server_variable_union(variables: &[(String, ServerVariable)]) -> Option<Strin
     Some(format!("  serverVariables?: {};", branches.join(" | ")))
 }
 
-fn render_regions(asset: &ParsedAsset<'_>, include: impl Fn(&RegionId) -> bool) -> String {
+fn render_regions(asset: &ParsedAsset<'_>, include: &dyn Fn(&RegionId) -> bool) -> String {
     let mut output = String::new();
     for part in &asset.parts {
         match part {
@@ -866,7 +870,7 @@ mod tests {
     #[test]
     fn no_enum_server_variables_leave_transport_byte_identical() {
         let assets = runtime_assets();
-        let frozen = render_regions(&assets.transport, |_| true);
+        let frozen = render_regions(&assets.transport, &|_| true);
         assert!(frozen.contains(FROZEN_TRANSPORT_SERVER_VARIABLES));
         let no_enum = [("region".to_owned(), server_variable("us", &[]))];
         assert_eq!(

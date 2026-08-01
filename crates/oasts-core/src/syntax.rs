@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::str::FromStr;
 
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde_json::{Map, Number, Value};
 use yaml_rust2::parser::{Event, Parser, Tag};
 use yaml_rust2::scanner::{Marker, TScalarStyle};

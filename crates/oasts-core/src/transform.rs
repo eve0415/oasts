@@ -7,8 +7,7 @@
 //! the typecheck and client-size budgets for nothing, so reachability is computed first and the
 //! emitters ask it.
 
-use std::collections::HashMap;
-
+use foldhash::HashMap;
 use serde_json::Value;
 
 use crate::config::{DateRepresentation, DateTimeRepresentation, ResolvedConfig};

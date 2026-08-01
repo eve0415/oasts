@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::diag::Diagnostic;
@@ -16,6 +17,7 @@ const CODE_MANIFEST: &str = "OASTS0231";
 const CODE_PATH: &str = "OASTS0232";
 const CODE_IO: &str = "OASTS0233";
 const CODE_DUPLICATE: &str = "OASTS0234";
+const PARALLEL_IO_MIN_FILES: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -83,6 +85,87 @@ struct PreparedFile {
     content: Vec<u8>,
 }
 
+/// Resolves generated paths against the output directory, memoising parent resolution.
+///
+/// The memo is only sound where nothing acts on the filesystem afterwards, so it is confined to
+/// the preflight sweep: preflight validates every path the run will touch and performs no I/O of
+/// its own, and a cache hit there at worst lets a hostile path pass a check that the fresh
+/// resolution in front of the actual operation then rejects. Every site that goes on to read,
+/// write or unlink a target resolves through [`validate_target`] instead, which builds a throwaway
+/// validator so the parent's metadata and containment are re-checked immediately before the
+/// operation — the property the uncached code had, and the one a cross-family review flagged this
+/// cache for weakening.
+struct TargetValidator<'a> {
+    output_dir: &'a Path,
+    resolved_parents: BTreeMap<PathBuf, PathBuf>,
+}
+
+impl<'a> TargetValidator<'a> {
+    fn new(output_dir: &'a Path) -> Self {
+        Self {
+            output_dir,
+            resolved_parents: BTreeMap::new(),
+        }
+    }
+
+    fn validate(&mut self, relative_path: &str) -> Result<PathBuf, Vec<Diagnostic>> {
+        validate_relative_path(relative_path)?;
+        let mut components = relative_path.split('/').peekable();
+        let mut unresolved_parent = self.output_dir.to_path_buf();
+        let mut resolved_parent = self.output_dir.to_path_buf();
+        let file_name = components
+            .next_back()
+            .expect("validated relative paths contain a file name");
+        for component in components {
+            unresolved_parent.push(component);
+            if let Some(cached) = self.resolved_parents.get(&unresolved_parent) {
+                resolved_parent.clone_from(cached);
+                continue;
+            }
+
+            let candidate = resolved_parent.join(component);
+            match fs::symlink_metadata(&candidate) {
+                Ok(metadata) => {
+                    if !metadata.is_dir() && !metadata.file_type().is_symlink() {
+                        return Err(vec![path_diagnostic(
+                            relative_path,
+                            "a parent component is not a directory",
+                        )]);
+                    }
+                    let canonical = fs::canonicalize(&candidate).map_err(|error| {
+                        vec![io_diagnostic(
+                            format!(
+                                "failed to canonicalize parent of generated path '{relative_path}': {error}"
+                            ),
+                            Some(&candidate),
+                        )]
+                    })?;
+                    if !canonical.is_dir() || !is_strictly_within(self.output_dir, &canonical) {
+                        return Err(vec![path_diagnostic(
+                            relative_path,
+                            "symlink-canonicalized parent escapes the output directory",
+                        )]);
+                    }
+                    resolved_parent = canonical;
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    resolved_parent.push(component);
+                }
+                Err(error) => {
+                    return Err(vec![io_diagnostic(
+                        format!("failed to inspect generated path '{relative_path}': {error}"),
+                        Some(&candidate),
+                    )]);
+                }
+            }
+            self.resolved_parents
+                .insert(unresolved_parent.clone(), resolved_parent.clone());
+        }
+        let target = resolved_parent.join(file_name);
+        validate_target_metadata(relative_path, &target, fs::symlink_metadata(&target))
+    }
+}
+
 /// Writes generated files and updates the output-root ownership manifest.
 pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport, Vec<Diagnostic>> {
     let prepared = prepare_files(files)?;
@@ -112,7 +195,8 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
         })?;
     }
     let canonical_output = canonical_output_dir(output_dir)?;
-    preflight_targets(&canonical_output, &prepared, previous)?;
+    let mut targets = TargetValidator::new(&canonical_output);
+    preflight_targets(&mut targets, &prepared, previous)?;
 
     let new_paths = prepared
         .iter()
@@ -142,19 +226,35 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
         }
     }
 
+    let unchanged = if output_existed {
+        if rayon::current_num_threads() == 1 || prepared.len() < PARALLEL_IO_MIN_FILES {
+            let mut existing_content = Vec::new();
+            prepared
+                .iter()
+                .map(|file| {
+                    existing_content_matches(&canonical_output, file, &mut existing_content)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            prepared
+                .par_iter()
+                .map_init(Vec::new, |existing_content, file| {
+                    existing_content_matches(&canonical_output, file, existing_content)
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    } else {
+        vec![false; prepared.len()]
+    };
+
     let mut files_written = 0;
-    let mut existing_content = Vec::new();
-    for file in &prepared {
-        let target = validate_target(&canonical_output, &file.relative_path)?;
-        let is_unchanged = output_existed
-            && fs::File::open(&target).is_ok_and(|mut existing_file| {
-                existing_content.clear();
-                existing_file.read_to_end(&mut existing_content).is_ok()
-                    && existing_content.as_slice() == file.content.as_slice()
-            });
+    for (file, is_unchanged) in prepared.iter().zip(unchanged) {
         if is_unchanged {
             continue;
         }
+        let target = validate_target(&canonical_output, &file.relative_path)?;
         let parent = target
             .parent()
             .expect("a validated target inside an absolute output directory has a parent");
@@ -204,6 +304,19 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
     })
 }
 
+fn existing_content_matches(
+    output_dir: &Path,
+    file: &PreparedFile,
+    existing_content: &mut Vec<u8>,
+) -> Result<bool, Vec<Diagnostic>> {
+    let target = validate_target(output_dir, &file.relative_path)?;
+    Ok(fs::File::open(&target).is_ok_and(|mut existing_file| {
+        existing_content.clear();
+        existing_file.read_to_end(existing_content).is_ok()
+            && existing_content.as_slice() == file.content.as_slice()
+    }))
+}
+
 /// Compares generated bytes and ownership metadata without changing the output tree.
 #[must_use]
 pub fn check_drift(output_dir: &Path, files: Vec<GeneratedFile>) -> DriftReport {
@@ -250,7 +363,8 @@ fn check_drift_inner(
     let manifest_read = read_manifest_bytes(&canonical_output)?;
     let manifest = manifest_read.as_ref().map(|(manifest, _)| manifest);
     validate_manifest_paths(manifest)?;
-    preflight_targets(&canonical_output, &prepared, manifest)?;
+    let mut targets = TargetValidator::new(&canonical_output);
+    preflight_targets(&mut targets, &prepared, manifest)?;
 
     let expected_manifest = Manifest {
         manifest_version: 1,
@@ -272,29 +386,27 @@ fn check_drift_inner(
         .map(|file| (file.relative_path.clone(), file))
         .collect::<BTreeMap<_, _>>();
 
-    let mut entries = Vec::with_capacity(generated.len() + recorded.len() + 1);
-    for (relative_path, file) in &generated {
-        let state = if !recorded.contains(relative_path) {
-            DriftState::Stale
+    let mut entries =
+        if rayon::current_num_threads() == 1 || generated.len() < PARALLEL_IO_MIN_FILES {
+            generated
+                .iter()
+                .map(|(relative_path, file)| {
+                    compare_drift_file(&canonical_output, &recorded, relative_path, file)
+                })
+                .collect::<Result<Vec<_>, _>>()?
         } else {
-            let target = validate_target(&canonical_output, relative_path)?;
-            match fs::read(&target) {
-                Ok(bytes) if bytes == file.content => DriftState::Clean,
-                Ok(_) => DriftState::Edited,
-                Err(error) if error.kind() == ErrorKind::NotFound => DriftState::Missing,
-                Err(error) => {
-                    return Err(vec![io_diagnostic(
-                        format!("failed to read generated file '{relative_path}': {error}"),
-                        Some(&target),
-                    )]);
-                }
-            }
+            generated
+                .iter()
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|(relative_path, file)| {
+                    compare_drift_file(&canonical_output, &recorded, relative_path, file)
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?
         };
-        entries.push(DriftEntry {
-            relative_path: relative_path.clone(),
-            state,
-        });
-    }
+    entries.reserve(recorded.len() + 1);
     for relative_path in recorded
         .iter()
         .filter(|path| !generated.contains_key(path.as_str()))
@@ -321,6 +433,34 @@ fn check_drift_inner(
     Ok(DriftReport {
         entries,
         diagnostics: Vec::new(),
+    })
+}
+
+fn compare_drift_file(
+    output_dir: &Path,
+    recorded: &BTreeSet<String>,
+    relative_path: &str,
+    file: &PreparedFile,
+) -> Result<DriftEntry, Vec<Diagnostic>> {
+    let state = if !recorded.contains(relative_path) {
+        DriftState::Stale
+    } else {
+        let target = validate_target(output_dir, relative_path)?;
+        match fs::read(&target) {
+            Ok(bytes) if bytes == file.content => DriftState::Clean,
+            Ok(_) => DriftState::Edited,
+            Err(error) if error.kind() == ErrorKind::NotFound => DriftState::Missing,
+            Err(error) => {
+                return Err(vec![io_diagnostic(
+                    format!("failed to read generated file '{relative_path}': {error}"),
+                    Some(&target),
+                )]);
+            }
+        }
+    };
+    Ok(DriftEntry {
+        relative_path: relative_path.to_owned(),
+        state,
     })
 }
 
@@ -465,68 +605,24 @@ fn validate_relative_path(relative_path: &str) -> Result<(), Vec<Diagnostic>> {
 }
 
 fn preflight_targets(
-    output_dir: &Path,
+    targets: &mut TargetValidator<'_>,
     files: &[PreparedFile],
     previous: Option<&Manifest>,
 ) -> Result<(), Vec<Diagnostic>> {
-    validate_target(output_dir, MANIFEST_NAME)?;
+    targets.validate(MANIFEST_NAME)?;
     for file in files {
-        validate_target(output_dir, &file.relative_path)?;
+        targets.validate(&file.relative_path)?;
     }
     if let Some(previous) = previous {
         for relative_path in &previous.files {
-            validate_target(output_dir, relative_path)?;
+            targets.validate(relative_path)?;
         }
     }
     Ok(())
 }
 
 fn validate_target(output_dir: &Path, relative_path: &str) -> Result<PathBuf, Vec<Diagnostic>> {
-    validate_relative_path(relative_path)?;
-    let mut components = relative_path.split('/').peekable();
-    let mut resolved_parent = output_dir.to_path_buf();
-    let file_name = components
-        .next_back()
-        .expect("validated relative paths contain a file name");
-    for component in components {
-        let candidate = resolved_parent.join(component);
-        match fs::symlink_metadata(&candidate) {
-            Ok(metadata) => {
-                if !metadata.is_dir() && !metadata.file_type().is_symlink() {
-                    return Err(vec![path_diagnostic(
-                        relative_path,
-                        "a parent component is not a directory",
-                    )]);
-                }
-                let canonical = fs::canonicalize(&candidate).map_err(|error| {
-                    vec![io_diagnostic(
-                        format!(
-                            "failed to canonicalize parent of generated path '{relative_path}': {error}"
-                        ),
-                        Some(&candidate),
-                    )]
-                })?;
-                if !canonical.is_dir() || !is_strictly_within(output_dir, &canonical) {
-                    return Err(vec![path_diagnostic(
-                        relative_path,
-                        "symlink-canonicalized parent escapes the output directory",
-                    )]);
-                }
-                resolved_parent = canonical;
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                resolved_parent.push(component);
-            }
-            Err(error) => {
-                return Err(vec![io_diagnostic(
-                    format!("failed to inspect generated path '{relative_path}': {error}"),
-                    Some(&candidate),
-                )]);
-            }
-        }
-    }
-    let target = resolved_parent.join(file_name);
-    validate_target_metadata(relative_path, &target, fs::symlink_metadata(&target))
+    TargetValidator::new(output_dir).validate(relative_path)
 }
 
 fn validate_target_metadata(
@@ -631,6 +727,56 @@ mod tests {
     }
 
     #[test]
+    fn parallel_comparisons_preserve_drift_and_write_results() {
+        let files = (0..64)
+            .map(|index| {
+                generated(
+                    &format!("group-{}/file-{index:02}.ts", index % 4),
+                    &format!("value {index}\n"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut expected_drift = None;
+
+        for thread_count in [1, 2, 18] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let output = temp.path().join("generated");
+            let mut initial = files.clone();
+            initial.push(generated("old.ts", "old\n"));
+            write(&output, initial).expect("initial write");
+            fs::write(output.join("group-0/file-00.ts"), "edited\n").expect("edit");
+            fs::remove_file(output.join("group-1/file-01.ts")).expect("remove");
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(thread_count)
+                .build()
+                .expect("rayon pool");
+            let drift = pool.install(|| check_drift(&output, files.clone()));
+            if let Some(expected) = &expected_drift {
+                assert_eq!(&drift, expected, "thread count {thread_count}");
+            } else {
+                expected_drift = Some(drift.clone());
+            }
+
+            let report = pool
+                .install(|| write(&output, files.clone()))
+                .expect("repair output");
+            assert_eq!(
+                report,
+                WriteReport {
+                    files_written: 2,
+                    files_deleted: 1,
+                },
+                "thread count {thread_count}"
+            );
+            assert!(
+                pool.install(|| check_drift(&output, files.clone()))
+                    .is_clean()
+            );
+        }
+    }
+
+    #[test]
     fn regeneration_deletes_only_obsolete_owned_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("generated");
@@ -696,6 +842,47 @@ mod tests {
         assert_eq!(diagnostics[0].category, crate::diag::Category::Config);
         assert_eq!(fs::read_to_string(victim).expect("victim"), "safe\n");
         assert!(!output.join("new.ts").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_memo_never_reaches_a_filesystem_action() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = fs::canonicalize(temp.path()).expect("canonical output");
+        fs::create_dir(output.join("parent")).expect("parent");
+        let outside_dir = tempfile::tempdir().expect("outside tempdir");
+        let outside = output.join("outside.ts");
+        fs::write(&outside, "outside").expect("outside");
+
+        // Inside the preflight sweep a memo hit still re-checks the target itself, so a target
+        // that became a symlink after its parent was resolved is rejected.
+        let mut targets = TargetValidator::new(&output);
+        targets
+            .validate("parent/target.ts")
+            .expect("missing target");
+        assert_eq!(targets.resolved_parents.len(), 1);
+        symlink(&outside, output.join("parent/target.ts")).expect("target symlink");
+        assert_eq!(
+            targets
+                .validate("parent/target.ts")
+                .expect_err("a memoised parent must not memoise target metadata")[0]
+                .code,
+            CODE_PATH
+        );
+
+        // Every site that reads, writes or unlinks goes through `validate_target`, which carries
+        // no memo: a parent swapped for an escaping symlink after preflight is still caught.
+        fs::remove_file(output.join("parent/target.ts")).expect("drop target symlink");
+        fs::remove_dir(output.join("parent")).expect("drop parent");
+        symlink(outside_dir.path(), output.join("parent")).expect("parent symlink");
+        assert_eq!(
+            validate_target(&output, "parent/target.ts")
+                .expect_err("an action must not trust a stale parent resolution")[0]
+                .code,
+            CODE_PATH
+        );
     }
 
     #[test]

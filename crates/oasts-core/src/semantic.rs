@@ -1,8 +1,9 @@
 //! Semantic analysis, identifier normalization, and stable name allocation.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde_json::{Number, Value};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::UnicodeNormalization;
@@ -569,18 +570,31 @@ fn allocate_operation_names(
         }
     }
 
-    // Borrowed keys, and the whole remedy pass gated on an actual collision — see the matching
-    // note in `allocate_schema_names`: suggestions only ever reach a user through a collision
-    // diagnostic, so a clean document must not pay to build them.
-    let mut groups = BTreeMap::<&str, Vec<usize>>::new();
+    // Find collisions with borrowed keys. Keep the first index for each name so diagnostics retain
+    // their original first-declaration source and encounter order.
+    let mut first_indices = HashMap::<&str, usize>::with_capacity(pending.len());
+    let mut collisions = Vec::new();
     for (index, operation) in pending.iter().enumerate() {
-        groups
-            .entry(operation.allocated.name.as_str())
-            .or_default()
-            .push(index);
+        let name = operation.allocated.name.as_str();
+        if let Some(previous_index) = first_indices.get(name).copied() {
+            collisions.push((index, previous_index));
+        } else {
+            first_indices.insert(name, index);
+        }
     }
+    drop(first_indices);
+
     let mut group_suggestions = HashMap::new();
-    if groups.values().any(|indices| indices.len() > 1) {
+    // Suggestions only reach a user through a collision diagnostic. Build the ordered grouping
+    // and remedy indexes only on that uncommon path.
+    if !collisions.is_empty() {
+        let mut groups = BTreeMap::<&str, Vec<usize>>::new();
+        for (index, operation) in pending.iter().enumerate() {
+            groups
+                .entry(operation.allocated.name.as_str())
+                .or_default()
+                .push(index);
+        }
         let existing_file_names = pending.iter().filter_map(|operation| {
             let source_name = if operation.overridden {
                 operation.allocated.name.as_str()
@@ -617,28 +631,21 @@ fn allocate_operation_names(
         }
     }
 
-    let mut names = Vec::new();
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    for operation in pending {
-        if let Some(previous_index) = seen.get(&operation.allocated.name).copied() {
-            let previous = &names[previous_index];
-            let diagnostic = operation_collision_diagnostic(
-                &operation,
-                previous,
-                group_suggestions
-                    .get(&operation.allocated.name)
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-            if let Some(diagnostic) = diagnostic {
-                sink.push(diagnostic);
-            }
-        } else {
-            seen.insert(operation.allocated.name.clone(), names.len());
+    for (index, previous_index) in collisions {
+        let operation = &pending[index];
+        let diagnostic = operation_collision_diagnostic(
+            operation,
+            &pending[previous_index],
+            group_suggestions
+                .get(&operation.allocated.name)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        if let Some(diagnostic) = diagnostic {
+            sink.push(diagnostic);
         }
-        names.push(operation);
     }
-    names
+    pending
         .into_iter()
         .map(|operation| operation.allocated)
         .collect()
@@ -969,21 +976,33 @@ fn allocate_schema_names(
         }
     }
 
-    // Keyed on borrowed names: every document pays for this grouping, and almost none of them
-    // collide, so the common run must not allocate a String per schema to learn that.
-    let mut groups = BTreeMap::<&str, Vec<usize>>::new();
+    // Find collisions with borrowed keys. Keep the first index for each name so diagnostics retain
+    // their original first-declaration source and encounter order.
+    let mut first_indices = HashMap::<&str, usize>::with_capacity(pending.len());
+    let mut collisions = Vec::new();
     for (index, schema) in pending.iter().enumerate() {
-        groups
-            .entry(schema.allocated.name.as_str())
-            .or_default()
-            .push(index);
+        let name = schema.allocated.name.as_str();
+        if let Some(previous_index) = first_indices.get(name).copied() {
+            collisions.push((index, previous_index));
+        } else {
+            first_indices.insert(name, index);
+        }
     }
+    drop(first_indices);
+
     let mut all_suggestions = Vec::new();
     // Suggestions only ever reach the user attached to an OASTS1202, so a document with no
     // identifier collision can never be shown one. Everything below — indexing every allocated
     // name, deriving a file base per schema, grouping those — is remedy machinery, and skipping
     // it outright is what keeps the overwhelmingly common clean run from paying for it.
-    if groups.values().any(|indices| indices.len() > 1) {
+    if !collisions.is_empty() {
+        let mut groups = BTreeMap::<&str, Vec<usize>>::new();
+        for (index, schema) in pending.iter().enumerate() {
+            groups
+                .entry(schema.allocated.name.as_str())
+                .or_default()
+                .push(index);
+        }
         let mut suggested_sources = HashSet::new();
         let existing_file_names = pending.iter().filter_map(|schema| {
             let source_name = if schema.overridden {
@@ -1008,30 +1027,21 @@ fn allocate_schema_names(
         );
     }
 
-    let mut names = Vec::new();
-    let mut seen: HashMap<&str, usize> = HashMap::new();
-    for schema in &pending {
-        if let Some(previous_index) = seen.get(schema.allocated.name.as_str()).copied() {
-            let previous: &&PendingSchemaName = &names[previous_index];
-            let message = format!(
-                "schema name collision: '{}' allocated at {} and {}",
-                schema.allocated.name,
-                previous.allocated.source.display(),
-                schema.allocated.source.display()
-            );
-            sink.push(
-                source_diagnostic(CODE_TYPE_NAME, message, &schema.allocated.source)
-                    .with_naming_override_suggestions(all_suggestions.clone()),
-            );
-        } else {
-            seen.insert(schema.allocated.name.as_str(), names.len());
-        }
-        names.push(schema);
+    for (index, previous_index) in collisions {
+        let schema = &pending[index];
+        let previous = &pending[previous_index];
+        let message = format!(
+            "schema name collision: '{}' allocated at {} and {}",
+            schema.allocated.name,
+            previous.allocated.source.display(),
+            schema.allocated.source.display()
+        );
+        sink.push(
+            source_diagnostic(CODE_TYPE_NAME, message, &schema.allocated.source)
+                .with_naming_override_suggestions(all_suggestions.clone()),
+        );
     }
-    names
-        .into_iter()
-        .map(|schema| schema.allocated.clone())
-        .collect()
+    pending.into_iter().map(|schema| schema.allocated).collect()
 }
 
 /// The paste-ready `naming.overrides.schemas` block for a run that collided, covering both the
@@ -1393,7 +1403,9 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
             validate_enum_extensions(None, meta, analysis.types, analysis.sink);
         }
     }
-    let applicators = schema.meta().validation_applicators();
+    let Some(applicators) = schema.meta().validation_applicators.as_deref() else {
+        return;
+    };
     if let Some(schema) = &applicators.not {
         analyze_schema_enums(schema, analysis);
     }
@@ -1427,7 +1439,9 @@ fn analyze_schema_enums(schema: &SchemaNode, analysis: &mut EnumAnalysis<'_, '_>
 }
 
 fn validate_numeric_bound_domain(meta: &SchemaMeta, sink: &mut DiagnosticSink) {
-    let constraints = meta.numeric_constraints();
+    let Some(constraints) = meta.numeric_constraints.as_deref() else {
+        return;
+    };
     let bounds = [
         ("minimum", constraints.minimum.as_ref()),
         ("maximum", constraints.maximum.as_ref()),
@@ -1463,6 +1477,9 @@ fn validate_numeric_bound_domain(meta: &SchemaMeta, sink: &mut DiagnosticSink) {
 }
 
 fn validate_annotation_domain(meta: &SchemaMeta, sink: &mut DiagnosticSink) {
+    if meta.docs.default.is_none() && meta.docs.examples.is_empty() {
+        return;
+    }
     for value in meta.docs.default.iter().chain(meta.docs.examples.iter()) {
         if let Some(number) = first_number_outside_binary64(value) {
             let mut diagnostic = source_diagnostic(
@@ -1485,6 +1502,9 @@ fn analyze_finite_values(
     meta: &SchemaMeta,
     analysis: &mut EnumAnalysis<'_, '_>,
 ) {
+    if enum_values.is_none() && const_value.is_none() && meta.enum_extensions.is_none() {
+        return;
+    }
     let extension_values =
         validate_enum_extensions(enum_values, meta, analysis.types, analysis.sink);
     if let Some(values) = enum_values {
@@ -1604,7 +1624,9 @@ fn validate_enum_extensions(
     types: &TypesConfig,
     sink: &mut DiagnosticSink,
 ) -> ValidatedExtensions {
-    let enum_ext = meta.enum_extensions();
+    let Some(enum_ext) = meta.enum_extensions.as_deref() else {
+        return ValidatedExtensions::default();
+    };
     let extensions = [
         ("x-enum-varnames", enum_ext.enum_varnames.as_ref()),
         ("x-enumNames", enum_ext.enum_names.as_ref()),
@@ -2909,10 +2931,12 @@ mod tests {
                 .iter()
                 .filter_map(|diagnostic| diagnostic.json_pointer.as_deref())
                 .collect::<HashSet<_>>(),
-            HashSet::from([
+            [
                 "/webhooks/ping/post",
-                "/paths/~1subscribe/post/callbacks/delivery/0/post"
-            ])
+                "/paths/~1subscribe/post/callbacks/delivery/0/post",
+            ]
+            .into_iter()
+            .collect()
         );
     }
 

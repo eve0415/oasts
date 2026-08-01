@@ -1,7 +1,7 @@
 //! Local OpenAPI document loading and reference resolution.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -495,8 +496,20 @@ impl WalkContext {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WalkLocation {
+    doc_id: DocId,
+    json_pointer: Rc<str>,
+}
+
+#[derive(Clone, Copy)]
+struct WalkPointer<'pointer> {
+    doc_id: DocId,
+    json_pointer: &'pointer str,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct VisitKey {
-    location: NodeLocation,
+    location: WalkLocation,
     context: WalkContext,
     base: Rc<Url>,
 }
@@ -509,13 +522,22 @@ struct ActiveReference {
 
 #[derive(Default)]
 struct TraversalState {
-    stack: Vec<NodeLocation>,
+    stack: Vec<WalkLocation>,
     active_references: Vec<ActiveReference>,
+}
+
+struct ResolvedWalkNode<'value> {
+    document: &'value Document,
+    value: &'value Value,
+    doc_id: DocId,
+    context: WalkContext,
+    base: Rc<Url>,
+    ref_depth: u64,
 }
 
 struct GraphBuilder<'a> {
     config: &'a ResolvedConfig,
-    documents: Vec<Document>,
+    documents: Vec<Rc<Document>>,
     path_to_id: HashMap<PathBuf, DocId>,
     identifiers: IdentifierRegistry,
     edges: Vec<ReferenceEdge>,
@@ -582,9 +604,16 @@ impl<'a> GraphBuilder<'a> {
             0,
             &mut state,
         )?;
+        let documents = self
+            .documents
+            .into_iter()
+            .map(|document| {
+                Rc::try_unwrap(document).expect("document handles do not escape graph traversal")
+            })
+            .collect();
         Ok((
             DocumentGraph {
-                documents: self.documents,
+                documents,
                 path_to_id: self.path_to_id,
                 identifiers: self.identifiers,
                 entry_id,
@@ -662,37 +691,7 @@ impl<'a> GraphBuilder<'a> {
                 None,
             )
         })?;
-        // Fast-reject that gates the identifier tree walk over the *raw* file bytes. It must also
-        // fire on spellings that escape the `$`: a document can write the key with the dollar as a
-        // JSON or YAML unicode/hex character escape and still parse to the key `$anchor`. Missing
-        // one skips registration silently — later refs fail to resolve and duplicate-anchor
-        // validation never runs. Over-triggering is harmless (the walk just finds no identifier
-        // keys); a false negative is not, so the pairs below need no false negatives, not exactness.
-        //
-        // `$id` earns its place despite matching plenty of unrelated text: it is what creates a
-        // schema resource, and resource registration must not depend on whether the document also
-        // happens to declare an anchor — that would make `$id` mean different things in two
-        // documents differing only in an unrelated keyword.
-        const DOLLAR_SPELLINGS: [&[u8]; 3] = [
-            b"$",
-            // The dollar as the unicode escape U+0024 (JSON, and YAML double-quoted) — the literal
-            // bytes `\`, `u`, `0`, `0`, `2`, `4`.
-            &[0x5C, 0x75, 0x30, 0x30, 0x32, 0x34],
-            // The dollar as the YAML hex escape \x24.
-            br"\x24",
-        ];
-        const IDENTIFIER_SUFFIXES: [&[u8]; 4] =
-            [b"anchor", b"dynamicAnchor", b"recursiveAnchor", b"id"];
-        let contains_anchor = DOLLAR_SPELLINGS.iter().any(|dollar| {
-            raw.windows(dollar.len())
-                .enumerate()
-                .any(|(index, window)| {
-                    window == *dollar
-                        && IDENTIFIER_SUFFIXES
-                            .iter()
-                            .any(|suffix| raw[index + dollar.len()..].starts_with(suffix))
-                })
-        });
+        let contains_anchor = declares_identifier(&raw);
         let (value, warning) = parse_document(&canonical_path, &raw, &source_id)?;
         if let Some(warning) = warning {
             self.warnings.push(warning);
@@ -705,13 +704,13 @@ impl<'a> GraphBuilder<'a> {
                 .expect("a canonical filesystem path is representable as a file URI");
             collect_anchors(&value, id, base, &source_id, &mut self.identifiers)?;
         }
-        self.documents.push(Document {
+        self.documents.push(Rc::new(Document {
             id,
             canonical_path: canonical_path.clone(),
             source_id,
             value,
             sha256,
-        });
+        }));
         self.path_to_id.insert(canonical_path, id);
         self.total_bytes = next_total;
         Ok(id)
@@ -729,185 +728,188 @@ impl<'a> GraphBuilder<'a> {
             return Ok(());
         }
 
-        // Per-node summary extracted under a short immutable borrow of the resolved
-        // subtree, so the deep clone of the whole subtree is avoided. The mutating
-        // work (follow_reference / recursion, both &mut self) then runs from the
-        // owned summary once the borrow is dropped.
-        enum NodeSummary {
-            Object {
-                reference: Option<String>,
-                children: Vec<(String, WalkContext)>,
+        let document = self.documents.get(location.doc_id.0).cloned();
+        let value = document
+            .as_ref()
+            .and_then(|document| {
+                evaluate_pointer_trusted(&document.value, &location.json_pointer).ok()
+            })
+            .ok_or_else(|| {
+                input_error(
+                    CODE_POINTER,
+                    format!("JSON Pointer '{}' does not resolve", location.json_pointer),
+                    self.source_id(location.doc_id),
+                    Some(&location.json_pointer),
+                )
+            })?;
+        let doc_id = location.doc_id;
+        let mut json_pointer = location.json_pointer;
+        self.walk_resolved_node(
+            ResolvedWalkNode {
+                document: document.as_ref().expect("resolved document exists"),
+                value,
+                doc_id,
+                context,
+                base,
+                ref_depth,
             },
-            Array {
-                len: usize,
-            },
-        }
+            state,
+            &mut json_pointer,
+        )
+    }
 
+    fn walk_resolved_node(
+        &mut self,
+        node: ResolvedWalkNode<'_>,
+        state: &mut TraversalState,
+        json_pointer: &mut String,
+    ) -> Result<(), Diagnostic> {
         enum Container<'value> {
             Object(&'value serde_json::Map<String, Value>),
             Array(&'value [Value]),
         }
 
-        let (effective_base, summary) = {
-            let value = self
-                .documents
-                .get(location.doc_id.0)
-                .and_then(|document| {
-                    evaluate_pointer_trusted(&document.value, &location.json_pointer).ok()
-                })
-                .ok_or_else(|| {
-                    input_error(
-                        CODE_POINTER,
-                        format!("JSON Pointer '{}' does not resolve", location.json_pointer),
-                        self.source_id(location.doc_id),
-                        Some(&location.json_pointer),
-                    )
-                })?;
-            let container = match value {
-                Value::Object(object) => Container::Object(object),
-                Value::Array(values) => Container::Array(values),
-                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-                    return Ok(());
-                }
-            };
-            let key = VisitKey {
-                location: location.clone(),
-                context,
-                base: Rc::clone(&base),
-            };
-            if !self.visited.insert(key) {
-                return Ok(());
-            }
-
-            state.stack.push(location.clone());
-            let mut effective_base = base;
-            if context == WalkContext::Schema
-                && let Container::Object(object) = &container
-                && let Some(id_value) = object.get("$id")
-            {
-                let Some(id) = id_value.as_str() else {
-                    return Err(input_error(
-                        CODE_INVALID_REFERENCE,
-                        "Schema Object $id must be a string URI reference",
-                        self.source_id(location.doc_id),
-                        Some(&append_pointer(&location.json_pointer, "$id")),
-                    ));
-                };
-                effective_base = Rc::new(resolve_identity_uri(
-                    &effective_base,
-                    id,
-                    self.source_id(location.doc_id),
-                    Some(&append_pointer(&location.json_pointer, "$id")),
-                )?);
-            }
-
-            let summary = match container {
-                Container::Object(object) => {
-                    let reference =
-                        if matches!(context, WalkContext::Schema | WalkContext::NonSchema)
-                            && let Some(reference_value) = object.get("$ref")
-                        {
-                            let Some(reference) = reference_value.as_str() else {
-                                return Err(input_error(
-                                    CODE_INVALID_REFERENCE,
-                                    "$ref must be a string URI reference",
-                                    self.source_id(location.doc_id),
-                                    Some(&append_pointer(&location.json_pointer, "$ref")),
-                                ));
-                            };
-                            Some(reference.to_owned())
-                        } else {
-                            None
-                        };
-
-                    let mut children = Vec::new();
-                    for (name, child) in object {
-                        if matches!(context, WalkContext::Schema | WalkContext::NonSchema)
-                            && matches!(name.as_str(), "$ref" | "$id")
-                        {
-                            continue;
-                        }
-                        let child_context =
-                            child_context(context, &location.json_pointer, name, child);
-                        if child_context == WalkContext::Skip {
-                            continue;
-                        }
-                        children
-                            .push((append_pointer(&location.json_pointer, name), child_context));
-                    }
-
-                    NodeSummary::Object {
-                        reference,
-                        children,
-                    }
-                }
-                Container::Array(values) => NodeSummary::Array { len: values.len() },
-            };
-
-            (effective_base, summary)
+        let ResolvedWalkNode {
+            document,
+            value,
+            doc_id,
+            context,
+            base,
+            ref_depth,
+        } = node;
+        let container = match value {
+            Value::Object(object) => Container::Object(object),
+            Value::Array(values) => Container::Array(values),
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => return Ok(()),
         };
+        let location = WalkLocation {
+            doc_id,
+            json_pointer: Rc::from(json_pointer.as_str()),
+        };
+        let key = VisitKey {
+            location: location.clone(),
+            context,
+            base: Rc::clone(&base),
+        };
+        if !self.visited.insert(key) {
+            return Ok(());
+        }
 
-        match summary {
-            NodeSummary::Object {
-                reference,
-                children,
-            } => {
-                if let Some(reference) = reference {
+        state.stack.push(location.clone());
+        let mut effective_base = base;
+        if context == WalkContext::Schema
+            && let Container::Object(object) = &container
+            && let Some(id_value) = object.get("$id")
+        {
+            let Some(id) = id_value.as_str() else {
+                return Err(input_error(
+                    CODE_INVALID_REFERENCE,
+                    "Schema Object $id must be a string URI reference",
+                    self.source_id(doc_id),
+                    Some(&append_pointer(json_pointer, "$id")),
+                ));
+            };
+            effective_base = Rc::new(resolve_identity_uri(
+                &effective_base,
+                id,
+                self.source_id(doc_id),
+                Some(&append_pointer(json_pointer, "$id")),
+            )?);
+        }
+
+        match container {
+            Container::Object(object) => {
+                if matches!(context, WalkContext::Schema | WalkContext::NonSchema)
+                    && let Some(reference_value) = object.get("$ref")
+                {
+                    let Some(reference) = reference_value.as_str() else {
+                        return Err(input_error(
+                            CODE_INVALID_REFERENCE,
+                            "$ref must be a string URI reference",
+                            self.source_id(doc_id),
+                            Some(&append_pointer(json_pointer, "$ref")),
+                        ));
+                    };
                     self.follow_reference(
-                        &location,
-                        context.position(),
-                        &effective_base,
-                        &reference,
-                        ref_depth,
-                        state,
-                    )?;
-                }
-
-                for (json_pointer, child_context) in children {
-                    self.walk_node(
-                        NodeLocation {
-                            doc_id: location.doc_id,
+                        WalkPointer {
+                            doc_id,
                             json_pointer,
                         },
-                        child_context,
-                        Rc::clone(&effective_base),
+                        context.position(),
+                        &effective_base,
+                        reference,
                         ref_depth,
                         state,
                     )?;
                 }
+
+                for (name, child) in object {
+                    if matches!(context, WalkContext::Schema | WalkContext::NonSchema)
+                        && matches!(name.as_str(), "$ref" | "$id")
+                    {
+                        continue;
+                    }
+                    let child_context = child_context(context, json_pointer, name, child);
+                    if child_context == WalkContext::Skip {
+                        continue;
+                    }
+                    let restore_length = json_pointer.len();
+                    push_pointer_token(json_pointer, name);
+                    let result = self.walk_resolved_node(
+                        ResolvedWalkNode {
+                            document,
+                            value: child,
+                            doc_id,
+                            context: child_context,
+                            base: Rc::clone(&effective_base),
+                            ref_depth,
+                        },
+                        state,
+                        json_pointer,
+                    );
+                    json_pointer.truncate(restore_length);
+                    result?;
+                }
             }
-            NodeSummary::Array { len } => {
+            Container::Array(values) => {
                 let child_context = array_child_context(context);
                 if child_context != WalkContext::Skip {
-                    for index in 0..len {
-                        self.walk_node(
-                            NodeLocation {
-                                doc_id: location.doc_id,
-                                json_pointer: append_pointer_index(&location.json_pointer, index),
+                    for (index, child) in values.iter().enumerate() {
+                        let restore_length = json_pointer.len();
+                        push_pointer_index(json_pointer, index);
+                        let result = self.walk_resolved_node(
+                            ResolvedWalkNode {
+                                document,
+                                value: child,
+                                doc_id,
+                                context: child_context,
+                                base: Rc::clone(&effective_base),
+                                ref_depth,
                             },
-                            child_context,
-                            Rc::clone(&effective_base),
-                            ref_depth,
                             state,
-                        )?;
+                            json_pointer,
+                        );
+                        json_pointer.truncate(restore_length);
+                        result?;
                     }
                 }
             }
         }
+
         state.stack.pop();
         Ok(())
     }
 
     fn follow_reference(
         &mut self,
-        from: &NodeLocation,
+        from: WalkPointer<'_>,
         position: PositionKind,
         base: &Url,
         reference: &str,
         ref_depth: u64,
         state: &mut TraversalState,
     ) -> Result<(), Diagnostic> {
-        let reference_pointer = append_pointer(&from.json_pointer, "$ref");
+        let reference_pointer = append_pointer(from.json_pointer, "$ref");
         let target_url = resolve_identity_uri(
             base,
             reference,
@@ -955,19 +957,22 @@ impl<'a> GraphBuilder<'a> {
                 Some(&reference_pointer),
             )?
         };
-        let target_source = self.documents[target.doc_id.0].source_id.clone();
-        evaluate_pointer(&self.documents[target.doc_id.0].value, &target.json_pointer).map_err(
-            |message| {
+        let target_document = Rc::clone(&self.documents[target.doc_id.0]);
+        let target_source = target_document.source_id.clone();
+        let target_value =
+            evaluate_pointer(&target_document.value, &target.json_pointer).map_err(|message| {
                 input_error(
                     CODE_POINTER,
                     message,
                     Some(&target_source),
                     Some(&target.json_pointer),
                 )
-            },
-        )?;
+            })?;
         self.edges.push(ReferenceEdge {
-            from: from.clone(),
+            from: NodeLocation {
+                doc_id: from.doc_id,
+                json_pointer: from.json_pointer.to_owned(),
+            },
             to: target.clone(),
             reference: reference.to_owned(),
             position,
@@ -983,7 +988,10 @@ impl<'a> GraphBuilder<'a> {
             ));
         }
 
-        if state.stack.iter().any(|ancestor| ancestor == &target) {
+        if state.stack.iter().any(|ancestor| {
+            ancestor.doc_id == target.doc_id
+                && ancestor.json_pointer.as_ref() == target.json_pointer
+        }) {
             let start = state
                 .active_references
                 .iter()
@@ -1010,11 +1018,24 @@ impl<'a> GraphBuilder<'a> {
             target: target.clone(),
             position,
         });
+        let target_doc_id = target.doc_id;
+        let mut target_pointer = target.json_pointer;
         let target_context = match position {
             PositionKind::Schema => WalkContext::Schema,
             PositionKind::NonSchema => WalkContext::NonSchema,
         };
-        let result = self.walk_node(target, target_context, target_base, next_depth, state);
+        let result = self.walk_resolved_node(
+            ResolvedWalkNode {
+                document: &target_document,
+                value: target_value,
+                doc_id: target_doc_id,
+                context: target_context,
+                base: target_base,
+                ref_depth: next_depth,
+            },
+            state,
+            &mut target_pointer,
+        );
         state.active_references.pop();
         result
     }
@@ -1024,9 +1045,8 @@ impl<'a> GraphBuilder<'a> {
         target: &NodeLocation,
         expected_position: PositionKind,
     ) -> Result<Url, Diagnostic> {
-        base_at(
-            &self.documents,
-            target.doc_id,
+        base_at_document(
+            &self.documents[target.doc_id.0],
             &target.json_pointer,
             expected_position,
         )
@@ -1051,6 +1071,14 @@ fn base_at(
     expected_position: PositionKind,
 ) -> Result<Url, Diagnostic> {
     let document = &documents[doc_id.0];
+    base_at_document(document, json_pointer, expected_position)
+}
+
+fn base_at_document(
+    document: &Document,
+    json_pointer: &str,
+    expected_position: PositionKind,
+) -> Result<Url, Diagnostic> {
     let mut base = file_url(&document.canonical_path).map_err(|message| {
         input_error(
             CODE_INVALID_REFERENCE,
@@ -1524,6 +1552,73 @@ fn configured_entry_path(path: &Path) -> Result<PathBuf, Diagnostic> {
     local_path_from_url(&url, None, None)
 }
 
+/// Fast-reject that gates the identifier tree walk over the *raw* file bytes. It must also
+/// fire on spellings that escape the `$`: a document can write the key with the dollar as a
+/// JSON or YAML unicode/hex character escape and still parse to the key `$anchor`. Missing
+/// one skips registration silently — later refs fail to resolve and duplicate-anchor
+/// validation never runs. Over-triggering is harmless (the walk just finds no identifier
+/// keys); a false negative is not, so the pairs below need no false negatives, not exactness.
+///
+/// `$id` earns its place despite matching plenty of unrelated text: it is what creates a
+/// schema resource, and resource registration must not depend on whether the document also
+/// happens to declare an anchor — that would make `$id` mean different things in two
+/// documents differing only in an unrelated keyword.
+///
+/// Every spelling starts with `$` or `\`, so one SIMD `memchr2` pass finds every candidate
+/// position; the per-candidate work is then a handful of `starts_with` checks. Scanning the
+/// three spellings independently with `windows()` walked the whole file three times over and
+/// cost ~4.5 ns/byte — 50 ms of the 216 ms GitHub compile, for a document that declares no
+/// identifier at all.
+fn declares_identifier(raw: &[u8]) -> bool {
+    // The dollar as the unicode escape U+0024 (JSON, and YAML double-quoted) — the literal
+    // bytes `\`, `u`, `0`, `0`, `2`, `4`.
+    const ESCAPED_UNICODE_DOLLAR: &[u8] = &[0x5C, 0x75, 0x30, 0x30, 0x32, 0x34];
+    // The dollar as the YAML hex escape \x24.
+    const ESCAPED_HEX_DOLLAR: &[u8] = br"\x24";
+    const IDENTIFIER_SUFFIXES: [&[u8]; 4] =
+        [b"anchor", b"dynamicAnchor", b"recursiveAnchor", b"id"];
+
+    memchr::memchr2_iter(b'$', b'\\', raw).any(|index| {
+        let candidate = &raw[index..];
+        let suffix = if candidate[0] == b'$' {
+            &candidate[1..]
+        } else if candidate.starts_with(ESCAPED_UNICODE_DOLLAR) {
+            &candidate[ESCAPED_UNICODE_DOLLAR.len()..]
+        } else if candidate.starts_with(ESCAPED_HEX_DOLLAR) {
+            &candidate[ESCAPED_HEX_DOLLAR.len()..]
+        } else {
+            return false;
+        };
+        IDENTIFIER_SUFFIXES
+            .iter()
+            .any(|identifier| suffix.starts_with(identifier))
+    })
+}
+
+/// Parses a JSON document into an owned `Value`, rejecting duplicate object keys.
+///
+/// This is the single largest item left in `load_graph` — 18.2 ms of GitHub's 11.3 MB spec —
+/// so "swap in a SIMD parser" comes up. It was benchmarked properly on the real corpora and the
+/// answer is no. Tokenizing is not the cost: deserializing to `serde::de::IgnoredAny`, which
+/// tokenizes and validates but builds nothing, is 5.6 ms — **30% of the work. The other 70% is
+/// materializing the tree**: a `String` per key, a `String` per string value, an `IndexMap` per
+/// object, across GitHub's 69,973 objects and 192,169 keys. A SIMD front end feeding the same
+/// tree therefore buys nothing, and measurement agrees exactly: simd-json into
+/// `serde_json::Value` is 18.2 ms, indistinguishable from this.
+///
+/// The parsers that are genuinely faster are faster because they build a *different* tree, and
+/// each one breaks a contract this compiler depends on:
+///
+/// - sonic-rs into `serde_json::Value` is 14.0 ms (-23%) but rounds a large integer default to
+///   `1.2345678901234568e+29`, and accepts duplicate object keys as last-wins.
+/// - sonic-rs' own DOM is 4.2 ms — the ceiling, reachable only by changing what the loader, the
+///   parser and the IR all consume — and still accepts duplicate keys.
+/// - simd-json's own DOM loses key order on objects past ~40 keys, which `preserve_order` exists
+///   to guarantee because emitted output depends on it.
+///
+/// Number exactness is not a nicety here: `default`, `enum`, `const`, `minimum`, `maximum` and
+/// `multipleOf` all carry numbers that reach generated TypeScript. Only this path keeps all of
+/// exact numbers, key order, duplicate-key rejection, and line/column error positions.
 fn parse_json(raw: &[u8], source_id: &str) -> Result<Value, Diagnostic> {
     serde_json::from_slice::<DedupValue>(raw)
         .map(|value| value.0)
@@ -2028,13 +2123,24 @@ fn unescape_pointer_token_borrowed(token: &str) -> Result<Cow<'_, str>, String> 
 pub(crate) fn append_pointer(pointer: &str, token: &str) -> String {
     let mut result = String::with_capacity(pointer.len() + 1 + token.len());
     result.push_str(pointer);
-    result.push('/');
-    if token.contains(['~', '/']) {
-        result.push_str(&token.replace('~', "~0").replace('/', "~1"));
-    } else {
-        result.push_str(token);
-    }
+    push_pointer_token(&mut result, token);
     result
+}
+
+fn push_pointer_token(pointer: &mut String, token: &str) {
+    pointer.push('/');
+    for character in token.chars() {
+        match character {
+            '~' => pointer.push_str("~0"),
+            '/' => pointer.push_str("~1"),
+            _ => pointer.push(character),
+        }
+    }
+}
+
+fn push_pointer_index(pointer: &mut String, index: usize) {
+    let mut buffer = itoa::Buffer::new();
+    push_pointer_token(pointer, buffer.format(index));
 }
 
 pub(crate) fn append_pointer_index(pointer: &str, index: usize) -> String {
@@ -2205,6 +2311,37 @@ mod tests {
         assert_eq!(diagnostic.category, Category::Input);
         assert_eq!(diagnostic.category.exit_code(), 1);
         diagnostic
+    }
+
+    #[test]
+    fn declares_identifier_matches_every_dollar_spelling() {
+        // The dollar as the unicode escape (JSON, and YAML double-quoted) and as the YAML
+        // hex escape, spelled here so the test cannot silently degrade to a literal dollar.
+        const UNICODE_ESCAPE: &str = "\\u0024";
+        const HEX_ESCAPE: &str = "\\x24";
+        for spelling in ["$", UNICODE_ESCAPE, HEX_ESCAPE] {
+            for identifier in ["anchor", "dynamicAnchor", "recursiveAnchor", "id"] {
+                let raw = format!("{{\"{spelling}{identifier}\": \"a\"}}");
+                assert!(declares_identifier(raw.as_bytes()), "{raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn declares_identifier_rejects_near_misses() {
+        for raw in [
+            // A dollar that starts an unrelated keyword.
+            "{\"$ref\": \"#/x\"}",
+            // A backslash escape whose code point is not the dollar.
+            "{\"\\u0041nchor\": \"a\"}",
+            // A dollar spelling with no room left for a suffix.
+            "$",
+            // The suffixes alone, unprefixed.
+            "{\"id\": 1, \"anchor\": 2}",
+            "",
+        ] {
+            assert!(!declares_identifier(raw.as_bytes()), "{raw}");
+        }
     }
 
     #[test]
@@ -3710,7 +3847,7 @@ mod tests {
         let mut retained = builder
             .visited
             .iter()
-            .map(|key| key.location.json_pointer.as_str())
+            .map(|key| key.location.json_pointer.as_ref())
             .collect::<Vec<_>>();
         retained.sort_unstable();
         assert_eq!(retained, ["", "/info"]);
@@ -4171,7 +4308,9 @@ mod tests {
             );
         }
 
-        builder.documents[id.0].value["$id"] = json!(7);
+        Rc::get_mut(&mut builder.documents[id.0])
+            .expect("the builder owns the only document handle")
+            .value["$id"] = json!(7);
         assert_eq!(
             builder
                 .base_at_target(
@@ -4185,7 +4324,9 @@ mod tests {
                 .code,
             CODE_INVALID_REFERENCE
         );
-        builder.documents[id.0].canonical_path = PathBuf::from("relative.json");
+        Rc::get_mut(&mut builder.documents[id.0])
+            .expect("the builder owns the only document handle")
+            .canonical_path = PathBuf::from("relative.json");
         assert_eq!(
             builder
                 .base_at_target(

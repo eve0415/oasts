@@ -14,14 +14,32 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-clap = { version = "=4.6.2", features = ["derive"] }
-libc = "=0.2.186"
-oxc_allocator = "=0.140.0"
-oxc_parser = "=0.140.0"
-oxc_span = "=0.140.0"
+clap = { version = "=4.6.4", features = ["derive"] }
+dhat = { version = "=0.3.3", optional = true }
+libc = "=0.2.189"
+oxc_allocator = "=0.142.0"
+oxc_parser = "=0.142.0"
+oxc_span = "=0.142.0"
 oasts-core = { path = "../oasts-core" }
-sha2 = "=0.10.9"
-tempfile = "=3.23.0"
+pprof = { version = "=0.15.0", default-features = false, features = ["flamegraph"], optional = true }
+serde_json = { version = "=1.0.151", optional = true }
+sha2 = "=0.11.0"
+tempfile = "=3.27.0"
 yaml-rust2 = "=0.11.0"
+rayon = "=1.11.0"
 
 [dev-dependencies]
+
+[features]
+cpu-profile = ["dep:pprof"]
+heap-profile = ["dep:dhat", "dep:serde_json"]
+
+[[bin]]
+name = "oasts-cpu-profile"
+path = "src/bin/cpu_profile.rs"
+required-features = ["cpu-profile"]
+
+[[bin]]
+name = "oasts-heap-profile"
+path = "src/bin/heap_profile.rs"
+required-features = ["heap-profile"]

@@ -1,7 +1,8 @@
 //! Normalization for composition schemas whose domains are provably empty.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 
+use foldhash::{HashMap, HashSet, HashSetExt};
 use serde_json::Value;
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
@@ -21,7 +22,9 @@ pub(crate) fn lower_uninhabitable_all_ofs(ir: &mut Ir, sink: &mut DiagnosticSink
     let mut diagnostics = Vec::new();
     analysis.inspect_ir(&mut lowerings, &mut diagnostics);
     drop(analysis);
-    lower_ir(ir, &lowerings);
+    if !lowerings.is_empty() {
+        lower_ir(ir, &lowerings);
+    }
     sink.extend(diagnostics);
 }
 
@@ -611,7 +614,12 @@ fn stricter_upper(left: Option<Bound>, right: Option<Bound>) -> Option<Bound> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{NamedSchema, SchemaMeta};
+    use crate::ir::{
+        Body, Callback, CallbackExpression, EncodingHeader, EncodingObject, MediaType, NamedSchema,
+        OasVersion, Param, ParamLocation, ResponseEntry, ResponseHeader, ResponseStatus,
+        SchemaMeta, Webhook,
+    };
+    use crate::media::MediaRangeKind;
 
     fn meta(pointer: &str) -> SchemaMeta {
         SchemaMeta {
@@ -622,6 +630,71 @@ mod tests {
                 col: Some(5),
             },
             ..SchemaMeta::default()
+        }
+    }
+
+    fn any_schema(pointer: &str) -> SchemaNode {
+        SchemaNode::Any {
+            meta: meta(pointer),
+        }
+    }
+
+    fn empty_operation(pointer: &str) -> Operation {
+        Operation {
+            method: "get".to_owned(),
+            path_template: Vec::new(),
+            operation_id: None,
+            summary: None,
+            description: None,
+            deprecated: false,
+            external_docs: None,
+            parameters: Vec::new(),
+            request_body: None,
+            responses: Vec::new(),
+            callbacks: Vec::new(),
+            servers: Vec::new(),
+            security: None,
+            source: meta(pointer).source,
+        }
+    }
+
+    fn media_type(pointer: &str, with_encoding: bool) -> MediaType {
+        let encodings = if with_encoding {
+            vec![(
+                "part".to_owned(),
+                EncodingObject {
+                    content_type: None,
+                    headers: vec![(
+                        "x-part".to_owned(),
+                        EncodingHeader {
+                            required: false,
+                            schema: any_schema(&format!("{pointer}/encoding/header")),
+                            content_media_type: None,
+                            source: meta(&format!("{pointer}/encoding/header")).source,
+                        },
+                    )],
+                    style: None,
+                    explode: None,
+                    allow_reserved: false,
+                    allow_reserved_explicit: false,
+                    source: meta(&format!("{pointer}/encoding")).source,
+                },
+            )]
+        } else {
+            Vec::new()
+        };
+        MediaType {
+            essence: "application/json".to_owned(),
+            full: "application/json".to_owned(),
+            range_kind: MediaRangeKind::Concrete,
+            raw_name: "application/json".to_owned(),
+            schema: any_schema(&format!("{pointer}/schema")),
+            schema_present: true,
+            examples: Vec::new(),
+            encodings,
+            streaming_marked: false,
+            oas_version: OasVersion::V3_1,
+            source: meta(pointer).source,
         }
     }
 
@@ -681,5 +754,198 @@ mod tests {
 
         let diagnostic = warning_diagnostic("proof", &meta("/proof").source);
         assert_eq!((diagnostic.line, diagnostic.col), (Some(3), Some(5)));
+    }
+
+    #[test]
+    fn lowering_leaves_ir_without_empty_compositions_unchanged() {
+        let mut ir = Ir {
+            schemas: vec![NamedSchema {
+                name: "Value".to_owned(),
+                schema: SchemaNode::Primitive {
+                    ty: PrimitiveType::String,
+                    format: None,
+                    enum_values: None,
+                    const_value: None,
+                    meta: meta("/components/schemas/Value"),
+                },
+                source: meta("/components/schemas/Value").source,
+            }],
+            ..Ir::default()
+        };
+        let expected = ir.clone();
+        let mut sink = DiagnosticSink::new();
+
+        lower_uninhabitable_all_ofs(&mut ir, &mut sink);
+
+        assert_eq!(ir, expected);
+        assert!(sink.as_slice().is_empty());
+    }
+
+    #[test]
+    fn lowering_replaces_proven_empty_compositions() {
+        let primitive = |ty, pointer| SchemaNode::Primitive {
+            ty,
+            format: None,
+            enum_values: None,
+            const_value: None,
+            meta: meta(pointer),
+        };
+        let mut ir = Ir {
+            schemas: vec![NamedSchema {
+                name: "Impossible".to_owned(),
+                schema: SchemaNode::AllOf {
+                    branches: vec![
+                        primitive(PrimitiveType::String, "/Impossible/allOf/0"),
+                        primitive(PrimitiveType::Boolean, "/Impossible/allOf/1"),
+                    ],
+                    meta: meta("/Impossible"),
+                },
+                source: meta("/Impossible").source,
+            }],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+
+        lower_uninhabitable_all_ofs(&mut ir, &mut sink);
+
+        assert!(matches!(ir.schemas[0].schema, SchemaNode::Never { .. }));
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_COMPOSITION)
+        );
+    }
+
+    #[test]
+    fn lowering_walk_visits_every_schema_container() {
+        let schemas = vec![
+            SchemaNode::Object {
+                properties: vec![(
+                    "value".to_owned(),
+                    any_schema("/object/value"),
+                    PropMeta {
+                        required: false,
+                        read_only: false,
+                        write_only: false,
+                    },
+                )],
+                additional_properties: AdditionalProperties::Allowed(Some(Box::new(any_schema(
+                    "/object/additional",
+                )))),
+                dependent_required: Vec::new(),
+                finite: None,
+                extra_required: Vec::new(),
+                meta: meta("/object"),
+            },
+            SchemaNode::Object {
+                properties: Vec::new(),
+                additional_properties: AdditionalProperties::Schema(Box::new(any_schema(
+                    "/object-schema/additional",
+                ))),
+                dependent_required: Vec::new(),
+                finite: None,
+                extra_required: Vec::new(),
+                meta: meta("/object-schema"),
+            },
+            SchemaNode::Array {
+                items: Box::new(any_schema("/array/items")),
+                finite: None,
+                meta: meta("/array"),
+            },
+            SchemaNode::Tuple {
+                prefix_items: vec![any_schema("/tuple/prefixItems/0")],
+                rest: TupleRest::Schema(Box::new(any_schema("/tuple/items"))),
+                finite: None,
+                meta: meta("/tuple"),
+            },
+            SchemaNode::AllOf {
+                branches: vec![any_schema("/allOf/0")],
+                meta: meta("/allOf"),
+            },
+            SchemaNode::OneOf {
+                branches: vec![any_schema("/oneOf/0")],
+                discriminator: None,
+                meta: meta("/oneOf"),
+            },
+            SchemaNode::AnyOf {
+                branches: vec![any_schema("/anyOf/0")],
+                discriminator: None,
+                meta: meta("/anyOf"),
+            },
+        ];
+        let mut operation = empty_operation("/operation");
+        operation.parameters.push(Param {
+            name: "value".to_owned(),
+            location: ParamLocation::Query,
+            required: false,
+            deprecated: false,
+            description: None,
+            schema: any_schema("/operation/parameter/schema"),
+            content_media_type: None,
+            style: None,
+            explode: None,
+            allow_reserved: false,
+            source: meta("/operation/parameter").source,
+        });
+        operation.request_body = Some(Body {
+            required: false,
+            description: None,
+            media_types: vec![media_type("/operation/request", true)],
+            source: meta("/operation/request-body").source,
+        });
+        operation.responses.push(ResponseEntry {
+            status: ResponseStatus::Exact("200".to_owned()),
+            description: "ok".to_owned(),
+            media_types: vec![media_type("/operation/response", false)],
+            headers: vec![(
+                "x-value".to_owned(),
+                ResponseHeader {
+                    required: false,
+                    deprecated: false,
+                    description: None,
+                    schema: any_schema("/operation/response/header/schema"),
+                    content_media_type: None,
+                    source: meta("/operation/response/header").source,
+                },
+            )],
+            links: Vec::new(),
+            source: meta("/operation/response").source,
+        });
+        operation.callbacks.push(Callback {
+            name: "done".to_owned(),
+            expressions: vec![CallbackExpression {
+                expression: "{$request.body#/callbackUrl}".to_owned(),
+                operations: vec![empty_operation("/operation/callback")],
+                source: meta("/operation/callback-expression").source,
+            }],
+            source: meta("/operation/callback").source,
+        });
+        let mut ir = Ir {
+            schemas: schemas
+                .into_iter()
+                .enumerate()
+                .map(|(index, schema)| NamedSchema {
+                    name: format!("Schema{index}"),
+                    source: schema.meta().source.clone(),
+                    schema,
+                })
+                .collect(),
+            operations: vec![operation],
+            webhooks: vec![Webhook {
+                name: "event".to_owned(),
+                operations: vec![empty_operation("/webhook")],
+                source: meta("/webhook").source,
+            }],
+            ..Ir::default()
+        };
+        let expected = ir.clone();
+        let unrelated_lowering = SchemaRef {
+            source_id: "workspace/other.json".to_owned(),
+            json_pointer: "/Impossible".to_owned(),
+        };
+
+        lower_ir(&mut ir, &HashSet::from_iter([unrelated_lowering]));
+
+        assert_eq!(ir, expected);
     }
 }

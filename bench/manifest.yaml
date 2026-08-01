@@ -8,11 +8,11 @@ runners:
     image: ubuntu-24.04
   baseline: # local measurement environment for pre-CI baselines
     kind: devcontainer
-    image: mcr.microsoft.com/devcontainers/rust:2.0.13-trixie
+    image: mcr.microsoft.com/devcontainers/rust:2.0.14-trixie
 toolchain:
   rust: "1.97.1"
-  node: "24.18.0"
-  pnpm: "11.15.1"
+  node: "24.18.1"
+  pnpm: "11.18.0"
   typescript: "7.0.2"
 typescriptVersions: # the pinned TS version set; minimum/floor 7.0
   - "7.0.2"

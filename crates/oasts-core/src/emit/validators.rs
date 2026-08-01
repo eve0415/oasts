@@ -18,8 +18,9 @@
 //! the keyword/construct and its source pointer. The writer never commits a failed run, so the
 //! types/client artifacts stay byte-identical when validators is disabled.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde_json::{Number, Value};
 use sha2::{Digest, Sha256};
 

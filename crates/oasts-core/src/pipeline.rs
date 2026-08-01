@@ -23,6 +23,10 @@ pub fn compile(
 ) -> Option<Vec<GeneratedFile>> {
     let graph = load_graph(config, sink)?;
     let ir = parse(&graph, sink)?;
+    // Parsing owns every downstream value in the IR. Keep only the source digest inputs so the
+    // JSON document tree is released before analysis or emitted-file buffers can overlap with it.
+    let source_tuples = graph.source_tuples();
+    drop(graph);
     let analyzed = analyze(ir, config, sink);
     let client_model = config
         .artifacts
@@ -32,7 +36,6 @@ pub fn compile(
     if sink.has_errors() {
         return None;
     }
-    let source_tuples = graph.source_tuples();
     let files = emit_artifacts(
         &analyzed,
         config,

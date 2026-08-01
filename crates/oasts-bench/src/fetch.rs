@@ -6,7 +6,7 @@
 //! file. Digest-and-rename logic is isolated behind the [`Fetcher`] trait so it is unit-testable
 //! without a network.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
 
@@ -138,8 +138,17 @@ pub fn sha256_hex(path: &Path) -> Result<String, Error> {
     let mut file = std::fs::File::open(path)
         .map_err(|error| Error::new(format!("opening {}: {error}", path.display())))?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
-        .map_err(|error| Error::new(format!("hashing {}: {error}", path.display())))?;
+    // digest 0.11 dropped the `io::Write` impl on hashers, so the chunked read is explicit.
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| Error::new(format!("hashing {}: {error}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(to_hex(&hasher.finalize()))
 }
 

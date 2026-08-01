@@ -1,6 +1,6 @@
 //! Fetch client artifact emission from the client planning IR.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use crate::client_model::{
@@ -18,6 +18,7 @@ use crate::ir::{
     ServerVariable,
 };
 use crate::media::{is_json, media_essence};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 use super::media_tag;
 
@@ -4312,8 +4313,8 @@ mod tests {
         };
         let (_temporary, analyzed, config) = probe_analyzed();
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let renderer = TypesEmitter::new(&mut model);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let renderer = TypesEmitter::new(&model);
         let arms = response_result_arms(&renderer, &plan, "Probe");
         let output = render_result_type(&arms, &plan, "Probe");
         assert!(output.contains(
@@ -4577,8 +4578,8 @@ mod tests {
         };
         let (_temporary, analyzed, config) = probe_analyzed();
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let renderer = TypesEmitter::new(&mut model);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let renderer = TypesEmitter::new(&model);
         let actual = render_result_type(
             &response_result_arms(&renderer, &plan, "HeadHealth"),
             &plan,
@@ -4687,12 +4688,14 @@ mod tests {
         ];
 
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
         assert!(schema_is_array(&model, &items_ref, &mut HashSet::new()));
-        let mut visited = HashSet::from([(
+        let mut visited: HashSet<_> = [(
             items_ref.meta().source.source_id.clone(),
             items_ref.meta().source.json_pointer.clone(),
-        )]);
+        )]
+        .into_iter()
+        .collect();
         if let SchemaNode::Ref { target, .. } = &items_ref {
             visited.clear();
             visited.insert((target.source_id.clone(), target.json_pointer.clone()));
@@ -4816,7 +4819,7 @@ mod tests {
         }));
 
         {
-            let renderer = TypesEmitter::new(&mut model);
+            let renderer = TypesEmitter::new(&model);
             let input = render_body_input(&renderer, &body, "Probe", 2);
             assert!(input.contains("contentType: string"));
             assert!(input.contains("filename?: string"));

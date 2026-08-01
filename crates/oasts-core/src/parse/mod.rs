@@ -1,7 +1,7 @@
 //! OpenAPI 3.0/3.1 parsing into the version-neutral IR.
 
-use std::collections::{HashMap, HashSet};
-
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use rayon::prelude::*;
 use serde_json::{Map, Value};
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
@@ -60,6 +60,7 @@ const CODE_SECURITY_FLOWS_SHAPE: &str = "OASTS1438";
 const METHODS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
 ];
+const PARALLEL_PARSE_MIN_ITEMS: usize = 64;
 /// The two reference keywords whose target is chosen by the dynamic scope of evaluation rather
 /// than by where they are written. OpenAPI 3.1 resolves them (see `parse_dynamic_ref`); OpenAPI
 /// 3.0's dialect is not JSON Schema at all, so there they stay unrepresentable.
@@ -486,22 +487,52 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             self.shape_error(root.doc_id, pointer, "components.schemas must be an object");
             return Vec::new();
         };
-        object
+        if rayon::current_num_threads() == 1 || object.len() < PARALLEL_PARSE_MIN_ITEMS {
+            return object
+                .iter()
+                .map(|(name, value)| self.parse_named_schema(root.doc_id, pointer, name, value))
+                .collect();
+        }
+        let parsed = object
             .iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
             .map(|(name, value)| {
-                let schema_pointer = append_pointer(pointer, name);
-                let node = NodeView {
-                    doc_id: root.doc_id,
-                    pointer: schema_pointer,
-                    value,
-                };
-                NamedSchema {
-                    name: name.clone(),
-                    schema: self.parse_schema(node.clone()),
-                    source: self.source(node.doc_id, &node.pointer),
-                }
+                let mut sink = DiagnosticSink::new();
+                let mut parser = Parser::new(self.graph, self.version, &mut sink);
+                let schema = parser.parse_named_schema(root.doc_id, pointer, name, value);
+                let entry_defs_referenced = parser.entry_defs_referenced;
+                (schema, sink.into_vec(), entry_defs_referenced)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let mut schemas = Vec::with_capacity(parsed.len());
+        for (schema, diagnostics, entry_defs_referenced) in parsed {
+            schemas.push(schema);
+            self.sink.extend(diagnostics);
+            self.entry_defs_referenced |= entry_defs_referenced;
+        }
+        schemas
+    }
+
+    #[inline]
+    fn parse_named_schema(
+        &mut self,
+        doc_id: DocId,
+        parent_pointer: &str,
+        name: &str,
+        value: &'graph Value,
+    ) -> NamedSchema {
+        let schema_pointer = append_pointer(parent_pointer, name);
+        let source = self.source(doc_id, &schema_pointer);
+        NamedSchema {
+            name: name.to_owned(),
+            schema: self.parse_schema(NodeView {
+                doc_id,
+                pointer: schema_pointer,
+                value,
+            }),
+            source,
+        }
     }
 
     fn parse_operations(&mut self, root: NodeView<'graph>) -> Vec<Operation> {
@@ -512,20 +543,50 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             self.shape_error(root.doc_id, "/paths", "paths must be an object");
             return Vec::new();
         };
-        let mut operations = Vec::new();
-        for (path, raw_path_item) in paths {
-            if path.starts_with("x-") {
-                continue;
+        if rayon::current_num_threads() == 1 || paths.len() < PARALLEL_PARSE_MIN_ITEMS {
+            let mut operations = Vec::new();
+            for (path, raw_path_item) in paths {
+                if !path.starts_with("x-") {
+                    operations.extend(self.parse_path_operations(root.doc_id, path, raw_path_item));
+                }
             }
-            let path_pointer = append_pointer("/paths", path);
-            let path_node = NodeView {
-                doc_id: root.doc_id,
-                pointer: path_pointer,
-                value: raw_path_item,
-            };
-            operations.extend(self.parse_path_item_operations(path_node, Some(path)));
+            return operations;
+        }
+        let parsed = paths
+            .iter()
+            .filter(|(path, _)| !path.starts_with("x-"))
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(path, raw_path_item)| {
+                let mut sink = DiagnosticSink::new();
+                let mut parser = Parser::new(self.graph, self.version, &mut sink);
+                let operations = parser.parse_path_operations(root.doc_id, path, raw_path_item);
+                let entry_defs_referenced = parser.entry_defs_referenced;
+                (operations, sink.into_vec(), entry_defs_referenced)
+            })
+            .collect::<Vec<_>>();
+        let mut operations = Vec::new();
+        for (mut path_operations, diagnostics, entry_defs_referenced) in parsed {
+            operations.append(&mut path_operations);
+            self.sink.extend(diagnostics);
+            self.entry_defs_referenced |= entry_defs_referenced;
         }
         operations
+    }
+
+    #[inline]
+    fn parse_path_operations(
+        &mut self,
+        doc_id: DocId,
+        path: &str,
+        raw_path_item: &'graph Value,
+    ) -> Vec<Operation> {
+        let path_node = NodeView {
+            doc_id,
+            pointer: append_pointer("/paths", path),
+            value: raw_path_item,
+        };
+        self.parse_path_item_operations(path_node, Some(path))
     }
 
     fn parse_webhooks(&mut self, root: &NodeView<'graph>) -> Vec<Webhook> {
@@ -2778,17 +2839,16 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         let raw_properties = object.get("properties").and_then(Value::as_object);
         let properties = raw_properties
             .map(|properties| {
+                let properties_pointer = append_pointer(&node.pointer, "properties");
                 properties
                     .iter()
                     .map(|(name, value)| {
-                        let properties_pointer = append_pointer(&node.pointer, "properties");
                         let pointer = append_pointer(&properties_pointer, name);
                         let schema = self.parse_schema(NodeView {
                             doc_id: node.doc_id,
-                            pointer: pointer.clone(),
+                            pointer,
                             value,
                         });
-                        let schema_meta = schema.meta();
                         let prop_meta = PropMeta {
                             required: required.contains(name.as_str()),
                             read_only: value
@@ -2799,11 +2859,6 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                                 .get("writeOnly")
                                 .and_then(Value::as_bool)
                                 .unwrap_or(false),
-                            deprecated: schema_meta.docs.deprecated,
-                            description: schema_meta.docs.description.clone(),
-                            default: schema_meta.docs.default.clone(),
-                            examples: schema_meta.docs.examples.clone(),
-                            source: self.source(node.doc_id, &pointer),
                         };
                         (name.clone(), schema, prop_meta)
                     })
@@ -2871,7 +2926,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             },
             Some(items) => self.parse_schema(NodeView {
                 doc_id: node.doc_id,
-                pointer: pointer.clone(),
+                pointer,
                 value: items,
             }),
         };
@@ -2977,6 +3032,13 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 ..SchemaMeta::default()
             };
         };
+        let content = schema_meta_content(object);
+        if content == SchemaMetaContent::None {
+            return SchemaMeta {
+                source: self.source(node.doc_id, &node.pointer),
+                ..SchemaMeta::default()
+            };
+        }
         let examples = match self.version {
             OasVersion::V3_0 => object.get("example").cloned().into_iter().collect(),
             OasVersion::V3_1 => match object.get("examples") {
@@ -2992,6 +3054,46 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 }
             },
         };
+        let mut meta = SchemaMeta {
+            nullable: self.version == OasVersion::V3_0
+                && object
+                    .get("nullable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            additional_properties_present: object.contains_key("additionalProperties"),
+            items_present: object.contains_key("items"),
+            read_only: object
+                .get("readOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            write_only: object
+                .get("writeOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            content_encoding: (self.version == OasVersion::V3_1)
+                .then(|| string_field(object, "contentEncoding"))
+                .flatten(),
+            docs: SchemaDocs {
+                title: string_field(object, "title"),
+                description: string_field(object, "description"),
+                deprecated: bool_field(object, "deprecated"),
+                default: object.get("default").cloned(),
+                examples,
+                comment: string_field(object, "$comment"),
+                constraints: Vec::new(),
+            },
+            enum_extensions: box_if_populated(EnumExtensionData {
+                enum_varnames: object.get("x-enum-varnames").cloned(),
+                enum_names: object.get("x-enumNames").cloned(),
+                enum_descriptions: object.get("x-enum-descriptions").cloned(),
+                enum_descriptions_camel: object.get("x-enumDescriptions").cloned(),
+            }),
+            source: self.source(node.doc_id, &node.pointer),
+            ..SchemaMeta::default()
+        };
+        if content == SchemaMetaContent::Annotations {
+            return meta;
+        }
         let numeric_constraints = collect_numeric_constraints(object, self.version);
         // `collect_numeric_constraints` already dropped an invalid `multipleOf` (non-number, ≤ 0, or
         // outside the binary64 domain) from `multiple_of`, so a present keyword with no surviving
@@ -3009,7 +3111,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         let string_constraints = collect_string_constraints(object);
         let array_constraints = collect_array_constraints(object);
         let object_constraints = collect_object_constraints(object);
-        let constraints = collect_constraints(object, &numeric_constraints);
+        meta.docs.constraints = collect_constraints(object, &numeric_constraints);
         let validation_applicators = if self.version == OasVersion::V3_0
             && object.contains_key("$ref")
         {
@@ -3189,72 +3291,37 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     }),
             }
         };
-        SchemaMeta {
-            nullable: self.version == OasVersion::V3_0
-                && object
-                    .get("nullable")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            additional_properties_present: object.contains_key("additionalProperties"),
-            items_present: object.contains_key("items"),
-            read_only: object
-                .get("readOnly")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            write_only: object
-                .get("writeOnly")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            content_encoding: (self.version == OasVersion::V3_1)
-                .then(|| string_field(object, "contentEncoding"))
-                .flatten(),
-            docs: SchemaDocs {
-                title: string_field(object, "title"),
-                description: string_field(object, "description"),
-                deprecated: bool_field(object, "deprecated"),
-                default: object.get("default").cloned(),
-                examples,
-                comment: string_field(object, "$comment"),
-                constraints,
-            },
-            enum_extensions: box_if_populated(EnumExtensionData {
-                enum_varnames: object.get("x-enum-varnames").cloned(),
-                enum_names: object.get("x-enumNames").cloned(),
-                enum_descriptions: object.get("x-enum-descriptions").cloned(),
-                enum_descriptions_camel: object.get("x-enumDescriptions").cloned(),
-            }),
-            numeric_constraints: box_if_populated(numeric_constraints),
-            string_constraints: box_if_populated(string_constraints),
-            array_constraints: box_if_populated(array_constraints),
-            object_constraints: box_if_populated(object_constraints),
-            validation_applicators: box_if_populated(validation_applicators),
-            // A dynamic reference is rejected only where it could not be pinned; `parse_dynamic_ref`
-            // adds it then. Under 3.0 it is not a keyword, so it is rejected outright.
-            rejected_validation_keywords: object
-                .keys()
-                .filter(|key| {
-                    self.version == OasVersion::V3_0
-                        && (DYNAMIC_REF_KEYWORDS.contains(&key.as_str())
-                            || matches!(
-                                key.as_str(),
-                                "propertyNames"
-                                    | "patternProperties"
-                                    | "contains"
-                                    | "minContains"
-                                    | "maxContains"
-                                    | "dependentSchemas"
-                                    | "if"
-                                    | "then"
-                                    | "else"
-                                    | "unevaluatedProperties"
-                                    | "unevaluatedItems"
-                                    | "additionalItems"
-                            ))
-                })
-                .cloned()
-                .collect(),
-            source: self.source(node.doc_id, &node.pointer),
-        }
+        meta.numeric_constraints = box_if_populated(numeric_constraints);
+        meta.string_constraints = box_if_populated(string_constraints);
+        meta.array_constraints = box_if_populated(array_constraints);
+        meta.object_constraints = box_if_populated(object_constraints);
+        meta.validation_applicators = box_if_populated(validation_applicators);
+        // A dynamic reference is rejected only where it could not be pinned; `parse_dynamic_ref`
+        // adds it then. Under 3.0 it is not a keyword, so it is rejected outright.
+        meta.rejected_validation_keywords = object
+            .keys()
+            .filter(|key| {
+                self.version == OasVersion::V3_0
+                    && (DYNAMIC_REF_KEYWORDS.contains(&key.as_str())
+                        || matches!(
+                            key.as_str(),
+                            "propertyNames"
+                                | "patternProperties"
+                                | "contains"
+                                | "minContains"
+                                | "maxContains"
+                                | "dependentSchemas"
+                                | "if"
+                                | "then"
+                                | "else"
+                                | "unevaluatedProperties"
+                                | "unevaluatedItems"
+                                | "additionalItems"
+                        ))
+            })
+            .cloned()
+            .collect();
+        meta
     }
 
     fn resolve_object(&mut self, node: NodeView<'graph>, kind: &str) -> Option<NodeView<'graph>> {
@@ -3351,13 +3418,26 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             .filter(|parameter| parameter.location == ParamLocation::Path)
             .map(|parameter| parameter.name.as_str())
             .collect::<HashSet<_>>();
-        for name in template_names.difference(&declared_names) {
+        // Diagnostic order is observable output, and a `HashSet` iterates in an order that
+        // depends on its hasher's per-instance seed — so emitting straight from `difference`
+        // makes the sequence within one path vary run to run. Sort both differences first.
+        let mut undeclared = template_names
+            .difference(&declared_names)
+            .copied()
+            .collect::<Vec<_>>();
+        undeclared.sort_unstable();
+        for name in undeclared {
             self.path_parameter_error(
                 node,
                 format!("path '{raw_path}' template parameter '{name}' is not declared"),
             );
         }
-        for name in declared_names.difference(&template_names) {
+        let mut absent = declared_names
+            .difference(&template_names)
+            .copied()
+            .collect::<Vec<_>>();
+        absent.sort_unstable();
+        for name in absent {
             self.path_parameter_error(
                 node,
                 format!("path parameter '{name}' is declared but absent from '{raw_path}'"),
@@ -3987,6 +4067,72 @@ fn collect_constraints(object: &Map<String, Value>, numeric: &NumericConstraints
     constraints
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SchemaMetaContent {
+    None,
+    Annotations,
+    Complex,
+}
+
+/// Classifies metadata in one key walk. Annotation-only schemas can skip every constraint and
+/// applicator collector, while structurally-only schemas retain the existing empty-meta reject.
+fn schema_meta_content(object: &Map<String, Value>) -> SchemaMetaContent {
+    let mut content = SchemaMetaContent::None;
+    for key in object.keys() {
+        match key.as_str() {
+            "minimum"
+            | "maximum"
+            | "exclusiveMinimum"
+            | "exclusiveMaximum"
+            | "multipleOf"
+            | "minLength"
+            | "maxLength"
+            | "pattern"
+            | "minItems"
+            | "maxItems"
+            | "uniqueItems"
+            | "minProperties"
+            | "maxProperties"
+            | "required"
+            | "format"
+            | "$dynamicRef"
+            | "$recursiveRef"
+            | "propertyNames"
+            | "patternProperties"
+            | "contains"
+            | "minContains"
+            | "maxContains"
+            | "dependentSchemas"
+            | "if"
+            | "then"
+            | "else"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "additionalItems"
+            | "not" => return SchemaMetaContent::Complex,
+            "example"
+            | "examples"
+            | "nullable"
+            | "additionalProperties"
+            | "items"
+            | "readOnly"
+            | "writeOnly"
+            | "contentEncoding"
+            | "title"
+            | "description"
+            | "deprecated"
+            | "default"
+            | "$comment"
+            | "x-enum-varnames"
+            | "x-enumNames"
+            | "x-enum-descriptions"
+            | "x-enumDescriptions" => content = SchemaMetaContent::Annotations,
+            _ => {}
+        }
+    }
+    content
+}
+
 /// True when a schema object carries any typed or value-constraint keyword — the "typed piece" a
 /// conjunction lowering must preserve as a real branch. Pure annotations (title, description,
 /// default, example(s), deprecated, readOnly, writeOnly, nullable, `x-*`) are not pieces. The
@@ -4106,6 +4252,85 @@ mod tests {
     use crate::pipeline::compile as compile_pipeline;
     use crate::semantic::{TargetCase, normalize_identifier};
 
+    #[test]
+    fn schema_meta_fast_reject_distinguishes_structural_and_metadata_keys() {
+        let mut object = Map::new();
+        object.insert("type".to_owned(), Value::String("string".to_owned()));
+        object.insert("properties".to_owned(), Value::Object(Map::new()));
+        object.insert(
+            "$ref".to_owned(),
+            Value::String("#/components/schemas/X".to_owned()),
+        );
+        assert_eq!(schema_meta_content(&object), SchemaMetaContent::None);
+
+        for key in [
+            "example",
+            "examples",
+            "nullable",
+            "additionalProperties",
+            "items",
+            "readOnly",
+            "writeOnly",
+            "contentEncoding",
+            "title",
+            "description",
+            "deprecated",
+            "default",
+            "$comment",
+            "x-enum-varnames",
+            "x-enumNames",
+            "x-enum-descriptions",
+            "x-enumDescriptions",
+        ] {
+            let mut object = Map::new();
+            object.insert(key.to_owned(), Value::Null);
+            assert_eq!(
+                schema_meta_content(&object),
+                SchemaMetaContent::Annotations,
+                "{key}"
+            );
+        }
+        for key in [
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+            "minLength",
+            "maxLength",
+            "pattern",
+            "minItems",
+            "maxItems",
+            "uniqueItems",
+            "minProperties",
+            "maxProperties",
+            "required",
+            "format",
+            "$dynamicRef",
+            "$recursiveRef",
+            "propertyNames",
+            "patternProperties",
+            "contains",
+            "minContains",
+            "maxContains",
+            "dependentSchemas",
+            "if",
+            "then",
+            "else",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "additionalItems",
+            "not",
+        ] {
+            let mut object = Map::new();
+            object.insert(key.to_owned(), Value::Null);
+            assert_eq!(
+                schema_meta_content(&object),
+                SchemaMetaContent::Complex,
+                "{key}"
+            );
+        }
+    }
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures")
@@ -4370,6 +4595,82 @@ mod tests {
 
         assert!(sink.has_errors(), "{:#?}", sink.as_slice());
         assert!(ir.operations[0].parameters.is_empty());
+    }
+
+    #[test]
+    fn parallel_parse_preserves_ir_and_diagnostic_order() {
+        let mut schemas = Map::new();
+        let mut paths = Map::new();
+        for index in 0..80 {
+            schemas.insert(
+                format!("Schema{index:02}"),
+                if index == 0 {
+                    json!({ "$ref": "#/x-shared" })
+                } else {
+                    json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": ["missing"]
+                    })
+                },
+            );
+            paths.insert(
+                format!("/path-{index:02}"),
+                json!({
+                    "get": {
+                        "parameters": "invalid",
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }),
+            );
+            // A second family of paths whose template parameters and declared parameters
+            // disagree in both directions, so each one emits several OASTS1105 diagnostics
+            // out of a HashSet difference. Ordering those by hasher iteration would make the
+            // sequence inside one path depend on the hasher's per-instance seed.
+            paths.insert(
+                format!("/mismatch-{index:02}/{{alpha}}/{{bravo}}/{{charlie}}/{{delta}}"),
+                json!({
+                    "get": {
+                        "parameters": [
+                            { "name": "echo", "in": "path", "required": true,
+                              "schema": { "type": "string" } },
+                            { "name": "foxtrot", "in": "path", "required": true,
+                              "schema": { "type": "string" } },
+                            { "name": "golf", "in": "path", "required": true,
+                              "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }),
+            );
+        }
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "parallel parse", "version": "1" },
+            "paths": paths,
+            "components": { "schemas": schemas },
+            "x-shared": { "type": "string" }
+        });
+        let (_temp, graph) = graph_for(&document);
+        let mut expected_sink = DiagnosticSink::new();
+        let expected = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("serial pool")
+            .install(|| parse(&graph, &mut expected_sink).expect("serial parse"));
+
+        for thread_count in [2, 18] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(thread_count)
+                .build()
+                .expect("parallel pool");
+            for _ in 0..4 {
+                let mut sink = DiagnosticSink::new();
+                let actual = pool.install(|| parse(&graph, &mut sink).expect("parallel parse"));
+                assert_eq!(actual, expected, "thread count {thread_count}");
+                assert_eq!(sink, expected_sink, "thread count {thread_count}");
+            }
+        }
     }
 
     #[test]
@@ -4761,7 +5062,7 @@ mod tests {
             .iter()
             .map(|schema| schema.name.as_str())
             .collect::<HashSet<_>>();
-        assert_eq!(names, HashSet::from(["FOO", "Foo"]));
+        assert_eq!(names, ["FOO", "Foo"].into_iter().collect());
     }
 
     #[test]
@@ -5982,6 +6283,25 @@ mod tests {
         let (_temp, ir, sink) = parse_value(&document);
         assert!(matches!(schema_named(&ir, "Thing"), SchemaNode::Ref { .. }));
         assert!(ref_sibling_warnings(&sink).is_empty());
+    }
+
+    #[test]
+    fn ref_with_constraint_sibling_drops_validation_applicators_in_30() {
+        let document = schemas_doc(
+            "3.0.3",
+            json!({
+                "Base": { "type": "string" },
+                "Thing": {
+                    "$ref": "#/components/schemas/Base",
+                    "not": { "type": "number" }
+                }
+            }),
+        );
+        let (_temp, ir, _sink) = parse_value(&document);
+        let thing = schema_named(&ir, "Thing");
+
+        assert!(matches!(thing, SchemaNode::Ref { .. }));
+        assert!(thing.meta().validation_applicators.is_none());
     }
 
     #[test]

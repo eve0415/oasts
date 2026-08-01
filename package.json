@@ -7,15 +7,15 @@
   "devEngines": {
     "runtime": {
       "name": "node",
-      "version": "24.18.0"
+      "version": "24.18.1"
     },
     "packageManager": {
       "name": "pnpm",
-      "version": "11.15.1"
+      "version": "11.18.0"
     }
   },
   "devDependencies": {
-    "@napi-rs/cli": "3.7.3",
+    "@napi-rs/cli": "3.8.1",
     "typescript": "7.0.2"
   }
 }

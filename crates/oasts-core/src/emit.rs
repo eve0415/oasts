@@ -10,10 +10,12 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::rc::Rc;
+use std::sync::Arc;
 
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use rayon::prelude::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use unicode_general_category::{GeneralCategory, get_general_category};
@@ -98,9 +100,9 @@ type BorrowedProperty<'a> = (&'a str, &'a SchemaNode, &'a PropMeta);
 /// A cached `allOf` merge result, keyed in the emitter by the branch slice's IR address.
 /// `None` records a slice that does not merge into a single object shape (cached so the
 /// negative answer is not recomputed once per position per pass either). The merged
-/// properties are shared via `Rc` so a cache hit is a refcount bump, not a `Vec` clone,
+/// properties are shared via `Arc` so workers read one immutable prewarmed result,
 /// and are borrowed at the model lifetime because the IR outlives the emitter.
-type CachedAllOf<'a> = Option<(Rc<[BorrowedProperty<'a>]>, &'a AdditionalProperties)>;
+type CachedAllOf<'a> = Option<(Arc<[BorrowedProperty<'a>]>, &'a AdditionalProperties)>;
 
 struct ObjectShape<'a> {
     properties: &'a [(String, SchemaNode, PropMeta)],
@@ -324,7 +326,9 @@ pub fn emit_types(
 pub(crate) fn emit_types_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
     let _client_artifact_emitter = client::emit_client_from_model;
     let _runtime_asset_emitter = runtime_assets::emit_runtime_files;
-    Emitter::new(model).emit()
+    let (files, diagnostics) = Emitter::new(model).emit();
+    model.sink.extend(diagnostics);
+    files
 }
 
 /// Emits every enabled artifact (types, client, validators) for one compile.
@@ -389,20 +393,20 @@ enum SchemaChildMode {
 }
 
 pub(super) struct Emitter<'model, 'input, 'sink> {
-    model: &'model mut EmissionModel<'input, 'sink>,
-    enum_member_indices: BTreeMap<(String, String), usize>,
+    model: &'model EmissionModel<'input, 'sink>,
+    enum_member_indices: Arc<BTreeMap<(String, String), usize>>,
     /// Resolved link indices (into `model.analyzed.link_targets`), grouped by the response
     /// they were declared on and keyed the same way as `enum_member_indices`. Built only when
     /// the document has at least one link — the fast-reject keeps a link-free document's
     /// emission allocation-identical to before links existed. Each group stays in
     /// `link_targets` order (insertion order, one linear pass), matching the ticket's
     /// deterministic-order requirement without a separate sort.
-    link_targets_by_response: BTreeMap<(String, String), Vec<usize>>,
+    link_targets_by_response: Arc<BTreeMap<(String, String), Vec<usize>>>,
     /// `operation_index -> Stem` for every allocated operation name, the same transform
     /// `emit_operation` applies to its own `stem`. Populated alongside
     /// `link_targets_by_response` (same fast-reject) so a resolved link's target response type
     /// name can be looked up in O(1) instead of scanning `operation_names` per link.
-    operation_stems: HashMap<usize, String>,
+    operation_stems: Arc<HashMap<usize, String>>,
     /// Refs whose targets `merge_all_of` is currently inlining, along the active
     /// render ancestry. A recursive schema whose `allOf` branch points
     /// back to an ancestor would otherwise inline forever; the branch renders as a
@@ -416,7 +420,7 @@ pub(super) struct Emitter<'model, 'input, 'sink> {
     /// locally built branches miss and recompute, and no live non-empty IR slice can
     /// share a local's address. Empty slices all share the dangling-pointer sentinel, so
     /// `cache_merge_all_of` refuses to insert them.
-    merge_cache: RefCell<HashMap<(usize, usize), CachedAllOf<'input>>>,
+    merge_cache: Arc<HashMap<(usize, usize), CachedAllOf<'input>>>,
     /// Component imports the operation module being rendered binds under a different local name,
     /// keyed by the imported variant name. An operation module declares `<Stem>Request` and
     /// `<Stem>Response*` of its own; a component that already carries one of those names would be
@@ -429,8 +433,50 @@ pub(super) struct Emitter<'model, 'input, 'sink> {
     deferred_diagnostics: RefCell<Vec<Diagnostic>>,
 }
 
+struct EmitterFactory<'model, 'input, 'sink> {
+    model: &'model EmissionModel<'input, 'sink>,
+    enum_member_indices: Arc<BTreeMap<(String, String), usize>>,
+    link_targets_by_response: Arc<BTreeMap<(String, String), Vec<usize>>>,
+    operation_stems: Arc<HashMap<usize, String>>,
+    merge_cache: Arc<HashMap<(usize, usize), CachedAllOf<'input>>>,
+}
+
+struct EmittedOperation {
+    file: GeneratedFile,
+    diagnostics: Vec<Diagnostic>,
+    has_response_headers: bool,
+}
+
+fn append_operation_emissions(
+    files: &mut Vec<GeneratedFile>,
+    diagnostics: &mut Vec<Diagnostic>,
+    any_response_headers: &mut bool,
+    emissions: Vec<EmittedOperation>,
+) {
+    for emission in emissions {
+        *any_response_headers |= emission.has_response_headers;
+        diagnostics.extend(emission.diagnostics);
+        files.push(emission.file);
+    }
+}
+
+impl<'model, 'input, 'sink> EmitterFactory<'model, 'input, 'sink> {
+    fn worker(&self) -> Emitter<'model, 'input, 'sink> {
+        Emitter {
+            model: self.model,
+            enum_member_indices: Arc::clone(&self.enum_member_indices),
+            link_targets_by_response: Arc::clone(&self.link_targets_by_response),
+            operation_stems: Arc::clone(&self.operation_stems),
+            inlining_refs: RefCell::new(Vec::new()),
+            merge_cache: Arc::clone(&self.merge_cache),
+            import_aliases: RefCell::new(HashMap::new()),
+            deferred_diagnostics: RefCell::new(Vec::new()),
+        }
+    }
+}
+
 impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
-    pub(super) fn new(model: &'model mut EmissionModel<'input, 'sink>) -> Self {
+    pub(super) fn new(model: &'model EmissionModel<'input, 'sink>) -> Self {
         let mut enum_member_indices = BTreeMap::new();
         for (index, table) in model.analyzed.enum_members.iter().enumerate() {
             enum_member_indices
@@ -462,18 +508,18 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         }
         Self {
             model,
-            enum_member_indices,
-            link_targets_by_response,
-            operation_stems,
+            enum_member_indices: Arc::new(enum_member_indices),
+            link_targets_by_response: Arc::new(link_targets_by_response),
+            operation_stems: Arc::new(operation_stems),
             inlining_refs: RefCell::new(Vec::new()),
-            merge_cache: RefCell::new(HashMap::new()),
+            merge_cache: Arc::new(HashMap::new()),
             import_aliases: RefCell::new(HashMap::new()),
             deferred_diagnostics: RefCell::new(Vec::new()),
         }
     }
 
-    fn emit(mut self) -> Vec<GeneratedFile> {
-        self.validate_model();
+    fn emit(mut self) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
+        let mut diagnostics = self.validate_model();
         // Compute every component's `allOf` merges once up front. Each component is
         // rendered for up to three positions and walked for imports for each, so a node's
         // position-independent merge would otherwise run up to six times; the cache turns
@@ -517,82 +563,110 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 }
             }
         }
-        let mut files = Vec::new();
-        for allocated in &self.model.analyzed.schema_names {
-            if self.model.component_files[allocated.schema_index].is_none() {
-                continue;
-            }
-            files.push(self.emit_component(allocated));
-        }
+        let factory = self.into_factory();
+        let mut files = factory
+            .model
+            .analyzed
+            .schema_names
+            .par_iter()
+            .filter(|allocated| factory.model.component_files[allocated.schema_index].is_some())
+            .map_init(
+                || factory.worker(),
+                |worker, allocated| worker.emit_component(allocated),
+            )
+            .collect::<Vec<_>>();
         let mut any_response_headers = false;
-        for allocated in &self.model.analyzed.operation_names {
-            let Some(file_base) = self.model.operation_files[allocated.operation_index].as_deref()
-            else {
-                continue;
-            };
-            let operation = &self.model.analyzed.ir.operations[allocated.operation_index];
-            self.push_operation_file(
-                &mut files,
-                &mut any_response_headers,
-                operation,
-                &allocated.name,
-                "operations",
-                file_base,
-            );
-        }
+        let operations = factory
+            .model
+            .analyzed
+            .operation_names
+            .par_iter()
+            .map_init(
+                || factory.worker(),
+                |worker, allocated| {
+                    let file_base =
+                        factory.model.operation_files[allocated.operation_index].as_deref()?;
+                    let operation =
+                        &factory.model.analyzed.ir.operations[allocated.operation_index];
+                    Some(worker.emit_operation(operation, &allocated.name, "operations", file_base))
+                },
+            )
+            .filter_map(|emission| emission)
+            .collect::<Vec<_>>();
+        append_operation_emissions(
+            &mut files,
+            &mut diagnostics,
+            &mut any_response_headers,
+            operations,
+        );
         // Webhook and callback operations reuse the operation renderer verbatim; their response
         // headers count toward the shared `types/headers.ts` helper just like a path operation's.
-        for index in 0..self.model.analyzed.webhook_names.len() {
-            let Some(file_base) = self.model.webhook_files[index].as_deref() else {
-                continue;
-            };
-            let allocated = &self.model.analyzed.webhook_names[index];
-            let operation = &self.model.analyzed.ir.webhooks[allocated.webhook_index].operations
-                [allocated.operation_index];
-            self.push_operation_file(
-                &mut files,
-                &mut any_response_headers,
-                operation,
-                &allocated.stem,
-                "webhooks",
-                file_base,
-            );
-        }
+        let webhooks = (0..factory.model.analyzed.webhook_names.len())
+            .into_par_iter()
+            .map_init(
+                || factory.worker(),
+                |worker, index| {
+                    let file_base = factory.model.webhook_files[index].as_deref()?;
+                    let allocated = &factory.model.analyzed.webhook_names[index];
+                    let operation = &factory.model.analyzed.ir.webhooks[allocated.webhook_index]
+                        .operations[allocated.operation_index];
+                    Some(worker.emit_operation(operation, &allocated.stem, "webhooks", file_base))
+                },
+            )
+            .filter_map(|emission| emission)
+            .collect::<Vec<_>>();
+        append_operation_emissions(
+            &mut files,
+            &mut diagnostics,
+            &mut any_response_headers,
+            webhooks,
+        );
         // A document with any webhook gets the `Webhooks` descriptor, including a webhook whose
         // path item declares no operations (it appears in the map with an empty object type).
-        if !self.model.analyzed.ir.webhooks.is_empty() {
-            files.push(self.emit_webhooks_index());
+        if !factory.model.analyzed.ir.webhooks.is_empty() {
+            files.push(factory.worker().emit_webhooks_index());
         }
-        for index in 0..self.model.analyzed.callback_names.len() {
-            let Some(file_base) = self.model.callback_files[index].as_deref() else {
-                continue;
-            };
-            let allocated = &self.model.analyzed.callback_names[index];
-            let operation = callback_operation(
-                &self.model.analyzed.ir,
-                &self.model.analyzed.callback_names,
-                allocated,
-            );
-            self.push_operation_file(
-                &mut files,
-                &mut any_response_headers,
-                operation,
-                &allocated.stem,
-                "callbacks",
-                file_base,
-            );
-        }
-        if self.model.callback_files.iter().any(Option::is_some) {
-            files.push(self.emit_callbacks_index());
+        let callbacks = (0..factory.model.analyzed.callback_names.len())
+            .into_par_iter()
+            .map_init(
+                || factory.worker(),
+                |worker, index| {
+                    let file_base = factory.model.callback_files[index].as_deref()?;
+                    let allocated = &factory.model.analyzed.callback_names[index];
+                    let operation = callback_operation(
+                        &factory.model.analyzed.ir,
+                        &factory.model.analyzed.callback_names,
+                        allocated,
+                    );
+                    Some(worker.emit_operation(operation, &allocated.stem, "callbacks", file_base))
+                },
+            )
+            .filter_map(|emission| emission)
+            .collect::<Vec<_>>();
+        append_operation_emissions(
+            &mut files,
+            &mut diagnostics,
+            &mut any_response_headers,
+            callbacks,
+        );
+        if factory.model.callback_files.iter().any(Option::is_some) {
+            files.push(factory.worker().emit_callbacks_index());
         }
         if any_response_headers {
-            files.push(self.emit_headers_helper_file());
-        }
-        for diagnostic in self.deferred_diagnostics.take() {
-            self.model.sink.push(diagnostic);
+            files.push(factory.worker().emit_headers_helper_file());
         }
         files.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        files
+        (files, diagnostics)
+    }
+
+    fn into_factory(self) -> EmitterFactory<'model, 'input, 'sink> {
+        EmitterFactory {
+            model: self.model,
+            enum_member_indices: self.enum_member_indices,
+            link_targets_by_response: self.link_targets_by_response,
+            operation_stems: self.operation_stems,
+            merge_cache: self.merge_cache,
+        }
     }
 
     /// Emits `types/webhooks/index.ts`: the `Webhooks` descriptor mapping each webhook name (as
@@ -810,7 +884,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         self.model.header()
     }
 
-    fn validate_model(&mut self) {
+    fn validate_model(&self) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         for schema in &self.model.analyzed.ir.schemas {
             self.validate_schema(&schema.schema, &mut diagnostics);
@@ -838,7 +912,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 }
             }
         }
-        self.model.sink.extend(diagnostics);
+        diagnostics
     }
 
     fn validate_schema(&self, schema: &SchemaNode, diagnostics: &mut Vec<Diagnostic>) {
@@ -879,10 +953,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     }
 
     fn resolve_ref<'a>(
-        &'a self,
+        &self,
         schema: &'a SchemaNode,
         visited: &mut HashSet<(&'a str, &'a str)>,
-    ) -> Option<&'a SchemaNode> {
+    ) -> Option<&'a SchemaNode>
+    where
+        'input: 'a,
+    {
         let SchemaNode::Ref { target, .. } = schema else {
             return Some(schema);
         };
@@ -891,18 +968,22 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             return None;
         }
         visited.insert(key);
-        let target = self
+        let index = self
             .model
-            .schema_target(&target.source_id, &target.json_pointer)?;
-        let resolved = &self.model.analyzed.ir.schemas.get(target.index)?.schema;
+            .schema_target(&target.source_id, &target.json_pointer)?
+            .index;
+        let resolved = &self.model.analyzed.ir.schemas.get(index)?.schema;
         self.resolve_ref(resolved, visited)
     }
 
     fn object_shape<'a>(
-        &'a self,
+        &self,
         schema: &'a SchemaNode,
         visited: &mut HashSet<(&'a str, &'a str)>,
-    ) -> Option<ObjectShape<'a>> {
+    ) -> Option<ObjectShape<'a>>
+    where
+        'input: 'a,
+    {
         let schema = self.resolve_ref(schema, visited)?;
         let SchemaNode::Object {
             properties,
@@ -923,10 +1004,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     }
 
     fn finite_constraint<'a>(
-        &'a self,
+        &self,
         schema: &'a SchemaNode,
         visited: &mut HashSet<(&'a str, &'a str)>,
-    ) -> Option<Vec<Value>> {
+    ) -> Option<Vec<Value>>
+    where
+        'input: 'a,
+    {
         let schema = self.resolve_ref(schema, visited)?;
         let (enum_values, const_value) = match schema {
             SchemaNode::Primitive {
@@ -1317,7 +1401,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             write_source_metadata(output, source, 0);
             write_schema_tsdoc(
                 output,
-                &schema.meta().docs,
+                SchemaDocView::from(&schema.meta().docs),
                 DocKind::Schema,
                 &self.model.config.documentation,
                 0,
@@ -1328,13 +1412,12 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             output.push_str(" = {\n");
             for member in members {
                 if let Some(description) = &member.description {
-                    let docs = SchemaDocs {
-                        description: Some(description.clone()),
-                        ..SchemaDocs::default()
-                    };
                     write_schema_tsdoc(
                         output,
-                        &docs,
+                        SchemaDocView {
+                            description: Some(description),
+                            ..SchemaDocView::default()
+                        },
                         DocKind::Property,
                         &self.model.config.documentation,
                         2,
@@ -1351,7 +1434,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             write_source_metadata(output, source, 0);
             write_schema_tsdoc(
                 output,
-                &schema.meta().docs,
+                SchemaDocView::from(&schema.meta().docs),
                 DocKind::Schema,
                 &self.model.config.documentation,
                 0,
@@ -1370,7 +1453,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         write_source_metadata(output, source, 0);
         write_schema_tsdoc(
             output,
-            &schema.meta().docs,
+            SchemaDocView::from(&schema.meta().docs),
             DocKind::Schema,
             &self.model.config.documentation,
             0,
@@ -1640,10 +1723,10 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 .filter(|&&(_, _, meta)| property_in_position(meta, position))
             {
                 let member_indent = indent + 2;
-                let docs = property_docs(schema, meta);
+                let docs = property_docs(schema);
                 write_schema_tsdoc(
                     &mut output,
-                    &docs,
+                    docs,
                     DocKind::Property,
                     &self.model.config.documentation,
                     member_indent,
@@ -1759,7 +1842,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         // does-not-merge answer. Clone out of the cache in a tight scope: `body` re-enters
         // this method, so the cache borrow must be released before it runs.
         let key = (branches.as_ptr() as usize, branches.len());
-        let cached = self.merge_cache.borrow().get(&key).cloned();
+        let cached = self.merge_cache.get(&key).cloned();
         let fresh;
         let (properties, additional_properties): (&[BorrowedProperty<'a>], &AdditionalProperties) =
             match &cached {
@@ -1782,9 +1865,12 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     }
 
     fn merge_all_of<'a>(
-        &'a self,
+        &self,
         branches: &'a [SchemaNode],
-    ) -> Option<(Vec<BorrowedProperty<'a>>, &'a AdditionalProperties)> {
+    ) -> Option<(Vec<BorrowedProperty<'a>>, &'a AdditionalProperties)>
+    where
+        'input: 'a,
+    {
         // One scratch set reused across branches; clearing before each call keeps
         // today's per-call-fresh cycle-visited semantics without a fresh allocation
         // per branch.
@@ -1799,45 +1885,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         Self::merge_shapes(&shapes)
     }
 
-    /// Model-lifetime `allOf` merge, used only to prewarm the cache. Identical result to
-    /// `merge_all_of` for the same branches, but the borrows are tied to the immutable IR
-    /// (`&'input`) rather than the `&self` borrow, so the properties outlive the emitter
-    /// and can be stored. Branches must be IR-resident; `merge_all_of` stays the fallback
-    /// for locally built schemas whose branch slices have no stable address to key on.
-    fn merge_all_of_ir(
-        &self,
-        branches: &'input [SchemaNode],
-    ) -> Option<(Vec<BorrowedProperty<'input>>, &'input AdditionalProperties)> {
-        let mut visited = HashSet::new();
-        let shapes = branches
-            .iter()
-            .map(|branch| {
-                visited.clear();
-                let resolved = self.resolve_ref_ir(branch, &mut visited)?;
-                let SchemaNode::Object {
-                    properties,
-                    additional_properties,
-                    meta,
-                    ..
-                } = resolved
-                else {
-                    return None;
-                };
-                if !meta.validation_applicators().pattern_properties.is_empty() {
-                    return None;
-                }
-                Some(ObjectShape {
-                    properties,
-                    additional_properties,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Self::merge_shapes(&shapes)
-    }
-
-    /// The `allOf` object merge over already-resolved branch shapes. Shared by the
-    /// `&'a self` fallback (`merge_all_of`) and the model-lifetime prewarm
-    /// (`merge_all_of_ir`) so both emit a byte-identical merged property list.
+    /// The `allOf` object merge over already-resolved branch shapes.
     fn merge_shapes<'a>(
         shapes: &[ObjectShape<'a>],
     ) -> Option<(Vec<BorrowedProperty<'a>>, &'a AdditionalProperties)> {
@@ -1885,37 +1933,11 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         Some((merged, merged_additional_properties))
     }
 
-    /// Resolves a `$ref` chain to its target node at the model lifetime. Mirrors
-    /// `resolve_ref`, but re-reads through `self.model.analyzed` (a `&'input` copy) so the
-    /// result is tied to the IR, not the `&self` borrow — required to cache a merge that
-    /// outlives the current call. Returns `None` on a ref cycle or unresolvable target,
-    /// exactly as `resolve_ref`, so a prewarmed merge equals the fallback merge.
-    fn resolve_ref_ir(
-        &self,
-        schema: &'input SchemaNode,
-        visited: &mut HashSet<(&'input str, &'input str)>,
-    ) -> Option<&'input SchemaNode> {
-        let SchemaNode::Ref { target, .. } = schema else {
-            return Some(schema);
-        };
-        let key = (target.source_id.as_str(), target.json_pointer.as_str());
-        if visited.contains(&key) {
-            return None;
-        }
-        visited.insert(key);
-        let index = self
-            .model
-            .schema_target(&target.source_id, &target.json_pointer)?
-            .index;
-        let resolved = &self.model.analyzed.ir.schemas.get(index)?.schema;
-        self.resolve_ref_ir(resolved, visited)
-    }
-
     /// Populates the merge cache for every `allOf` node in one IR schema tree. Descends the
     /// raw structure — never through a `$ref`, which is a leaf here, so the walk always
     /// terminates — and computes each node's merge once, before the node is rendered and
     /// walked for imports up to six times.
-    fn prewarm_all_of(&self, schema: &'input SchemaNode) {
+    fn prewarm_all_of(&mut self, schema: &'input SchemaNode) {
         match schema {
             SchemaNode::Object {
                 properties,
@@ -2002,19 +2024,21 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     /// sentinel, so an empty IR slice's key would also match every other empty slice,
     /// IR-resident or not. Skipping them keeps the pointer key collision-free; the
     /// fallback recomputes an empty merge to the same `None` answer either way.
-    fn cache_merge_all_of(&self, branches: &'input [SchemaNode]) {
+    fn cache_merge_all_of(&mut self, branches: &'input [SchemaNode]) {
         if branches.is_empty() {
             return;
         }
         let key = (branches.as_ptr() as usize, branches.len());
-        // Compute the entry before touching the cache — `merge_all_of_ir` never reads it,
-        // and this keeps the mutable borrow to the single `insert`.
+        // Compute the entry before touching the cache to keep the mutable borrow to the
+        // single `insert`.
         let entry = self
-            .merge_all_of_ir(branches)
+            .merge_all_of(branches)
             .map(|(properties, additional_properties)| {
-                (Rc::from(properties), additional_properties)
+                (Arc::from(properties), additional_properties)
             });
-        self.merge_cache.borrow_mut().insert(key, entry);
+        Arc::get_mut(&mut self.merge_cache)
+            .expect("the allOf cache is not shared until prewarming finishes")
+            .insert(key, entry);
     }
 
     fn collect_component_imports(
@@ -2309,26 +2333,25 @@ impl SchemaTarget {
 }
 
 impl Emitter<'_, '_, '_> {
-    /// Renders one operation-shaped file and appends it, folding its response headers into the
-    /// running `any_response_headers` flag first. Shared by the path-operation, webhook, and
-    /// callback emission loops, which differ only in how they resolve `(operation, name, file_base)`
-    /// and the `subdir` they target.
-    fn push_operation_file(
+    /// Renders one operation-shaped file and returns its ordered diagnostics and header-helper bit.
+    /// Shared by the path-operation, webhook, and callback parallel loops, whose ordered collects
+    /// make these per-file accumulators deterministic before the caller appends them.
+    fn emit_operation(
         &self,
-        files: &mut Vec<GeneratedFile>,
-        any_response_headers: &mut bool,
         operation: &Operation,
         allocated_name: &str,
         subdir: &str,
         file_base: &str,
-    ) {
-        if !*any_response_headers {
-            *any_response_headers = operation
+    ) -> EmittedOperation {
+        let file = self.emit_operation_file(operation, allocated_name, subdir, file_base);
+        EmittedOperation {
+            file,
+            diagnostics: self.deferred_diagnostics.take(),
+            has_response_headers: operation
                 .responses
                 .iter()
-                .any(|response| !response.headers.is_empty());
+                .any(|response| !response.headers.is_empty()),
         }
-        files.push(self.emit_operation_file(operation, allocated_name, subdir, file_base));
     }
 
     /// Renders one operation-shaped type file — the `<Stem>Request`, per-status `<Stem>Response*`,
@@ -2563,8 +2586,8 @@ impl Emitter<'_, '_, '_> {
                     continue;
                 };
                 tsdoc.see.push((
-                    format!("{target_stem}Response"),
-                    Some(resolved.link_name.clone()),
+                    Cow::Owned(format!("{target_stem}Response")),
+                    Some(Cow::Borrowed(resolved.link_name.as_str())),
                 ));
             }
         }
@@ -2589,7 +2612,7 @@ impl Emitter<'_, '_, '_> {
         for (name, header) in &response.headers {
             write_schema_tsdoc(
                 output,
-                &response_header_docs(header),
+                response_header_docs(header),
                 DocKind::Header,
                 &self.model.config.documentation,
                 2,
@@ -2665,13 +2688,12 @@ impl Emitter<'_, '_, '_> {
                 axis,
             );
             if let Some(description) = &body.description {
-                let docs = SchemaDocs {
-                    description: Some(description.clone()),
-                    ..SchemaDocs::default()
-                };
                 write_schema_tsdoc(
                     &mut output,
-                    &docs,
+                    SchemaDocView {
+                        description: Some(description),
+                        ..SchemaDocView::default()
+                    },
                     DocKind::Property,
                     &self.model.config.documentation,
                     indent + 2,
@@ -2713,7 +2735,7 @@ impl Emitter<'_, '_, '_> {
             );
             write_schema_tsdoc(
                 &mut output,
-                &docs,
+                docs,
                 DocKind::Parameter,
                 &self.model.config.documentation,
                 indent + 2,
@@ -2907,15 +2929,16 @@ pub(super) fn property_in_position(meta: &PropMeta, position: TypePosition) -> b
     }
 }
 
-fn property_docs(schema: &SchemaNode, meta: &PropMeta) -> SchemaDocs {
-    SchemaDocs {
-        title: schema.meta().docs.title.clone(),
-        description: meta.description.clone(),
-        deprecated: meta.deprecated,
-        default: meta.default.clone(),
-        examples: meta.examples.clone(),
-        comment: schema.meta().docs.comment.clone(),
-        constraints: schema.meta().docs.constraints.clone(),
+fn property_docs(schema: &SchemaNode) -> SchemaDocView<'_> {
+    let docs = &schema.meta().docs;
+    SchemaDocView {
+        title: docs.title.as_deref(),
+        description: docs.description.as_deref(),
+        deprecated: docs.deprecated,
+        default: docs.default.as_ref(),
+        examples: &docs.examples,
+        comment: docs.comment.as_deref(),
+        constraints: &docs.constraints,
     }
 }
 
@@ -2923,23 +2946,23 @@ fn property_docs(schema: &SchemaNode, meta: &PropMeta) -> SchemaDocs {
 /// `title` or `default` (those live only inside the schema), plus the nested schema's
 /// `examples`/`comment`/`constraints`. Both objects carry the same description/deprecated/schema
 /// shape, so `render_parameter_group` (Parameter) and `response_header_docs` (Header) share this.
-fn schema_field_docs(
-    description: Option<&str>,
+fn schema_field_docs<'a>(
+    description: Option<&'a str>,
     deprecated: bool,
-    schema: &SchemaNode,
-) -> SchemaDocs {
-    SchemaDocs {
+    schema: &'a SchemaNode,
+) -> SchemaDocView<'a> {
+    SchemaDocView {
         title: None,
-        description: description.map(str::to_owned),
+        description,
         deprecated,
         default: None,
-        examples: schema.meta().docs.examples.clone(),
-        comment: schema.meta().docs.comment.clone(),
-        constraints: schema.meta().docs.constraints.clone(),
+        examples: &schema.meta().docs.examples,
+        comment: schema.meta().docs.comment.as_deref(),
+        constraints: &schema.meta().docs.constraints,
     }
 }
 
-fn response_header_docs(header: &ResponseHeader) -> SchemaDocs {
+fn response_header_docs(header: &ResponseHeader) -> SchemaDocView<'_> {
     schema_field_docs(
         header.description.as_deref(),
         header.deprecated,
@@ -3148,27 +3171,52 @@ enum DocKind {
     Header,
 }
 
-#[derive(Default)]
-struct TsDoc {
-    summary: Option<String>,
-    remarks: Vec<String>,
-    deprecated: Option<&'static str>,
-    params: Vec<(String, String)>,
-    returns: Option<&'static str>,
-    default_value: Option<String>,
-    examples: Vec<DocExample>,
-    private_remarks: Option<String>,
-    see: Vec<(String, Option<String>)>,
+#[derive(Clone, Copy, Default)]
+struct SchemaDocView<'a> {
+    title: Option<&'a str>,
+    description: Option<&'a str>,
+    deprecated: bool,
+    default: Option<&'a Value>,
+    examples: &'a [Value],
+    comment: Option<&'a str>,
+    constraints: &'a [String],
 }
 
-struct DocExample {
-    label: Option<String>,
-    value: Value,
+impl<'a> From<&'a SchemaDocs> for SchemaDocView<'a> {
+    fn from(docs: &'a SchemaDocs) -> Self {
+        Self {
+            title: docs.title.as_deref(),
+            description: docs.description.as_deref(),
+            deprecated: docs.deprecated,
+            default: docs.default.as_ref(),
+            examples: &docs.examples,
+            comment: docs.comment.as_deref(),
+            constraints: &docs.constraints,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TsDoc<'a> {
+    summary: Option<Cow<'a, str>>,
+    remarks: Vec<Cow<'a, str>>,
+    deprecated: Option<&'static str>,
+    params: Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    returns: Option<&'static str>,
+    default_value: Option<Cow<'a, str>>,
+    examples: Vec<DocExample<'a>>,
+    private_remarks: Option<Cow<'a, str>>,
+    see: Vec<(Cow<'a, str>, Option<Cow<'a, str>>)>,
+}
+
+struct DocExample<'a> {
+    label: Option<Cow<'a, str>>,
+    value: Cow<'a, Value>,
 }
 
 fn write_schema_tsdoc(
     output: &mut String,
-    docs: &SchemaDocs,
+    docs: SchemaDocView<'_>,
     kind: DocKind,
     config: &DocumentationConfig,
     indent: usize,
@@ -3180,19 +3228,14 @@ fn write_schema_tsdoc(
     let mut tsdoc = TsDoc::default();
     match kind {
         DocKind::Schema | DocKind::Property => {
-            map_summary_description(
-                &mut tsdoc,
-                docs.title.as_deref(),
-                docs.description.as_deref(),
-                config,
-            );
+            map_summary_description(&mut tsdoc, docs.title, docs.description, config);
         }
         DocKind::Parameter | DocKind::Header => {
-            if let Some(description) = docs.description.as_ref() {
+            if let Some(description) = docs.description {
                 if config.summary {
-                    tsdoc.summary = Some(description.clone());
+                    tsdoc.summary = Some(Cow::Borrowed(description));
                 } else if config.description {
-                    tsdoc.remarks.push(description.clone());
+                    tsdoc.remarks.push(Cow::Borrowed(description));
                 }
             }
         }
@@ -3205,7 +3248,7 @@ fn write_schema_tsdoc(
             DocKind::Header => "This header is deprecated.",
         });
     }
-    if let Some(default) = docs.default.as_ref() {
+    if let Some(default) = docs.default {
         let mut rendered = render_json_compact(default, ObjectKeyMode::Plain);
         if first_number_outside_binary64(default).is_some() {
             let marker = if default.is_number() {
@@ -3216,62 +3259,66 @@ fn write_schema_tsdoc(
             rendered.push_str(&format!(" ({marker})"));
         }
         if kind == DocKind::Property && interface_member {
-            tsdoc.default_value = Some(rendered);
+            tsdoc.default_value = Some(Cow::Owned(rendered));
         } else if kind == DocKind::Schema {
-            tsdoc.remarks.push(format!("Default value: {rendered}"));
+            tsdoc
+                .remarks
+                .push(Cow::Owned(format!("Default value: {rendered}")));
         }
     }
     if config.constraints && !docs.constraints.is_empty() {
-        tsdoc.remarks.push(format!(
+        tsdoc.remarks.push(Cow::Owned(format!(
             "Constraints\n\n{}",
             docs.constraints
                 .iter()
                 .map(|constraint| format!("- {constraint}"))
                 .collect::<Vec<_>>()
                 .join("\n")
-        ));
+        )));
     }
     if config.examples {
         tsdoc.examples = docs
             .examples
             .iter()
-            .cloned()
             .map(|value| {
-                let label = first_number_outside_binary64(&value).map(|_| {
-                    if value.is_number() {
+                let label = first_number_outside_binary64(value).map(|_| {
+                    Cow::Owned(if value.is_number() {
                         "Outside the binary64 range.".to_owned()
                     } else {
                         "Contains a value outside the binary64 range.".to_owned()
-                    }
+                    })
                 });
-                DocExample { label, value }
+                DocExample {
+                    label,
+                    value: Cow::Borrowed(value),
+                }
             })
             .collect();
     }
-    tsdoc.private_remarks = docs.comment.clone();
+    tsdoc.private_remarks = docs.comment.map(Cow::Borrowed);
     write_tsdoc(output, &tsdoc, indent);
 }
 
-fn map_summary_description(
-    tsdoc: &mut TsDoc,
-    title: Option<&str>,
-    description: Option<&str>,
+fn map_summary_description<'a>(
+    tsdoc: &mut TsDoc<'a>,
+    title: Option<&'a str>,
+    description: Option<&'a str>,
     config: &DocumentationConfig,
 ) {
     if config.summary {
         if let Some(title) = title {
-            tsdoc.summary = Some(title.to_owned());
+            tsdoc.summary = Some(Cow::Borrowed(title));
         } else if config.description
             && let Some(description) = description
         {
-            tsdoc.summary = Some(description.to_owned());
+            tsdoc.summary = Some(Cow::Borrowed(description));
             return;
         }
     }
     if config.description
         && let Some(description) = description
     {
-        tsdoc.remarks.push(description.to_owned());
+        tsdoc.remarks.push(Cow::Borrowed(description));
     }
 }
 
@@ -3292,7 +3339,7 @@ fn write_operation_tsdoc(
         config,
     );
     if config.description && !operation.responses.is_empty() {
-        tsdoc.remarks.push(format!(
+        tsdoc.remarks.push(Cow::Owned(format!(
             "Responses\n\n{}",
             operation
                 .responses
@@ -3304,7 +3351,7 @@ fn write_operation_tsdoc(
                 ))
                 .collect::<Vec<_>>()
                 .join("\n")
-        ));
+        )));
     }
     if config.constraints {
         let mut media_notes = Vec::new();
@@ -3329,17 +3376,20 @@ fn write_operation_tsdoc(
             }
         }
         if !media_notes.is_empty() {
-            tsdoc.remarks.push(format!(
+            tsdoc.remarks.push(Cow::Owned(format!(
                 "Media type constraints\n\n{}",
                 media_notes.join("\n")
-            ));
+            )));
         }
     }
     if config.deprecated && operation.deprecated {
         tsdoc.deprecated = Some("This operation is deprecated.");
     }
     if let Some((url, description)) = &operation.external_docs {
-        tsdoc.see.push((url.clone(), description.clone()));
+        tsdoc.see.push((
+            Cow::Borrowed(url.as_str()),
+            description.as_deref().map(Cow::Borrowed),
+        ));
     }
     if config.examples {
         for media_type in operation
@@ -3389,7 +3439,7 @@ pub(super) fn write_client_operation_tsdoc(
             config,
         );
         if config.description && !operation.responses.is_empty() {
-            tsdoc.remarks.push(format!(
+            tsdoc.remarks.push(Cow::Owned(format!(
                 "Responses\n\n{}",
                 operation
                     .responses
@@ -3401,19 +3451,22 @@ pub(super) fn write_client_operation_tsdoc(
                     ))
                     .collect::<Vec<_>>()
                     .join("\n")
-            ));
+            )));
         }
         if config.constraints && !decoding_notes.is_empty() {
-            tsdoc.remarks.push(format!(
+            tsdoc.remarks.push(Cow::Owned(format!(
                 "Response decoding\n\n{}",
                 decoding_notes.join("\n")
-            ));
+            )));
         }
         if config.deprecated && operation.deprecated {
             tsdoc.deprecated = Some("This operation is deprecated.");
         }
         if let Some((url, description)) = &operation.external_docs {
-            tsdoc.see.push((url.clone(), description.clone()));
+            tsdoc.see.push((
+                Cow::Borrowed(url.as_str()),
+                description.as_deref().map(Cow::Borrowed),
+            ));
         }
     }
     match kind {
@@ -3422,8 +3475,9 @@ pub(super) fn write_client_operation_tsdoc(
             if unchecked_response {
                 tsdoc.remarks.insert(
                     0,
-                    "Successful response data is decoded but unchecked against the OpenAPI schema."
-                        .to_owned(),
+                    Cow::Borrowed(
+                        "Successful response data is decoded but unchecked against the OpenAPI schema.",
+                    ),
                 );
             }
             if config.enabled && config.description {
@@ -3431,10 +3485,12 @@ pub(super) fn write_client_operation_tsdoc(
                     .parameters
                     .iter()
                     .filter_map(|parameter| {
-                        parameter
-                            .description
-                            .as_ref()
-                            .map(|description| (parameter.name.clone(), description.clone()))
+                        parameter.description.as_ref().map(|description| {
+                            (
+                                Cow::Borrowed(parameter.name.as_str()),
+                                Cow::Borrowed(description.as_str()),
+                            )
+                        })
                     })
                     .collect();
             }
@@ -3448,17 +3504,27 @@ pub(super) fn write_client_operation_tsdoc(
     write_tsdoc(output, &tsdoc, 0);
 }
 
-fn push_media_examples(examples: &mut Vec<DocExample>, media_type: &MediaType, source: &str) {
+fn push_media_examples<'a>(
+    examples: &mut Vec<DocExample<'a>>,
+    media_type: &'a MediaType,
+    source: &str,
+) {
     for (label, value) in &media_type.examples {
         examples.push(DocExample {
-            label: Some(format!("Source: {source} {label} ({})", media_type.essence)),
-            value: value.clone(),
+            label: Some(Cow::Owned(format!(
+                "Source: {source} {label} ({})",
+                media_type.essence
+            ))),
+            value: Cow::Borrowed(value),
         });
     }
     for value in &media_type.schema.meta().docs.examples {
         examples.push(DocExample {
-            label: Some(format!("Source: {source} ({})", media_type.essence)),
-            value: value.clone(),
+            label: Some(Cow::Owned(format!(
+                "Source: {source} ({})",
+                media_type.essence
+            ))),
+            value: Cow::Borrowed(value),
         });
     }
 }
@@ -3513,7 +3579,7 @@ impl TsDocWriter<'_> {
     }
 }
 
-fn write_tsdoc(output: &mut String, docs: &TsDoc, indent: usize) {
+fn write_tsdoc(output: &mut String, docs: &TsDoc<'_>, indent: usize) {
     if docs.summary.is_none()
         && docs.remarks.is_empty()
         && docs.deprecated.is_none()
@@ -3540,7 +3606,15 @@ fn write_tsdoc(output: &mut String, docs: &TsDoc, indent: usize) {
     if !docs.remarks.is_empty() {
         writer.begin_section();
         writer.plain_line("@remarks");
-        writer.encoded_lines(&docs.remarks.join("\n\n"));
+        let (first, rest) = docs
+            .remarks
+            .split_first()
+            .expect("non-empty remarks have a first entry");
+        writer.encoded_lines(first);
+        for remark in rest {
+            writer.plain_line("");
+            writer.encoded_lines(remark);
+        }
     }
     if let Some(deprecated) = docs.deprecated {
         writer.begin_section();
@@ -3582,7 +3656,7 @@ fn write_tsdoc(output: &mut String, docs: &TsDoc, indent: usize) {
             writer.plain_line("");
         }
         writer.plain_line("```json");
-        for line in render_json_pretty(&example.value).lines() {
+        for line in render_json_pretty(example.value.as_ref()).lines() {
             writer.neutralized_line(line);
         }
         writer.plain_line("```");
@@ -4536,16 +4610,11 @@ mod tests {
         }
     }
 
-    fn prop_meta(pointer: &str) -> PropMeta {
+    fn prop_meta() -> PropMeta {
         PropMeta {
             required: false,
             read_only: false,
             write_only: false,
-            deprecated: false,
-            description: None,
-            default: None,
-            examples: Vec::new(),
-            source: source(pointer),
         }
     }
 
@@ -4789,7 +4858,7 @@ mod tests {
                         const_value: Some(json!(value)),
                         meta: meta(&format!("{pointer}/kind")),
                     },
-                    prop_meta(&format!("{pointer}/kind")),
+                    prop_meta(),
                 )],
                 additional_properties: AdditionalProperties::Allowed(None),
                 dependent_required: Vec::new(),
@@ -4810,8 +4879,8 @@ mod tests {
         };
         let (_temp, config) = resolved_config(json!({}));
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let emitter = Emitter::new(&mut model);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&model);
         let missing = schema_ref("/missing", "/components/schemas/Missing");
         let nested = SchemaNode::AnyOf {
             branches: vec![
@@ -4910,8 +4979,8 @@ mod tests {
             "types": { "enum": "const" }
         }));
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let emitter = Emitter::new(&mut model);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&model);
         assert!(
             emitter
                 .resolve_ref(&self_ref, &mut HashSet::new())
@@ -5026,8 +5095,8 @@ mod tests {
         };
         let (_temp, config) = resolved_config(json!({}));
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let emitter = Emitter::new(&mut model);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&model);
 
         let unknown = |reason: &str, pointer: &str| SchemaNode::Unknown {
             reason: reason.to_owned(),
@@ -5037,7 +5106,7 @@ mod tests {
             properties: vec![(
                 "a".to_owned(),
                 primitive(PrimitiveType::String, "/object/a"),
-                prop_meta("/object/a"),
+                prop_meta(),
             )],
             additional_properties: AdditionalProperties::Forbidden,
             dependent_required: Vec::new(),
@@ -5160,8 +5229,8 @@ mod tests {
         };
         let (_temp, config) = resolved_config(json!({}));
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let emitter = Emitter::new(&mut model);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&model);
 
         let mut nullable_string = primitive(PrimitiveType::String, "/nullable");
         if let SchemaNode::Primitive { meta, .. } = &mut nullable_string {
@@ -5338,7 +5407,7 @@ mod tests {
                     )],
                     meta: meta("/components/schemas/Loop/properties/child"),
                 },
-                prop_meta("/components/schemas/Loop/properties/child"),
+                prop_meta(),
             )],
             additional_properties: AdditionalProperties::Forbidden,
             dependent_required: Vec::new(),
@@ -5370,8 +5439,8 @@ mod tests {
         };
         let (_temp, config) = resolved_config(json!({}));
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let emitter = Emitter::new(&mut model);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&model);
 
         // Terminates (no stack overflow) and the recursive branch is the bare named type.
         let rendered =
@@ -5435,15 +5504,15 @@ mod tests {
             "emit": { "importExtension": "none" }
         }));
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let emitter = Emitter::new(&mut model);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let emitter = Emitter::new(&model);
 
         let first = object(
             "/closed-one",
             vec![(
                 "one".to_owned(),
                 primitive(PrimitiveType::String, "/closed-one/one"),
-                prop_meta("/closed-one/one"),
+                prop_meta(),
             )],
             AdditionalProperties::Forbidden,
         );
@@ -5452,7 +5521,7 @@ mod tests {
             vec![(
                 "two".to_owned(),
                 primitive(PrimitiveType::String, "/closed-two/two"),
-                prop_meta("/closed-two/two"),
+                prop_meta(),
             )],
             AdditionalProperties::Forbidden,
         );
@@ -5461,7 +5530,7 @@ mod tests {
         let equal_property = (
             "same".to_owned(),
             primitive(PrimitiveType::String, "/equal/same"),
-            prop_meta("/equal/same"),
+            prop_meta(),
         );
         assert!(
             emitter
@@ -5485,11 +5554,11 @@ mod tests {
             vec![(
                 "same".to_owned(),
                 primitive(PrimitiveType::String, "/conflict-one/same"),
-                prop_meta("/conflict-one/same"),
+                prop_meta(),
             )],
             AdditionalProperties::Allowed(None),
         );
-        let mut required = prop_meta("/conflict-two/same");
+        let mut required = prop_meta();
         required.required = true;
         let second = object(
             "/conflict-two",
@@ -5581,7 +5650,7 @@ mod tests {
     fn prewarm_covers_alias_cycle_and_schema_additional_properties() {
         // Direct IR construction, since the analyzer never emits these shapes. An `allOf`
         // whose ref branch chains through a ref-alias cycle (AliasA -> AliasB -> AliasA)
-        // drives `resolve_ref_ir`'s cycle guard during prewarm, and an object with a
+        // drives `resolve_ref`'s cycle guard during prewarm, and an object with a
         // schema-valued `additionalProperties` drives the prewarm walk's recursion into
         // it. `emit()` prewarms both before rendering, so this also reads back the cached
         // does-not-merge answer.
@@ -5700,8 +5769,9 @@ mod tests {
         };
         let (_temp, config) = resolved_config(json!({ "emit": { "importExtension": "none" } }));
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = Emitter::new(&mut model).emit();
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let (files, diagnostics) = Emitter::new(&model).emit();
+        assert!(diagnostics.is_empty());
         // The cyclic `allOf` does not merge, so `UsesAlias` renders as its raw branch ref.
         assert!(
             files
@@ -5718,12 +5788,10 @@ mod tests {
 
     #[test]
     fn prewarmed_merges_match_the_fallback_path() {
-        // Differential guard for the mirrored resolve_ref/resolve_ref_ir pair: for every
-        // IR-resident allOf slice in the composition-stressor fixture, the model-lifetime
-        // prewarm path and the &self fallback path must produce the identical merge. An
-        // edit that desynchronizes the mirrors makes the cached answer win silently in
-        // production, so this asserts equivalence over real analyzer output, not one
-        // hand-picked shape.
+        // Differential guard for the cached prewarm and uncached fallback paths: for every
+        // IR-resident allOf slice in the composition-stressor fixture, both must retain the
+        // identical merge. This would catch a future prewarm-specific resolver or merger
+        // diverging from the fallback over real analyzer output, not one hand-picked shape.
         fn collect_all_of<'i>(schema: &'i SchemaNode, out: &mut Vec<&'i [SchemaNode]>) {
             match schema {
                 SchemaNode::Object {
@@ -5787,27 +5855,33 @@ mod tests {
             assert!(!sink.has_errors(), "{fixture_name}: {:#?}", sink.as_slice());
 
             let mut sink = DiagnosticSink::new();
-            let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-            let emitter = Emitter::new(&mut model);
+            let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+            let mut emitter = Emitter::new(&model);
             let mut slices = Vec::new();
             for schema in &analyzed.ir.schemas {
                 collect_all_of(&schema.schema, &mut slices);
             }
             compared += slices.len();
             for branches in slices {
-                let prewarm = emitter
-                    .merge_all_of_ir(branches)
-                    .map(|(properties, additional)| (properties, additional.clone()));
                 let fallback = emitter
                     .merge_all_of(branches)
                     .map(|(properties, additional)| (properties, additional.clone()));
+                emitter.cache_merge_all_of(branches);
+                let key = (branches.as_ptr().addr(), branches.len());
+                let prewarm = emitter
+                    .merge_cache
+                    .get(&key)
+                    .cloned()
+                    .expect("non-empty allOf slice is cached")
+                    .map(|(properties, additional)| (properties.to_vec(), additional.clone()));
                 assert_eq!(prewarm, fallback);
             }
 
             // The empty slice shares the dangling-pointer sentinel with every other empty
             // Vec, so cache_merge_all_of must refuse to key it.
+            let cached = emitter.merge_cache.len();
             emitter.cache_merge_all_of(&[]);
-            assert!(emitter.merge_cache.borrow().is_empty());
+            assert_eq!(emitter.merge_cache.len(), cached);
         }
         assert!(
             compared > 0,
@@ -5998,8 +6072,9 @@ mod tests {
             "documentation": { "summary": false, "description": true }
         }));
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = Emitter::new(&mut model).emit();
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let (files, diagnostics) = Emitter::new(&model).emit();
+        model.sink.extend(diagnostics);
         drop(model);
         assert!(sink.as_slice().is_empty());
         let rich = files
@@ -7684,35 +7759,43 @@ mod tests {
     #[test]
     fn tsdoc_writer_preserves_section_and_escape_layout() {
         let docs = TsDoc {
-            summary: Some("Summary @tag\r\nnext".to_owned()),
-            remarks: vec!["First".to_owned(), "Second\nline".to_owned()],
+            summary: Some(Cow::Owned("Summary @tag\r\nnext".to_owned())),
+            remarks: vec![
+                Cow::Owned("First".to_owned()),
+                Cow::Owned("Second\nline".to_owned()),
+            ],
             deprecated: Some("Deprecated."),
             params: vec![
-                ("arg\r\nname".to_owned(), "Description\rline".to_owned()),
+                (
+                    Cow::Owned("arg\r\nname".to_owned()),
+                    Cow::Owned("Description\rline".to_owned()),
+                ),
                 // A fenced block inside a param description takes the literal path: its lines are
                 // neutralized rather than comment-escaped, so a `*/` inside the fence cannot close
                 // the comment while the fence's own markup survives.
                 (
-                    "fenced".to_owned(),
-                    "before\n```txt\n*/ sourceMappingURL=\n```\nafter @tag".to_owned(),
+                    Cow::Owned("fenced".to_owned()),
+                    Cow::Owned("before\n```txt\n*/ sourceMappingURL=\n```\nafter @tag".to_owned()),
                 ),
             ],
             returns: Some("A value."),
-            default_value: Some("value\n@tag".to_owned()),
+            default_value: Some(Cow::Owned("value\n@tag".to_owned())),
             examples: vec![
                 DocExample {
-                    label: Some("Label @tag\r\nnext".to_owned()),
-                    value: json!("*/ sourceMappingURL="),
+                    label: Some(Cow::Owned("Label @tag\r\nnext".to_owned())),
+                    value: Cow::Owned(json!("*/ sourceMappingURL=")),
                 },
                 DocExample {
                     label: None,
-                    value: json!([1, true]),
+                    value: Cow::Owned(json!([1, true])),
                 },
             ],
-            private_remarks: Some("Private @tag\n```txt\n*/ sourceMappingURL=\n```".to_owned()),
+            private_remarks: Some(Cow::Owned(
+                "Private @tag\n```txt\n*/ sourceMappingURL=\n```".to_owned(),
+            )),
             see: vec![(
-                "u{v}|<x>\r\n*/sourceMappingURL=".to_owned(),
-                Some("L{a}\r\nB".to_owned()),
+                Cow::Owned("u{v}|<x>\r\n*/sourceMappingURL=".to_owned()),
+                Some(Cow::Owned("L{a}\r\nB".to_owned())),
             )],
         };
         let mut output = String::new();
@@ -8470,6 +8553,96 @@ mod tests {
             "{}",
             flagged.message
         );
+    }
+
+    #[test]
+    fn parallel_operation_diagnostics_keep_source_order() {
+        let media = |reference: &str| {
+            json!({
+                "application/json": {
+                    "schema": { "$ref": format!("#/components/schemas/{reference}") }
+                }
+            })
+        };
+        let operation = |stem: &str| {
+            let request = format!("{stem}Request");
+            let alias = format!("{stem}RequestBody");
+            json!({
+                "operationId": stem.to_ascii_lowercase(),
+                "requestBody": { "required": true, "content": media(&request) },
+                "responses": {
+                    "200": { "description": "ok", "content": media(&alias) }
+                }
+            })
+        };
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "parallel diagnostics", "version": "1" },
+            "paths": {
+                "/alpha": { "post": operation("Alpha") },
+                "/beta": { "post": operation("Beta") }
+            },
+            "components": {
+                "schemas": {
+                    "AlphaRequest": { "type": "string" },
+                    "AlphaRequestBody": { "type": "string" },
+                    "BetaRequest": { "type": "string" },
+                    "BetaRequestBody": { "type": "string" }
+                }
+            }
+        });
+        let temp = TempDir::new().expect("temp directory");
+        let input = temp.path().join("openapi.json");
+        let config_path = temp.path().join("oasts.json");
+        fs::write(
+            &input,
+            serde_json::to_vec(&document).expect("document JSON"),
+        )
+        .expect("write OpenAPI");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated"
+            }))
+            .expect("config JSON"),
+        )
+        .expect("write config");
+        let config = load_config(Some(&config_path), temp.path()).expect("valid config");
+        let mut preparation_sink = DiagnosticSink::new();
+        let graph = load_graph(&config, &mut preparation_sink).expect("loaded graph");
+        let ir = parse(&graph, &mut preparation_sink).expect("supported OpenAPI");
+        let analyzed = analyze(ir, &config, &mut preparation_sink);
+        assert!(preparation_sink.as_slice().is_empty());
+        let source_tuples = graph.source_tuples();
+        let expected = ["AlphaRequest", "BetaRequest"];
+
+        for thread_count in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(thread_count)
+                .build()
+                .expect("rayon pool");
+            for _ in 0..8 {
+                let mut sink = DiagnosticSink::new();
+                let files =
+                    pool.install(|| emit_types(&analyzed, &config, &source_tuples, &mut sink));
+                assert!(!files.is_empty());
+                let ordered = sink
+                    .as_slice()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == CODE_IMPORT_ALIAS)
+                    .map(|diagnostic| {
+                        expected
+                            .iter()
+                            .find(|name| diagnostic.message.contains(*name))
+                            .copied()
+                            .expect("diagnostic names its shadowed import")
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(ordered, expected, "thread count {thread_count}");
+            }
+        }
     }
 
     /// The whole point of routing declarations through `variant_name`: the module that declares the
