@@ -14,7 +14,7 @@ use crate::ir::{
     SecKind, SecurityRequirement, ServerEntry, SourceRef,
 };
 use crate::loader::append_pointer;
-use crate::media::{MediaRangeKind, is_json, is_xml, media_essence};
+use crate::media::{MediaRangeKind, is_json, media_essence};
 pub use crate::param_serialization::{HelperId, ResolvedParameterSerialization};
 use crate::param_serialization::{
     parameter_requires_caller_serialization, resolve_parameter_serialization,
@@ -24,7 +24,7 @@ pub use crate::response_media::ResponseMediaKind as DecoderClass;
 use crate::response_media::response_status_name;
 use crate::response_media::{
     ResponseMediaProjector, ResponseSchemaProjection, classify_response_media,
-    diagnose_operation_response_media,
+    diagnose_operation_response_media, xml_requires_structural_mapping,
 };
 use crate::semantic::Analyzed;
 
@@ -2179,19 +2179,6 @@ fn diagnose_request_media(
 
 fn projection_excludes_string(projection: Projection) -> bool {
     matches!(projection, Projection::Known(domain) if !domain.contains(Domain::STRING))
-}
-
-fn xml_requires_structural_mapping(
-    media: &MediaType,
-    projector: &PrimitiveDomainProjector<'_>,
-) -> bool {
-    if !is_xml(&media.essence) || !media.schema_present {
-        return false;
-    }
-    match projector.project(&media.schema) {
-        Projection::Known(domain) => !domain_is_required_with_optional_null(domain, Domain::STRING),
-        Projection::Unsupported => false,
-    }
 }
 
 fn source_diagnostic(

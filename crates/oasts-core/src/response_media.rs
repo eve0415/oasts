@@ -135,7 +135,7 @@ fn response_media_diagnostic(
     ))
 }
 
-fn xml_requires_structural_mapping(
+pub(crate) fn xml_requires_structural_mapping(
     media: &MediaType,
     projector: &impl ResponseMediaProjector,
 ) -> bool {
