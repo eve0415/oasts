@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use oasts_core::config::{ResolvedConfig, load_config};
 use oasts_core::diag::{self, Diagnostic, DiagnosticSink};
 use oasts_core::emit::GeneratedFile;
+use oasts_core::msw_peer;
 use oasts_core::pipeline;
 use oasts_core::writer::{DriftState, check_drift, write};
 use oasts_core::zod_peer;
@@ -161,6 +162,11 @@ fn generate(
     // is neither inspected nor relevant.
     if config.artifacts.zod.enabled
         && let Some(diagnostic) = zod_peer::diagnose(&config.output)
+    {
+        let _ = render_diagnostics(vec![diagnostic], stderr);
+    }
+    if config.artifacts.msw.enabled
+        && let Some(diagnostic) = msw_peer::diagnose(&config.output)
     {
         let _ = render_diagnostics(vec![diagnostic], stderr);
     }
@@ -846,8 +852,11 @@ mod tests {
         assert!(stderr.contains("OASTS0011"));
     }
 
-    /// A project with `zod` installed at `version`, emitting the artifacts named by `artifacts`.
-    fn project_with_installed_zod(artifacts: &str, version: &str) -> tempfile::TempDir {
+    fn project_with_installed_package(
+        artifacts: &str,
+        package_name: &str,
+        version: &str,
+    ) -> tempfile::TempDir {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("openapi.json"),
@@ -861,11 +870,11 @@ mod tests {
             ),
         )
         .expect("config JSON");
-        let package = temp.path().join("node_modules").join("zod");
+        let package = temp.path().join("node_modules").join(package_name);
         fs::create_dir_all(&package).expect("package directory");
         fs::write(
             package.join("package.json"),
-            format!("{{\"name\":\"zod\",\"version\":\"{version}\"}}"),
+            format!("{{\"name\":\"{package_name}\",\"version\":\"{version}\"}}"),
         )
         .expect("package manifest");
         temp
@@ -873,7 +882,7 @@ mod tests {
 
     #[test]
     fn generate_warns_when_the_installed_zod_is_out_of_range() {
-        let temp = project_with_installed_zod(r#"{"types":true,"zod":true}"#, "4.1.0");
+        let temp = project_with_installed_package(r#"{"types":true,"zod":true}"#, "zod", "4.1.0");
         let (code, _, stderr) = invoke(
             &["oasts", "generate", "--config", "oasts.json"],
             temp.path(),
@@ -885,7 +894,7 @@ mod tests {
 
     #[test]
     fn generate_stays_quiet_when_the_installed_zod_is_supported() {
-        let temp = project_with_installed_zod(r#"{"types":true,"zod":true}"#, "4.4.0");
+        let temp = project_with_installed_package(r#"{"types":true,"zod":true}"#, "zod", "4.4.0");
         let (code, _, stderr) = invoke(
             &["oasts", "generate", "--config", "oasts.json"],
             temp.path(),
@@ -896,7 +905,7 @@ mod tests {
 
     #[test]
     fn check_mode_does_not_inspect_the_installed_zod() {
-        let temp = project_with_installed_zod(r#"{"types":true,"zod":true}"#, "4.1.0");
+        let temp = project_with_installed_package(r#"{"types":true,"zod":true}"#, "zod", "4.1.0");
         assert_eq!(
             invoke(
                 &["oasts", "generate", "--config", "oasts.json"],
@@ -915,12 +924,25 @@ mod tests {
 
     #[test]
     fn a_run_without_the_zod_artifact_ignores_the_installed_zod() {
-        let temp = project_with_installed_zod(r#"{"types":true}"#, "4.1.0");
+        let temp = project_with_installed_package(r#"{"types":true}"#, "zod", "4.1.0");
         let (code, _, stderr) = invoke(
             &["oasts", "generate", "--config", "oasts.json"],
             temp.path(),
         );
         assert_eq!(code, 0);
         assert!(!stderr.contains("OASTS0241"), "{stderr}");
+    }
+
+    #[test]
+    fn generate_warns_when_the_installed_msw_is_out_of_range() {
+        let temp = project_with_installed_package(r#"{"types":true,"msw":true}"#, "msw", "3.0.0");
+        let (code, _, stderr) = invoke(
+            &["oasts", "generate", "--config", "oasts.json"],
+            temp.path(),
+        );
+
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stderr.contains("OASTS0242"), "{stderr}");
+        assert!(stderr.contains("^2.8.0"), "{stderr}");
     }
 }

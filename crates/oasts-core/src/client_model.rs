@@ -15,6 +15,17 @@ use crate::ir::{
 };
 use crate::loader::append_pointer;
 use crate::media::{MediaRangeKind, is_json, is_xml, media_essence};
+pub use crate::param_serialization::{HelperId, ResolvedParameterSerialization};
+use crate::param_serialization::{
+    parameter_requires_caller_serialization, resolve_parameter_serialization,
+};
+pub use crate::response_media::ResponseMediaKind as DecoderClass;
+#[cfg(test)]
+use crate::response_media::response_status_name;
+use crate::response_media::{
+    ResponseMediaProjector, ResponseSchemaProjection, classify_response_media,
+    diagnose_operation_response_media,
+};
 use crate::semantic::Analyzed;
 
 const CODE_OAUTH2_EMPTY_FLOWS: &str = "OASTS1435";
@@ -93,81 +104,6 @@ pub struct ParameterPlan {
     /// text/plain-over-string passthrough (the OASTS1443 case); every typed case keeps this false.
     pub caller_serialized: bool,
     pub source: SourceRef,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResolvedParameterSerialization {
-    pub location: ParamLocation,
-    pub style: ParamStyle,
-    pub explode: bool,
-    pub allow_reserved: bool,
-    pub helper: HelperId,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HelperId {
-    PathSimple,
-    PathSimpleExplode,
-    PathLabel,
-    PathLabelExplode,
-    PathMatrix,
-    PathMatrixExplode,
-    QueryForm,
-    QueryFormExplode,
-    QuerySpaceDelimited,
-    QuerySpaceDelimitedObject,
-    QueryPipeDelimited,
-    QueryPipeDelimitedObject,
-    QueryDeepObject,
-    /// Bracket encoding for a `deepObject` parameter whose schema is not object-only, dispatching
-    /// on the runtime value's shape. Reached only under `compat.deepObjectEncoding: extended`.
-    QueryDeepObjectExtended,
-    HeaderSimple,
-    HeaderSimpleExplode,
-    /// Content-sourced JSON-family parameters: `JSON.stringify` then location-appropriate encoding.
-    /// One per wire framing (path segment vs `name=value` query/cookie pair vs raw simple-header
-    /// value); style/explode/allowReserved never apply. Cookies reuse the query serializer.
-    ContentJsonPath,
-    ContentJsonQuery,
-    ContentJsonHeader,
-}
-
-impl HelperId {
-    /// Every variant, in declaration order. The client emitter reserves each helper's exported
-    /// name against component imports, and that reservation is only sound if this covers the enum;
-    /// `helper_id_all_lists_every_variant` fails to compile when a variant is added without being
-    /// listed here.
-    pub(crate) const ALL: [Self; 19] = [
-        Self::PathSimple,
-        Self::PathSimpleExplode,
-        Self::PathLabel,
-        Self::PathLabelExplode,
-        Self::PathMatrix,
-        Self::PathMatrixExplode,
-        Self::QueryForm,
-        Self::QueryFormExplode,
-        Self::QuerySpaceDelimited,
-        Self::QuerySpaceDelimitedObject,
-        Self::QueryPipeDelimited,
-        Self::QueryPipeDelimitedObject,
-        Self::QueryDeepObject,
-        Self::QueryDeepObjectExtended,
-        Self::HeaderSimple,
-        Self::HeaderSimpleExplode,
-        Self::ContentJsonPath,
-        Self::ContentJsonQuery,
-        Self::ContentJsonHeader,
-    ];
-
-    /// Whether this helper is a content-sourced JSON serializer, which the runtime feeds the raw
-    /// typed value (not a pre-validated `ParamValue`) so its descriptor entry carries `content: true`.
-    #[must_use]
-    pub(crate) fn is_content_json(self) -> bool {
-        matches!(
-            self,
-            Self::ContentJsonPath | Self::ContentJsonQuery | Self::ContentJsonHeader
-        )
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -447,21 +383,6 @@ pub struct MultipartResponsePlan {
     pub open: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DecoderClass {
-    Streaming,
-    Json,
-    Xml,
-    /// `multipart/form-data`, whose parts carry the `Content-Disposition` `name` that maps them
-    /// onto the declared object's properties (RFC 7578 §4.2).
-    Multipart,
-    /// Any other `multipart/*` media or range. Legal to declare, but no part-naming convention
-    /// exists for it, so there is nothing to map parts onto — diagnosed rather than guessed.
-    MultipartUnnamed,
-    Text,
-    Binary,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PayloadDisposition {
     NoPayload,
@@ -498,6 +419,9 @@ pub fn build_client_model(
     let deep_object = config.compat.deep_object_encoding;
     let oas_version = analyzed.ir.version;
     diagnose_security_schemes(&analyzed.ir, sink);
+    for operation in &analyzed.ir.operations {
+        diagnose_operation_response_media(operation, &projector, sink);
+    }
     let security_schemes = index_security_schemes(&analyzed.ir);
     let operations: Vec<_> = analyzed
         .ir
@@ -545,7 +469,7 @@ pub fn build_client_model(
                 .request_body
                 .as_ref()
                 .and_then(|body| build_body_plan(&body.media_types, &projector));
-            let response_table = response_table(operation, oas_version, &projector, sink);
+            let response_table = response_table(operation, oas_version, &projector);
             let accept = build_accept(operation.responses.iter().flat_map(|response| {
                 response
                     .media_types
@@ -739,159 +663,40 @@ fn is_absolute_url(value: &str) -> bool {
     url::Url::parse(value).is_ok_and(|url| !url.cannot_be_a_base())
 }
 
-/// How a parameter reaches the wire, decided by its content media type (OAS Parameter Object
-/// `content`). Non-content parameters and content parameters that serialize identically to a
-/// schema+style string both resolve to `SchemaStyle`; the class only distinguishes what the
-/// serializer and input type must do differently.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ParamContentClass {
-    /// Schema+style serialization, or a content text/plain-over-string passthrough that is
-    /// byte-for-byte identical to it: the input stays typed from the schema.
-    SchemaStyle,
-    /// Content JSON family: `JSON.stringify` then location encoding; the input stays typed.
-    ContentJson,
-    /// Content media the client cannot serialize (any non-JSON that is not a text/plain-over-string
-    /// passthrough): the caller pre-serializes to a `string`, and OASTS1443 records it.
-    CallerSerialized,
-}
-
-fn classify_param_content(
-    parameter: &crate::ir::Param,
-    projector: &PrimitiveDomainProjector<'_>,
-) -> ParamContentClass {
-    let Some(media) = parameter.content_media_type.as_deref() else {
-        return ParamContentClass::SchemaStyle;
-    };
-    if is_json(media) {
-        return ParamContentClass::ContentJson;
-    }
-    // text/plain over a string-shaped schema (nullability aside) is a bare passthrough — the value
-    // is used as-is with location encoding, exactly like a schema+style string. Every other media,
-    // and text/plain over a non-string schema, needs a caller-serialized string.
-    if media_essence(media) == "text/plain"
-        && matches!(
-            projector.project(&parameter.schema),
-            Projection::Known(domain) if domain_is_required_with_optional_null(domain, Domain::STRING)
-        )
-    {
-        return ParamContentClass::SchemaStyle;
-    }
-    ParamContentClass::CallerSerialized
-}
-
-/// The location-default serializer used when style and explode are irrelevant — the terminal arm of
-/// `helper_id`, reused for content parameters whose value is always a single string. A cookie
-/// parameter reuses the query-form serializer: its value is always `allowReserved: false` (enforced
-/// in `parameter_plan`), for which `serializeQueryForm` produces byte-identical output, and the
-/// runtime routes it into the Cookie header by the descriptor's `location`, not the helper identity.
-fn location_default_helper(location: ParamLocation) -> HelperId {
-    match location {
-        ParamLocation::Path => HelperId::PathSimple,
-        ParamLocation::Query | ParamLocation::Cookie => HelperId::QueryForm,
-        ParamLocation::Header => HelperId::HeaderSimple,
-    }
-}
-
-fn content_json_helper(location: ParamLocation) -> HelperId {
-    match location {
-        ParamLocation::Path => HelperId::ContentJsonPath,
-        // A cookie JSON value serializes identically to a query one; location drives Cookie framing.
-        ParamLocation::Query | ParamLocation::Cookie => HelperId::ContentJsonQuery,
-        ParamLocation::Header => HelperId::ContentJsonHeader,
-    }
-}
-
-fn parameter_plan(
+pub(crate) fn parameter_plan(
     parameter: &crate::ir::Param,
     projector: &PrimitiveDomainProjector<'_>,
     deep_object: DeepObjectEncoding,
 ) -> ParameterPlan {
-    // OAS 3.1 §4.8.12.2.2: the default style for `in: cookie` is `form`, matching `in: query`.
-    // Content parameters carry no style/explode (parse zeroes them), so these resolve to the
-    // location defaults and only feed the vestigial `resolved` fields; the helper is overridden
-    // below and serialization ignores style/explode/allowReserved.
-    let style = parameter.style.unwrap_or(match parameter.location {
-        ParamLocation::Query | ParamLocation::Cookie => ParamStyle::Form,
-        ParamLocation::Path | ParamLocation::Header => ParamStyle::Simple,
-    });
-    let explode = parameter
-        .explode
-        .unwrap_or(matches!(style, ParamStyle::Form | ParamStyle::DeepObject));
-    let (helper, caller_serialized) = match classify_param_content(parameter, projector) {
-        ParamContentClass::SchemaStyle => (
-            helper_id(
-                parameter.location,
-                style,
-                explode,
-                projector.project(&parameter.schema),
-                deep_object,
-            ),
-            false,
-        ),
-        ParamContentClass::ContentJson => (content_json_helper(parameter.location), false),
-        ParamContentClass::CallerSerialized => (location_default_helper(parameter.location), true),
-    };
+    let projection = projector.project(&parameter.schema);
+    let schema_is_object_only = matches!(
+        projection,
+        Projection::Known(domain)
+            if domain_is_required_with_optional_null(domain, Domain::OBJECT)
+    );
+    let schema_is_string_only = matches!(
+        projection,
+        Projection::Known(domain)
+            if domain_is_required_with_optional_null(domain, Domain::STRING)
+    );
     ParameterPlan {
         name: parameter.name.clone(),
         schema: parameter.schema.clone(),
-        resolved: ResolvedParameterSerialization {
-            location: parameter.location,
-            style,
-            explode,
-            // OAS 3.1 §4.8.12: allowReserved applies to `in: query` only. A parser that forwards it
-            // for any location would let a non-query serializer emit raw reserved characters — on the
-            // cookie path a raw ';'/'=' smuggles extra pairs into the joined Cookie header.
-            allow_reserved: parameter.location == ParamLocation::Query && parameter.allow_reserved,
-            helper,
-        },
-        caller_serialized,
+        resolved: resolve_parameter_serialization(
+            parameter,
+            schema_is_object_only,
+            schema_is_string_only,
+            deep_object,
+        ),
+        caller_serialized: parameter_requires_caller_serialization(
+            parameter,
+            schema_is_string_only,
+        ),
         source: parameter.source.clone(),
     }
 }
 
-fn helper_id(
-    location: ParamLocation,
-    style: ParamStyle,
-    explode: bool,
-    projection: Projection,
-    deep_object: DeepObjectEncoding,
-) -> HelperId {
-    match (location, style, explode) {
-        (ParamLocation::Path, ParamStyle::Simple, false) => HelperId::PathSimple,
-        (ParamLocation::Path, ParamStyle::Simple, true) => HelperId::PathSimpleExplode,
-        (ParamLocation::Path, ParamStyle::Label, false) => HelperId::PathLabel,
-        (ParamLocation::Path, ParamStyle::Label, true) => HelperId::PathLabelExplode,
-        (ParamLocation::Path, ParamStyle::Matrix, false) => HelperId::PathMatrix,
-        (ParamLocation::Path, ParamStyle::Matrix, true) => HelperId::PathMatrixExplode,
-        (ParamLocation::Query, ParamStyle::Form, false) => HelperId::QueryForm,
-        (ParamLocation::Query, ParamStyle::Form, true) => HelperId::QueryFormExplode,
-        (ParamLocation::Query, ParamStyle::SpaceDelimited, _) if matches!(projection, Projection::Known(domain) if domain_is_required_with_optional_null(domain, Domain::OBJECT)) => {
-            HelperId::QuerySpaceDelimitedObject
-        }
-        (ParamLocation::Query, ParamStyle::SpaceDelimited, _) => HelperId::QuerySpaceDelimited,
-        (ParamLocation::Query, ParamStyle::PipeDelimited, _) if matches!(projection, Projection::Known(domain) if domain_is_required_with_optional_null(domain, Domain::OBJECT)) => {
-            HelperId::QueryPipeDelimitedObject
-        }
-        (ParamLocation::Query, ParamStyle::PipeDelimited, _) => HelperId::QueryPipeDelimited,
-        // An object-only schema keeps the OpenAPI-defined serializer in both modes, so opting into
-        // `extended` never changes output for a parameter the specification already covers. Every
-        // other admitted shape — array, untyped, or a projection the domain analysis cannot pin —
-        // may hold either an object or an array at runtime, so it takes the dispatching serializer.
-        (ParamLocation::Query, ParamStyle::DeepObject, _)
-            if deep_object == DeepObjectEncoding::Strict
-                || matches!(projection, Projection::Known(domain)
-                    if domain_is_required_with_optional_null(domain, Domain::OBJECT)) =>
-        {
-            HelperId::QueryDeepObject
-        }
-        (ParamLocation::Query, ParamStyle::DeepObject, _) => HelperId::QueryDeepObjectExtended,
-        (ParamLocation::Header, ParamStyle::Simple, false) => HelperId::HeaderSimple,
-        (ParamLocation::Header, ParamStyle::Simple, true) => HelperId::HeaderSimpleExplode,
-        _ => location_default_helper(location),
-    }
-}
-
-fn build_body_plan(
+pub(crate) fn build_body_plan(
     media_types: &[MediaType],
     projector: &PrimitiveDomainProjector<'_>,
 ) -> Option<BodyPlan> {
@@ -923,9 +728,12 @@ fn build_body_plan(
 /// (JSON, urlencoded, multipart, text, binary) is an essence-level decision, so a parameterized JSON
 /// key still serializes as JSON — while the emitted `contentType` string is the canonical full media
 /// type (`media.full`), preserving any parameters onto the wire.
-fn body_plan_for_media(media: &MediaType, projector: &PrimitiveDomainProjector<'_>) -> BodyPlan {
+pub(crate) fn body_plan_for_media(
+    media: &MediaType,
+    projector: &PrimitiveDomainProjector<'_>,
+) -> BodyPlan {
     let schema = media.schema_present.then(|| media.schema.clone());
-    if is_json(&media.essence) {
+    if is_request_json(&media.essence) {
         BodyPlan::Json {
             media: media.full.clone(),
             schema,
@@ -937,13 +745,13 @@ fn body_plan_for_media(media: &MediaType, projector: &PrimitiveDomainProjector<'
             fields: form_fields(media, false, projector),
             source: media.source.clone(),
         }
-    } else if media.essence.starts_with("multipart/") {
+    } else if media.essence == "multipart/form-data" {
         BodyPlan::Multipart {
             media: media.full.clone(),
             fields: form_fields(media, true, projector),
             source: media.source.clone(),
         }
-    } else if media.essence.starts_with("text/") && !is_xml(&media.essence) {
+    } else if media.essence.starts_with("text/") {
         BodyPlan::TopLevelText {
             media: media.full.clone(),
             schema,
@@ -956,6 +764,13 @@ fn body_plan_for_media(media: &MediaType, projector: &PrimitiveDomainProjector<'
             source: media.source.clone(),
         }
     }
+}
+
+fn is_request_json(media: &str) -> bool {
+    media == "application/json"
+        || media
+            .rsplit_once('/')
+            .is_some_and(|(_, subtype)| subtype.ends_with("+json"))
 }
 
 fn form_fields(
@@ -1079,7 +894,8 @@ fn content_field_parts(
                         }
                     }
                 }
-                (canonicals, all_concrete, false, true)
+                let binary_upload = explicit_binary_upload(schema, projector, &mut HashSet::new());
+                (canonicals, all_concrete, binary_upload, true)
             }
         };
     // A binary upload is binary for every admitted media, independent of the media string, so it
@@ -1103,6 +919,38 @@ fn content_field_parts(
         },
         encoding.map(|encoding| encoding.source.clone()),
     )
+}
+
+fn explicit_binary_upload(
+    schema: &SchemaNode,
+    projector: &PrimitiveDomainProjector<'_>,
+    visited: &mut HashSet<(String, String)>,
+) -> bool {
+    let resolved = projector.resolve_schema(schema).unwrap_or(schema);
+    match resolved {
+        SchemaNode::Primitive {
+            ty: PrimitiveType::String,
+            format: Some(format),
+            ..
+        } => format == "binary",
+        SchemaNode::Array { items, .. } if enter_array_items(items, visited) => {
+            explicit_binary_upload(items, projector, visited)
+        }
+        SchemaNode::AllOf { branches, .. } => branches
+            .iter()
+            .any(|branch| explicit_binary_upload(branch, projector, visited)),
+        SchemaNode::Ref { .. }
+        | SchemaNode::Primitive { .. }
+        | SchemaNode::Finite { .. }
+        | SchemaNode::Object { .. }
+        | SchemaNode::Array { .. }
+        | SchemaNode::Tuple { .. }
+        | SchemaNode::OneOf { .. }
+        | SchemaNode::AnyOf { .. }
+        | SchemaNode::Any { .. }
+        | SchemaNode::Never { .. }
+        | SchemaNode::Unknown { .. } => false,
+    }
 }
 
 /// The `contentEncoding` in effect for a part schema, resolved through `$ref` chains and the
@@ -1153,16 +1001,14 @@ fn default_part_media_impl(
         SchemaNode::Ref { .. } => ("application/octet-stream", false),
         SchemaNode::Primitive {
             ty: PrimitiveType::String,
+            format,
+            ..
+        } if format.as_deref() == Some("binary") => ("application/octet-stream", true),
+        SchemaNode::Primitive {
+            ty: PrimitiveType::String,
             ..
         } if version == OasVersion::V3_1 && encoding.is_some() => {
             ("application/octet-stream", false)
-        }
-        SchemaNode::Primitive {
-            ty: PrimitiveType::String,
-            format,
-            ..
-        } if version == OasVersion::V3_0 && format.as_deref() == Some("binary") => {
-            ("application/octet-stream", true)
         }
         SchemaNode::Primitive {
             ty: PrimitiveType::String,
@@ -1327,7 +1173,6 @@ fn response_table(
     operation: &crate::ir::Operation,
     oas_version: OasVersion,
     projector: &PrimitiveDomainProjector<'_>,
-    sink: &mut DiagnosticSink,
 ) -> Vec<ResponsePlan> {
     let mut responses = operation.responses.iter().collect::<Vec<_>>();
     responses.sort_by(|left, right| {
@@ -1367,7 +1212,6 @@ fn response_table(
                     &response.status,
                     ResponseStatus::Exact(value) if matches!(value.as_str(), "204" | "205" | "304")
                 );
-            diagnose_response(response, static_bodyless, projector, sink);
             let payload = if media.is_empty() {
                 PayloadDisposition::NoPayload
             } else if static_bodyless {
@@ -1420,11 +1264,11 @@ fn plan_parameters(
                 ));
                 return None;
             }
-        // A content media the client cannot serialize is carried as the caller's pre-serialized
-        // string; the media type is present on this class by construction.
+            let plan = parameter_plan(parameter, projector, deep_object);
+            // A content media the client cannot serialize is carried as the caller's pre-serialized
+            // string; the media type is present on this class by construction.
             if let Some(media) = &parameter.content_media_type
-                && classify_param_content(parameter, projector)
-                    == ParamContentClass::CallerSerialized
+                && plan.caller_serialized
             {
                 sink.push(source_diagnostic(
                     CODE_CONTENT_CALLER_SERIALIZED,
@@ -1436,7 +1280,6 @@ fn plan_parameters(
                     Severity::Warning,
                 ));
             }
-            let plan = parameter_plan(parameter, projector, deep_object);
             if plan.resolved.style == ParamStyle::DeepObject && parameter.explode == Some(false) {
                 sink.push(source_diagnostic(
                     CODE_DEEP_OBJECT_FALSE_EXPLODE,
@@ -2317,7 +2160,7 @@ fn diagnose_request_media(
                 Severity::Error,
             ));
         } else if media.essence.starts_with("text/")
-            && !is_json(&media.essence)
+            && !is_request_json(&media.essence)
             && media.schema_present
             && projection_excludes_string(projector.project(&media.schema))
         {
@@ -2334,83 +2177,6 @@ fn diagnose_request_media(
     }
 }
 
-fn diagnose_response(
-    response: &crate::ir::ResponseEntry,
-    static_bodyless: bool,
-    projector: &PrimitiveDomainProjector<'_>,
-    sink: &mut DiagnosticSink,
-) {
-    for media in &response.media_types {
-        if static_bodyless {
-            sink.push(source_diagnostic(
-                "OASTS1406",
-                format!(
-                    "response key '{}' is statically bodyless but declares media '{}'",
-                    response_status_name(&response.status),
-                    media.essence
-                ),
-                &media.source,
-                Severity::Warning,
-            ));
-            continue;
-        }
-        match classify_response_media(media, projector) {
-            DecoderClass::Streaming => sink.push(source_diagnostic(
-                "OASTS1402",
-                format!(
-                    "response media '{}' requires streaming support, which is not yet available",
-                    media.essence
-                ),
-                &media.source,
-                Severity::Error,
-            )),
-            DecoderClass::Xml => sink.push(source_diagnostic(
-                "OASTS1403",
-                format!(
-                    "response media '{}' is XML, which Oasts does not support",
-                    media.essence
-                ),
-                &media.source,
-                Severity::Error,
-            )),
-            DecoderClass::MultipartUnnamed => sink.push(source_diagnostic(
-                "OASTS1404",
-                format!(
-                    "multipart response media '{}' has no part-to-property mapping; only multipart/form-data names its parts (RFC 7578 §4.2 Content-Disposition), so nothing decides which declared property a part belongs to",
-                    media.essence
-                ),
-                &media.source,
-                Severity::Error,
-            )),
-            DecoderClass::Text
-                if media.schema_present
-                    && projection_excludes_string(projector.project(&media.schema)) =>
-            {
-                sink.push(source_diagnostic(
-                    "OASTS1405",
-                    format!(
-                        "text response media '{}' requires a schema whose primitive projection contains string",
-                        media.essence
-                    ),
-                    &media.source,
-                    Severity::Error,
-                ));
-            }
-            DecoderClass::Json
-            | DecoderClass::Multipart
-            | DecoderClass::Text
-            | DecoderClass::Binary => {}
-        }
-    }
-}
-
-fn response_status_name(status: &ResponseStatus) -> &str {
-    match status {
-        ResponseStatus::Exact(value) | ResponseStatus::Range(value) => value,
-        ResponseStatus::Default => "default",
-    }
-}
-
 fn projection_excludes_string(projection: Projection) -> bool {
     matches!(projection, Projection::Known(domain) if !domain.contains(Domain::STRING))
 }
@@ -2419,16 +2185,11 @@ fn xml_requires_structural_mapping(
     media: &MediaType,
     projector: &PrimitiveDomainProjector<'_>,
 ) -> bool {
-    if !is_xml(&media.essence) {
-        return false;
-    }
-    if !media.schema_present {
+    if !is_xml(&media.essence) || !media.schema_present {
         return false;
     }
     match projector.project(&media.schema) {
         Projection::Known(domain) => !domain_is_required_with_optional_null(domain, Domain::STRING),
-        // The schema diagnostic owns an unsupported projection; do not add an unproven structural
-        // XML claim to it.
         Projection::Unsupported => false,
     }
 }
@@ -2460,31 +2221,6 @@ fn response_sort_key(status: &ResponseStatus) -> (u8, u16) {
                 .map_or(u16::MAX, |digit| u16::from(*digit)),
         ),
         ResponseStatus::Default => (2, 0),
-    }
-}
-
-fn classify_response_media(
-    media: &MediaType,
-    projector: &PrimitiveDomainProjector<'_>,
-) -> DecoderClass {
-    if media.streaming_marked || media.essence == "text/event-stream" {
-        DecoderClass::Streaming
-    } else if is_json(&media.essence) {
-        DecoderClass::Json
-    } else if xml_requires_structural_mapping(media, projector) {
-        DecoderClass::Xml
-    } else if is_xml(&media.essence) {
-        DecoderClass::Binary
-    } else if media.essence == "multipart/form-data" {
-        DecoderClass::Multipart
-    } else if media.essence.starts_with("multipart/") {
-        DecoderClass::MultipartUnnamed
-    } else if media.essence == "application/x-www-form-urlencoded"
-        || media.essence.starts_with("text/")
-    {
-        DecoderClass::Text
-    } else {
-        DecoderClass::Binary
     }
 }
 
@@ -2582,14 +2318,31 @@ enum Projection {
     Unsupported,
 }
 
-struct PrimitiveDomainProjector<'ir> {
+pub(crate) struct PrimitiveDomainProjector<'ir> {
     schemas: &'ir [crate::ir::NamedSchema],
     indices: HashMap<(&'ir str, &'ir str), usize>,
     domains: Vec<Projection>,
 }
 
+impl ResponseMediaProjector for PrimitiveDomainProjector<'_> {
+    fn response_schema_projection(&self, schema: &SchemaNode) -> ResponseSchemaProjection {
+        match self.project(schema) {
+            Projection::Known(domain)
+                if domain_is_required_with_optional_null(domain, Domain::STRING) =>
+            {
+                ResponseSchemaProjection::StringWithOptionalNull
+            }
+            Projection::Known(domain) if domain.contains(Domain::STRING) => {
+                ResponseSchemaProjection::IncludesString
+            }
+            Projection::Known(_) => ResponseSchemaProjection::ExcludesString,
+            Projection::Unsupported => ResponseSchemaProjection::Unsupported,
+        }
+    }
+}
+
 impl<'ir> PrimitiveDomainProjector<'ir> {
-    fn new(ir: &'ir Ir) -> Self {
+    pub(crate) fn new(ir: &'ir Ir) -> Self {
         let schemas = ir.schemas.as_slice();
         if schemas.is_empty() {
             return Self {
@@ -2672,7 +2425,15 @@ impl<'ir> PrimitiveDomainProjector<'ir> {
         project_schema(schema, &self.indices, &self.domains)
     }
 
-    fn resolve_schema<'schema>(
+    pub(crate) fn admits_collection(&self, schema: &SchemaNode) -> bool {
+        matches!(
+            self.project(schema),
+            Projection::Known(domain)
+                if domain.contains(Domain::ARRAY) || domain.contains(Domain::OBJECT)
+        )
+    }
+
+    pub(crate) fn resolve_schema<'schema>(
         &'schema self,
         schema: &'schema SchemaNode,
     ) -> Option<&'schema SchemaNode>
@@ -3808,11 +3569,15 @@ mod tests {
                                             "object": { "type": "object" },
                                             "objects": { "type": "array", "items": { "type": "object" } },
                                             "primitive": { "type": "boolean" },
-                                            "styled": { "type": "string" }
+                                            "styled": { "type": "string" },
+                                            "binary": { "type": "string", "format": "binary" },
+                                            "binaryAllOf": { "allOf": [{ "type": "string", "format": "binary" }] }
                                         }
                                     },
                                     "encoding": {
-                                        "styled": { "style": "form" }
+                                        "styled": { "style": "form" },
+                                        "binary": { "contentType": "application/octet-stream" },
+                                        "binaryAllOf": { "contentType": "application/octet-stream" }
                                     }
                                 }
                             }
@@ -3860,6 +3625,8 @@ mod tests {
                 ("application/json", false, PayloadKind::Json),
                 ("application/json", false, PayloadKind::Json),
                 ("text/plain", false, PayloadKind::Text),
+                ("application/octet-stream", true, PayloadKind::Binary),
+                ("application/octet-stream", true, PayloadKind::Binary),
             ]
         );
 
@@ -4324,140 +4091,7 @@ mod tests {
     }
 
     #[test]
-    fn delimited_query_helpers_follow_the_projected_domain() {
-        for (style, projection, expected) in [
-            (
-                ParamStyle::SpaceDelimited,
-                Projection::Known(Domain::OBJECT),
-                HelperId::QuerySpaceDelimitedObject,
-            ),
-            (
-                ParamStyle::SpaceDelimited,
-                Projection::Known(Domain::ARRAY),
-                HelperId::QuerySpaceDelimited,
-            ),
-            (
-                ParamStyle::SpaceDelimited,
-                Projection::Unsupported,
-                HelperId::QuerySpaceDelimited,
-            ),
-            (
-                ParamStyle::PipeDelimited,
-                Projection::Known(Domain::OBJECT),
-                HelperId::QueryPipeDelimitedObject,
-            ),
-            (
-                ParamStyle::PipeDelimited,
-                Projection::Known(Domain::ARRAY),
-                HelperId::QueryPipeDelimited,
-            ),
-            (
-                ParamStyle::PipeDelimited,
-                Projection::Unsupported,
-                HelperId::QueryPipeDelimited,
-            ),
-        ] {
-            assert_eq!(
-                helper_id(
-                    ParamLocation::Query,
-                    style,
-                    false,
-                    projection,
-                    DeepObjectEncoding::Strict,
-                ),
-                expected
-            );
-        }
-    }
-
-    #[test]
     fn client_model_helper_edges_are_total() {
-        for (location, style, explode, expected) in [
-            (
-                ParamLocation::Path,
-                ParamStyle::Simple,
-                false,
-                HelperId::PathSimple,
-            ),
-            (
-                ParamLocation::Path,
-                ParamStyle::Simple,
-                true,
-                HelperId::PathSimpleExplode,
-            ),
-            (
-                ParamLocation::Path,
-                ParamStyle::Label,
-                false,
-                HelperId::PathLabel,
-            ),
-            (
-                ParamLocation::Path,
-                ParamStyle::Matrix,
-                false,
-                HelperId::PathMatrix,
-            ),
-            (
-                ParamLocation::Path,
-                ParamStyle::Matrix,
-                true,
-                HelperId::PathMatrixExplode,
-            ),
-            (
-                ParamLocation::Query,
-                ParamStyle::Form,
-                false,
-                HelperId::QueryForm,
-            ),
-            (
-                ParamLocation::Header,
-                ParamStyle::Simple,
-                true,
-                HelperId::HeaderSimpleExplode,
-            ),
-            (
-                ParamLocation::Path,
-                ParamStyle::Form,
-                false,
-                HelperId::PathSimple,
-            ),
-            (
-                ParamLocation::Query,
-                ParamStyle::Simple,
-                false,
-                HelperId::QueryForm,
-            ),
-            (
-                ParamLocation::Header,
-                ParamStyle::Form,
-                false,
-                HelperId::HeaderSimple,
-            ),
-            (
-                ParamLocation::Cookie,
-                ParamStyle::Form,
-                false,
-                HelperId::QueryForm,
-            ),
-            (
-                ParamLocation::Cookie,
-                ParamStyle::Simple,
-                false,
-                HelperId::QueryForm,
-            ),
-        ] {
-            assert_eq!(
-                helper_id(
-                    location,
-                    style,
-                    explode,
-                    Projection::Unsupported,
-                    DeepObjectEncoding::Strict,
-                ),
-                expected
-            );
-        }
-
         let empty_ir = Ir::default();
         let projector = PrimitiveDomainProjector::new(&empty_ir);
         assert!(build_body_plan(&[], &projector).is_none());
@@ -5240,7 +4874,7 @@ mod tests {
     }
 
     #[test]
-    fn schemaless_xml_requests_and_responses_are_opaque_binary() {
+    fn text_xml_requests_are_text_while_xml_responses_stay_binary() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -5311,10 +4945,12 @@ mod tests {
             .as_ref()
             .and_then(BodyPlan::discriminated_arms)
             .expect("discriminated opaque body");
-        assert!(
-            arms.iter()
-                .all(|(_, plan)| matches!(plan, BodyPlan::TopLevelBinary { .. }))
-        );
+        assert!(arms.iter().any(|(media, plan)| {
+            media == "text/xml" && matches!(plan, BodyPlan::TopLevelText { .. })
+        }));
+        assert!(arms.iter().all(|(media, plan)| {
+            media == "text/xml" || matches!(plan, BodyPlan::TopLevelBinary { .. })
+        }));
         assert!(
             opaque.response_table[0]
                 .media
@@ -5334,14 +4970,14 @@ mod tests {
                     == Some("stringXml")
             })
             .expect("string operation");
-        let expected_binary_variant = BodyPlan::TopLevelBinary {
+        let expected_text_variant = BodyPlan::TopLevelText {
             media: String::new(),
             schema: None,
             source: test_meta("/expected-binary").source,
         };
         assert_eq!(
             std::mem::discriminant(string.body_plan.as_ref().expect("string request body")),
-            std::mem::discriminant(&expected_binary_variant)
+            std::mem::discriminant(&expected_text_variant)
         );
         assert_eq!(
             string.response_table[0].media[0].decoder,
@@ -5380,6 +5016,12 @@ mod tests {
                                 "content": {
                                     "text/xml": { "schema": { "type": "object" } }
                                 }
+                            },
+                            "203": {
+                                "description": "mixed xml",
+                                "content": {
+                                    "text/xml": { "schema": { "anyOf": [{ "type": "string" }, { "type": "object" }] } }
+                                }
                             }
                         }
                     }
@@ -5393,7 +5035,7 @@ mod tests {
                 .iter()
                 .filter(|diagnostic| diagnostic.code == "OASTS1403")
                 .count(),
-            3
+            4
         );
     }
 
@@ -5446,7 +5088,7 @@ mod tests {
     }
 
     #[test]
-    fn text_json_uses_json_request_and_response_plans_with_declared_headers() {
+    fn text_json_uses_text_requests_and_keeps_json_response_classification() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -5456,10 +5098,7 @@ mod tests {
                         "requestBody": {
                             "content": {
                                 "text/json": {
-                                    "schema": {
-                                        "type": "object",
-                                        "properties": { "message": { "type": "string" } }
-                                    }
+                                    "schema": { "type": "string" }
                                 }
                             }
                         },
@@ -5491,7 +5130,7 @@ mod tests {
         let operation = &model.operations[0];
         assert!(matches!(
             operation.body_plan,
-            Some(BodyPlan::Json { ref media, .. }) if media == "text/json"
+            Some(BodyPlan::TopLevelText { ref media, .. }) if media == "text/json"
         ));
         assert_eq!(operation.accept.as_deref(), Some("text/json"));
         assert_eq!(operation.response_table[0].media[0].media, "text/json");
@@ -8355,37 +7994,6 @@ mod tests {
                 .filter(|diagnostic| diagnostic.code == CODE_NON_OAUTH_REQUIREMENT_SCOPES)
                 .count();
             assert_eq!(hits, expected, "version {version}: {diagnostics:#?}");
-        }
-    }
-
-    /// `HelperId::ALL` feeds the client emitter's reserved-name set, so a variant missing from it
-    /// would leave that helper's exported name shadowable by a component import. The match below
-    /// is exhaustive: adding a variant stops this compiling until `ALL` is extended too.
-    #[test]
-    fn helper_id_all_lists_every_variant() {
-        for helper in HelperId::ALL {
-            let position = match helper {
-                HelperId::PathSimple => 0,
-                HelperId::PathSimpleExplode => 1,
-                HelperId::PathLabel => 2,
-                HelperId::PathLabelExplode => 3,
-                HelperId::PathMatrix => 4,
-                HelperId::PathMatrixExplode => 5,
-                HelperId::QueryForm => 6,
-                HelperId::QueryFormExplode => 7,
-                HelperId::QuerySpaceDelimited => 8,
-                HelperId::QuerySpaceDelimitedObject => 9,
-                HelperId::QueryPipeDelimited => 10,
-                HelperId::QueryPipeDelimitedObject => 11,
-                HelperId::QueryDeepObject => 12,
-                HelperId::QueryDeepObjectExtended => 13,
-                HelperId::HeaderSimple => 14,
-                HelperId::HeaderSimpleExplode => 15,
-                HelperId::ContentJsonPath => 16,
-                HelperId::ContentJsonQuery => 17,
-                HelperId::ContentJsonHeader => 18,
-            };
-            assert_eq!(HelperId::ALL[position], helper);
         }
     }
 }

@@ -80,6 +80,14 @@ fixtures:
       path: openapi.json
       url: "https://raw.githubusercontent.com/kubernetes/kubernetes/v1.36.2/api/openapi-spec/v3/apis__apiextensions.k8s.io__v1_openapi.json"
       sha256: "1c7dd621bece6661867bcc29471f774a46b36c02567d59815c7c72f6d08aa512"
+  - name: github-3.0-msw
+    class: large
+    dir: github-3.0
+    config: oasts-msw.yaml
+    spec:
+      path: openapi.json
+      url: "https://raw.githubusercontent.com/github/rest-api-description/v2.1.0/descriptions/api.github.com/api.github.com.json"
+      sha256: "b138e9cdcf4ac29a23fea1f6579d2840668a5f3d41fe7f160b263bec590d2e3f"
   - name: github-3.0-zod
     class: large
     dir: github-3.0
@@ -91,6 +99,11 @@ fixtures:
   - name: petstore-3.0
     class: small
     config: oasts.yaml
+    committed: true
+  - name: petstore-3.0-msw
+    class: small
+    dir: petstore-3.0
+    config: oasts-msw.yaml
     committed: true
   - name: petstore-3.0-zod
     class: small

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use napi_derive::napi;
 use oasts_core::config::{self, ResolvedConfig};
 use oasts_core::diag::{Diagnostic, DiagnosticSink, Severity};
+use oasts_core::msw_peer;
 use oasts_core::pipeline;
 use oasts_core::writer::{DriftState, check_drift, write};
 use oasts_core::zod_peer;
@@ -232,6 +233,14 @@ pub fn run(options: RunOptions) -> RunResult {
     // is neither inspected nor relevant.
     if config.artifacts.zod.enabled
         && let Some(diagnostic) = zod_peer::diagnose(&config.output)
+    {
+        rendered_warnings.push_str(&oasts_core::diag::render_to_string(vec![
+            diagnostic.clone(),
+        ]));
+        diagnostics_js.push(to_diagnostic_js(&diagnostic));
+    }
+    if config.artifacts.msw.enabled
+        && let Some(diagnostic) = msw_peer::diagnose(&config.output)
     {
         rendered_warnings.push_str(&oasts_core::diag::render_to_string(vec![
             diagnostic.clone(),

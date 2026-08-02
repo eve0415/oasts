@@ -14,10 +14,10 @@
 //! silent when no `node_modules/zod` is reachable at all: generating before install and resolving
 //! through Yarn PnP are both legitimate, and a check that fires spuriously in CI is worse than none.
 
-use std::fs;
 use std::path::Path;
 
 use crate::diag::{Diagnostic, Severity};
+use crate::peer::{installed_version, major_minor};
 
 const CODE_ZOD_PEER: &str = "OASTS0241";
 
@@ -39,7 +39,7 @@ fn supported_range() -> String {
 /// generating into a sibling package must be judged against that package's `node_modules`.
 #[must_use]
 pub fn diagnose(output: &Path) -> Option<Diagnostic> {
-    let installed = installed_version(output)?;
+    let installed = installed_version(output, "zod")?;
     let (major, minor) = major_minor(&installed.version)?;
     if major == SUPPORTED_MAJOR && minor >= MINIMUM_MINOR {
         return None;
@@ -59,49 +59,12 @@ pub fn diagnose(output: &Path) -> Option<Diagnostic> {
     Some(diagnostic)
 }
 
-/// The `zod` package manifest nearest to the emitted files, and the version it declares.
-struct InstalledZod {
-    version: String,
-    manifest: String,
-}
-
-/// Walks up from the emitted-file root for the `node_modules/zod` that Node would resolve.
-///
-/// `read_to_string` follows symlinks, which is what pnpm's layout needs: `node_modules/zod` there
-/// is a link into the content-addressed store rather than a real directory.
-fn installed_version(output: &Path) -> Option<InstalledZod> {
-    for ancestor in output.ancestors() {
-        let manifest = ancestor
-            .join("node_modules")
-            .join("zod")
-            .join("package.json");
-        let Ok(text) = fs::read_to_string(&manifest) else {
-            continue;
-        };
-        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok()?;
-        let version = parsed.get("version")?.as_str()?.to_owned();
-        return Some(InstalledZod {
-            version,
-            manifest: manifest.display().to_string(),
-        });
-    }
-    None
-}
-
-/// Reads the major and minor of a semantic version, discarding any prerelease or build metadata.
-fn major_minor(version: &str) -> Option<(u64, u64)> {
-    let core = version.split(['-', '+']).next()?;
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    Some((major, minor))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::fs;
+    use std::path::Path;
 
     fn install_zod(root: &Path, version: &str) {
         let package = root.join("node_modules").join("zod");

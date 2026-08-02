@@ -1,0 +1,25 @@
+# SHA-256 manifest of the MSW-artifact frozen entry-gate files; scripts/msw-gate.sh verifies it.
+# These files were authored from the pinned handler contract before any implementation existed and
+# are never edited afterward — the implementation is written to satisfy them.
+#
+# What each one pins:
+#
+#   - the showcase document and its config: the request/response surface the handler factories are
+#     written against, so the emitter cannot be tuned to a document that grew to fit it;
+#   - the compile-assert cases: the generated API itself — module paths, factory names, the shape of
+#     the resolver argument, and the `respond` correlation between match, status, contentType and
+#     body. It also carries the no-payload guard pairs, which is why verify-ts.sh typechecks this
+#     file twice, once with exactOptionalPropertyTypes off and once on: an optional `never` still
+#     admits `undefined` when that flag is off, so a guard resting on `?: never` would pass one run
+#     and fail the other, and freezing only one run would hide it;
+#   - the handler-error vectors: the malformed-input error's declaration and the construction cases
+#     covering every code plus both the null and non-null application-path forms.
+files:
+  - path: fixtures/msw-showcase-3.1/openapi.yaml
+    sha256: 734acf9537d9ae30000b8fe5fa2bceef1082142f81c3e36041dcb6b93dc632f0
+  - path: fixtures/msw-showcase-3.1/oasts-msw.yaml
+    sha256: 531f7e4fff71fdb32dc85d2a174ae798e809808df6ba5512f01dbdf09ab3633e
+  - path: fixtures/msw-showcase-3.1/compile-assert/cases.ts
+    sha256: 96a17c1b383b5aaa8c70251ae041f4a53c76ca807f09244b7de0412e08b86ac7
+  - path: crates/oasts-core/runtime/test-conformance/vectors-msw-handler-error.ts
+    sha256: 316fa66e163fd3549494b344c8f79965372d470239f25d3229d7ec695e8ef96a

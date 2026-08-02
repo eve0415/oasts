@@ -30,8 +30,8 @@ Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtim
 | Typed fetch client | ✅ |
 | Zod schemas | ✅ — needs `zod` ^4.4.0 in your project; `zod/mini` supported |
 | Standalone validators | ✅ |
+| MSW handlers | ✅ — needs `msw` ^2.8.0 in your project |
 | TanStack Query hooks | Planned |
-| MSW handlers | Planned |
 
 ## Quick start
 
@@ -105,6 +105,88 @@ In CI, fail on drift instead of writing files:
 ```sh
 pnpm exec oasts generate --check
 ```
+
+## MSW handlers
+
+Enable the artifact and every operation gets a typed handler factory next to your types. Handlers
+mock the server side, so they import your generated types and a small local helper — never the
+client, its transport, or a validation engine.
+
+```yaml
+artifacts:
+  types: true
+  msw: true
+```
+
+```ts
+import { setupServer } from "msw/node";
+import { getPetHandler } from "./generated/msw/handlers/getpet.js";
+
+const server = setupServer(
+  getPetHandler(({ params, respond }) =>
+    respond({
+      match: 200,
+      status: 200,
+      contentType: "application/json",
+      body: { id: params.petId, name: "Bella" },
+    })),
+);
+```
+
+`respond` is the whole surface, and it is checked against the document: `match` picks a declared
+response key, and `status`, `contentType` and `body` have to agree with what that key declares.
+Responding `404` from an operation that documents no `4XX`, or handing a `text/plain` arm a JSON
+object, is a compile error rather than a mock that quietly lies. A response the document declares
+with no content takes `respond({ match, status })` and nothing else — passing even
+`body: undefined` is rejected, under `exactOptionalPropertyTypes` either way.
+
+Request values arrive **decoded**, not as the raw strings MSW hands a hand-written handler. A path
+parameter documented as an integer is a `number`; an array query parameter is an array, whichever
+`style`/`explode` the document declares. That is the same serialization matrix the client encodes
+with, run backwards.
+
+**oasts emits no mock data.** There is no faker, no seeded generator, and no placeholder body — you
+write the data, or you do not get one. That is a deliberate trade: every generator that synthesizes
+bodies does it through faker, where recursive schemas overflow the stack and seeding still does not
+make values stable across a faker upgrade. A typed slot you fill is worth more than a plausible
+body nobody reviewed.
+
+Everything you already know about MSW keeps working. Returning nothing falls through to the next
+handler, `passthrough()` performs the request for real, and a generator resolver answers a
+different branch per call:
+
+```ts
+server.use(
+  getPetHandler(function* ({ respond }) {
+    yield respond({ match: 200, status: 200, contentType: "application/json", body: pet });
+    yield respond({ match: "4XX", status: 404, contentType: "application/json", body: notFound });
+  }),
+);
+```
+
+Two things worth knowing:
+
+- **Origin is enforced.** The matcher is built from the operation's server URL, so two APIs mocked
+  in one suite never answer for each other. Pass `{ baseUrl }` to point a handler somewhere else.
+- **MSW resolves first match wins**, and a parameterized path shadows a static sibling — put
+  `/pets/mine` ahead of `/pets/{petId}` in your handler array. Registering a handler through
+  `server.use()` in a test always wins, because MSW prepends it.
+
+If you would rather write handlers by hand, the artifact also emits a `paths` type that
+[openapi-msw](https://github.com/christoph-fricke/openapi-msw) accepts, so both styles work against
+the same generated output:
+
+```ts
+import { createOpenApiHttp } from "openapi-msw";
+import type { paths } from "./generated/msw/paths.js";
+
+const http = createOpenApiHttp<paths>();
+const handler = http.get("/pets/{petId}", ({ response }) => response("200").json(pet));
+```
+
+Paths that MSW's matcher cannot express are refused at generation time rather than emitted as a
+handler that silently never matches — the failure mode that otherwise surfaces as an unrelated
+test's unhandled-request warning.
 
 ## Comparison
 
@@ -189,7 +271,7 @@ pnpm -C packages/oasts build            # bundle the npm package
 - Typed auth providers with runtime enforcement
 - Streaming request/response bodies
 - Transform layer (e.g. `date-time` → `Date`)
-- TanStack Query hooks and MSW handlers
+- TanStack Query hooks
 
 ## License
 

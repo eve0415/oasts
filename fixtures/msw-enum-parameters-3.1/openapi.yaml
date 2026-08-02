@@ -1,0 +1,74 @@
+openapi: 3.1.0
+info:
+  title: MSW enum parameters
+  version: 1.0.0
+servers:
+  - url: https://api.test
+paths:
+  /messages/search:
+    get:
+      operationId: searchMessages
+      parameters:
+        - name: sort_by
+          in: query
+          schema:
+            $ref: "#/components/schemas/SortingMode"
+        - name: author_type
+          in: query
+          schema:
+            type: array
+            items:
+              $ref: "#/components/schemas/AuthorType"
+        - name: has
+          in: query
+          schema:
+            type: array
+            items:
+              $ref: "#/components/schemas/HasOption"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            enum: [10, 25]
+        - name: state
+          in: query
+          schema:
+            type: [string, "null"]
+            enum: [active, null]
+        - name: ratio
+          in: query
+          schema:
+            type: number
+            enum: [0.5, 1]
+        - name: enabled
+          in: query
+          schema:
+            type: boolean
+            enum: [true]
+        - name: empty
+          in: query
+          schema:
+            type: "null"
+            enum: [null]
+      responses:
+        "204":
+          description: Search completed.
+components:
+  schemas:
+    SortingMode:
+      type: string
+      oneOf:
+        - const: relevance
+        - const: timestamp
+    AuthorType:
+      type: string
+      oneOf:
+        - const: user
+        - const: bot
+        - const: webhook
+    HasOption:
+      type: string
+      oneOf:
+        - const: link
+        - const: embed
+        - const: file

@@ -15,7 +15,6 @@ import type {
   SendTextJsonInput,
   SendTextJsonResult,
 } from "../generated/client/operations/sendtextjson.js";
-import type { TextJsonRequest } from "../generated/types/components/textjsonrequest.js";
 import type { TextJsonResponse } from "../generated/types/components/textjsonresponse.js";
 
 type Equal<A, B> =
@@ -28,7 +27,7 @@ type AssertApplicationXmlRequestIsOpaque = Expect<
 type AssertApplicationXmlResponseIsOpaque = Expect<
   Equal<Extract<RoundTripApplicationXmlResult, { outcome: 200 }>["data"], unknown>
 >;
-type AssertTextXmlRequestIsOpaque = Expect<Equal<RoundTripTextXmlInput["body"], Uint8Array>>;
+type AssertTextXmlRequestIsText = Expect<Equal<RoundTripTextXmlInput["body"], string>>;
 type AssertTextXmlResponseIsOpaque = Expect<
   Equal<Extract<RoundTripTextXmlResult, { outcome: 200 }>["data"], unknown>
 >;
@@ -36,7 +35,7 @@ type AssertSvgRequestIsOpaque = Expect<Equal<RoundTripSvgInput["body"], Uint8Arr
 type AssertSvgResponseIsOpaque = Expect<
   Equal<Extract<RoundTripSvgResult, { outcome: 200 }>["data"], unknown>
 >;
-type AssertTextJsonRequestKeepsSchema = Expect<Equal<SendTextJsonInput["body"], TextJsonRequest>>;
+type AssertTextJsonRequestIsText = Expect<Equal<SendTextJsonInput["body"], string>>;
 type AssertTextJsonResponseKeepsSchema = Expect<
   Equal<Extract<SendTextJsonResult, { outcome: 202 }>["data"], TextJsonResponse>
 >;
@@ -45,11 +44,11 @@ type AssertPlainTextRequestStaysString = Expect<Equal<SendPlainTextInput["body"]
 export type {
   AssertApplicationXmlRequestIsOpaque,
   AssertApplicationXmlResponseIsOpaque,
-  AssertTextXmlRequestIsOpaque,
+  AssertTextXmlRequestIsText,
   AssertTextXmlResponseIsOpaque,
   AssertSvgRequestIsOpaque,
   AssertSvgResponseIsOpaque,
-  AssertTextJsonRequestKeepsSchema,
+  AssertTextJsonRequestIsText,
   AssertTextJsonResponseKeepsSchema,
   AssertPlainTextRequestStaysString,
 };

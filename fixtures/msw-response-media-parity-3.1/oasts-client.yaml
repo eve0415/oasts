@@ -1,0 +1,12 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-client
+artifacts:
+  types: true
+  client: true
+client:
+  authEnforcement: types
+validation:
+  engine: off
+  unchecked: allow

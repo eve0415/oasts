@@ -175,6 +175,31 @@ keys:
         allocBytes: 30838
     informational:
       peakBytes: 93424
+  - fixture: "petstore-3.0-msw"
+    config: "oasts-msw.yaml"
+    stages:
+      - stage: "loadGraph"
+        allocs: 1316
+        reallocs: 87
+        deallocs: 998
+        allocBytes: 139839
+      - stage: "parse"
+        allocs: 352
+        reallocs: 45
+        deallocs: 158
+        allocBytes: 73732
+      - stage: "analyze"
+        allocs: 53
+        reallocs: 4
+        deallocs: 30
+        allocBytes: 2788
+      - stage: "emit"
+        allocs: 1261
+        reallocs: 242
+        deallocs: 1234
+        allocBytes: 241451
+    informational:
+      peakBytes: 169063
   - fixture: "petstore-3.0-zod"
     config: "oasts-zod.yaml"
     stages:

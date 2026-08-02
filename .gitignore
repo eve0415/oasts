@@ -28,6 +28,7 @@ fixtures/*/generated/
 fixtures/*/generated-client/
 fixtures/*/generated-validators/
 fixtures/*/generated-zod*/
+fixtures/*/generated-msw*/
 
 # Node
 node_modules/

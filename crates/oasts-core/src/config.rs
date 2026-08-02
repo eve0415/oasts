@@ -30,6 +30,7 @@ const CODE_ARTIFACT_DIRECTORY: &str = "OASTS0102";
 const CODE_DISABLED_ARTIFACT_OPTIONS: &str = "OASTS0103";
 const CODE_UNSUPPORTED_ARTIFACT: &str = "OASTS0111";
 const CODE_CLIENT_REQUIRES_TYPES: &str = "OASTS0112";
+const CODE_MSW_REQUIRES_TYPES: &str = "OASTS0113";
 const CODE_DISABLED_OPTIONS: &str = "OASTS0121";
 const CODE_DATE_REPRESENTATION: &str = "OASTS0131";
 const CODE_DATE_TRANSFORM_UNSUPPORTED: &str = "OASTS0132";
@@ -1738,7 +1739,7 @@ fn resolve_artifacts(
         ("zod", &states.zod, true),
         ("validators", &states.validators, true),
         ("tanstack", &states.tanstack, false),
-        ("msw", &states.msw, false),
+        ("msw", &states.msw, true),
     ];
     if !artifacts.iter().any(|(_, state, _)| state.enabled) {
         sink.push(config_error(
@@ -1757,6 +1758,17 @@ fn resolve_artifacts(
                 Some("/artifacts"),
             ));
         }
+    }
+    // Handlers import the generated request and response types, so the types artifact is a real
+    // prerequisite rather than a convention. It is stated here and never inferred: enabling msw
+    // does not silently switch types on.
+    if states.msw.enabled && !states.types.enabled {
+        sink.push(config_error(
+            CODE_MSW_REQUIRES_TYPES,
+            "the msw artifact requires the types artifact to be enabled",
+            Some(source),
+            Some("/artifacts/msw"),
+        ));
     }
     states
 }
@@ -2753,15 +2765,36 @@ mod tests {
 
     #[test]
     fn unavailable_framework_artifacts_report_named_unsupported_error() {
-        for artifact in ["tanstack", "msw"] {
-            let mut value = valid_json_value();
-            value["artifacts"] = json!({ (artifact): true });
-            let diagnostics = assert_code(load_json(&value), CODE_UNSUPPORTED_ARTIFACT);
-            assert!(diagnostics.iter().any(|diagnostic| {
-                diagnostic.code == CODE_UNSUPPORTED_ARTIFACT
-                    && diagnostic.message.contains(artifact)
-            }));
-        }
+        // tanstack is the only artifact still without an emitter.
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "tanstack": true });
+        let diagnostics = assert_code(load_json(&value), CODE_UNSUPPORTED_ARTIFACT);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CODE_UNSUPPORTED_ARTIFACT && diagnostic.message.contains("tanstack")
+        }));
+    }
+
+    #[test]
+    fn msw_artifact_resolves_alongside_types() {
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "types": true, "msw": true });
+        let resolved = load_json(&value).expect("types + msw config should resolve");
+        assert!(resolved.artifacts.msw.enabled);
+        assert_eq!(
+            resolved.artifacts.msw.directory,
+            resolved.output.join("msw")
+        );
+    }
+
+    #[test]
+    fn msw_artifact_requires_types() {
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "types": false, "msw": true });
+        let diagnostics = assert_code(load_json(&value), CODE_MSW_REQUIRES_TYPES);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CODE_MSW_REQUIRES_TYPES
+                && diagnostic.json_pointer.as_deref() == Some("/artifacts/msw")
+        }));
     }
 
     #[test]

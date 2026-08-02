@@ -63,7 +63,7 @@ after(async () => {
   await rm(temporaryRoot, { recursive: true, force: true });
 });
 
-test("text/json sends declared headers and serializes and decodes JSON", async () => {
+test("text/json sends a text request and decodes a JSON response", async () => {
   scriptRoute("POST", "/json", {
     status: 202,
     headers: [["Content-Type", "text/json"]],
@@ -72,14 +72,14 @@ test("text/json sends declared headers and serializes and decodes JSON", async (
 
   const transport = createTransport({ baseUrl });
   const result = requiredRecord(
-    await sendTextJson(transport, { body: { message: "hello" } }),
+    await sendTextJson(transport, { body: "hello" }),
     "text/json result",
   );
   const received = requiredRequest(0);
 
   assert.equal(requestHeader(received, "Content-Type"), "text/json");
   assert.equal(requestHeader(received, "Accept"), "text/json");
-  assert.equal(received.body.toString("utf8"), '{"message":"hello"}');
+  assert.equal(received.body.toString("utf8"), "hello");
   assert.equal(result.outcome, 202);
   assert.deepEqual(result.data, { accepted: true });
 });

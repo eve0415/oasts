@@ -1,0 +1,23 @@
+openapi: 3.1.0
+info:
+  title: Empty exploded path
+  version: 1.0.0
+servers:
+  - url: https://api.test/v1
+paths:
+  /items/{p}:
+    get:
+      operationId: getEmptyMatrix
+      parameters:
+        - name: p
+          in: path
+          required: true
+          style: matrix
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+      responses:
+        "204":
+          description: Empty collection accepted

@@ -983,8 +983,10 @@ fn write_config(
             format!(
                 // zod rides the full config as a standalone artifact rather than as the bound
                 // engine: the client binds one engine, and generating both here is what makes the
-                // sweep report any construct one emitter rejects and the other accepts.
-                "schemaVersion: 1\ninput:\n  path: {input}\noutput: ./generated-full\nartifacts:\n  types: true\n  client: true\n  validators: true\n  zod: true\nclient:\n  baseUrl:\n{base_url}validation:\n  engine: generated\n  request: true\n  response: true\n  unchecked: allow\n"
+                // sweep report any construct one emitter rejects and the other accepts. msw joins
+                // for the same reason — it is the only emitter that has to render a path template
+                // as a matcher, so the vendor specs are where an unmatchable path shows up.
+                "schemaVersion: 1\ninput:\n  path: {input}\noutput: ./generated-full\nartifacts:\n  types: true\n  client: true\n  validators: true\n  zod: true\n  msw: true\nclient:\n  baseUrl:\n{base_url}validation:\n  engine: generated\n  request: true\n  response: true\n  unchecked: allow\n"
             )
         }
     };

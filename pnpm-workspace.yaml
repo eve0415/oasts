@@ -3,6 +3,9 @@ packages:
   - crates/oasts-core/runtime
 allowBuilds:
   esbuild: true
+  # msw's install script only copies its browser service-worker file into a public directory.
+  # Nothing here serves a browser, so the copy has no consumer.
+  msw: false
 minimumReleaseAgeStrict: true
 # Every `pnpm exec` first runs a deps status check, and when it decides node_modules must be
 # recreated it asks to purge the directory — a prompt that aborts outright with no TTY. That makes

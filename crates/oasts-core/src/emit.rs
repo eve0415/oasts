@@ -40,6 +40,7 @@ use crate::semantic::{
 
 mod client;
 mod model;
+mod msw;
 pub(crate) mod runtime_assets;
 mod transform;
 mod validators;
@@ -332,7 +333,7 @@ pub(crate) fn emit_types_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Ge
     files
 }
 
-/// Emits every enabled artifact (types, client, validators, zod) for one compile.
+/// Emits every enabled artifact (types, client, validators, zod, msw) for one compile.
 ///
 /// Public so out-of-crate harnesses can run the emission stage exactly as
 /// `pipeline::compile` does, including a client model when one was built.
@@ -356,6 +357,9 @@ pub fn emit_artifacts(
     }
     if config.artifacts.zod.enabled {
         files.extend(zod::emit_zod_from_model(&mut model));
+    }
+    if config.artifacts.msw.enabled {
+        files.extend(msw::emit_msw_from_model(&mut model));
     }
     files.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
     files
@@ -2724,7 +2728,7 @@ impl Emitter<'_, '_, '_> {
         output
     }
 
-    fn render_parameter_group(
+    pub(super) fn render_parameter_group(
         &self,
         parameters: &[&Param],
         axis: TypeAxis,

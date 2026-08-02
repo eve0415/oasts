@@ -22,14 +22,6 @@
     "build:napi": "napi build --platform --release --esm --manifest-path ../../crates/oasts-napi/Cargo.toml -o napi",
     "test:e2e": "pnpm build && node --test test-e2e/cli.e2e.test.ts"
   },
-  "peerDependencies": {
-    "zod": "^4.4.0"
-  },
-  "peerDependenciesMeta": {
-    "zod": {
-      "optional": true
-    }
-  },
   "devDependencies": {
     "@napi-rs/cli": "3.8.1",
     "@types/node": "26.1.2",
@@ -38,6 +30,18 @@
     "oxlint-tsgolint": "7.0.2001",
     "tsdown": "0.22.14",
     "typescript": "7.0.2"
+  },
+  "peerDependencies": {
+    "msw": "^2.8.0",
+    "zod": "^4.4.0"
+  },
+  "peerDependenciesMeta": {
+    "msw": {
+      "optional": true
+    },
+    "zod": {
+      "optional": true
+    }
   },
   "engines": {
     "node": ">=24"

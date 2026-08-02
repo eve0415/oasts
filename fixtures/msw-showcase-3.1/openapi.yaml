@@ -1,0 +1,246 @@
+openapi: 3.1.0
+info:
+  title: MSW Showcase
+  version: 1.0.0
+  description: >
+    Exercises the request/response surface an MSW handler factory has to reproduce: every
+    parameter location and serialization style the projector must invert, each request-body class,
+    and a response map spanning exact, range, and default keys with and without content.
+servers:
+  - url: https://api.test/v1
+paths:
+  /pets/{petId}:
+    get:
+      operationId: getPetMock
+      summary: Read one pet.
+      parameters:
+        - name: petId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: tags
+          in: query
+          required: false
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: filter
+          in: query
+          required: false
+          style: deepObject
+          explode: true
+          schema:
+            type: object
+            properties:
+              status:
+                type: string
+              minAge:
+                type: integer
+        - name: X-Request-Id
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The pet, as JSON or as its name in plain text.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+            text/plain:
+              schema:
+                type: string
+        "204":
+          description: The pet exists and carries no representation.
+        4XX:
+          description: A client error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        default:
+          description: Any other error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /pets:
+    post:
+      operationId: createPetMock
+      summary: Create a pet from a JSON body.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewPet"
+      responses:
+        "201":
+          description: The created pet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+        "422":
+          description: The body did not validate.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /pets/{petId}/photo:
+    put:
+      operationId: uploadPhotoMock
+      summary: Replace a pet photo with raw bytes.
+      parameters:
+        - name: petId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "204":
+          description: Stored.
+  /forms:
+    post:
+      operationId: submitFormMock
+      summary: Accept a form-urlencoded body.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                tags:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: An acknowledgement line.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /uploads:
+    post:
+      operationId: uploadMultipartMock
+      summary: Accept a multipart body with a JSON part beside a binary part.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - meta
+                - file
+              properties:
+                meta:
+                  $ref: "#/components/schemas/NewPet"
+                file:
+                  type: string
+                  format: binary
+            encoding:
+              meta:
+                contentType: application/json
+              file:
+                contentType: application/octet-stream
+      responses:
+        "200":
+          description: The stored pet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+  /reports/{reportId}:
+    get:
+      operationId: getReportMock
+      summary: A label-style path parameter beside a matrix-style one.
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          style: label
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+        - name: window
+          in: query
+          required: false
+          style: pipeDelimited
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+        - name: session
+          in: cookie
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The report bytes.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+  /health:
+    head:
+      operationId: headHealthMock
+      summary: A bodyless operation.
+      responses:
+        "200":
+          description: Reachable.
+components:
+  schemas:
+    Pet:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        tag:
+          type: string
+    NewPet:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+        tag:
+          type: string
+    Problem:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+        code:
+          type: integer

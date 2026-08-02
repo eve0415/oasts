@@ -39,7 +39,10 @@ generate_fixture() {
   local name=$1 import_extension=$2
   local destination="$work/$name"
   cp -r "$fixture_source" "$destination"
-  rm -rf -- "$destination/generated" "$destination/generated-client" "$destination/generated-validators"
+  # Glob rather than a hand-kept list: every artifact writes under a `generated*` directory, and a
+  # list here silently stops stripping the moment a new one lands. `generated-zod*` was already
+  # being missed.
+  rm -rf -- "$destination"/generated*
   printf '\nemit:\n  importExtension: "%s"\n' "$import_extension" >>"$destination/oasts.yaml"
   printf '{"type":"module"}\n' >"$destination/package.json"
   if ! (cd "$destination" && "$repo_root/$binary" generate --config oasts.yaml) >"$destination/generate.log" 2>&1; then

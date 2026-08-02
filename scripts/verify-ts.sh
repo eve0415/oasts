@@ -177,6 +177,48 @@ for run in "${zod_runs[@]}"; do
   generate_and_verify "$fixture" "$config" "$work/$dir" zod "$fixture ($config)" link
 done
 
+# The msw artifact. Emitted handlers import `msw` bare, so this row needs the node_modules link the
+# zod rows use. The compile-assert runs TWICE, with exactOptionalPropertyTypes off and then on:
+# the no-payload responder guard has to reject `body: undefined` under both, and an optional `never`
+# still admits undefined when the flag is off, so a single run would certify only half the contract.
+generate_and_verify msw-showcase-3.1 oasts-msw.yaml "$work/msw-showcase" msw "msw-showcase-3.1" link
+# A media entry with no schema, or one admitting every instance, still has to produce a body type
+# MSW accepts. This is the shape real vendor documents hit and the showcase does not.
+generate_and_verify msw-unconstrained-body-3.1 oasts-msw.yaml "$work/msw-unconstrained" msw \
+  "msw-unconstrained-body-3.1" link
+generate_and_verify msw-enum-parameters-3.1 oasts-msw.yaml "$work/msw-enum-parameters" msw \
+  "msw-enum-parameters-3.1" link
+generate_and_verify msw-openapi-msw-3.1 oasts-msw.yaml "$work/msw-openapi-msw" msw \
+  "msw-openapi-msw-3.1" link
+
+# Both the compile-assert AND the emitted tree are typechecked under exactOptionalPropertyTypes off
+# and on. The compile-assert needs it because the no-payload responder guard has to reject
+# `body: undefined` either way. The emitted tree needs it because a consumer may well have the flag
+# on, and a projected parameter group that is only valid with it off would not compile for them —
+# `generate_and_verify` alone runs with it off and would never notice.
+for exact_optional in false true; do
+  pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext \
+    --moduleResolution bundler --exactOptionalPropertyTypes "$exact_optional" \
+    "$work/msw-showcase/compile-assert/cases.ts"
+  echo "compile-assert matrix ok: msw-showcase-3.1 (exactOptionalPropertyTypes=$exact_optional)"
+  pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext \
+    --moduleResolution bundler --exactOptionalPropertyTypes "$exact_optional" \
+    "$work/msw-enum-parameters/compile-assert/cases.ts"
+  echo "compile-assert matrix ok: msw-enum-parameters-3.1 (exactOptionalPropertyTypes=$exact_optional)"
+  pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext \
+    --moduleResolution bundler --exactOptionalPropertyTypes "$exact_optional" \
+    --noUnusedLocals --noUnusedParameters \
+    "$work/msw-openapi-msw/compile-assert/cases.ts"
+  echo "compile-assert matrix ok: msw-openapi-msw-3.1 (exactOptionalPropertyTypes=$exact_optional)"
+  for tree in msw-showcase msw-unconstrained msw-enum-parameters msw-openapi-msw; do
+    pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext \
+      --moduleResolution bundler --exactOptionalPropertyTypes "$exact_optional" \
+      --noUnusedLocals --noUnusedParameters \
+      "$work/$tree"/generated-msw/**/*.ts
+    echo "emitted tree ok: $tree (exactOptionalPropertyTypes=$exact_optional)"
+  done
+done
+
 # An assertion about coverage rather than a run, so it sits outside the loop: if petstore ever stops
 # emitting a response-header schema, the row above silently stops testing what it is there for.
 grep -rq 'z.custom<' "$work/zod-petstore-mini/generated-zod-mini/zod/operations" \

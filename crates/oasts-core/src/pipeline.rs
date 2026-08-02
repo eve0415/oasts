@@ -1111,6 +1111,39 @@ content:
     }
 
     #[test]
+    fn client_and_msw_reject_the_same_structural_xml_response() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/msw-response-media-parity-3.1");
+        let diagnostics = |config_name: &str| {
+            let config = load_config(Some(&fixture.join(config_name)), &fixture)
+                .expect("resolved response media config");
+            let mut sink = DiagnosticSink::new();
+            assert!(compile(&config, false, &mut sink).is_none());
+            sink.into_sorted_vec()
+                .into_iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.code,
+                        diagnostic.message,
+                        diagnostic.json_pointer,
+                        diagnostic.severity,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let client = diagnostics("oasts-client.yaml");
+        let msw = diagnostics("oasts-msw.yaml");
+        assert_eq!(client, msw);
+        assert_eq!(client.len(), 1);
+        assert_eq!(client[0].0, "OASTS1403");
+        assert_eq!(
+            client[0].1,
+            "response media 'text/xml' is XML, which Oasts does not support"
+        );
+    }
+
+    #[test]
     fn uninhabitable_allof_fixture_emits_every_artifact() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/uninhabitable-allof-3.0");

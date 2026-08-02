@@ -1,0 +1,76 @@
+openapi: 3.1.0
+info:
+  title: Unconstrained response bodies
+  version: 1.0.0
+  description: >
+    Media entries that declare no schema, or one that cannot be represented as a concrete
+    TypeScript type. The handler's response-body type still has to satisfy what MSW accepts as a
+    body, so these are the shapes that catch a union widened past that constraint.
+servers:
+  - url: https://api.test
+paths:
+  /unconstrained:
+    get:
+      operationId: getUnconstrained
+      summary: A media entry with no schema at all.
+      responses:
+        "200":
+          description: Anything.
+          content:
+            application/json: {}
+  /boolean-true:
+    get:
+      operationId: getBooleanTrue
+      summary: A schema of the boolean true, which admits every instance.
+      responses:
+        "200":
+          description: Anything.
+          content:
+            application/json:
+              schema: true
+  /mixed:
+    get:
+      operationId: getMixed
+      summary: One representable JSON entry beside an unconstrained one.
+      responses:
+        "200":
+          description: Either.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Thing"
+            application/problem+json: {}
+        "204":
+          description: Nothing.
+  /aliased:
+    get:
+      operationId: getAliased
+      summary: A named component that leaves every instance open.
+      responses:
+        "200":
+          description: Anything through an alias.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenBody"
+  /text-json:
+    get:
+      operationId: getTextJson
+      summary: The de-facto JSON alias, which is JSON on the wire despite the text/ prefix.
+      responses:
+        "200":
+          description: A JSON body.
+          content:
+            text/json:
+              schema:
+                $ref: "#/components/schemas/Thing"
+components:
+  schemas:
+    OpenBody: {}
+    Thing:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: integer
