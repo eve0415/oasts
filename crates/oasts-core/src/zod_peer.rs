@@ -1,5 +1,8 @@
 //! Peer-version check for the `zod` the consumer has installed.
 //!
+//! Both flavors are one npm package — `zod/mini` is a subpath of `zod` — so the check is flavor
+//! blind, and the range below covers either entry point.
+//!
 //! Emitted zod schemas import `zod` from the project that consumes them, and the emitted runtime
 //! helpers are written against zod's 4.4 issue shape. That makes an out-of-range zod a *silent*
 //! defect rather than a build failure: 4.0 through 4.3 typecheck clean and then disagree with the
@@ -32,7 +35,7 @@ fn supported_range() -> String {
 /// Warns when the reachable `zod` install falls outside [`SUPPORTED_RANGE`].
 ///
 /// `output` is the emitted-file root rather than the working directory on purpose: the emitted
-/// `import { z } from "zod"` resolves relative to the file that contains it, so a monorepo
+/// `import * as z from "zod"` resolves relative to the file that contains it, so a monorepo
 /// generating into a sibling package must be judged against that package's `node_modules`.
 #[must_use]
 pub fn diagnose(output: &Path) -> Option<Diagnostic> {

@@ -10,6 +10,7 @@ use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde_json::Value;
 
 use crate::composition::finite_values;
+use crate::config::ZodFlavor;
 use crate::diag::Diagnostic;
 use crate::ir::{
     AdditionalProperties, ExclusiveBound, Operation, ParamLocation, PrimitiveType, PropMeta,
@@ -341,7 +342,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
                     self.runtime_values.insert("dependentRequired");
                     object = check(
                         object,
-                        format!(
+                        &format!(
                             "dependentRequired([{}])",
                             dependent_required
                                 .iter()
@@ -381,12 +382,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             } => {
                 let items = prefix_items
                     .iter()
-                    .map(|item| {
-                        format!(
-                            "{}.optional()",
-                            self.render_deferred(item, self_is_deferred)
-                        )
-                    })
+                    .map(|item| optional(self.render_deferred(item, self_is_deferred)))
                     .collect::<Vec<_>>()
                     .join(",");
                 let tuple = match rest {
@@ -422,7 +418,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
                     .collect::<Vec<_>>();
                 let base = union(rendered.clone());
                 self.runtime_values.insert("oneOf");
-                check(base, format!("oneOf([{}])", rendered.join(",")))
+                check(base, &format!("oneOf([{}])", rendered.join(",")))
             }
             SchemaNode::Any { meta } => self.render_typeless(meta, self_is_deferred),
             SchemaNode::Never { .. } => "z.never()".to_owned(),
@@ -479,11 +475,11 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             PrimitiveType::Number => self.apply_number_constraints("z.number()".to_owned(), meta),
             PrimitiveType::Integer => {
                 self.runtime_values.insert("integer");
-                let number = check("z.number()".to_owned(), "integer()".to_owned());
+                let number = check("z.number()".to_owned(), "integer()");
                 let number = self.apply_number_constraints(number, meta);
                 if format == Some("int32") {
                     self.runtime_values.insert("int32");
-                    check(number, "int32()".to_owned())
+                    check(number, "int32()")
                 } else {
                     number
                 }
@@ -522,17 +518,17 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
         let constraints = meta.string_constraints();
         if let Some(minimum) = constraints.min_length {
             self.runtime_values.insert("minLength");
-            expression = check(expression, format!("minLength({minimum})"));
+            expression = check(expression, &format!("minLength({minimum})"));
         }
         if let Some(maximum) = constraints.max_length {
             self.runtime_values.insert("maxLength");
-            expression = check(expression, format!("maxLength({maximum})"));
+            expression = check(expression, &format!("maxLength({maximum})"));
         }
         if let Some(pattern_value) = &constraints.pattern {
             self.runtime_values.insert("pattern");
             expression = check(
                 expression,
-                format!("pattern(new RegExp({}))", render_ts_string(pattern_value)),
+                &format!("pattern(new RegExp({}))", render_ts_string(pattern_value)),
             );
         }
         if let Some((predicate, name)) = format.and_then(string_format) {
@@ -540,7 +536,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             self.runtime_values.insert(predicate);
             expression = check(
                 expression,
-                format!("stringFormat({predicate},{})", render_ts_string(name)),
+                &format!("stringFormat({predicate},{})", render_ts_string(name)),
             );
         }
         expression
@@ -554,44 +550,33 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             self.runtime_values.insert("multipleOf");
             expression = check(
                 expression,
-                format!("multipleOf({})", render_number_value(divisor)),
+                &format!("multipleOf({})", render_number_value(divisor)),
             );
         }
         expression
     }
 
-    fn apply_array_constraints(&mut self, mut expression: String, meta: &SchemaMeta) -> String {
+    fn apply_array_constraints(&mut self, expression: String, meta: &SchemaMeta) -> String {
         let constraints = meta.array_constraints();
-        if let Some(minimum) = constraints.min_items {
-            expression.push_str(&format!(".min({minimum})"));
-        }
-        if let Some(maximum) = constraints.max_items {
-            expression.push_str(&format!(".max({maximum})"));
-        }
+        let mut expression = apply_item_count_bounds(expression, constraints);
         if constraints.unique_items {
             self.runtime_values.insert("uniqueItems");
-            expression = check(expression, "uniqueItems()".to_owned());
+            expression = check(expression, "uniqueItems()");
         }
         expression
     }
 
     fn apply_tuple_constraints(&mut self, expression: String, meta: &SchemaMeta) -> String {
         let constraints = meta.array_constraints();
-        let mut bound = "z.array(z.unknown())".to_owned();
-        if let Some(minimum) = constraints.min_items {
-            bound.push_str(&format!(".min({minimum})"));
-        }
-        if let Some(maximum) = constraints.max_items {
-            bound.push_str(&format!(".max({maximum})"));
-        }
         let mut expression = if constraints.min_items.is_some() || constraints.max_items.is_some() {
+            let bound = apply_item_count_bounds("z.array(z.unknown())".to_owned(), constraints);
             format!("z.intersection({expression},{bound})")
         } else {
             expression
         };
         if constraints.unique_items {
             self.runtime_values.insert("uniqueItems");
-            expression = check(expression, "uniqueItems()".to_owned());
+            expression = check(expression, "uniqueItems()");
         }
         expression
     }
@@ -612,7 +597,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             let recursive = self.contains_self_ref(schema);
             let mut property = self.render_deferred(schema, self_is_deferred || recursive);
             if !property_meta.required {
-                property.push_str(".optional()");
+                property = optional(property);
             }
             if recursive {
                 members.push(format!(
@@ -630,16 +615,16 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
         }
 
         let pattern_properties = &meta.validation_applicators().pattern_properties;
-        let mut expression = if pattern_properties.is_empty() {
+        let expression = if pattern_properties.is_empty() {
             match additional {
                 AdditionalProperties::Forbidden => {
                     format!("z.strictObject({{{}}})", members.join(","))
                 }
                 AdditionalProperties::Schema(schema)
-                | AdditionalProperties::Allowed(Some(schema)) => format!(
-                    "z.looseObject({{{}}}).catchall({})",
-                    members.join(","),
-                    self.render_deferred(schema, self_is_deferred)
+                | AdditionalProperties::Allowed(Some(schema)) => catchall(
+                    format!("z.looseObject({{{}}})", members.join(",")),
+                    &self.render_deferred(schema, self_is_deferred),
+                    self.model.config.zod.flavor,
                 ),
                 AdditionalProperties::Allowed(None) => {
                     format!("z.looseObject({{{}}})", members.join(","))
@@ -649,19 +634,25 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             format!("z.looseObject({{{}}})", members.join(","))
         };
 
+        self.apply_property_count(expression, meta)
+    }
+
+    /// Bounds an object's key count, shared by the typed and typeless object paths so the two
+    /// cannot drift on what `minProperties`/`maxProperties` mean.
+    fn apply_property_count(&mut self, expression: String, meta: &SchemaMeta) -> String {
         let constraints = meta.object_constraints();
-        if constraints.min_properties.is_some() || constraints.max_properties.is_some() {
-            self.runtime_values.insert("propertyCount");
-            expression = check(
-                expression,
-                format!(
-                    "propertyCount({},{})",
-                    optional_u64(constraints.min_properties),
-                    optional_u64(constraints.max_properties)
-                ),
-            );
+        if constraints.min_properties.is_none() && constraints.max_properties.is_none() {
+            return expression;
         }
-        expression
+        self.runtime_values.insert("propertyCount");
+        check(
+            expression,
+            &format!(
+                "propertyCount({},{})",
+                optional_u64(constraints.min_properties),
+                optional_u64(constraints.max_properties)
+            ),
+        )
     }
 
     fn render_typeless(&mut self, meta: &SchemaMeta, self_is_deferred: bool) -> String {
@@ -685,19 +676,8 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             .map(|name| format!("{}:z.unknown()", render_value_key(name)))
             .collect::<Vec<_>>()
             .join(",");
-        let mut object = format!("z.looseObject({{{required}}})");
-        let constraints = meta.object_constraints();
-        if constraints.min_properties.is_some() || constraints.max_properties.is_some() {
-            self.runtime_values.insert("propertyCount");
-            object = check(
-                object,
-                format!(
-                    "propertyCount({},{})",
-                    optional_u64(constraints.min_properties),
-                    optional_u64(constraints.max_properties)
-                ),
-            );
-        }
+        let object = format!("z.looseObject({{{required}}})");
+        let object = self.apply_property_count(object, meta);
         let object = self.apply_object_applicators(object, meta, None, self_is_deferred);
         let array = self.apply_array_applicators(array, meta, None, self_is_deferred);
         format!("z.union([{string},{number},z.boolean(),z.null(),{array},{object}])")
@@ -761,7 +741,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             self.runtime_values.insert("enumValues");
             expression = check(
                 expression,
-                format!(
+                &format!(
                     "enumValues([{}])",
                     values
                         .iter()
@@ -775,7 +755,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             self.runtime_values.insert("constValue");
             expression = check(
                 expression,
-                format!(
+                &format!(
                     "constValue({})",
                     render_json_compact(value, ObjectKeyMode::ProtoSafe)
                 ),
@@ -817,13 +797,13 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
         if let Some(schema) = &applicators.not {
             self.runtime_values.insert("not");
             let nested = self.render_deferred(schema, self_is_deferred);
-            expression = check(expression, format!("not({nested})"));
+            expression = check(expression, &format!("not({nested})"));
         }
         if let Some(conditional) = &applicators.conditional {
             self.runtime_values.insert("conditional");
             expression = check(
                 expression,
-                format!(
+                &format!(
                     "conditional({},{},{})",
                     self.render_deferred(&conditional.condition, self_is_deferred),
                     render_optional_schema(
@@ -891,7 +871,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
         if let Some(schema) = &applicators.property_names {
             self.runtime_values.insert("propertyNames");
             let nested = self.render_deferred(schema, self_is_deferred);
-            expression = check(expression, format!("propertyNames({nested})"));
+            expression = check(expression, &format!("propertyNames({nested})"));
         }
         if !applicators.pattern_properties.is_empty() {
             self.runtime_values.insert("patternProperties");
@@ -943,7 +923,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             );
             expression = check(
                 expression,
-                format!(
+                &format!(
                     "patternProperties([{patterns}],[{}],{additional})",
                     declared
                         .iter()
@@ -957,7 +937,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             self.runtime_values.insert("dependentSchemas");
             expression = check(
                 expression,
-                format!(
+                &format!(
                     "dependentSchemas([{}])",
                     applicators
                         .dependent_schemas
@@ -981,7 +961,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             let allowed = render_allowed_schema(self, allowed, self_is_deferred);
             expression = check(
                 expression,
-                format!("unevaluatedProperties({scope},{allowed})"),
+                &format!("unevaluatedProperties({scope},{allowed})"),
             );
         }
         expression
@@ -1000,7 +980,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             let nested = self.render_deferred(&contains.schema, self_is_deferred);
             expression = check(
                 expression,
-                format!(
+                &format!(
                     "contains({nested},{},{},{})",
                     contains
                         .min_contains
@@ -1014,7 +994,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             self.runtime_values.insert("unevaluatedItems");
             let scope = self.render_item_scope(context, meta, self_is_deferred);
             let allowed = render_allowed_schema(self, allowed, self_is_deferred);
-            expression = check(expression, format!("unevaluatedItems({scope},{allowed})"));
+            expression = check(expression, &format!("unevaluatedItems({scope},{allowed})"));
         }
         expression
     }
@@ -1285,8 +1265,67 @@ fn render_allowed_schema(
     }
 }
 
-fn check(expression: String, check: String) -> String {
-    format!("{expression}.check({check})")
+/// Appends one runtime or native check to a schema expression.
+///
+/// Grows the expression in place rather than formatting a new one: a schema accumulates a check per
+/// constraint keyword, and this is called once per keyword on every node in the document.
+fn check(mut expression: String, check: &str) -> String {
+    expression.push_str(".check(");
+    expression.push_str(check);
+    expression.push(')');
+    expression
+}
+
+/// The module emitted schemas import from.
+///
+/// This and [`schema_type`] live here rather than on [`ZodFlavor`] because they are emitted
+/// TypeScript, and emitted vocabulary belongs to the emitter — the config module names the choice,
+/// this module spells it. `TransformKind::ts_type` is the same split for date representations.
+const fn specifier(flavor: ZodFlavor) -> &'static str {
+    match flavor {
+        ZodFlavor::Classic => "zod",
+        ZodFlavor::Mini => "zod/mini",
+    }
+}
+
+/// The schema base type an explicitly annotated export is declared against.
+const fn schema_type(flavor: ZodFlavor) -> &'static str {
+    match flavor {
+        ZodFlavor::Classic => "z.ZodType",
+        ZodFlavor::Mini => "z.ZodMiniType",
+    }
+}
+
+/// Binds a schema for the keys an object declares no property for.
+///
+/// The one applicator with no shared spelling: classic carries it as a method, mini only as a free
+/// function. Both set the same `catchall` on the object def.
+fn catchall(mut object: String, additional: &str, flavor: ZodFlavor) -> String {
+    match flavor {
+        ZodFlavor::Classic => {
+            object.push_str(".catchall(");
+            object.push_str(additional);
+            object.push(')');
+            object
+        }
+        ZodFlavor::Mini => {
+            object.insert_str(0, "z.catchall(");
+            object.push(',');
+            object.push_str(additional);
+            object.push(')');
+            object
+        }
+    }
+}
+
+/// Wraps a schema so the position it occupies also admits `undefined`.
+///
+/// Spelled as the free function rather than the `.optional()` method because the free function is
+/// the one form both zod and `zod/mini` accept; the method exists only on the classic wrapper.
+fn optional(mut expression: String) -> String {
+    expression.insert_str(0, "z.optional(");
+    expression.push(')');
+    expression
 }
 
 fn union(expressions: Vec<String>) -> String {
@@ -1308,54 +1347,79 @@ fn intersection(expressions: Vec<String>) -> String {
     result
 }
 
-fn apply_lower_bound(
+/// Bounds an array's element count.
+///
+/// Zod's `.min()`/`.max()` on an array are the method forms of the very same `minLength`/`maxLength`
+/// checks, so routing through `.check()` keeps the verdicts identical while staying inside the
+/// vocabulary `zod/mini` also exports. The runtime's own `minLength`/`maxLength` are the *string*
+/// predicates, which count code points and are a different contract — these stay namespaced under
+/// `z` so the two never get confused at a call site.
+fn apply_item_count_bounds(
     mut expression: String,
-    constraints: &crate::ir::NumericConstraints,
+    constraints: &crate::ir::ArrayConstraints,
 ) -> String {
-    match &constraints.exclusive_minimum {
-        Some(ExclusiveBound::Number(value)) => {
-            expression.push_str(&format!(".gt({})", render_number_value(value)));
-            if let Some(value) = &constraints.minimum {
-                expression.push_str(&format!(".min({})", render_number_value(value)));
-            }
-        }
-        Some(ExclusiveBound::Boolean(true)) => {
-            if let Some(value) = &constraints.minimum {
-                expression.push_str(&format!(".gt({})", render_number_value(value)));
-            }
-        }
-        Some(ExclusiveBound::Boolean(false)) | None => {
-            if let Some(value) = &constraints.minimum {
-                expression.push_str(&format!(".min({})", render_number_value(value)));
-            }
-        }
+    if let Some(minimum) = constraints.min_items {
+        expression = check(expression, &format!("z.minLength({minimum})"));
+    }
+    if let Some(maximum) = constraints.max_items {
+        expression = check(expression, &format!("z.maxLength({maximum})"));
     }
     expression
 }
 
-fn apply_upper_bound(
+/// Applies one end of a numeric range.
+///
+/// Lower and upper are the same shape with the comparators swapped, so they share a body: whether
+/// `exclusive` names its own value, merely marks `inclusive` as strict, or is absent decides which
+/// comparator each recorded bound renders as. Keeping it in one place is what stops a spec-fidelity
+/// fix from landing on one end and silently emitting an inclusive bound at the other.
+fn apply_bound(
     mut expression: String,
-    constraints: &crate::ir::NumericConstraints,
+    exclusive: Option<&ExclusiveBound>,
+    inclusive: Option<&serde_json::Number>,
+    strict: &str,
+    loose: &str,
 ) -> String {
-    match &constraints.exclusive_maximum {
+    let bound = |expression: String, comparator: &str, value: &serde_json::Number| {
+        check(
+            expression,
+            &format!("z.{comparator}({})", render_number_value(value)),
+        )
+    };
+    // `exclusive` decides only which comparator the recorded `inclusive` bound renders as — except
+    // when it carries its own value, which is a second bound on top rather than a choice.
+    let comparator = match exclusive {
         Some(ExclusiveBound::Number(value)) => {
-            expression.push_str(&format!(".lt({})", render_number_value(value)));
-            if let Some(value) = &constraints.maximum {
-                expression.push_str(&format!(".max({})", render_number_value(value)));
-            }
+            expression = bound(expression, strict, value);
+            loose
         }
-        Some(ExclusiveBound::Boolean(true)) => {
-            if let Some(value) = &constraints.maximum {
-                expression.push_str(&format!(".lt({})", render_number_value(value)));
-            }
-        }
-        Some(ExclusiveBound::Boolean(false)) | None => {
-            if let Some(value) = &constraints.maximum {
-                expression.push_str(&format!(".max({})", render_number_value(value)));
-            }
-        }
+        Some(ExclusiveBound::Boolean(true)) => strict,
+        Some(ExclusiveBound::Boolean(false)) | None => loose,
+    };
+    if let Some(value) = inclusive {
+        expression = bound(expression, comparator, value);
     }
     expression
+}
+
+fn apply_lower_bound(expression: String, constraints: &crate::ir::NumericConstraints) -> String {
+    apply_bound(
+        expression,
+        constraints.exclusive_minimum.as_ref(),
+        constraints.minimum.as_ref(),
+        "gt",
+        "gte",
+    )
+}
+
+fn apply_upper_bound(expression: String, constraints: &crate::ir::NumericConstraints) -> String {
+    apply_bound(
+        expression,
+        constraints.exclusive_maximum.as_ref(),
+        constraints.maximum.as_ref(),
+        "lt",
+        "lte",
+    )
 }
 
 fn string_format(format: &str) -> Option<(&'static str, &'static str)> {
@@ -1414,7 +1478,7 @@ fn node_finite_values(schema: &SchemaNode) -> (Option<&[Value]>, Option<&Value>)
 fn render_decl(
     export_type: &str,
     schema_name: &str,
-    annotated_type: Option<&str>,
+    annotated_type: Option<(&str, &str)>,
     expression: &str,
 ) -> Decl {
     // An operation module also exports the `validate{Name}(value, path, issues)` entry point the
@@ -1425,10 +1489,10 @@ fn render_decl(
         "\nexport function validate{export_type}(value: unknown, path: readonly (string | number)[], issues: Issue[]): void {{\n  collect({schema_name}, value, path, issues);\n}}\n"
     );
     match annotated_type {
-        Some(type_expression) => Decl {
+        Some((type_expression, type_annotation)) => Decl {
             type_declaration: format!("export type {export_type} = {type_expression};\n"),
             schema: format!(
-                "export const {schema_name}: z.ZodType<{export_type}> = {expression};\n{wrapper}"
+                "export const {schema_name}: {type_annotation} = {expression};\n{wrapper}"
             ),
         },
         None => Decl {
@@ -1441,7 +1505,7 @@ fn render_decl(
 }
 
 /// Whether a component's schema can reach itself by following `$ref`s, directly or through other
-/// components. Only such a schema needs an explicit `z.ZodType<T>` annotation: without one
+/// components. Only such a schema needs the explicit schema-type annotation: without one
 /// TypeScript reports a circular inference error, and with one the cycle is broken. Everything else
 /// exports `z.infer` of its own schema, which is both what the artifact contract asks for and the
 /// only honest answer — the structural types the types artifact emits are approximations in places
@@ -1533,10 +1597,20 @@ fn emit_component(
             imports: &mut imports,
         }
         .render(&schema.schema);
+        // The annotation is rendered here, at the one site that knows a cycle needs one, so
+        // `render_decl` never has to ask which flavor is in play.
+        let annotation = type_expression.as_ref().map(|type_expression| {
+            (
+                type_expression.as_str(),
+                format!("{}<{export_type}>", schema_type(model.config.zod.flavor)),
+            )
+        });
         declarations.push(render_decl(
             &export_type,
             &schema_name,
-            type_expression.as_deref(),
+            annotation
+                .as_ref()
+                .map(|(expression, annotation)| (*expression, annotation.as_str())),
             &expression,
         ));
     }
@@ -1813,7 +1887,16 @@ fn assemble_file(
 ) -> String {
     let extension = import_extension(model);
     let mut output = model.header();
-    output.push_str("import { z } from \"zod\";\n");
+    // A namespace import, not `import { z } from "zod"`. Zod re-exports `z` as a runtime namespace
+    // *object*, so importing that binding is an opaque value reference a bundler cannot look
+    // through: every string format, every locale, and both JSON Schema converters link whether or
+    // not a schema mentions them. A true namespace import lets the bundler resolve `z.string` and
+    // friends statically and drop the rest — bundling the github artifact's
+    // `pulls-update-review-comment` module with esbuild falls from 66.0 kB to 21.4 kB gzip. The
+    // README's table reports the same measurement across a spread of operations.
+    output.push_str("import * as z from \"");
+    output.push_str(specifier(model.config.zod.flavor));
+    output.push_str("\";\n");
     if !runtime_values.is_empty() {
         output.push_str(&format!(
             "import {{ {} }} from {};\n",
@@ -2194,6 +2277,65 @@ mod tests {
     }
 
     #[test]
+    fn every_emitted_file_imports_zod_as_a_namespace() {
+        // `import { z }` binds zod's runtime namespace object, which a bundler cannot look through:
+        // the whole library links into every consumer. Nothing else pins the import form, so a
+        // well-meaning tidy-up back to the named import would silently quadruple emitted bundles.
+        let (files, diagnostics) = compile(doc(json!({ "Thing": { "type": "string" } })));
+        assert_clean(&diagnostics);
+        let mut value_imports = 0;
+        for file in &files {
+            for line in file.content.lines() {
+                if !line.ends_with("from \"zod\";") || line.starts_with("import type ") {
+                    continue;
+                }
+                value_imports += 1;
+                assert_eq!(
+                    line, "import * as z from \"zod\";",
+                    "{}",
+                    file.relative_path
+                );
+            }
+        }
+        assert!(value_imports > 0);
+    }
+
+    #[test]
+    fn the_mini_flavor_switches_the_specifier_the_annotation_and_catchall() {
+        // These three are the whole classic/mini delta in emitted code. Everything else — the
+        // factories, `.check()`, `z.optional`, `z.infer` — is spelled identically by both entry
+        // points, which is why the flavor is a rendering detail rather than a second emitter.
+        let document = doc(json!({
+            "Bag": { "type": "object", "additionalProperties": { "type": "integer" } },
+            "Node": {
+                "type": "object",
+                "properties": { "next": { "$ref": "#/components/schemas/Node" } }
+            }
+        }));
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "./openapi.json" },
+            "output": "./generated",
+            "artifacts": { "types": true, "zod": true },
+            "zod": { "flavor": "mini" }
+        });
+        let (files, diagnostics) = compile_with_config(document, config);
+        assert_clean(&diagnostics);
+
+        let bag = component(&files, "bag");
+        assert!(bag.contains("import * as z from \"zod/mini\";"), "{bag}");
+        assert!(bag.contains("z.catchall(z.looseObject({}),"), "{bag}");
+        assert!(!bag.contains("}).catchall("), "{bag}");
+
+        let node = component(&files, "node");
+        assert!(
+            node.contains("export const nodeSchema: z.ZodMiniType<Node> ="),
+            "{node}"
+        );
+        assert!(!node.contains("z.ZodType<"), "{node}");
+    }
+
+    #[test]
     fn object_modes_and_runtime_checks_follow_the_zod_contract() {
         let (files, diagnostics) = compile(doc(json!({
             "Open": {
@@ -2276,8 +2418,8 @@ mod tests {
         })));
         assert_clean(&diagnostics);
         let tree = component(&files, "tree");
-        assert!(tree.contains("get \"children\"() { return z.array(treeSchema).optional(); }"));
-        assert!(tree.contains("z.lazy(() => otherSchema).optional()"));
+        assert!(tree.contains("get \"children\"() { return z.optional(z.array(treeSchema)); }"));
+        assert!(tree.contains("z.optional(z.lazy(() => otherSchema))"));
         assert!(tree.contains("import { type Other, otherSchema } from \"./other.js\";"));
     }
 
@@ -2303,9 +2445,19 @@ mod tests {
                 file.content
             );
             assert!(!file.content.contains(": z.ZodType<"));
-            assert!(!file.content.contains(" as "));
             assert!(!file.content.contains(": any"));
             assert!(!file.content.contains("!;"));
+            // The zod namespace import spells `as` for a reason that has nothing to do with
+            // casting, so it is exempted by exact text rather than by being an import: a future
+            // aliased sibling import (`import { type Other as Other2, ... }`) is a real escape
+            // hatch and must still fail here.
+            for line in file
+                .content
+                .lines()
+                .filter(|line| !line.starts_with("import * as z from "))
+            {
+                assert!(!line.contains(" as "), "{line}");
+            }
         }
     }
 
@@ -2517,8 +2669,8 @@ mod tests {
             "stringFormat(isDate,\"date\")",
             "stringFormat(isTime,\"time\")",
             "stringFormat(isUuid,\"uuid\")",
-            "z.number().check(integer()).min(0).max(10).check(multipleOf(2)).check(int32())",
-            "z.number().gt(2).min(0).lt(8).max(10).check(multipleOf(0.1))",
+            "z.number().check(integer()).check(z.gte(0)).check(z.lte(10)).check(multipleOf(2)).check(int32())",
+            "z.number().check(z.gt(2)).check(z.gte(0)).check(z.lt(8)).check(z.lte(10)).check(multipleOf(0.1))",
             "z.boolean()",
             "z.null()",
             "z.union([z.string(),z.null()])",
@@ -2527,7 +2679,7 @@ mod tests {
         ] {
             assert!(content.contains(expected), "missing {expected}: {content}");
         }
-        assert!(content.contains("\"annotationOnly\":z.string().optional()"));
+        assert!(content.contains("\"annotationOnly\":z.optional(z.string())"));
         assert!(!content.contains("isEmail"));
     }
 
@@ -2564,8 +2716,14 @@ mod tests {
         }));
         assert_clean(&diagnostics);
         let content = component(&files, "bounds");
-        assert!(content.contains("z.number().gt(5).lt(10)"), "{content}");
-        assert!(content.contains("z.number().min(1).max(9)"), "{content}");
+        assert!(
+            content.contains("z.number().check(z.gt(5)).check(z.lt(10))"),
+            "{content}"
+        );
+        assert!(
+            content.contains("z.number().check(z.gte(1)).check(z.lte(9))"),
+            "{content}"
+        );
         assert!(
             content.contains("z.union([z.string(),z.null()])"),
             "{content}"
@@ -2661,24 +2819,28 @@ mod tests {
         assert_clean(&diagnostics);
 
         let list = component(&files, "list");
-        assert!(list.contains("z.array(z.string()).min(1).max(3).check(uniqueItems())"));
+        assert!(list.contains(
+            "z.array(z.string()).check(z.minLength(1)).check(z.maxLength(3)).check(uniqueItems())"
+        ));
         assert!(list.contains("enumValues([[\"a\"]])"));
         assert!(list.contains("constValue([\"a\"])"));
 
         let allowed = component(&files, "allowedtuple");
-        assert!(allowed.contains("z.tuple([z.string().optional()], z.unknown())"));
+        assert!(allowed.contains("z.tuple([z.optional(z.string())], z.unknown())"));
 
         let closed = component(&files, "closedtuple");
         assert!(
             closed.contains(
-                "z.tuple([z.string().optional(),z.number().check(integer()).optional()])"
+                "z.tuple([z.optional(z.string()),z.optional(z.number().check(integer()))])"
             )
         );
-        assert!(closed.contains("z.array(z.unknown()).min(1).max(2)"));
+        assert!(
+            closed.contains("z.array(z.unknown()).check(z.minLength(1)).check(z.maxLength(2))")
+        );
         assert!(closed.contains(".check(uniqueItems())"));
 
         let rest = component(&files, "resttuple");
-        assert!(rest.contains("z.tuple([z.string().optional()], z.boolean())"));
+        assert!(rest.contains("z.tuple([z.optional(z.string())], z.boolean())"));
         assert!(rest.contains("enumValues([[\"a\",true]])"));
         assert!(rest.contains("constValue([\"a\",true])"));
     }
@@ -2706,7 +2868,7 @@ mod tests {
         assert!(component(&files, "nothing").contains("= z.never();"));
 
         let constrained = component(&files, "constrained");
-        assert!(constrained.contains("z.union([z.string().check(minLength(2)),z.number().min(1),z.boolean(),z.null(),z.array(z.unknown()).min(3),"));
+        assert!(constrained.contains("z.union([z.string().check(minLength(2)),z.number().check(z.gte(1)),z.boolean(),z.null(),z.array(z.unknown()).check(z.minLength(3)),"));
         assert!(
             constrained
                 .contains("z.looseObject({\"present\":z.unknown()}).check(propertyCount(1,4))")
@@ -2771,11 +2933,11 @@ mod tests {
         assert!(component(&files, "reference").contains("z.lazy(() => targetSchema)"));
         assert!(
             component(&files, "dynamic")
-                .contains("get \"next\"() { return dynamicSchema.optional(); }")
+                .contains("get \"next\"() { return z.optional(dynamicSchema); }")
         );
         assert!(
             component(&files, "recursive")
-                .contains("get \"next\"() { return recursiveSchema.optional(); }")
+                .contains("get \"next\"() { return z.optional(recursiveSchema); }")
         );
     }
 
@@ -2886,8 +3048,8 @@ mod tests {
         assert_clean(&diagnostics);
         assert!(component(&files, "refscope").contains("unevaluatedProperties({declared:[\"requestOnly\",\"responseOnly\",\"shared\"],additional:true},false)"));
         assert!(component(&files, "allscope").contains("allOf:[{declared:[\"requestOnly\",\"responseOnly\",\"shared\"],additional:true},{declared:[\"all\"]}]"));
-        assert!(component(&files, "anyscope").contains("branches:[[z.looseObject({\"a\":z.string().optional()}),{declared:[\"a\"]}],[z.looseObject({\"b\":z.string().optional()}),{declared:[\"b\"]}]]"));
-        assert!(component(&files, "onescope").contains("branches:[[z.looseObject({\"a\":z.string().optional()}),{declared:[\"a\"]}],[z.looseObject({\"b\":z.string().optional()}),{declared:[\"b\"]}]]"));
+        assert!(component(&files, "anyscope").contains("branches:[[z.looseObject({\"a\":z.optional(z.string())}),{declared:[\"a\"]}],[z.looseObject({\"b\":z.optional(z.string())}),{declared:[\"b\"]}]]"));
+        assert!(component(&files, "onescope").contains("branches:[[z.looseObject({\"a\":z.optional(z.string())}),{declared:[\"a\"]}],[z.looseObject({\"b\":z.optional(z.string())}),{declared:[\"b\"]}]]"));
         let conditional = component(&files, "conditionalscope");
         assert!(conditional.contains("conditional:{condition:"));
         assert!(conditional.contains("whenTrue:{declared:[\"yes\"]}"));
@@ -2898,8 +3060,8 @@ mod tests {
         let base = component(&files, "base");
         assert!(base.contains("export const baseRequestSchema"));
         assert!(base.contains("export const baseResponseSchema"));
-        assert!(base.contains("\"requestOnly\":z.string().optional()"));
-        assert!(base.contains("\"responseOnly\":z.string().optional()"));
+        assert!(base.contains("\"requestOnly\":z.optional(z.string())"));
+        assert!(base.contains("\"responseOnly\":z.optional(z.string())"));
     }
 
     #[test]
@@ -3130,7 +3292,7 @@ mod tests {
             "{name:\"X-Required\",required:true,schema:z.lazy(() => headerValueSchema)}"
         ));
         assert!(operation.contains(
-            "{name:\"X-Optional\",required:false,schema:z.number().check(integer()).min(1)}"
+            "{name:\"X-Optional\",required:false,schema:z.number().check(integer()).check(z.gte(1))}"
         ));
         // An opaque content header contributes no schema at all: its wire value is always a string.
         assert!(operation.contains("{name:\"X-Opaque\",required:"));

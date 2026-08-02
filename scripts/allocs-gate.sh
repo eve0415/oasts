@@ -9,6 +9,14 @@
 # absorbed.
 # Runs release: the committed counters were measured under the release profile, and debug's extra
 # instrumentation would make every key fail this gate for reasons unrelated to a real regression.
+#
+# Why the largest fixtures are ungated: their emit counters are not reproducible run to run. Two
+# `--update` runs over identical code move github-3.0 by ~98 allocs, github-3.0-zod by ~86, and
+# stripe-3.0 by ~48. That noise floor is what disqualifies them from the gate — but it is small, so
+# their recorded numbers still carry signal and a change that moves one well past it (this branch
+# moved github-3.0-zod emit by -13249) must be re-recorded like any gated key. A blanket `--update`
+# is the wrong instrument for that: it also rewrites the keys that only moved within the noise,
+# which buries the one real delta in a diff of churn. Re-record the keys you moved.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

@@ -1,0 +1,19 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-zod-mini-client
+artifacts:
+  types: true
+  client: true
+  zod: true
+zod:
+  flavor: mini
+client:
+  authEnforcement: types
+  baseUrl:
+    source: runtime
+validation:
+  engine: zod
+  request: true
+  response: true
+  unchecked: allow

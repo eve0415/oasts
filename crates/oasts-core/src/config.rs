@@ -118,6 +118,8 @@ pub struct RawConfig {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub types: Option<TypesConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub zod: Option<ZodConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub client: Option<RawClient>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub validation: Option<RawValidation>,
@@ -567,6 +569,34 @@ pub struct TypesConfig {
     pub readonly: bool,
 }
 
+/// Which zod entry point the emitted schemas import.
+///
+/// The two share one parsing core and return identical verdicts; they differ in API shape and in
+/// what a bundler can drop. `Mini` is the tree-shakable functional entry point — smaller, but its
+/// schemas are `ZodMiniType`, so a consumer handing them to a library that expects the classic
+/// `ZodType` wants `Classic`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum ZodFlavor {
+    #[default]
+    Classic,
+    Mini,
+}
+
+/// Zod artifact options with schema defaults applied during deserialization.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(rename_all = "camelCase", description = "Zod artifact options.")
+)]
+pub struct ZodConfig {
+    pub flavor: ZodFlavor,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -865,6 +895,7 @@ pub struct ResolvedConfig {
     pub namespace: String,
     pub artifacts: ResolvedArtifactsConfig,
     pub types: TypesConfig,
+    pub zod: ZodConfig,
     pub client: Option<ClientConfig>,
     pub validation: Option<ValidationConfig>,
     pub naming: NamingConfig,
@@ -1173,6 +1204,14 @@ pub fn resolve_config(
             Some("/types"),
         ));
     }
+    if raw.zod.is_some() && !artifact_states.zod.enabled {
+        sink.push(config_error(
+            CODE_DISABLED_OPTIONS,
+            "zod options are invalid while the zod artifact is disabled",
+            Some(source_path),
+            Some("/zod"),
+        ));
+    }
     if raw.client.is_some() && !artifact_states.client.enabled {
         sink.push(config_error(
             CODE_DISABLED_OPTIONS,
@@ -1270,6 +1309,7 @@ pub fn resolve_config(
         namespace,
         artifacts,
         types,
+        zod: raw.zod.unwrap_or_default(),
         client,
         validation,
         naming,
@@ -2760,6 +2800,35 @@ mod tests {
         let resolved = load_json(&with_types).expect("types+zod config should resolve");
         assert!(resolved.artifacts.types.enabled);
         assert!(resolved.artifacts.zod.enabled);
+    }
+
+    #[test]
+    fn zod_flavor_defaults_to_classic_and_accepts_mini() {
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "types": true, "zod": true });
+        let resolved = load_json(&value).expect("zod without options should resolve");
+        assert_eq!(resolved.zod.flavor, ZodFlavor::Classic);
+
+        value["zod"] = json!({ "flavor": "mini" });
+        let resolved = load_json(&value).expect("zod mini should resolve");
+        assert_eq!(resolved.zod.flavor, ZodFlavor::Mini);
+    }
+
+    #[test]
+    fn zod_options_require_the_zod_artifact() {
+        // The block only configures the artifact's own output, so naming a flavor while the
+        // artifact is off asks for nothing — say so rather than emitting types under a setting the
+        // reader believes took effect.
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "types": true, "zod": false });
+        value["zod"] = json!({ "flavor": "mini" });
+        let diagnostics = load_json(&value).expect_err("zod options without the artifact");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_DISABLED_OPTIONS),
+            "{diagnostics:#?}"
+        );
     }
 
     #[test]

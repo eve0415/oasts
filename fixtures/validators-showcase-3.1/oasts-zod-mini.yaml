@@ -1,0 +1,9 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-zod-mini
+artifacts:
+  types: true
+  zod: true
+zod:
+  flavor: mini

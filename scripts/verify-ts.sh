@@ -22,16 +22,22 @@ shopt -s globstar
 # generated output, generate under one config and typecheck it, then regenerate into a sibling dir
 # and diff to prove generation is byte-stable. The gate label and message differ per caller, so they
 # are passed in; the working-dir name is the caller's to choose because later steps reopen specific
-# ones by path. Args: fixture config work-dir gate-label message.
+# ones by path. A 6th argument links the runtime's node_modules into the tree, which the zod rows
+# need and nothing else does — only the tree tsc runs on, since `--moduleResolution bundler`
+# resolves from the importing file's own tree and the repeat tree is only ever diffed.
+# Args: fixture config work-dir gate-label message [link-node-modules].
 generate_and_verify() {
-  local f=$1 cfg=$2 d=$3 label=$4 message=$5
+  local f=$1 cfg=$2 d=$3 label=$4 message=$5 link=${6:-}
   cp -r "fixtures/$f" "$d"
-  rm -rf "$d"/generated "$d"/generated-client "$d"/generated-validators "$d"/generated-zod "$d"/generated-zod-client
+  rm -rf "$d"/generated*
+  if [[ -n "$link" ]]; then
+    ln -s "$PWD/crates/oasts-core/runtime/node_modules" "$d/node_modules"
+  fi
   (cd "$d" && "$OLDPWD/$bin" generate --config "$cfg")
   pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$d"/generated*/**/*.ts
   echo "tsc --strict $label ok: $message"
   cp -r "fixtures/$f" "$d-repeat"
-  rm -rf "$d-repeat"/generated "$d-repeat"/generated-client "$d-repeat"/generated-validators
+  rm -rf "$d-repeat"/generated*
   (cd "$d-repeat" && "$OLDPWD/$bin" generate --config "$cfg")
   diff -r "$d"/generated* "$d-repeat"/generated*
   echo "double-generation byte identity ok: $message"
@@ -142,38 +148,48 @@ echo "validators conformance ok: validators-readonly-3.1"
 OASTS_VALIDATORS_GENERATED_ROOT="$work/validators-webhooks-showcase-3.1-oasts-validators/generated-validators" OASTS_VALIDATORS_CONFORMANCE_FIXTURE=webhooks node --test crates/oasts-core/runtime/test-conformance/
 echo "validators conformance ok: webhooks-showcase-3.1"
 
-# Zod gets its own block rather than joining the loop above: emitted zod schemas import `zod`, so
-# both tsc and node need a node_modules that resolves it, and the package lives in the runtime
-# workspace rather than the repo root. Symlinking it into the work tree is what makes the generated
-# output loadable from a temp directory at all.
-repo=$PWD
-zod_work="$work/zod-validators-showcase-3.1"
-cp -r fixtures/validators-showcase-3.1 "$zod_work"
-rm -rf "$zod_work"/generated "$zod_work"/generated-client "$zod_work"/generated-validators "$zod_work"/generated-zod "$zod_work"/generated-zod-client
-ln -s "$repo/crates/oasts-core/runtime/node_modules" "$zod_work/node_modules"
-(cd "$zod_work" && "$repo/$bin" generate --config oasts-zod.yaml)
-pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$zod_work"/generated-zod/**/*.ts
-echo "tsc --strict zod ok: validators-showcase-3.1"
+# Zod rows go through the shared helper like everything else, with the node_modules link turned on:
+# emitted zod schemas import `zod`, both tsc and node need to resolve it, and the package lives in
+# the runtime workspace rather than the repo root.
+#
+# What each row buys:
+#   - zod / zod-mini: the same document under both flavors. Mini's emitted schemas import a
+#     different entry point and spell catchall and the cycle annotation differently, then satisfy
+#     the SAME frozen vectors classic does — running the vectors twice rather than writing a second
+#     set is the point, since a mini-specific expectation file could absorb a real divergence.
+#   - the two client rows: the client bound to the zod engine under each flavor. Emitted client
+#     bytes differ from the generated-engine build only in the two import lines per operation
+#     module, so this proves the binding is a directory swap and nothing else, and that the flavor
+#     and the binding compose — the client emitter picks the artifact by directory and never names
+#     an entry point.
+#   - petstore under mini: the showcase has no response headers, so its output never reaches the
+#     one emission site whose type identity is flavor-sensitive — the response-header schema, which
+#     renders as `z.custom<T>()`, `ZodCustom` under classic and `ZodMiniCustom` under mini.
+zod_runs=(
+  "validators-showcase-3.1 oasts-zod.yaml zod-showcase"
+  "validators-showcase-3.1 oasts-zod-mini.yaml zod-showcase-mini"
+  "validators-showcase-3.1 oasts-zod-client.yaml zod-showcase-client"
+  "validators-showcase-3.1 oasts-zod-mini-client.yaml zod-showcase-mini-client"
+  "petstore-3.0 oasts-zod-mini.yaml zod-petstore-mini"
+)
+for run in "${zod_runs[@]}"; do
+  read -r fixture config dir <<<"$run"
+  generate_and_verify "$fixture" "$config" "$work/$dir" zod "$fixture ($config)" link
+done
 
-cp -r fixtures/validators-showcase-3.1 "$zod_work-repeat"
-rm -rf "$zod_work-repeat"/generated "$zod_work-repeat"/generated-client "$zod_work-repeat"/generated-validators "$zod_work-repeat"/generated-zod "$zod_work-repeat"/generated-zod-client
-(cd "$zod_work-repeat" && "$repo/$bin" generate --config oasts-zod.yaml)
-diff -r "$zod_work"/generated-zod "$zod_work-repeat"/generated-zod
-echo "double-generation byte identity ok: validators-showcase-3.1 (zod)"
-
-# The client bound to the zod engine. Emitted client bytes differ from the generated-engine build
-# only in the two import lines per operation module, so this proves the binding is a directory swap
-# and nothing else — and that the emitted client still typechecks against zod's entry points.
-(cd "$zod_work" && "$repo/$bin" generate --config oasts-zod-client.yaml)
-pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$zod_work"/generated-zod-client/**/*.ts
-echo "tsc --strict zod-client ok: validators-showcase-3.1"
+# An assertion about coverage rather than a run, so it sits outside the loop: if petstore ever stops
+# emitting a response-header schema, the row above silently stops testing what it is there for.
+grep -rq 'z.custom<' "$work/zod-petstore-mini/generated-zod-mini/zod/operations" \
+  || { echo "verify-ts: petstore mini output no longer covers the response-header schema" >&2; exit 1; }
 
 # The zod artifact's own vectors, plus the dual-engine suite. Both roots come from the same showcase
 # document under two configs, which is what makes the pairwise verdict/value comparison meaningful:
 # the engines are compared against each other, not each against its own expectations.
-OASTS_ZOD_GENERATED_ROOT="$zod_work/generated-zod" \
-  OASTS_VALIDATORS_GENERATED_ROOT="$work/validators-validators-showcase-3.1-oasts/generated" \
-  node --test crates/oasts-core/runtime/test-conformance/zod-runner.ts
-echo "zod + dual-engine conformance ok: validators-showcase-3.1"
+for flavor in zod-showcase/generated-zod zod-showcase-mini/generated-zod-mini; do
+  OASTS_ZOD_GENERATED_ROOT="$work/$flavor" \
+    OASTS_VALIDATORS_GENERATED_ROOT="$work/validators-validators-showcase-3.1-oasts/generated" \
+    node --test crates/oasts-core/runtime/test-conformance/zod-runner.ts
+  echo "zod + dual-engine conformance ok: validators-showcase-3.1 ($flavor)"
+done
 
 node --test crates/oasts-core/runtime/test-e2e/

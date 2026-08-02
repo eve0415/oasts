@@ -144,10 +144,10 @@ keys:
         deallocs: 19134
         allocBytes: 1201887
       - stage: "emit"
-        allocs: 666544
-        reallocs: 277703
-        deallocs: 660829
-        allocBytes: 107734105
+        allocs: 651873
+        reallocs: 291009
+        deallocs: 646158
+        allocBytes: 107424640
     informational:
       peakBytes: 95101476
   - fixture: "petstore-3.0"
@@ -194,10 +194,10 @@ keys:
         deallocs: 30
         allocBytes: 2788
       - stage: "emit"
-        allocs: 874
-        reallocs: 261
-        deallocs: 845
-        allocBytes: 98452
+        allocs: 864
+        reallocs: 263
+        deallocs: 835
+        allocBytes: 98378
     informational:
       peakBytes: 93424
   - fixture: "petstore-3.0-client"

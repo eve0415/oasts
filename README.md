@@ -28,7 +28,7 @@ Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtim
 | --- | --- |
 | TypeScript types | ✅ |
 | Typed fetch client | ✅ |
-| Zod schemas | ✅ — needs `zod` ^4.4.0 in your project |
+| Zod schemas | ✅ — needs `zod` ^4.4.0 in your project; `zod/mini` supported |
 | Standalone validators | ✅ |
 | TanStack Query hooks | Planned |
 | MSW handlers | Planned |
@@ -140,6 +140,30 @@ validation:
   engine: off
   unchecked: allow
 ```
+
+### Zod flavor
+
+The zod artifact imports classic `zod` by default. Set `zod.flavor: mini` to import `zod/mini` instead — the tree-shakable entry point, same package, same `^4.4.0` peer range, no extra dependency.
+
+```yaml
+artifacts:
+  types: true
+  zod: true
+zod:
+  flavor: mini
+```
+
+Both flavors share one parsing core and are held to the same conformance vectors, so verdicts and parsed values are identical. What changes is what your bundler can drop. Each row below is one esbuild bundle over the named entry points from the GitHub spec's generated artifact, minified, gzipped:
+
+| bundle | `zod` | `zod/mini` |
+| --- | --- | --- |
+| `meta-get-octocat` (smallest operation) | 15.9 kB | 2.8 kB |
+| `dependabot-list-alerts-for-repo` (largest operation) | 22.3 kB | 8.1 kB |
+| the first thirty operations together | 25.5 kB | 11.4 kB |
+
+Zod itself dominates a small bundle and amortizes across a large one, which is why the smallest operation gains the most proportionally.
+
+Pick classic if you hand the emitted schemas to something that expects a classic `ZodType` — under mini they are `ZodMiniType`.
 
 ## Determinism
 

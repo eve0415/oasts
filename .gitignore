@@ -27,7 +27,7 @@ packages/oasts/config.ts
 fixtures/*/generated/
 fixtures/*/generated-client/
 fixtures/*/generated-validators/
-fixtures/*/generated-zod/
+fixtures/*/generated-zod*/
 
 # Node
 node_modules/
