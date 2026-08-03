@@ -1,0 +1,302 @@
+openapi: 3.1.0
+info:
+  title: Transform showcase
+  version: 1.0.0
+  description: >-
+    Every declared position a date/time transform can occupy, in one document: component and inline
+    schemas, compositions, arrays and tuples, parameters, request and response bodies, and a
+    documented error body. The same document is generated under each non-string representation, so
+    a position that only transforms in one mode still has to compile in the others.
+servers:
+  - url: https://transform.example.test
+paths:
+  /events/{occurredAt}:
+    get:
+      operationId: readEvent
+      summary: Read one event by the instant it occurred.
+      parameters:
+        - name: occurredAt
+          in: path
+          required: true
+          description: A path parameter that transforms before serialization.
+          schema:
+            type: string
+            format: date-time
+        - name: since
+          in: query
+          required: false
+          description: A query parameter that transforms before serialization.
+          schema:
+            type: string
+            format: date-time
+        - name: window
+          in: query
+          required: false
+          description: An array parameter — the validator must still observe an array, not a string.
+          schema:
+            type: array
+            items:
+              type: string
+              format: date-time
+        - name: onDay
+          in: query
+          required: false
+          description: A plain-date query parameter.
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: The event, as a component that reaches a transform.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '4XX':
+          description: A documented error body carrying a transforming property.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Failure'
+  /events/latest:
+    get:
+      operationId: getLatestEvent
+      summary: >-
+        The one operation with no request-surface transform, so a response-side assertion observes
+        the response pipeline alone rather than whatever the request pipeline did to the URL.
+      responses:
+        '200':
+          description: The most recent event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '4XX':
+          description: A documented error body carrying a transforming property.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Failure'
+  /events:
+    post:
+      operationId: recordEvent
+      summary: Record an event from a component request body.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventDraft'
+      responses:
+        '201':
+          description: The recorded event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '422':
+          description: A documented rejection carrying a transforming property.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Failure'
+  /events/inline:
+    post:
+      operationId: recordInlineEvent
+      summary: Both bodies are inline schemas rather than component references.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - startedAt
+              properties:
+                startedAt:
+                  type: string
+                  format: date-time
+                finishedAt:
+                  type: string
+                  format: date-time
+                onDay:
+                  type: string
+                  format: date
+      responses:
+        '200':
+          description: An inline response schema that reaches a transform.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - acceptedAt
+                properties:
+                  acceptedAt:
+                    type: string
+                    format: date-time
+                  label:
+                    type: string
+  /events/collections:
+    post:
+      operationId: recordEventCollections
+      summary: Arrays and tuples of transforming values, at both surfaces.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventCollections'
+      responses:
+        '200':
+          description: The same collection shapes on the response surface.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventCollections'
+  /events/compositions:
+    post:
+      operationId: recordEventComposition
+      summary: A transforming value reached through allOf and through oneOf.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompositeEvent'
+      responses:
+        '200':
+          description: The same composition on the response surface.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompositeEvent'
+components:
+  schemas:
+    Event:
+      type: object
+      description: A component schema with a date-time property.
+      required:
+        - id
+        - occurredAt
+      properties:
+        id:
+          type: string
+        occurredAt:
+          type: string
+          format: date-time
+        retiredOn:
+          type: string
+          format: date
+        label:
+          type: string
+    EventDraft:
+      type: object
+      description: The request-surface twin of Event.
+      required:
+        - occurredAt
+      properties:
+        occurredAt:
+          type: string
+          format: date-time
+        retiredOn:
+          type: string
+          format: date
+        label:
+          type: string
+    Failure:
+      type: object
+      description: A documented error body whose properties transform like any other.
+      required:
+        - message
+        - detectedAt
+      properties:
+        message:
+          type: string
+        detectedAt:
+          type: string
+          format: date-time
+    EventCollections:
+      type: object
+      description: Arrays and tuples of transforming values.
+      required:
+        - instants
+      properties:
+        instants:
+          type: array
+          items:
+            type: string
+            format: date-time
+        days:
+          type: array
+          items:
+            type: string
+            format: date
+        span:
+          description: A tuple whose first two positions transform and whose third does not.
+          type: array
+          prefixItems:
+            - type: string
+              format: date-time
+            - type: string
+              format: date-time
+            - type: string
+          items: false
+        nested:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+    EventBase:
+      type: object
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+    Scheduled:
+      type: object
+      description: >-
+        An allOf branch contributing a transforming property. Its discriminator property is a
+        literal, which is what lets a reader — and the emitted codec — tell the branches apart.
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required:
+            - kind
+            - scheduledFor
+          properties:
+            kind:
+              const: scheduled
+            scheduledFor:
+              type: string
+              format: date-time
+    Cancelled:
+      type: object
+      description: A second branch, so oneOf has to dispatch between them.
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required:
+            - kind
+            - cancelledAt
+          properties:
+            kind:
+              const: cancelled
+            cancelledAt:
+              type: string
+              format: date-time
+            reason:
+              type: string
+    CompositeEvent:
+      description: >-
+        A oneOf over two allOf branches, each reaching a transform. Two object branches that
+        transform differently need a discriminator to tell them apart — without one the compiler
+        refuses the union rather than guess which codec applies.
+      oneOf:
+        - $ref: '#/components/schemas/Scheduled'
+        - $ref: '#/components/schemas/Cancelled'
+      discriminator:
+        propertyName: kind
+        mapping:
+          scheduled: '#/components/schemas/Scheduled'
+          cancelled: '#/components/schemas/Cancelled'

@@ -33,7 +33,6 @@ const CODE_CLIENT_REQUIRES_TYPES: &str = "OASTS0112";
 const CODE_MSW_REQUIRES_TYPES: &str = "OASTS0113";
 const CODE_DISABLED_OPTIONS: &str = "OASTS0121";
 const CODE_DATE_REPRESENTATION: &str = "OASTS0131";
-const CODE_DATE_TRANSFORM_UNSUPPORTED: &str = "OASTS0132";
 const CODE_VALIDATION_REQUIRED: &str = "OASTS0151";
 const CODE_VALIDATION_ENGINE_REQUIRED: &str = "OASTS0152";
 const CODE_VALIDATION_WITHOUT_CLIENT: &str = "OASTS0161";
@@ -1238,23 +1237,18 @@ pub fn resolve_config(
     );
 
     let types = raw.types.unwrap_or_default();
-    if types.date_time != DateTimeRepresentation::String || types.date != DateRepresentation::String
+    // The codecs are emitted under the client artifact and only run at client pipeline positions,
+    // so a transforming representation without the client artifact has nowhere to bind.
+    if (types.date_time != DateTimeRepresentation::String
+        || types.date != DateRepresentation::String)
+        && !artifact_states.client.enabled
     {
-        if artifact_states.client.enabled {
-            sink.push(config_error(
-                CODE_DATE_TRANSFORM_UNSUPPORTED,
-                "non-string dateTime/date representations require the transform layer, which is not yet supported in this build",
-                Some(source_path),
-                Some("/types"),
-            ));
-        } else {
-            sink.push(config_error(
-                CODE_DATE_REPRESENTATION,
-                "non-string dateTime/date representations require the client artifact",
-                Some(source_path),
-                Some("/types"),
-            ));
-        }
+        sink.push(config_error(
+            CODE_DATE_REPRESENTATION,
+            "non-string dateTime/date representations require the client artifact",
+            Some(source_path),
+            Some("/types"),
+        ));
     }
 
     let naming = raw.naming.unwrap_or_default();
@@ -3426,19 +3420,30 @@ mod tests {
     }
 
     #[test]
-    fn non_string_dates_with_client_report_the_m3_build_limit() {
-        for types in [
-            json!({ "dateTime": "date" }),
-            json!({ "dateTime": "temporal" }),
-            json!({ "date": "temporal" }),
+    fn non_string_dates_with_client_resolve() {
+        for (types, expected_date_time, expected_date) in [
+            (
+                json!({ "dateTime": "date" }),
+                DateTimeRepresentation::Date,
+                DateRepresentation::String,
+            ),
+            (
+                json!({ "dateTime": "temporal" }),
+                DateTimeRepresentation::Temporal,
+                DateRepresentation::String,
+            ),
+            (
+                json!({ "date": "temporal" }),
+                DateTimeRepresentation::String,
+                DateRepresentation::Temporal,
+            ),
         ] {
             let mut value = valid_client_json_value();
             value["types"] = types;
-            let diagnostics = assert_code(load_json(&value), CODE_DATE_TRANSFORM_UNSUPPORTED);
-            assert!(diagnostics.iter().any(|diagnostic| {
-                diagnostic.message
-                    == "non-string dateTime/date representations require the transform layer, which is not yet supported in this build"
-            }));
+            let resolved = load_json(&value)
+                .expect("a non-string date representation with the client artifact should resolve");
+            assert_eq!(resolved.types.date_time, expected_date_time);
+            assert_eq!(resolved.types.date, expected_date);
         }
     }
 

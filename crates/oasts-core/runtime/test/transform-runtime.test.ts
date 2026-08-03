@@ -5,6 +5,7 @@ import { describe, test } from "node:test";
 import { TransformError } from "../result.ts";
 import {
   decodeDateTimeDate,
+  guarded,
   decodeInstant,
   decodePlainDate,
   encodeDateTimeDate,
@@ -328,4 +329,83 @@ describe("the frozen TransformError surface", () => {
       assert.ok(error instanceof Error);
     });
   }
+});
+
+describe("guarded", () => {
+  const GUARD_POINTER = {
+    logicalSourceId: "workspace/openapi.yaml",
+    jsonPointer: "/paths/~1events/get/responses/200",
+  };
+
+  test("passes a successful conversion straight through", () => {
+    assert.equal(
+      guarded(() => "converted", "response", GUARD_POINTER),
+      "converted",
+    );
+  });
+
+  test("rethrows a TransformError unchanged, so the leaf's own path survives", () => {
+    const original = assertRejects(
+      () => decodeDateTimeDate("not a timestamp", POINTER, PATH),
+      "invalid-wire-value",
+      "response",
+      "leaf rejection",
+    );
+    let thrown: unknown;
+    try {
+      guarded(
+        () => {
+          throw original;
+        },
+        "response",
+        GUARD_POINTER,
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    assert.equal(thrown, original, "the original error is rethrown by identity");
+    assert.deepEqual(original.applicationPath, PATH, "its path is not overwritten");
+  });
+
+  test("converts a native container fault into a wire-value failure", () => {
+    // The realistic trigger — a `null` body where an object is declared — is exercised end to end
+    // in test-e2e/transform.test.ts. What this pins is the conversion itself: any non-TransformError
+    // becomes a wire-value failure carrying the entry point's pointer and the native error as cause.
+    let thrown: unknown;
+    const fault = new TypeError("Cannot read properties of null (reading 'occurredAt')");
+    try {
+      guarded(
+        () => {
+          throw fault;
+        },
+        "response",
+        GUARD_POINTER,
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    assert.ok(thrown instanceof TransformError);
+    assert.equal(thrown.code, "invalid-wire-value");
+    assert.equal(thrown.direction, "response");
+    assert.deepEqual(thrown.sourcePointer, GUARD_POINTER);
+    assert.equal(thrown.cause, fault, "the native error is preserved as the cause");
+  });
+
+  test("an encode-side fault is an application-value failure", () => {
+    let thrown: unknown;
+    try {
+      guarded(
+        () => {
+          throw new RangeError("nope");
+        },
+        "request",
+        GUARD_POINTER,
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    assert.ok(thrown instanceof TransformError);
+    assert.equal(thrown.code, "invalid-application-value");
+    assert.equal(thrown.direction, "request");
+  });
 });

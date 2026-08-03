@@ -22,6 +22,39 @@ export function pushPath(path: ApplicationPath, key: string | number): Applicati
 }
 
 /**
+ * Runs one conversion, turning any non-`TransformError` throw into one.
+ *
+ * The codecs validate every leaf they read, but they walk containers by property access and
+ * `.map()` — so a body that parses as JSON and is simply the wrong shape (`null`, or an array where
+ * an object is declared) faults natively part-way through rather than at a leaf. That is a decode
+ * failure like any other, and the contract is that a decode failure is a result arm, not a rejected
+ * promise. Wrapping at the operation's own entry point covers every position beneath it, so the
+ * per-property codecs stay free of shape guards they would otherwise repeat at every node.
+ *
+ * The native error is preserved as `cause`; the pointer is the converting position's own.
+ */
+export function guarded<T>(
+  convert: () => T,
+  direction: TransformError["direction"],
+  pointer: SourcePointer,
+): T {
+  try {
+    return convert();
+  } catch (error) {
+    if (error instanceof TransformError) {
+      throw error;
+    }
+    throw new TransformError({
+      direction,
+      code: direction === "response" ? "invalid-wire-value" : "invalid-application-value",
+      sourcePointer: pointer,
+      applicationPath: [],
+      cause: error,
+    });
+  }
+}
+
+/**
  * `value` without `key`.
  *
  * A converted optional property cannot simply be spread over the original: TypeScript unions the

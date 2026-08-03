@@ -24,11 +24,7 @@ schemas/
 packages/oasts/config.ts
 
 # Generated fixture output (oasts generate writes here; scratch, never committed)
-fixtures/*/generated/
-fixtures/*/generated-client/
-fixtures/*/generated-validators/
-fixtures/*/generated-zod*/
-fixtures/*/generated-msw*/
+fixtures/*/generated*/
 
 # Node
 node_modules/

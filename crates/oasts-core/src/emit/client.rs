@@ -290,7 +290,15 @@ fn emit_operation(
     file_base: &str,
 ) -> String {
     let stem = uppercase_first(allocated_name);
-    let operation_type_names = operation_type_imports(plan, &stem);
+    let transforming = model.transform_facts().enabled();
+    let wire_responses = response_transform_flags(model, plan);
+    let response_transforms = response_transform_bindings(plan, &stem, &wire_responses);
+    let request_transforms = request_transform_binding(model, plan);
+    // The object the request actually dispatches, named once: the validators read it and `execute`
+    // receives it, and two spellings of the same choice would disagree as an undeclared binding in
+    // the emitted module rather than as a failure here.
+    let dispatch_root = if request_transforms { "wire" } else { "input" };
+    let mut operation_type_names = operation_type_imports(plan, &stem, &wire_responses);
     let uses_typed_headers = plan
         .response_table
         .iter()
@@ -299,7 +307,15 @@ fn emit_operation(
     let documentation = model.config.documentation.clone();
     // Everything that renders a component type lives in this one borrow scope, because the scope
     // has to end before `model.header()` can reborrow the model mutably.
-    let (input, result_type, envelope_type, component_aliases, alias_diagnostics) = {
+    let (
+        input,
+        input_wire,
+        request_twin,
+        result_type,
+        envelope_type,
+        component_aliases,
+        alias_diagnostics,
+    ) = {
         let renderer = TypesEmitter::new(model);
         for parameter in &plan.param_plans {
             renderer.collect_operation_imports(
@@ -328,17 +344,50 @@ fn emit_operation(
             (HashMap::new(), Vec::new())
         } else {
             assign_import_aliases(
-                &client_declarations(&stem, &operation_type_names),
+                &client_declarations(&stem, &operation_type_names, transforming),
                 client_module_bindings(),
                 &component_imports,
                 &operation.source,
             )
         };
         renderer.set_import_aliases(aliases.clone());
-        let arms = response_result_arms(&renderer, plan, &stem);
+        let arms = response_result_arms(&renderer, plan, &stem, &[]);
+        let mut result_type = render_result_type(&arms, plan, &stem, "");
+        // The pre-conversion union is declared next to the converted one so a reader sees both
+        // surfaces in the module that converts between them, and so `execute`'s type argument names
+        // a declaration rather than an inline union.
+        if !response_transforms.is_empty() {
+            let wire_arms = response_result_arms(&renderer, plan, &stem, &wire_responses);
+            result_type.push('\n');
+            result_type.push_str(&render_result_type(&wire_arms, plan, &stem, "Wire"));
+        }
+        // Whether the types artifact declared the request's wire twin. `render_input` names it on
+        // the wire axis, so the same answer decides both the rendering and the import below.
+        let request_twin = renderer.request_transforms(operation);
+        let input_wire = request_transforms.then(|| {
+            render_input(
+                &renderer,
+                operation,
+                plan,
+                &stem,
+                &documentation,
+                TypeAxis::Wire,
+                request_twin,
+            )
+        });
         (
-            render_input(&renderer, operation, plan, &stem, &documentation),
-            render_result_type(&arms, plan, &stem),
+            render_input(
+                &renderer,
+                operation,
+                plan,
+                &stem,
+                &documentation,
+                TypeAxis::Application,
+                request_twin,
+            ),
+            input_wire,
+            request_twin,
+            result_type,
             successful_envelope_union(&arms),
             aliases,
             diagnostics,
@@ -346,6 +395,14 @@ fn emit_operation(
     };
     for diagnostic in alias_diagnostics {
         model.sink.push(diagnostic);
+    }
+    // The wire input names the request's wire twin for its JSON body member, so that declaration
+    // has to come across with the rest of the operation's types.
+    if input_wire.is_some()
+        && request_twin
+        && plan.body_plan.as_ref().is_some_and(body_uses_json_alias)
+    {
+        operation_type_names.insert(format!("{stem}RequestWire"));
     }
     let mut function_docs_operation = operation.clone();
     for parameter in &mut function_docs_operation.parameters {
@@ -369,7 +426,8 @@ fn emit_operation(
         .is_some_and(|validation| !validation.response);
     let decoding_notes = multipart_decoding_notes(plan);
     let (validate_request, validate_response) = validation_flags(model);
-    let request_checks = request_validation_checks(operation, plan, &stem, validate_request);
+    let request_checks =
+        request_validation_checks(operation, plan, &stem, validate_request, dispatch_root);
     let response_checks = response_validation_checks(plan, &stem, validate_response);
     let validation_binding = !request_checks.is_empty() || !response_checks.is_empty();
     let mut output = model.header();
@@ -408,10 +466,19 @@ fn emit_operation(
         "../../{runtime_directory}/result{extension}"
     )));
     output.push_str(";\n");
-    if validation_binding {
-        // `unwrap` reuses the result module's failed-branch throw so the orThrow variant delegates
-        // to the validated base function instead of the runtime's unvalidated executeOrThrow.
-        output.push_str("import { unwrap } from ");
+    // `unwrap` reuses the result module's failed-branch throw so the orThrow variant delegates to
+    // the bound base function instead of the runtime's unbound executeOrThrow. `TransformError` is
+    // the class a conversion's catch narrows on, and comes from the same module.
+    let binds_transform = request_transforms || !response_transforms.is_empty();
+    let result_values = match (binds_transform, validation_binding || binds_transform) {
+        (true, _) => "TransformError, unwrap",
+        (false, true) => "unwrap",
+        (false, false) => "",
+    };
+    if !result_values.is_empty() {
+        output.push_str("import { ");
+        output.push_str(result_values);
+        output.push_str(" } from ");
         output.push_str(&render_ts_string(&format!(
             "../../{runtime_directory}/result{extension}"
         )));
@@ -485,6 +552,25 @@ fn emit_operation(
             validation_artifact_dir(model),
         );
     }
+    // The operation's own codec module, one import for both directions: the encoder the request
+    // conversion calls and every decoder its converting response branches call.
+    // One decoder per declared response plus at most one encoder, so the names are distinct by
+    // construction; sorting is the only thing the emitted order needs.
+    let mut codec_names = response_transforms
+        .iter()
+        .map(|transform| transform.decoder.clone())
+        .collect::<Vec<_>>();
+    if request_transforms {
+        codec_names.push(format!("encode{stem}Input"));
+    }
+    codec_names.sort_unstable();
+    if !codec_names.is_empty() {
+        output.push_str(&format!("import {{ {} }} from ", codec_names.join(", ")));
+        output.push_str(&render_ts_string(&format!(
+            "../transform/operations/{file_base}{extension}"
+        )));
+        output.push_str(";\n");
+    }
     output.push('\n');
 
     write_source_metadata(&mut output, &operation.source, 0);
@@ -501,6 +587,15 @@ fn emit_operation(
     output.push_str("Input = ");
     output.push_str(&input);
     output.push_str(";\n\n");
+
+    if let Some(input_wire) = &input_wire {
+        write_source_metadata(&mut output, &operation.source, 0);
+        output.push_str("export type ");
+        output.push_str(&stem);
+        output.push_str("InputWire = ");
+        output.push_str(input_wire);
+        output.push_str(";\n\n");
+    }
 
     write_source_metadata(&mut output, &operation.source, 0);
     write_client_operation_tsdoc(
@@ -543,6 +638,9 @@ fn emit_operation(
         &stem,
         &request_checks,
         &response_checks,
+        request_transforms,
+        dispatch_root,
+        &response_transforms,
     ));
     output.push_str("}\n\n");
 
@@ -564,10 +662,12 @@ fn emit_operation(
     output.push_str("CallArgs<S>): Promise<");
     output.push_str(&envelope_type);
     output.push_str("> {\n");
+    // A conversion binds the same way a validator does: the orThrow variant delegates to the base
+    // function so the throw happens after the conversion, not around it.
     output.push_str(&throw_function_body(
         allocated_name,
         &stem,
-        validation_binding,
+        validation_binding || binds_transform,
     ));
     output.push_str("}\n");
     output
@@ -622,6 +722,99 @@ struct ResponseCheck {
 
 /// `(validate_request, validate_response)` — both false unless a non-off engine is resolved, which
 /// keeps the emitted client bytes identical to today for `engine: off`.
+/// One documented response branch whose payload the transform layer converts after dispatch.
+struct ResponseTransform {
+    /// The rendered `outcome` literal, the same value the result union's arm carries.
+    outcome: String,
+    /// The emitted codec this branch calls, from the operation's own transform module.
+    decoder: String,
+    /// Which field carries the payload — `default` spans both, so `result.ok` picks at runtime.
+    body: ResponseBody,
+}
+
+/// Which declared responses carry a payload the transform layer converts, in `response_table`
+/// order.
+///
+/// A branch that renders its payload inline — content-type discriminated, or multipart — names one
+/// type per media entry rather than the status-wide alias the emitted codec is keyed on, so it
+/// cannot bind here. `unconvertible_transform_diagnostics` refuses those rather than leaving one
+/// silently unconverted under a type that says it converted.
+fn response_transform_flags(model: &EmissionModel<'_, '_>, plan: &OperationPlan) -> Vec<bool> {
+    if !model.transform_facts().enabled() {
+        return Vec::new();
+    }
+    plan.response_table
+        .iter()
+        .map(|response| {
+            matches!(response.payload, PayloadDisposition::Payload)
+                && !renders_payload_inline(response)
+                // JSON only, matching the types artifact's own twin rule: a `text/plain` payload
+                // stays a string on both surfaces, declares no wire twin, and gets no codec, so
+                // binding it here would import two symbols that were never emitted.
+                && response
+                    .media
+                    .iter()
+                    .any(|entry| {
+                        is_json(media_essence(&entry.media))
+                            && model.transform_facts().reaches(&entry.schema)
+                    })
+        })
+        .collect()
+}
+
+/// Whether the request surface carries a value the transform layer converts, and so binds an
+/// encode call before dispatch.
+///
+/// A caller-serialized parameter is excluded: its input is the caller's own pre-serialized string,
+/// so there is no application value to convert. Every body shape this cannot carry is refused by
+/// `unconvertible_transform_diagnostics` rather than left to convert silently.
+///
+/// The transform emitter reads this rather than restating it: it decides on the same condition
+/// whether to export the encoder this module imports, and two independently written answers would
+/// disagree as a compile error in the emitted code rather than as a failing test here.
+pub(super) fn request_transform_binding(
+    model: &EmissionModel<'_, '_>,
+    plan: &OperationPlan,
+) -> bool {
+    if !model.transform_facts().enabled() {
+        return false;
+    }
+    plan.param_plans.iter().any(|parameter| {
+        !parameter.caller_serialized && model.transform_facts().reaches(&parameter.schema)
+    }) || json_body_transforms(model, plan.body_plan.as_ref())
+}
+
+/// Whether a request body's JSON payload converts, following the discriminated arms the same way
+/// the body renderer does.
+fn json_body_transforms(model: &EmissionModel<'_, '_>, plan: Option<&BodyPlan>) -> bool {
+    match plan {
+        Some(BodyPlan::Json {
+            schema: Some(schema),
+            ..
+        }) => model.transform_facts().reaches(schema),
+        // A discriminated body is a union of `{ contentType, body }` shapes, not one payload the
+        // operation's encoder is keyed on; it is refused rather than bound.
+        _ => false,
+    }
+}
+
+fn response_transform_bindings(
+    plan: &OperationPlan,
+    stem: &str,
+    converts: &[bool],
+) -> Vec<ResponseTransform> {
+    plan.response_table
+        .iter()
+        .zip(converts.iter().copied())
+        .filter(|(_, converts)| *converts)
+        .map(|(response, _)| ResponseTransform {
+            outcome: outcome_literal(response),
+            decoder: format!("decode{}", response_type_name(stem, response)),
+            body: response_body_side(response.kind, &response.match_key),
+        })
+        .collect()
+}
+
 fn validation_flags(model: &EmissionModel<'_, '_>) -> (bool, bool) {
     match model.config.validation.as_ref() {
         Some(validation)
@@ -656,6 +849,7 @@ fn request_validation_checks(
     plan: &OperationPlan,
     stem: &str,
     enabled: bool,
+    root: &str,
 ) -> Vec<RequestCheck> {
     if !enabled {
         return Vec::new();
@@ -665,10 +859,13 @@ fn request_validation_checks(
     for (index, parameter, _) in planned_parameters(operation, plan) {
         let type_name = &names[index];
         checks.push(RequestCheck {
-            access: input_member(InputMember::Parameter {
-                location: parameter.location,
-                name: &parameter.name,
-            }),
+            access: input_member(
+                InputMember::Parameter {
+                    location: parameter.location,
+                    name: &parameter.name,
+                },
+                root,
+            ),
             validator: format!("validate{type_name}"),
             base_path: format!(
                 "[{}, {}]",
@@ -686,7 +883,7 @@ fn request_validation_checks(
             .as_ref()
             .is_some_and(|body| body.required);
         checks.push(RequestCheck {
-            access: input_member(InputMember::Body),
+            access: input_member(InputMember::Body, root),
             validator: format!("validate{stem}RequestBody"),
             base_path: "[\"body\"]".to_owned(),
             guarded: !required,
@@ -776,7 +973,11 @@ enum InputMember<'a> {
 }
 
 /// The accessor for one nested input member, reused by both the presence guard and validator call.
-fn input_member(member: InputMember<'_>) -> String {
+///
+/// `root` is the object the request actually dispatches: the caller's own input, or — where the
+/// request converts — the encoded one, so a validator observes wire values and never an application
+/// `Date`.
+fn input_member(member: InputMember<'_>, root: &str) -> String {
     match member {
         InputMember::Parameter { location, name } => {
             // `location` is always one of the four fixed identifiers (path/query/header/cookie), so
@@ -784,12 +985,12 @@ fn input_member(member: InputMember<'_>) -> String {
             let location = location_name(location);
             let key = render_property_key(name);
             if key == name {
-                format!("input.{location}?.{name}")
+                format!("{root}.{location}?.{name}")
             } else {
-                format!("input.{location}?.[{key}]")
+                format!("{root}.{location}?.[{key}]")
             }
         }
-        InputMember::Body => "input.body".to_owned(),
+        InputMember::Body => format!("{root}.body"),
     }
 }
 
@@ -836,11 +1037,33 @@ fn result_function_body(
     stem: &str,
     request: &[RequestCheck],
     response: &[ResponseCheck],
+    encodes_request: bool,
+    dispatched: &str,
+    transforms: &[ResponseTransform],
 ) -> String {
-    if request.is_empty() && response.is_empty() {
+    if request.is_empty() && response.is_empty() && transforms.is_empty() && !encodes_request {
         return format!("  return execute<{stem}Result>(transport, descriptor, input, args[0]);\n");
     }
+    // With a response conversion bound, `execute` hands back the pre-conversion surface and each
+    // converting branch is narrowed and converted before it is returned; the branches that convert
+    // nothing are the same declaration on both surfaces and fall through untouched.
+    let executed = if transforms.is_empty() {
+        format!("{stem}Result")
+    } else {
+        format!("{stem}ResultWire")
+    };
     let mut body = String::new();
+    if encodes_request {
+        body.push_str(&format!("  let wire: {stem}InputWire;\n"));
+        body.push_str("  try {\n");
+        body.push_str(&format!("    wire = encode{stem}Input(input);\n"));
+        body.push_str("  } catch (error) {\n");
+        body.push_str("    if (error instanceof TransformError) {\n");
+        body.push_str("      return { outcome: \"request-transform\", ok: false, error };\n");
+        body.push_str("    }\n");
+        body.push_str("    throw error;\n");
+        body.push_str("  }\n");
+    }
     if !request.is_empty() {
         body.push_str("  const requestIssues: Issue[] = [];\n");
         for check in request {
@@ -864,15 +1087,68 @@ fn result_function_body(
         );
         body.push_str("  }\n");
     }
-    if response.is_empty() {
+    if response.is_empty() && transforms.is_empty() {
         body.push_str(&format!(
-            "  return execute<{stem}Result>(transport, descriptor, input, args[0]);\n"
+            "  return execute<{executed}>(transport, descriptor, {dispatched}, args[0]);\n"
         ));
         return body;
     }
     body.push_str(&format!(
-        "  const result = await execute<{stem}Result>(transport, descriptor, input, args[0]);\n"
+        "  const result = await execute<{executed}>(transport, descriptor, {dispatched}, args[0]);\n"
     ));
+    if !response.is_empty() {
+        write_response_validation(&mut body, response);
+    }
+    // Conversion runs after validation, on every branch that declares one, so a validator only ever
+    // observes wire values and a decode that rejects is reported as its own arm rather than folded
+    // into a validation failure.
+    for transform in transforms {
+        write_response_transform(&mut body, transform);
+    }
+    body.push_str("  return result;\n");
+    body
+}
+
+/// One converting response branch: narrowed, converted, and returned — or reported as a
+/// `response-transform` failure. The narrowing holds inside `catch` because `result` is `const` and
+/// nothing in `try` assigns it, which is what lets the failure arm read `status` and `meta`.
+fn write_response_transform(body: &mut String, transform: &ResponseTransform) {
+    let ResponseTransform {
+        outcome, decoder, ..
+    } = transform;
+    body.push_str(&format!("  if (result.outcome === {outcome}) {{\n"));
+    body.push_str("    try {\n");
+    match transform.body {
+        ResponseBody::Data => {
+            body.push_str(&format!(
+                "      return {{ ...result, data: {decoder}(result.data) }};\n"
+            ));
+        }
+        ResponseBody::Error => {
+            body.push_str(&format!(
+                "      return {{ ...result, error: {decoder}(result.error) }};\n"
+            ));
+        }
+        ResponseBody::Both => {
+            body.push_str("      return result.ok\n");
+            body.push_str(&format!(
+                "        ? {{ ...result, data: {decoder}(result.data) }}\n"
+            ));
+            body.push_str(&format!(
+                "        : {{ ...result, error: {decoder}(result.error) }};\n"
+            ));
+        }
+    }
+    body.push_str("    } catch (error) {\n");
+    body.push_str("      if (error instanceof TransformError) {\n");
+    body.push_str("        return { outcome: \"response-transform\", ok: false, match: result.outcome, status: result.status, error, meta: result.meta };\n");
+    body.push_str("      }\n");
+    body.push_str("      throw error;\n");
+    body.push_str("    }\n");
+    body.push_str("  }\n");
+}
+
+fn write_response_validation(body: &mut String, response: &[ResponseCheck]) {
     // The outer guard admits exactly the branches that carry a check, which is what narrows
     // `result` to the arms with a `status` and a `meta` for the failure return below. A single
     // checked branch needs no inner test — the guard already established it.
@@ -914,7 +1190,7 @@ fn result_function_body(
                 }
                 None => indent,
             };
-            write_body_validator_call(&mut body, indent, media_check);
+            write_body_validator_call(body, indent, media_check);
         }
         if check
             .body
@@ -936,8 +1212,6 @@ fn result_function_body(
     body.push_str("      return { outcome: \"response-validation\", ok: false, match: result.outcome, status: result.status, issues: responseIssues, meta: result.meta };\n");
     body.push_str("    }\n");
     body.push_str("  }\n");
-    body.push_str("  return result;\n");
-    body
 }
 
 /// One validator call, selecting `result.data` or `result.error` by the branch's side — or both,
@@ -1040,7 +1314,11 @@ const CLIENT_MODULE_BINDINGS: &[&str] = &[
 /// operation-type import, so `assign_import_aliases` renames it. `Req` and `Missing` are reserved
 /// unconditionally: they are the call-args helpers, and which of them this operation declares
 /// depends on its resolved auth shape, which is not settled when imports are written.
-fn client_declarations(stem: &str, operation_type_names: &BTreeSet<String>) -> BTreeSet<String> {
+fn client_declarations(
+    stem: &str,
+    operation_type_names: &BTreeSet<String>,
+    transforming: bool,
+) -> BTreeSet<String> {
     let mut declared = BTreeSet::from([
         format!("{stem}Input"),
         format!("{stem}Result"),
@@ -1049,6 +1327,17 @@ fn client_declarations(stem: &str, operation_type_names: &BTreeSet<String>) -> B
         "Req".to_owned(),
         "Missing".to_owned(),
     ]);
+    // The pre-conversion surfaces are reserved for the whole compile rather than per operation:
+    // which operations declare one is not settled when the declaration set is built, but a
+    // representation that converts nothing can produce none of them, and reserving three names
+    // per operation there would cost three allocations for nothing.
+    if transforming {
+        declared.extend([
+            format!("{stem}ResultWire"),
+            format!("{stem}InputWire"),
+            format!("{stem}RequestWire"),
+        ]);
+    }
     declared.extend(operation_type_names.iter().cloned());
     declared
 }
@@ -1091,18 +1380,25 @@ fn write_component_imports(
     }
 }
 
-fn operation_type_imports(plan: &OperationPlan, stem: &str) -> BTreeSet<String> {
+fn operation_type_imports(
+    plan: &OperationPlan,
+    stem: &str,
+    wire_responses: &[bool],
+) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     if plan.body_plan.as_ref().is_some_and(body_uses_json_alias) {
         names.insert(format!("{stem}Request"));
     }
-    for response in &plan.response_table {
+    for (index, response) in plan.response_table.iter().enumerate() {
         // A branch that renders its payload inline has no reader for the status-wide alias, so
         // importing it would be an unused import.
         if matches!(response.payload, PayloadDisposition::Payload)
             && !renders_payload_inline(response)
         {
             names.insert(response_type_name(stem, response));
+            if wire_responses.get(index).copied().unwrap_or(false) {
+                names.insert(format!("{}Wire", response_type_name(stem, response)));
+            }
         }
         if response.has_headers {
             names.insert(format!("{}Headers", response_type_name(stem, response)));
@@ -1150,12 +1446,17 @@ fn collect_body_imports(
     }
 }
 
+/// The caller-facing input object, on either surface. The wire surface is what the request
+/// conversion produces and what `execute` then serializes; a position reaching no transform renders
+/// the same declaration on both, which is why only converting operations declare the second one.
 fn render_input(
     renderer: &TypesEmitter<'_, '_, '_>,
     operation: &Operation,
     plan: &OperationPlan,
     stem: &str,
     documentation: &DocumentationConfig,
+    axis: TypeAxis,
+    request_twin: bool,
 ) -> String {
     if plan.param_plans.is_empty() && plan.body_plan.is_none() {
         return "{}".to_owned();
@@ -1199,7 +1500,7 @@ fn render_input(
                 output.push_str(&renderer.render_type(
                     &parameter_plan.schema,
                     TypePosition::Request,
-                    TypeAxis::Application,
+                    axis,
                     4,
                 ));
             }
@@ -1217,7 +1518,14 @@ fn render_input(
             output.push('?');
         }
         output.push_str(": ");
-        output.push_str(&render_body_input(renderer, body_plan, stem, 2));
+        output.push_str(&render_body_input(
+            renderer,
+            body_plan,
+            stem,
+            2,
+            axis,
+            request_twin,
+        ));
         output.push_str(";\n");
     }
     output.push('}');
@@ -1267,18 +1575,29 @@ fn write_parameter_property_tsdoc(
     output.push_str(" */\n");
 }
 
+/// `body_twin` says the types artifact declared a wire twin of the request alias, which it does
+/// only where the request converts — so a wire-axis render for a request that converts nothing
+/// still names the application alias, the only one that exists.
 fn render_body_input(
     renderer: &TypesEmitter<'_, '_, '_>,
     plan: &BodyPlan,
     stem: &str,
     indent: usize,
+    axis: TypeAxis,
+    body_twin: bool,
 ) -> String {
     match plan {
-        BodyPlan::Json { .. } => format!("{stem}Request[\"body\"]"),
+        BodyPlan::Json { .. } => {
+            if axis == TypeAxis::Wire && body_twin {
+                format!("{stem}RequestWire[\"body\"]")
+            } else {
+                format!("{stem}Request[\"body\"]")
+            }
+        }
         BodyPlan::TopLevelText { .. } => "string".to_owned(),
         BodyPlan::TopLevelBinary { .. } => "Uint8Array".to_owned(),
         BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
-            render_form_input(renderer, fields, indent)
+            render_form_input(renderer, fields, indent, axis)
         }
         BodyPlan::ContentTypeDiscriminated { arms, all_concrete } => arms
             .iter()
@@ -1290,7 +1609,7 @@ fn render_body_input(
                 };
                 format!(
                     "{{ contentType: {content_type}; body: {} }}",
-                    render_body_input(renderer, arm, stem, indent)
+                    render_body_input(renderer, arm, stem, indent, axis, body_twin)
                 )
             })
             .collect::<Vec<_>>()
@@ -1302,6 +1621,7 @@ fn render_form_input(
     renderer: &TypesEmitter<'_, '_, '_>,
     fields: &[FormFieldPlan],
     indent: usize,
+    axis: TypeAxis,
 ) -> String {
     let mut output = String::from("{\n");
     for field in fields {
@@ -1311,7 +1631,7 @@ fn render_form_input(
             output.push('?');
         }
         output.push_str(": ");
-        output.push_str(&render_form_field_input(renderer, field, indent + 2));
+        output.push_str(&render_form_field_input(renderer, field, indent + 2, axis));
         output.push_str(";\n");
     }
     push_indent(&mut output, indent);
@@ -1323,18 +1643,15 @@ fn render_form_field_input(
     renderer: &TypesEmitter<'_, '_, '_>,
     field: &FormFieldPlan,
     indent: usize,
+    axis: TypeAxis,
 ) -> String {
     let body = match &field.serialization {
         FieldSerializationPlan::Content { media, .. } if media.binary_upload => {
             "Blob | File".to_owned()
         }
-        FieldSerializationPlan::Style { .. } | FieldSerializationPlan::Content { .. } => renderer
-            .render_type(
-                &field.schema,
-                TypePosition::Request,
-                TypeAxis::Application,
-                indent,
-            ),
+        FieldSerializationPlan::Style { .. } | FieldSerializationPlan::Content { .. } => {
+            renderer.render_type(&field.schema, TypePosition::Request, axis, indent)
+        }
     };
     if !field.wrapper.wrapped {
         return body;
@@ -1380,14 +1697,24 @@ struct ResultArm {
     headers_interface: Option<String>,
 }
 
+/// The result union's arms. `wire` marks, per declared response, the branches whose payload the
+/// transform layer converts — those name their wire twin instead, which is the surface `execute`
+/// hands back before conversion. An empty slice asks for the application surface throughout.
 fn response_result_arms(
     renderer: &TypesEmitter<'_, '_, '_>,
     plan: &OperationPlan,
     stem: &str,
+    wire: &[bool],
 ) -> Vec<ResultArm> {
     let mut arms = Vec::new();
-    for response in &plan.response_table {
-        push_response_result_arms(&mut arms, renderer, response, stem);
+    for (index, response) in plan.response_table.iter().enumerate() {
+        push_response_result_arms(
+            &mut arms,
+            renderer,
+            response,
+            stem,
+            wire.get(index).copied().unwrap_or(false),
+        );
     }
     arms
 }
@@ -1397,6 +1724,7 @@ fn push_response_result_arms(
     renderer: &TypesEmitter<'_, '_, '_>,
     response: &ResponsePlan,
     stem: &str,
+    wire: bool,
 ) {
     let status = match response.kind {
         ResponseMatchKind::Exact => response.match_key.clone(),
@@ -1430,7 +1758,7 @@ fn push_response_result_arms(
                 })
                 .collect()
         } else {
-            vec![(None, response_payload_type(response, stem))]
+            vec![(None, response_payload_type(response, stem, wire))]
         };
     // `default` is the one key that spans both outcomes, so each of its media entries yields a
     // success arm and a failure arm; every other key resolves to exactly one.
@@ -1616,11 +1944,18 @@ fn render_multipart_part_type(
     )
 }
 
-fn render_result_type(arms: &[ResultArm], plan: &OperationPlan, stem: &str) -> String {
+fn render_result_type(
+    arms: &[ResultArm],
+    plan: &OperationPlan,
+    stem: &str,
+    suffix: &str,
+) -> String {
     let mut output = String::new();
     output.push_str("export type ");
     output.push_str(stem);
-    output.push_str("Result =\n");
+    output.push_str("Result");
+    output.push_str(suffix);
+    output.push_str(" =\n");
     for arm in arms {
         write_response_result_arm(&mut output, arm);
     }
@@ -1691,12 +2026,15 @@ fn meta_type(headers_interface: Option<&str>) -> String {
     }
 }
 
-fn response_payload_type(response: &ResponsePlan, stem: &str) -> String {
+fn response_payload_type(response: &ResponsePlan, stem: &str, wire: bool) -> String {
     match response.payload {
         PayloadDisposition::NoPayload | PayloadDisposition::StaticBodyless => {
             "undefined".to_owned()
         }
-        PayloadDisposition::Payload => response_type_name(stem, response),
+        PayloadDisposition::Payload => {
+            let name = response_type_name(stem, response);
+            if wire { format!("{name}Wire") } else { name }
+        }
     }
 }
 
@@ -2697,7 +3035,7 @@ fn response_decodes_multipart(response: &ResponsePlan) -> bool {
 /// per media entry); a multipart branch does because the decoded object type is a client-side
 /// notion the types artifact does not render — the same split multipart *request* bodies already
 /// take, where the types artifact says `unknown` and `render_form_input` owns the real shape.
-fn renders_payload_inline(response: &ResponsePlan) -> bool {
+pub(super) fn renders_payload_inline(response: &ResponsePlan) -> bool {
     response.content_type_discriminated || response_decodes_multipart(response)
 }
 
@@ -2817,6 +3155,255 @@ mod tests {
             .content
             .clone();
         (content, sink.into_sorted_vec())
+    }
+
+    /// The same emission under a configured `dateTime: date` representation, which is the only way
+    /// to make any position reach the transform layer.
+    fn emit_transforming_operation(document: Value, suffix: &str) -> (String, Vec<Diagnostic>) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("openapi.json"),
+            serde_json::to_vec_pretty(&document).expect("document JSON"),
+        )
+        .expect("document");
+        let config = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.json" },
+            "output": "generated",
+            "artifacts": { "types": true, "client": true },
+            "client": {
+                "authEnforcement": "types",
+                "baseUrl": { "source": "literal", "value": "https://api.example.test/v1" }
+            },
+            "types": { "dateTime": "date" },
+            "validation": { "engine": "off", "unchecked": "allow" }
+        });
+        let config = load_config_from_json(
+            &temp.path().join("oasts.json"),
+            &serde_json::to_vec(&config).expect("config JSON"),
+        )
+        .expect("resolved config");
+        let mut sink = DiagnosticSink::new();
+        let graph = load_graph(&config, &mut sink).expect("graph");
+        let ir = parse(&graph, &mut sink).expect("IR");
+        let analyzed = analyze(ir, &config, &mut sink);
+        let client = build_client_model(&analyzed, &config, &mut sink);
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let files = emit_client_from_model(&mut model, &client);
+        drop(model);
+        let content = files
+            .iter()
+            .find(|file| file.relative_path == format!("client/operations/{suffix}.ts"))
+            .expect("operation file")
+            .content
+            .clone();
+        (content, sink.into_sorted_vec())
+    }
+
+    /// One operation returning a component whose only property converts.
+    fn transforming_response_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "T", "version": "1.0.0" },
+            "paths": {
+                "/events": {
+                    "get": {
+                        "operationId": "readEvent",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": "#/components/schemas/Event" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Event": {
+                        "type": "object",
+                        "required": ["at"],
+                        "properties": { "at": { "type": "string", "format": "date-time" } }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_converting_response_decodes_after_execute() {
+        let (content, _) =
+            emit_transforming_operation(transforming_response_document(), "readevent");
+
+        assert!(
+            content.contains(
+                "import { decodeReadEventResponse200 } from \"../transform/operations/readevent.js\";\n"
+            ),
+            "the operation module should import its response decoder: {content}"
+        );
+        assert!(
+            content.contains(
+                "  const result = await execute<ReadEventResultWire>(transport, descriptor, input, args[0]);\n"
+            ),
+            "execute should be typed on the pre-conversion surface: {content}"
+        );
+        assert!(
+            content.contains(
+                "      return { ...result, data: decodeReadEventResponse200(result.data) };\n"
+            ),
+            "the success arm should convert its payload: {content}"
+        );
+        assert!(
+            content.contains(
+                "        return { outcome: \"response-transform\", ok: false, match: result.outcome, status: result.status, error, meta: result.meta };\n"
+            ),
+            "a rejected decode should surface as a response-transform arm: {content}"
+        );
+    }
+
+    #[test]
+    fn a_converting_request_encodes_before_execute() {
+        let mut document = transforming_response_document();
+        document["paths"]["/events"]["get"]["parameters"] = json!([{
+            "name": "since",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "format": "date-time" }
+        }]);
+        let (content, _) = emit_transforming_operation(document, "readevent");
+
+        assert!(
+            content.contains(
+                "import { decodeReadEventResponse200, encodeReadEventInput } from \"../transform/operations/readevent.js\";\n"
+            ),
+            "the operation module should import its input encoder: {content}"
+        );
+        assert!(
+            content.contains("export type ReadEventInputWire = {"),
+            "the pre-serialization input surface should be declared: {content}"
+        );
+        let encode = content
+            .find("encodeReadEventInput(input)")
+            .expect("the input encoder should be called");
+        let execute = content
+            .find("await execute<ReadEventResultWire>")
+            .expect("execute should still be called");
+        assert!(
+            encode < execute,
+            "the input must be encoded before execute serializes it: {content}"
+        );
+        assert!(
+            content
+                .contains("      return { outcome: \"request-transform\", ok: false, error };\n"),
+            "a rejected encode should surface as a request-transform arm: {content}"
+        );
+        assert!(
+            content.contains(
+                "  const result = await execute<ReadEventResultWire>(transport, descriptor, wire, args[0]);\n"
+            ),
+            "execute should receive the encoded input, not the caller's: {content}"
+        );
+    }
+
+    #[test]
+    fn a_non_json_response_binds_no_codec() {
+        // `text/plain` stays a string on both surfaces, so the types artifact declares no wire twin
+        // and the transform artifact emits no decoder — binding one here would import two symbols
+        // that were never emitted.
+        let (content, _) = emit_transforming_operation(
+            json!({
+                "openapi": "3.1.0",
+                "info": { "title": "T", "version": "1.0.0" },
+                "paths": {
+                    "/events": {
+                        "post": {
+                            "operationId": "readEvent",
+                            "responses": {
+                                "200": {
+                                    "description": "ok",
+                                    "content": {
+                                        "text/plain": {
+                                            "schema": { "type": "string", "format": "date-time" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            "readevent",
+        );
+
+        assert!(!content.contains("../transform/operations/"), "{content}");
+        assert!(!content.contains("ResultWire"), "{content}");
+    }
+
+    /// The showcase document's shape, with the response table swapped in per test.
+    fn transforming_document(responses: Value) -> Value {
+        let operation = json!({ "operationId": "readEvent", "responses": responses });
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "T", "version": "1.0.0" },
+            "paths": { "/events": { "post": operation } },
+            "components": {
+                "schemas": {
+                    "Event": {
+                        "type": "object",
+                        "required": ["at"],
+                        "properties": { "at": { "type": "string", "format": "date-time" } }
+                    }
+                }
+            }
+        })
+    }
+
+    fn json_event_response(description: &str) -> Value {
+        json!({
+            "description": description,
+            "content": {
+                "application/json": { "schema": { "$ref": "#/components/schemas/Event" } }
+            }
+        })
+    }
+
+    #[test]
+    fn a_converting_error_branch_decodes_the_error_field() {
+        let (content, _) = emit_transforming_operation(
+            transforming_document(json!({ "404": json_event_response("gone") })),
+            "readevent",
+        );
+
+        assert!(
+            content.contains(
+                "      return { ...result, error: decodeReadEventResponse404(result.error) };\n"
+            ),
+            "an error branch converts the error field, not data: {content}"
+        );
+    }
+
+    #[test]
+    fn a_converting_default_branch_decodes_whichever_field_carries_the_body() {
+        let (content, _) = emit_transforming_operation(
+            transforming_document(json!({ "default": json_event_response("any") })),
+            "readevent",
+        );
+
+        // `default` spans both outcomes, so the field is chosen at runtime rather than at emit time.
+        assert!(
+            content.contains("      return result.ok\n")
+                && content.contains(
+                    "        ? { ...result, data: decodeReadEventResponseDefault(result.data) }\n"
+                )
+                && content.contains(
+                    "        : { ...result, error: decodeReadEventResponseDefault(result.error) };\n"
+                ),
+            "{content}"
+        );
     }
 
     fn tsdoc_blocks(source: &str) -> String {
@@ -4183,21 +4770,28 @@ mod tests {
             (ParamLocation::Cookie, "input.cookie?.petId"),
         ] {
             assert_eq!(
-                input_member(InputMember::Parameter {
-                    location,
-                    name: "petId",
-                }),
+                input_member(
+                    InputMember::Parameter {
+                        location,
+                        name: "petId",
+                    },
+                    "input"
+                ),
                 expected
             );
         }
         assert_eq!(
-            input_member(InputMember::Parameter {
-                location: ParamLocation::Path,
-                name: "pet-id",
-            }),
+            input_member(
+                InputMember::Parameter {
+                    location: ParamLocation::Path,
+                    name: "pet-id",
+                },
+                "input"
+            ),
             "input.path?.[\"pet-id\"]"
         );
-        assert_eq!(input_member(InputMember::Body), "input.body");
+        assert_eq!(input_member(InputMember::Body, "input"), "input.body");
+        assert_eq!(input_member(InputMember::Body, "wire"), "wire.body");
     }
 
     #[test]
@@ -4444,8 +5038,8 @@ mod tests {
         let mut sink = DiagnosticSink::new();
         let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
         let renderer = TypesEmitter::new(&model);
-        let arms = response_result_arms(&renderer, &plan, "Probe");
-        let output = render_result_type(&arms, &plan, "Probe");
+        let arms = response_result_arms(&renderer, &plan, "Probe", &[]);
+        let output = render_result_type(&arms, &plan, "Probe", "");
         assert!(output.contains(
             "outcome: 100; ok: false; status: 100; error: undefined; meta: ResponseMeta"
         ));
@@ -4469,8 +5063,8 @@ mod tests {
             response_table: Vec::new(),
             ..plan
         };
-        let empty_arms = response_result_arms(&renderer, &empty, "Empty");
-        let output = render_result_type(&empty_arms, &empty, "Empty");
+        let empty_arms = response_result_arms(&renderer, &empty, "Empty", &[]);
+        let output = render_result_type(&empty_arms, &empty, "Empty", "");
         assert!(output.contains("| ResponsePhaseFailure<never>\n  | RequestPhaseFailure;\n"));
         assert_eq!(successful_envelope_union(&empty_arms), "never");
     }
@@ -4710,9 +5304,10 @@ mod tests {
         let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
         let renderer = TypesEmitter::new(&model);
         let actual = render_result_type(
-            &response_result_arms(&renderer, &plan, "HeadHealth"),
+            &response_result_arms(&renderer, &plan, "HeadHealth", &[]),
             &plan,
             "HeadHealth",
+            "",
         );
         let expected = "export type HeadHealthResult =\n  | { outcome: 200; ok: true; status: 200; data: undefined; meta: ResponseMeta }\n  | { outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }\n  | ResponsePhaseFailure<200>\n  | RequestPhaseFailure;\n";
         assert_eq!(actual, expected);
@@ -4962,7 +5557,8 @@ mod tests {
 
         {
             let renderer = TypesEmitter::new(&model);
-            let input = render_body_input(&renderer, &body, "Probe", 2);
+            let input =
+                render_body_input(&renderer, &body, "Probe", 2, TypeAxis::Application, false);
             assert!(input.contains("contentType: string"));
             assert!(input.contains("filename?: string"));
             assert!(input.contains("Blob | File"));

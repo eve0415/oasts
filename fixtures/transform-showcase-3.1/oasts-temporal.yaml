@@ -1,0 +1,16 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-temporal
+artifacts:
+  types: true
+  client: true
+client:
+  authEnforcement: types
+  baseUrl:
+    source: runtime
+types:
+  dateTime: temporal
+validation:
+  engine: 'off'
+  unchecked: allow

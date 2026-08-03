@@ -85,6 +85,15 @@ done
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-client-showcase-3.1/compile-assert/cases.ts"
 echo "compile-assert matrix ok: client-showcase-3.1"
 
+# The date/time transform showcase, one row per representation plus the validation-bound build.
+# Each row is a distinct emitted pipeline, not a re-run of the same one: the two Temporal modes
+# convert at different positions from the Date mode, and the validated row is the only one where a
+# request validator and a request conversion are emitted into the same function body.
+for transform_config in oasts-date oasts-date-validated oasts-temporal oasts-plaindate; do
+  generate_and_verify transform-showcase-3.1 "$transform_config.yaml" \
+    "$work/transform-$transform_config" transform "transform-showcase-3.1 ($transform_config)"
+done
+
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-auth-showcase-3.1/compile-assert/cases.ts"
 echo "compile-assert matrix ok: auth-showcase-3.1"
 

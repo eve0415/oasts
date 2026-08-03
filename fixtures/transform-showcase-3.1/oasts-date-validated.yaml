@@ -1,0 +1,21 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-date-validated
+artifacts:
+  types: true
+  client: true
+  validators: true
+client:
+  authEnforcement: types
+  baseUrl:
+    source: runtime
+types:
+  dateTime: date
+validation:
+  engine: generated
+  request: true
+  # Deliberately off: it is what makes a rejecting decode observable as `response-transform`
+  # rather than being caught one step earlier as a format violation.
+  response: false
+  unchecked: allow

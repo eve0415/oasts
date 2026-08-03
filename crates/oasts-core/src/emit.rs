@@ -76,6 +76,11 @@ const CODE_VARIANT_ALIAS: &str = "OASTS1310";
 /// would corrupt it silently, and ordered try-each-branch decoding cannot detect the mistake — a
 /// non-converting branch always succeeds by identity — so the document is refused instead.
 const CODE_TRANSFORM_UNION: &str = "OASTS1313";
+/// A position that reaches a transform the client pipeline cannot carry: a form or multipart field,
+/// a content-type-discriminated request body, or a per-media-entry response payload. Each declares
+/// a shape no single codec is keyed on, and emitting nothing for one would leave a wire string
+/// behind a type promising an application value.
+pub(super) const CODE_UNCONVERTIBLE_TRANSFORM: &str = "OASTS1314";
 /// A wire twin whose derived `{Name}Wire` is already a declared component's name. The document owns
 /// its name; the compiler invented the other, so the twin yields to `{Name}WireValue` and generation
 /// continues — the same rule OASTS1306 applies to a colliding request/response variant.
@@ -350,7 +355,10 @@ pub fn emit_artifacts(
         files.extend(client::emit_client_from_model(&mut model, client_model));
         // The transform artifact lives under the client's tree and only ever runs at the client's
         // pipeline positions, so it is emitted with the client and never without it.
-        files.extend(transform::emit_transform_from_model(&mut model));
+        files.extend(transform::emit_transform_from_model(
+            &mut model,
+            client_model,
+        ));
     }
     if config.artifacts.validators.enabled {
         files.extend(validators::emit_validators_from_model(&mut model));
@@ -1215,6 +1223,30 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     /// parent+allOf discriminated-union spelling prove). `None` means no finite proof; `Some(empty)`
     /// means the sub-branches fix the property to disjoint values — an uninhabitable branch. Cycles
     /// are guarded by a visited set keyed on the resolved `(source_id, json_pointer)`.
+    /// Whether every branch fixes the discriminator property to at least one literal in its **own**
+    /// declared type.
+    ///
+    /// `prove_discriminator_tags` also accepts a branch whose only proof is a mapping entry. That is
+    /// enough to *choose* a codec, because the mapping says which branch a wire value routes to. It
+    /// is not enough to *emit* the choice: the emitted dispatch narrows with
+    /// `value.<property> === "<tag>"`, and TypeScript narrows on that only where the branch's type
+    /// declares the literal. Under a mapping-only proof every arm still declares `<property>` as
+    /// `string`, and the emitted ternary compiles to a type error rather than a dispatch.
+    pub(super) fn discriminator_branches_fix_a_literal(
+        &self,
+        branches: &[SchemaNode],
+        property: &str,
+    ) -> bool {
+        branches.iter().all(|branch| {
+            matches!(
+                self.resolve_ref(branch, &mut HashSet::new()),
+                Some(SchemaNode::Never { .. })
+            ) || self
+                .merged_object_property_finite(branch, property, &mut HashSet::new())
+                .is_some_and(|values| !values.is_empty())
+        })
+    }
+
     fn merged_object_property_finite<'a>(
         &'a self,
         branch: &'a SchemaNode,
@@ -2375,21 +2407,7 @@ impl Emitter<'_, '_, '_> {
         file_base: &str,
     ) -> GeneratedFile {
         let stem = uppercase_first(allocated_name);
-        let mut response_declarations = operation
-            .responses
-            .iter()
-            .map(|response| {
-                (
-                    format!(
-                        "{}Response{}",
-                        stem,
-                        response_status_type_suffix(&response.status)
-                    ),
-                    response,
-                )
-            })
-            .collect::<Vec<_>>();
-        response_declarations.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let response_declarations = operation_response_declarations(operation, &stem);
 
         let mut content = self.header();
         let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
@@ -2413,7 +2431,7 @@ impl Emitter<'_, '_, '_> {
             );
         }
         // The request twin names the wire form of every component its payload reaches.
-        if self.request_body_transforms(operation) {
+        if self.request_transforms(operation) {
             for parameter in &operation.parameters {
                 self.collect_operation_imports(
                     &parameter.schema,
@@ -2493,7 +2511,7 @@ impl Emitter<'_, '_, '_> {
         // A payload twin is emitted for exactly the positions that convert, on the same rule the
         // component twins follow: a payload reaching no transform is identity in both surfaces and
         // declares one type.
-        if self.request_body_transforms(operation) {
+        if self.request_transforms(operation) {
             write_source_metadata(&mut content, &operation.source, 0);
             content.push_str("export type ");
             content.push_str(&stem);
@@ -2778,16 +2796,20 @@ impl Emitter<'_, '_, '_> {
         })
     }
 
-    /// Whether this operation's selected JSON request body converts.
-    pub(super) fn request_body_transforms(&self, operation: &Operation) -> bool {
+    /// Whether any request parameter or the selected JSON request body converts.
+    pub(super) fn request_transforms(&self, operation: &Operation) -> bool {
         operation
-            .request_body
-            .as_ref()
-            .and_then(|body| select_request_media(&body.media_types))
-            .is_some_and(|media_type| {
-                is_json(&media_type.essence)
-                    && self.model.transform_facts().reaches(&media_type.schema)
-            })
+            .parameters
+            .iter()
+            .any(|parameter| self.model.transform_facts().reaches(&parameter.schema))
+            || operation
+                .request_body
+                .as_ref()
+                .and_then(|body| select_request_media(&body.media_types))
+                .is_some_and(|media_type| {
+                    is_json(&media_type.essence)
+                        && self.model.transform_facts().reaches(&media_type.schema)
+                })
     }
 
     /// The wire form of one response's payload union. Called only where `response_transforms`
@@ -2927,6 +2949,29 @@ pub(super) fn response_status_type_suffix(status: &ResponseStatus) -> String {
         ResponseStatus::Exact(value) | ResponseStatus::Range(value) => value.to_ascii_uppercase(),
         ResponseStatus::Default => "Default".to_owned(),
     }
+}
+
+/// The response type declarations for one operation, in their emitted order.
+pub(super) fn operation_response_declarations<'operation>(
+    operation: &'operation Operation,
+    stem: &str,
+) -> Vec<(String, &'operation ResponseEntry)> {
+    let mut declarations = operation
+        .responses
+        .iter()
+        .map(|response| {
+            (
+                format!(
+                    "{}Response{}",
+                    stem,
+                    response_status_type_suffix(&response.status)
+                ),
+                response,
+            )
+        })
+        .collect::<Vec<_>>();
+    declarations.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    declarations
 }
 
 pub(super) fn property_in_position(meta: &PropMeta, position: TypePosition) -> bool {
@@ -3092,6 +3137,20 @@ pub fn render_property_key(value: &str) -> String {
     } else {
         render_ts_string(value)
     }
+}
+
+/// An object-literal key in **value** position.
+///
+/// `render_property_key` answers the type-declaration question, where `__proto__` is an ordinary
+/// property name. In a value literal it is not: both `__proto__: v` and `"__proto__": v` invoke the
+/// prototype setter rather than creating an own property, so the emitted object would lack a
+/// property its declared type promises — and `JSON.stringify` and `Object.keys` would both drop it.
+/// A computed key is the only spelling that creates one.
+pub(super) fn render_literal_key(value: &str) -> String {
+    if value == "__proto__" {
+        return format!("[{}]", render_ts_string(value));
+    }
+    render_property_key(value)
 }
 
 fn add_nullable(mut rendered: String, schema: &SchemaNode) -> String {

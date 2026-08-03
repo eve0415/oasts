@@ -3,7 +3,8 @@
 //! Emits, under the output root when the client artifact is enabled and any `types.dateTime` /
 //! `types.date` representation is non-`string`:
 //!   - `client/transform/runtime.ts` (embedded asset, verbatim);
-//!   - `client/transform/result.ts` (a generated re-export of the shared result module).
+//!   - `client/transform/result.ts` (a generated re-export of the shared result module);
+//!   - component and operation codec modules for every payload reaching a transform.
 //!
 //! Nothing goes under the shared `runtime/` directory. Two specs may share one emitted runtime
 //! whenever their `emit.importExtension` and `client.transport` agree, and the date options are
@@ -21,15 +22,21 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::client_model::{BodyPlan, ClientModel, OperationPlan, PayloadDisposition};
 use crate::diag::Diagnostic;
-use crate::ir::{AdditionalProperties, Discriminator, PropMeta, SchemaNode, SourceRef, TupleRest};
+use crate::ir::{
+    AdditionalProperties, Discriminator, Operation, ParamLocation, PrimitiveType, PropMeta,
+    ResponseEntry, SchemaMeta, SchemaNode, SourceRef, TupleRest,
+};
+use crate::media::{is_json, is_xml};
 use crate::transform::{JsonKinds, KindBranch, TransformFacts, TransformKind, UnionDispatch};
 
 use super::model::EmissionModel;
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
-    CODE_TRANSFORM_UNION, Emitter, GeneratedFile, SchemaChildMode, TypePosition, import_extension,
-    property_in_position, render_property_key, render_ts_string, source_diagnostic,
+    CODE_TRANSFORM_UNION, CODE_UNCONVERTIBLE_TRANSFORM, Emitter, GeneratedFile, SchemaChildMode,
+    TypePosition, import_extension, operation_response_declarations, property_in_position,
+    render_literal_key, render_property_key, render_ts_string, source_diagnostic, uppercase_first,
 };
 
 /// Emitted as `client/transform/runtime.ts`; the generated-transform call ABI is fixed to it.
@@ -78,6 +85,7 @@ pub(crate) fn resolve_dispatch(
         // value that resolves to nothing simply contributes no tag.
         if let Ok(tags) =
             emitter.prove_discriminator_tags(branches, discriminator, &mapping_targets)
+            && emitter.discriminator_branches_fix_a_literal(branches, &discriminator.property_name)
         {
             return Some(Ok(ResolvedDispatch::Discriminator {
                 property: discriminator.property_name.clone(),
@@ -88,7 +96,7 @@ pub(crate) fn resolve_dispatch(
     Some(Err(source_diagnostic(
         CODE_TRANSFORM_UNION,
         format!(
-            "branches {left} and {right} of this union convert date/time values differently, and no JSON value kind or discriminator tells them apart; declare a discriminator whose mapping resolves both branches, or set the representation back to string"
+            "branches {left} and {right} of this union convert date/time values differently, and no JSON value kind or discriminator tells them apart; declare a discriminator whose mapping resolves both branches and whose property each branch fixes to a literal, or set the representation back to string"
         ),
         &node.meta().source,
     )))
@@ -130,6 +138,28 @@ fn collect_union_refusals(
     if let Some(Err(diagnostic)) = resolve_dispatch(emitter, facts, node) {
         out.push(diagnostic);
     }
+    // A converting index signature is emitted as one pass over `Object.entries`, which cannot also
+    // carry per-property conversions — so an object declaring both would convert its declared
+    // properties and silently leave every undeclared key a wire string behind an index signature
+    // that says otherwise.
+    // `Schema` alone, not `Allowed(Some(_))`: the parser only ever pairs a schema with the latter
+    // synthetically, never from a document — `parse::tests` says so where it covers that arm by
+    // building the node directly.
+    if let SchemaNode::Object {
+        properties,
+        additional_properties: AdditionalProperties::Schema(additional),
+        meta,
+        ..
+    } = node
+        && !properties.is_empty()
+        && facts.reaches(additional)
+    {
+        out.push(source_diagnostic(
+            CODE_UNCONVERTIBLE_TRANSFORM,
+            "an index signature that applies a date/time transform cannot be converted alongside declared properties; drop the declared properties, drop the index signature, or set the representation back to string",
+            &meta.source,
+        ));
+    }
     // The types emitter's own child walk, so this never becomes a second answer to "what is nested
     // inside this schema". `Validation` mode visits every child regardless of read/writeOnly
     // position, which is what a refusal must consider: the union is refused wherever it appears.
@@ -138,8 +168,87 @@ fn collect_union_refusals(
     });
 }
 
+/// Refuses every position that reaches a transform the client pipeline cannot carry.
+///
+/// The emitted codecs convert one payload per position, keyed on the type that position declares.
+/// Three shapes declare something else: a form or multipart field serializes per field rather than
+/// as one document; a content-type-discriminated body is a union of `{ contentType, body }` shapes;
+/// a discriminated or multipart response names one type per media entry. Each is refused here,
+/// because emitting nothing for them would put a wire string behind a type that promises a `Date`.
+fn unconvertible_transform_diagnostics(
+    model: &EmissionModel<'_, '_>,
+    plan: &OperationPlan,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    body_transform_refusals(model, plan.body_plan.as_ref(), diagnostics);
+    for response in &plan.response_table {
+        if !matches!(response.payload, PayloadDisposition::Payload)
+            || !super::client::renders_payload_inline(response)
+        {
+            continue;
+        }
+        for entry in &response.media {
+            if model.transform_facts().reaches(&entry.schema) {
+                diagnostics.push(source_diagnostic(
+                    CODE_UNCONVERTIBLE_TRANSFORM,
+                    format!(
+                        "response '{}' entry '{}' applies a date/time transform, which a per-media-entry payload cannot carry; set the representation back to string",
+                        response.match_key, entry.media
+                    ),
+                    &entry.source,
+                ));
+            }
+        }
+    }
+}
+
+fn body_transform_refusals(
+    model: &EmissionModel<'_, '_>,
+    plan: Option<&BodyPlan>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match plan {
+        Some(BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. }) => {
+            for field in fields {
+                if model.transform_facts().reaches(&field.schema) {
+                    diagnostics.push(source_diagnostic(
+                        CODE_UNCONVERTIBLE_TRANSFORM,
+                        format!(
+                            "form field '{}' applies a date/time transform, which per-field serialization cannot carry; set the representation back to string",
+                            field.name
+                        ),
+                        &field.source,
+                    ));
+                }
+            }
+        }
+        Some(BodyPlan::ContentTypeDiscriminated { arms, .. }) => {
+            for (_, arm) in arms {
+                if let BodyPlan::Json {
+                    schema: Some(schema),
+                    source,
+                    ..
+                } = arm
+                    && model.transform_facts().reaches(schema)
+                {
+                    diagnostics.push(source_diagnostic(
+                        CODE_UNCONVERTIBLE_TRANSFORM,
+                        "a content-type-discriminated request body applies a date/time transform, which its per-entry input shape cannot carry; set the representation back to string",
+                        source,
+                    ));
+                }
+                body_transform_refusals(model, Some(arm), diagnostics);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Emits the transform artifact's files, or nothing when no representation transforms.
-pub(crate) fn emit_transform_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
+pub(crate) fn emit_transform_from_model(
+    model: &mut EmissionModel<'_, '_>,
+    client: &ClientModel,
+) -> Vec<GeneratedFile> {
     if !model.transform_facts().enabled() {
         return Vec::new();
     }
@@ -152,6 +261,9 @@ pub(crate) fn emit_transform_from_model(model: &mut EmissionModel<'_, '_>) -> Ve
         let ir = &emitter.model.analyzed.ir;
         for schema in &ir.schemas {
             collect_union_refusals(&emitter, facts, &schema.schema, &mut refusals);
+        }
+        for plan in &client.operations {
+            unconvertible_transform_diagnostics(emitter.model, plan, &mut refusals);
         }
         for operation in &ir.operations {
             for parameter in &operation.parameters {
@@ -173,6 +285,7 @@ pub(crate) fn emit_transform_from_model(model: &mut EmissionModel<'_, '_>) -> Ve
         }
     }
     let mut pairs = Vec::new();
+    let mut operation_pairs = Vec::new();
     {
         let emitter = Emitter::new(model);
         for allocated in &emitter.model.analyzed.schema_names {
@@ -185,6 +298,27 @@ pub(crate) fn emit_transform_from_model(model: &mut EmissionModel<'_, '_>) -> Ve
                         .source
                         .clone(),
                 ));
+            }
+        }
+        for plan in &client.operations {
+            let operation_index = plan.operation_index;
+            let Some(allocated) = emitter
+                .model
+                .analyzed
+                .operation_names
+                .iter()
+                .find(|allocated| allocated.operation_index == operation_index)
+            else {
+                continue;
+            };
+            let Some(file_base) = emitter.model.operation_files[operation_index].as_deref() else {
+                continue;
+            };
+            let operation = &emitter.model.analyzed.ir.operations[operation_index];
+            if let Some(file) =
+                emit_operation_pairs(&emitter, operation, plan, &allocated.name, file_base)
+            {
+                operation_pairs.push((file, operation.source.clone()));
             }
         }
     }
@@ -207,6 +341,10 @@ pub(crate) fn emit_transform_from_model(model: &mut EmissionModel<'_, '_>) -> Ve
         ),
     ];
     for (file, source) in pairs {
+        model.register_path(&file.relative_path, &source);
+        files.push(file);
+    }
+    for (file, source) in operation_pairs {
         model.register_path(&file.relative_path, &source);
         files.push(file);
     }
@@ -335,6 +473,285 @@ fn emit_component_pairs(
     })
 }
 
+/// The request encoder and response decoders for one operation, or `None` when every position is
+/// identity. Names and ordering mirror the operation types module exactly.
+fn emit_operation_pairs(
+    emitter: &Emitter<'_, '_, '_>,
+    operation: &Operation,
+    plan: &OperationPlan,
+    allocated_name: &str,
+    file_base: &str,
+) -> Option<GeneratedFile> {
+    let stem = uppercase_first(allocated_name);
+    let request_transforms = super::client::request_transform_binding(emitter.model, plan);
+    let responses = operation_response_declarations(operation, &stem)
+        .into_iter()
+        .filter(|(_, response)| emitter.response_transforms(response))
+        .collect::<Vec<_>>();
+    if !request_transforms && responses.is_empty() {
+        return None;
+    }
+
+    let mut type_imports = BTreeSet::new();
+    let mut pair_imports = BTreeMap::new();
+    let mut helpers = BTreeSet::new();
+    let mut pointers = Vec::new();
+    let mut bodies = String::new();
+
+    if request_transforms {
+        let application = format!("{stem}Input");
+        let wire = format!("{application}Wire");
+        let schema = operation_input_schema(emitter, operation, plan);
+        let mut builder = PairBuilder::new(emitter, TypePosition::Request);
+        let converted = builder.convert(&schema, Direction::Encode, "value", "path", Frame::ROOT);
+        pointers = builder.pointers;
+        helpers = builder.helpers;
+        pair_imports = builder.pair_imports;
+        let body = guarded_body(
+            converted,
+            Direction::Encode,
+            &mut pointers,
+            &mut helpers,
+            &operation.source,
+        );
+        bodies.push_str(&format!(
+            "\nexport function encode{application}(value: {application}, path: ApplicationPath = []): {wire} {{\n  return {body};\n}}\n"
+        ));
+    }
+
+    for (application, response) in responses {
+        let wire = format!("{application}Wire");
+        type_imports.insert(application.clone());
+        type_imports.insert(wire.clone());
+        let schema = operation_response_schema(response);
+        let mut builder = PairBuilder::new(emitter, TypePosition::Response);
+        builder.pointers = pointers;
+        builder.helpers = helpers;
+        builder.pair_imports = pair_imports;
+        let converted = builder.convert(&schema, Direction::Decode, "value", "path", Frame::ROOT);
+        pointers = builder.pointers;
+        helpers = builder.helpers;
+        pair_imports = builder.pair_imports;
+        let body = guarded_body(
+            converted,
+            Direction::Decode,
+            &mut pointers,
+            &mut helpers,
+            &response.source,
+        );
+        bodies.push_str(&format!(
+            "\nexport function decode{application}(value: {wire}, path: ApplicationPath = []): {application} {{\n  return {body};\n}}\n"
+        ));
+    }
+
+    let mut content = emitter.header();
+    let header_len = content.len();
+    let extension = import_extension(emitter.model);
+    if !type_imports.is_empty() {
+        content.push_str(&format!(
+            "import type {{ {} }} from \"../../../types/operations/{file_base}{extension}\";\n",
+            type_imports.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if request_transforms {
+        content.push_str(&format!(
+            "import type {{ {stem}Input, {stem}InputWire }} from \"../../operations/{file_base}{extension}\";\n"
+        ));
+    }
+    content.push_str(&format!(
+        "import type {{ ApplicationPath }} from \"../result{extension}\";\n"
+    ));
+    if !helpers.is_empty() {
+        content.push_str(&format!(
+            "import {{ {} }} from \"../runtime{extension}\";\n",
+            helpers.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    for (file, names) in pair_imports {
+        content.push_str(&format!(
+            "import {{ {} }} from \"../components/{file}{extension}\";\n",
+            names.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    content.push('\n');
+    write_pointer_constants(&mut content, &pointers);
+    content.push_str(&bodies);
+    Some(GeneratedFile {
+        relative_path: format!("client/transform/operations/{file_base}.ts"),
+        content: super::insert_temporal_reference(content, header_len),
+    })
+}
+
+/// The operation request surface represented as the object shape its client module emits.
+fn operation_input_schema(
+    emitter: &Emitter<'_, '_, '_>,
+    operation: &Operation,
+    plan: &OperationPlan,
+) -> SchemaNode {
+    let mut properties = Vec::new();
+    for (location, group_name) in [
+        (ParamLocation::Path, "path"),
+        (ParamLocation::Query, "query"),
+        (ParamLocation::Header, "header"),
+        (ParamLocation::Cookie, "cookie"),
+    ] {
+        let parameters = plan
+            .param_plans
+            .iter()
+            .filter(|parameter| parameter.resolved.location == location)
+            .collect::<Vec<_>>();
+        if parameters.is_empty() {
+            continue;
+        }
+        // One lookup per parameter: the group's own optionality is derived from the same answers
+        // rather than re-scanning the operation's parameter list a second time.
+        let resolved = parameters
+            .into_iter()
+            .map(|parameter| {
+                let required = operation
+                    .parameters
+                    .iter()
+                    .find(|candidate| candidate.source == parameter.source)
+                    .expect("a client parameter plan originates from its operation")
+                    .required;
+                (parameter, required)
+            })
+            .collect::<Vec<_>>();
+        let required = resolved.iter().any(|(_, required)| *required);
+        let group_properties = resolved
+            .into_iter()
+            .filter(|(parameter, _)| !parameter.caller_serialized)
+            .map(|(parameter, required)| {
+                (
+                    parameter.name.clone(),
+                    parameter.schema.clone(),
+                    operation_property(required),
+                )
+            })
+            .collect::<Vec<_>>();
+        if group_properties.is_empty() {
+            continue;
+        }
+        properties.push((
+            group_name.to_owned(),
+            object_schema(group_properties, operation.source.clone()),
+            operation_property(required),
+        ));
+    }
+    if let Some(BodyPlan::Json {
+        schema: Some(schema),
+        ..
+    }) = &plan.body_plan
+        && emitter.model.transform_facts().reaches(schema)
+    {
+        properties.push((
+            "body".to_owned(),
+            schema.clone(),
+            operation_property(
+                operation
+                    .request_body
+                    .as_ref()
+                    .is_some_and(|body| body.required),
+            ),
+        ));
+    }
+    object_schema(properties, operation.source.clone())
+}
+
+/// The media union represented by one response declaration in the types module.
+fn operation_response_schema(response: &ResponseEntry) -> SchemaNode {
+    let mut branches = response
+        .media_types
+        .iter()
+        .map(|media_type| {
+            if is_json(&media_type.essence) {
+                media_type.schema.clone()
+            } else if media_type.essence.starts_with("text/") && !is_xml(&media_type.essence) {
+                SchemaNode::Primitive {
+                    ty: PrimitiveType::String,
+                    format: None,
+                    enum_values: None,
+                    const_value: None,
+                    meta: operation_schema_meta(media_type.schema.meta().source.clone()),
+                }
+            } else {
+                SchemaNode::Any {
+                    meta: operation_schema_meta(media_type.schema.meta().source.clone()),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    if branches.len() == 1 {
+        return branches.pop().expect("one response media branch");
+    }
+    SchemaNode::AnyOf {
+        branches,
+        discriminator: None,
+        meta: operation_schema_meta(response.source.clone()),
+    }
+}
+
+fn object_schema(properties: Vec<(String, SchemaNode, PropMeta)>, source: SourceRef) -> SchemaNode {
+    SchemaNode::Object {
+        properties,
+        additional_properties: AdditionalProperties::Allowed(None),
+        dependent_required: Vec::new(),
+        finite: None,
+        extra_required: Vec::new(),
+        meta: operation_schema_meta(source),
+    }
+}
+
+fn operation_schema_meta(source: SourceRef) -> SchemaMeta {
+    SchemaMeta {
+        source,
+        ..SchemaMeta::default()
+    }
+}
+
+const fn operation_property(required: bool) -> PropMeta {
+    PropMeta {
+        required,
+        read_only: false,
+        write_only: false,
+    }
+}
+
+/// One operation entry point's returned expression.
+///
+/// A position that converts nothing returns the value untouched — there is no conversion to fault,
+/// so wrapping it would cost a closure and a guard per call for nothing. A converting one is wrapped
+/// so a native fault from walking a wrong-shaped container becomes the same result arm a rejected
+/// leaf produces; the wrap goes here, at the entry point, rather than at every node beneath it.
+fn guarded_body(
+    converted: Option<String>,
+    direction: Direction,
+    pointers: &mut Vec<SourceRef>,
+    helpers: &mut BTreeSet<&'static str>,
+    source: &SourceRef,
+) -> String {
+    let Some(expression) = converted else {
+        return "value".to_owned();
+    };
+    helpers.insert("guarded");
+    let pointer = pointer_constant(pointers, source);
+    let label = match direction {
+        Direction::Encode => "request",
+        Direction::Decode => "response",
+    };
+    format!("guarded(() => ({expression}), \"{label}\", {pointer})")
+}
+
+/// Appends one source location and names the constant `write_pointer_constants` will emit for it.
+///
+/// Appended rather than deduplicated: the locations already in the list are the schema positions the
+/// conversion reads, and an entry point's own location — an operation or a response declaration — is
+/// never one of them, so a lookup would never hit.
+fn pointer_constant(pointers: &mut Vec<SourceRef>, source: &SourceRef) -> String {
+    pointers.push(source.clone());
+    format!("P{}", pointers.len() - 1)
+}
+
 /// Hoists one `SourcePointer` per distinct schema location, in first-seen order.
 ///
 /// Hoisted rather than inlined at each call: the same location is named by both directions of a
@@ -391,6 +808,10 @@ struct ObjectParts {
     bases: Vec<String>,
     parts: Vec<String>,
     omitted: Vec<String>,
+    /// Property names that already contributed a part. Two `allOf` branches may constrain the same
+    /// property, and the merged type declares it once — so the object literal has to assign it once
+    /// too, or TypeScript refuses the duplicate key outright.
+    assigned: BTreeSet<String>,
 }
 
 impl ObjectParts {
@@ -687,8 +1108,11 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             ) else {
                 continue;
             };
+            if !object.assigned.insert(name.clone()) {
+                continue;
+            }
             self.helpers.insert("pushPath");
-            let key = render_property_key(name);
+            let key = render_literal_key(name);
             if meta.required {
                 object.parts.push(format!("{key}: {converted}"));
             } else {
@@ -783,14 +1207,23 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
         path: &str,
         frame: Frame,
     ) -> Option<String> {
-        let (branches, _) = union_parts(node)?;
+        let (branches, _) =
+            union_parts(node).expect("convert_union is called only for oneOf and anyOf nodes");
         // The refusal walk has already reported an indistinguishable union, so the run fails; there
         // is nothing honest to emit for it, and identity is what keeps the emitter total.
-        match resolve_dispatch(self.emitter, self.facts(), node)? {
+        match resolve_dispatch(self.emitter, self.facts(), node)
+            .expect("a oneOf or anyOf node always resolves to a dispatch")
+        {
             Ok(ResolvedDispatch::Identity) | Err(_) => None,
-            Ok(ResolvedDispatch::Shared) => {
-                self.convert(branches.first()?, direction, value, path, frame)
-            }
+            Ok(ResolvedDispatch::Shared) => self.convert(
+                branches
+                    .first()
+                    .expect("a shared union dispatch has at least one branch"),
+                direction,
+                value,
+                path,
+                frame,
+            ),
             Ok(ResolvedDispatch::Kind(kinds)) => {
                 let arms = kinds
                     .iter()
@@ -871,7 +1304,9 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
     ) -> Option<String> {
         let mut rendered = Vec::new();
         for (test, index) in arms {
-            let branch = branches.get(index)?;
+            let branch = branches
+                .get(index)
+                .expect("a dispatch arm index originates from this union's branches");
             if let Some(expression) = self.convert(branch, direction, value, path, frame) {
                 rendered.push(format!("{test} ? {expression}"));
             }
@@ -1350,6 +1785,97 @@ mod tests {
     }
 
     #[test]
+    fn a_discriminator_whose_branches_fix_no_literal_is_refused() {
+        // The mapping resolves both branches, so the generator knows which codec each wire value
+        // selects — but neither branch fixes `kind` to a literal, so the emitted union's own type
+        // carries `kind: string` on both arms and the dispatch it would emit never narrows.
+        let (_files, diagnostics, _has_errors) = compile_document(
+            notice_document(json!({
+                "Scheduled": {
+                    "type": "object",
+                    "required": ["kind", "at"],
+                    "properties": {
+                        "kind": { "type": "string" },
+                        "at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Cancelled": {
+                    "type": "object",
+                    "required": ["kind", "on"],
+                    "properties": {
+                        "kind": { "type": "string" },
+                        "on": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Notice": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/Scheduled" },
+                        { "$ref": "#/components/schemas/Cancelled" }
+                    ],
+                    "discriminator": {
+                        "propertyName": "kind",
+                        "mapping": {
+                            "scheduled": "#/components/schemas/Scheduled",
+                            "cancelled": "#/components/schemas/Cancelled"
+                        }
+                    }
+                }
+            })),
+            |config| config.types.date_time = DateTimeRepresentation::Date,
+        );
+        assert_eq!(refusals(&diagnostics).len(), 1, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_discriminator_whose_branches_fix_a_literal_dispatches() {
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Scheduled": {
+                    "type": "object",
+                    "required": ["kind", "at"],
+                    "properties": {
+                        "kind": { "const": "scheduled" },
+                        "at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Cancelled": {
+                    "type": "object",
+                    "required": ["kind", "on"],
+                    "properties": {
+                        "kind": { "const": "cancelled" },
+                        "on": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Notice": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/Scheduled" },
+                        { "$ref": "#/components/schemas/Cancelled" }
+                    ],
+                    "discriminator": {
+                        "propertyName": "kind",
+                        "mapping": {
+                            "scheduled": "#/components/schemas/Scheduled",
+                            "cancelled": "#/components/schemas/Cancelled"
+                        }
+                    }
+                }
+            })),
+            |config| config.types.date_time = DateTimeRepresentation::Date,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(refusals(&diagnostics).is_empty(), "{diagnostics:#?}");
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        assert!(
+            content.contains("value.kind === \"scheduled\""),
+            "{content}"
+        );
+    }
+
+    #[test]
     fn a_refusable_union_is_not_refused_in_string_mode() {
         let (_files, diagnostics, _has_errors) = compile_document(
             notice_document(json!({
@@ -1477,7 +2003,7 @@ mod tests {
             Some(&client),
             &mut sink,
         );
-        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert!(!sink.has_errors());
         files
     }
 
@@ -1575,6 +2101,88 @@ mod pair_tests {
             .into_iter()
             .find(|file| file.relative_path == format!("client/transform/components/{base}.ts"))
             .map(|file| file.content)
+    }
+
+    #[test]
+    fn a_converting_property_named_proto_uses_a_computed_key() {
+        // `__proto__: v` and `"__proto__": v` both invoke the prototype setter in a value literal,
+        // so either spelling would emit an object without the own property its type declares.
+        let content = pairs(
+            json!({
+                "Notice": {
+                    "type": "object",
+                    "required": ["__proto__"],
+                    "properties": { "__proto__": { "type": "string", "format": "date-time" } }
+                }
+            }),
+            "notice",
+            |config| config.types.date_time = DateTimeRepresentation::Date,
+        )
+        .expect("a pair module");
+
+        assert!(
+            content.contains("[\"__proto__\"]: decodeDateTimeDate("),
+            "{content}"
+        );
+        assert!(!content.contains("\n    __proto__:"), "{content}");
+    }
+
+    #[test]
+    fn merged_allof_branches_assign_a_shared_property_once() {
+        let content = pairs(
+            json!({
+                "Notice": {
+                    "allOf": [
+                        {
+                            "type": "object",
+                            "required": ["at"],
+                            "properties": { "at": { "type": "string", "format": "date-time" } }
+                        },
+                        {
+                            "type": "object",
+                            "required": ["at"],
+                            "properties": { "at": { "type": "string", "format": "date-time" } }
+                        }
+                    ]
+                }
+            }),
+            "notice",
+            |config| config.types.date_time = DateTimeRepresentation::Date,
+        )
+        .expect("a pair module");
+
+        // A duplicate key is not a style problem: TypeScript refuses the object literal outright.
+        let decode = content
+            .split("export function encodeNotice")
+            .next()
+            .expect("the decode half");
+        assert_eq!(
+            decode.matches("at: decodeDateTimeDate(").count(),
+            1,
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_converting_index_signature_beside_declared_properties_is_refused() {
+        let (_files, diagnostics, _has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": { "at": { "type": "string", "format": "date-time" } },
+                    "additionalProperties": { "type": "string", "format": "date-time" }
+                }
+            })),
+            |config| config.types.date_time = DateTimeRepresentation::Date,
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "OASTS1314"),
+            "{diagnostics:#?}"
+        );
     }
 
     /// The union-dispatch expression a `Notice` component compiles its decode to.
@@ -2447,5 +3055,612 @@ mod pair_tests {
                 "{name}: {content}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod operation_pair_tests {
+    use serde_json::{Value, json};
+
+    use super::tests::compile_document;
+    use crate::config::{DateTimeRepresentation, ResolvedConfig};
+    use crate::emit::GeneratedFile;
+
+    fn date_mode(config: &mut ResolvedConfig) {
+        config.types.date_time = DateTimeRepresentation::Date;
+    }
+
+    fn operation_document(operation: Value, schemas: Value) -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/events": { "post": operation } },
+            "components": { "schemas": schemas }
+        })
+    }
+
+    fn operation_module<'files>(files: &'files [GeneratedFile], base: &str) -> Option<&'files str> {
+        files
+            .iter()
+            .find(|file| file.relative_path == format!("client/transform/operations/{base}.ts"))
+            .map(|file| file.content.as_str())
+    }
+
+    fn operation_types<'files>(files: &'files [GeneratedFile], base: &str) -> &'files str {
+        files
+            .iter()
+            .find(|file| file.relative_path == format!("types/operations/{base}.ts"))
+            .map(|file| file.content.as_str())
+            .expect("operation types")
+    }
+
+    /// The messages an emission refused for a position no single codec is keyed on.
+    fn refused(diagnostics: &[crate::diag::Diagnostic]) -> Vec<&str> {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "OASTS1314")
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect()
+    }
+
+    fn event_schema() -> Value {
+        json!({
+            "Event": {
+                "type": "object",
+                "required": ["at"],
+                "properties": { "at": { "type": "string", "format": "date-time" } }
+            }
+        })
+    }
+
+    #[test]
+    fn a_converting_form_field_is_refused() {
+        let (_files, diagnostics, _has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "readEvent",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/x-www-form-urlencoded": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["at"],
+                                    "properties": {
+                                        "at": { "type": "string", "format": "date-time" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": { "204": { "description": "ok" } }
+                }),
+                json!({}),
+            ),
+            date_mode,
+        );
+
+        let messages = refused(&diagnostics);
+        assert_eq!(messages.len(), 1, "{diagnostics:#?}");
+        assert!(messages[0].contains("form field 'at'"), "{messages:?}");
+    }
+
+    #[test]
+    fn a_converting_discriminated_request_body_is_refused() {
+        let (_files, diagnostics, _has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "readEvent",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/Event" }
+                            },
+                            "text/plain": { "schema": { "type": "string" } }
+                        }
+                    },
+                    "responses": { "204": { "description": "ok" } }
+                }),
+                event_schema(),
+            ),
+            date_mode,
+        );
+
+        let messages = refused(&diagnostics);
+        assert_eq!(messages.len(), 1, "{diagnostics:#?}");
+        assert!(
+            messages[0].contains("content-type-discriminated request body"),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn a_converting_discriminated_response_entry_is_refused() {
+        let (_files, diagnostics, _has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "readEvent",
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/Event" }
+                                },
+                                "application/vnd.api+json": {
+                                    "schema": { "$ref": "#/components/schemas/Event" }
+                                }
+                            }
+                        }
+                    }
+                }),
+                event_schema(),
+            ),
+            date_mode,
+        );
+
+        let messages = refused(&diagnostics);
+        assert_eq!(
+            messages.len(),
+            2,
+            "one per declared media entry: {diagnostics:#?}"
+        );
+        assert!(messages[0].contains("response '200' entry"), "{messages:?}");
+    }
+
+    #[test]
+    fn operations_without_allocated_names_or_files_emit_no_transform_module() {
+        let response = json!({
+            "200": {
+                "description": "ok",
+                "content": {
+                    "application/json": {
+                        "schema": { "type": "string", "format": "date-time" }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics, has_errors) = compile_document(
+            json!({
+                "openapi": "3.1.0",
+                "info": { "title": "t", "version": "1" },
+                "paths": {
+                    "/invalid-name": {
+                        "get": {
+                            "operationId": "---",
+                            "responses": response
+                        }
+                    },
+                    "/invalid-file": {
+                        "get": {
+                            "operationId": "CON",
+                            "responses": response
+                        }
+                    }
+                }
+            }),
+            date_mode,
+        );
+        assert!(has_errors, "{diagnostics:#?}");
+        for code in ["OASTS1201", "OASTS1301"] {
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+                "missing {code}: {diagnostics:#?}"
+            );
+        }
+        assert!(files.iter().all(|file| {
+            !file
+                .relative_path
+                .starts_with("client/transform/operations/")
+        }));
+    }
+
+    #[test]
+    fn an_inline_request_body_emits_an_operation_encoder() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "recordInlineEvent",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["startedAt"],
+                                    "properties": {
+                                        "startedAt": {
+                                            "type": "string",
+                                            "format": "date-time"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": { "204": { "description": "done" } }
+                }),
+                json!({}),
+            ),
+            date_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = operation_module(&files, "recordinlineevent").expect("operation codec");
+        assert!(content.contains("import type { RecordInlineEventInput, RecordInlineEventInputWire } from \"../../operations/recordinlineevent.js\";"), "{content}");
+        assert!(content.contains("export function encodeRecordInlineEventInput(value: RecordInlineEventInput, path: ApplicationPath = []): RecordInlineEventInputWire"), "{content}");
+        assert!(
+            content.contains("startedAt: encodeDateTimeDate(value.body.startedAt"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn an_inline_response_body_emits_an_operation_decoder() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "readInlineEvent",
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["acceptedAt"],
+                                        "properties": {
+                                            "acceptedAt": {
+                                                "type": "string",
+                                                "format": "date-time"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+                json!({}),
+            ),
+            date_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = operation_module(&files, "readinlineevent").expect("operation codec");
+        assert!(content.contains("export function decodeReadInlineEventResponse200(value: ReadInlineEventResponse200Wire, path: ApplicationPath = []): ReadInlineEventResponse200"), "{content}");
+        assert!(
+            content.contains("acceptedAt: decodeDateTimeDate(value.acceptedAt"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn response_media_shapes_cover_text_binary_and_media_unions() {
+        let timed = json!({
+            "type": "object",
+            "required": ["acceptedAt"],
+            "properties": {
+                "acceptedAt": { "type": "string", "format": "date-time" }
+            }
+        });
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "readMediaEvent",
+                    "responses": {
+                        "200": {
+                            "description": "json or text",
+                            "content": {
+                                "application/json": { "schema": timed },
+                                "text/plain": { "schema": { "type": "string" } }
+                            }
+                        },
+                        "201": {
+                            "description": "json or binary",
+                            "content": {
+                                "application/json": { "schema": timed },
+                                "application/octet-stream": {
+                                    "schema": { "type": "string", "format": "binary" }
+                                }
+                            }
+                        }
+                    }
+                }),
+                json!({}),
+            ),
+            date_mode,
+        );
+        assert!(has_errors, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS1314")
+                .count(),
+            2,
+            "{diagnostics:#?}"
+        );
+        let content = operation_module(&files, "readmediaevent").expect("operation codec");
+        assert!(
+            content.contains("export function decodeReadMediaEventResponse200"),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "(typeof value === \"object\" && value !== null && !Array.isArray(value)) ? {"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function decodeReadMediaEventResponse201"),
+            "{content}"
+        );
+        assert!(
+            content.contains("decodeReadMediaEventResponse201(value: ReadMediaEventResponse201Wire, path: ApplicationPath = []): ReadMediaEventResponse201 {\n  return value;"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_referenced_request_body_delegates_to_the_component_pair() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "recordEvent",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/EventDraft" }
+                            }
+                        }
+                    },
+                    "responses": { "204": { "description": "done" } }
+                }),
+                json!({
+                    "EventDraft": {
+                        "type": "object",
+                        "required": ["occurredAt"],
+                        "properties": {
+                            "occurredAt": { "type": "string", "format": "date-time" }
+                        }
+                    }
+                }),
+            ),
+            date_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = operation_module(&files, "recordevent").expect("operation codec");
+        assert!(
+            content.contains("import { encodeEventDraft } from \"../components/eventdraft.js\";"),
+            "{content}"
+        );
+        assert!(content.contains("export function encodeRecordEventInput(value: RecordEventInput, path: ApplicationPath = []): RecordEventInputWire"), "{content}");
+        assert!(
+            content.contains("body: encodeEventDraft(value.body, pushPath(path, \"body\"))"),
+            "{content}"
+        );
+        assert!(!content.contains("encodeDateTimeDate"), "{content}");
+    }
+
+    #[test]
+    fn transforming_parameters_emit_a_wire_request_and_convert_arrays_element_wise() {
+        let (files, diagnostics, has_errors) = compile_document(
+            json!({
+                "openapi": "3.1.0",
+                "info": { "title": "t", "version": "1" },
+                "paths": {
+                    "/events/{occurredAt}": {
+                        "get": {
+                            "operationId": "readEvent",
+                            "parameters": [
+                                {
+                                    "name": "occurredAt",
+                                    "in": "path",
+                                    "required": true,
+                                    "schema": { "type": "string", "format": "date-time" }
+                                },
+                                {
+                                    "name": "window",
+                                    "in": "query",
+                                    "schema": {
+                                        "type": "array",
+                                        "items": { "type": "string", "format": "date-time" }
+                                    }
+                                }
+                            ],
+                            "responses": { "204": { "description": "done" } }
+                        }
+                    }
+                }
+            }),
+            date_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let types = operation_types(&files, "readevent");
+        assert!(
+            types.contains("export type ReadEventRequestWire ="),
+            "{types}"
+        );
+        assert!(types.contains("occurredAt: string;"), "{types}");
+        assert!(types.contains("window?: string[];"), "{types}");
+
+        let content = operation_module(&files, "readevent").expect("operation codec");
+        assert!(
+            content.contains("encodeDateTimeDate(value.path.occurredAt"),
+            "{content}"
+        );
+        assert!(
+            content.contains("value.query.window.map((item0, index0) => encodeDateTimeDate(item0"),
+            "{content}"
+        );
+        assert!(content.contains("export function encodeReadEventInput(value: ReadEventInput, path: ApplicationPath = []): ReadEventInputWire"), "{content}");
+    }
+
+    #[test]
+    fn a_caller_serialized_transform_emits_no_input_encoder() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "readOpaqueEvent",
+                    "parameters": [{
+                        "name": "occurredAt",
+                        "in": "query",
+                        "content": {
+                            "application/octet-stream": {
+                                "schema": { "type": "string", "format": "date-time" }
+                            }
+                        }
+                    }],
+                    "responses": { "204": { "description": "done" } }
+                }),
+                json!({}),
+            ),
+            date_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(operation_module(&files, "readopaqueevent").is_none());
+    }
+
+    #[test]
+    fn a_caller_serialized_only_group_is_omitted_from_a_body_encoder() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "recordOpaqueEvent",
+                    "parameters": [{
+                        "name": "opaque",
+                        "in": "query",
+                        "content": {
+                            "application/octet-stream": {
+                                "schema": { "type": "string", "format": "date-time" }
+                            }
+                        }
+                    }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["occurredAt"],
+                                    "properties": {
+                                        "occurredAt": {
+                                            "type": "string",
+                                            "format": "date-time"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": { "204": { "description": "done" } }
+                }),
+                json!({}),
+            ),
+            date_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = operation_module(&files, "recordopaqueevent").expect("operation codec");
+        assert!(
+            content.contains("occurredAt: encodeDateTimeDate(value.body.occurredAt"),
+            "{content}"
+        );
+        assert!(!content.contains("value.query"), "{content}");
+    }
+
+    #[test]
+    fn input_parameter_groups_follow_client_names_and_optionality() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "filterEvents",
+                    "parameters": [
+                        {
+                            "name": "opaque",
+                            "in": "query",
+                            "required": true,
+                            "content": {
+                                "application/octet-stream": {
+                                    "schema": { "type": "string", "format": "date-time" }
+                                }
+                            }
+                        },
+                        {
+                            "name": "since",
+                            "in": "query",
+                            "schema": { "type": "string", "format": "date-time" }
+                        },
+                        {
+                            "name": "X-At",
+                            "in": "header",
+                            "schema": { "type": "string", "format": "date-time" }
+                        },
+                        {
+                            "name": "session-at",
+                            "in": "cookie",
+                            "schema": { "type": "string", "format": "date-time" }
+                        }
+                    ],
+                    "responses": { "204": { "description": "done" } }
+                }),
+                json!({}),
+            ),
+            date_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = operation_module(&files, "filterevents").expect("operation codec");
+        assert!(!content.contains("value.query === undefined"), "{content}");
+        assert!(
+            content.contains("value.header === undefined ? {} : { header:"),
+            "{content}"
+        );
+        assert!(
+            content.contains("value.cookie === undefined ? {} : { cookie:"),
+            "{content}"
+        );
+        assert!(
+            content.contains("\"X-At\": encodeDateTimeDate(value.header[\"X-At\"]"),
+            "{content}"
+        );
+        assert!(
+            content.contains("\"session-at\": encodeDateTimeDate(value.cookie[\"session-at\"]"),
+            "{content}"
+        );
+        assert!(!content.contains("opaque"), "{content}");
+    }
+
+    #[test]
+    fn an_operation_reaching_no_transform_emits_no_operation_module() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "readLabel",
+                    "parameters": [
+                        {
+                            "name": "label",
+                            "in": "query",
+                            "schema": { "type": "string" }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": { "label": { "type": "string" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+                json!({}),
+            ),
+            date_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(operation_module(&files, "readlabel").is_none());
     }
 }

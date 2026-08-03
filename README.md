@@ -21,6 +21,7 @@ Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtim
 - **The full parameter serialization matrix.** style/explode for path, query, and header parameters (form, spaceDelimited, pipeDelimited, deepObject, label, matrix, simple), multipart encoding with per-part content types — implemented to the letter of the spec, not approximated.
 - **Auth the compiler checks.** An operation's security requirements compile into its call signature, so calling one whose auth you never configured is a type error rather than a 401 you find in staging. `client.authEnforcement: runtime` moves the check to call time instead, where an unsatisfied requirement comes back as an `auth` result.
 - **Zero-dependency generated client.** The typed fetch client is emitted next to your types. No runtime package to version-match, nothing in your dependency tree.
+- **Dates as dates.** `types.dateTime`/`types.date` make a `date-time` or `date` schema a `Date` or a `Temporal` value in your code while the wire keeps its string. Conversion happens before request validation and after response decoding, so validators only ever see wire values, and a value neither side can represent comes back as a `request-transform`/`response-transform` result rather than a throw.
 - **Rust-powered.** Cold starts in milliseconds; full specs the size of GitHub's compile in well under a second.
 
 ## Features
@@ -226,6 +227,33 @@ validation:
   unchecked: allow
 ```
 
+### Date and time representations
+
+`date-time` and `date` schemas are strings on the wire and, by default, strings in your code too.
+Set a representation and the client converts at the boundary instead:
+
+```yaml
+artifacts:
+  types: true
+  client: true
+types:
+  dateTime: date      # string | date | temporal
+  date: temporal      # string | temporal
+```
+
+`dateTime: date` gives you `Date`, `dateTime: temporal` gives you `Temporal.Instant`, and
+`date: temporal` gives you `Temporal.PlainDate`. The wire grammar is RFC 3339 and is checked field
+by field rather than handed to `new Date` or `Temporal.Instant.from`, both of which accept more than
+the contract does.
+
+Conversion is unconditional and ordered: a request is converted before validation and before
+serialization, a response after decoding, so validators only ever observe wire values. A value the
+wire cannot represent is a `request-transform` result with nothing sent; one the application cannot
+represent is a `response-transform` result. Neither throws.
+
+The representations need the client artifact — the codecs are emitted under it and only run at its
+pipeline positions.
+
 ### Zod flavor
 
 The zod artifact imports classic `zod` by default. Set `zod.flavor: mini` to import `zod/mini` instead — the tree-shakable entry point, same package, same `^4.4.0` peer range, no extra dependency.
@@ -271,7 +299,6 @@ pnpm -C packages/oasts build            # bundle the npm package
 
 ## Roadmap
 
-- Transform layer (e.g. `date-time` → `Date`)
 - TanStack Query hooks
 - Streaming request/response bodies (`text/event-stream` is a generation error until then)
 
