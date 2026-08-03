@@ -115,6 +115,11 @@ fixtures:
     dir: petstore-3.0
     config: oasts-client.yaml
     committed: true
+  - name: petstore-3.0-tanstack
+    class: small
+    dir: petstore-3.0
+    config: oasts-tanstack.yaml
+    committed: true
   - name: tictactoe-3.1
     class: small
     config: oasts.yaml

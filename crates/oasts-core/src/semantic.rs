@@ -1176,7 +1176,7 @@ fn unmatched_override_diagnostic(kind: &str, namespace: &str, key: &str) -> Diag
 }
 
 /// Escapes a single JSON Pointer reference token per RFC 6901 (`~` -> `~0`, `/` -> `~1`).
-fn escape_json_pointer_token(token: &str) -> String {
+pub(crate) fn escape_json_pointer_token(token: &str) -> String {
     token.replace('~', "~0").replace('/', "~1")
 }
 
@@ -2140,7 +2140,7 @@ fn validate_normalized_identifier(identifier: &str) -> Result<(), NormalizeError
     Ok(())
 }
 
-fn validate_final_identifier(identifier: &str) -> Result<(), NormalizeError> {
+pub(crate) fn validate_final_identifier(identifier: &str) -> Result<(), NormalizeError> {
     validate_final_identifier_characters(identifier)?;
     validate_normalized_identifier(identifier)
 }
@@ -3636,6 +3636,7 @@ mod tests {
             overrides: NameOverrides {
                 schemas: BTreeMap::from([("ghost".to_owned(), "Ghost".to_owned())]),
                 operations: BTreeMap::from([("phantomOp".to_owned(), "PhantomOp".to_owned())]),
+                ..NameOverrides::default()
             },
             ..NamingConfig::default()
         };

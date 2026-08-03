@@ -711,7 +711,7 @@ struct BodyCheck {
 
 /// Which side of a documented `response` branch carries the decoded JSON body to validate.
 #[derive(Clone, Copy)]
-enum ResponseBody {
+pub(super) enum ResponseBody {
     /// A 2xx branch: the body lives in `result.data`.
     Data,
     /// A documented non-2xx branch: the body lives in `result.error`.
@@ -2067,7 +2067,7 @@ fn response_type_name(stem: &str, response: &ResponsePlan) -> String {
 /// `default` spans both because one `default` branch can cover 2xx and non-2xx statuses alike.
 /// One classification for both readers — the arm writer, which turns it into how many arms the key
 /// emits, and the validation binding, which turns it into which field it checks.
-fn response_body_side(kind: ResponseMatchKind, match_key: &str) -> ResponseBody {
+pub(super) fn response_body_side(kind: ResponseMatchKind, match_key: &str) -> ResponseBody {
     let successful = match kind {
         ResponseMatchKind::Default => return ResponseBody::Both,
         ResponseMatchKind::Exact => match_key

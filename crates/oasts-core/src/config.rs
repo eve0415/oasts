@@ -28,9 +28,9 @@ const CODE_NAMESPACE: &str = "OASTS0091";
 const CODE_NO_ARTIFACT: &str = "OASTS0101";
 const CODE_ARTIFACT_DIRECTORY: &str = "OASTS0102";
 const CODE_DISABLED_ARTIFACT_OPTIONS: &str = "OASTS0103";
-const CODE_UNSUPPORTED_ARTIFACT: &str = "OASTS0111";
 const CODE_CLIENT_REQUIRES_TYPES: &str = "OASTS0112";
 const CODE_MSW_REQUIRES_TYPES: &str = "OASTS0113";
+const CODE_TANSTACK_REQUIRES_CLIENT: &str = "OASTS0114";
 const CODE_DISABLED_OPTIONS: &str = "OASTS0121";
 const CODE_DATE_REPRESENTATION: &str = "OASTS0131";
 const CODE_VALIDATION_REQUIRED: &str = "OASTS0151";
@@ -674,11 +674,17 @@ impl Default for NamingConfig {
 /// The nested per-namespace shape stays additive: a future namespace is a new field, not a
 /// breaking reshape. A value is the complete TypeScript identifier — `typePrefix`/`typeSuffix`
 /// are not applied on top, because the user wrote the exact name they want and decorating it
-/// would defeat the point. Values are still validated and still participate in collision
-/// detection like any generated name, so an override resolves a collision only by naming a
-/// distinct identifier, never by bypassing the check. A key matching no declaration in the
-/// document is a config error (see identifier allocation), so a typo surfaces instead of
-/// silently leaving the original collision unexplained.
+/// would defeat the point. For `schemas` and `operations`, values are still validated and still
+/// participate in collision detection like any generated name, so an override resolves a
+/// collision only by naming a distinct identifier, never by bypassing the check; a key matching
+/// no declaration in the document is a config error (see identifier allocation), so a typo
+/// surfaces instead of silently leaving the original collision unexplained.
+///
+/// `pathSegments` is keyed by the raw URL path segment text as written in the path template
+/// (e.g. `foo-bar`), not by any name derived from it. Its values are validated the same way, but
+/// whether a key matches anything in the document is not this layer's concern: the artifact that
+/// consumes path-segment overrides may not even be enabled, so an unmatched key is reported there,
+/// as a warning, rather than as a config error here.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -695,6 +701,9 @@ pub struct NameOverrides {
     pub schemas: BTreeMap<String, String>,
     /// Keyed by the `operationId`; the value is the final operation identifier.
     pub operations: BTreeMap<String, String>,
+    /// Keyed by the raw URL path segment text; the value is the final identifier fragment bound
+    /// for every declaration under that segment.
+    pub path_segments: BTreeMap<String, String>,
 }
 
 /// Documentation switches.
@@ -1722,36 +1731,25 @@ fn resolve_artifacts(
         msw,
     };
 
-    // One row per artifact is the single source of truth for both the "at least one enabled" check
-    // and the unsupported-artifact check. `supported: false` marks a framework adapter that still
-    // has no emitter — enabling it is a config error. The standalone zod and validators artifacts
-    // are supported alongside types and client. A future artifact added here cannot land in one check
-    // and be missed by the other, which two hand-kept lists allowed.
+    // Every declared artifact now has an emitter, so this list is only the "at least one enabled"
+    // check. It carried a `supported` column while a framework adapter was still stubbed out;
+    // an artifact key that names nothing is refused by `deny_unknown_fields` on the selector
+    // struct, which is the check that actually protects a user against a typo.
     let artifacts = [
-        ("types", &states.types, true),
-        ("client", &states.client, true),
-        ("zod", &states.zod, true),
-        ("validators", &states.validators, true),
-        ("tanstack", &states.tanstack, false),
-        ("msw", &states.msw, true),
+        &states.types,
+        &states.client,
+        &states.zod,
+        &states.validators,
+        &states.tanstack,
+        &states.msw,
     ];
-    if !artifacts.iter().any(|(_, state, _)| state.enabled) {
+    if !artifacts.iter().any(|state| state.enabled) {
         sink.push(config_error(
             CODE_NO_ARTIFACT,
             "at least one artifact must be enabled",
             Some(source),
             Some("/artifacts"),
         ));
-    }
-    for (name, state, supported) in artifacts {
-        if state.enabled && !supported {
-            sink.push(config_error(
-                CODE_UNSUPPORTED_ARTIFACT,
-                format!("artifact '{name}' is not supported in this build"),
-                Some(source),
-                Some("/artifacts"),
-            ));
-        }
     }
     // Handlers import the generated request and response types, so the types artifact is a real
     // prerequisite rather than a convention. It is stated here and never inferred: enabling msw
@@ -1762,6 +1760,17 @@ fn resolve_artifacts(
             "the msw artifact requires the types artifact to be enabled",
             Some(source),
             Some("/artifacts/msw"),
+        ));
+    }
+    // Descriptors wrap the client's own `orThrow` surface and propagate its `CallArgs<S>`, so the
+    // client is a real prerequisite rather than a convention. Without this the artifact would
+    // resolve, emit nothing, and report nothing — the exact silent no-op the check exists to stop.
+    if states.tanstack.enabled && !states.client.enabled {
+        sink.push(config_error(
+            CODE_TANSTACK_REQUIRES_CLIENT,
+            "the tanstack artifact requires the client artifact to be enabled",
+            Some(source),
+            Some("/artifacts/tanstack"),
         ));
     }
     states
@@ -1845,6 +1854,24 @@ fn validate_naming(naming: &NamingConfig, source: &Path, sink: &mut DiagnosticSi
             Some(source),
             Some("/naming/typeSuffix"),
         ));
+    }
+    // pathSegments has no document to check keys against here (see NameOverrides' doc comment),
+    // but values get the identical identifier validation schemas/operations values get, applied
+    // eagerly since nothing downstream re-validates an unmatched key's value for us.
+    for (key, value) in &naming.overrides.path_segments {
+        if let Err(error) = crate::semantic::validate_final_identifier(value) {
+            sink.push(config_error(
+                CODE_NAMING,
+                format!(
+                    "naming.overrides.pathSegments value '{value}' is not a valid identifier: {error}"
+                ),
+                Some(source),
+                Some(&format!(
+                    "/naming/overrides/pathSegments/{}",
+                    crate::semantic::escape_json_pointer_token(key)
+                )),
+            ));
+        }
     }
 }
 
@@ -2758,13 +2785,46 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_framework_artifacts_report_named_unsupported_error() {
-        // tanstack is the only artifact still without an emitter.
+    fn an_unknown_artifact_key_is_rejected() {
+        // Every declared artifact now has an emitter, so nothing reaches the unsupported-artifact
+        // check any more. The mechanism still has to hold: an artifact key the schema does not
+        // declare is refused rather than silently ignored, which is what would let a typo read as
+        // "that artifact is simply off".
         let mut value = valid_json_value();
-        value["artifacts"] = json!({ "tanstack": true });
-        let diagnostics = assert_code(load_json(&value), CODE_UNSUPPORTED_ARTIFACT);
+        value["artifacts"] = json!({ "types": true, "solid": true });
+        let error = load_json(&value).expect_err("unknown artifact key should be rejected");
+        assert!(
+            error
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("solid")),
+            "{error:#?}"
+        );
+    }
+
+    #[test]
+    fn every_declared_artifact_is_supported() {
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({
+            "types": true, "client": true, "zod": true,
+            "validators": true, "tanstack": true, "msw": true,
+        });
+        value["validation"] = json!({ "engine": "off", "unchecked": "allow" });
+        let resolved = load_json(&value).expect("every artifact should resolve");
+        assert!(resolved.artifacts.tanstack.enabled);
+        assert_eq!(
+            resolved.artifacts.tanstack.directory,
+            resolved.output.join("tanstack")
+        );
+    }
+
+    #[test]
+    fn tanstack_artifact_requires_client() {
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "types": true, "tanstack": true });
+        let diagnostics = assert_code(load_json(&value), CODE_TANSTACK_REQUIRES_CLIENT);
         assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == CODE_UNSUPPORTED_ARTIFACT && diagnostic.message.contains("tanstack")
+            diagnostic.code == CODE_TANSTACK_REQUIRES_CLIENT
+                && diagnostic.json_pointer.as_deref() == Some("/artifacts/tanstack")
         }));
     }
 
@@ -3509,6 +3569,51 @@ mod tests {
         let mut value = valid_json_value();
         value["naming"] = json!({ "overrides": { "params": { "x": "Y" } } });
         assert_code(load_json(&value), CODE_PARSE);
+    }
+
+    #[test]
+    fn naming_overrides_path_segments_deserialize_into_resolved_naming() {
+        let mut value = valid_json_value();
+        value["naming"] = json!({
+            "overrides": {
+                "pathSegments": { "foo_bar": "FooBarSegment" }
+            }
+        });
+        let resolved = load_json(&value).expect("pathSegments overrides should resolve");
+        assert_eq!(
+            resolved
+                .naming
+                .overrides
+                .path_segments
+                .get("foo_bar")
+                .map(String::as_str),
+            Some("FooBarSegment")
+        );
+    }
+
+    #[test]
+    fn naming_overrides_path_segments_reject_invalid_identifier_value() {
+        let mut value = valid_json_value();
+        value["naming"] = json!({
+            "overrides": {
+                "pathSegments": { "foo-bar": "bad-name" }
+            }
+        });
+        assert_code(load_json(&value), CODE_NAMING);
+    }
+
+    #[test]
+    fn naming_overrides_path_segments_unmatched_key_is_not_a_config_error() {
+        // Unlike schemas/operations, pathSegments has no document to check keys against at the
+        // config layer: the artifact that consumes it (not yet implemented) reports an unmatched
+        // key as a warning instead. A key naming no segment anywhere must still load clean.
+        let mut value = valid_json_value();
+        value["naming"] = json!({
+            "overrides": {
+                "pathSegments": { "not-a-segment": "NeverUsed" }
+            }
+        });
+        load_json(&value).expect("an unmatched pathSegments key is not a config error");
     }
 
     #[test]

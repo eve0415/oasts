@@ -1,0 +1,41 @@
+# SHA-256 manifest of the tanstack-artifact frozen entry-gate files; scripts/tanstack-gate.sh
+# verifies it. These files were authored from the pinned descriptor and key-factory contract before
+# any implementation existed and are never edited afterward — the implementation is written to
+# satisfy them.
+#
+# What each one pins:
+#
+#   - the showcase document and its two configs: the path templates and response surface the key
+#     factory and the eligibility rule are written against, so the emitter cannot be tuned to a
+#     document that grew to fit it. The second config generates the same document under a non-string
+#     date/time representation, which is the only condition under which a key must hold a value
+#     different from the one the caller passed;
+#   - the compile-assert cases: the generated API itself — module paths, descriptor names, the
+#     structural shape an adapter's options object needs, that a query resolves the payload rather
+#     than the client envelope, that the auth proof survives the wrapper, and that the three
+#     query-ineligible reads export no descriptor at all;
+#   - the key vectors: exact query keys and invalidation lists as data, with the input that produces
+#     each one frozen alongside it. Freezing only the key would let a runner pick whatever input made
+#     the emitter look right;
+#   - the collision and override documents and configs: one reachable input each for the
+#     segment-collision error and for the unmatched-override warning, plus the escape hatch that
+#     makes the colliding document generable again.
+files:
+  - path: fixtures/tanstack-showcase-3.1/openapi.yaml
+    sha256: 5f057bf41da17c732ced931603da1c43173b1b41121d4327b29cc9f51fbede38
+  - path: fixtures/tanstack-showcase-3.1/oasts-tanstack.yaml
+    sha256: b48acd01a3e66fe1808bfeed67871ac9ea16e53e3aa0520cf3e953c779d8036c
+  - path: fixtures/tanstack-showcase-3.1/oasts-tanstack-date.yaml
+    sha256: 02be75ebf09c5a032e53fc4264a5a2581a55309c3df3af85c733e84344896971
+  - path: fixtures/tanstack-showcase-3.1/compile-assert/cases.ts
+    sha256: f6051a3e8c549ca5a165f63fc1abe1966be392937c834eeb31a72959196c786b
+  - path: fixtures/tanstack-segment-collision-3.1/openapi.yaml
+    sha256: 43825f2a8def302a8d36ab2836a3dafb293df0efc000fcc90be0ccc25127dc68
+  - path: fixtures/tanstack-segment-collision-3.1/oasts-tanstack.yaml
+    sha256: b48acd01a3e66fe1808bfeed67871ac9ea16e53e3aa0520cf3e953c779d8036c
+  - path: fixtures/tanstack-segment-override-3.1/openapi.yaml
+    sha256: 5220e3752d500f732f65f87ab83c151bab96a334540ced968ae8adcbcd2bcf9b
+  - path: fixtures/tanstack-segment-override-3.1/oasts-tanstack.yaml
+    sha256: 7bfec6ca7115d58518c7c1ed1e8d8cfaacaeee65a8b62a951dc01a86b0819244
+  - path: crates/oasts-core/runtime/test-conformance/vectors-tanstack-keys.ts
+    sha256: 6aac936f1ab4da579bfa7b3405e68648c3aada23d2e5cee70d8f28e160718e18

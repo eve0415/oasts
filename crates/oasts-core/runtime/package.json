@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "devDependencies": {
+    "@tanstack/query-core": "5.101.4",
     "@types/node": "26.1.2",
     "esbuild": "0.28.1",
     "msw": "2.15.0",

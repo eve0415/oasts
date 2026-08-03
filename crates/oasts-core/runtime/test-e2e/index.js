@@ -4,6 +4,7 @@ import "./media-classification.test.ts";
 import "./media-validation.test.ts";
 import "./msw.test.ts";
 import "./multipart-response.test.ts";
+import "./tanstack.test.ts";
 import "./transform.test.ts";
 import "./transform-temporal.test.ts";
 import "./validators.test.ts";

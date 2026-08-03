@@ -33,7 +33,7 @@ Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtim
 | Zod schemas | ✅ — needs `zod` ^4.4.0 in your project; `zod/mini` supported |
 | Standalone validators | ✅ |
 | MSW handlers | ✅ — needs `msw` ^2.8.0 in your project |
-| TanStack Query hooks | Planned |
+| TanStack Query descriptors | ✅ — imports no TanStack package |
 
 ## Quick start
 
@@ -192,6 +192,104 @@ Paths that MSW's matcher cannot express are refused at generation time rather th
 handler that silently never matches — the failure mode that otherwise surfaces as an unrelated
 test's unhandled-request warning.
 
+## TanStack Query
+
+Enable the artifact and every operation gets a descriptor — a plain `{ queryKey, queryFn }` or
+`{ mutationKey, mutationFn }` object you spread into whatever adapter you already use. No hooks, no
+peer dependency, no React context to carry the transport: generated code imports nothing from
+TanStack, so the same descriptor works in React, Solid, Svelte, a route loader, or a prefetch.
+
+```yaml
+artifacts:
+  types: true
+  client: true
+  tanstack: true
+```
+
+```ts
+import { useQuery } from "@tanstack/react-query";
+import { getPetQuery } from "./generated/tanstack/operations/getpet.js";
+
+const pet = useQuery(getPetQuery(transport, { path: { petId } }));
+```
+
+`queryFn` resolves the response payload, so `pet.data` is your `Pet` — not an envelope you have to
+unwrap twice. Errors reject with the typed `ApiError` for that operation, and each module exports
+`{Operation}QueryKey`, `{Operation}QueryData` and `{Operation}QueryError` so you can name them.
+
+### Keys are hierarchical
+
+Query keys come from the URL path template, so a prefix invalidates everything beneath it:
+
+```ts
+import { keys, apiPetsAll } from "./generated/tanstack/keys.js";
+
+queryClient.invalidateQueries({ queryKey: apiPetsAll });     // every pet query
+queryClient.setQueryDefaults(apiPetsAll, { staleTime: 30_000 });
+keys.pets.byPetId.all(petId);                                 // everything under one pet
+```
+
+A literal path segment contributes a string and a parameter contributes a single-key object, so
+`/pets/mine` and `/pets/{petId}` with `petId = "mine"` are different cache entries at every prefix
+depth — they cannot be confused the way a template-string key can.
+
+Every path node is also exported as a flat binding (`apiPetsAll`, `apiPetsByPetId`). Operation
+modules import one leaf, so bundling a single descriptor does not drag in the rest of the spec's
+key data; import the composed `keys` object when you want the whole tree.
+
+### Invalidating after a mutation
+
+Each mutation exports a companion that takes the same input and returns the keys it structurally
+affects, broadest first:
+
+```ts
+import { updatePetMutation, updatePetMutationAffects } from "./generated/tanstack/operations/updatepet.js";
+
+useMutation({
+  ...updatePetMutation(transport),
+  onSuccess: (_data, input) => {
+    for (const key of updatePetMutationAffects(input)) {
+      queryClient.invalidateQueries({ queryKey: key });
+    }
+  },
+});
+```
+
+It takes the input, so it always has the path parameters it needs. It is a structural derivation
+from the path template, never a claim about what your API means — compose it with what you know.
+
+These are **prefix** keys. A query that carried query, header or cookie input has those appended as
+a further key element, so `exact: true` against the entity entry matches only the unfiltered query —
+invalidate without it to catch every filtered variant of the same resource.
+
+### What does not get a query descriptor
+
+A read gets one only when **every** documented success response carries a body. A `HEAD`, a 204-only
+`GET`, and a `GET` returning 200 *or* 204 all fail that — the last one is the easy one to miss,
+because it only resolves `undefined` on the days the server picks the 204. TanStack rejects a
+`queryFn` that resolves `undefined`, so each of these emits no descriptor and a warning naming the
+operation, rather than a descriptor that fails at runtime. Non-reads are unaffected: a 204 `DELETE`
+gets a mutation descriptor, because mutations may resolve `undefined`.
+
+Infinite queries are not generated either. OpenAPI has no pagination vocabulary, so any such support
+would be a guess about your API that fails silently at runtime; write `infiniteQueryOptions` by hand
+over the same call.
+
+### When two paths would fight over a name
+
+Key bindings are derived from path text, so `/foo-bar` and `/foo_bar` want the same name — and so do
+`/foo/bar` and `/foo-bar`, a segment named `all`, and anything that normalizes to a name the
+generated module already uses. Every one of these is refused at generation with the two paths named,
+never resolved by a compiler-invented suffix that would shift under you the next time the document
+changes. `naming.overrides.pathSegments` is the way out, keyed by the raw segment text:
+
+```yaml
+naming:
+  overrides:
+    pathSegments:
+      foo_bar: fooBarUnderscore
+```
+
 ## Comparison
 
 | | oasts | openapi-typescript | orval / hey-api | openapi-generator |
@@ -199,6 +297,7 @@ test's unhandled-request warning.
 | Types | ✅ | ✅ | ✅ | ✅ |
 | Typed client | ✅ zero-dependency | — | ✅ needs runtime deps | ✅ heavyweight templates |
 | Failure-complete results | ✅ | — | — | — |
+| Hierarchical, prefix-invalidatable query keys | ✅ | — | — | — |
 | Serialization matrix (style/explode, multipart) | ✅ full | n/a | partial | partial |
 | Deterministic committed output | ✅ byte-identical, `--check` gated | — | — | — |
 | Toolchain | native binary via npm | Node | Node | Java |
@@ -295,11 +394,12 @@ pnpm -C packages/oasts build:napi       # build the native Node binding
 pnpm -C packages/oasts build            # bundle the npm package
 ```
 
-`scripts/*.sh` are the gates. `gate.sh` runs lint and tests; `coverage.sh` / `coverage-ts.sh` hold the coverage floors; `verify-ts.sh` typechecks generated fixture output under `tsc --strict` (run `cargo build` first); `consume-gate.sh` proves generated clients resolve, bundle, tree-shake, and run as consumed artifacts; `allocs-gate.sh` catches drift in the per-stage allocation counters. `auth-gate.sh`, `msw-gate.sh`, `transform-gate.sh`, `validators-gate.sh` and `zod-gate.sh` check the SHA-256 of each artifact's frozen test vectors — those were authored from the contract before the implementation existed, so a mismatch means the freeze was broken. `client-size.sh` reports emitted per-operation client sizes without enforcing a ceiling.
+`scripts/*.sh` are the gates. `gate.sh` runs lint and tests; `coverage.sh` / `coverage-ts.sh` hold the coverage floors; `verify-ts.sh` typechecks generated fixture output under `tsc --strict` (run `cargo build` first); `consume-gate.sh` proves generated clients resolve, bundle, tree-shake, and run as consumed artifacts; `allocs-gate.sh` catches drift in the per-stage allocation counters. `auth-gate.sh`, `msw-gate.sh`, `tanstack-gate.sh`, `transform-gate.sh`, `validators-gate.sh` and `zod-gate.sh` check the SHA-256 of each artifact's frozen test vectors — those were authored from the contract before the implementation existed, so a mismatch means the freeze was broken. `client-size.sh` reports emitted per-operation client sizes without enforcing a ceiling.
 
 ## Roadmap
 
-- TanStack Query hooks
+- Infinite-query support for the TanStack artifact, once there is a way to say where the cursor
+  lives that is not a guess
 - Streaming request/response bodies (`text/event-stream` is a generation error until then)
 
 ## License

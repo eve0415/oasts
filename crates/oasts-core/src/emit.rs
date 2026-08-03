@@ -45,6 +45,7 @@ mod client;
 mod model;
 mod msw;
 pub(crate) mod runtime_assets;
+mod tanstack;
 mod transform;
 mod validators;
 mod zod;
@@ -363,6 +364,12 @@ pub fn emit_artifacts(
             &mut model,
             client_model,
         ));
+        // Descriptors wrap the client's own `orThrow` surface and propagate its `CallArgs<S>`, so
+        // the tanstack artifact is emitted with the client and never without it — the config layer
+        // already refuses the combination, and this placement makes that structural.
+        if config.artifacts.tanstack.enabled {
+            files.extend(tanstack::emit_tanstack_from_model(&mut model, client_model));
+        }
     }
     if config.artifacts.validators.enabled {
         files.extend(validators::emit_validators_from_model(&mut model));

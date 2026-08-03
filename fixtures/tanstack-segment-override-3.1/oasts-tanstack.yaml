@@ -1,0 +1,25 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+namespace: api
+output: ./generated-tanstack
+artifacts:
+  types: true
+  client: true
+  tanstack: true
+client:
+  authEnforcement: types
+  baseUrl:
+    source: runtime
+naming:
+  overrides:
+    pathSegments:
+      # Resolves the collision: /foo_bar's nodes bind under this fragment instead of `FooBar`,
+      # which /foo-bar keeps. One entry resolves both colliding names, because every node under
+      # the segment is renamed with it.
+      foo_bar: fooBarUnderscore
+      # Matches no segment in this document, so it warns rather than passing silently.
+      not-a-segment: neverUsed
+validation:
+  engine: 'off'
+  unchecked: allow

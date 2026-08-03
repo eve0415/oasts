@@ -1,0 +1,43 @@
+openapi: 3.1.0
+info:
+  title: TanStack segment override
+  version: 1.0.0
+  description: >-
+    The collision document again, generated with the path-segment override that resolves it. The
+    same configuration also carries one override key matching no segment in this document, so the
+    unmatched-override warning has a reachable input.
+servers:
+  - url: https://override.example.test
+paths:
+  /foo-bar/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: readHyphenated
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                type: object
+  /foo_bar/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: readUnderscored
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                type: object

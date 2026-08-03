@@ -1,0 +1,43 @@
+openapi: 3.1.0
+info:
+  title: TanStack segment collision
+  version: 1.0.0
+  description: >-
+    Two path segments whose raw text differs only by a separator, so identifier normalization maps
+    both to the same key-factory binding name. The compiler refuses rather than picking a winner,
+    and names the configuration entry that resolves it.
+servers:
+  - url: https://collision.example.test
+paths:
+  /foo-bar/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: readHyphenated
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                type: object
+  /foo_bar/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: readUnderscored
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                type: object

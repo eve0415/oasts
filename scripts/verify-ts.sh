@@ -205,6 +205,54 @@ generate_and_verify msw-openapi-msw-3.1 oasts-msw.yaml "$work/msw-openapi-msw" m
 generate_and_verify transform-msw-3.1 oasts-msw.yaml "$work/transform-msw" msw \
   "transform-msw-3.1" link
 
+# The tanstack artifact. Descriptors import no TanStack package, so unlike the msw and zod rows this
+# one needs no node_modules link — if it ever does, something started depending on a peer.
+generate_and_verify tanstack-showcase-3.1 oasts-tanstack.yaml "$work/tanstack-showcase" tanstack \
+  "tanstack-showcase-3.1"
+# The same document under a non-string date/time representation. A query key must hold wire values,
+# so the descriptor encodes before it keys — and so must the invalidation list, or a mutation would
+# name an entity key holding an application value that no query ever stored.
+generate_and_verify tanstack-showcase-3.1 oasts-tanstack-date.yaml "$work/tanstack-showcase-date" \
+  tanstack "tanstack-showcase-3.1 (date)"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext \
+  --moduleResolution bundler "$work/tanstack-showcase/compile-assert/cases.ts"
+echo "compile-assert matrix ok: tanstack-showcase-3.1"
+
+# The two key-factory naming diagnostics, asserted on exit code rather than only in unit tests: the
+# frozen documents exist to be generable (or not) end to end, and a gate that never runs them would
+# let the fixtures rot.
+cp -r fixtures/tanstack-segment-collision-3.1 "$work/tanstack-collision"
+if (cd "$work/tanstack-collision" && "$OLDPWD/$bin" generate --config oasts-tanstack.yaml) \
+  >"$work/tanstack-collision.log" 2>&1; then
+  echo "verify-ts: the colliding path-segment document generated instead of failing" >&2
+  exit 1
+fi
+grep -q 'OASTS1512' "$work/tanstack-collision.log" \
+  || { echo "verify-ts: colliding segments did not report OASTS1512" >&2; exit 1; }
+grep -q 'naming.overrides.pathSegments' "$work/tanstack-collision.log" \
+  || { echo "verify-ts: the collision diagnostic named no resolution" >&2; exit 1; }
+echo "segment collision refused: tanstack-segment-collision-3.1"
+
+generate_and_verify tanstack-segment-override-3.1 oasts-tanstack.yaml "$work/tanstack-override" \
+  tanstack "tanstack-segment-override-3.1"
+(cd "$work/tanstack-override" && "$OLDPWD/$bin" generate --config oasts-tanstack.yaml) \
+  >"$work/tanstack-override.log" 2>&1
+grep -q 'OASTS1513' "$work/tanstack-override.log" \
+  || { echo "verify-ts: an unmatched pathSegments override did not warn" >&2; exit 1; }
+echo "segment override resolves the collision and warns on an unmatched key"
+
+# The frozen key vectors, against both representations at once: the pairing is the point, since the
+# transform vectors assert that an application value in and a wire string out land on the same
+# cache entry the string-mode run produced.
+OASTS_TANSTACK_GENERATED_ROOT="$work/tanstack-showcase/generated-tanstack" \
+  OASTS_TANSTACK_DATE_GENERATED_ROOT="$work/tanstack-showcase-date/generated-tanstack-date" \
+  node --test crates/oasts-core/runtime/test-conformance/tanstack-keys-runner.ts
+echo "tanstack key vectors ok: tanstack-showcase-3.1"
+
+OASTS_TANSTACK_GENERATED_ROOT="$work/tanstack-showcase/generated-tanstack" \
+  node --test crates/oasts-core/runtime/test-e2e/tanstack.test.ts
+echo "tanstack descriptors drive a real query client ok: tanstack-showcase-3.1"
+
 # Both the compile-assert AND the emitted tree are typechecked under exactOptionalPropertyTypes off
 # and on. The compile-assert needs it because the no-payload responder guard has to reject
 # `body: undefined` either way. The emitted tree needs it because a consumer may well have the flag

@@ -1,0 +1,429 @@
+openapi: 3.1.0
+info:
+  title: TanStack showcase
+  version: 1.0.0
+  description: >-
+    Every key-factory segment rule and every query-eligibility branch in one document: literal,
+    whole-template and mixed path segments; collection, entity and nested-entity keys; a literal
+    segment whose text a parameter value can also take; the three ways a read operation can fail
+    the bodyless-success rule; a secured read whose descriptor must keep propagating its auth
+    proof; and a date-time path parameter, so the key holds a wire string rather than an
+    application value once a transform is configured.
+servers:
+  - url: https://tanstack.example.test/v1
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      summary: List every pet.
+      description: A collection read with no non-path input, so its key ends at the path elements.
+      responses:
+        '200':
+          description: The pets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Pet'
+    post:
+      operationId: createPet
+      summary: Create a pet.
+      description: A collection-level mutation, so its invalidation list carries the collection key alone.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PetDraft'
+      responses:
+        '201':
+          description: The created pet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+  /pets/mine:
+    get:
+      operationId: getMyPet
+      summary: Read the caller's own pet.
+      description: >-
+        A literal segment whose text a petId value can also take. Its key element is the bare
+        string, never a single-key object, so it cannot collide with the entity key at any prefix
+        depth.
+      responses:
+        '200':
+          description: The pet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+  /pets/{petId}:
+    parameters:
+      - name: petId
+        in: path
+        required: true
+        description: The pet identifier.
+        schema:
+          type: string
+    get:
+      operationId: getPet
+      summary: Read one pet.
+      description: An entity read whose whole input is its path, so its key ends at the path elements.
+      responses:
+        '200':
+          description: The pet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+        '404':
+          description: No such pet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    put:
+      operationId: updatePet
+      summary: Replace one pet.
+      description: An entity mutation, so its invalidation list carries the collection key and the entity key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PetDraft'
+      responses:
+        '200':
+          description: The updated pet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+    delete:
+      operationId: deletePet
+      summary: Delete one pet.
+      description: A bodyless mutation, so its mutation function resolves undefined.
+      responses:
+        '204':
+          description: The pet was deleted.
+    head:
+      operationId: headPet
+      summary: Probe one pet.
+      description: >-
+        A read whose method is bodyless by definition, so it emits no query descriptor and warns
+        instead.
+      responses:
+        '200':
+          description: The pet exists.
+  /pets/{petId}/status:
+    parameters:
+      - name: petId
+        in: path
+        required: true
+        description: The pet identifier.
+        schema:
+          type: string
+    get:
+      operationId: getPetStatus
+      summary: Read one pet's status.
+      description: >-
+        A read whose only success branch is bodyless, so it emits no query descriptor and warns
+        instead.
+      responses:
+        '204':
+          description: The pet is healthy.
+  /pets/{petId}/summary:
+    parameters:
+      - name: petId
+        in: path
+        required: true
+        description: The pet identifier.
+        schema:
+          type: string
+    get:
+      operationId: getPetSummary
+      summary: Read one pet's summary.
+      description: >-
+        A read with one body-carrying and one bodyless success branch. Its payload union admits
+        undefined, which a query function may not resolve, so it emits no query descriptor and
+        warns instead.
+      responses:
+        '200':
+          description: The summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PetSummary'
+        '204':
+          description: There is nothing to summarize.
+  /pets/{petId}/toys:
+    parameters:
+      - name: petId
+        in: path
+        required: true
+        description: The pet identifier.
+        schema:
+          type: string
+    get:
+      operationId: listToys
+      summary: List one pet's toys.
+      description: >-
+        A collection under a parameterized ancestor, so its key binding is a function of the
+        ancestor's parameter rather than a constant.
+      responses:
+        '200':
+          description: The toys.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Toy'
+  /pets/{petId}/toys/{toyId}:
+    parameters:
+      - name: petId
+        in: path
+        required: true
+        description: The pet identifier.
+        schema:
+          type: string
+      - name: toyId
+        in: path
+        required: true
+        description: The toy identifier.
+        schema:
+          type: string
+    delete:
+      operationId: deleteToy
+      summary: Delete one toy.
+      description: >-
+        A nested entity mutation, so its invalidation list threads both ancestor parameters into
+        the parent collection key.
+      responses:
+        '204':
+          description: The toy was deleted.
+  /reports/{id}.json:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The report identifier.
+        schema:
+          type: string
+    get:
+      operationId: getReportJson
+      summary: Read one report as JSON.
+      description: >-
+        A mixed segment — one template expression followed by a literal run — so its key element is
+        a nested array of the ordered runs and stays distinct from its sibling extension.
+      responses:
+        '200':
+          description: The report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+  /reports/{id}.xml:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The report identifier.
+        schema:
+          type: string
+    get:
+      operationId: getReportXml
+      summary: Read one report in the XML-suffixed form.
+      description: >-
+        The sibling mixed segment. The suffix is part of the path template, not the response media
+        type, so the two reports differ at the same prefix depth.
+      responses:
+        '200':
+          description: The report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+  /search:
+    get:
+      operationId: search
+      summary: Search across pets.
+      description: >-
+        Every non-path input location at once, all optional, so one operation covers the canonical
+        input object with a section present, with a section empty, and with a section absent.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: The search text.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: The result limit.
+          schema:
+            type: integer
+        - name: X-Trace-Id
+          in: header
+          required: false
+          description: A caller-supplied trace identifier.
+          schema:
+            type: string
+        - name: session
+          in: cookie
+          required: false
+          description: The session cookie.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The matching pets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Pet'
+  /secure/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: The record identifier.
+        schema:
+          type: string
+    get:
+      operationId: getSecure
+      summary: Read one secured record.
+      description: >-
+        A read under a security requirement, so its descriptor must keep propagating the operation's
+        auth proof through to the underlying call.
+      security:
+        - apiKey: []
+      responses:
+        '200':
+          description: The record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+  /events/{occurredAt}:
+    parameters:
+      - name: occurredAt
+        in: path
+        required: true
+        description: The instant the event occurred.
+        schema:
+          type: string
+          format: date-time
+    get:
+      operationId: readEvent
+      summary: Read one event.
+      description: >-
+        A read whose path parameter reaches a date/time transform, so the key must hold the wire
+        string rather than the application value.
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: A query parameter that also reaches the transform.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+    put:
+      operationId: updateEvent
+      summary: Replace one event.
+      description: >-
+        A mutation whose path parameter reaches the transform, so its invalidation list must encode
+        before building the entity key or it would name a key the query never stored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Event'
+      responses:
+        '200':
+          description: The updated event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+  schemas:
+    Pet:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+    PetDraft:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+    PetSummary:
+      type: object
+      required:
+        - id
+        - toyCount
+      properties:
+        id:
+          type: string
+        toyCount:
+          type: integer
+    Toy:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+    Report:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: string
+        rows:
+          type: integer
+    Event:
+      type: object
+      required:
+        - occurredAt
+      properties:
+        occurredAt:
+          type: string
+          format: date-time
+        note:
+          type: string
+    Problem:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string

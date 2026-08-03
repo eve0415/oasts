@@ -1,0 +1,22 @@
+# The same document under a non-string date/time representation. The date-time path and query
+# parameters on /events/{occurredAt} become application values here, which is what forces the
+# descriptor to encode to wire form before it builds a key — and forces the mutation's invalidation
+# list to encode too, or it would name a key the query never stored.
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+namespace: api
+output: ./generated-tanstack-date
+artifacts:
+  types: true
+  client: true
+  tanstack: true
+client:
+  authEnforcement: types
+  baseUrl:
+    source: runtime
+types:
+  dateTime: date
+validation:
+  engine: 'off'
+  unchecked: allow

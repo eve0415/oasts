@@ -349,10 +349,10 @@ mod tests {
     #[test]
     fn parses_every_fixture_including_the_shared_directory_keys() {
         let manifest = load_real();
-        assert_eq!(manifest.fixtures.len(), 16);
+        assert_eq!(manifest.fixtures.len(), 17);
         // A key may share another key's fixture directory under a different config; the zod keys
-        // and MSW keys plus the petstore client key are the cases, and `dir` is what keeps them
-        // distinct.
+        // and MSW keys plus the petstore client and tanstack keys are the cases, and `dir` is what
+        // keeps them distinct.
         let zod = manifest
             .fixtures
             .iter()

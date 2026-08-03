@@ -33,19 +33,21 @@ if [[ ! -x "$esbuild_bin" || ! -x "$rollup_bin" || ! -x "$tsc_bin" || ! -x "$vit
 fi
 
 work=$(mktemp -d)
-fixture_source="$repo_root/fixtures/client-showcase-3.1"
 
+# Args: work-dir-name import-extension [fixture-dir relative to the repo root] [config file name].
 generate_fixture() {
   local name=$1 import_extension=$2
+  local source_dir=${3:-fixtures/client-showcase-3.1}
+  local config=${4:-oasts.yaml}
   local destination="$work/$name"
-  cp -r "$fixture_source" "$destination"
+  cp -r "$repo_root/$source_dir" "$destination"
   # Glob rather than a hand-kept list: every artifact writes under a `generated*` directory, and a
   # list here silently stops stripping the moment a new one lands. `generated-zod*` was already
   # being missed.
   rm -rf -- "$destination"/generated*
-  printf '\nemit:\n  importExtension: "%s"\n' "$import_extension" >>"$destination/oasts.yaml"
+  printf '\nemit:\n  importExtension: "%s"\n' "$import_extension" >>"$destination/$config"
   printf '{"type":"module"}\n' >"$destination/package.json"
-  if ! (cd "$destination" && "$repo_root/$binary" generate --config oasts.yaml) >"$destination/generate.log" 2>&1; then
+  if ! (cd "$destination" && "$repo_root/$binary" generate --config "$config") >"$destination/generate.log" 2>&1; then
     cat "$destination/generate.log" >&2
     return 1
   fi
@@ -272,6 +274,81 @@ NODE
 )
 tree_bytes=$(wc -c <"$tree_bundle")
 echo "ok: tree-shaking ($tree_report; $((tree_bytes)) bytes, report-only)"
+
+# The tanstack key factory exports one flat binding per path node *and* a composed `keys` object.
+# The flat bindings exist solely so an operation module can import one leaf: a bundler cannot drop
+# unused properties of an object it references at all, so a module reaching through `keys` would
+# retain every path's key data. That is a claim about bundler behaviour, so it is asserted here
+# rather than measured in client-size.sh — a number that drifts upward reads as noise, a bundle
+# that still contains another path's binding is a defect.
+generate_fixture tanstack-tree-js .js fixtures/tanstack-showcase-3.1 oasts-tanstack.yaml
+tanstack_fixture="$work/tanstack-tree-js"
+tanstack_entry="$tanstack_fixture/one-query.ts"
+printf '%s\n' \
+  'import { getPetQuery } from "./generated-tanstack/tanstack/operations/getpet.js";' \
+  'import { createTransport } from "./generated-tanstack/runtime/transport.js";' \
+  'export { createTransport, getPetQuery };' \
+  >"$tanstack_entry"
+tanstack_bundle="$bundle_dir/vite-tanstack-one.mjs"
+run_vite "$tanstack_entry" "$bundle_dir" "$(basename "$tanstack_bundle")" true "$work/vite-tanstack.log"
+tanstack_report=$(
+  node --input-type=module - "$tanstack_fixture/generated-tanstack/tanstack/keys.ts" apiPetsByPetId "$tanstack_bundle" <<'NODE'
+import { readFile } from "node:fs/promises";
+
+const keysPath = process.argv[2];
+const selectedBinding = process.argv[3];
+const bundlePath = process.argv[4];
+
+// Binding *names* are renamed by the minifier, so this asserts on the key data instead: the string
+// literals each path node contributes to its key. Those are the payload the flat-binding split
+// exists to keep out of a bundle that did not ask for them, and they survive minification because
+// they are data rather than identifiers.
+const keysSource = await readFile(keysPath, "utf8");
+const bindings = [...keysSource.matchAll(/^export const (\w+) = (?:\([^)]*\) => )?(\[.*\]) as const;$/gmu)]
+  .map(([, name, key]) => ({ name, literals: [...key.matchAll(/"([^"]*)"/gu)].map((m) => m[1]) }));
+if (bindings.length < 5) {
+  throw new Error(`key factory has only ${String(bindings.length)} flat bindings`);
+}
+const selected = bindings.find((binding) => binding.name === selectedBinding);
+if (selected === undefined) {
+  throw new Error(`selected binding ${selectedBinding} is missing from ${keysPath}`);
+}
+
+const bundle = await readFile(bundlePath, "utf8");
+const present = (literal) => bundle.includes(JSON.stringify(literal));
+
+const missing = selected.literals.filter((literal) => !present(literal));
+if (missing.length !== 0) {
+  throw new Error(`the imported query's own key data was tree-shaken: ${missing.join(", ")}`);
+}
+
+// Only literals no surviving binding legitimately needs. `"api"` and `"pets"` are on the selected
+// binding's own path, so their presence proves nothing either way and they are not evidence.
+const ownLiterals = new Set(selected.literals);
+const foreign = [
+  ...new Set(
+    bindings
+      .filter((binding) => binding.name !== selectedBinding)
+      .flatMap((binding) => binding.literals)
+      .filter((literal) => !ownLiterals.has(literal)),
+  ),
+];
+if (foreign.length < 5) {
+  throw new Error(`only ${String(foreign.length)} foreign key literals to test against`);
+}
+const retained = foreign.filter(present);
+if (retained.length !== 0) {
+  throw new Error(
+    `bundle still contains key data for unrelated paths: ${retained.map((l) => JSON.stringify(l)).join(", ")}`,
+  );
+}
+process.stdout.write(
+  `${String(bindings.length - 1)} other path-node bindings' key data absent (${String(foreign.length)} literals checked)`,
+);
+NODE
+)
+tanstack_bytes=$(wc -c <"$tanstack_bundle")
+echo "ok: tanstack tree-shaking ($tanstack_report; $((tanstack_bytes)) bytes, report-only)"
 
 typecheck_generated() {
   local generated_root=$1 module=$2 resolution=$3
