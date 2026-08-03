@@ -19,6 +19,7 @@ Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtim
 - **Failure-complete result types.** Every call returns a discriminated union covering documented responses, undocumented HTTP responses, network failures, and decode failures — not just the 2xx happy path. Exhaustive `switch` over an API call is a type error away from correct.
 - **Deterministic, byte-identical output.** Same input, same config, same version ⇒ the same bytes on every machine and OS. Generated code is meant to be committed and reviewed; `--check` makes drift a CI failure.
 - **The full parameter serialization matrix.** style/explode for path, query, and header parameters (form, spaceDelimited, pipeDelimited, deepObject, label, matrix, simple), multipart encoding with per-part content types — implemented to the letter of the spec, not approximated.
+- **Auth the compiler checks.** An operation's security requirements compile into its call signature, so calling one whose auth you never configured is a type error rather than a 401 you find in staging. `client.authEnforcement: runtime` moves the check to call time instead, where an unsatisfied requirement comes back as an `auth` result.
 - **Zero-dependency generated client.** The typed fetch client is emitted next to your types. No runtime package to version-match, nothing in your dependency tree.
 - **Rust-powered.** Cold starts in milliseconds; full specs the size of GitHub's compile in well under a second.
 
@@ -39,7 +40,7 @@ Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtim
 pnpm add -D oasts
 ```
 
-Drop an `oasts.yaml` next to your spec:
+Node 24 or newer. Drop an `oasts.yaml` next to your spec:
 
 ```yaml
 schemaVersion: 1
@@ -54,7 +55,7 @@ Generate:
 pnpm exec oasts generate
 ```
 
-Every schema becomes a plain, readable interface (`generated/types/components/pet.ts`, verbatim):
+Every schema becomes a plain, readable interface — the declaration from `generated/types/components/pet.ts`, verbatim under its provenance header:
 
 ```ts
 export interface Pet {
@@ -99,6 +100,8 @@ switch (result.outcome) {
 ```
 
 An exact declared status is a number literal, a range or `default` key and every failure tag a string literal — the two never overlap, so `case 200:` can never also match `"4XX"`.
+
+Every operation also gets a `getPetShowcaseOrThrow` companion for the call sites where a failure is not worth branching on: it resolves to the matched success arm's `{ data, meta }` and throws `ApiError` otherwise, with the whole failed result preserved on `error.result`. Both forms are re-exported from `generated/client/api.ts` if you would rather import one object than one module per operation.
 
 In CI, fail on drift instead of writing files:
 
@@ -199,7 +202,7 @@ test's unhandled-request warning.
 | Deterministic committed output | ✅ byte-identical, `--check` gated | — | — | — |
 | Toolchain | native binary via npm | Node | Node | Java |
 
-Performance is measured, not promised: the in-repo benchmark harness compiles GitHub's full OpenAPI spec to types in ~437 ms warm (p50, reference container) with every run gated on repeatability. Reproduce it with `cargo run -p oasts-bench` — the harness, corpus manifest, and recorded baseline live in [`bench/`](./bench).
+Performance is measured, not promised: the in-repo benchmark harness compiles GitHub's full OpenAPI spec to types in ~80 ms — warm p50 of end-to-end `oasts generate` runs on the reference container — with every run gated on repeatability. Reproduce it with `cargo run -p oasts-bench` — the harness, corpus manifest, and recorded baseline live in [`bench/`](./bench).
 
 ## Configuration
 
@@ -264,14 +267,13 @@ pnpm -C packages/oasts build:napi       # build the native Node binding
 pnpm -C packages/oasts build            # bundle the npm package
 ```
 
-`scripts/*.sh` are the gates: `gate.sh` (lint + tests), `coverage.sh` / `coverage-ts.sh`, and `verify-ts.sh` (typechecks generated fixture output under `tsc --strict`; run `cargo build` first).
+`scripts/*.sh` are the gates. `gate.sh` runs lint and tests; `coverage.sh` / `coverage-ts.sh` hold the coverage floors; `verify-ts.sh` typechecks generated fixture output under `tsc --strict` (run `cargo build` first); `consume-gate.sh` proves generated clients resolve, bundle, tree-shake, and run as consumed artifacts; `allocs-gate.sh` catches drift in the per-stage allocation counters. `auth-gate.sh`, `msw-gate.sh`, `transform-gate.sh`, `validators-gate.sh` and `zod-gate.sh` check the SHA-256 of each artifact's frozen test vectors — those were authored from the contract before the implementation existed, so a mismatch means the freeze was broken. `client-size.sh` reports emitted per-operation client sizes without enforcing a ceiling.
 
 ## Roadmap
 
-- Typed auth providers with runtime enforcement
-- Streaming request/response bodies
 - Transform layer (e.g. `date-time` → `Date`)
 - TanStack Query hooks
+- Streaming request/response bodies (`text/event-stream` is a generation error until then)
 
 ## License
 
