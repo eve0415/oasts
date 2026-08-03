@@ -22,6 +22,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use foldhash::HashMap;
+
 use crate::client_model::{BodyPlan, ClientModel, OperationPlan, PayloadDisposition};
 use crate::diag::Diagnostic;
 use crate::ir::{
@@ -93,11 +95,18 @@ pub(crate) fn resolve_dispatch(
             }));
         }
     }
+    let message = if facts.branches_differ_only_in_optionality(branches) {
+        format!(
+            "branches {left} and {right} of this union convert the same date/time values but disagree on which of those properties they require, so which conversion is emitted would depend on the order the branches are declared in; make the branches agree on their required properties, or set the representation back to string"
+        )
+    } else {
+        format!(
+            "branches {left} and {right} of this union convert date/time values differently, and no JSON value kind or discriminator tells them apart; declare a discriminator whose mapping resolves both branches and whose property each branch requires and fixes to a literal, or set the representation back to string"
+        )
+    };
     Some(Err(source_diagnostic(
         CODE_TRANSFORM_UNION,
-        format!(
-            "branches {left} and {right} of this union convert date/time values differently, and no JSON value kind or discriminator tells them apart; declare a discriminator whose mapping resolves both branches and whose property each branch fixes to a literal, or set the representation back to string"
-        ),
+        message,
         &node.meta().source,
     )))
 }
@@ -159,6 +168,23 @@ fn collect_union_refusals(
             "an index signature that applies a date/time transform cannot be converted alongside declared properties; drop the declared properties, drop the index signature, or set the representation back to string",
             &meta.source,
         ));
+    }
+    // A pattern property renders an index signature in the declared type but has no conversion: the
+    // codecs walk declared properties and one index signature, and no emitted shape dispatches on a
+    // key pattern. Converting nothing behind a type that says `Date` is the failure this refuses.
+    if let SchemaNode::Object { meta, .. } = node {
+        for pattern in &meta.validation_applicators().pattern_properties {
+            if pattern.type_key.is_some() && facts.reaches(&pattern.schema) {
+                out.push(source_diagnostic(
+                    CODE_UNCONVERTIBLE_TRANSFORM,
+                    format!(
+                        "pattern property '{}' applies a date/time transform to an index signature no codec converts; drop the pattern property, or set the representation back to string",
+                        pattern.pattern
+                    ),
+                    &meta.source,
+                ));
+            }
+        }
     }
     // The types emitter's own child walk, so this never becomes a second answer to "what is nested
     // inside this schema". `Validation` mode visits every child regardless of read/writeOnly
@@ -321,6 +347,7 @@ pub(crate) fn emit_transform_from_model(
                 operation_pairs.push((file, operation.source.clone()));
             }
         }
+        refusals.extend(emitter.deferred_diagnostics.take());
     }
     model.sink.extend(refusals);
     let extension = import_extension(model);
@@ -373,6 +400,39 @@ fn transform_file(
 
 // --- pair modules ------------------------------------------------------------------------------
 
+/// The name a kernel import is bound to in the module being rendered — its own, unless the module
+/// declares that identifier and `assign_import_aliases` had to rename the import.
+fn local_import_name(name: &str, aliases: &HashMap<String, String>) -> String {
+    aliases
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| name.to_owned())
+}
+
+/// Every name a codec module imports from the compiler's own modules, as the shape
+/// `assign_import_aliases` reads. Rendered against the module's declarations, so a document that
+/// names a component `Instant` or `ApplicationPath` gets the *import* renamed rather than being
+/// refused: the identifier is the compiler's, and the rename is file-local.
+fn transform_module_imports() -> BTreeMap<String, BTreeSet<String>> {
+    let mut imports = BTreeMap::new();
+    imports.insert(
+        "result".to_owned(),
+        BTreeSet::from(["ApplicationPath".to_owned()]),
+    );
+    let mut kernel = BTreeSet::new();
+    for direction in [Direction::Decode, Direction::Encode] {
+        for kind in [
+            TransformKind::DateTimeDate,
+            TransformKind::DateTimeInstant,
+            TransformKind::DatePlainDate,
+        ] {
+            kernel.insert(direction.codec(kind).to_owned());
+        }
+    }
+    imports.insert("runtime".to_owned(), kernel);
+    imports
+}
+
 /// The encode/decode pair module for one transforming component, or `None` when the component
 /// declares no twin.
 ///
@@ -402,6 +462,48 @@ fn emit_component_pairs(
     let mut helpers: BTreeSet<&'static str> = BTreeSet::new();
     let mut pointers: Vec<SourceRef> = Vec::new();
     let mut bodies = String::new();
+    // What this module binds, before anything is rendered: the conversion carries the codec name
+    // into its expressions, so the import's local name has to be settled first.
+    let mut declared: BTreeSet<String> = BTreeSet::new();
+    for position in [
+        TypePosition::Neutral,
+        TypePosition::Request,
+        TypePosition::Response,
+    ] {
+        let Some(wire) = target.wire_export(position) else {
+            continue;
+        };
+        let application = target.variant_name(position);
+        declared.insert(application.clone());
+        declared.insert(wire);
+        let stem = if position == TypePosition::Neutral {
+            name
+        } else {
+            application.as_str()
+        };
+        for direction in [Direction::Decode, Direction::Encode] {
+            declared.insert(format!("{}{stem}", direction.prefix()));
+        }
+    }
+    // A sibling pair this module calls is bound here too, and its name is derived from a component
+    // the document named — so `decodeInstant` can arrive from a sibling as readily as from the
+    // kernel. Every component whose name a kernel codec ends in is enough to know that.
+    let module_imports = transform_module_imports();
+    for allocated in &emitter.model.analyzed.schema_names {
+        for direction in [Direction::Decode, Direction::Encode] {
+            let pair = format!("{}{}", direction.prefix(), allocated.name);
+            if module_imports.values().any(|names| names.contains(&pair)) {
+                declared.insert(pair);
+            }
+        }
+    }
+    let (aliases, alias_diagnostics) =
+        super::assign_import_aliases(&declared, &BTreeSet::new(), &module_imports, &schema.source);
+    emitter
+        .deferred_diagnostics
+        .borrow_mut()
+        .extend(alias_diagnostics);
+    let path_type = local_import_name("ApplicationPath", &aliases);
     for position in [
         TypePosition::Neutral,
         TypePosition::Request,
@@ -414,7 +516,7 @@ fn emit_component_pairs(
         type_imports.insert(application.clone());
         type_imports.insert(wire.clone());
         for direction in [Direction::Decode, Direction::Encode] {
-            let mut builder = PairBuilder::new(emitter, position);
+            let mut builder = PairBuilder::new(emitter, position, &aliases);
             builder.pointers = pointers;
             builder.helpers = helpers;
             builder.pair_imports = pair_imports;
@@ -429,7 +531,7 @@ fn emit_component_pairs(
                 Direction::Encode => (application.as_str(), wire.as_str()),
             };
             bodies.push_str(&format!(
-                "\nexport function {}{}(value: {parameter}, path: ApplicationPath = []): {returns} {{\n  return {expression};\n}}\n",
+                "\nexport function {}{}(value: {parameter}, path: {path_type} = []): {returns} {{\n  return {expression};\n}}\n",
                 direction.prefix(),
                 if position == TypePosition::Neutral {
                     name.to_owned()
@@ -447,12 +549,17 @@ fn emit_component_pairs(
         type_imports.into_iter().collect::<Vec<_>>().join(", ")
     ));
     content.push_str(&format!(
-        "import type {{ ApplicationPath }} from \"../result{extension}\";\n"
+        "import type {{ {} }} from \"../result{extension}\";\n",
+        super::import_clause("ApplicationPath".to_owned(), &aliases)
     ));
     if !helpers.is_empty() {
         content.push_str(&format!(
             "import {{ {} }} from \"../runtime{extension}\";\n",
-            helpers.into_iter().collect::<Vec<_>>().join(", ")
+            helpers
+                .into_iter()
+                .map(|helper| super::import_clause(helper.to_owned(), &aliases))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     for (file, names) in pair_imports {
@@ -498,11 +605,44 @@ fn emit_operation_pairs(
     let mut pointers = Vec::new();
     let mut bodies = String::new();
 
+    // Settled before anything renders, for the reason `emit_component_pairs` gives.
+    let mut declared: BTreeSet<String> = BTreeSet::new();
+    if request_transforms {
+        declared.insert(format!("{stem}Input"));
+        declared.insert(format!("{stem}InputWire"));
+        declared.insert(format!("encode{stem}Input"));
+    }
+    for (application, _) in &responses {
+        declared.insert(application.clone());
+        declared.insert(format!("{application}Wire"));
+        declared.insert(format!("decode{application}"));
+    }
+    let module_imports = transform_module_imports();
+    for allocated in &emitter.model.analyzed.schema_names {
+        for direction in [Direction::Decode, Direction::Encode] {
+            let pair = format!("{}{}", direction.prefix(), allocated.name);
+            if module_imports.values().any(|names| names.contains(&pair)) {
+                declared.insert(pair);
+            }
+        }
+    }
+    let (aliases, alias_diagnostics) = super::assign_import_aliases(
+        &declared,
+        &BTreeSet::new(),
+        &module_imports,
+        &operation.source,
+    );
+    emitter
+        .deferred_diagnostics
+        .borrow_mut()
+        .extend(alias_diagnostics);
+    let path_type = local_import_name("ApplicationPath", &aliases);
+
     if request_transforms {
         let application = format!("{stem}Input");
         let wire = format!("{application}Wire");
         let schema = operation_input_schema(emitter, operation, plan);
-        let mut builder = PairBuilder::new(emitter, TypePosition::Request);
+        let mut builder = PairBuilder::new(emitter, TypePosition::Request, &aliases);
         let converted = builder.convert(&schema, Direction::Encode, "value", "path", Frame::ROOT);
         pointers = builder.pointers;
         helpers = builder.helpers;
@@ -515,7 +655,7 @@ fn emit_operation_pairs(
             &operation.source,
         );
         bodies.push_str(&format!(
-            "\nexport function encode{application}(value: {application}, path: ApplicationPath = []): {wire} {{\n  return {body};\n}}\n"
+            "\nexport function encode{application}(value: {application}, path: {path_type} = []): {wire} {{\n  return {body};\n}}\n"
         ));
     }
 
@@ -524,7 +664,7 @@ fn emit_operation_pairs(
         type_imports.insert(application.clone());
         type_imports.insert(wire.clone());
         let schema = operation_response_schema(response);
-        let mut builder = PairBuilder::new(emitter, TypePosition::Response);
+        let mut builder = PairBuilder::new(emitter, TypePosition::Response, &aliases);
         builder.pointers = pointers;
         builder.helpers = helpers;
         builder.pair_imports = pair_imports;
@@ -540,7 +680,7 @@ fn emit_operation_pairs(
             &response.source,
         );
         bodies.push_str(&format!(
-            "\nexport function decode{application}(value: {wire}, path: ApplicationPath = []): {application} {{\n  return {body};\n}}\n"
+            "\nexport function decode{application}(value: {wire}, path: {path_type} = []): {application} {{\n  return {body};\n}}\n"
         ));
     }
 
@@ -559,12 +699,17 @@ fn emit_operation_pairs(
         ));
     }
     content.push_str(&format!(
-        "import type {{ ApplicationPath }} from \"../result{extension}\";\n"
+        "import type {{ {} }} from \"../result{extension}\";\n",
+        super::import_clause("ApplicationPath".to_owned(), &aliases)
     ));
     if !helpers.is_empty() {
         content.push_str(&format!(
             "import {{ {} }} from \"../runtime{extension}\";\n",
-            helpers.into_iter().collect::<Vec<_>>().join(", ")
+            helpers
+                .into_iter()
+                .map(|helper| super::import_clause(helper.to_owned(), &aliases))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     for (file, names) in pair_imports {
@@ -879,6 +1024,9 @@ impl Frame {
 struct PairBuilder<'a, 'model, 'input, 'sink> {
     emitter: &'a Emitter<'model, 'input, 'sink>,
     position: TypePosition,
+    /// The local binding each kernel import took in this module. Empty in every module whose own
+    /// declarations leave the kernel names free, which is all but a handful.
+    aliases: &'a HashMap<String, String>,
     /// Hoisted `SourcePointer` constants in first-seen order, so the emitted bytes stay stable.
     pointers: Vec<SourceRef>,
     /// Sibling pair modules this file calls into, keyed by file base.
@@ -888,10 +1036,15 @@ struct PairBuilder<'a, 'model, 'input, 'sink> {
 }
 
 impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
-    fn new(emitter: &'a Emitter<'model, 'input, 'sink>, position: TypePosition) -> Self {
+    fn new(
+        emitter: &'a Emitter<'model, 'input, 'sink>,
+        position: TypePosition,
+        aliases: &'a HashMap<String, String>,
+    ) -> Self {
         Self {
             emitter,
             position,
+            aliases,
             pointers: Vec::new(),
             pair_imports: BTreeMap::new(),
             helpers: BTreeSet::new(),
@@ -946,7 +1099,8 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             let pointer = self.pointer(&node.meta().source);
             let codec = direction.codec(kind);
             self.helpers.insert(codec);
-            return Some(format!("{codec}({value}, {pointer}, {path})"));
+            let local = local_import_name(codec, self.aliases);
+            return Some(format!("{local}({value}, {pointer}, {path})"));
         }
         match node {
             SchemaNode::Ref { target, .. } => {
@@ -1631,6 +1785,7 @@ mod tests {
             notice_document(json!({
                 "Reminder": {
                     "type": "object",
+                    "required": ["kind"],
                     "properties": {
                         "kind": { "type": "string", "const": "reminder" },
                         "at": { "type": "string", "format": "date-time" }
@@ -1638,6 +1793,7 @@ mod tests {
                 },
                 "Digest": {
                     "type": "object",
+                    "required": ["kind"],
                     "properties": {
                         "kind": { "type": "string", "const": "digest" },
                         "on": { "type": "string", "format": "date" }
@@ -1659,6 +1815,134 @@ mod tests {
         assert!(
             refusals(&diagnostics).is_empty(),
             "the discriminator resolves both branches: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn a_union_differing_only_in_requiredness_names_that_as_the_difference() {
+        // The generic message points at conversions that are in fact identical, which sends the
+        // reader looking for a difference that is not there.
+        let (_files, diagnostics, _has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "required": ["at"],
+                            "properties": { "at": { "type": "string", "format": "date-time" } }
+                        },
+                        {
+                            "type": "object",
+                            "properties": { "at": { "type": "string", "format": "date-time" } }
+                        }
+                    ]
+                }
+            })),
+            |config| config.types.date_time = DateTimeRepresentation::Date,
+        );
+
+        let refused = refusals(&diagnostics);
+        assert_eq!(refused.len(), 1, "{diagnostics:#?}");
+        assert!(
+            refused[0]
+                .message
+                .contains("disagree on which of those properties they require"),
+            "{refused:#?}"
+        );
+    }
+
+    #[test]
+    fn a_base_requiring_the_tag_proves_it_for_the_subtype_that_fixes_it() {
+        // The standard spelling: the base requires `kind` as a plain string, and each subtype fixes
+        // its literal without repeating `required`. The two facts live in different constituents of
+        // the same `allOf`, and demanding both from one of them refused the whole pattern.
+        let (_files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Base": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": { "kind": { "type": "string" } }
+                },
+                "Reminder": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/Base" },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "const": "reminder" },
+                                "at": { "type": "string", "format": "date-time" }
+                            }
+                        }
+                    ]
+                },
+                "Digest": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/Base" },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "const": "digest" },
+                                "on": { "type": "string", "format": "date-time" }
+                            }
+                        }
+                    ]
+                },
+                "Notice": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/Reminder" },
+                        { "$ref": "#/components/schemas/Digest" }
+                    ],
+                    "discriminator": { "propertyName": "kind" }
+                }
+            })),
+            |config| config.types.date_time = DateTimeRepresentation::Date,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(refusals(&diagnostics).is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_discriminator_whose_tag_is_optional_does_not_dispatch() {
+        // Dispatched on it before this. `value.kind === "reminder"` does not narrow an optional
+        // property, so both arms were type errors, and a payload omitting the tag fell through
+        // every arm unconverted.
+        let (_files, diagnostics, _has_errors) = compile_document(
+            notice_document(json!({
+                "Reminder": {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "const": "reminder" },
+                        "at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Digest": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                        "kind": { "type": "string", "const": "digest" },
+                        "on": { "type": "string", "format": "date" }
+                    }
+                },
+                "Notice": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/Reminder" },
+                        { "$ref": "#/components/schemas/Digest" }
+                    ],
+                    "discriminator": { "propertyName": "kind" }
+                }
+            })),
+            |config| {
+                config.types.date_time = DateTimeRepresentation::Temporal;
+                config.types.date = DateRepresentation::Temporal;
+            },
+        );
+
+        let refused = refusals(&diagnostics);
+        assert_eq!(refused.len(), 1, "{diagnostics:#?}");
+        assert!(
+            refused[0].message.contains("requires and fixes"),
+            "{refused:#?}"
         );
     }
 
@@ -2042,6 +2326,31 @@ mod tests {
     }
 
     #[test]
+    fn every_codec_the_kernel_exports_is_one_the_emitter_can_name() {
+        // `transform_module_imports` lists the codec names a module may bind, and `Direction::codec`
+        // is where they come from. A kernel export starting with `decode`/`encode` that the emitter
+        // cannot name would be one no module ever aliases — a collision with no local remedy.
+        let mut declared: Vec<&str> = Vec::new();
+        for line in TRANSFORM_RUNTIME_TS.lines() {
+            let Some(rest) = line.strip_prefix("export function ") else {
+                continue;
+            };
+            let name = rest.split(['<', '(']).next().expect("a declared name");
+            if name.starts_with("decode") || name.starts_with("encode") {
+                declared.push(name);
+            }
+        }
+        declared.sort_unstable();
+        let mut aliasable: Vec<String> = transform_module_imports()
+            .remove("runtime")
+            .expect("the kernel import entry")
+            .into_iter()
+            .collect();
+        aliasable.sort_unstable();
+        assert_eq!(declared, aliasable);
+    }
+
+    #[test]
     fn the_asset_imports_only_siblings_so_nothing_but_the_extension_can_move() {
         let relative = TRANSFORM_RUNTIME_TS
             .lines()
@@ -2078,6 +2387,7 @@ mod tests {
 mod pair_tests {
     use serde_json::{Value, json};
 
+    use super::Diagnostic;
     use super::tests::{compile_document, notice_document};
     use crate::config::{DateRepresentation, DateTimeRepresentation, ResolvedConfig};
 
@@ -2101,6 +2411,125 @@ mod pair_tests {
             .into_iter()
             .find(|file| file.relative_path == format!("client/transform/components/{base}.ts"))
             .map(|file| file.content)
+    }
+
+    #[test]
+    fn a_component_shadowing_the_representation_global_is_aliased_not_refused() {
+        // `at: Date` meant the imported component before this — a `{ label: string }` object where
+        // a `Date` was promised. It compiled, which is what made it dangerous. Refusing the document
+        // would have been wrong too: the name is the document's, and the alias is file-local.
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Date": {
+                    "type": "object",
+                    "required": ["label"],
+                    "properties": { "label": { "type": "string" } }
+                },
+                "Notice": {
+                    "type": "object",
+                    "required": ["at", "d"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" },
+                        "d": { "$ref": "#/components/schemas/Date" }
+                    }
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        let notice = files
+            .iter()
+            .find(|file| file.relative_path == "types/components/notice.ts")
+            .expect("the component module");
+        assert!(
+            notice.content.contains("import type { Date as "),
+            "{}",
+            notice.content
+        );
+        assert!(notice.content.contains("at: Date;"), "{}", notice.content);
+    }
+
+    #[test]
+    fn a_component_named_for_a_result_import_aliases_the_import() {
+        // Two `import type { ApplicationPath }` in one module before this. The document owns the
+        // name; the compiler's own import is what gives way, and only inside this file.
+        let content = pairs(
+            json!({
+                "ApplicationPath": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": { "at": { "type": "string", "format": "date-time" } }
+                },
+                "Notice": { "$ref": "#/components/schemas/ApplicationPath" }
+            }),
+            "applicationpath",
+            date_mode,
+        )
+        .expect("a converting component emits a pair module");
+        assert!(
+            content.contains(
+                "import type { ApplicationPath as ApplicationPathBody } from \"../result"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("path: ApplicationPathBody = []"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_component_whose_codec_names_a_kernel_export_aliases_the_kernel() {
+        // `decodeInstant` was both this module's own export and the kernel import it calls.
+        let content = pairs(
+            json!({
+                "Instant": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": { "at": { "type": "string", "format": "date-time" } }
+                },
+                "Notice": { "$ref": "#/components/schemas/Instant" }
+            }),
+            "instant",
+            temporal_mode,
+        )
+        .expect("a converting component emits a pair module");
+        assert!(
+            content.contains("decodeInstant as decodeInstantBody"),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function decodeInstant("),
+            "{content}"
+        );
+        assert!(content.contains("decodeInstantBody(value.at"), "{content}");
+    }
+
+    #[test]
+    fn a_component_whose_codec_name_is_never_imported_keeps_the_plain_name() {
+        // `Instant` converts only through a `$ref`, so its module calls a sibling pair and imports
+        // no kernel codec — nothing to give way to, and the emitted call stays unaliased.
+        let content = pairs(
+            json!({
+                "Stamp": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": { "at": { "type": "string", "format": "date-time" } }
+                },
+                "Instant": {
+                    "type": "object",
+                    "required": ["stamp"],
+                    "properties": { "stamp": { "$ref": "#/components/schemas/Stamp" } }
+                },
+                "Notice": { "$ref": "#/components/schemas/Instant" }
+            }),
+            "instant",
+            temporal_mode,
+        )
+        .expect("a converting component emits a pair module");
+        assert!(!content.contains("as decodeInstantBody"), "{content}");
+        assert!(content.contains("decodeStamp(value.stamp"), "{content}");
     }
 
     #[test]
@@ -2181,6 +2610,66 @@ mod pair_tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "OASTS1314"),
+            "{diagnostics:#?}"
+        );
+    }
+
+    /// Every message the unconvertible-transform refusal emitted. A loop rather than an iterator
+    /// chain, for the reason `shadow_messages` gives.
+    fn unconvertible_messages(diagnostics: &[Diagnostic]) -> Vec<&str> {
+        let mut messages = Vec::new();
+        for diagnostic in diagnostics {
+            if diagnostic.code == "OASTS1314" {
+                messages.push(diagnostic.message.as_str());
+            }
+        }
+        messages
+    }
+
+    #[test]
+    fn a_converting_pattern_property_is_refused() {
+        // Emitted `{ [key: `x-${string}`]: Date }` and no codec at all before this: the index
+        // signature promised a converted value nothing ever converted.
+        let (_files, diagnostics, _has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "patternProperties": {
+                        "^x-": { "type": "string", "format": "date-time" }
+                    }
+                }
+            })),
+            date_mode,
+        );
+
+        let refusals = unconvertible_messages(&diagnostics);
+        assert_eq!(refusals.len(), 1, "{diagnostics:#?}");
+        assert!(
+            refusals[0].contains("pattern property '^x-'"),
+            "{refusals:?}"
+        );
+    }
+
+    #[test]
+    fn a_pattern_property_that_declares_no_index_signature_is_left_alone() {
+        // The types emitter renders a signature only for a pattern it can turn into a key type.
+        // One it cannot declares nothing, so nothing promises a converted value and nothing is
+        // refused — reachability and that rendering have to agree on which patterns count.
+        let (_files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "patternProperties": {
+                        "^x-[0-9]+$": { "type": "string", "format": "date-time" }
+                    }
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(
+            unconvertible_messages(&diagnostics).is_empty(),
             "{diagnostics:#?}"
         );
     }
@@ -3127,7 +3616,10 @@ mod operation_pair_tests {
                                     "type": "object",
                                     "required": ["at"],
                                     "properties": {
-                                        "at": { "type": "string", "format": "date-time" }
+                                        "at": { "type": "string", "format": "date-time" },
+                                        // Converts nothing, so the refusal walk's negative branch
+                                        // runs alongside its positive one.
+                                        "label": { "type": "string" }
                                     }
                                 }
                             }

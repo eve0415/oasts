@@ -199,6 +199,11 @@ generate_and_verify msw-enum-parameters-3.1 oasts-msw.yaml "$work/msw-enum-param
   "msw-enum-parameters-3.1" link
 generate_and_verify msw-openapi-msw-3.1 oasts-msw.yaml "$work/msw-openapi-msw" msw \
   "msw-openapi-msw-3.1" link
+# The response surface under a date/time transform. The request surface is refused by name
+# (OASTS1508/OASTS1509), so this document declares responses only: the handler declares the
+# application type and `JSON.stringify` produces the wire the client's codecs parse.
+generate_and_verify transform-msw-3.1 oasts-msw.yaml "$work/transform-msw" msw \
+  "transform-msw-3.1" link
 
 # Both the compile-assert AND the emitted tree are typechecked under exactOptionalPropertyTypes off
 # and on. The compile-assert needs it because the no-payload responder guard has to reject

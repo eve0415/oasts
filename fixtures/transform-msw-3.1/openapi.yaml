@@ -1,0 +1,31 @@
+openapi: 3.1.0
+info:
+  title: Transform MSW
+  version: '1'
+# The MSW artifact refuses a request-surface transform by name (OASTS1508/OASTS1509), because a
+# handler cannot invert a wire parameter or body back into its declared application type. The
+# response surface has no such guard: the handler declares the application type and the author
+# supplies a `Date`, which `JSON.stringify` serialises to exactly the wire form the client's codecs
+# parse. This document exercises only that side, so the coupling is a test rather than an argument.
+paths:
+  /events/latest:
+    get:
+      operationId: getLatestEvent
+      responses:
+        '200':
+          description: The most recent event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+components:
+  schemas:
+    Event:
+      type: object
+      required: [id, occurredAt]
+      properties:
+        id:
+          type: string
+        occurredAt:
+          type: string
+          format: date-time

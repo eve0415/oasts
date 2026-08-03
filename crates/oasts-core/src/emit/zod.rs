@@ -4,6 +4,7 @@
 //! kernel, and sibling Zod modules. Component references stay named and deferred so recursive
 //! graphs compile without widening their output types.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -21,7 +22,9 @@ use crate::num::render_number_value;
 
 use super::model::EmissionModel;
 use super::runtime_assets::rewrite_relative_ts_imports;
-use super::validators::{identical_component_delegate, operation_parameter_validator_names};
+use super::validators::{
+    identical_component_delegate, operation_parameter_validator_names, validator_wire_type_name,
+};
 use super::{
     Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypeAxis, TypePosition,
     callback_operation, callback_parent_operation, import_extension, lowercase_first, media_tag,
@@ -249,7 +252,11 @@ impl SiblingImports {
                 .entry(target.file_base.clone())
                 .or_default()
                 .0
-                .insert(target.variant_name(position));
+                .insert(if target.transforms {
+                    target.wire_name(position)
+                } else {
+                    target.variant_name(position)
+                });
         });
     }
 
@@ -1476,7 +1483,8 @@ fn node_finite_values(schema: &SchemaNode) -> (Option<&[Value]>, Option<&Value>)
 /// Builds one exported declaration pair. `annotated_type` is `Some` only for a schema in a
 /// reference cycle, which is the sole case that needs the explicit annotation.
 fn render_decl(
-    export_type: &str,
+    export_name: &str,
+    declared_type: &str,
     schema_name: &str,
     annotated_type: Option<(&str, &str)>,
     expression: &str,
@@ -1486,11 +1494,11 @@ fn render_decl(
     // bound and only the import path differs. It discards the parsed value: the client forwards what
     // it already decoded, which keeps zod's object reconstruction invisible at that seam.
     let wrapper = format!(
-        "\nexport function validate{export_type}(value: unknown, path: readonly (string | number)[], issues: Issue[]): void {{\n  collect({schema_name}, value, path, issues);\n}}\n"
+        "\nexport function validate{export_name}(value: unknown, path: readonly (string | number)[], issues: Issue[]): void {{\n  collect({schema_name}, value, path, issues);\n}}\n"
     );
     match annotated_type {
         Some((type_expression, type_annotation)) => Decl {
-            type_declaration: format!("export type {export_type} = {type_expression};\n"),
+            type_declaration: format!("export type {declared_type} = {type_expression};\n"),
             schema: format!(
                 "export const {schema_name}: {type_annotation} = {expression};\n{wrapper}"
             ),
@@ -1498,7 +1506,7 @@ fn render_decl(
         None => Decl {
             type_declaration: String::new(),
             schema: format!(
-                "export const {schema_name} = {expression};\n\nexport type {export_type} = z.infer<typeof {schema_name}>;\n{wrapper}"
+                "export const {schema_name} = {expression};\n\nexport type {declared_type} = z.infer<typeof {schema_name}>;\n{wrapper}"
             ),
         },
     }
@@ -1558,18 +1566,27 @@ fn emit_component(
     let analyzed = model.analyzed;
     let file_base = model.component_files[schema_index].clone()?;
     let schema = &analyzed.ir.schemas[schema_index];
-    let (request_variant, response_variant) = {
+    let (request_variant, response_variant, neutral_wire, request_wire, response_wire) = {
         let target = model
             .schema_target(&schema.source.source_id, &schema.source.json_pointer)
             .expect("a component with an allocated file has a registered target");
-        (target.request_export(), target.response_export())
+        (
+            target.request_export(),
+            target.response_export(),
+            target.wire_export(TypePosition::Neutral),
+            target.wire_export(TypePosition::Request),
+            target.wire_export(TypePosition::Response),
+        )
     };
-    let mut variants = vec![(name.to_owned(), TypePosition::Neutral)];
+    // The wire twin is carried as `None` when there is none rather than as a copy of the export
+    // name: under the `string` default no position has one, and a copy per variant would be an
+    // allocation the non-converting build pays for nothing.
+    let mut variants = vec![(name.to_owned(), neutral_wire, TypePosition::Neutral)];
     if let Some(request) = request_variant {
-        variants.push((request, TypePosition::Request));
+        variants.push((request, request_wire, TypePosition::Request));
     }
     if let Some(response) = response_variant {
-        variants.push((response, TypePosition::Response));
+        variants.push((response, response_wire, TypePosition::Response));
     }
 
     let mut runtime_values = BTreeSet::new();
@@ -1581,13 +1598,14 @@ fn emit_component(
     };
     let mut declarations = Vec::new();
     let cyclic = participates_in_reference_cycle(model, schema_index);
-    for (export_type, position) in variants {
+    for (export_name, wire_name, position) in variants {
+        let declared_type = wire_name.as_deref().unwrap_or(&export_name);
         let type_expression = cyclic.then(|| {
             let emitter = Emitter::new(model);
             imports.collect_types(&emitter, &schema.schema, position);
-            emitter.render_type(&schema.schema, position, TypeAxis::Application, 0)
+            emitter.render_type(&schema.schema, position, TypeAxis::Wire, 0)
         });
-        let schema_name = schema_const_name(&export_type);
+        let schema_name = schema_const_name(&export_name);
         let expression = SchemaRenderer {
             model,
             position,
@@ -1602,11 +1620,12 @@ fn emit_component(
         let annotation = type_expression.as_ref().map(|type_expression| {
             (
                 type_expression.as_str(),
-                format!("{}<{export_type}>", schema_type(model.config.zod.flavor)),
+                format!("{}<{declared_type}>", schema_type(model.config.zod.flavor)),
             )
         });
         declarations.push(render_decl(
-            &export_type,
+            &export_name,
+            declared_type,
             &schema_name,
             annotation
                 .as_ref()
@@ -1710,26 +1729,53 @@ fn emit_operation_file(
     let mut imports = SiblingImports::default();
     let mut reexports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut declarations = Vec::new();
+    // Every name this module declares of its own, so a derived twin never lands on one.
+    // Built only when a representation converts: nothing derives a twin otherwise, and an empty
+    // set allocates nothing, so the `string` default pays for none of this.
+    let siblings: BTreeSet<&str> = if model.transform_facts().enabled() {
+        positions
+            .iter()
+            .map(|(export_type, _, _)| export_type.as_str())
+            .chain(
+                header_positions
+                    .iter()
+                    .map(|(export_type, _)| export_type.as_str()),
+            )
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let mut wire_diagnostics = Vec::new();
     // An operation schema is never itself the target of a `$ref`, so its inference can only cycle
     // through a component, and that component carries the annotation that breaks it.
-    for (export_type, schema, position) in positions {
+    for (export_type, schema, position) in &positions {
+        let (schema, position) = (*schema, *position);
         // A position that is a bare `$ref` to a component whose name it already shares must
         // re-export that component rather than declare its own: the two identifiers are the same,
         // so declaring one here both collides with the sibling import and makes the schema
         // reference itself. Airbyte's `AssistV1ProcessRequestBody` is a real case.
+        let emitter = Emitter::new(model);
+        let declared_type = validator_wire_type_name(
+            &emitter,
+            export_type,
+            schema,
+            position,
+            &siblings,
+            &mut wire_diagnostics,
+        );
+        if let Some(file_base) =
+            identical_component_delegate(&emitter, export_type, schema, position)
         {
-            let emitter = Emitter::new(model);
-            if let Some(file_base) =
-                identical_component_delegate(&emitter, &export_type, schema, position)
-            {
-                let entry = reexports.entry(file_base).or_default();
-                entry.insert(format!("type {export_type}"));
-                entry.insert(schema_const_name(&export_type));
-                entry.insert(format!("validate{export_type}"));
-                continue;
-            }
+            let entry = reexports.entry(file_base).or_default();
+            entry.insert(format!("type {declared_type}"));
+            entry.insert(schema_const_name(export_type));
+            entry.insert(format!("validate{export_type}"));
+            continue;
         }
-        let schema_name = schema_const_name(&export_type);
+        // The name borrows the export, not the emitter, so the read-only borrow of the model ends
+        // here and the renderer below can take it mutably.
+        drop(emitter);
+        let schema_name = schema_const_name(export_type);
         let expression = SchemaRenderer {
             model,
             position,
@@ -1739,7 +1785,13 @@ fn emit_operation_file(
             imports: &mut imports,
         }
         .render(schema);
-        declarations.push(render_decl(&export_type, &schema_name, None, &expression));
+        declarations.push(render_decl(
+            export_type,
+            &declared_type,
+            &schema_name,
+            None,
+            &expression,
+        ));
     }
     for (export_type, response) in header_positions {
         let (_, expression) = render_headers(
@@ -1750,8 +1802,25 @@ fn emit_operation_file(
             &mut runtime_values,
         );
         let schema_name = schema_const_name(&export_type);
-        declarations.push(render_decl(&export_type, &schema_name, None, &expression));
+        let transforms = response.headers.iter().any(|(_, header)| {
+            !crate::client_model::response_header_is_opaque_string(header)
+                && model.transform_facts().reaches(&header.schema)
+        });
+        // Borrowed when nothing transforms, which is every position under the `string` default.
+        let declared_type = if transforms {
+            Cow::Owned(format!("{export_type}Wire"))
+        } else {
+            Cow::Borrowed(export_type.as_str())
+        };
+        declarations.push(render_decl(
+            &export_type,
+            &declared_type,
+            &schema_name,
+            None,
+            &expression,
+        ));
     }
+    model.sink.extend(wire_diagnostics);
     let content = assemble_file(
         model,
         "../components/",
@@ -1784,12 +1853,7 @@ fn render_headers(
         } else {
             let emitter = Emitter::new(model);
             imports.collect_types(&emitter, &header.schema, TypePosition::Response);
-            emitter.render_type(
-                &header.schema,
-                TypePosition::Response,
-                TypeAxis::Application,
-                2,
-            )
+            emitter.render_type(&header.schema, TypePosition::Response, TypeAxis::Wire, 2)
         };
         type_members.push(format!(
             "  {}{}{}: {type_expression};",
@@ -2588,6 +2652,164 @@ mod tests {
                 content
             );
         }
+    }
+
+    #[test]
+    fn transforming_date_time_schemas_declare_wire_types() {
+        let (files, diagnostics) = compile_with_config(
+            doc(json!({
+                "Event": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Node": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" },
+                        "child": { "$ref": "#/components/schemas/Node" },
+                        "event": { "$ref": "#/components/schemas/Event" }
+                    }
+                }
+            })),
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "zod": true },
+                "types": { "dateTime": "date" },
+                "validation": {
+                    "engine": "zod",
+                    "request": true,
+                    "response": true,
+                    "unchecked": "allow"
+                }
+            }),
+        );
+        assert_clean(&diagnostics);
+
+        let event = component(&files, "event");
+        assert!(event.contains("export const eventSchema ="), "{event}");
+        assert!(
+            event.contains("export type EventWire = z.infer<typeof eventSchema>;"),
+            "{event}"
+        );
+        assert!(
+            event.contains("export function validateEvent(value: unknown,"),
+            "{event}"
+        );
+        assert!(
+            event.contains("stringFormat(isDateTime,\"date-time\")"),
+            "{event}"
+        );
+
+        let node = component(&files, "node");
+        assert!(
+            node.contains("import { type EventWire, eventSchema } from \"./event.js\";"),
+            "{node}"
+        );
+        assert!(
+            node.contains("export type NodeWire = {\n  at: string;"),
+            "{node}"
+        );
+        assert!(
+            node.contains("export const nodeSchema: z.ZodType<NodeWire> ="),
+            "{node}"
+        );
+        assert!(
+            node.contains("export function validateNode(value: unknown,"),
+            "{node}"
+        );
+    }
+
+    #[test]
+    fn transforming_operation_schemas_keep_their_public_names() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/events": {
+                    "post": {
+                        "operationId": "createEvent",
+                        "parameters": [{
+                            "name": "since",
+                            "in": "query",
+                            "schema": { "type": "string", "format": "date-time" }
+                        }],
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CreateEventRequestBody" }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "created",
+                                "headers": {
+                                    "X-Created-At": {
+                                        "required": true,
+                                        "schema": { "type": "string", "format": "date-time" }
+                                    }
+                                },
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "string", "format": "date-time" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "CreateEventRequestBody": {
+                        "type": "object",
+                        "required": ["at"],
+                        "properties": {
+                            "at": { "type": "string", "format": "date-time" }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile_with_config(
+            document,
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "zod": true },
+                "types": { "dateTime": "date" },
+                "validation": {
+                    "engine": "zod",
+                    "request": true,
+                    "response": true,
+                    "unchecked": "allow"
+                }
+            }),
+        );
+        assert_clean(&diagnostics);
+        let content = generated(&files, "zod/operations/createevent.ts");
+        assert!(content.contains("export type CreateEventQuerySinceWire = z.infer<typeof createEventQuerySinceSchema>;"), "{content}");
+        assert!(
+            content.contains("export function validateCreateEventQuerySince(value: unknown,"),
+            "{content}"
+        );
+        assert!(content.contains("export { createEventRequestBodySchema, type CreateEventRequestBodyWire, validateCreateEventRequestBody } from \"../components/createeventrequestbody.js\";"), "{content}");
+        assert!(content.contains("export type CreateEventResponse200Wire = z.infer<typeof createEventResponse200Schema>;"), "{content}");
+        assert!(content.contains("export type CreateEventResponse200HeadersWire = z.infer<typeof createEventResponse200HeadersSchema>;"), "{content}");
+        assert!(content.contains("\"X-Created-At\": string;"), "{content}");
+        assert!(
+            content
+                .contains("export function validateCreateEventResponse200Headers(value: unknown,"),
+            "{content}"
+        );
     }
 
     #[test]

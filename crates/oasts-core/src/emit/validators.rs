@@ -18,6 +18,7 @@
 //! the keyword/construct and its source pointer. The writer never commits a failed run, so the
 //! types/client artifacts stay byte-identical when validators is disabled.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -36,10 +37,11 @@ use crate::semantic::{TargetCase, normalize_identifier};
 use super::model::EmissionModel;
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
-    Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypeAxis, TypePosition,
-    callback_operation, callback_parent_operation, import_extension, lowercase_first, media_tag,
-    property_in_position, push_indent, render_json_compact, render_ts_string,
-    response_status_type_suffix, source_diagnostic, uppercase_first,
+    CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode,
+    TypeAxis, TypePosition, callback_operation, callback_parent_operation, import_extension,
+    lowercase_first, media_tag, property_in_position, push_indent, render_json_compact,
+    render_ts_string, response_status_type_suffix, source_diagnostic, uppercase_first,
+    warning_diagnostic,
 };
 use crate::media::is_json;
 
@@ -3512,6 +3514,11 @@ struct Decl {
     validator: String,
 }
 
+struct NamedTypeDeclaration {
+    name: String,
+    content: String,
+}
+
 type SiblingBindings = BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>;
 
 /// A direct component `$ref` whose positioned component name already is this operation export needs
@@ -3544,6 +3551,62 @@ pub(super) fn identical_component_delegate(
         .then(|| resolved.file_base.clone())
 }
 
+/// The wire type an operation-local validator declares while its public export stem stays fixed.
+/// A bare component delegate reuses that component's allocated twin name, including a collision
+/// replacement; every other transforming position owns the ordinary `{Name}Wire` twin.
+pub(super) fn validator_wire_type_name<'a>(
+    emitter: &Emitter<'_, '_, '_>,
+    export_name: &'a str,
+    schema: &SchemaNode,
+    position: TypePosition,
+    siblings: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Cow<'a, str> {
+    // Borrowed on the non-converting path: under the `string` default every position takes it, and
+    // owning a copy of the name it already has is an allocation that build pays for nothing.
+    // `enabled` first because `reaches` is a fresh recursive scan that allocates as it collects a
+    // node's outgoing refs, and no representation converting means no position has a twin.
+    let facts = emitter.model.transform_facts();
+    if !facts.enabled() || !facts.reaches(schema) {
+        return Cow::Borrowed(export_name);
+    }
+    if let SchemaNode::Ref { target, .. } = schema
+        && let Some(resolved) = emitter
+            .model
+            .schema_target(&target.source_id, &target.json_pointer)
+        && resolved.variant_name(position) == export_name
+    {
+        // A component's twin was allocated against every declared component name already, so it
+        // arrives resolved; only the operation-local names below are derived here.
+        return Cow::Owned(resolved.wire_name(position));
+    }
+    let derived = format!("{export_name}Wire");
+    if !siblings.contains(derived.as_str()) {
+        return Cow::Owned(derived);
+    }
+    // The same yield the component twins take, module-locally: a position literally named
+    // `<other>Wire` owns that name, and the derived one gives way rather than declaring it twice.
+    let replacement = format!("{derived}Value");
+    if siblings.contains(replacement.as_str()) {
+        diagnostics.push(source_diagnostic(
+            CODE_WIRE_COLLISION,
+            format!(
+                "generated wire type name '{derived}' for '{export_name}' collides with another declaration in the same module, and the replacement name '{replacement}' is already taken; rename one with naming.overrides"
+            ),
+            &schema.meta().source,
+        ));
+        return Cow::Owned(derived);
+    }
+    diagnostics.push(warning_diagnostic(
+        CODE_WIRE_ALIAS,
+        format!(
+            "generated wire type name '{derived}' for '{export_name}' collides with another declaration in the same module; emitting it as '{replacement}'"
+        ),
+        &schema.meta().source,
+    ));
+    Cow::Owned(replacement)
+}
+
 fn emit_component(
     model: &mut EmissionModel<'_, '_>,
     schema_index: usize,
@@ -3558,12 +3621,24 @@ fn emit_component(
     // first-class Request/Response validator variants mirroring the type artifact. The divergence
     // was resolved across the whole reference graph at model construction; `Some` is exactly the
     // positions that diverge, and carries the name each one declares under.
-    let (request_variant, response_variant) = {
+    let (request_variant, response_variant, neutral_wire, request_wire, response_wire) = {
         let target = model
             .schema_target(&schema.source.source_id, &schema.source.json_pointer)
             .expect("a component with an allocated file has a registered target");
-        (target.request_export(), target.response_export())
+        (
+            target.request_export(),
+            target.response_export(),
+            target.wire_export(TypePosition::Neutral),
+            target.wire_export(TypePosition::Request),
+            target.wire_export(TypePosition::Response),
+        )
     };
+    // Borrowed when the position has no wire twin, which is every position under the `string`
+    // default: owning a copy of the name it already has is an allocation that build pays for
+    // nothing, and the drift gate counts it.
+    let neutral_type: Cow<'_, str> = neutral_wire
+        .as_deref()
+        .map_or(Cow::Borrowed(name), Cow::Borrowed);
 
     let mut scope = FileScope::default();
     let mut imports = SiblingImports {
@@ -3576,13 +3651,13 @@ fn emit_component(
         // Response — keeps the emitted file deterministic. The variant export names come from
         // `SchemaTarget`, the same producer the type artifact and every sibling import read, so
         // agreement is enforced here rather than restated.
-        let mut variants: Vec<(String, TypePosition)> = Vec::with_capacity(3);
-        variants.push((name.to_owned(), TypePosition::Neutral));
+        let mut variants: Vec<(String, Option<String>, TypePosition)> = Vec::with_capacity(3);
+        variants.push((name.to_owned(), neutral_wire, TypePosition::Neutral));
         if let Some(export) = request_variant {
-            variants.push((export, TypePosition::Request));
+            variants.push((export, request_wire, TypePosition::Request));
         }
         if let Some(export) = response_variant {
-            variants.push((export, TypePosition::Response));
+            variants.push((export, response_wire, TypePosition::Response));
         }
 
         // Phase 1: render each variant's structural type and collect its sibling imports through the
@@ -3591,14 +3666,15 @@ fn emit_component(
             let emitter = Emitter::new(model);
             variants
                 .iter()
-                .map(|(export, position)| {
+                .map(|(export_name, wire_name, position)| {
+                    let declared_type = wire_name.as_deref().unwrap_or(export_name);
                     let mut declaration = String::new();
                     emitter.write_schema_declaration(
                         &mut declaration,
-                        export,
+                        declared_type,
                         &schema.schema,
                         *position,
-                        TypeAxis::Application,
+                        TypeAxis::Wire,
                         &schema.source,
                     );
                     imports.collect_types(&emitter, &schema.schema, *position);
@@ -3610,13 +3686,16 @@ fn emit_component(
         // Phase 2: generate each variant's validate body (needs schema_target lookups through a
         // dropped emitter); the position drives which properties the body checks.
         let mut declarations = Vec::with_capacity(variants.len());
-        for ((export, position), type_declaration) in variants.iter().zip(type_declarations) {
+        for ((export_name, wire_name, position), type_declaration) in
+            variants.iter().zip(type_declarations)
+        {
+            let declared_type = wire_name.as_deref().unwrap_or(export_name);
             let mut body = FnBody::new(
                 &mut scope,
                 &mut imports,
                 model,
                 *position,
-                export,
+                export_name,
                 schema.schema.meta().source.display(),
             );
             body.gen_root_schema(&schema.schema, "value", "path", "issues");
@@ -3624,7 +3703,7 @@ fn emit_component(
             declarations.push(Decl {
                 type_declaration,
                 helpers,
-                validator: render_validator(export, &body),
+                validator: render_validator(export_name, declared_type, &body),
             });
         }
         declarations
@@ -3636,10 +3715,10 @@ fn emit_component(
             let mut declaration = String::new();
             emitter.write_schema_declaration(
                 &mut declaration,
-                name,
+                &neutral_type,
                 &schema.schema,
                 TypePosition::Neutral,
-                TypeAxis::Application,
+                TypeAxis::Wire,
                 &schema.source,
             );
             imports.collect_types(&emitter, &schema.schema, TypePosition::Neutral);
@@ -3658,7 +3737,7 @@ fn emit_component(
         vec![Decl {
             type_declaration,
             helpers,
-            validator: render_validator(name, &body),
+            validator: render_validator(name, &neutral_type, &body),
         }]
     };
 
@@ -3762,36 +3841,85 @@ fn emit_operation_file(
     // Phase 1: render each position's type alias and collect sibling imports. One emitter serves
     // both the value and header declarations — its merge/link caches carry across the two loops —
     // and the block scopes its borrow of `model` so phase 2 can reborrow `model` mutably.
-    let (type_declarations, header_type_declarations): (Vec<Option<String>>, Vec<String>) = {
+    // Every name this module declares of its own, so a derived twin never lands on one.
+    // Built only when a representation converts: nothing derives a twin otherwise, and an empty
+    // set allocates nothing, so the `string` default pays for none of this.
+    let siblings: BTreeSet<&str> = if model.transform_facts().enabled() {
+        positions
+            .iter()
+            .map(|(export_type, _, _)| export_type.as_str())
+            .chain(
+                header_positions
+                    .iter()
+                    .map(|(export_type, _)| export_type.as_str()),
+            )
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let mut wire_diagnostics = Vec::new();
+    let (type_declarations, header_type_declarations): (
+        Vec<Option<NamedTypeDeclaration>>,
+        Vec<NamedTypeDeclaration>,
+    ) = {
         let emitter = Emitter::new(model);
         let type_declarations = positions
             .iter()
             .map(|(export_type, schema, position)| {
+                let declared_type = validator_wire_type_name(
+                    &emitter,
+                    export_type,
+                    schema,
+                    *position,
+                    &siblings,
+                    &mut wire_diagnostics,
+                );
                 if let Some(file_base) =
                     identical_component_delegate(&emitter, export_type, schema, *position)
                 {
                     let (types, values) = reexports.entry(file_base).or_default();
-                    types.insert(export_type.clone());
+                    types.insert(declared_type.into_owned());
                     values.insert(format!("{}Validator", lowercase_first(export_type)));
                     values.insert(format!("validate{export_type}"));
                     return None;
                 }
                 imports.collect_types(&emitter, schema, *position);
-                Some(format!(
-                    "export type {export_type} = {};\n",
-                    emitter.render_type(schema, *position, TypeAxis::Application, 0)
-                ))
+                let declaration = format!(
+                    "export type {declared_type} = {};\n",
+                    emitter.render_type(schema, *position, TypeAxis::Wire, 0)
+                );
+                Some(NamedTypeDeclaration {
+                    name: declared_type.into_owned(),
+                    content: declaration,
+                })
             })
             .collect();
         let header_type_declarations = header_positions
             .iter()
             .map(|(export_type, response)| {
+                let transforms = response.headers.iter().any(|(_, header)| {
+                    !crate::client_model::response_header_is_opaque_string(header)
+                        && model.transform_facts().reaches(&header.schema)
+                });
+                let declared_type = if transforms {
+                    format!("{export_type}Wire")
+                } else {
+                    export_type.clone()
+                };
                 for (_, header) in &response.headers {
                     imports.collect_types(&emitter, &header.schema, TypePosition::Response);
                 }
                 let mut declaration = String::new();
-                emitter.write_response_headers_interface(&mut declaration, export_type, response);
-                declaration
+                emitter.write_response_headers_interface(
+                    &mut declaration,
+                    &declared_type,
+                    response,
+                    TypeAxis::Wire,
+                );
+                NamedTypeDeclaration {
+                    name: declared_type,
+                    content: declaration,
+                }
             })
             .collect();
         (type_declarations, header_type_declarations)
@@ -3816,9 +3944,9 @@ fn emit_operation_file(
         body.gen_root_schema(schema, "value", "path", "issues");
         let (helpers, body) = body.finish();
         declarations.push(Decl {
-            type_declaration,
+            type_declaration: type_declaration.content,
             helpers,
-            validator: render_validator(export_type, &body),
+            validator: render_validator(export_type, &type_declaration.name, &body),
         });
     }
     for ((export_type, response), type_declaration) in
@@ -3835,9 +3963,9 @@ fn emit_operation_file(
         body.gen_response_headers(response);
         let (helpers, body) = body.finish();
         declarations.push(Decl {
-            type_declaration,
+            type_declaration: type_declaration.content,
             helpers,
-            validator: render_validator(export_type, &body),
+            validator: render_validator(export_type, &type_declaration.name, &body),
         });
     }
 
@@ -3849,6 +3977,7 @@ fn emit_operation_file(
         &scope,
         &declarations,
     );
+    model.sink.extend(wire_diagnostics);
     report_incomplete_applicators(model.sink, &scope);
     let relative_path = format!("validators/{directory}/{file_base}.ts");
     model.register_path(&relative_path, &operation.source);
@@ -4146,19 +4275,19 @@ fn location_title(location: ParamLocation) -> &'static str {
 }
 
 /// The `validate`/`checked`/const trio for one export, given its already-generated validate body.
-fn render_validator(export_type: &str, body: &str) -> String {
-    let const_name = format!("{}Validator", lowercase_first(export_type));
+fn render_validator(export_name: &str, declared_type: &str, body: &str) -> String {
+    let const_name = format!("{}Validator", lowercase_first(export_name));
     let mut output = String::new();
     output.push_str(&format!(
-        "export function validate{export_type}(value: unknown, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): void {{\n"
+        "export function validate{export_name}(value: unknown, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): void {{\n"
     ));
     output.push_str(body);
     output.push_str("}\n\n");
     output.push_str(&format!(
-        "function checked{export_type}(value: unknown, issues: Issue[]): value is {export_type} {{\n  validate{export_type}(value, [], issues);\n  return issues.length === 0;\n}}\n\n"
+        "function checked{export_name}(value: unknown, issues: Issue[]): value is {declared_type} {{\n  validate{export_name}(value, [], issues);\n  return issues.length === 0;\n}}\n\n"
     ));
     output.push_str(&format!(
-        "export const {const_name}: SyncStandardSchemaV1<{export_type}> = {{\n"
+        "export const {const_name}: SyncStandardSchemaV1<{declared_type}> = {{\n"
     ));
     output.push_str("  \"~standard\": {\n");
     output.push_str("    version: 1,\n");
@@ -4166,7 +4295,7 @@ fn render_validator(export_type: &str, body: &str) -> String {
     output.push_str("    validate(value) {\n");
     output.push_str("      const issues: Issue[] = [];\n");
     output.push_str(&format!(
-        "      return checked{export_type}(value, issues) ? {{ value }} : {{ issues }};\n"
+        "      return checked{export_name}(value, issues) ? {{ value }} : {{ issues }};\n"
     ));
     output.push_str("    },\n");
     output.push_str("    types: undefined,\n");
@@ -4198,7 +4327,12 @@ impl SiblingImports {
                 return;
             }
             let entry = self.files.entry(target.file_base.clone()).or_default();
-            entry.0.insert(target.variant_name(position));
+            let type_name = if target.transforms {
+                target.wire_name(position)
+            } else {
+                target.variant_name(position)
+            };
+            entry.0.insert(type_name);
         });
     }
 
@@ -4325,6 +4459,21 @@ mod tests {
     /// Compiles an OpenAPI document with the validators artifact enabled, returning the emitted
     /// files and the sorted diagnostics. Mirrors the pipeline stages so the reject walk runs.
     fn compile(document: Value) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
+        compile_with_config(
+            document,
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "validators": true }
+            }),
+        )
+    }
+
+    fn compile_with_config(
+        document: Value,
+        config: Value,
+    ) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
         let temp = TempDir::new().expect("temp directory");
         let input = temp.path().join("openapi.json");
         let config_path = temp.path().join("oasts.json");
@@ -4333,12 +4482,6 @@ mod tests {
             serde_json::to_vec(&document).expect("document JSON"),
         )
         .expect("write document");
-        let config = json!({
-            "schemaVersion": 1,
-            "input": { "path": "./openapi.json" },
-            "output": "./generated",
-            "artifacts": { "types": true, "validators": true }
-        });
         fs::write(
             &config_path,
             serde_json::to_vec(&config).expect("config JSON"),
@@ -4421,6 +4564,278 @@ mod tests {
             .expect("component validator file")
             .content
             .clone()
+    }
+
+    #[test]
+    fn transforming_date_time_validator_declares_the_wire_type() {
+        let (files, diagnostics) = compile_with_config(
+            doc_31(json!({
+                "Event": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Envelope": {
+                    "type": "object",
+                    "required": ["event"],
+                    "properties": {
+                        "event": { "$ref": "#/components/schemas/Event" }
+                    }
+                }
+            })),
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "validators": true },
+                "types": { "dateTime": "date" },
+                "validation": {
+                    "engine": "generated",
+                    "request": true,
+                    "response": true,
+                    "unchecked": "allow"
+                }
+            }),
+        );
+        assert_clean(&diagnostics);
+        let content = component(&files, "event");
+        assert!(
+            content.contains("export interface EventWire {\n  at: string;\n}"),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function validateEvent(value: unknown,"),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "function checkedEvent(value: unknown, issues: Issue[]): value is EventWire {"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("export const eventValidator: SyncStandardSchemaV1<EventWire> = {"),
+            "{content}"
+        );
+        assert!(
+            content.contains("if (typeof value0 === \"string\") {"),
+            "{content}"
+        );
+        let envelope = component(&files, "envelope");
+        assert!(
+            envelope.contains("import { type EventWire, validateEvent } from \"./event.js\";"),
+            "{envelope}"
+        );
+        assert!(envelope.contains("event: EventWire;"), "{envelope}");
+    }
+
+    #[test]
+    fn a_derived_wire_name_yields_to_a_position_that_owns_it() {
+        // Query parameters `a` and `aWire`: the first converts, so it derives `ReadQueryAWire` —
+        // which is the second's own name. Both were emitted as `export type ReadQueryAWire`.
+        let (files, diagnostics) = compile_with_config(
+            json!({
+                "openapi": "3.1.0",
+                "info": { "title": "t", "version": "1" },
+                "paths": { "/r": { "get": {
+                    "operationId": "read",
+                    "parameters": [
+                        { "name": "a", "in": "query", "required": true,
+                          "schema": { "type": "string", "format": "date-time" } },
+                        { "name": "aWire", "in": "query", "required": true,
+                          "schema": { "type": "string" } }
+                    ],
+                    "responses": { "200": { "description": "ok", "content": {
+                        "application/json": { "schema": { "type": "object" } } } } }
+                } } },
+                "components": { "schemas": {} }
+            }),
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "validators": true },
+                "types": { "dateTime": "date" },
+                "validation": {
+                    "engine": "generated",
+                    "request": true,
+                    "response": true,
+                    "unchecked": "allow"
+                }
+            }),
+        );
+
+        let content = &files
+            .iter()
+            .find(|file| file.relative_path == "validators/operations/read.ts")
+            .expect("the operation validator module")
+            .content;
+        assert!(
+            content.contains("export type ReadQueryAWireValue = string;"),
+            "{content}"
+        );
+        assert_eq!(
+            content.matches("export type ReadQueryAWire =").count(),
+            1,
+            "{content}"
+        );
+        let mut warned = false;
+        for diagnostic in &diagnostics {
+            if diagnostic.code == "OASTS1311" {
+                warned = true;
+            }
+        }
+        assert!(warned, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_wire_name_with_nowhere_left_to_yield_is_fatal() {
+        // `ReadQueryAWire` and `ReadQueryAWireValue` are both owned by other positions, so the
+        // derived twin has no free name and sharing one silently is the outcome to avoid.
+        let (_files, diagnostics) = compile_with_config(
+            json!({
+                "openapi": "3.1.0",
+                "info": { "title": "t", "version": "1" },
+                "paths": { "/r": { "get": {
+                    "operationId": "read",
+                    "parameters": [
+                        { "name": "a", "in": "query", "required": true,
+                          "schema": { "type": "string", "format": "date-time" } },
+                        { "name": "aWire", "in": "query", "required": true,
+                          "schema": { "type": "string" } },
+                        { "name": "aWireValue", "in": "query", "required": true,
+                          "schema": { "type": "string" } }
+                    ],
+                    "responses": { "200": { "description": "ok", "content": {
+                        "application/json": { "schema": { "type": "object" } } } } }
+                } } },
+                "components": { "schemas": {} }
+            }),
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "validators": true },
+                "types": { "dateTime": "date" },
+                "validation": {
+                    "engine": "generated",
+                    "request": true,
+                    "response": true,
+                    "unchecked": "allow"
+                }
+            }),
+        );
+
+        let mut fatal = Vec::new();
+        for diagnostic in &diagnostics {
+            if diagnostic.code == "OASTS1312" {
+                fatal.push(diagnostic.message.as_str());
+            }
+        }
+        assert_eq!(fatal.len(), 1, "{diagnostics:#?}");
+        assert!(fatal[0].contains("ReadQueryAWireValue"), "{fatal:?}");
+    }
+
+    #[test]
+    fn transforming_operation_validators_keep_their_public_names() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/events": {
+                    "post": {
+                        "operationId": "createEvent",
+                        "parameters": [{
+                            "name": "since",
+                            "in": "query",
+                            "schema": { "type": "string", "format": "date-time" }
+                        }],
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CreateEventRequestBody" }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "created",
+                                "headers": {
+                                    "X-Created-At": {
+                                        "required": true,
+                                        "schema": { "type": "string", "format": "date-time" }
+                                    }
+                                },
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "string", "format": "date-time" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "CreateEventRequestBody": {
+                        "type": "object",
+                        "required": ["at"],
+                        "properties": {
+                            "at": { "type": "string", "format": "date-time" }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile_with_config(
+            document,
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "validators": true },
+                "types": { "dateTime": "date" },
+                "validation": {
+                    "engine": "generated",
+                    "request": true,
+                    "response": true,
+                    "unchecked": "allow"
+                }
+            }),
+        );
+        assert_clean(&diagnostics);
+        let content = operation(&files, "createevent");
+        assert!(
+            content.contains("export type CreateEventQuerySinceWire = string;"),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function validateCreateEventQuerySince(value: unknown,"),
+            "{content}"
+        );
+        assert!(
+            content.contains("SyncStandardSchemaV1<CreateEventQuerySinceWire>"),
+            "{content}"
+        );
+        assert!(content.contains("export { type CreateEventRequestBodyWire, createEventRequestBodyValidator, validateCreateEventRequestBody } from \"../components/createeventrequestbody.js\";"), "{content}");
+        assert!(
+            content.contains("export type CreateEventResponse200Wire = string;"),
+            "{content}"
+        );
+        assert!(
+            content.contains("export interface CreateEventResponse200HeadersWire {"),
+            "{content}"
+        );
+        assert!(content.contains("\"X-Created-At\": string;"), "{content}");
+        assert!(
+            content
+                .contains("export function validateCreateEventResponse200Headers(value: unknown,"),
+            "{content}"
+        );
     }
 
     #[test]

@@ -343,9 +343,23 @@ fn emit_operation(
         let (aliases, diagnostics) = if component_imports.is_empty() {
             (HashMap::new(), Vec::new())
         } else {
+            // The interned set is extended only when a representation renders a global, so the
+            // `string` default still borrows it and owns nothing per module.
+            let globals = super::representation_globals(&model.config.types);
+            let extended;
+            let reserved = if globals.is_empty() {
+                client_module_bindings()
+            } else {
+                extended = client_module_bindings()
+                    .iter()
+                    .copied()
+                    .chain(globals)
+                    .collect::<BTreeSet<&str>>();
+                &extended
+            };
             assign_import_aliases(
                 &client_declarations(&stem, &operation_type_names, transforming),
-                client_module_bindings(),
+                reserved,
                 &component_imports,
                 &operation.source,
             )

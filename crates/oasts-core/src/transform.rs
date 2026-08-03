@@ -139,7 +139,13 @@ enum Conversion {
 /// two branches converting at different places compare unequal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Step {
-    Property(String),
+    /// Requiredness is part of the step, not decoration: two branches converting the same property
+    /// emit different code when one of them permits it to be omitted, so a profile that ignored it
+    /// would call them interchangeable and let branch order decide which one is emitted.
+    Property {
+        name: String,
+        required: bool,
+    },
     Items,
     Index(usize),
     AdditionalProperties,
@@ -449,6 +455,31 @@ impl<'ir> TransformFacts<'ir> {
         declared.union(nullable)
     }
 
+    /// Whether every branch converts the same values at the same places and the branches disagree
+    /// only about which of those properties they require.
+    ///
+    /// Read by the refusal that reports an indistinguishable union, so it can name the difference
+    /// the user can actually act on instead of pointing at conversions that are in fact identical.
+    #[must_use]
+    pub fn branches_differ_only_in_optionality(&self, branches: &[SchemaNode]) -> bool {
+        let erased = |branch| {
+            let mut conversions = self.conversions(branch);
+            for (path, _) in &mut conversions {
+                for step in path {
+                    if let Step::Property { required, .. } = step {
+                        *required = true;
+                    }
+                }
+            }
+            conversions
+        };
+        // Consecutive pairs rather than each against the first: equality is transitive, so the two
+        // say the same thing, and this one needs no case for a branch list that cannot be empty.
+        branches
+            .windows(2)
+            .all(|pair| erased(&pair[0]) == erased(&pair[1]))
+    }
+
     /// The conversions this node performs, each with the path it performs them at, in a deterministic
     /// order. Used only for equality: two branches convert identically when these lists match.
     fn conversions(&self, node: &SchemaNode) -> Conversions {
@@ -477,8 +508,11 @@ impl<'ir> TransformFacts<'ir> {
                 additional_properties,
                 ..
             } => {
-                for (name, property, _) in properties {
-                    path.push(Step::Property(name.clone()));
+                for (name, property, meta) in properties {
+                    path.push(Step::Property {
+                        name: name.clone(),
+                        required: meta.required,
+                    });
                     self.collect_conversions(property, path, out);
                     path.pop();
                 }
@@ -583,6 +617,7 @@ impl<'ir> TransformFacts<'ir> {
             SchemaNode::Object {
                 properties,
                 additional_properties,
+                meta,
                 ..
             } => {
                 for (_, property, _) in properties {
@@ -592,6 +627,14 @@ impl<'ir> TransformFacts<'ir> {
                     AdditionalProperties::Allowed(Some(schema))
                     | AdditionalProperties::Schema(schema) => self.scan(schema, out),
                     AdditionalProperties::Allowed(None) | AdditionalProperties::Forbidden => {}
+                }
+                // Only a pattern the types emitter turns into an index signature: one without a key
+                // it can render contributes no declared type, so nothing there can promise a
+                // converted value. Reachability and that rendering have to agree.
+                for pattern in &meta.validation_applicators().pattern_properties {
+                    if pattern.type_key.is_some() {
+                        self.scan(&pattern.schema, out);
+                    }
                 }
             }
             SchemaNode::Array { items, .. } => self.scan(items, out),
@@ -1621,6 +1664,33 @@ mod union_tests {
             date_mode(),
         );
         assert_eq!(d, UnionDispatch::Shared);
+    }
+
+    #[test]
+    fn branches_disagreeing_on_requiredness_do_not_share_a_conversion() {
+        // Shared before this, which emitted the first branch's conversion: declared required-first
+        // it converted `at` unconditionally and threw on the valid payload `{}`; declared the other
+        // way round it emitted the guarded form. Same document, two behaviours.
+        let required = json!({
+            "type": "object",
+            "required": ["at"],
+            "properties": { "at": { "type": "string", "format": "date-time" } }
+        });
+        let optional = json!({
+            "type": "object",
+            "properties": { "at": { "type": "string", "format": "date-time" } }
+        });
+        for order in [json!([required, optional]), json!([optional, required])] {
+            let d = dispatch(
+                doc(json!({ SHARED: { "anyOf": order } })),
+                SHARED,
+                date_mode(),
+            );
+            assert!(
+                matches!(d, UnionDispatch::Indistinguishable { .. }),
+                "branch order must not decide the conversion; got {d:?}"
+            );
+        }
     }
 
     #[test]

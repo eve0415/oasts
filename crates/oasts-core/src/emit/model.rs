@@ -134,6 +134,11 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                     }
                     let derived = format!("{}Wire", target.variant_name(position));
                     if !declared.contains(derived.as_str()) {
+                        // Stored even when nothing collides, for the reason `reserve_names` gives
+                        // about variant overrides: a later rename would otherwise re-derive this
+                        // name from one that pass invented, and nothing re-checks that derivation
+                        // against the declared components.
+                        wire_variants[position.index()] = Some(derived);
                         continue;
                     }
                     let replacement = format!("{derived}Value");
@@ -1366,6 +1371,30 @@ mod wire_variant_tests {
         assert!(warnings[0].contains("'PetWire'"));
         assert!(warnings[0].contains("'PetWireValue'"));
         assert!(codes(&diagnostics, "OASTS1312").is_empty());
+    }
+
+    #[test]
+    fn a_reserved_name_rename_does_not_re_derive_the_wire_twin() {
+        // `Issue` is a name the validators runtime binds, so that emitter renames the component to
+        // `Issue2` — after wire twins were allocated. Re-deriving the twin from the new name gave
+        // `Issue2Wire`, which the document already declares, and a module importing both got two
+        // bindings of one name with no diagnostic.
+        let (exports, diagnostics) = wire_exports(
+            json!({
+                "Issue": timed(),
+                "Issue2Wire": { "type": "object", "properties": { "n": { "type": "integer" } } }
+            }),
+            "Issue",
+        );
+        assert_eq!(exports[0].as_deref(), Some("IssueWire"));
+        assert!(
+            codes(&diagnostics, "OASTS1311").is_empty(),
+            "{diagnostics:#?}"
+        );
+        assert!(
+            codes(&diagnostics, "OASTS1312").is_empty(),
+            "{diagnostics:#?}"
+        );
     }
 
     #[test]

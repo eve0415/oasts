@@ -27,6 +27,7 @@ const repoRoot = path.resolve(import.meta.dirname, "../../../..");
 const binary = path.join(repoRoot, "target/debug/oasts");
 const fixtureSource = path.join(repoRoot, "fixtures/msw-showcase-3.1");
 const emptyPathFixtureSource = path.join(repoRoot, "fixtures/msw-empty-path-3.1");
+const transformFixtureSource = path.join(repoRoot, "fixtures/transform-msw-3.1");
 
 const BASE = "https://api.test/v1";
 
@@ -36,6 +37,9 @@ let getReportMockHandler: ExportedFunction;
 let createPetMockHandler: ExportedFunction;
 let uploadMultipartMockHandler: ExportedFunction;
 let getEmptyMatrixHandler: ExportedFunction;
+let getLatestEventHandler: ExportedFunction;
+let getLatestEvent: ExportedFunction;
+let createTransformTransport: ExportedFunction;
 
 // Registered last, so it only answers when no generated handler matched. That makes "did our
 // matcher match?" an observable fact rather than an inference from an unhandled-request warning.
@@ -55,14 +59,20 @@ before(async () => {
   const temporaryRoot = await mkdtemp(path.join(tmpdir(), "oasts-msw-e2e-"));
   const fixtureRoot = path.join(temporaryRoot, "msw-showcase-3.1");
   const emptyPathFixtureRoot = path.join(temporaryRoot, "msw-empty-path-3.1");
+  const transformFixtureRoot = path.join(temporaryRoot, "transform-msw-3.1");
   await cp(fixtureSource, fixtureRoot, { recursive: true });
   await cp(emptyPathFixtureSource, emptyPathFixtureRoot, { recursive: true });
+  await cp(transformFixtureSource, transformFixtureRoot, { recursive: true });
   execFileSync(binary, ["generate", "--config", "oasts-msw.yaml"], {
     cwd: fixtureRoot,
     stdio: "pipe",
   });
   execFileSync(binary, ["generate", "--config", "oasts-msw.yaml"], {
     cwd: emptyPathFixtureRoot,
+    stdio: "pipe",
+  });
+  execFileSync(binary, ["generate", "--config", "oasts-msw.yaml"], {
+    cwd: transformFixtureRoot,
     stdio: "pipe",
   });
   // Emitted handlers import `msw` bare, the way a consumer's would. Nothing resolves that from a
@@ -75,7 +85,9 @@ before(async () => {
   }
   const generatedRoot = path.join(fixtureRoot, "generated-msw");
   const emptyPathGeneratedRoot = path.join(emptyPathFixtureRoot, "generated-msw");
+  const transformGeneratedRoot = path.join(transformFixtureRoot, "generated-msw");
   await cp(emptyPathGeneratedRoot, path.join(generatedRoot, "empty-path"), { recursive: true });
+  await cp(transformGeneratedRoot, path.join(generatedRoot, "transform"), { recursive: true });
 
   register(new URL("./resolve-generated.mjs", import.meta.url), {
     data: { generatedRootUrl: pathToFileURL(generatedRoot).href },
@@ -96,6 +108,22 @@ before(async () => {
       pathToFileURL(path.join(generatedRoot, "empty-path/msw/handlers/getemptymatrix.ts")).href
     ),
     "getEmptyMatrixHandler",
+  );
+  getLatestEventHandler = requiredFunction(
+    await import(
+      pathToFileURL(path.join(generatedRoot, "transform/msw/handlers/getlatestevent.ts")).href
+    ),
+    "getLatestEventHandler",
+  );
+  getLatestEvent = requiredFunction(
+    await import(
+      pathToFileURL(path.join(generatedRoot, "transform/client/operations/getlatestevent.ts")).href
+    ),
+    "getLatestEvent",
+  );
+  createTransformTransport = requiredFunction(
+    await import(pathToFileURL(path.join(generatedRoot, "transform/runtime/transport.ts")).href),
+    "createTransport",
   );
 
   server.listen({ onUnhandledRequest: "bypass" });
@@ -178,6 +206,34 @@ test("a documented JSON response carries its declared content type", async () =>
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("content-type"), "application/json");
   assert.deepEqual(await response.json(), { id: 7, name: "Bella" });
+});
+
+test("MSW application dates round-trip through the wire into generated client dates", async () => {
+  const occurredAt = new Date("2024-03-01T12:00:00.000Z");
+  use(
+    getLatestEventHandler(
+      (input: unknown) => {
+        const respond = requiredFunction(input, "respond");
+        return respond({
+          match: 200,
+          status: 200,
+          contentType: "application/json",
+          body: { id: "e1", occurredAt },
+        });
+      },
+      { baseUrl: BASE },
+    ),
+  );
+
+  const wireResponse = await fetch(`${BASE}/events/latest`);
+  const wireBody = requiredRecord(await wireResponse.json(), "wire response");
+  assert.equal(wireBody.occurredAt, occurredAt.toISOString());
+
+  const transport = createTransformTransport({ baseUrl: BASE });
+  const result = requiredRecord(await getLatestEvent(transport, {}), "getLatestEvent result");
+  const data = requiredRecord(result.data, "getLatestEvent data");
+  assert.ok(data.occurredAt instanceof Date, "occurredAt should decode to a Date");
+  assert.equal(data.occurredAt.getTime(), occurredAt.getTime());
 });
 
 test("a second media entry on the same status selects its own content type", async () => {

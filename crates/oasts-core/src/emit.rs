@@ -25,7 +25,10 @@ use crate::client_model::ClientModel;
 #[cfg(test)]
 use crate::composition::CODE_COMPOSITION;
 use crate::composition::{finite_values, json_equal};
-use crate::config::{DocumentationConfig, EnumRepresentation, FileCase, ResolvedConfig};
+use crate::config::{
+    DateRepresentation, DateTimeRepresentation, DocumentationConfig, EnumRepresentation, FileCase,
+    ResolvedConfig, TypesConfig,
+};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
     AdditionalProperties, Discriminator, Ir, MediaType, Operation, Param, ParamLocation,
@@ -81,6 +84,7 @@ const CODE_TRANSFORM_UNION: &str = "OASTS1313";
 /// a shape no single codec is keyed on, and emitting nothing for one would leave a wire string
 /// behind a type promising an application value.
 pub(super) const CODE_UNCONVERTIBLE_TRANSFORM: &str = "OASTS1314";
+
 /// A wire twin whose derived `{Name}Wire` is already a declared component's name. The document owns
 /// its name; the compiler invented the other, so the twin yields to `{Name}WireValue` and generation
 /// continues — the same rule OASTS1306 applies to a colliding request/response variant.
@@ -389,6 +393,19 @@ pub(super) enum TypePosition {
 pub(super) enum TypeAxis {
     Application,
     Wire,
+}
+
+/// What a conjunction proves about a discriminator property: the literals it fixes the property to,
+/// and whether any constituent requires it.
+///
+/// The two travel together because they come from one walk, but they merge differently — an `allOf`
+/// *intersects* the values its constituents fix and *unions* the ones that require the property. The
+/// base-plus-subtype spelling is exactly that split: the base requires the tag as a plain string and
+/// the subtype fixes its literal without repeating `required`.
+#[derive(Default)]
+struct TagFacts {
+    values: Option<Vec<Value>>,
+    required: bool,
 }
 
 impl TypePosition {
@@ -1123,7 +1140,9 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 .filter(|(_, index)| branch_index == Some(*index))
                 .map(|(tag, _)| *tag)
                 .collect();
-            let const_proof = self.merged_object_property_finite(branch, prop, &mut HashSet::new());
+            let const_proof = self
+                .merged_object_property_finite(branch, prop, &mut HashSet::new())
+                .values;
 
             // An allOf idiom that fixes the tag property to disjoint values proves an uninhabitable
             // branch: no wire value selects it, so the union cannot dispatch. Warn and fall back.
@@ -1232,6 +1251,9 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     /// `value.<property> === "<tag>"`, and TypeScript narrows on that only where the branch's type
     /// declares the literal. Under a mapping-only proof every arm still declares `<property>` as
     /// `string`, and the emitted ternary compiles to a type error rather than a dispatch.
+    /// A branch also has to *require* the property. An optional tag declares `<property>?: "alpha"`,
+    /// which the emitted `value.<property> === "alpha"` does not narrow — the arm is a type error,
+    /// and a payload that omits the tag falls through every arm unconverted.
     pub(super) fn discriminator_branches_fix_a_literal(
         &self,
         branches: &[SchemaNode],
@@ -1241,9 +1263,11 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             matches!(
                 self.resolve_ref(branch, &mut HashSet::new()),
                 Some(SchemaNode::Never { .. })
-            ) || self
-                .merged_object_property_finite(branch, property, &mut HashSet::new())
-                .is_some_and(|values| !values.is_empty())
+            ) || {
+                let facts =
+                    self.merged_object_property_finite(branch, property, &mut HashSet::new());
+                facts.required && facts.values.is_some_and(|values| !values.is_empty())
+            }
         })
     }
 
@@ -1252,38 +1276,49 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         branch: &'a SchemaNode,
         prop: &str,
         visited: &mut HashSet<(&'a str, &'a str)>,
-    ) -> Option<Vec<Value>> {
+    ) -> TagFacts {
         match branch {
             SchemaNode::Ref { target, .. } => {
                 if !visited.insert((target.source_id.as_str(), target.json_pointer.as_str())) {
-                    return None;
+                    return TagFacts::default();
                 }
-                let index = self
-                    .model
-                    .schema_target(&target.source_id, &target.json_pointer)?
-                    .index;
-                let resolved = &self.model.analyzed.ir.schemas.get(index)?.schema;
-                self.merged_object_property_finite(resolved, prop, visited)
+                self.model
+                    .schema_target(&target.source_id, &target.json_pointer)
+                    .and_then(|target| self.model.analyzed.ir.schemas.get(target.index))
+                    .map_or_else(TagFacts::default, |resolved| {
+                        self.merged_object_property_finite(&resolved.schema, prop, visited)
+                    })
             }
-            SchemaNode::Object { properties, .. } => {
-                let (_, schema, _) = properties.iter().find(|(name, _, _)| name == prop)?;
-                // A primitive tag property fixes its value in `const`/`enum` (resolved through a
-                // `$ref`); an object/array/tuple-typed one carries it in the `finite` box b9e3b24
-                // added. Consult both so either spelling proves.
-                self.finite_constraint(schema, &mut visited.clone())
-                    .or_else(|| container_finite_values(schema))
-            }
+            // A primitive tag property fixes its value in `const`/`enum` (resolved through a
+            // `$ref`); an object/array/tuple-typed one carries it in the `finite` box b9e3b24
+            // added. Consult both so either spelling proves.
+            SchemaNode::Object { properties, .. } => properties
+                .iter()
+                .find(|(name, _, _)| name == prop)
+                .map_or_else(TagFacts::default, |(_, schema, meta)| TagFacts {
+                    values: self
+                        .finite_constraint(schema, &mut visited.clone())
+                        .or_else(|| container_finite_values(schema)),
+                    required: meta.required,
+                }),
             SchemaNode::AllOf { branches, .. } => {
-                let mut sets = branches.iter().filter_map(|branch| {
-                    self.merged_object_property_finite(branch, prop, &mut visited.clone())
-                });
-                let mut intersection = sets.next()?;
-                for set in sets {
-                    intersection.retain(|value| set.iter().any(|other| json_equal(value, other)));
+                let mut facts = TagFacts::default();
+                for branch in branches {
+                    let constituent =
+                        self.merged_object_property_finite(branch, prop, &mut visited.clone());
+                    facts.required |= constituent.required;
+                    let Some(values) = constituent.values else {
+                        continue;
+                    };
+                    match facts.values.as_mut() {
+                        None => facts.values = Some(values),
+                        Some(intersection) => intersection
+                            .retain(|value| values.iter().any(|other| json_equal(value, other))),
+                    }
                 }
-                Some(intersection)
+                facts
             }
-            _ => None,
+            _ => TagFacts::default(),
         }
     }
 
@@ -1355,6 +1390,16 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 );
             }
         }
+        let (aliases, alias_diagnostics) = assign_import_aliases(
+            &BTreeSet::new(),
+            &representation_globals(&self.model.config.types),
+            &imports,
+            &schema.source,
+        );
+        self.set_import_aliases(aliases);
+        self.deferred_diagnostics
+            .borrow_mut()
+            .extend(alias_diagnostics);
         self.write_imports(&mut content, imports, "./");
         self.write_schema_declaration(
             &mut content,
@@ -2239,6 +2284,25 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     }
 }
 
+/// The TypeScript globals a configured date/time representation renders as.
+///
+/// An imported component of the same name silently retypes every occurrence of the global in that
+/// module — `at: Date` comes to mean the component rather than the built-in, which compiles and is
+/// wrong. Every emitter that renders the application axis reserves these so `assign_import_aliases`
+/// renames the import instead; the alias is file-local, so no exported name changes.
+pub(super) fn representation_globals(types: &TypesConfig) -> BTreeSet<&'static str> {
+    let mut globals = BTreeSet::new();
+    if types.date_time == DateTimeRepresentation::Date {
+        globals.insert("Date");
+    }
+    if types.date_time == DateTimeRepresentation::Temporal
+        || types.date == DateRepresentation::Temporal
+    {
+        globals.insert("Temporal");
+    }
+    globals
+}
+
 /// Picks the local binding for every component import a module would otherwise let its own
 /// declarations shadow. A shadowed import is silently retyped to the local declaration, so the
 /// emitted module is not merely uncompilable — where it does compile, it is wrong.
@@ -2344,8 +2408,13 @@ impl SchemaTarget {
     /// onto the derived name instead would have two modules exporting `PetRequestWire` with no
     /// diagnostic at all.
     pub(super) fn wire_name(&self, position: TypePosition) -> String {
+        // A position that declares nothing of its own reads the neutral declaration's twin, exactly
+        // as `variant_name` reads its name. Deriving one here instead would rebuild it from a name
+        // `reserve_names` may since have renamed, and nothing re-checks that against the declared
+        // components — the trap that pass documents for variant overrides.
         self.wire_variants[position.index()]
             .clone()
+            .or_else(|| self.wire_variants[TypePosition::Neutral.index()].clone())
             .unwrap_or_else(|| format!("{}Wire", self.variant_name(position)))
     }
 
@@ -2493,7 +2562,12 @@ impl Emitter<'_, '_, '_> {
                     declared.insert(format!("{response_name}Headers"));
                 }
             }
-            assign_import_aliases(&declared, &BTreeSet::new(), &imports, &operation.source)
+            assign_import_aliases(
+                &declared,
+                &representation_globals(&self.model.config.types),
+                &imports,
+                &operation.source,
+            )
         };
         self.set_import_aliases(aliases);
         self.deferred_diagnostics
@@ -2543,6 +2617,7 @@ impl Emitter<'_, '_, '_> {
                     &mut content,
                     &format!("{response_name}Headers"),
                     response,
+                    TypeAxis::Application,
                 );
             }
         }
@@ -2630,6 +2705,7 @@ impl Emitter<'_, '_, '_> {
         output: &mut String,
         interface_name: &str,
         response: &ResponseEntry,
+        axis: TypeAxis,
     ) {
         write_source_metadata(output, &response.source, 0);
         output.push_str("export interface ");
@@ -2658,12 +2734,7 @@ impl Emitter<'_, '_, '_> {
                 // and schema+style headers render their typed schema.
                 output.push_str("string");
             } else {
-                output.push_str(&self.render_type(
-                    &header.schema,
-                    TypePosition::Response,
-                    TypeAxis::Application,
-                    2,
-                ));
+                output.push_str(&self.render_type(&header.schema, TypePosition::Response, axis, 2));
             }
             output.push_str(";\n");
         }

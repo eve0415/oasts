@@ -255,7 +255,8 @@ fn emit_paths(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
     }
 
     let declared = BTreeSet::from(["paths".to_owned()]);
-    let reserved = BTreeSet::from(["Uint8Array"]);
+    let mut reserved = BTreeSet::from(["Uint8Array"]);
+    reserved.extend(super::representation_globals(&model.config.types));
     let (aliases, diagnostics) =
         assign_import_aliases(&declared, &reserved, &component_imports, &source);
     model.sink.extend(diagnostics);
@@ -502,6 +503,8 @@ fn emit_operation(
             "requestBody",
             "respondWith",
         ]);
+        let mut reserved = reserved;
+        reserved.extend(super::representation_globals(&model.config.types));
         let (aliases, diagnostics) =
             assign_import_aliases(&declared, &reserved, &component_imports, &operation.source);
         renderer.set_import_aliases(aliases.clone());

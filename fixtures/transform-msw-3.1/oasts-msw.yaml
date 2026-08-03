@@ -1,0 +1,17 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-msw
+artifacts:
+  types: true
+  client: true
+  msw: true
+client:
+  authEnforcement: types
+  baseUrl:
+    source: runtime
+types:
+  dateTime: date
+validation:
+  engine: 'off'
+  unchecked: allow
