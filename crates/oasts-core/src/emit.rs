@@ -2565,8 +2565,19 @@ impl Emitter<'_, '_, '_> {
         } else {
             let mut declared =
                 BTreeSet::from([format!("{stem}Request"), format!("{stem}Response")]);
+            // The payload twins count as declarations too, on exactly the conditions that emit
+            // them below. Listing only the application names left a module importing a component
+            // called `{Stem}Response200` with one of the pair aliased and its `Wire` twin not: the
+            // import then bound the local twin instead, which is TS2440 where the names collide and
+            // a silently wrong type where they do not.
+            if self.request_transforms(operation) {
+                declared.insert(format!("{stem}RequestWire"));
+            }
             for (response_name, response) in &response_declarations {
                 declared.insert(response_name.clone());
+                if self.response_transforms(response) {
+                    declared.insert(format!("{response_name}Wire"));
+                }
                 if !response.headers.is_empty() {
                     declared.insert(format!("{response_name}Headers"));
                 }
@@ -8939,6 +8950,47 @@ mod tests {
         assert!(
             file.content
                 .contains("export type CompleteUploadResponse200 = CompleteUploadResponse200Body;"),
+            "{}",
+            file.content
+        );
+    }
+
+    #[test]
+    fn a_component_shadowing_a_response_wire_twin_imports_under_a_role_alias() {
+        let (files, diagnostics) = compile(
+            shadowing_document(
+                json!({
+                    "CompleteUploadResponse200": {
+                        "type": "object",
+                        "properties": { "at": { "type": "string", "format": "date-time" } }
+                    }
+                }),
+                "",
+                "CompleteUploadResponse200",
+            ),
+            json!({
+                "artifacts": { "types": true, "client": true },
+                "client": {},
+                "validation": { "engine": "off", "unchecked": "allow" },
+                "types": { "dateTime": "date" }
+            }),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let file = find_file(&files, "types/operations/completeupload.ts");
+        // Both halves of the pair are declarations of this module, so both have to be aliased. With
+        // only the application name in the declared set, `CompleteUploadResponse200Wire` bound the
+        // local twin and the wire payload silently referred to itself.
+        assert!(
+            file.content.contains(
+                "import type { CompleteUploadResponse200 as CompleteUploadResponse200Body, CompleteUploadResponse200Wire as CompleteUploadResponse200WireBody } from \"../components/completeuploadresponse200.js\";"
+            ),
+            "{}",
+            file.content
+        );
+        assert!(
+            file.content.contains(
+                "export type CompleteUploadResponse200Wire = CompleteUploadResponse200WireBody;"
+            ),
             "{}",
             file.content
         );

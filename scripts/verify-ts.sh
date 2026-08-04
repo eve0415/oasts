@@ -94,6 +94,15 @@ for transform_config in oasts-date oasts-date-validated oasts-temporal oasts-pla
     "$work/transform-$transform_config" transform "transform-showcase-3.1 ($transform_config)"
 done
 
+# The `allOf` merges whose branches name a converting component. Only tsc over the emitted tree
+# decides these: both surfaces of a merged object have to assign, and a merge that writes one key
+# twice widens it to `Date | string`, which no assertion over the emitted string would catch.
+for composition_config in oasts-date oasts-temporal; do
+  generate_and_verify transform-composition-3.1 "$composition_config.yaml" \
+    "$work/composition-$composition_config" transform \
+    "transform-composition-3.1 ($composition_config)"
+done
+
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-auth-showcase-3.1/compile-assert/cases.ts"
 echo "compile-assert matrix ok: auth-showcase-3.1"
 

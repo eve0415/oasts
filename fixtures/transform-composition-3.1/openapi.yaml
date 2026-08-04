@@ -1,0 +1,273 @@
+openapi: 3.1.0
+info:
+  title: Transform composition
+  version: 1.0.0
+  description: >-
+    The shapes an `allOf` merge can take when a branch names a component that converts. Each one is
+    a distinct emitted merge, and tsc over the emitted tree is what checks them: the two surfaces of
+    a merged object have to assign, which no unit test over the emitted string can tell you.
+servers:
+  - url: https://composition.example.test
+paths:
+  /pairs:
+    get:
+      operationId: readPair
+      summary: Two referenced branches, each converting an optional property.
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pair'
+  /optionals:
+    get:
+      operationId: readOptional
+      summary: One referenced branch converting an optional property, beside an inline branch.
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OptionalMerge'
+  /requireds:
+    get:
+      operationId: readRequired
+      summary: One referenced branch converting a required property — the shape that already worked.
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequiredMerge'
+  /maps:
+    get:
+      operationId: readMap
+      summary: A referenced branch beside an index signature that converts every other key.
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MapMerge'
+  /audits:
+    post:
+      operationId: writeAudit
+      summary: A read-only property inside a referenced branch — absent from the request surface.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuditMerge'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditMerge'
+  /diamonds:
+    get:
+      operationId: readDiamond
+      summary: Two branches reaching one component, which is inlined once rather than once per path.
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Diamond'
+  /strictures:
+    get:
+      operationId: readStricture
+      summary: Two branches sharing a property, one requiring it and one not.
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StrictureMerge'
+  /instants:
+    get:
+      operationId: readInstant
+      summary: A sibling codec whose name the runtime kernel also exports.
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Holder'
+  /notices:
+    get:
+      operationId: readNotice
+      summary: A branch that is not object-shaped, which converts the whole value instead.
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NoticeMerge'
+components:
+  schemas:
+    Left:
+      type: object
+      properties:
+        leftAt:
+          type: string
+          format: date-time
+    Right:
+      type: object
+      properties:
+        rightAt:
+          type: string
+          format: date-time
+    Pair:
+      description: >-
+        Two whole-value codec calls spread over one value reverted each other, because each spreads
+        every key back whether it converted it or not.
+      allOf:
+        - $ref: '#/components/schemas/Left'
+        - $ref: '#/components/schemas/Right'
+    OptionalMerge:
+      description: >-
+        One call is enough to break this on its own: the spread of an optional `leftAt?: Date` over
+        the value's own `leftAt?: string` unions to `Date | string`, which assigns to neither
+        surface.
+      allOf:
+        - $ref: '#/components/schemas/Left'
+        - type: object
+          properties:
+            note:
+              type: string
+    Required:
+      type: object
+      required:
+        - at
+      properties:
+        at:
+          type: string
+          format: date-time
+    RequiredMerge:
+      description: A required property overrode the wire key outright, so this shape always compiled.
+      allOf:
+        - $ref: '#/components/schemas/Required'
+        - type: object
+          required:
+            - id
+          properties:
+            id:
+              type: string
+    MapMerge:
+      description: The referenced branch's keys are members, so the index signature must skip them.
+      allOf:
+        - $ref: '#/components/schemas/Left'
+        - type: object
+          additionalProperties:
+            type: string
+            format: date-time
+    Audited:
+      type: object
+      properties:
+        seenAt:
+          type: string
+          format: date-time
+          readOnly: true
+        sentAt:
+          type: string
+          format: date-time
+    AuditMerge:
+      allOf:
+        - $ref: '#/components/schemas/Audited'
+        - type: object
+          required:
+            - subject
+          properties:
+            subject:
+              type: string
+    Diamond:
+      description: >-
+        Both branches name the same component. It contributes its keys once — walking it per path is
+        what turns a deep reference graph into an exponential one.
+      allOf:
+        - $ref: '#/components/schemas/Left'
+        - $ref: '#/components/schemas/Left'
+    StrictureMerge:
+      description: >-
+        The merged member is required, so only the unconditional assignment satisfies it. Writing
+        the optional branch's conditional spread and dropping the required one as a duplicate left a
+        codec returning `at?: Date` for a type declaring `at: Date`.
+      allOf:
+        - $ref: '#/components/schemas/Left'
+        - type: object
+          required:
+            - leftAt
+          properties:
+            leftAt:
+              type: string
+              format: date-time
+    Instant:
+      description: >-
+        Under the Temporal representation the runtime kernel exports `decodeInstant` too. The kernel
+        import yields to the sibling; giving both the same local binding declared one identifier
+        twice.
+      type: object
+      properties:
+        deep:
+          type: string
+          format: date-time
+    Holder:
+      type: object
+      properties:
+        own:
+          type: string
+          format: date-time
+        nested:
+          $ref: '#/components/schemas/Instant'
+    Reminder:
+      type: object
+      required:
+        - kind
+        - remindAt
+      properties:
+        kind:
+          type: string
+          const: reminder
+        remindAt:
+          type: string
+          format: date-time
+    Digest:
+      type: object
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          const: digest
+        title:
+          type: string
+    Notice:
+      oneOf:
+        - $ref: '#/components/schemas/Reminder'
+        - $ref: '#/components/schemas/Digest'
+      discriminator:
+        propertyName: kind
+    NoticeMerge:
+      description: >-
+        A union has no keys to contribute one at a time, so this branch keeps its whole-value call —
+        and the key-selected pass beside it has to spread after that call, not before. `remindAt` is
+        required because the optional form of this same document is refused: a whole-value spread
+        beside `...value` unions an optional key rather than overriding it.
+      allOf:
+        - $ref: '#/components/schemas/Notice'
+        - type: object
+          patternProperties:
+            '^x-':
+              type: string
+              format: date-time

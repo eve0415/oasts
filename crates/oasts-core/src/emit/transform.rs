@@ -31,7 +31,8 @@ use crate::client_model::{
 use crate::diag::Diagnostic;
 use crate::ir::{
     AdditionalProperties, Discriminator, Operation, ParamLocation, PatternProperty,
-    PatternPropertyKey, PrimitiveType, PropMeta, SchemaMeta, SchemaNode, SourceRef, TupleRest,
+    PatternPropertyKey, PrimitiveType, PropMeta, SchemaMeta, SchemaNode, SchemaRef, SourceRef,
+    TupleRest,
 };
 use crate::transform::{JsonKinds, KindBranch, TransformFacts, TransformKind, UnionDispatch};
 
@@ -152,6 +153,8 @@ fn collect_union_refusals(
         out.push(diagnostic);
     }
     collect_index_signature_refusals(emitter, facts, node, out);
+    collect_merged_index_signature_refusals(emitter, facts, node, out);
+    collect_whole_value_base_refusals(emitter, facts, node, out);
     // The types emitter's own child walk, so this never becomes a second answer to "what is nested
     // inside this schema". `Validation` mode visits every child regardless of read/writeOnly
     // position, which is what a refusal must consider: the union is refused wherever it appears.
@@ -203,9 +206,54 @@ fn collect_index_signature_refusals(
     else {
         return;
     };
-    // Collected before anything is rendered: rendering a type is a full recursive walk, and an
-    // object whose index signatures all keep their wire form has nothing to refuse and so nothing
-    // worth rendering.
+    let mut signatures = index_signatures(facts, additional_properties, meta);
+    if !signatures.iter().any(|signature| signature.converts) {
+        return;
+    }
+    render_signatures(emitter, &mut signatures);
+    for (index, signature) in signatures.iter().enumerate() {
+        for other in &signatures[index + 1..] {
+            if !keys_overlap(signature.key, other.key) || (!signature.converts && !other.converts) {
+                continue;
+            }
+            // Within one object these are one pass: JSON Schema applies every matching pattern and
+            // the emitted chain of key tests can select only one of them, so two that convert are
+            // refused whether or not they agree. Across branches they are two passes, which is why
+            // `refuse_merged_signature_pair` asks the narrower question.
+            if signature.converts && other.converts {
+                out.push(source_diagnostic(
+                    CODE_UNCONVERTIBLE_TRANSFORM,
+                    format!(
+                        "{} and {} both apply a date/time transform to keys they can both match, and one pass over those keys can apply only one; make their patterns disjoint, or set the representation back to string",
+                        signature.label, other.label
+                    ),
+                    &meta.source,
+                ));
+            } else if signature.rendered != other.rendered {
+                out.push(source_diagnostic(
+                    CODE_UNCONVERTIBLE_TRANSFORM,
+                    format!(
+                        "{} types the keys it shares with {} as '{}' while that one types them as '{}', and a date/time transform is bound to one of them; give them the same type, or set the representation back to string",
+                        signature.label, other.label, signature.rendered, other.rendered
+                    ),
+                    &meta.source,
+                ));
+            }
+        }
+    }
+    refuse_property_conflicts(emitter, &signatures, properties, &meta.source, out);
+}
+
+/// The index signatures one object's emitted type carries, unrendered.
+///
+/// Collected before anything is rendered: rendering a type is a full recursive walk, and an object
+/// whose index signatures all keep their wire form has nothing to refuse and so nothing worth
+/// rendering.
+fn index_signatures<'schema>(
+    facts: &TransformFacts<'_>,
+    additional_properties: &'schema AdditionalProperties,
+    meta: &'schema SchemaMeta,
+) -> Vec<IndexSignature<'schema>> {
     let mut signatures = Vec::new();
     for pattern in &meta.validation_applicators().pattern_properties {
         let converts = facts.reaches(&pattern.schema);
@@ -236,55 +284,289 @@ fn collect_index_signature_refusals(
             converts: facts.reaches(additional),
         });
     }
-    if !signatures.iter().any(|signature| signature.converts) {
-        return;
+    signatures
+}
+
+/// Fills in the type each signature gives the keys it covers.
+fn render_signatures(emitter: &Emitter<'_, '_, '_>, signatures: &mut [IndexSignature<'_>]) {
+    for signature in signatures {
+        signature.rendered = render_application_type(emitter, signature.schema);
     }
-    let render = |schema: &SchemaNode| {
-        emitter.render_type(schema, TypePosition::Neutral, TypeAxis::Application, 0)
-    };
-    for signature in &mut signatures {
-        signature.rendered = render(signature.schema);
-    }
-    let mut refuse = |message: String| {
-        out.push(source_diagnostic(
-            CODE_UNCONVERTIBLE_TRANSFORM,
-            message,
-            &meta.source,
-        ));
-    };
-    for (index, signature) in signatures.iter().enumerate() {
-        for other in &signatures[index + 1..] {
-            if !keys_overlap(signature.key, other.key) || (!signature.converts && !other.converts) {
-                continue;
-            }
-            if signature.converts && other.converts {
-                refuse(format!(
-                    "{} and {} both apply a date/time transform to keys they can both match, and one pass over those keys can apply only one; make their patterns disjoint, or set the representation back to string",
-                    signature.label, other.label
-                ));
-            } else if signature.rendered != other.rendered {
-                refuse(format!(
-                    "{} types the keys it shares with {} as '{}' while that one types them as '{}', and a date/time transform is bound to one of them; give them the same type, or set the representation back to string",
-                    signature.label, other.label, signature.rendered, other.rendered
+}
+
+fn render_application_type(emitter: &Emitter<'_, '_, '_>, schema: &SchemaNode) -> String {
+    emitter.render_type(schema, TypePosition::Neutral, TypeAxis::Application, 0)
+}
+
+/// Refuses every declared property a converting signature types differently.
+///
+/// Every declared property, not only the ones the position keeps. This walk has no position — it
+/// visits each schema once, wherever it appears — and erring the other way would let a property that
+/// *is* declared in some position through, which emits a codec whose object literal TypeScript
+/// rejects. A `readOnly` property refused for the request surface it is absent from is the cost of
+/// that.
+fn refuse_property_conflicts(
+    emitter: &Emitter<'_, '_, '_>,
+    signatures: &[IndexSignature<'_>],
+    properties: &[(String, SchemaNode, PropMeta)],
+    source: &SourceRef,
+    out: &mut Vec<Diagnostic>,
+) {
+    for signature in signatures.iter().filter(|signature| signature.converts) {
+        for (name, schema, _) in properties {
+            let rendered = render_application_type(emitter, schema);
+            if key_matches(signature.key, name) && rendered != signature.rendered {
+                out.push(source_diagnostic(
+                    CODE_UNCONVERTIBLE_TRANSFORM,
+                    format!(
+                        "property '{name}' is typed '{rendered}' while {} applies a date/time transform typing that same key '{}'; give it that type, drop it from the pattern's keys, or set the representation back to string",
+                        signature.label, signature.rendered
+                    ),
+                    source,
                 ));
             }
         }
     }
-    // Every declared property, not only the ones the position keeps. This walk has no position —
-    // it visits each schema once, wherever it appears — and erring the other way would let a
-    // property that *is* declared in some position through, which emits a codec whose object
-    // literal TypeScript rejects. A `readOnly` property refused for the request surface it is
-    // absent from is the cost of that.
-    for signature in signatures.iter().filter(|signature| signature.converts) {
-        for (name, schema, _) in properties {
-            if key_matches(signature.key, name) && render(schema) != signature.rendered {
-                refuse(format!(
-                    "property '{name}' is typed '{}' while {} applies a date/time transform typing that same key '{}'; give it that type, drop it from the pattern's keys, or set the representation back to string",
-                    render(schema),
-                    signature.label,
-                    signature.rendered
-                ));
+}
+
+/// The checks `collect_index_signature_refusals` runs within one object, run again across the
+/// branches of one `allOf`.
+///
+/// An intersection types a key by every member that covers it, so a property one branch declares
+/// `string` sits under another branch's `[key: string]: Date` exactly as it would if both came from
+/// one object — and nothing inhabits that. Only cross-branch pairs are checked: each branch has
+/// already been checked against itself, and reporting a pair twice would say the same thing twice.
+///
+/// A `$ref` branch is followed, because the merged type declares the members it names just as an
+/// inline branch's are declared. Refs already open are skipped, which terminates a recursive schema.
+fn collect_merged_index_signature_refusals(
+    emitter: &Emitter<'_, '_, '_>,
+    facts: &TransformFacts<'_>,
+    node: &SchemaNode,
+    out: &mut Vec<Diagnostic>,
+) {
+    let SchemaNode::AllOf { branches, .. } = node else {
+        return;
+    };
+    let mut objects = Vec::new();
+    collect_merged_objects(emitter, branches, &mut BTreeSet::new(), &mut objects);
+    let mut merged: Vec<_> = objects
+        .iter()
+        .map(|(properties, additional_properties, meta)| {
+            (
+                *properties,
+                &meta.source,
+                index_signatures(facts, additional_properties, meta),
+            )
+        })
+        .collect();
+    // The same fast-reject the single-object check makes, over the merge: no converting signature
+    // anywhere in it means nothing here can disagree with a transform, and nothing is rendered.
+    if !merged
+        .iter()
+        .any(|(_, _, signatures)| signatures.iter().any(|signature| signature.converts))
+    {
+        return;
+    }
+    for (_, _, signatures) in &mut merged {
+        render_signatures(emitter, signatures);
+    }
+    for (index, (_, source, signatures)) in merged.iter().enumerate() {
+        for (other_index, (properties, _, others)) in merged.iter().enumerate() {
+            if other_index == index {
+                continue;
             }
+            refuse_property_conflicts(emitter, signatures, properties, source, out);
+            // One direction only, so the two branches do not each report the same disagreement.
+            if other_index > index {
+                for signature in signatures {
+                    for other in others {
+                        refuse_merged_signature_pair(signature, other, source, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Refuses two index signatures in different branches of one `allOf` whose key spaces overlap and
+/// whose types disagree.
+///
+/// Narrower than the single-object rule on purpose, and the difference is real rather than a
+/// concession. Within one object the emitted conversion is *one* pass whose chain of key tests can
+/// select only one pattern, so two that convert are refused even when they agree — the pass would
+/// have to pick. Across branches each contributes its own pass, both run over the original value,
+/// and two that produce the same type produce the same value for every key they share, whichever
+/// runs last. Only a disagreement is unresolvable, and that is what this refuses: a document where
+/// one branch says a key is a `Date` and another says it is a `string` declares a type nothing
+/// inhabits, and the emitted passes would silently pick one.
+fn refuse_merged_signature_pair(
+    signature: &IndexSignature<'_>,
+    other: &IndexSignature<'_>,
+    source: &SourceRef,
+    out: &mut Vec<Diagnostic>,
+) {
+    if !keys_overlap(signature.key, other.key)
+        || (!signature.converts && !other.converts)
+        || signature.rendered == other.rendered
+    {
+        return;
+    }
+    out.push(source_diagnostic(
+        CODE_UNCONVERTIBLE_TRANSFORM,
+        format!(
+            "{} types the keys it shares with {} in another branch of this allOf as '{}' while that one types them as '{}', and a date/time transform is bound to one of them; give them the same type, or set the representation back to string",
+            signature.label, other.label, signature.rendered, other.rendered
+        ),
+        source,
+    ));
+}
+
+/// Refuses an `allOf` branch that rebuilds the whole value while declaring an *optional* property
+/// that converts.
+///
+/// A rebuilt branch is spread over `...value`, and for an optional key that spread unions rather
+/// than overrides: the branch's `at?: Date` lands beside the value's own `at?: string` as
+/// `Date | string`, which assigns to neither surface. Only a branch that contributes its keys one
+/// at a time can shed the wire key first, and a branch with no keys to give — a union — cannot.
+/// Nothing inhabits what the document declares, so this is refused on the same rule as a declared
+/// property disagreeing with an index signature, rather than emitted as code `tsc` rejects.
+fn collect_whole_value_base_refusals(
+    emitter: &Emitter<'_, '_, '_>,
+    facts: &TransformFacts<'_>,
+    node: &SchemaNode,
+    out: &mut Vec<Diagnostic>,
+) {
+    let SchemaNode::AllOf { branches, .. } = node else {
+        return;
+    };
+    for branch in branches {
+        if !rebuilds_whole_value(emitter, facts, branch) {
+            continue;
+        }
+        let mut walked = BTreeSet::new();
+        if let Some(name) = optional_converting_property(emitter, facts, branch, &mut walked) {
+            out.push(source_diagnostic(
+                CODE_UNCONVERTIBLE_TRANSFORM,
+                format!(
+                    "this branch converts as a whole value and declares '{name}' optional, so its converted value is spread beside the unconverted one and the merged property types as both; require '{name}', give the branch a declared object shape, or set the representation back to string"
+                ),
+                &branch.meta().source,
+            ));
+        }
+    }
+}
+
+/// Whether an `allOf` branch converts by rebuilding the whole value rather than by contributing its
+/// keys — the `ObjectParts::bases` shape, on the same test `collect_parts` applies.
+///
+/// A branch whose reference cycles back on itself also becomes a base, and this does not say so: it
+/// would have to carry the walk's ref stack to know. Under-reporting is the safe side, and that
+/// document is uninhabitable for its own reasons.
+fn rebuilds_whole_value(
+    emitter: &Emitter<'_, '_, '_>,
+    facts: &TransformFacts<'_>,
+    branch: &SchemaNode,
+) -> bool {
+    if !facts.reaches(branch) {
+        return false;
+    }
+    match branch {
+        SchemaNode::Object { .. } | SchemaNode::AllOf { .. } => false,
+        SchemaNode::Ref { target, .. } if !branch.meta().nullable => emitter
+            .model
+            .schema_target(&target.source_id, &target.json_pointer)
+            .filter(|resolved| resolved.transforms)
+            .is_some_and(|resolved| {
+                !matches!(
+                    &emitter.model.analyzed.ir.schemas[resolved.index].schema,
+                    SchemaNode::Object { .. } | SchemaNode::AllOf { .. }
+                )
+            }),
+        _ => true,
+    }
+}
+
+/// The branches a composition declares its shape through, or `None` for a node that declares its
+/// own. `union_parts` answers the same question for the two that carry a discriminator.
+fn composed_branches(node: &SchemaNode) -> Option<&[SchemaNode]> {
+    match node {
+        SchemaNode::AllOf { branches, .. } => Some(branches),
+        _ => union_parts(node).map(|(branches, _)| branches),
+    }
+}
+
+/// The first optional property that converts anywhere under `node`'s own declared shape, following
+/// `$ref` and composed branches. A required one is not reported: a required key in a spread
+/// overrides the value's own rather than unioning with it, which is why that shape compiles.
+fn optional_converting_property(
+    emitter: &Emitter<'_, '_, '_>,
+    facts: &TransformFacts<'_>,
+    node: &SchemaNode,
+    walked: &mut BTreeSet<usize>,
+) -> Option<String> {
+    if let SchemaNode::Object { properties, .. } = node {
+        return properties
+            .iter()
+            .find(|(_, schema, meta)| !meta.required && facts.reaches(schema))
+            .map(|(name, _, _)| name.clone());
+    }
+    if let SchemaNode::Ref { target, .. } = node {
+        let resolved = emitter
+            .model
+            .schema_target(&target.source_id, &target.json_pointer)
+            .filter(|resolved| walked.insert(resolved.index))?;
+        let resolved = &emitter.model.analyzed.ir.schemas[resolved.index].schema;
+        return optional_converting_property(emitter, facts, resolved, walked);
+    }
+    // Anything else declares its properties through branches or declares none, and a node with no
+    // branches yields an empty iterator rather than needing an arm of its own.
+    composed_branches(node)
+        .into_iter()
+        .flatten()
+        .find_map(|branch| optional_converting_property(emitter, facts, branch, walked))
+}
+
+/// One object an `allOf` contributes to the merged type: what it declares, what its index
+/// signatures come from, and where a refusal about it points. Destructured where it is collected,
+/// so no reader of the list has to re-establish that these are objects.
+type MergedObject<'schema> = (
+    &'schema [(String, SchemaNode, PropMeta)],
+    &'schema AdditionalProperties,
+    &'schema SchemaMeta,
+);
+
+/// Every object an `allOf`'s branches contribute to the merged type, following `$ref`.
+fn collect_merged_objects<'schema>(
+    emitter: &Emitter<'_, 'schema, '_>,
+    branches: &'schema [SchemaNode],
+    walked: &mut BTreeSet<usize>,
+    out: &mut Vec<MergedObject<'schema>>,
+) {
+    for branch in branches {
+        match branch {
+            SchemaNode::Object {
+                properties,
+                additional_properties,
+                meta,
+                ..
+            } => out.push((properties, additional_properties, meta)),
+            SchemaNode::AllOf {
+                branches: nested, ..
+            } => collect_merged_objects(emitter, nested, walked, out),
+            SchemaNode::Ref { target, .. } => {
+                let Some(resolved) = emitter
+                    .model
+                    .schema_target(&target.source_id, &target.json_pointer)
+                    .filter(|resolved| !walked.contains(&resolved.index))
+                else {
+                    continue;
+                };
+                walked.insert(resolved.index);
+                let node = &emitter.model.analyzed.ir.schemas[resolved.index].schema;
+                collect_merged_objects(emitter, std::slice::from_ref(node), walked, out);
+            }
+            _ => continue,
         }
     }
 }
@@ -433,6 +715,18 @@ pub(crate) fn emit_transform_from_model(
             }
         }
     }
+    // One node can be reached by more than one walk — a nested `allOf` is visited in its own right
+    // and again flattened into its parent's merge — and the same refusal said twice reads as two
+    // problems with the document rather than one.
+    let mut seen = BTreeSet::new();
+    refusals.retain(|refusal: &Diagnostic| {
+        seen.insert((
+            refusal.code,
+            refusal.message.clone(),
+            refusal.source_id.clone(),
+            refusal.json_pointer.clone(),
+        ))
+    });
     let mut pairs = Vec::new();
     let mut operation_pairs = Vec::new();
     {
@@ -560,6 +854,113 @@ fn transform_module_imports() -> BTreeMap<String, BTreeSet<String>> {
     imports
 }
 
+/// The sibling codec imports as alias assignment reads them. They ride one synthetic key because
+/// only the names are read — the key names a module for a reader of this function and nothing else.
+///
+/// Deliberately a *separate* assignment from the kernel's. One name can arrive from both: in
+/// Temporal mode a component called `Instant` gives this module a sibling `decodeInstant` while the
+/// kernel exports one too. The kernel's assignment already yields to that — the pre-seeding below
+/// puts the sibling's name in its declared set — and running both through one map would hand the
+/// sibling the kernel's alias as well, so the module would bind one identifier twice.
+fn sibling_alias_imports(siblings: &BTreeSet<String>) -> BTreeMap<String, BTreeSet<String>> {
+    if siblings.is_empty() {
+        return BTreeMap::new();
+    }
+    BTreeMap::from([("components".to_owned(), siblings.clone())])
+}
+
+/// The local name every kernel import took, so a sibling codec never picks a binding one of them
+/// already holds.
+fn kernel_local_names(
+    module_imports: &BTreeMap<String, BTreeSet<String>>,
+    kernel: &HashMap<String, String>,
+) -> Vec<String> {
+    module_imports
+        .values()
+        .flatten()
+        .map(|name| local_import_name(name, kernel))
+        .collect()
+}
+
+/// The two local-binding maps a codec module renders through, kept apart for the reason
+/// `sibling_alias_imports` gives and travelling together because every render site needs both.
+struct ModuleAliases {
+    /// The local binding each kernel import took. Empty in every module whose own declarations
+    /// leave the kernel names free, which is all but a handful.
+    kernel: HashMap<String, String>,
+    /// The local binding each sibling codec import took, which is likewise empty almost everywhere.
+    siblings: HashMap<String, String>,
+}
+
+/// Every sibling codec a rendered module imports. An operation module imports only components, so
+/// none of these can be one of its own declarations arriving back as an import.
+fn sibling_import_names(pair_imports: &BTreeMap<String, BTreeSet<String>>) -> BTreeSet<String> {
+    pair_imports.values().flatten().cloned().collect()
+}
+
+/// One codec module's rendered function bodies and everything the walk pulled in on the way.
+#[derive(Default)]
+struct RenderedPairs {
+    bodies: String,
+    pointers: Vec<SourceRef>,
+    helpers: BTreeSet<&'static str>,
+    pair_imports: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Renders one component's codecs under `aliases`, kept separate from the module's imports and
+/// header so the two read as the two things they are.
+fn render_component_pairs(
+    emitter: &Emitter<'_, '_, '_>,
+    index: usize,
+    name: &str,
+    aliases: &ModuleAliases,
+) -> RenderedPairs {
+    let schema = &emitter.model.analyzed.ir.schemas[index];
+    // Infallible for the same reason `emit_component_pairs` gives: its caller already resolved it.
+    let target = emitter
+        .model
+        .schema_target(&schema.source.source_id, &schema.source.json_pointer)
+        .expect("a component with an allocated file has a registered target");
+    let path_type = local_import_name("ApplicationPath", &aliases.kernel);
+    let mut rendered = RenderedPairs::default();
+    for position in [
+        TypePosition::Neutral,
+        TypePosition::Request,
+        TypePosition::Response,
+    ] {
+        let Some(wire) = target.wire_export(position) else {
+            continue;
+        };
+        let application = target.variant_name(position);
+        for direction in [Direction::Decode, Direction::Encode] {
+            let mut builder = PairBuilder::new(emitter, position, aliases);
+            builder.pointers = rendered.pointers;
+            builder.helpers = rendered.helpers;
+            builder.pair_imports = rendered.pair_imports;
+            let expression = builder
+                .convert(&schema.schema, direction, "value", "path", Frame::ROOT)
+                .unwrap_or_else(|| "value".to_owned());
+            rendered.pointers = builder.pointers;
+            rendered.helpers = builder.helpers;
+            rendered.pair_imports = builder.pair_imports;
+            let (parameter, returns) = match direction {
+                Direction::Decode => (wire.as_str(), application.as_str()),
+                Direction::Encode => (application.as_str(), wire.as_str()),
+            };
+            rendered.bodies.push_str(&format!(
+                "\nexport function {}{}(value: {parameter}, path: {path_type} = []): {returns} {{\n  return {expression};\n}}\n",
+                direction.prefix(),
+                if position == TypePosition::Neutral {
+                    name.to_owned()
+                } else {
+                    application.clone()
+                },
+            ));
+        }
+    }
+    rendered
+}
+
 /// The encode/decode pair module for one transforming component, or `None` when the component
 /// declares no twin.
 ///
@@ -585,10 +986,6 @@ fn emit_component_pairs(
         return None;
     }
     let mut type_imports: BTreeSet<String> = BTreeSet::new();
-    let mut pair_imports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut helpers: BTreeSet<&'static str> = BTreeSet::new();
-    let mut pointers: Vec<SourceRef> = Vec::new();
-    let mut bodies = String::new();
     // What this module binds, before anything is rendered: the conversion carries the codec name
     // into its expressions, so the import's local name has to be settled first.
     let mut declared: BTreeSet<String> = BTreeSet::new();
@@ -602,7 +999,9 @@ fn emit_component_pairs(
         };
         let application = target.variant_name(position);
         declared.insert(application.clone());
-        declared.insert(wire);
+        declared.insert(wire.clone());
+        type_imports.insert(application.clone());
+        type_imports.insert(wire);
         let stem = if position == TypePosition::Neutral {
             name
         } else {
@@ -614,7 +1013,8 @@ fn emit_component_pairs(
     }
     // A sibling pair this module calls is bound here too, and its name is derived from a component
     // the document named — so `decodeInstant` can arrive from a sibling as readily as from the
-    // kernel. Every component whose name a kernel codec ends in is enough to know that.
+    // kernel. Every component whose name a kernel codec ends in is enough to know that: seeding it
+    // here is what makes the *kernel* import yield, leaving the sibling its own name.
     let module_imports = transform_module_imports();
     for allocated in &emitter.model.analyzed.schema_names {
         for direction in [Direction::Decode, Direction::Encode] {
@@ -624,50 +1024,27 @@ fn emit_component_pairs(
             }
         }
     }
-    let (aliases, alias_diagnostics) =
+    let (kernel, alias_diagnostics) =
         super::assign_import_aliases(&declared, &BTreeSet::new(), &module_imports, &schema.source);
     emitter
         .deferred_diagnostics
         .borrow_mut()
         .extend(alias_diagnostics);
-    let path_type = local_import_name("ApplicationPath", &aliases);
-    for position in [
-        TypePosition::Neutral,
-        TypePosition::Request,
-        TypePosition::Response,
-    ] {
-        let Some(wire) = target.wire_export(position) else {
-            continue;
-        };
-        let application = target.variant_name(position);
-        type_imports.insert(application.clone());
-        type_imports.insert(wire.clone());
-        for direction in [Direction::Decode, Direction::Encode] {
-            let mut builder = PairBuilder::new(emitter, position, &aliases);
-            builder.pointers = pointers;
-            builder.helpers = helpers;
-            builder.pair_imports = pair_imports;
-            let expression = builder
-                .convert(&schema.schema, direction, "value", "path", Frame::ROOT)
-                .unwrap_or_else(|| "value".to_owned());
-            pointers = builder.pointers;
-            helpers = builder.helpers;
-            pair_imports = builder.pair_imports;
-            let (parameter, returns) = match direction {
-                Direction::Decode => (wire.as_str(), application.as_str()),
-                Direction::Encode => (application.as_str(), wire.as_str()),
-            };
-            bodies.push_str(&format!(
-                "\nexport function {}{}(value: {parameter}, path: {path_type} = []): {returns} {{\n  return {expression};\n}}\n",
-                direction.prefix(),
-                if position == TypePosition::Neutral {
-                    name.to_owned()
-                } else {
-                    application.clone()
-                },
-            ));
-        }
-    }
+    // A component module never renames a sibling codec, so unlike an operation module it renders
+    // once. The two ways one could collide are both closed upstream: name allocation renames this
+    // component's own position variant when another component already carries that name, and a
+    // document declaring both `Instant` and `InstantBody` — the only pair that could reach a
+    // kernel import's replacement name — is already fatal at OASTS1307.
+    let aliases = ModuleAliases {
+        kernel,
+        siblings: HashMap::default(),
+    };
+    let RenderedPairs {
+        bodies,
+        pointers,
+        helpers,
+        pair_imports,
+    } = render_component_pairs(emitter, index, name, &aliases);
     let mut content = emitter.header();
     let header_len = content.len();
     let extension = import_extension(emitter.model);
@@ -686,14 +1063,14 @@ fn emit_component_pairs(
     ));
     content.push_str(&format!(
         "import type {{ {} }} from \"../result{extension}\";\n",
-        super::import_clause("ApplicationPath".to_owned(), &aliases)
+        super::import_clause("ApplicationPath".to_owned(), &aliases.kernel)
     ));
     if !helpers.is_empty() {
         content.push_str(&format!(
             "import {{ {} }} from \"../runtime{extension}\";\n",
             helpers
                 .into_iter()
-                .map(|helper| super::import_clause(helper.to_owned(), &aliases))
+                .map(|helper| super::import_clause(helper.to_owned(), &aliases.kernel))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -704,7 +1081,11 @@ fn emit_component_pairs(
         }
         content.push_str(&format!(
             "import {{ {} }} from \"./{file}{extension}\";\n",
-            names.into_iter().collect::<Vec<_>>().join(", ")
+            names
+                .into_iter()
+                .map(|codec| super::import_clause(codec, &aliases.siblings))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     content.push('\n');
@@ -791,6 +1172,74 @@ fn response_codecs(
     codecs
 }
 
+/// Renders one operation's codecs under `aliases`.
+///
+/// Split out because the module may have to be rendered twice: which siblings it calls is only
+/// known once the walk has run, and the walk resolves those names through the aliases — so the pass
+/// that discovers a collision is never the pass that can settle it.
+fn render_operation_pairs(
+    emitter: &Emitter<'_, '_, '_>,
+    operation: &Operation,
+    plan: &OperationPlan,
+    stem: &str,
+    request_transforms: bool,
+    responses: &[ResponseCodec],
+    aliases: &ModuleAliases,
+) -> RenderedPairs {
+    let path_type = local_import_name("ApplicationPath", &aliases.kernel);
+    let mut rendered = RenderedPairs::default();
+    if request_transforms {
+        let application = format!("{stem}Input");
+        let wire = format!("{application}Wire");
+        let schema = operation_input_schema(emitter, operation, plan);
+        let mut builder = PairBuilder::new(emitter, TypePosition::Request, aliases);
+        let converted = builder.convert(&schema, Direction::Encode, "value", "path", Frame::ROOT);
+        rendered.pointers = builder.pointers;
+        rendered.helpers = builder.helpers;
+        rendered.pair_imports = builder.pair_imports;
+        let body = guarded_body(
+            converted,
+            Direction::Encode,
+            &mut rendered.pointers,
+            &mut rendered.helpers,
+            &operation.source,
+        );
+        rendered.bodies.push_str(&format!(
+            "\nexport function encode{application}(value: {application}, path: {path_type} = []): {wire} {{\n  return {body};\n}}\n"
+        ));
+    }
+
+    for codec in responses {
+        let application = &codec.application;
+        let wire = format!("{application}Wire");
+        let mut builder = PairBuilder::new(emitter, TypePosition::Response, aliases);
+        builder.pointers = rendered.pointers;
+        builder.helpers = rendered.helpers;
+        builder.pair_imports = rendered.pair_imports;
+        let converted = builder.convert(
+            &codec.schema,
+            Direction::Decode,
+            "value",
+            "path",
+            Frame::ROOT,
+        );
+        rendered.pointers = builder.pointers;
+        rendered.helpers = builder.helpers;
+        rendered.pair_imports = builder.pair_imports;
+        let body = guarded_body(
+            converted,
+            Direction::Decode,
+            &mut rendered.pointers,
+            &mut rendered.helpers,
+            &codec.source,
+        );
+        rendered.bodies.push_str(&format!(
+            "\nexport function decode{application}(value: {wire}, path: {path_type} = []): {application} {{\n  return {body};\n}}\n"
+        ));
+    }
+    rendered
+}
+
 /// The request encoder and response decoders for one operation, or `None` when every position is
 /// identity. Names and ordering mirror the operation types module exactly.
 fn emit_operation_pairs(
@@ -811,10 +1260,14 @@ fn emit_operation_pairs(
     // Payload names the client's own operation module declares: the request surface's pair, and
     // every per-entry response pair a discriminated branch narrows to.
     let mut client_imports = BTreeSet::new();
-    let mut pair_imports = BTreeMap::new();
-    let mut helpers = BTreeSet::new();
-    let mut pointers = Vec::new();
-    let mut bodies = String::new();
+    for codec in &responses {
+        let names = match codec.declared_by {
+            PayloadModule::Types => &mut type_imports,
+            PayloadModule::Client => &mut client_imports,
+        };
+        names.insert(codec.application.clone());
+        names.insert(format!("{}Wire", codec.application));
+    }
 
     // Settled before anything renders, for the reason `emit_component_pairs` gives.
     let mut declared: BTreeSet<String> = BTreeSet::new();
@@ -828,6 +1281,7 @@ fn emit_operation_pairs(
         declared.insert(format!("{}Wire", codec.application));
         declared.insert(format!("decode{}", codec.application));
     }
+    let own_declared = declared.clone();
     let module_imports = transform_module_imports();
     for allocated in &emitter.model.analyzed.schema_names {
         for direction in [Direction::Decode, Direction::Encode] {
@@ -837,72 +1291,60 @@ fn emit_operation_pairs(
             }
         }
     }
-    let (aliases, alias_diagnostics) = super::assign_import_aliases(
-        &declared,
-        &BTreeSet::new(),
-        &module_imports,
-        &operation.source,
-    );
-    emitter
-        .deferred_diagnostics
-        .borrow_mut()
-        .extend(alias_diagnostics);
-    let path_type = local_import_name("ApplicationPath", &aliases);
-
-    if request_transforms {
-        let application = format!("{stem}Input");
-        let wire = format!("{application}Wire");
-        let schema = operation_input_schema(emitter, operation, plan);
-        let mut builder = PairBuilder::new(emitter, TypePosition::Request, &aliases);
-        let converted = builder.convert(&schema, Direction::Encode, "value", "path", Frame::ROOT);
-        pointers = builder.pointers;
-        helpers = builder.helpers;
-        pair_imports = builder.pair_imports;
-        let body = guarded_body(
-            converted,
-            Direction::Encode,
-            &mut pointers,
-            &mut helpers,
+    // Rendered twice on a collision, for the reason `emit_component_pairs` gives. A component named
+    // after one of this operation's response payloads is the shape that reaches it.
+    let mut siblings: BTreeSet<String> = BTreeSet::new();
+    let mut settled = false;
+    let (aliases, rendered) = loop {
+        let (kernel, alias_diagnostics) = super::assign_import_aliases(
+            &declared,
+            &BTreeSet::new(),
+            &module_imports,
             &operation.source,
         );
-        bodies.push_str(&format!(
-            "\nexport function encode{application}(value: {application}, path: {path_type} = []): {wire} {{\n  return {body};\n}}\n"
-        ));
-    }
-
-    for codec in responses {
-        let ResponseCodec {
-            application,
-            schema,
-            source,
-            declared_by,
-        } = codec;
-        let wire = format!("{application}Wire");
-        let names = match declared_by {
-            PayloadModule::Types => &mut type_imports,
-            PayloadModule::Client => &mut client_imports,
-        };
-        names.insert(application.clone());
-        names.insert(wire.clone());
-        let mut builder = PairBuilder::new(emitter, TypePosition::Response, &aliases);
-        builder.pointers = pointers;
-        builder.helpers = helpers;
-        builder.pair_imports = pair_imports;
-        let converted = builder.convert(&schema, Direction::Decode, "value", "path", Frame::ROOT);
-        pointers = builder.pointers;
-        helpers = builder.helpers;
-        pair_imports = builder.pair_imports;
-        let body = guarded_body(
-            converted,
-            Direction::Decode,
-            &mut pointers,
-            &mut helpers,
-            &source,
+        let kernel_locals = kernel_local_names(&module_imports, &kernel);
+        let reserved: BTreeSet<&str> = kernel_locals.iter().map(String::as_str).collect();
+        let (sibling_aliases, sibling_diagnostics) = super::assign_import_aliases(
+            &own_declared,
+            &reserved,
+            &sibling_alias_imports(&siblings),
+            &operation.source,
         );
-        bodies.push_str(&format!(
-            "\nexport function decode{application}(value: {wire}, path: {path_type} = []): {application} {{\n  return {body};\n}}\n"
-        ));
-    }
+        let aliases = ModuleAliases {
+            kernel,
+            siblings: sibling_aliases,
+        };
+        let rendered = render_operation_pairs(
+            emitter,
+            operation,
+            plan,
+            &stem,
+            request_transforms,
+            &responses,
+            &aliases,
+        );
+        let imported = sibling_import_names(&rendered.pair_imports);
+        if !settled
+            && imported
+                .iter()
+                .any(|name| own_declared.contains(name) || reserved.contains(name.as_str()))
+        {
+            settled = true;
+            siblings = imported;
+            continue;
+        }
+        emitter
+            .deferred_diagnostics
+            .borrow_mut()
+            .extend(alias_diagnostics.into_iter().chain(sibling_diagnostics));
+        break (aliases, rendered);
+    };
+    let RenderedPairs {
+        bodies,
+        pointers,
+        helpers,
+        pair_imports,
+    } = rendered;
 
     let mut content = emitter.header();
     let header_len = content.len();
@@ -934,14 +1376,14 @@ fn emit_operation_pairs(
     }
     content.push_str(&format!(
         "import type {{ {} }} from \"../result{extension}\";\n",
-        super::import_clause("ApplicationPath".to_owned(), &aliases)
+        super::import_clause("ApplicationPath".to_owned(), &aliases.kernel)
     ));
     if !helpers.is_empty() {
         content.push_str(&format!(
             "import {{ {} }} from \"../runtime{extension}\";\n",
             helpers
                 .into_iter()
-                .map(|helper| super::import_clause(helper.to_owned(), &aliases))
+                .map(|helper| super::import_clause(helper.to_owned(), &aliases.kernel))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -949,7 +1391,11 @@ fn emit_operation_pairs(
     for (file, names) in pair_imports {
         content.push_str(&format!(
             "import {{ {} }} from \"../components/{file}{extension}\";\n",
-            names.into_iter().collect::<Vec<_>>().join(", ")
+            names
+                .into_iter()
+                .map(|codec| super::import_clause(codec, &aliases.siblings))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     content.push('\n');
@@ -1256,8 +1702,17 @@ struct ObjectParts {
     /// A conversion replacing the whole value, when the schema is an open map rather than a set of
     /// declared properties. Mutually exclusive with `parts` by construction.
     whole: Option<String>,
-    /// Conversions that rebuild the whole value — a `$ref` branch's own pair call, which spreads
-    /// every key back whether it converted it or not.
+    /// Conversions that rebuild the whole value — an `allOf` branch with no keys to contribute one
+    /// at a time, such as a union. Each spreads every key back whether it converted it or not, so
+    /// only the first can be trusted: a second reverts it.
+    ///
+    /// This is the reason object-shaped branches are inlined instead of landing here: a base whose
+    /// type converts an *optional* property cannot compile — `...value` keeps its own `at?: string`
+    /// beside the base's `at?: Date` and the spread unions them, which assigns to neither surface.
+    /// Shedding the key would mean knowing which keys the base converts, and a union-typed base has
+    /// no single key set to read, so `collect_whole_value_base_refusals` refuses that document
+    /// instead. What reaches here is the rest: a base every one of whose converted properties is
+    /// required, where the spread overrides rather than unions.
     bases: Vec<String>,
     /// Conversions that write only the keys they convert. They spread *after* every base, because a
     /// base rewrites keys it does not own and would otherwise revert them; these never do, so
@@ -1265,10 +1720,28 @@ struct ObjectParts {
     passes: Vec<String>,
     parts: Vec<String>,
     omitted: Vec<String>,
-    /// Property names that already contributed a part. Two `allOf` branches may constrain the same
+    /// Components already inlined into this merge. A reference graph that reaches one component by
+    /// more than one path — two branches per level each naming the level below — would otherwise
+    /// walk it once per path and double the work at every level, while the parts it contributes the
+    /// second time are the ones `assigned` discards. Per merge rather than per builder, because a
+    /// property's own object is a different merge and inlines on its own terms.
+    expanded: BTreeSet<usize>,
+    /// The part each property name already contributed. Two `allOf` branches may constrain the same
     /// property, and the merged type declares it once — so the object literal has to assign it once
     /// too, or TypeScript refuses the duplicate key outright.
-    assigned: BTreeSet<String>,
+    assigned: BTreeMap<String, AssignedPart>,
+}
+
+/// Where one property's part landed, and whether the branch that put it there required it.
+///
+/// Which of two branches writes a shared property is not arbitrary. A branch that requires it makes
+/// the merged member required, and only the unconditional assignment satisfies that — the
+/// conditional spread an optional branch emits yields `at?: Date` for a member declared `at: Date`.
+/// So a required branch replaces an optional one's part rather than being dropped as a duplicate.
+#[derive(Clone, Copy)]
+struct AssignedPart {
+    index: usize,
+    required: bool,
 }
 
 impl ObjectParts {
@@ -1378,22 +1851,24 @@ impl Frame {
 struct PairBuilder<'a, 'model, 'input, 'sink> {
     emitter: &'a Emitter<'model, 'input, 'sink>,
     position: TypePosition,
-    /// The local binding each kernel import took in this module. Empty in every module whose own
-    /// declarations leave the kernel names free, which is all but a handful.
-    aliases: &'a HashMap<String, String>,
+    aliases: &'a ModuleAliases,
     /// Hoisted `SourcePointer` constants in first-seen order, so the emitted bytes stay stable.
     pointers: Vec<SourceRef>,
     /// Sibling pair modules this file calls into, keyed by file base.
     pair_imports: BTreeMap<String, BTreeSet<String>>,
     /// The codec kernel exports actually called, so the runtime import names exactly those.
     helpers: BTreeSet<&'static str>,
+    /// Component schemas whose properties are being inlined into an `allOf` merge along the active
+    /// walk. A component whose branch points back at an ancestor would inline forever; that branch
+    /// falls back to its own codec call, which is where the recursion belongs.
+    inlining: Vec<usize>,
 }
 
 impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
     fn new(
         emitter: &'a Emitter<'model, 'input, 'sink>,
         position: TypePosition,
-        aliases: &'a HashMap<String, String>,
+        aliases: &'a ModuleAliases,
     ) -> Self {
         Self {
             emitter,
@@ -1402,6 +1877,7 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             pointers: Vec::new(),
             pair_imports: BTreeMap::new(),
             helpers: BTreeSet::new(),
+            inlining: Vec::new(),
         }
     }
 
@@ -1453,7 +1929,7 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             let pointer = self.pointer(&node.meta().source);
             let codec = direction.codec(kind);
             self.helpers.insert(codec);
-            let local = local_import_name(codec, self.aliases);
+            let local = local_import_name(codec, &self.aliases.kernel);
             return Some(format!("{local}({value}, {pointer}, {path})"));
         }
         match node {
@@ -1475,7 +1951,8 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                     .entry(target.file_base.clone())
                     .or_default()
                     .insert(name.clone());
-                Some(format!("{name}({value}, {path})"))
+                let local = local_import_name(&name, &self.aliases.siblings);
+                Some(format!("{local}({value}, {path})"))
             }
             SchemaNode::Object {
                 properties,
@@ -1582,30 +2059,61 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
     /// conversions merge into one object literal, so the exclusion has to be the merged set.
     fn declared_names_across(&self, branches: &[SchemaNode]) -> Vec<String> {
         let mut names = Vec::new();
+        self.collect_declared_names(branches, &mut BTreeSet::new(), &mut names);
+        names
+    }
+
+    /// `declared_names_across`, carrying the ref targets already walked.
+    ///
+    /// Entered and never left, which both terminates a recursive schema and keeps a reference graph
+    /// that reaches one target by several paths from being walked once per path — the names a
+    /// second walk would find are the ones the first already collected. Same reason
+    /// `ObjectParts::expanded` exists, on the same graphs.
+    fn collect_declared_names(
+        &self,
+        branches: &[SchemaNode],
+        walked: &mut BTreeSet<usize>,
+        names: &mut Vec<String>,
+    ) {
         for branch in branches {
-            let branch_names = match branch {
+            match branch {
                 SchemaNode::AllOf {
                     branches: nested, ..
-                } => self.declared_names_across(nested),
-                SchemaNode::Object { properties, .. } => self.declared_names(properties),
-                _ => continue,
-            };
-            for name in branch_names {
-                if !names.contains(&name) {
-                    names.push(name);
+                } => self.collect_declared_names(nested, walked, names),
+                SchemaNode::Object { properties, .. } => {
+                    for name in self.declared_names(properties) {
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
+                    }
                 }
+                // A referenced branch's properties are members of the merged type just as an
+                // inline branch's are, whether the conversion inlines the branch or calls its
+                // codec — either way no index signature in the merge may claim those keys.
+                SchemaNode::Ref { target, .. } => {
+                    if let Some(resolved) = self
+                        .emitter
+                        .model
+                        .schema_target(&target.source_id, &target.json_pointer)
+                        .filter(|resolved| !walked.contains(&resolved.index))
+                    {
+                        let node = &self.emitter.model.analyzed.ir.schemas[resolved.index].schema;
+                        walked.insert(resolved.index);
+                        self.collect_declared_names(std::slice::from_ref(node), walked, names);
+                    }
+                }
+                _ => continue,
             }
         }
-        names
     }
 
     /// Collects one `allOf` node's parts.
     ///
     /// The branches all describe the same value, so their conversions merge rather than chain:
     /// chaining would read each later branch's properties off an earlier branch's *result*,
-    /// recomputing it once per property. A branch converting the whole value — a `$ref` to a
-    /// component with its own pair — contributes that call as a base to spread; an object branch
-    /// contributes its properties, each read off the original value.
+    /// recomputing it once per property. Every branch contributes its properties, each read off the
+    /// original value; a branch that is neither an object nor a reference to one converts the whole
+    /// value instead and contributes that as a base to spread.
     fn collect_parts(
         &mut self,
         branches: &[SchemaNode],
@@ -1639,6 +2147,12 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                     site,
                     object,
                 ),
+                // A nullable branch is excluded: its conversion is a guard around the whole value,
+                // which is not something the merge can take a key at a time.
+                SchemaNode::Ref {
+                    target: reference, ..
+                } if !branch.meta().nullable
+                    && self.collect_referenced_parts(reference, declared, site, object) => {}
                 _ => {
                     if let Some(converted) = self.convert(branch, direction, value, path, frame) {
                         object.bases.push(converted);
@@ -1646,6 +2160,54 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                 }
             }
         }
+    }
+
+    /// Collects one `$ref` branch by reading the schema it names, in place of calling that schema's
+    /// codec. Returns whether it could — a branch this cannot inline falls through to the call.
+    ///
+    /// A codec call rebuilds the whole value: it spreads every key back, converted or not. Two of
+    /// them in one merge revert each other, and even one is uncompilable where the component
+    /// converts an *optional* property, because the spread of `{ at?: Date }` over `...value`'s own
+    /// `at?: string` unions to `Date | string` and assigns to neither surface. Contributing the
+    /// referenced properties the way an inline object branch does answers both: each key is written
+    /// once, by the part that converts it, and `omit` sheds the wire key it replaces. It also
+    /// matches the merged type, which the types emitter renders by inlining these same branches.
+    ///
+    /// The cost is the shared call — a referenced component's conversion is emitted again at each
+    /// merge that names it. That is the price of a merge whose keys are each written once.
+    fn collect_referenced_parts(
+        &mut self,
+        reference: &SchemaRef,
+        declared: &[String],
+        site: ObjectSite<'_>,
+        object: &mut ObjectParts,
+    ) -> bool {
+        // Copied out rather than reborrowed: the walk below takes `&mut self`, and the schema it
+        // reads outlives this builder either way.
+        let emitter = self.emitter;
+        let Some(target) = emitter
+            .model
+            .schema_target(&reference.source_id, &reference.json_pointer)
+            .filter(|target| target.transforms)
+        else {
+            // A reference resolving to nothing and one resolving to a component that does not
+            // convert are the same answer `convert` gives them: nothing to contribute either way.
+            return false;
+        };
+        if self.inlining.contains(&target.index) {
+            return false;
+        }
+        let node = &emitter.model.analyzed.ir.schemas[target.index].schema;
+        if !matches!(node, SchemaNode::Object { .. } | SchemaNode::AllOf { .. }) {
+            return false;
+        }
+        if !object.expanded.insert(target.index) {
+            return true;
+        }
+        self.inlining.push(target.index);
+        self.collect_parts(std::slice::from_ref(node), declared, site, object);
+        self.inlining.pop();
+        true
     }
 
     fn collect_object_parts(
@@ -1677,13 +2239,16 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             ) else {
                 continue;
             };
-            if !object.assigned.insert(name.clone()) {
+            // A duplicate only gets to write when it is the stricter of the two — see
+            // `AssignedPart` for why requiredness decides that.
+            let held = object.assigned.get(name).copied();
+            if held.is_some_and(|held| held.required || !meta.required) {
                 continue;
             }
             self.helpers.insert("pushPath");
             let key = render_literal_key(name);
-            if meta.required {
-                object.parts.push(format!("{key}: {converted}"));
+            let part = if meta.required {
+                format!("{key}: {converted}")
             } else {
                 // The base spread has to lose the key first — see `omit` in the codec kernel for why
                 // the simpler conditional spread does not typecheck, and why assigning `undefined`
@@ -1691,10 +2256,27 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                 // absent rather than becoming present-with-undefined.
                 object.omitted.push(name.clone());
                 self.helpers.insert("omit");
-                object.parts.push(format!(
-                    "...({access} === undefined ? {{}} : {{ {key}: {converted} }})"
-                ));
-            }
+                format!("...({access} === undefined ? {{}} : {{ {key}: {converted} }})")
+            };
+            // Replacing in place rather than appending keeps declaration order, which is what makes
+            // the emitted bytes independent of which branch happened to write the property first.
+            let index = match held {
+                Some(held) => {
+                    object.parts[held.index] = part;
+                    held.index
+                }
+                None => {
+                    object.parts.push(part);
+                    object.parts.len() - 1
+                }
+            };
+            object.assigned.insert(
+                name.clone(),
+                AssignedPart {
+                    index,
+                    required: meta.required,
+                },
+            );
         }
         let entry = format!("entry{}", frame.depth);
         let key = format!("key{}", frame.depth);
@@ -3213,16 +3795,101 @@ mod pair_tests {
     }
 
     #[test]
+    fn a_component_named_after_a_response_codec_is_imported_under_an_alias() {
+        // The sibling a codec module calls is only known once the walk has run, so this collision
+        // cannot be settled by the alias pass that precedes it — the module renders twice.
+        let (files, diagnostics, has_errors) = compile_document(
+            json!({
+                "openapi": "3.1.0",
+                "info": { "title": "t", "version": "1" },
+                "paths": {
+                    "/notices": {
+                        "get": {
+                            "operationId": "listNotices",
+                            "responses": {
+                                "200": {
+                                    "description": "ok",
+                                    "content": {
+                                        "application/json": {
+                                            "schema": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "nested": {
+                                                        "$ref": "#/components/schemas/ListNoticesResponse200"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "components": {
+                    "schemas": {
+                        "ListNoticesResponse200": {
+                            "type": "object",
+                            "properties": { "at": { "type": "string", "format": "date-time" } }
+                        }
+                    }
+                }
+            }),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/operations/listnotices.ts")
+            .expect("operation codec module")
+            .content;
+        assert!(
+            content.contains(
+                "import { decodeListNoticesResponse200 as decodeListNoticesResponse200Body } from \"../components/listnoticesresponse200.js\";"
+            ),
+            "{content}"
+        );
+        // Unaliased, the call resolved to the function being declared: TS2440 on the import, and an
+        // unbounded self-recursion where it compiled.
+        assert!(
+            content.contains("nested: decodeListNoticesResponse200Body(value.nested"),
+            "{content}"
+        );
+    }
+
+    #[test]
     fn a_key_selected_pass_spreads_after_the_branch_that_rebuilds_the_value() {
-        // A `$ref` branch's pair call spreads every key back, converted or not, so it would revert
-        // a pass that ran before it. A pass writes only what it converts, so ordering it last is
-        // the only order in which both survive.
+        // A branch converting the whole value spreads every key back, converted or not, so it would
+        // revert a pass that ran before it. A pass writes only what it converts, so ordering it
+        // last is the only order in which both survive. A union is the branch shape that still
+        // reaches this: an object-shaped one contributes its keys individually instead.
         let (files, diagnostics, has_errors) = compile_document(
             notice_document(json!({
-                "Base": {
+                // `at` is required because a whole-value branch declaring it optional is refused:
+                // its converted value would be spread beside the unconverted one.
+                "Reminder": {
                     "type": "object",
-                    "required": ["at"],
-                    "properties": { "at": { "type": "string", "format": "date-time" } }
+                    "required": ["kind", "at"],
+                    "properties": {
+                        "kind": { "type": "string", "const": "reminder" },
+                        "at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Digest": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                        "kind": { "type": "string", "const": "digest" },
+                        "on": { "type": "string" }
+                    }
+                },
+                "Base": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/Reminder" },
+                        { "$ref": "#/components/schemas/Digest" }
+                    ],
+                    "discriminator": { "propertyName": "kind" }
                 },
                 "Notice": {
                     "allOf": [
@@ -3278,6 +3945,258 @@ mod pair_tests {
         assert!(
             messages[0].contains("pattern property '^x-' types the keys it shares with"),
             "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn a_property_one_branch_declares_is_checked_against_another_branchs_index_signature() {
+        // An intersection types a key by every member covering it, so a `string` property under
+        // another branch's `[key: string]: Date` is the same contradiction as one inside a single
+        // object. Nothing inhabits it, so no codec is right: converting the key throws on a real
+        // string, and leaving it alone emits an object literal `tsc` rejects.
+        for referenced in [true, false] {
+            let branch = if referenced {
+                json!({ "$ref": "#/components/schemas/Held" })
+            } else {
+                json!({ "type": "object", "properties": { "id": { "type": "string" } } })
+            };
+            let (_files, diagnostics, has_errors) = compile_document(
+                notice_document(json!({
+                    "Held": { "type": "object", "properties": { "id": { "type": "string" } } },
+                    "Notice": {
+                        "allOf": [
+                            branch,
+                            {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "string",
+                                    "format": "date-time"
+                                }
+                            }
+                        ]
+                    }
+                })),
+                date_mode,
+            );
+
+            assert!(has_errors, "referenced={referenced}: {diagnostics:#?}");
+            let messages = unconvertible_messages(&diagnostics);
+            assert_eq!(
+                messages.len(),
+                1,
+                "referenced={referenced}: {diagnostics:#?}"
+            );
+            assert!(
+                messages[0]
+                    .starts_with("property 'id' is typed 'string' while the index signature"),
+                "referenced={referenced}: {messages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_whole_value_branch_declaring_an_optional_converting_property_is_refused() {
+        // The branch has no keys to give one at a time, so its `at?: Date` is spread whole beside
+        // the value's own `at?: string` and the merged property types as both. Requiring it is what
+        // makes the spread override instead, which is why only the optional form is refused.
+        for (required, inline, composed) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let (_files, diagnostics, has_errors) = compile_document(
+                notice_document(json!({
+                    "Reminder": {
+                        "type": "object",
+                        "required": if required { json!(["kind", "at"]) } else { json!(["kind"]) },
+                        "properties": {
+                            "kind": { "type": "string", "const": "reminder" },
+                            "at": { "type": "string", "format": "date-time" }
+                        }
+                    },
+                    "Digest": {
+                        "type": "object",
+                        "required": ["kind"],
+                        "properties": {
+                            "kind": { "type": "string", "const": "digest" },
+                            "on": { "type": "string" }
+                        }
+                    },
+                    // One row wraps a branch in its own `allOf`, which is where a union's branch
+                    // declares its properties through a composition rather than directly.
+                    "Either": {
+                        "oneOf": [
+                            if composed {
+                                json!({ "allOf": [{ "$ref": "#/components/schemas/Reminder" }] })
+                            } else {
+                                json!({ "$ref": "#/components/schemas/Reminder" })
+                            },
+                            { "$ref": "#/components/schemas/Digest" }
+                        ],
+                        "discriminator": { "propertyName": "kind" }
+                    },
+                    // The union sits inline in one row and behind a `$ref` in the other: a branch
+                    // reaches `bases` either way, and only the reference resolves through a target.
+                    "Notice": {
+                        "allOf": [
+                            if inline {
+                                json!({
+                                    "oneOf": [
+                                        { "$ref": "#/components/schemas/Reminder" },
+                                        { "$ref": "#/components/schemas/Digest" }
+                                    ],
+                                    "discriminator": { "propertyName": "kind" }
+                                })
+                            } else {
+                                json!({ "$ref": "#/components/schemas/Either" })
+                            },
+                            { "type": "object", "properties": { "id": { "type": "string" } } }
+                        ]
+                    }
+                })),
+                date_mode,
+            );
+
+            assert_eq!(
+                has_errors, !required,
+                "required={required}: {diagnostics:#?}"
+            );
+            let messages = unconvertible_messages(&diagnostics);
+            if required {
+                assert!(messages.is_empty(), "{messages:?}");
+            } else {
+                assert_eq!(messages.len(), 1, "{diagnostics:#?}");
+                assert!(
+                    messages[0].starts_with(
+                        "this branch converts as a whole value and declares 'at' optional"
+                    ),
+                    "{messages:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_branches_typing_one_key_differently_are_refused() {
+        // Same rule as two signatures inside one object: whichever pass runs last decides, and the
+        // merged type declares both, so nothing inhabits it.
+        let (_files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "allOf": [
+                        {
+                            "type": "object",
+                            "patternProperties": {
+                                "^x-": { "type": "string", "format": "date-time" }
+                            }
+                        },
+                        { "type": "object", "patternProperties": { "^x-y": { "type": "string" } } }
+                    ]
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        let messages = unconvertible_messages(&diagnostics);
+        assert_eq!(messages.len(), 1, "{diagnostics:#?}");
+        assert!(
+            messages[0].contains(
+                "in another branch of this allOf as 'Date' while that one types them as 'string'"
+            ),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn two_branches_typing_one_key_the_same_way_are_not_refused() {
+        // Where one object would be refused — one pass cannot apply two patterns to a key — a merge
+        // emits one pass per branch, and passes that agree produce the same value whichever runs
+        // last. A component `allOf`-ed twice is an ordinary document, not a contradiction.
+        let (_files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Map": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string", "format": "date-time" }
+                },
+                "Notice": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/Map" },
+                        { "$ref": "#/components/schemas/Map" }
+                    ]
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(
+            unconvertible_messages(&diagnostics).is_empty(),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_all_of_does_not_report_the_same_refusal_twice() {
+        // The inner `allOf` is visited in its own right and again flattened into the outer merge.
+        let (_files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "allOf": [
+                        {
+                            "allOf": [
+                                { "type": "object", "properties": { "id": { "type": "string" } } },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": {
+                                        "type": "string",
+                                        "format": "date-time"
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        assert_eq!(
+            unconvertible_messages(&diagnostics).len(),
+            1,
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn a_property_agreeing_with_another_branchs_index_signature_is_not_refused() {
+        // The merged form the fixture carries: the referenced property converts to the same type
+        // the signature promises, so one pass over the other keys delivers exactly what is declared.
+        let (_files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Held": {
+                    "type": "object",
+                    "properties": { "at": { "type": "string", "format": "date-time" } }
+                },
+                "Notice": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/Held" },
+                        {
+                            "type": "object",
+                            "additionalProperties": { "type": "string", "format": "date-time" }
+                        }
+                    ]
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(
+            unconvertible_messages(&diagnostics).is_empty(),
+            "{diagnostics:#?}"
         );
     }
 
@@ -4024,11 +4943,222 @@ mod pair_tests {
             date_mode,
         )
         .expect("pairs");
-        // The ref's own pair runs first, then the inline branch converts its own property over the
-        // result — each spreads what it does not touch, so both survive.
-        assert!(content.contains("...decodeBase(value, path),"), "{content}");
+        // The referenced branch contributes its property the way the inline branches contribute
+        // theirs, so every key of the merge is written once, by the part that converts it.
+        assert!(!content.contains("decodeBase("), "{content}");
+        assert!(
+            content.contains("at: decodeDateTimeDate(value.at,"),
+            "{content}"
+        );
         assert!(
             content.contains("on: decodeDateTimeDate(value.on,"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn two_referenced_branches_do_not_revert_each_other() {
+        let content = pairs(
+            json!({
+                "Left": {
+                    "type": "object",
+                    "properties": { "leftAt": { "type": "string", "format": "date-time" } }
+                },
+                "Right": {
+                    "type": "object",
+                    "properties": { "rightAt": { "type": "string", "format": "date-time" } }
+                },
+                "Notice": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/Left" },
+                        { "$ref": "#/components/schemas/Right" }
+                    ]
+                }
+            }),
+            "notice",
+            date_mode,
+        )
+        .expect("pairs");
+        // As two calls this read `{ ...value, ...decodeLeft(value), ...decodeRight(value) }`, and
+        // the second call's own spread of `value` wrote the first's converted key back as the wire
+        // string it had started as.
+        assert!(!content.contains("decodeLeft("), "{content}");
+        assert!(!content.contains("decodeRight("), "{content}");
+        for name in ["leftAt", "rightAt"] {
+            assert!(
+                content.contains(&format!(
+                    "...(value.{name} === undefined ? {{}} : {{ {name}: decodeDateTimeDate(value.{name},"
+                )),
+                "{content}"
+            );
+        }
+        // Both wire keys leave the base spread, or each would survive beside its converted twin as
+        // `Date | string`.
+        assert!(
+            content.contains("...omit(omit(value, \"leftAt\"), \"rightAt\"),"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_referenced_branchs_property_is_inlined_at_the_position_being_rendered() {
+        let content = pairs(
+            json!({
+                "Left": {
+                    "type": "object",
+                    "properties": {
+                        "seenAt": { "type": "string", "format": "date-time", "readOnly": true },
+                        "sentAt": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Notice": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/Left" },
+                        { "type": "object", "properties": { "id": { "type": "string" } } }
+                    ]
+                }
+            }),
+            "notice",
+            date_mode,
+        )
+        .expect("pairs");
+        // A read-only property is not a member of the request surface, so the request encoder must
+        // not convert it — the inline reads the referenced properties at the position being
+        // rendered, exactly as the referenced component's own codec for that position would.
+        let encode = content
+            .split_once("export function encodeNoticeRequest")
+            .expect("the request encoder")
+            .1;
+        assert!(!encode.contains("seenAt"), "{content}");
+        assert!(encode.contains("sentAt: encodeDateTimeDate"), "{content}");
+        assert!(content.contains("seenAt: decodeDateTimeDate"), "{content}");
+    }
+
+    #[test]
+    fn a_sibling_codec_sharing_a_kernel_name_keeps_its_own_binding() {
+        let content = pairs(
+            json!({
+                "Instant": {
+                    "type": "object",
+                    "properties": { "deep": { "type": "string", "format": "date-time" } }
+                },
+                "Notice": {
+                    "type": "object",
+                    "properties": {
+                        "own": { "type": "string", "format": "date-time" },
+                        "nested": { "$ref": "#/components/schemas/Instant" }
+                    }
+                }
+            }),
+            "notice",
+            |config| config.types.date_time = DateTimeRepresentation::Temporal,
+        )
+        .expect("pairs");
+        // A component called `Instant` gives this module a sibling `decodeInstant` while the kernel
+        // exports one too. The kernel yields; the sibling keeps its name. Running both through one
+        // alias map handed them the same binding, and the module declared one identifier twice.
+        assert!(
+            content.contains("import { decodeInstant as decodeInstantBody, encodeInstant as encodeInstantBody, omit, pushPath } from \"../runtime.js\";"),
+            "{content}"
+        );
+        assert!(
+            content.contains("import { decodeInstant, encodeInstant } from \"./instant.js\";"),
+            "{content}"
+        );
+        assert!(
+            content.contains("own: decodeInstantBody(value.own,"),
+            "{content}"
+        );
+        assert!(
+            content.contains("nested: decodeInstant(value.nested,"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn the_branch_that_requires_a_shared_property_is_the_one_that_writes_it() {
+        for loose_first in [true, false] {
+            let loose = json!({
+                "type": "object",
+                "properties": { "at": { "type": "string", "format": "date-time" } }
+            });
+            let strict = json!({
+                "type": "object",
+                "required": ["at"],
+                "properties": { "at": { "type": "string", "format": "date-time" } }
+            });
+            let branches = if loose_first {
+                json!([loose, strict])
+            } else {
+                json!([strict, loose])
+            };
+            let content = pairs(
+                json!({ "Notice": { "allOf": branches } }),
+                "notice",
+                date_mode,
+            )
+            .expect("pairs");
+            // The merged member is required either way, and only the unconditional assignment
+            // satisfies it — the conditional spread yields `at?: Date` and assigns to neither
+            // surface. Which branch is written first must not decide it.
+            assert!(
+                content.contains("at: decodeDateTimeDate(value.at,"),
+                "loose_first={loose_first}: {content}"
+            );
+            assert!(
+                !content.contains("value.at === undefined"),
+                "loose_first={loose_first}: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_component_reached_by_two_branches_is_inlined_once() {
+        let content = pairs(
+            json!({
+                "Base": {
+                    "type": "object",
+                    "properties": { "at": { "type": "string", "format": "date-time" } }
+                },
+                "Notice": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/Base" },
+                        { "$ref": "#/components/schemas/Base" }
+                    ]
+                }
+            }),
+            "notice",
+            date_mode,
+        )
+        .expect("pairs");
+        // Walking the same target once per path is what makes a deep reference graph exponential:
+        // two branches per level doubles the work at every level, for parts the merge discards.
+        assert_eq!(
+            content.matches("at: decodeDateTimeDate(value.at,").count(),
+            1
+        );
+        assert_eq!(content.matches("...omit(value, \"at\"),").count(), 2);
+    }
+
+    #[test]
+    fn a_branch_referring_back_to_the_schema_being_merged_keeps_its_call() {
+        let content = pairs(
+            json!({
+                "Notice": {
+                    "allOf": [
+                        { "type": "object", "properties": { "at": { "type": "string", "format": "date-time" } } },
+                        { "$ref": "#/components/schemas/Notice" }
+                    ]
+                }
+            }),
+            "notice",
+            date_mode,
+        )
+        .expect("pairs");
+        // Inlining a branch that names the schema being merged would never terminate. The call is
+        // where that recursion belongs, so the cycle falls back to it.
+        assert!(
+            content.contains("...decodeNotice(value, path)"),
             "{content}"
         );
     }
