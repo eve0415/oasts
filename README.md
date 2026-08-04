@@ -326,6 +326,22 @@ validation:
   unchecked: allow
 ```
 
+### Output layout
+
+Each artifact gets its own directory under `output`, named after the artifact. Rename or nest any of them and the imports between artifacts follow:
+
+```yaml
+artifacts:
+  types:
+    directory: shared/model
+  client:
+    directory: sdk/fetch
+emit:
+  runtimeDirectory: shared/kernel
+```
+
+Two enabled artifacts may not share a directory, or nest one inside another — that's an `OASTS0102` at config time rather than a collision at write time.
+
 ### Date and time representations
 
 `date-time` and `date` schemas are strings on the wire and, by default, strings in your code too.

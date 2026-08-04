@@ -166,7 +166,7 @@ pub(crate) fn emit_zod_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Gene
 
 fn embedded_asset(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
     let content = rewrite_relative_ts_imports(ZOD_RUNTIME_TS, &model.config.emit.import_extension);
-    let relative_path = "zod/runtime.ts".to_owned();
+    let relative_path = format!("{}/runtime.ts", model.dirs.zod);
     let source = model
         .analyzed
         .ir
@@ -1641,7 +1641,7 @@ fn emit_component(
         &runtime_values,
         &declarations,
     );
-    let relative_path = format!("zod/components/{file_base}.ts");
+    let relative_path = format!("{}/components/{file_base}.ts", model.dirs.zod);
     model.register_path(&relative_path, &schema.source);
     Some(GeneratedFile {
         relative_path,
@@ -1829,7 +1829,7 @@ fn emit_operation_file(
         &runtime_values,
         &declarations,
     );
-    let relative_path = format!("zod/{directory}/{file_base}.ts");
+    let relative_path = format!("{}/{directory}/{file_base}.ts", model.dirs.zod);
     model.register_path(&relative_path, &operation.source);
     Some(GeneratedFile {
         relative_path,
@@ -2049,7 +2049,12 @@ fn emit_webhooks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
         }
     }
     body.push_str("};\n");
-    assemble_descriptor_index(model, "zod/webhooks/index.ts", imports, body)
+    assemble_descriptor_index(
+        model,
+        &format!("{}/webhooks/index.ts", model.dirs.zod),
+        imports,
+        body,
+    )
 }
 
 fn emit_callbacks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
@@ -2134,7 +2139,12 @@ fn emit_callbacks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
         }
         body.push_str("};\n");
     }
-    assemble_descriptor_index(model, "zod/callbacks/index.ts", imports, body)
+    assemble_descriptor_index(
+        model,
+        &format!("{}/callbacks/index.ts", model.dirs.zod),
+        imports,
+        body,
+    )
 }
 
 fn operation_has_request_schemas(operation: &Operation) -> bool {

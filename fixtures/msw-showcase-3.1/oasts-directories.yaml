@@ -1,0 +1,12 @@
+# The msw artifact under a nested directory. It imports the types artifact from two depths — the
+# paths module at the artifact root and the handler modules one below it — so relocating both sides
+# is what proves each specifier is computed rather than counted.
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-directories
+artifacts:
+  types:
+    directory: shared/model
+  msw:
+    directory: mocks/msw

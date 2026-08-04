@@ -1,0 +1,34 @@
+# Every artifact relocated, and every one of them nested. The default layout is one segment deep,
+# so it cannot tell a real relative-path computation apart from a fixed `../` count — only a nested
+# directory can. This config enables the whole cross-artifact graph at once (client -> types,
+# runtime, validators and codecs; codecs -> types and runtime; tanstack -> client, codecs and
+# runtime; msw covers its own two depths in the msw showcase), so typechecking the emitted tree
+# proves every one of those specifiers resolves.
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+namespace: api
+output: ./generated-directories
+artifacts:
+  types:
+    directory: shared/model
+  client:
+    directory: sdk/fetch
+  tanstack:
+    directory: sdk/query
+  validators:
+    directory: schemas/generated
+  zod:
+    directory: schemas/zod
+client:
+  authEnforcement: types
+  baseUrl:
+    source: runtime
+types:
+  dateTime: date
+emit:
+  runtimeDirectory: shared/kernel
+validation:
+  engine: generated
+  request: true
+  response: true

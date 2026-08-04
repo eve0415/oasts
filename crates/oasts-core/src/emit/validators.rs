@@ -255,7 +255,7 @@ fn embedded_asset(
     source: &str,
 ) -> GeneratedFile {
     let content = rewrite_relative_ts_imports(source, &model.config.emit.import_extension);
-    let relative_path = format!("validators/{file_name}");
+    let relative_path = format!("{}/{file_name}", model.dirs.validators);
     let asset_source = model
         .analyzed
         .ir
@@ -3744,7 +3744,7 @@ fn emit_component(
     let reexports = SiblingBindings::new();
     let content = assemble_file(model, "./", &imports, &reexports, &scope, &declarations);
     report_incomplete_applicators(model.sink, &scope);
-    let relative_path = format!("validators/components/{file_base}.ts");
+    let relative_path = format!("{}/components/{file_base}.ts", model.dirs.validators);
     model.register_path(&relative_path, &schema.source);
     Some(GeneratedFile {
         relative_path,
@@ -3979,7 +3979,7 @@ fn emit_operation_file(
     );
     model.sink.extend(wire_diagnostics);
     report_incomplete_applicators(model.sink, &scope);
-    let relative_path = format!("validators/{directory}/{file_base}.ts");
+    let relative_path = format!("{}/{directory}/{file_base}.ts", model.dirs.validators);
     model.register_path(&relative_path, &operation.source);
     Some(GeneratedFile {
         relative_path,
@@ -4034,7 +4034,12 @@ fn emit_webhooks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
         }
     }
     body.push_str("};\n");
-    assemble_descriptor_index(model, "validators/webhooks/index.ts", imports, body)
+    assemble_descriptor_index(
+        model,
+        &format!("{}/webhooks/index.ts", model.dirs.validators),
+        imports,
+        body,
+    )
 }
 
 fn emit_callbacks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
@@ -4122,7 +4127,12 @@ fn emit_callbacks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
         }
         body.push_str("};\n");
     }
-    assemble_descriptor_index(model, "validators/callbacks/index.ts", imports, body)
+    assemble_descriptor_index(
+        model,
+        &format!("{}/callbacks/index.ts", model.dirs.validators),
+        imports,
+        body,
+    )
 }
 
 fn operation_has_request_validators(operation: &Operation) -> bool {

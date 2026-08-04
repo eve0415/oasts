@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::paths::relative_import;
 use super::{
     EmissionModel, Emitter as TypesEmitter, GeneratedFile, TypeAxis, TypePosition,
     assign_import_aliases, import_clause, import_extension, render_property_key, render_ts_string,
@@ -262,6 +263,7 @@ fn emit_paths(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
     model.sink.extend(diagnostics);
 
     let extension = import_extension(model);
+    let relative_path = format!("{}/paths.ts", model.dirs.msw);
     let mut output = model.header();
     let has_component_imports = !component_imports.is_empty();
     write_component_imports(
@@ -269,7 +271,8 @@ fn emit_paths(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
         component_imports,
         &aliases,
         &extension,
-        "../types/components/",
+        &relative_path,
+        model.dirs.types,
     );
     if has_component_imports {
         output.push('\n');
@@ -300,7 +303,6 @@ fn emit_paths(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
     }
     output.push_str("};\n");
 
-    let relative_path = "msw/paths.ts".to_owned();
     model.register_path(&relative_path, &source);
     GeneratedFile {
         relative_path,
@@ -542,6 +544,7 @@ fn emit_operation(
     };
 
     let extension = import_extension(model);
+    let relative_path = format!("{}/handlers/{file_base}.ts", model.dirs.msw);
     let mut output = model.header();
     output.push_str("import { http } from \"msw\";\n");
     output.push_str(
@@ -578,7 +581,8 @@ fn emit_operation(
         component_imports,
         &aliases,
         &extension,
-        "../../types/components/",
+        &relative_path,
+        model.dirs.types,
     );
     output.push('\n');
 
@@ -705,7 +709,6 @@ fn emit_operation(
     });
     output.push_str("      respond: (response) => {\n        const ownsContentType = Object.hasOwn(response, \"contentType\");\n        const ownsBody = Object.hasOwn(response, \"body\");\n        const contentType =\n          ownsContentType &&\n          \"contentType\" in response &&\n          typeof response.contentType === \"string\"\n            ? response.contentType\n            : null;\n        const body =\n          contentType === null && (ownsContentType || ownsBody)\n            ? response\n            : ownsBody && \"body\" in response\n              ? response.body\n              : null;\n        return respondWith(response.status, contentType, body, responsePayloads);\n      },\n    });\n  });\n}\n");
 
-    let relative_path = format!("msw/handlers/{file_base}.ts");
     model.register_path(&relative_path, &operation.source);
     Some(GeneratedFile {
         relative_path,
@@ -2072,7 +2075,8 @@ fn write_component_imports(
     imports: BTreeMap<String, BTreeSet<String>>,
     aliases: &foldhash::HashMap<String, String>,
     extension: &str,
-    prefix: &str,
+    from_file: &str,
+    types_dir: &str,
 ) {
     for (file, names) in imports {
         output.push_str("import type { ");
@@ -2084,7 +2088,11 @@ fn write_component_imports(
                 .join(", "),
         );
         output.push_str(" } from ");
-        output.push_str(&render_ts_string(&format!("{prefix}{file}{extension}")));
+        output.push_str(&render_ts_string(&relative_import(
+            from_file,
+            &[types_dir, "components", &file],
+            extension,
+        )));
         output.push_str(";\n");
     }
 }
@@ -2130,21 +2138,24 @@ fn embedded_assets(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
         .map(|schema| schema.source.clone())
         .unwrap_or_default();
     [
-        ("msw/project.ts", MSW_PROJECT_TS),
-        ("msw/runtime.ts", MSW_RUNTIME_TS),
+        ("project.ts", MSW_PROJECT_TS),
+        ("runtime.ts", MSW_RUNTIME_TS),
     ]
     .into_iter()
-    .map(|(relative_path, source_text)| {
-        let source_text = if relative_path == "msw/project.ts" {
+    .map(|(file_name, source_text)| {
+        // Both assets sit in the msw directory itself, so the project's import of the runtime is a
+        // sibling specifier no matter where that directory is.
+        let source_text = if file_name == "project.ts" {
             source_text.replace("./msw-runtime.ts", "./runtime.ts")
         } else {
             source_text.to_owned()
         };
         let content =
             rewrite_relative_ts_imports(&source_text, &model.config.emit.import_extension);
-        model.register_path(relative_path, &source);
+        let relative_path = format!("{}/{file_name}", model.dirs.msw);
+        model.register_path(&relative_path, &source);
         GeneratedFile {
-            relative_path: relative_path.to_owned(),
+            relative_path,
             content,
         }
     })

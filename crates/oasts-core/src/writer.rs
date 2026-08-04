@@ -166,6 +166,31 @@ impl<'a> TargetValidator<'a> {
     }
 }
 
+/// Removes directories left empty by deleting stale files, walking up to but never touching the
+/// output root itself.
+///
+/// Renaming a schema only ever moves a file within its directory, so before artifact directories
+/// were configurable nothing could empty one. Relocating an artifact empties its whole old tree,
+/// and a committed `generated/` would otherwise keep those husks forever — `--check` sees only
+/// files and would call the tree clean.
+///
+/// `remove_dir` refuses a non-empty directory, so a directory holding anything the user put there
+/// survives untouched and every error is simply the signal to stop climbing.
+fn prune_emptied_directories(output_root: &Path, emptied: Vec<PathBuf>) {
+    let mut candidates = emptied;
+    candidates.sort_unstable();
+    candidates.dedup();
+    // Deepest first, so a directory whose only content was another pruned directory is itself
+    // empty by the time it is reached.
+    for mut directory in candidates.into_iter().rev() {
+        // Every candidate is the parent of a validated target, so climbing can only ever reach the
+        // output root, which ends the walk.
+        while directory != output_root && fs::remove_dir(&directory).is_ok() {
+            directory.pop();
+        }
+    }
+}
+
 /// Writes generated files and updates the output-root ownership manifest.
 pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport, Vec<Diagnostic>> {
     let prepared = prepare_files(files)?;
@@ -212,10 +237,16 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
     stale_paths.sort_unstable();
 
     let mut files_deleted = 0;
+    let mut emptied = Vec::new();
     for relative_path in stale_paths {
         let target = validate_target(&canonical_output, &relative_path)?;
         match fs::remove_file(&target) {
-            Ok(()) => files_deleted += 1,
+            Ok(()) => {
+                files_deleted += 1;
+                if let Some(parent) = target.parent() {
+                    emptied.push(parent.to_path_buf());
+                }
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(vec![io_diagnostic(
@@ -225,6 +256,7 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
             }
         }
     }
+    prune_emptied_directories(&canonical_output, emptied);
 
     let unchanged = if output_existed {
         if rayon::current_num_threads() == 1 || prepared.len() < PARALLEL_IO_MIN_FILES {
@@ -1084,6 +1116,44 @@ mod tests {
         fs::write(output.join(MANIFEST_NAME), manifest_bytes(&manifest)).expect("manifest");
         let report = write(&output, Vec::new()).expect("missing stale file is harmless");
         assert_eq!(report.files_deleted, 0);
+    }
+
+    #[test]
+    fn relocating_an_artifact_leaves_no_husk_of_its_old_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        write(
+            &output,
+            vec![
+                generated("types/components/pet.ts", "old"),
+                generated("types/operations/listpets.ts", "old"),
+            ],
+        )
+        .expect("initial layout");
+
+        // The same artifact, relocated two segments deep. Its whole old tree goes stale at once,
+        // which nothing but a directory change can do.
+        let report = write(
+            &output,
+            vec![generated("shared/model/components/pet.ts", "new")],
+        )
+        .expect("relocated layout");
+
+        assert_eq!(report.files_deleted, 2);
+        assert!(!output.join("types").exists(), "old tree survived");
+        assert!(output.join("shared/model/components/pet.ts").exists());
+    }
+
+    #[test]
+    fn a_directory_the_user_owns_survives_its_generated_files_going_stale() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        write(&output, vec![generated("types/components/pet.ts", "old")]).expect("initial layout");
+        fs::write(output.join("types/components/notes.md"), "mine").expect("user file");
+
+        write(&output, vec![generated("shared/pet.ts", "new")]).expect("relocated layout");
+
+        assert!(output.join("types/components/notes.md").exists());
     }
 
     #[cfg(unix)]

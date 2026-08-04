@@ -279,12 +279,12 @@ keys:
         deallocs: 30
         allocBytes: 18020
       - stage: "emit"
-        allocs: 1812
-        reallocs: 421
-        deallocs: 1773
-        allocBytes: 436810
+        allocs: 1811
+        reallocs: 460
+        deallocs: 1772
+        allocBytes: 436651
     informational:
-      peakBytes: 279066
+      peakBytes: 279006
   - fixture: "tictactoe-3.1"
     config: "oasts.yaml"
     stages:

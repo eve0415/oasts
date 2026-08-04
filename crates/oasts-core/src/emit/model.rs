@@ -7,6 +7,7 @@ use crate::semantic::Analyzed;
 
 use crate::transform::TransformFacts;
 
+use super::paths::ArtifactDirs;
 use super::{
     CODE_FILE_NAME, CODE_PATH_COLLISION, CODE_VARIANT_ALIAS, CODE_VARIANT_COLLISION,
     CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, TypePosition, file_base_name, shape_variants,
@@ -39,6 +40,9 @@ pub(crate) struct SchemaTarget {
 pub(crate) struct EmissionModel<'input, 'sink> {
     pub(crate) analyzed: &'input Analyzed,
     pub(crate) config: &'input ResolvedConfig,
+    /// Where each artifact's files land. Every emitted path and every cross-artifact import is
+    /// built from these, so no emitter spells another artifact's directory.
+    pub(crate) dirs: ArtifactDirs<'input>,
     digest: String,
     schema_targets: HashMap<String, HashMap<String, SchemaTarget>>,
     pub(crate) component_files: Vec<Option<String>>,
@@ -66,6 +70,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         let mut model = Self {
             analyzed,
             config,
+            dirs: ArtifactDirs::new(config),
             digest,
             schema_targets: HashMap::new(),
             component_files: vec![None; analyzed.ir.schemas.len()],
@@ -484,7 +489,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             let Some(file_base) = self.allocate_file_base(source_name, &schema.source) else {
                 continue;
             };
-            let relative = format!("types/components/{file_base}.ts");
+            let relative = format!("{}/components/{file_base}.ts", self.dirs.types);
             self.register_path(&relative, &schema.source);
             self.component_files[allocated.schema_index] = Some(file_base.clone());
             let (request_differs, response_differs) = shape_variants(&schema.schema);
@@ -528,7 +533,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             let Some(file_base) = self.allocate_file_base(source_name, &operation.source) else {
                 continue;
             };
-            let relative = format!("types/operations/{file_base}.ts");
+            let relative = format!("{}/operations/{file_base}.ts", self.dirs.types);
             self.register_path(&relative, &operation.source);
             self.operation_files[allocated.operation_index] = Some(file_base);
         }
@@ -544,7 +549,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             let Some(file_base) = self.allocate_file_base(source_name, &source) else {
                 continue;
             };
-            let relative = format!("types/webhooks/{file_base}.ts");
+            let relative = format!("{}/webhooks/{file_base}.ts", self.dirs.types);
             self.register_path(&relative, &source);
             self.webhook_files[index] = Some(file_base);
         }
@@ -559,7 +564,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             let Some(file_base) = self.allocate_file_base(source_name, &source) else {
                 continue;
             };
-            let relative = format!("types/callbacks/{file_base}.ts");
+            let relative = format!("{}/callbacks/{file_base}.ts", self.dirs.types);
             self.register_path(&relative, &source);
             self.callback_files[index] = Some(file_base);
         }

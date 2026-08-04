@@ -241,6 +241,17 @@ grep -q 'OASTS1513' "$work/tanstack-override.log" \
   || { echo "verify-ts: an unmatched pathSegments override did not warn" >&2; exit 1; }
 echo "segment override resolves the collision and warns on an unmatched key"
 
+# Configured artifact directories, nested. Everything above runs at the default one-segment layout,
+# where a hardcoded `../` count and a real relative-path computation are indistinguishable — these
+# two rows are the ones that tell them apart. The tanstack showcase relocates the whole
+# cross-artifact graph at once (types, client, codecs, tanstack, validators, zod and the runtime);
+# the msw showcase covers the two depths msw imports the types artifact from. tsc resolving the
+# emitted tree is the proof: every specifier is computed from where its file actually landed.
+generate_and_verify tanstack-showcase-3.1 oasts-directories.yaml "$work/directories-tanstack" \
+  directories "tanstack-showcase-3.1 (relocated artifacts)" link
+generate_and_verify msw-showcase-3.1 oasts-directories.yaml "$work/directories-msw" \
+  directories "msw-showcase-3.1 (relocated artifacts)" link
+
 # The frozen key vectors, against both representations at once: the pairing is the point, since the
 # transform vectors assert that an application value in and a wire string out land on the same
 # cache entry the string-mode run produced.

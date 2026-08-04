@@ -44,6 +44,7 @@ use crate::semantic::{
 mod client;
 mod model;
 mod msw;
+mod paths;
 pub(crate) mod runtime_assets;
 mod tanstack;
 mod transform;
@@ -307,7 +308,7 @@ fn has_unsafe_path(value: &str) -> bool {
         || value.as_bytes().get(1) == Some(&b':')
 }
 
-fn is_reserved_device(value: &str) -> bool {
+pub(crate) fn is_reserved_device(value: &str) -> bool {
     let device = value
         .split('.')
         .next()
@@ -767,7 +768,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         self.write_imports(&mut content, imports, "./");
         content.push_str(&body);
         GeneratedFile {
-            relative_path: "types/webhooks/index.ts".to_owned(),
+            relative_path: format!("{}/webhooks/index.ts", self.model.dirs.types),
             content,
         }
     }
@@ -859,7 +860,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         self.write_imports(&mut content, imports, "./");
         content.push_str(&body);
         GeneratedFile {
-            relative_path: "types/callbacks/index.ts".to_owned(),
+            relative_path: format!("{}/callbacks/index.ts", self.model.dirs.types),
             content,
         }
     }
@@ -915,7 +916,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         content.push_str("  get(name: string): string | null;\n");
         content.push_str("}\n");
         GeneratedFile {
-            relative_path: "types/headers.ts".to_owned(),
+            relative_path: format!("{}/headers.ts", self.model.dirs.types),
             content,
         }
     }
@@ -1458,7 +1459,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             }
         }
         GeneratedFile {
-            relative_path: format!("types/components/{file_base}.ts"),
+            relative_path: format!("{}/components/{file_base}.ts", self.model.dirs.types),
             content: insert_temporal_reference(content, header_len),
         }
     }
@@ -2642,7 +2643,7 @@ impl Emitter<'_, '_, '_> {
 
         self.import_aliases.borrow_mut().clear();
         GeneratedFile {
-            relative_path: format!("types/{subdir}/{file_base}.ts"),
+            relative_path: format!("{}/{subdir}/{file_base}.ts", self.model.dirs.types),
             content,
         }
     }

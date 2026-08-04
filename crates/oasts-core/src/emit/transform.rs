@@ -34,6 +34,7 @@ use crate::media::{is_json, is_xml};
 use crate::transform::{JsonKinds, KindBranch, TransformFacts, TransformKind, UnionDispatch};
 
 use super::model::EmissionModel;
+use super::paths::{TRANSFORM_SUBDIR, relative_import};
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
     CODE_TRANSFORM_UNION, CODE_UNCONVERTIBLE_TRANSFORM, Emitter, GeneratedFile, SchemaChildMode,
@@ -351,7 +352,11 @@ pub(crate) fn emit_transform_from_model(
     }
     model.sink.extend(refusals);
     let extension = import_extension(model);
-    let runtime_directory = model.config.emit.runtime_directory.clone();
+    let result_module = super::render_ts_string(&relative_import(
+        &format!("{}/{TRANSFORM_SUBDIR}/result.ts", model.dirs.client),
+        &[model.dirs.runtime, "result"],
+        &extension,
+    ));
     let header = model.header();
     let mut files = vec![
         transform_file(
@@ -363,7 +368,7 @@ pub(crate) fn emit_transform_from_model(
             model,
             "result.ts",
             format!(
-                "{header}export {{ TransformError }} from \"../../{runtime_directory}/result{extension}\";\nexport type {{ ApplicationPath, SourcePointer }} from \"../../{runtime_directory}/result{extension}\";\n"
+                "{header}export {{ TransformError }} from {result_module};\nexport type {{ ApplicationPath, SourcePointer }} from {result_module};\n"
             ),
         ),
     ];
@@ -383,7 +388,7 @@ fn transform_file(
     file_name: &str,
     content: String,
 ) -> GeneratedFile {
-    let relative_path = format!("client/transform/{file_name}");
+    let relative_path = format!("{}/{TRANSFORM_SUBDIR}/{file_name}", model.dirs.client);
     let asset_source = model
         .analyzed
         .ir
@@ -544,9 +549,18 @@ fn emit_component_pairs(
     let mut content = emitter.header();
     let header_len = content.len();
     let extension = import_extension(emitter.model);
+    let relative_path = format!(
+        "{}/{TRANSFORM_SUBDIR}/components/{file_base}.ts",
+        emitter.model.dirs.client
+    );
     content.push_str(&format!(
-        "import type {{ {} }} from \"../../../types/components/{file_base}{extension}\";\n",
-        type_imports.into_iter().collect::<Vec<_>>().join(", ")
+        "import type {{ {} }} from {};\n",
+        type_imports.into_iter().collect::<Vec<_>>().join(", "),
+        super::render_ts_string(&relative_import(
+            &relative_path,
+            &[emitter.model.dirs.types, "components", &file_base],
+            &extension,
+        ))
     ));
     content.push_str(&format!(
         "import type {{ {} }} from \"../result{extension}\";\n",
@@ -575,7 +589,7 @@ fn emit_component_pairs(
     write_pointer_constants(&mut content, &pointers);
     content.push_str(&bodies);
     Some(GeneratedFile {
-        relative_path: format!("client/transform/components/{file_base}.ts"),
+        relative_path,
         content: super::insert_temporal_reference(content, header_len),
     })
 }
@@ -687,10 +701,19 @@ fn emit_operation_pairs(
     let mut content = emitter.header();
     let header_len = content.len();
     let extension = import_extension(emitter.model);
+    let relative_path = format!(
+        "{}/{TRANSFORM_SUBDIR}/operations/{file_base}.ts",
+        emitter.model.dirs.client
+    );
     if !type_imports.is_empty() {
         content.push_str(&format!(
-            "import type {{ {} }} from \"../../../types/operations/{file_base}{extension}\";\n",
-            type_imports.into_iter().collect::<Vec<_>>().join(", ")
+            "import type {{ {} }} from {};\n",
+            type_imports.into_iter().collect::<Vec<_>>().join(", "),
+            super::render_ts_string(&relative_import(
+                &relative_path,
+                &[emitter.model.dirs.types, "operations", file_base],
+                &extension,
+            ))
         ));
     }
     if request_transforms {
@@ -722,7 +745,7 @@ fn emit_operation_pairs(
     write_pointer_constants(&mut content, &pointers);
     content.push_str(&bodies);
     Some(GeneratedFile {
-        relative_path: format!("client/transform/operations/{file_base}.ts"),
+        relative_path,
         content: super::insert_temporal_reference(content, header_len),
     })
 }

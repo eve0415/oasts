@@ -850,7 +850,10 @@ impl Default for LimitsConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedArtifact {
     pub enabled: bool,
-    pub directory: PathBuf,
+    /// Where this artifact's files land, relative to the output root, in normalized `/`-separated
+    /// form. Emitters build both their own paths and their imports of other artifacts from this,
+    /// so the whole layout follows from one string per artifact.
+    pub directory: String,
 }
 
 /// Fully resolved artifact selectors.
@@ -1263,8 +1266,9 @@ pub fn resolve_config(
     let naming = raw.naming.unwrap_or_default();
     validate_naming(&naming, source_path, &mut sink);
     let documentation = raw.documentation.unwrap_or_default();
-    let emit = raw.emit.unwrap_or_default();
+    let mut emit = raw.emit.unwrap_or_default();
     validate_emit(&emit, source_path, &mut sink);
+    emit.runtime_directory = normalize_directory(&emit.runtime_directory);
     validate_directory_overlaps(&artifact_states, &emit, source_path, &mut sink);
 
     let local = raw.local.unwrap_or_default();
@@ -1299,7 +1303,7 @@ pub fn resolve_config(
     let client = resolve_client_config(raw.client.as_ref(), artifact_states.client.enabled);
     let validation =
         resolve_validation_config(raw.validation.as_ref(), artifact_states.client.enabled);
-    let artifacts = artifact_states.with_output(&output);
+    let artifacts = artifact_states.resolve();
 
     Ok(ResolvedConfig {
         diagnostics,
@@ -1422,22 +1426,22 @@ struct ArtifactStates {
 }
 
 impl ArtifactStates {
-    fn with_output(self, output: &Path) -> ResolvedArtifactsConfig {
+    fn resolve(self) -> ResolvedArtifactsConfig {
         ResolvedArtifactsConfig {
-            types: resolved_artifact(self.types, output),
-            client: resolved_artifact(self.client, output),
-            zod: resolved_artifact(self.zod, output),
-            validators: resolved_artifact(self.validators, output),
-            tanstack: resolved_artifact(self.tanstack, output),
-            msw: resolved_artifact(self.msw, output),
+            types: resolved_artifact(self.types),
+            client: resolved_artifact(self.client),
+            zod: resolved_artifact(self.zod),
+            validators: resolved_artifact(self.validators),
+            tanstack: resolved_artifact(self.tanstack),
+            msw: resolved_artifact(self.msw),
         }
     }
 }
 
-fn resolved_artifact(state: ArtifactState, output: &Path) -> ResolvedArtifact {
+fn resolved_artifact(state: ArtifactState) -> ResolvedArtifact {
     ResolvedArtifact {
         enabled: state.enabled,
-        directory: output.join(state.directory),
+        directory: state.directory,
     }
 }
 
@@ -1697,9 +1701,16 @@ fn validate_directory_overlaps(
     }
 }
 
+/// Whether two artifact directories are the same, or one is inside the other.
+///
+/// Compared case-insensitively because generated paths are: `register_path` folds case before
+/// looking for collisions, so `Schemas` and `schemas` are one directory as far as emission — and as
+/// far as a case-insensitive filesystem — is concerned.
 fn directories_overlap(left: &str, right: &str) -> bool {
-    let left = Path::new(left);
-    let right = Path::new(right);
+    let left = left.to_ascii_lowercase();
+    let right = right.to_ascii_lowercase();
+    let left = Path::new(&left);
+    let right = Path::new(&right);
     left.starts_with(right) || right.starts_with(left)
 }
 
@@ -1810,12 +1821,17 @@ fn resolve_artifact_setting(
     if !is_valid_directory(&directory) {
         sink.push(config_error(
             CODE_ARTIFACT_DIRECTORY,
-            format!("artifact '{name}' has invalid directory '{directory}'"),
+            format!(
+                "artifact '{name}' has invalid directory '{directory}': each segment must be a relative, non-empty run of letters, digits, '_' or '-'"
+            ),
             Some(source),
             Some("/artifacts"),
         ));
     }
-    ArtifactState { enabled, directory }
+    ArtifactState {
+        enabled,
+        directory: normalize_directory(&directory),
+    }
 }
 
 fn validate_naming(naming: &NamingConfig, source: &Path, sink: &mut DiagnosticSink) {
@@ -1879,7 +1895,7 @@ fn validate_emit(emit: &EmitConfig, source: &Path, sink: &mut DiagnosticSink) {
     if !is_valid_directory(&emit.runtime_directory) {
         sink.push(config_error(
             CODE_EMIT,
-            "emit.runtimeDirectory must be a non-empty relative directory without '..'",
+            "emit.runtimeDirectory segments must each be a relative, non-empty run of letters, digits, '_' or '-'",
             Some(source),
             Some("/emit/runtimeDirectory"),
         ));
@@ -2027,15 +2043,47 @@ fn is_ts_identifier(value: &str) -> bool {
 
 fn is_valid_directory(value: &str) -> bool {
     let path = Path::new(value);
-    !value.is_empty()
-        && value != "."
-        && !path.is_absolute()
-        && path.components().all(|component| {
-            !matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
+    // `is_absolute` answers for the host platform only, and a config is authored on one platform
+    // and consumed on another; the leading-separator check makes the verdict the same everywhere.
+    !path.is_absolute() && !value.starts_with(['/', '\\']) && {
+        let normalized = normalize_directory(value);
+        !normalized.is_empty() && normalized.split('/').all(is_valid_directory_segment)
+    }
+}
+
+/// Directory segments are held to exactly the charset generated file names are.
+///
+/// The compiler already refuses to name a *file* anything outside `[A-Za-z0-9_-]`, and a directory
+/// it has to place that file in has the same problems: a separator or drive letter is rejected by
+/// the writer, a quote produces an unterminated import, a leading dot collides with the ownership
+/// manifest, and a Windows device name is unopenable. Catching all of them here means one
+/// `OASTS0102` naming the offending value instead of a later failure naming a path the user never
+/// wrote.
+fn is_valid_directory_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !crate::emit::is_reserved_device(segment)
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Reduces a configured directory to the one spelling everything downstream reads: `/`-separated,
+/// with empty and `.` segments dropped. The overlap check compares these, emitters join onto them,
+/// and the relative-import computation walks their segments — so `./a/` and `a` must not be able to
+/// disagree about how deep the directory is. Absolute and `..` inputs are rejected by
+/// [`is_valid_directory`] before this ever runs, so dropping segments here cannot escape the root.
+fn normalize_directory(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    for segment in value
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+    {
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(segment);
+    }
+    normalized
 }
 
 fn resolve_below(base: &Path, relative: &Path, allow_equal: bool) -> Result<PathBuf, String> {
@@ -2244,10 +2292,7 @@ mod tests {
         assert_eq!(resolved.output, directory.path().join("generated"));
         assert_eq!(resolved.namespace, "api");
         assert!(resolved.artifacts.types.enabled);
-        assert_eq!(
-            resolved.artifacts.types.directory,
-            directory.path().join("generated/types")
-        );
+        assert_eq!(resolved.artifacts.types.directory, "types");
         assert!(!resolved.artifacts.client.enabled);
         assert_eq!(resolved.emit.runtime_directory, "runtime");
         assert_eq!(resolved.limits, LimitsConfig::default());
@@ -2811,10 +2856,7 @@ mod tests {
         value["validation"] = json!({ "engine": "off", "unchecked": "allow" });
         let resolved = load_json(&value).expect("every artifact should resolve");
         assert!(resolved.artifacts.tanstack.enabled);
-        assert_eq!(
-            resolved.artifacts.tanstack.directory,
-            resolved.output.join("tanstack")
-        );
+        assert_eq!(resolved.artifacts.tanstack.directory, "tanstack");
     }
 
     #[test]
@@ -2834,10 +2876,7 @@ mod tests {
         value["artifacts"] = json!({ "types": true, "msw": true });
         let resolved = load_json(&value).expect("types + msw config should resolve");
         assert!(resolved.artifacts.msw.enabled);
-        assert_eq!(
-            resolved.artifacts.msw.directory,
-            resolved.output.join("msw")
-        );
+        assert_eq!(resolved.artifacts.msw.directory, "msw");
     }
 
     #[test]
@@ -2858,10 +2897,7 @@ mod tests {
         let resolved = load_json(&standalone).expect("validators-only config should resolve");
         assert!(resolved.artifacts.validators.enabled);
         assert!(!resolved.artifacts.types.enabled);
-        assert_eq!(
-            resolved.artifacts.validators.directory,
-            resolved.output.join("validators")
-        );
+        assert_eq!(resolved.artifacts.validators.directory, "validators");
 
         let mut with_types = valid_json_value();
         with_types["artifacts"] = json!({ "types": true, "validators": true });
@@ -2877,10 +2913,7 @@ mod tests {
         let resolved = load_json(&standalone).expect("zod-only config should resolve");
         assert!(resolved.artifacts.zod.enabled);
         assert!(!resolved.artifacts.types.enabled);
-        assert_eq!(
-            resolved.artifacts.zod.directory,
-            resolved.output.join("zod")
-        );
+        assert_eq!(resolved.artifacts.zod.directory, "zod");
 
         let mut with_types = valid_json_value();
         with_types["artifacts"] = json!({ "types": true, "zod": true });
@@ -2964,7 +2997,26 @@ mod tests {
 
     #[test]
     fn artifact_directories_are_validated() {
-        for directory in ["", ".", "/absolute", "../outside", "a/../b"] {
+        // Each of these fails somewhere downstream if it gets through: the writer rejects a
+        // separator or drive letter, a quote produces an unterminated import, a leading dot
+        // collides with the ownership manifest, and a device name is unopenable on Windows.
+        for directory in [
+            "",
+            ".",
+            "./",
+            "//",
+            "/absolute",
+            "\\unc",
+            "../outside",
+            "a/../b",
+            "model\\types",
+            "sha\"red",
+            ".oasts-manifest.json",
+            "c:",
+            "aux",
+            "com1",
+            "shared model",
+        ] {
             let mut value = valid_json_value();
             value["artifacts"] = json!({ "types": { "directory": directory } });
             assert_code(load_json(&value), CODE_ARTIFACT_DIRECTORY);
@@ -2973,7 +3025,32 @@ mod tests {
         let mut valid = valid_json_value();
         valid["artifacts"] = json!({ "types": { "directory": "model/types" } });
         let resolved = load_json(&valid).expect("nested artifact directory should resolve");
-        assert!(resolved.artifacts.types.directory.ends_with("model/types"));
+        assert_eq!(resolved.artifacts.types.directory, "model/types");
+    }
+
+    #[test]
+    fn directories_that_differ_only_in_case_are_one_directory() {
+        // Generated paths are compared case-folded, and so are they: two artifacts here would
+        // collide at emission, which is late and names a path the user never wrote.
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({
+            "types": true,
+            "validators": { "directory": "Schemas" },
+            "zod": { "directory": "schemas" },
+        });
+        assert_code(load_json(&value), CODE_ARTIFACT_DIRECTORY);
+    }
+
+    #[test]
+    fn configured_directories_resolve_to_one_normalized_spelling() {
+        // Emitters count these segments to build relative imports, so two spellings of the same
+        // directory must not reach them as different depths.
+        let mut value = valid_json_value();
+        value["artifacts"] = json!({ "types": { "directory": "./model//types/" } });
+        value["emit"] = json!({ "runtimeDirectory": "./kernel/" });
+        let resolved = load_json(&value).expect("redundant separators should resolve");
+        assert_eq!(resolved.artifacts.types.directory, "model/types");
+        assert_eq!(resolved.emit.runtime_directory, "kernel");
     }
 
     #[test]
@@ -3138,7 +3215,7 @@ mod tests {
         value["artifacts"] = json!({ "types": { "directory": "model" } });
         let resolved = load_json(&value).expect("object selector should default to enabled");
         assert!(resolved.artifacts.types.enabled);
-        assert!(resolved.artifacts.types.directory.ends_with("model"));
+        assert_eq!(resolved.artifacts.types.directory, "model");
     }
 
     #[test]

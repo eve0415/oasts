@@ -23,6 +23,7 @@ use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use super::media_tag;
 
 use super::model::EmissionModel;
+use super::paths::{TRANSFORM_SUBDIR, relative_import};
 use super::runtime_assets::{RuntimeSelection, emit_runtime_files};
 use super::validators::operation_parameter_validator_names;
 use super::{
@@ -65,11 +66,19 @@ pub(crate) fn emit_client_from_model(
         if plan.response_table.iter().any(response_decodes_multipart) {
             helper_ids.insert(MULTIPART_RESPONSE_REGION.to_owned());
         }
-        let relative_path = format!("client/operations/{file_base}.ts");
+        let relative_path = format!("{}/operations/{file_base}.ts", model.dirs.client);
         model.register_path(&relative_path, &operation.source);
+        let content = emit_operation(
+            model,
+            &operation,
+            plan,
+            &allocated.name,
+            &file_base,
+            &relative_path,
+        );
         files.push(GeneratedFile {
             relative_path,
-            content: emit_operation(model, &operation, plan, &allocated.name, &file_base),
+            content,
         });
         aggregate_entries.push((allocated.name, file_base));
     }
@@ -90,7 +99,7 @@ pub(crate) fn emit_client_from_model(
         .is_some_and(|client| client.aggregate)
     {
         let namespace = model.config.namespace.clone();
-        let relative_path = format!("client/{namespace}.ts");
+        let relative_path = format!("{}/{namespace}.ts", model.dirs.client);
         model.register_path(&relative_path, &source);
         files.push(GeneratedFile {
             relative_path,
@@ -233,16 +242,19 @@ fn emit_document_auth(
     }
 
     let extension = import_extension(model);
+    let relative_path = format!("{}/auth.ts", model.dirs.client);
     let mut output = model.header();
     output.push_str("import type { AuthProvider } from ");
-    output.push_str(&render_ts_string(&format!(
-        "../runtime/transport{extension}"
+    output.push_str(&render_ts_string(&relative_import(
+        &relative_path,
+        &[model.dirs.runtime, "transport"],
+        &extension,
     )));
     output.push_str(";\n\nexport interface DocumentAuthProviders {\n");
     output.push_str(&body);
     output.push_str("}\n");
     Some(GeneratedFile {
-        relative_path: "client/auth.ts".to_owned(),
+        relative_path,
         content: output,
     })
 }
@@ -288,6 +300,8 @@ fn emit_operation(
     plan: &OperationPlan,
     allocated_name: &str,
     file_base: &str,
+    // Where this module will be written. Every import it emits is relative to it.
+    self_path: &str,
 ) -> String {
     let stem = uppercase_first(allocated_name);
     let transforming = model.transform_facts().enabled();
@@ -432,7 +446,6 @@ fn emit_operation(
         .auth_enforcement;
     let (imports_basic_credential, imports_cookie_credential, imports_client_certificate) =
         call_args_credentials(plan, auth_enforcement);
-    let runtime_directory = &model.config.emit.runtime_directory;
     let unchecked_response = model
         .config
         .validation
@@ -450,6 +463,8 @@ fn emit_operation(
         component_imports,
         &component_aliases,
         &extension,
+        self_path,
+        model.dirs.types,
     );
     if !operation_type_names.is_empty() {
         output.push_str("import type { ");
@@ -461,23 +476,29 @@ fn emit_operation(
                 .join(", "),
         );
         output.push_str(" } from ");
-        output.push_str(&render_ts_string(&format!(
-            "../../types/operations/{file_base}{extension}"
+        output.push_str(&render_ts_string(&relative_import(
+            self_path,
+            &[model.dirs.types, "operations", file_base],
+            &extension,
         )));
         output.push_str(";\n");
     }
     if uses_typed_headers {
         output.push_str("import type { TypedHeaders } from ");
-        output.push_str(&render_ts_string(&format!(
-            "../../types/headers{extension}"
+        output.push_str(&render_ts_string(&relative_import(
+            self_path,
+            &[model.dirs.types, "headers"],
+            &extension,
         )));
         output.push_str(";\n");
     }
     output.push_str(
         "import type { RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError } from ",
     );
-    output.push_str(&render_ts_string(&format!(
-        "../../{runtime_directory}/result{extension}"
+    output.push_str(&render_ts_string(&relative_import(
+        self_path,
+        &[model.dirs.runtime, "result"],
+        &extension,
     )));
     output.push_str(";\n");
     // `unwrap` reuses the result module's failed-branch throw so the orThrow variant delegates to
@@ -493,8 +514,10 @@ fn emit_operation(
         output.push_str("import { ");
         output.push_str(result_values);
         output.push_str(" } from ");
-        output.push_str(&render_ts_string(&format!(
-            "../../{runtime_directory}/result{extension}"
+        output.push_str(&render_ts_string(&relative_import(
+            self_path,
+            &[model.dirs.runtime, "result"],
+            &extension,
         )));
         output.push_str(";\n");
     }
@@ -510,8 +533,10 @@ fn emit_operation(
         output.push_str("import { ");
         output.push_str(&helper_names.into_iter().collect::<Vec<_>>().join(", "));
         output.push_str(" } from ");
-        output.push_str(&render_ts_string(&format!(
-            "../../{runtime_directory}/serialize{extension}"
+        output.push_str(&render_ts_string(&relative_import(
+            self_path,
+            &[model.dirs.runtime, "serialize"],
+            &extension,
         )));
         output.push_str(";\n");
     }
@@ -552,8 +577,10 @@ fn emit_operation(
         output.push_str(", type BasicCredential");
     }
     output.push_str(", type CallOptions, type OperationDescriptor, type Transport } from ");
-    output.push_str(&render_ts_string(&format!(
-        "../../{runtime_directory}/transport{extension}"
+    output.push_str(&render_ts_string(&relative_import(
+        self_path,
+        &[model.dirs.runtime, "transport"],
+        &extension,
     )));
     output.push_str(";\n");
     if validation_binding {
@@ -563,6 +590,7 @@ fn emit_operation(
             &response_checks,
             file_base,
             &extension,
+            self_path,
             validation_artifact_dir(model),
         );
     }
@@ -580,8 +608,10 @@ fn emit_operation(
     codec_names.sort_unstable();
     if !codec_names.is_empty() {
         output.push_str(&format!("import {{ {} }} from ", codec_names.join(", ")));
-        output.push_str(&render_ts_string(&format!(
-            "../transform/operations/{file_base}{extension}"
+        output.push_str(&render_ts_string(&relative_import(
+            self_path,
+            &[model.dirs.client, TRANSFORM_SUBDIR, "operations", file_base],
+            &extension,
         )));
         output.push_str(";\n");
     }
@@ -849,10 +879,10 @@ fn validation_flags(model: &EmissionModel<'_, '_>) -> (bool, bool) {
 /// `Issue` type, so the engine selects a directory and changes nothing else about the emitted body —
 /// and because the client forwards the value it already decoded rather than the validator's return,
 /// which engine is bound is invisible in `data`.
-fn validation_artifact_dir(model: &EmissionModel<'_, '_>) -> &'static str {
+fn validation_artifact_dir<'model>(model: &'model EmissionModel<'_, '_>) -> &'model str {
     match model.config.validation.as_ref() {
-        Some(validation) if validation.engine == ValidationEngine::Zod => "zod",
-        _ => "validators",
+        Some(validation) if validation.engine == ValidationEngine::Zod => model.dirs.zod,
+        _ => model.dirs.validators,
     }
 }
 
@@ -1015,11 +1045,14 @@ fn write_validator_imports(
     response: &[ResponseCheck],
     file_base: &str,
     extension: &str,
+    from_file: &str,
     artifact: &str,
 ) {
     output.push_str("import type { Issue } from ");
-    output.push_str(&render_ts_string(&format!(
-        "../../{artifact}/runtime{extension}"
+    output.push_str(&render_ts_string(&relative_import(
+        from_file,
+        &[artifact, "runtime"],
+        extension,
     )));
     output.push_str(";\n");
     let validators = request
@@ -1039,8 +1072,10 @@ fn write_validator_imports(
     output.push_str("import { ");
     output.push_str(&validators.into_iter().collect::<Vec<_>>().join(", "));
     output.push_str(" } from ");
-    output.push_str(&render_ts_string(&format!(
-        "../../{artifact}/operations/{file_base}{extension}"
+    output.push_str(&render_ts_string(&relative_import(
+        from_file,
+        &[artifact, "operations", file_base],
+        extension,
     )));
     output.push_str(";\n");
 }
@@ -1376,6 +1411,8 @@ fn write_component_imports(
     imports: BTreeMap<String, BTreeSet<String>>,
     aliases: &HashMap<String, String>,
     extension: &str,
+    from_file: &str,
+    types_dir: &str,
 ) {
     for (file, names) in imports {
         output.push_str("import type { ");
@@ -1387,8 +1424,10 @@ fn write_component_imports(
                 .join(", "),
         );
         output.push_str(" } from ");
-        output.push_str(&render_ts_string(&format!(
-            "../../types/components/{file}{extension}"
+        output.push_str(&render_ts_string(&relative_import(
+            from_file,
+            &[types_dir, "components", &file],
+            extension,
         )));
         output.push_str(";\n");
     }
@@ -5580,7 +5619,14 @@ mod tests {
             let mut imports = BTreeMap::new();
             collect_body_imports(&renderer, &body, &mut imports);
             let mut import_text = String::new();
-            write_component_imports(&mut import_text, imports, &HashMap::new(), ".js");
+            write_component_imports(
+                &mut import_text,
+                imports,
+                &HashMap::new(),
+                ".js",
+                "client/operations/getpet.ts",
+                "types",
+            );
             assert!(import_text.contains("types/components"));
         }
         let mut descriptor = String::new();

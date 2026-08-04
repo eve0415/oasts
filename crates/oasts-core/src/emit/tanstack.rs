@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::client::{ResponseBody, request_transform_binding, response_body_side};
 use super::import_extension;
 use super::model::EmissionModel;
+use super::paths::{TRANSFORM_SUBDIR, relative_import};
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
     GeneratedFile, render_literal_key, render_property_key, render_ts_string, source_diagnostic,
@@ -641,10 +642,11 @@ impl KeyFactory {
              // data. Import `keys` when you want prefix invalidation and are willing to pay for the tree.\n\n",
         );
         let extension = import_extension(model);
-        let runtime_directory = &model.config.emit.runtime_directory;
         output.push_str("import type { ParamValue } from ");
-        output.push_str(&render_ts_string(&format!(
-            "../{runtime_directory}/serialize{extension}"
+        output.push_str(&render_ts_string(&relative_import(
+            &format!("{}/keys.ts", model.dirs.tanstack),
+            &[model.dirs.runtime, "serialize"],
+            &extension,
         )));
         output.push_str(
             ";\n\n// What a path parameter contributes to a key. Wider than `ParamValue` because a\n             // `content`-typed parameter carries arbitrary JSON, and one signature has to serve\n             // every operation on the path — the client is what checks the value against its own\n             // schema; a key only has to be able to hold it.\n             export type KeyValue = ParamValue | { readonly [key: string]: KeyValue } | readonly KeyValue[];\n\n",
@@ -860,9 +862,10 @@ pub(crate) fn emit_tanstack_from_model(
         .next()
         .map_or_else(SourceRef::default, |binding| binding.source.clone());
     let keys = factory.render(model);
-    model.register_path("tanstack/keys.ts", &keys_source);
+    let keys_path = format!("{}/keys.ts", model.dirs.tanstack);
+    model.register_path(&keys_path, &keys_source);
     files.push(GeneratedFile {
-        relative_path: "tanstack/keys.ts".to_owned(),
+        relative_path: keys_path,
         content: keys,
     });
 
@@ -870,19 +873,23 @@ pub(crate) fn emit_tanstack_from_model(
     // runtime tree. The repoint happens AFTER the extension rewrite, not before: that rewrite only
     // recognizes `./`-prefixed specifiers, so repointing first would leave the `.ts` suffix in
     // emitted output.
+    let runtime_path = format!("{}/runtime.ts", model.dirs.tanstack);
     let runtime =
         rewrite_relative_ts_imports(TANSTACK_RUNTIME_TS, &model.config.emit.import_extension)
             .replace(
                 &format!("\"./transport{}\"", import_extension(model)),
                 &format!(
-                    "\"../{}/transport{}\"",
-                    model.config.emit.runtime_directory,
-                    import_extension(model)
+                    "\"{}\"",
+                    relative_import(
+                        &runtime_path,
+                        &[model.dirs.runtime, "transport"],
+                        &import_extension(model),
+                    )
                 ),
             );
-    model.register_path("tanstack/runtime.ts", &keys_source);
+    model.register_path(&runtime_path, &keys_source);
     files.push(GeneratedFile {
-        relative_path: "tanstack/runtime.ts".to_owned(),
+        relative_path: runtime_path,
         content: runtime,
     });
 
@@ -976,7 +983,7 @@ fn emit_operation(
     }
 
     let extension = import_extension(model);
-    let runtime_directory = model.config.emit.runtime_directory.clone();
+    let relative_path = format!("{}/operations/{file_base}.ts", model.dirs.tanstack);
     let mut output = model.header();
     output.push('\n');
     // Every descriptor names at least its own path node's binding, so this import is unconditional.
@@ -998,27 +1005,40 @@ fn emit_operation(
     }
     output.push_str(&format!(
         "import {{ {allocated_name}OrThrow, type {stem}CallArgs, type {stem}Input, type {stem}Result }} from {};\n",
-        render_ts_string(&format!("../../client/operations/{file_base}{extension}"))
+        render_ts_string(&relative_import(
+            &relative_path,
+            &[model.dirs.client, "operations", file_base],
+            &extension,
+        ))
     ));
     if body.uses_encoder {
         output.push_str(&format!(
             "import {{ encode{stem}Input }} from {};\n",
-            render_ts_string(&format!(
-                "../../client/transform/operations/{file_base}{extension}"
+            render_ts_string(&relative_import(
+                &relative_path,
+                &[model.dirs.client, TRANSFORM_SUBDIR, "operations", file_base],
+                &extension,
             ))
         ));
     }
     output.push_str(&format!(
         "import type {{ ApiError }} from {};\n",
-        render_ts_string(&format!("../../{runtime_directory}/result{extension}"))
+        render_ts_string(&relative_import(
+            &relative_path,
+            &[model.dirs.runtime, "result"],
+            &extension,
+        ))
     ));
     output.push_str(&format!(
         "import type {{ Transport }} from {};\n\n",
-        render_ts_string(&format!("../../{runtime_directory}/transport{extension}"))
+        render_ts_string(&relative_import(
+            &relative_path,
+            &[model.dirs.runtime, "transport"],
+            &extension,
+        ))
     ));
     output.push_str(&body.content);
 
-    let relative_path = format!("tanstack/operations/{file_base}.ts");
     model.register_path(&relative_path, &operation.source);
     Some(GeneratedFile {
         relative_path,
