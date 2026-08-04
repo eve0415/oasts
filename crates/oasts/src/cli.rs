@@ -9,13 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use oasts_core::config::{ResolvedConfig, load_config};
-use oasts_core::diag::{self, Diagnostic, DiagnosticSink};
-use oasts_core::emit::GeneratedFile;
-use oasts_core::msw_peer;
-use oasts_core::pipeline;
-use oasts_core::writer::{DriftState, check_drift, write};
-use oasts_core::zod_peer;
+use oasts_core::diag::{self, Diagnostic};
+use oasts_core::driver::{self, Command as DriverCommand, ConfigSource, Outcome};
 
 const CODE_CURRENT_DIR: &str = "OASTS0001";
 
@@ -118,122 +113,45 @@ fn run_os_with_io(
         }
     };
     match cli.command {
-        Command::Generate { check, config } => {
-            generate(config.as_deref(), check, cwd, stdout, stderr)
+        Command::Generate { check, config } => dispatch(
+            DriverCommand::Generate { check },
+            config.as_deref(),
+            cwd,
+            stdout,
+            stderr,
+        ),
+        Command::Check { config } => {
+            dispatch(DriverCommand::Check, config.as_deref(), cwd, stdout, stderr)
         }
-        Command::Check { config } => check_input(config.as_deref(), cwd, stdout, stderr),
     }
 }
 
-fn generate(
-    config_path: Option<&Path>,
-    check: bool,
-    cwd: &Path,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> u8 {
-    let (config, files, sink) = compile(config_path, cwd, true);
-    if let Err(exit_code) = drain_warnings(sink, stderr) {
-        return exit_code;
-    }
-    let config = config.expect("successful compilation retains its configuration");
-    let files = files.expect("successful emitting compilation returns generated files");
-
-    if check {
-        let report = check_drift(&config.output, files);
-        if !report.diagnostics.is_empty() {
-            return report_diagnostics(report.diagnostics, stderr);
-        }
-        if report.is_clean() {
-            let _ = writeln!(stdout, "check ok");
-            return 0;
-        }
-        for entry in report
-            .entries
-            .iter()
-            .filter(|entry| entry.state != DriftState::Clean)
-        {
-            let _ = writeln!(stderr, "{}: {}", entry.state, entry.relative_path);
-        }
-        return 1;
-    }
-
-    // Only on the write path: `--check` compares bytes for CI, where the consumer's node_modules
-    // is neither inspected nor relevant.
-    if config.artifacts.zod.enabled
-        && let Some(diagnostic) = zod_peer::diagnose(&config.output)
-    {
-        let _ = render_diagnostics(vec![diagnostic], stderr);
-    }
-    if config.artifacts.msw.enabled
-        && let Some(diagnostic) = msw_peer::diagnose(&config.output)
-    {
-        let _ = render_diagnostics(vec![diagnostic], stderr);
-    }
-
-    let generated_count = files.len();
-    match write(&config.output, files) {
-        Ok(_) => {
-            let _ = writeln!(stdout, "generated {generated_count} files");
-            0
-        }
-        Err(diagnostics) => report_diagnostics(diagnostics, stderr),
-    }
-}
-
-fn check_input(
+fn dispatch(
+    command: DriverCommand,
     config_path: Option<&Path>,
     cwd: &Path,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
-    let (_, _, sink) = compile(config_path, cwd, false);
-    if let Err(exit_code) = drain_warnings(sink, stderr) {
-        return exit_code;
+    let outcome = driver::run(
+        command,
+        ConfigSource::Path {
+            explicit: config_path,
+            cwd,
+        },
+    );
+    report(outcome, stdout, stderr)
+}
+
+fn report(outcome: Outcome, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    let _ = render_diagnostics(outcome.diagnostics, stderr);
+    for line in &outcome.drift_lines {
+        let _ = writeln!(stderr, "{line}");
     }
-    let _ = writeln!(stdout, "check ok");
-    0
-}
-
-fn drain_warnings(sink: DiagnosticSink, stderr: &mut dyn Write) -> Result<(), u8> {
-    if sink.has_errors() {
-        return Err(report_sink(sink, stderr));
+    if let Some(summary) = outcome.stdout_summary {
+        let _ = writeln!(stdout, "{summary}");
     }
-    let _ = render_diagnostics(sink.into_sorted_vec(), stderr);
-    Ok(())
-}
-
-fn compile(
-    config_path: Option<&Path>,
-    cwd: &Path,
-    should_emit: bool,
-) -> (
-    Option<ResolvedConfig>,
-    Option<Vec<GeneratedFile>>,
-    DiagnosticSink,
-) {
-    let mut sink = DiagnosticSink::new();
-    let config = match load_config(config_path, cwd) {
-        Ok(config) => config,
-        Err(diagnostics) => {
-            sink.extend(diagnostics);
-            return (None, None, sink);
-        }
-    };
-    let files = pipeline::compile(&config, should_emit, &mut sink);
-    (Some(config), files, sink)
-}
-
-fn report_sink(sink: DiagnosticSink, stderr: &mut dyn Write) -> u8 {
-    let exit_code = sink.worst_exit_code();
-    let _ = render_diagnostics(sink.into_sorted_vec(), stderr);
-    exit_code
-}
-
-fn report_diagnostics(diagnostics: Vec<Diagnostic>, stderr: &mut dyn Write) -> u8 {
-    let mut sink = DiagnosticSink::new();
-    sink.extend(diagnostics);
-    report_sink(sink, stderr)
+    outcome.exit_code
 }
 
 fn render_diagnostics(diagnostics: Vec<Diagnostic>, stderr: &mut dyn Write) -> io::Result<()> {
@@ -776,22 +694,29 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_exit_precedence_and_rendering_are_deterministic() {
-        let diagnostics = vec![
-            Diagnostic::input("OASTS1000", "input")
-                .with_source("workspace/api.yaml")
-                .with_location(4, 2)
-                .with_json_pointer("/paths"),
-            Diagnostic::config("OASTS0031", "config"),
-        ];
+    fn outcome_rendering_is_deterministic() {
+        let outcome = Outcome {
+            exit_code: 2,
+            stdout_summary: Some("check ok".to_owned()),
+            diagnostics: vec![
+                Diagnostic::input("OASTS1000", "input")
+                    .with_source("workspace/api.yaml")
+                    .with_location(4, 2)
+                    .with_json_pointer("/paths"),
+                Diagnostic::config("OASTS0031", "config"),
+            ],
+            drift_lines: vec!["modified: generated/api.ts".to_owned()],
+        };
+        let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let code = report_diagnostics(diagnostics, &mut stderr);
+        let code = report(outcome, &mut stdout, &mut stderr);
 
         assert_eq!(code, 2);
+        assert_eq!(String::from_utf8(stdout).expect("stdout"), "check ok\n");
         assert_eq!(
             String::from_utf8(stderr).expect("stderr"),
-            "error[OASTS0031]: config\nerror[OASTS1000]: input\n  --> workspace/api.yaml:4:2 /paths\n"
+            "error[OASTS0031]: config\nerror[OASTS1000]: input\n  --> workspace/api.yaml:4:2 /paths\nmodified: generated/api.ts\n"
         );
     }
 

@@ -2,6 +2,7 @@ pub mod client_model;
 mod composition;
 pub mod config;
 pub mod diag;
+pub mod driver;
 pub mod emit;
 mod headers;
 pub mod ir;

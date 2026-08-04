@@ -1,6 +1,6 @@
 /**
  * Argument parsing for the Node CLI, mirroring the Rust CLI's command
- * surface plus the Node-only flags (`--spec`, `--locked`).
+ * surface plus the Node-only `--spec`.
  */
 
 import { ok } from "node:assert";
@@ -12,7 +12,6 @@ export interface ParsedArgs {
   config?: string;
   check: boolean;
   specs: string[];
-  locked: boolean;
 }
 
 /** A usage error; rendered to stderr with exit code 2. */
@@ -30,7 +29,6 @@ Options:
   --check            With generate: check committed output without writing
   --spec <name>      Select a workspace spec (workspace configs are
                      unsupported in this build; selecting one fails)
-  --locked           Accepted for CI parity; a no-op without a remote input
 `;
 
 function parseRaw(argv: readonly string[]) {
@@ -42,7 +40,6 @@ function parseRaw(argv: readonly string[]) {
         config: { type: "string" },
         check: { type: "boolean" },
         spec: { type: "string", multiple: true },
-        locked: { type: "boolean" },
       },
     });
   } catch (error) {
@@ -76,7 +73,6 @@ export function parse(argv: readonly string[]): ParsedArgs {
     command,
     check,
     specs: specValues === undefined ? [] : [...specValues],
-    locked: parsed.values.locked === true,
   };
   if (typeof config === "string") {
     result.config = config;

@@ -9,11 +9,8 @@
 
 import { ArgsError, USAGE, parse } from "./args.ts";
 import { loadScriptConfig } from "./config/load.ts";
-import { CliFailure, configFailure, fromNativeError } from "./diagnostics.ts";
-import { discoverConfig, run as nativeRun } from "./native.ts";
-
-/** Core code for unsupported feature blocks (`OASTS0222`), reused for `watch`. */
-const CODE_UNSUPPORTED_FEATURE = "OASTS0222";
+import { CliFailure, fromNativeError } from "./diagnostics.ts";
+import { commandRefusal, discoverConfig, run as nativeRun } from "./native.ts";
 
 /** Byte sinks for CLI output; `process.stdout`/`process.stderr` in the shim. */
 export interface OutputStreams {
@@ -27,11 +24,10 @@ async function dispatch(
   stderr: OutputStreams,
 ): Promise<number> {
   const args = parse(argv);
-  if (args.command === "watch") {
-    throw configFailure(
-      CODE_UNSUPPORTED_FEATURE,
-      "the watch command is not supported in this build",
-    );
+  // Asked before discovery so an unimplemented command never fails on a missing config first.
+  const refusal = commandRefusal(args.command);
+  if (refusal !== null) {
+    throw new CliFailure(refusal.exitCode, refusal.renderedStderr);
   }
 
   let discovered;
@@ -50,7 +46,6 @@ async function dispatch(
     command: args.command,
     check: args.check,
     specs: args.specs,
-    locked: args.locked,
   });
 
   if (result.renderedStderr !== "") {

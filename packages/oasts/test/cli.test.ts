@@ -63,7 +63,7 @@ test("generate and check succeed with a script config", async () => {
   assert.equal(checked.code, 0, checked.stderr);
   assert.equal(checked.stdout, "check ok\n");
 
-  const clean = await invoke(["generate", "--check", "--locked"], directory);
+  const clean = await invoke(["generate", "--check"], directory);
   assert.equal(clean.code, 0, clean.stderr);
   assert.equal(clean.stdout, "check ok\n");
 });

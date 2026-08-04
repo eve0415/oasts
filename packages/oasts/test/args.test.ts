@@ -13,20 +13,18 @@ test("parses generate with every flag", () => {
     "a",
     "--spec",
     "b",
-    "--locked",
   ]);
   assert.deepEqual(args, {
     command: "generate",
     config: "custom.yaml",
     check: true,
     specs: ["a", "b"],
-    locked: true,
   });
 });
 
 test("parses bare commands with defaults", () => {
-  assert.deepEqual(parse(["check"]), { command: "check", check: false, specs: [], locked: false });
-  assert.deepEqual(parse(["watch"]), { command: "watch", check: false, specs: [], locked: false });
+  assert.deepEqual(parse(["check"]), { command: "check", check: false, specs: [] });
+  assert.deepEqual(parse(["watch"]), { command: "watch", check: false, specs: [] });
 });
 
 test("rejects missing, unknown, and duplicated commands", () => {

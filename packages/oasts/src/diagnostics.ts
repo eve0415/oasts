@@ -2,7 +2,8 @@
  * Node-owned diagnostics for the script-config path.
  *
  * These cover only what the Rust core cannot see: evaluating the config
- * module (OASTS0013) and validating its export is plain JSON data (OASTS0014).
+ * module (OASTS0013), validating its export is plain JSON data (OASTS0014),
+ * and a native call that failed without a structured reason (OASTS0001).
  * Rendering matches `oasts_core::diag::render` so both hosts produce one
  * stderr dialect. Everything else renders in Rust and passes through verbatim.
  */

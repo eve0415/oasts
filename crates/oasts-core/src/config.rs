@@ -20,7 +20,7 @@ const CODE_SCHEMA_VERSION: &str = "OASTS0041";
 const CODE_SCHEMA_URI: &str = "OASTS0042";
 const CODE_WORKSPACE_ROOT: &str = "OASTS0051";
 const CODE_SINGLE_SHAPE: &str = "OASTS0061";
-const CODE_WORKSPACE_UNSUPPORTED: &str = "OASTS0062";
+pub(crate) const CODE_WORKSPACE_UNSUPPORTED: &str = "OASTS0062";
 const CODE_INPUT_SHAPE: &str = "OASTS0071";
 const CODE_INPUT_PATH: &str = "OASTS0073";
 const CODE_OUTPUT: &str = "OASTS0081";
@@ -45,7 +45,7 @@ const CODE_BASE_URL: &str = "OASTS0181";
 const CODE_NAMING: &str = "OASTS0201";
 const CODE_EMIT: &str = "OASTS0211";
 const CODE_TRUST_LIMITS: &str = "OASTS0221";
-const CODE_BLOCK_UNSUPPORTED: &str = "OASTS0222";
+pub(crate) const CODE_BLOCK_UNSUPPORTED: &str = "OASTS0222";
 
 const DISCOVERY_NAMES: [&str; 8] = [
     "oasts.config.ts",

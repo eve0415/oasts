@@ -9,12 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use napi_derive::napi;
-use oasts_core::config::{self, ResolvedConfig};
-use oasts_core::diag::{Diagnostic, DiagnosticSink, Severity};
-use oasts_core::msw_peer;
-use oasts_core::pipeline;
-use oasts_core::writer::{DriftState, check_drift, write};
-use oasts_core::zod_peer;
+use oasts_core::config;
+use oasts_core::diag::{Diagnostic, Severity};
+use oasts_core::driver::{self, Command, ConfigSource, Outcome, Unsupported};
 
 /// A config discovery result exposed to the Node CLI.
 #[napi(object)]
@@ -55,14 +52,12 @@ pub struct RunOptions {
     pub config_path: String,
     /// Evaluated script config serialized to JSON; `None` for data configs.
     pub config_json: Option<String>,
-    /// `generate` or `check`.
+    /// The command name the host parsed.
     pub command: String,
     /// Whether `generate` runs in `--check` drift mode.
     pub check: bool,
     /// `--spec` selections; non-empty selections are unsupported locally.
     pub specs: Vec<String>,
-    /// `--locked`; a no-op in the local wedge (remote-only semantics).
-    pub locked: bool,
 }
 
 /// Outcome of one compiler invocation.
@@ -77,8 +72,6 @@ pub struct RunResult {
     /// Structured diagnostics mirroring `rendered_stderr`.
     pub diagnostics: Vec<DiagnosticJs>,
 }
-
-const CODE_WORKSPACE_UNSUPPORTED: &str = "OASTS0062";
 
 fn to_diagnostic_js(diagnostic: &Diagnostic) -> DiagnosticJs {
     DiagnosticJs {
@@ -137,132 +130,61 @@ pub fn discover_config(
     }
 }
 
-fn load(options: &RunOptions) -> Result<ResolvedConfig, Vec<Diagnostic>> {
-    let config_path = Path::new(&options.config_path);
-    match options.config_json.as_deref() {
-        Some(json) => config::load_config_from_json(config_path, json.as_bytes()),
-        None => config::load_config(Some(config_path), Path::new(&options.cwd)),
+fn render(outcome: Outcome) -> RunResult {
+    let mut rendered_stderr = oasts_core::diag::render_to_string(outcome.diagnostics.clone());
+    for line in &outcome.drift_lines {
+        rendered_stderr.push_str(line);
+        rendered_stderr.push('\n');
+    }
+    RunResult {
+        exit_code: u32::from(outcome.exit_code),
+        stdout_summary: outcome.stdout_summary,
+        rendered_stderr,
+        diagnostics: outcome.diagnostics.iter().map(to_diagnostic_js).collect(),
     }
 }
 
-fn failure(sink: DiagnosticSink) -> RunResult {
-    let exit_code = u32::from(sink.worst_exit_code());
-    let diagnostics = sink.into_sorted_vec();
-    RunResult {
-        exit_code,
-        stdout_summary: None,
-        rendered_stderr: oasts_core::diag::render_to_string(diagnostics.clone()),
-        diagnostics: diagnostics.iter().map(to_diagnostic_js).collect(),
+fn parse_command(name: &str, check: bool) -> Result<Command, Outcome> {
+    match name {
+        "generate" => Ok(Command::Generate { check }),
+        "check" => Ok(Command::Check),
+        other => Err(driver::refuse(Unsupported::Command(other))),
     }
+}
+
+/// Refusal for a declared command this build does not implement, else `None`.
+///
+/// The Node CLI asks before discovering a config, so an unimplemented command
+/// never fails on a missing config file first. Answering here keeps every
+/// `OASTS` code in the core.
+#[napi]
+pub fn command_refusal(command: String) -> Option<RunResult> {
+    parse_command(&command, false).err().map(render)
 }
 
 /// Runs `generate` or `check` for one already-discovered config.
-///
-/// The `locked` flag is accepted and ignored: `--locked` has remote-only
-/// semantics and the local wedge treats it as a no-op success.
 #[napi]
 pub fn run(options: RunOptions) -> RunResult {
-    let mut sink = DiagnosticSink::new();
-    let config = match load(&options) {
-        Ok(config) => config,
-        Err(diagnostics) => {
-            sink.extend(diagnostics);
-            return failure(sink);
-        }
-    };
     if !options.specs.is_empty() {
-        sink.push(Diagnostic::config(
-            CODE_WORKSPACE_UNSUPPORTED,
-            "--spec selects a workspace spec, and workspace configuration is not supported in this build",
-        ));
-        return failure(sink);
+        return render(driver::refuse(Unsupported::SpecSelection));
     }
 
-    let should_emit = options.command == "generate";
-    let files = pipeline::compile(&config, should_emit, &mut sink);
-    if sink.has_errors() {
-        return failure(sink);
-    }
-    let warnings = sink.into_sorted_vec();
-    let mut rendered_warnings = oasts_core::diag::render_to_string(warnings.clone());
-    let mut diagnostics_js = warnings.iter().map(to_diagnostic_js).collect::<Vec<_>>();
-
-    if !should_emit {
-        return RunResult {
-            exit_code: 0,
-            stdout_summary: Some("check ok".to_owned()),
-            rendered_stderr: rendered_warnings,
-            diagnostics: diagnostics_js,
-        };
-    }
-
-    let files = files.expect("successful emitting compilation returns generated files");
-    if options.check {
-        let report = check_drift(&config.output, files);
-        if !report.diagnostics.is_empty() {
-            let mut drift_sink = DiagnosticSink::new();
-            drift_sink.extend(warnings);
-            drift_sink.extend(report.diagnostics);
-            return failure(drift_sink);
-        }
-        if report.is_clean() {
-            return RunResult {
-                exit_code: 0,
-                stdout_summary: Some("check ok".to_owned()),
-                rendered_stderr: rendered_warnings,
-                diagnostics: diagnostics_js,
-            };
-        }
-        let mut drift_lines = rendered_warnings;
-        for entry in report
-            .entries
-            .iter()
-            .filter(|entry| entry.state != DriftState::Clean)
-        {
-            drift_lines.push_str(&format!("{}: {}\n", entry.state, entry.relative_path));
-        }
-        return RunResult {
-            exit_code: 1,
-            stdout_summary: None,
-            rendered_stderr: drift_lines,
-            diagnostics: diagnostics_js,
-        };
-    }
-
-    // Only on the write path: `--check` compares bytes for CI, where the consumer's node_modules
-    // is neither inspected nor relevant.
-    if config.artifacts.zod.enabled
-        && let Some(diagnostic) = zod_peer::diagnose(&config.output)
-    {
-        rendered_warnings.push_str(&oasts_core::diag::render_to_string(vec![
-            diagnostic.clone(),
-        ]));
-        diagnostics_js.push(to_diagnostic_js(&diagnostic));
-    }
-    if config.artifacts.msw.enabled
-        && let Some(diagnostic) = msw_peer::diagnose(&config.output)
-    {
-        rendered_warnings.push_str(&oasts_core::diag::render_to_string(vec![
-            diagnostic.clone(),
-        ]));
-        diagnostics_js.push(to_diagnostic_js(&diagnostic));
-    }
-
-    let generated_count = files.len();
-    match write(&config.output, files) {
-        Ok(_) => RunResult {
-            exit_code: 0,
-            stdout_summary: Some(format!("generated {generated_count} files")),
-            rendered_stderr: rendered_warnings,
-            diagnostics: diagnostics_js,
+    let command = match parse_command(&options.command, options.check) {
+        Ok(command) => command,
+        Err(refusal) => return render(refusal),
+    };
+    let config_path = Path::new(&options.config_path);
+    let source = match options.config_json.as_deref() {
+        Some(json) => ConfigSource::Json {
+            config_path,
+            json: json.as_bytes(),
         },
-        Err(diagnostics) => {
-            let mut write_sink = DiagnosticSink::new();
-            write_sink.extend(warnings);
-            write_sink.extend(diagnostics);
-            failure(write_sink)
-        }
-    }
+        None => ConfigSource::Path {
+            explicit: Some(config_path),
+            cwd: Path::new(&options.cwd),
+        },
+    };
+    render(driver::run(command, source))
 }
 
 #[cfg(test)]
@@ -294,7 +216,6 @@ mod tests {
             command: command.to_owned(),
             check,
             specs: Vec::new(),
-            locked: false,
         }
     }
 
@@ -389,8 +310,6 @@ mod tests {
             r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated"}"#
                 .to_owned(),
         );
-        options.locked = true;
-
         let result = run(options);
         assert_eq!(result.exit_code, 0, "{}", result.rendered_stderr);
         assert!(result.rendered_stderr.contains("warning[OASTS1304]"));
@@ -451,6 +370,23 @@ mod tests {
     }
 
     #[test]
+    fn command_refusal_names_only_unimplemented_commands() {
+        assert!(command_refusal("generate".to_owned()).is_none());
+        assert!(command_refusal("check".to_owned()).is_none());
+
+        let refusal = command_refusal("watch".to_owned()).expect("watch is unimplemented");
+        assert_eq!(refusal.exit_code, 2);
+        assert_eq!(refusal.diagnostics[0].code, "OASTS0222");
+        assert!(
+            refusal
+                .rendered_stderr
+                .contains("the watch command is not supported in this build"),
+            "{}",
+            refusal.rendered_stderr
+        );
+    }
+
+    #[test]
     fn diagnostic_conversion_preserves_location_fields() {
         let diagnostic = Diagnostic::config("OASTS0001", "message")
             .with_source("config.yaml")
@@ -501,6 +437,31 @@ mod tests {
             generated.rendered_stderr
         );
         assert!(generated.rendered_stderr.contains("^4.4.0"));
+    }
+
+    #[test]
+    fn run_keeps_the_zod_peer_warning_when_the_write_fails() {
+        let temp = project_with_outdated_zod();
+        assert_eq!(run(options(&temp, "generate", false)).exit_code, 0);
+        fs::write(
+            temp.path().join("generated/.oasts-manifest.json"),
+            r#"{"manifestVersion":2,"files":[]}"#,
+        )
+        .expect("unsupported manifest");
+
+        let failed = run(options(&temp, "generate", false));
+
+        assert_eq!(failed.exit_code, 2, "{}", failed.rendered_stderr);
+        for code in ["OASTS0231", "OASTS0241"] {
+            assert!(
+                failed
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code),
+                "{code} missing from {}",
+                failed.rendered_stderr
+            );
+        }
     }
 
     #[test]
