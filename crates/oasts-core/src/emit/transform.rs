@@ -208,13 +208,19 @@ fn collect_index_signature_refusals(
     // worth rendering.
     let mut signatures = Vec::new();
     for pattern in &meta.validation_applicators().pattern_properties {
-        if let Some(key) = pattern.type_key.as_ref() {
+        let converts = facts.reaches(&pattern.schema);
+        // A pattern the types emitter could not turn into a key type is one no emitted test can
+        // select either, so it is entered with the key space of `additionalProperties` — every key.
+        // It earns a place here only when it does *not* convert: something else's conversion would
+        // then reach the keys this pattern governs, and the check below is what catches that. One
+        // that converts selects nothing and is left as it was.
+        if pattern.type_key.is_some() || !converts {
             signatures.push(IndexSignature {
-                key: Some(key),
+                key: pattern.type_key.as_ref(),
                 label: format!("pattern property '{}'", pattern.pattern),
                 schema: &pattern.schema,
                 rendered: String::new(),
-                converts: facts.reaches(&pattern.schema),
+                converts,
             });
         }
     }
@@ -1250,7 +1256,13 @@ struct ObjectParts {
     /// A conversion replacing the whole value, when the schema is an open map rather than a set of
     /// declared properties. Mutually exclusive with `parts` by construction.
     whole: Option<String>,
+    /// Conversions that rebuild the whole value — a `$ref` branch's own pair call, which spreads
+    /// every key back whether it converted it or not.
     bases: Vec<String>,
+    /// Conversions that write only the keys they convert. They spread *after* every base, because a
+    /// base rewrites keys it does not own and would otherwise revert them; these never do, so
+    /// nothing they write can be reverted in turn.
+    passes: Vec<String>,
     parts: Vec<String>,
     omitted: Vec<String>,
     /// Property names that already contributed a part. Two `allOf` branches may constrain the same
@@ -1266,7 +1278,7 @@ impl ObjectParts {
         if let Some(whole) = self.whole {
             return Some(whole);
         }
-        if self.parts.is_empty() && self.bases.is_empty() {
+        if self.parts.is_empty() && self.bases.is_empty() && self.passes.is_empty() {
             return None;
         }
         // Broken across lines rather than joined: a real schema converts several properties, and a
@@ -1280,6 +1292,7 @@ impl ObjectParts {
         }
         let mut spreads = vec![format!("...{base}")];
         spreads.extend(self.bases.iter().map(|base| format!("...{base}")));
+        spreads.extend(self.passes.iter().map(|pass| format!("...{pass}")));
         spreads.extend(self.parts);
         Some(format!(
             "{{\n{inner}{},\n{closing}}}",
@@ -1771,7 +1784,7 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
         if selection.is_empty() {
             object.whole = Some(pass);
         } else {
-            object.bases.push(pass);
+            object.passes.push(pass);
         }
     }
 
@@ -3197,6 +3210,75 @@ mod pair_tests {
             );
         }
         assert!(!content.contains(": entry0"), "{content}");
+    }
+
+    #[test]
+    fn a_key_selected_pass_spreads_after_the_branch_that_rebuilds_the_value() {
+        // A `$ref` branch's pair call spreads every key back, converted or not, so it would revert
+        // a pass that ran before it. A pass writes only what it converts, so ordering it last is
+        // the only order in which both survive.
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Base": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": { "at": { "type": "string", "format": "date-time" } }
+                },
+                "Notice": {
+                    "allOf": [
+                        {
+                            "type": "object",
+                            "patternProperties": {
+                                "^x-": { "type": "string", "format": "date-time" }
+                            }
+                        },
+                        { "$ref": "#/components/schemas/Base" }
+                    ]
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        let base = content
+            .find("...decodeBase(value, path)")
+            .expect("the ref base");
+        let pass = content
+            .find("...Object.fromEntries")
+            .expect("the key-selected pass");
+        assert!(base < pass, "the pass must spread last: {content}");
+    }
+
+    #[test]
+    fn a_pattern_no_test_can_select_is_refused_when_something_else_converts_its_keys() {
+        // The parser gives a pattern beside an index signature no key type, so no emitted test can
+        // hold its keys back from the index signature's own conversion — which would convert a
+        // value the document says is a plain string, and throw on it.
+        let (_files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": { "at": { "type": "string", "format": "date-time" } },
+                    "patternProperties": { "^x-": { "type": "string" } },
+                    "additionalProperties": { "type": "string", "format": "date-time" }
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        let messages = unconvertible_messages(&diagnostics);
+        assert_eq!(messages.len(), 1, "{diagnostics:#?}");
+        assert!(
+            messages[0].contains("pattern property '^x-' types the keys it shares with"),
+            "{messages:?}"
+        );
     }
 
     #[test]
