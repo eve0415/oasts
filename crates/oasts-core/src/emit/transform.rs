@@ -30,19 +30,19 @@ use crate::client_model::{
 };
 use crate::diag::Diagnostic;
 use crate::ir::{
-    AdditionalProperties, Discriminator, Operation, ParamLocation, PrimitiveType, PropMeta,
-    ResponseEntry, SchemaMeta, SchemaNode, SourceRef, TupleRest,
+    AdditionalProperties, Discriminator, Operation, ParamLocation, PatternProperty,
+    PatternPropertyKey, PrimitiveType, PropMeta, SchemaMeta, SchemaNode, SourceRef, TupleRest,
 };
-use crate::media::{is_json, is_xml, media_essence};
 use crate::transform::{JsonKinds, KindBranch, TransformFacts, TransformKind, UnionDispatch};
 
+use super::client::ResponseConversion;
 use super::model::EmissionModel;
 use super::paths::{TRANSFORM_SUBDIR, relative_import};
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
     CODE_TRANSFORM_UNION, CODE_UNCONVERTIBLE_TRANSFORM, Emitter, GeneratedFile, SchemaChildMode,
-    TypePosition, import_extension, operation_response_declarations, property_in_position,
-    render_literal_key, render_property_key, render_ts_string, source_diagnostic, uppercase_first,
+    TypeAxis, TypePosition, import_extension, property_in_position, render_literal_key,
+    render_property_key, render_ts_string, source_diagnostic, uppercase_first,
 };
 
 /// Emitted as `client/transform/runtime.ts`; the generated-transform call ABI is fixed to it.
@@ -151,45 +151,7 @@ fn collect_union_refusals(
     if let Some(Err(diagnostic)) = resolve_dispatch(emitter, facts, node) {
         out.push(diagnostic);
     }
-    // A converting index signature is emitted as one pass over `Object.entries`, which cannot also
-    // carry per-property conversions — so an object declaring both would convert its declared
-    // properties and silently leave every undeclared key a wire string behind an index signature
-    // that says otherwise.
-    // `Schema` alone, not `Allowed(Some(_))`: the parser only ever pairs a schema with the latter
-    // synthetically, never from a document — `parse::tests` says so where it covers that arm by
-    // building the node directly.
-    if let SchemaNode::Object {
-        properties,
-        additional_properties: AdditionalProperties::Schema(additional),
-        meta,
-        ..
-    } = node
-        && !properties.is_empty()
-        && facts.reaches(additional)
-    {
-        out.push(source_diagnostic(
-            CODE_UNCONVERTIBLE_TRANSFORM,
-            "an index signature that applies a date/time transform cannot be converted alongside declared properties; drop the declared properties, drop the index signature, or set the representation back to string",
-            &meta.source,
-        ));
-    }
-    // A pattern property renders an index signature in the declared type but has no conversion: the
-    // codecs walk declared properties and one index signature, and no emitted shape dispatches on a
-    // key pattern. Converting nothing behind a type that says `Date` is the failure this refuses.
-    if let SchemaNode::Object { meta, .. } = node {
-        for pattern in &meta.validation_applicators().pattern_properties {
-            if pattern.type_key.is_some() && facts.reaches(&pattern.schema) {
-                out.push(source_diagnostic(
-                    CODE_UNCONVERTIBLE_TRANSFORM,
-                    format!(
-                        "pattern property '{}' applies a date/time transform to an index signature no codec converts; drop the pattern property, or set the representation back to string",
-                        pattern.pattern
-                    ),
-                    &meta.source,
-                ));
-            }
-        }
-    }
+    collect_index_signature_refusals(emitter, facts, node, out);
     // The types emitter's own child walk, so this never becomes a second answer to "what is nested
     // inside this schema". `Validation` mode visits every child regardless of read/writeOnly
     // position, which is what a refusal must consider: the union is refused wherever it appears.
@@ -198,10 +160,157 @@ fn collect_union_refusals(
     });
 }
 
+/// One index signature the emitted object type carries — from `additionalProperties`, or from a
+/// pattern property the types emitter could express as a template-literal key.
+struct IndexSignature<'schema> {
+    /// The keys it types. `None` is `additionalProperties`, whose emitted `[key: string]` types
+    /// every key regardless of which ones JSON Schema hands it.
+    key: Option<&'schema PatternPropertyKey>,
+    /// How the message names it.
+    label: String,
+    schema: &'schema SchemaNode,
+    /// The type it gives the keys it covers, rendered only once some signature here converts.
+    rendered: String,
+    converts: bool,
+}
+
+/// Refuses the objects whose index signatures promise something one pass over their keys cannot
+/// deliver.
+///
+/// A converting index signature *is* convertible beside declared properties and beside other index
+/// signatures: the entries pass skips the declared keys and tests the rest. What it cannot do is
+/// make disagreeing types agree. The emitted declaration is an intersection of the object literal
+/// and every index signature, so a value has to satisfy all of them at once — and wherever two of
+/// them can type the same key differently, no conversion produces a value that does. Those
+/// documents declare a type nothing inhabits; refusing here keeps the emitted codec from being
+/// where TypeScript says so.
+///
+/// Two converting patterns that can match one key are refused for the other reason: JSON Schema
+/// applies both, one pass can apply only one, and picking silently is the failure this exists to
+/// prevent.
+fn collect_index_signature_refusals(
+    emitter: &Emitter<'_, '_, '_>,
+    facts: &TransformFacts<'_>,
+    node: &SchemaNode,
+    out: &mut Vec<Diagnostic>,
+) {
+    let SchemaNode::Object {
+        properties,
+        additional_properties,
+        meta,
+        ..
+    } = node
+    else {
+        return;
+    };
+    // Collected before anything is rendered: rendering a type is a full recursive walk, and an
+    // object whose index signatures all keep their wire form has nothing to refuse and so nothing
+    // worth rendering.
+    let mut signatures = Vec::new();
+    for pattern in &meta.validation_applicators().pattern_properties {
+        if let Some(key) = pattern.type_key.as_ref() {
+            signatures.push(IndexSignature {
+                key: Some(key),
+                label: format!("pattern property '{}'", pattern.pattern),
+                schema: &pattern.schema,
+                rendered: String::new(),
+                converts: facts.reaches(&pattern.schema),
+            });
+        }
+    }
+    // `Schema` alone, not `Allowed(Some(_))`: the parser only ever pairs a schema with the latter
+    // synthetically, never from a document — `parse::tests` says so where it covers that arm by
+    // building the node directly.
+    if let AdditionalProperties::Schema(additional) = additional_properties {
+        signatures.push(IndexSignature {
+            key: None,
+            label: "the index signature".to_owned(),
+            schema: additional,
+            rendered: String::new(),
+            converts: facts.reaches(additional),
+        });
+    }
+    if !signatures.iter().any(|signature| signature.converts) {
+        return;
+    }
+    let render = |schema: &SchemaNode| {
+        emitter.render_type(schema, TypePosition::Neutral, TypeAxis::Application, 0)
+    };
+    for signature in &mut signatures {
+        signature.rendered = render(signature.schema);
+    }
+    let mut refuse = |message: String| {
+        out.push(source_diagnostic(
+            CODE_UNCONVERTIBLE_TRANSFORM,
+            message,
+            &meta.source,
+        ));
+    };
+    for (index, signature) in signatures.iter().enumerate() {
+        for other in &signatures[index + 1..] {
+            if !keys_overlap(signature.key, other.key) || (!signature.converts && !other.converts) {
+                continue;
+            }
+            if signature.converts && other.converts {
+                refuse(format!(
+                    "{} and {} both apply a date/time transform to keys they can both match, and one pass over those keys can apply only one; make their patterns disjoint, or set the representation back to string",
+                    signature.label, other.label
+                ));
+            } else if signature.rendered != other.rendered {
+                refuse(format!(
+                    "{} types the keys it shares with {} as '{}' while that one types them as '{}', and a date/time transform is bound to one of them; give them the same type, or set the representation back to string",
+                    signature.label, other.label, signature.rendered, other.rendered
+                ));
+            }
+        }
+    }
+    // Every declared property, not only the ones the position keeps. This walk has no position —
+    // it visits each schema once, wherever it appears — and erring the other way would let a
+    // property that *is* declared in some position through, which emits a codec whose object
+    // literal TypeScript rejects. A `readOnly` property refused for the request surface it is
+    // absent from is the cost of that.
+    for signature in signatures.iter().filter(|signature| signature.converts) {
+        for (name, schema, _) in properties {
+            if key_matches(signature.key, name) && render(schema) != signature.rendered {
+                refuse(format!(
+                    "property '{name}' is typed '{}' while {} applies a date/time transform typing that same key '{}'; give it that type, drop it from the pattern's keys, or set the representation back to string",
+                    render(schema),
+                    signature.label,
+                    signature.rendered
+                ));
+            }
+        }
+    }
+}
+
+/// Whether two index signatures can type one key. `None` is `additionalProperties`, whose emitted
+/// key type is `string` and so overlaps everything.
+///
+/// Two prefixes overlap only when one extends the other; every other pair of forms admits a key
+/// built by concatenation — `x-` and `-at` share `x--at`.
+fn keys_overlap(left: Option<&PatternPropertyKey>, right: Option<&PatternPropertyKey>) -> bool {
+    match (left, right) {
+        (Some(PatternPropertyKey::Prefix(left)), Some(PatternPropertyKey::Prefix(right))) => {
+            left.starts_with(right.as_str()) || right.starts_with(left.as_str())
+        }
+        _ => true,
+    }
+}
+
+/// Whether one index signature types the key a declared property occupies — the same test the
+/// emitted template-literal key performs.
+fn key_matches(key: Option<&PatternPropertyKey>, name: &str) -> bool {
+    match key {
+        None | Some(PatternPropertyKey::All) => true,
+        Some(PatternPropertyKey::Prefix(prefix)) => name.starts_with(prefix.as_str()),
+        Some(PatternPropertyKey::Contains(infix)) => name.contains(infix.as_str()),
+    }
+}
+
 /// Refuses every position that reaches a transform the client pipeline cannot carry.
 ///
 /// The emitted codecs convert one payload per position, keyed on the type that position declares.
-/// Inline-rendered response payloads and non-literal request discriminants declare shapes the
+/// A decoded multipart response payload and a non-literal request discriminant declare shapes the
 /// operation codecs cannot carry. They are refused here because emitting nothing for them would put
 /// a wire string behind a type that promises a `Date`.
 fn unconvertible_transform_diagnostics(
@@ -211,22 +320,15 @@ fn unconvertible_transform_diagnostics(
 ) {
     body_transform_refusals(model, plan.body_plan.as_ref(), diagnostics);
     for response in &plan.response_table {
-        if !matches!(response.payload, PayloadDisposition::Payload)
-            || !super::client::renders_payload_inline(response)
-        {
+        if !matches!(response.payload, PayloadDisposition::Payload) {
             continue;
         }
         for entry in &response.media {
-            if inline_response_entry_transforms(model, entry) {
-                let mismatch = if response.content_type_discriminated {
-                    "its inline payload is narrowed by contentType on the result while the response converter passes only data or error to the status-wide codec"
-                } else {
-                    "its decoded multipart object is rendered inline while the response converter accepts the status-wide media alias"
-                };
+            if multipart_response_entry_transforms(model, entry) {
                 diagnostics.push(source_diagnostic(
                     CODE_UNCONVERTIBLE_TRANSFORM,
                     format!(
-                        "response '{}' entry '{}' applies a date/time transform, but {mismatch}; set the representation back to string",
+                        "response '{}' entry '{}' applies a date/time transform, but its payload is the object its parts decode to rather than the shape its schema renders, and no emitted codec converts that object; set the representation back to string",
                         response.match_key, entry.media,
                     ),
                     &entry.source,
@@ -236,16 +338,19 @@ fn unconvertible_transform_diagnostics(
     }
 }
 
-/// Whether an inline-rendered response entry actually exposes a transformed application value.
-/// Text and binary entries ignore their schemas when rendering, and multipart binary parts render
-/// `Uint8Array`; none of those positions can put a wire string behind a `Date` type.
-fn inline_response_entry_transforms(
+/// Whether a multipart-decoded response entry exposes a transformed application value.
+///
+/// Only multipart entries reach a refusal now: every other payload is converted by a codec keyed on
+/// what it declares — the status-wide alias, or the entry's own pair when the branch narrows by
+/// `contentType`. A multipart payload is the object its parts decode to, which is not what any
+/// schema renders, so no pair names it. Binary parts render `Uint8Array` and never reach their
+/// schema, so they cannot put a wire string behind a `Date` either.
+fn multipart_response_entry_transforms(
     model: &EmissionModel<'_, '_>,
     entry: &ResponseMediaPlan,
 ) -> bool {
     let Some(multipart) = &entry.multipart else {
-        return is_json(media_essence(&entry.media))
-            && model.transform_facts().reaches(&entry.schema);
+        return false;
     };
     multipart
         .parts
@@ -605,6 +710,81 @@ fn emit_component_pairs(
     })
 }
 
+/// Which module declares the payload pair one codec converts between.
+enum PayloadModule {
+    /// The types artifact's operation module, which names the status-wide response alias.
+    Types,
+    /// The client's own operation module, which names each discriminated entry's payload — the same
+    /// place the request surface's `{Stem}Input` pair is declared.
+    Client,
+}
+
+/// One emitted response decoder: the payload pair it converts between, the schema it converts, and
+/// where that pair is declared.
+struct ResponseCodec {
+    application: String,
+    schema: SchemaNode,
+    source: SourceRef,
+    declared_by: PayloadModule,
+}
+
+/// The decoders one operation emits, in the order the types module declares its responses.
+///
+/// The client decides *what* converts — this reads that answer rather than restating it, so the
+/// codec this emits and the call the client emits cannot disagree about which branches convert or
+/// what their payloads are named.
+fn response_codecs(
+    emitter: &Emitter<'_, '_, '_>,
+    plan: &OperationPlan,
+    stem: &str,
+) -> Vec<ResponseCodec> {
+    let conversions = super::client::response_conversions(emitter.model, plan, stem);
+    // Sorted by the alias the types module declares, which is the order that module writes its
+    // responses in. Taken from the plan rather than joined against the types module's own list:
+    // both render the same name from the same status, and reconciling two spellings by string
+    // equality would drop a codec silently if either ever moved.
+    let mut branches = plan
+        .response_table
+        .iter()
+        .zip(&conversions)
+        .map(|(response, conversion)| {
+            (
+                super::client::response_type_name(stem, response),
+                response,
+                conversion,
+            )
+        })
+        .collect::<Vec<_>>();
+    branches.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut codecs = Vec::new();
+    for (application, response, conversion) in branches {
+        match conversion {
+            ResponseConversion::None => {}
+            // The alias names the branch's whole payload, which is the one entry it declares — the
+            // source stays the response's own, because that is the position the alias is declared
+            // at and the pointer a failed decode reports.
+            ResponseConversion::Whole(entry) => codecs.push(ResponseCodec {
+                schema: response.media[*entry].schema.clone(),
+                source: response.source.clone(),
+                application,
+                declared_by: PayloadModule::Types,
+            }),
+            ResponseConversion::PerEntry(entries) => {
+                for (index, name) in entries {
+                    let entry = &response.media[*index];
+                    codecs.push(ResponseCodec {
+                        application: name.clone(),
+                        schema: entry.schema.clone(),
+                        source: entry.source.clone(),
+                        declared_by: PayloadModule::Client,
+                    });
+                }
+            }
+        }
+    }
+    codecs
+}
+
 /// The request encoder and response decoders for one operation, or `None` when every position is
 /// identity. Names and ordering mirror the operation types module exactly.
 fn emit_operation_pairs(
@@ -616,15 +796,15 @@ fn emit_operation_pairs(
 ) -> Option<GeneratedFile> {
     let stem = uppercase_first(allocated_name);
     let request_transforms = super::client::request_transform_binding(emitter.model, plan);
-    let responses = operation_response_declarations(operation, &stem)
-        .into_iter()
-        .filter(|(_, response)| emitter.response_transforms(response))
-        .collect::<Vec<_>>();
+    let responses = response_codecs(emitter, plan, &stem);
     if !request_transforms && responses.is_empty() {
         return None;
     }
 
     let mut type_imports = BTreeSet::new();
+    // Payload names the client's own operation module declares: the request surface's pair, and
+    // every per-entry response pair a discriminated branch narrows to.
+    let mut client_imports = BTreeSet::new();
     let mut pair_imports = BTreeMap::new();
     let mut helpers = BTreeSet::new();
     let mut pointers = Vec::new();
@@ -637,10 +817,10 @@ fn emit_operation_pairs(
         declared.insert(format!("{stem}InputWire"));
         declared.insert(format!("encode{stem}Input"));
     }
-    for (application, _) in &responses {
-        declared.insert(application.clone());
-        declared.insert(format!("{application}Wire"));
-        declared.insert(format!("decode{application}"));
+    for codec in &responses {
+        declared.insert(codec.application.clone());
+        declared.insert(format!("{}Wire", codec.application));
+        declared.insert(format!("decode{}", codec.application));
     }
     let module_imports = transform_module_imports();
     for allocated in &emitter.model.analyzed.schema_names {
@@ -684,11 +864,20 @@ fn emit_operation_pairs(
         ));
     }
 
-    for (application, response) in responses {
+    for codec in responses {
+        let ResponseCodec {
+            application,
+            schema,
+            source,
+            declared_by,
+        } = codec;
         let wire = format!("{application}Wire");
-        type_imports.insert(application.clone());
-        type_imports.insert(wire.clone());
-        let schema = operation_response_schema(response);
+        let names = match declared_by {
+            PayloadModule::Types => &mut type_imports,
+            PayloadModule::Client => &mut client_imports,
+        };
+        names.insert(application.clone());
+        names.insert(wire.clone());
         let mut builder = PairBuilder::new(emitter, TypePosition::Response, &aliases);
         builder.pointers = pointers;
         builder.helpers = helpers;
@@ -702,7 +891,7 @@ fn emit_operation_pairs(
             Direction::Decode,
             &mut pointers,
             &mut helpers,
-            &response.source,
+            &source,
         );
         bodies.push_str(&format!(
             "\nexport function decode{application}(value: {wire}, path: {path_type} = []): {application} {{\n  return {body};\n}}\n"
@@ -728,8 +917,13 @@ fn emit_operation_pairs(
         ));
     }
     if request_transforms {
+        client_imports.insert(format!("{stem}Input"));
+        client_imports.insert(format!("{stem}InputWire"));
+    }
+    if !client_imports.is_empty() {
         content.push_str(&format!(
-            "import type {{ {stem}Input, {stem}InputWire }} from \"../../operations/{file_base}{extension}\";\n"
+            "import type {{ {} }} from \"../../operations/{file_base}{extension}\";\n",
+            client_imports.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
     content.push_str(&format!(
@@ -942,39 +1136,6 @@ fn string_schema(source: SourceRef, const_value: Option<serde_json::Value>) -> S
     }
 }
 
-/// The media union represented by one response declaration in the types module.
-fn operation_response_schema(response: &ResponseEntry) -> SchemaNode {
-    let mut branches = response
-        .media_types
-        .iter()
-        .map(|media_type| {
-            if is_json(&media_type.essence) {
-                media_type.schema.clone()
-            } else if media_type.essence.starts_with("text/") && !is_xml(&media_type.essence) {
-                SchemaNode::Primitive {
-                    ty: PrimitiveType::String,
-                    format: None,
-                    enum_values: None,
-                    const_value: None,
-                    meta: operation_schema_meta(media_type.schema.meta().source.clone()),
-                }
-            } else {
-                SchemaNode::Any {
-                    meta: operation_schema_meta(media_type.schema.meta().source.clone()),
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    if branches.len() == 1 {
-        return branches.pop().expect("one response media branch");
-    }
-    SchemaNode::AnyOf {
-        branches,
-        discriminator: None,
-        meta: operation_schema_meta(response.source.clone()),
-    }
-}
-
 fn object_schema(properties: Vec<(String, SchemaNode, PropMeta)>, source: SourceRef) -> SchemaNode {
     SchemaNode::Object {
         properties,
@@ -1127,6 +1288,47 @@ impl ObjectParts {
     }
 }
 
+/// The test that selects one pattern property's conversion for a key, or `None` when the pattern
+/// renders no index signature — then the declared type promises nothing for those keys and there is
+/// nothing for a conversion to deliver.
+///
+/// The three forms are the three the types emitter can express as a template-literal key, and each
+/// maps to the string test that accepts exactly the keys that key type accepts. There is no regex
+/// here for the same reason there is none in the emitted type: a pattern outside these forms has no
+/// key type, so it never reaches this.
+fn pattern_key_test(pattern: &PatternProperty, key: &str) -> Option<KeyTest> {
+    match pattern.type_key.as_ref()? {
+        PatternPropertyKey::All => Some(KeyTest::Every),
+        PatternPropertyKey::Prefix(prefix) => Some(KeyTest::When(format!(
+            "{key}.startsWith({})",
+            render_ts_string(prefix)
+        ))),
+        PatternPropertyKey::Contains(infix) => Some(KeyTest::When(format!(
+            "{key}.includes({})",
+            render_ts_string(infix)
+        ))),
+    }
+}
+
+/// Which keys one index signature's conversion claims.
+enum KeyTest {
+    /// Every key, so its conversion needs no test and leaves none unconverted.
+    Every,
+    /// The keys the expression accepts.
+    When(String),
+}
+
+/// The four things every part of one object conversion reads: which direction it converts, the
+/// expression the value is read from, the expression its source path is built from, and its frame.
+/// They are always the same four for every part of one object, so they travel as one.
+#[derive(Clone, Copy)]
+struct ObjectSite<'a> {
+    direction: Direction,
+    value: &'a str,
+    path: &'a str,
+    frame: Frame,
+}
+
 /// Where one conversion sits: the callback-variable depth, so a nested `.map` callback never shadows
 /// its parent's binding, and the indent its object literals break at.
 #[derive(Clone, Copy)]
@@ -1265,10 +1467,12 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             SchemaNode::Object {
                 properties,
                 additional_properties,
+                meta,
                 ..
             } => self.convert_object(
                 properties,
                 additional_properties,
+                &meta.validation_applicators().pattern_properties,
                 direction,
                 value,
                 path,
@@ -1292,7 +1496,14 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             } => self.convert_tuple(prefix_items, rest, direction, value, path, frame),
             SchemaNode::AllOf { branches, .. } => {
                 let mut object = ObjectParts::default();
-                self.collect_parts(branches, direction, value, path, frame, &mut object);
+                let declared = self.declared_names_across(branches);
+                let site = ObjectSite {
+                    direction,
+                    value,
+                    path,
+                    frame,
+                };
+                self.collect_parts(branches, &declared, site, &mut object);
                 object.render(value, frame)
             }
             SchemaNode::OneOf { .. } | SchemaNode::AnyOf { .. } => {
@@ -1306,26 +1517,73 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the three things an object declares about its keys, plus where the conversion sits"
+    )]
     fn convert_object(
         &mut self,
         properties: &[(String, SchemaNode, PropMeta)],
         additional_properties: &AdditionalProperties,
+        patterns: &[PatternProperty],
         direction: Direction,
         value: &str,
         path: &str,
         frame: Frame,
     ) -> Option<String> {
         let mut object = ObjectParts::default();
-        self.collect_object_parts(
-            properties,
-            additional_properties,
+        let declared = self.declared_names(properties);
+        let site = ObjectSite {
             direction,
             value,
             path,
             frame,
+        };
+        self.collect_object_parts(
+            properties,
+            additional_properties,
+            patterns,
+            &declared,
+            site,
             &mut object,
         );
         object.render(value, frame)
+    }
+
+    /// The property names an object declares in the position being rendered, in declaration order.
+    ///
+    /// This is the key set an index signature does *not* cover: the emitted type gives each of these
+    /// its own member, so each is converted by its own property conversion and the entries pass has
+    /// to skip it. A property outside the position is not declared in the rendered type at all, so
+    /// the index signature does cover it and it is not in this set.
+    fn declared_names(&self, properties: &[(String, SchemaNode, PropMeta)]) -> Vec<String> {
+        properties
+            .iter()
+            .filter(|(_, _, meta)| property_in_position(meta, self.position))
+            .map(|(name, _, _)| name.clone())
+            .collect()
+    }
+
+    /// Every name the branches of one `allOf` declare, so each branch's index signature skips the
+    /// keys any other branch gave a member of its own. The merged type declares them all, and the
+    /// conversions merge into one object literal, so the exclusion has to be the merged set.
+    fn declared_names_across(&self, branches: &[SchemaNode]) -> Vec<String> {
+        let mut names = Vec::new();
+        for branch in branches {
+            let branch_names = match branch {
+                SchemaNode::AllOf {
+                    branches: nested, ..
+                } => self.declared_names_across(nested),
+                SchemaNode::Object { properties, .. } => self.declared_names(properties),
+                _ => continue,
+            };
+            for name in branch_names {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
     }
 
     /// Collects one `allOf` node's parts.
@@ -1338,30 +1596,34 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
     fn collect_parts(
         &mut self,
         branches: &[SchemaNode],
-        direction: Direction,
-        value: &str,
-        path: &str,
-        frame: Frame,
+        declared: &[String],
+        site: ObjectSite<'_>,
         object: &mut ObjectParts,
     ) {
+        let ObjectSite {
+            direction,
+            value,
+            path,
+            frame,
+        } = site;
         for branch in branches {
             match branch {
                 SchemaNode::AllOf {
                     branches: nested, ..
                 } => {
-                    self.collect_parts(nested, direction, value, path, frame, object);
+                    self.collect_parts(nested, declared, site, object);
                 }
                 SchemaNode::Object {
                     properties,
                     additional_properties,
+                    meta,
                     ..
                 } => self.collect_object_parts(
                     properties,
                     additional_properties,
-                    direction,
-                    value,
-                    path,
-                    frame,
+                    &meta.validation_applicators().pattern_properties,
+                    declared,
+                    site,
                     object,
                 ),
                 _ => {
@@ -1373,20 +1635,21 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one collector over the four things an object conversion reads, plus its output"
-    )]
     fn collect_object_parts(
         &mut self,
         properties: &[(String, SchemaNode, PropMeta)],
         additional_properties: &AdditionalProperties,
-        direction: Direction,
-        value: &str,
-        path: &str,
-        frame: Frame,
+        patterns: &[PatternProperty],
+        declared: &[String],
+        site: ObjectSite<'_>,
         object: &mut ObjectParts,
     ) {
+        let ObjectSite {
+            direction,
+            value,
+            path,
+            frame,
+        } = site;
         for (name, schema, meta) in properties {
             if !property_in_position(meta, self.position) {
                 continue;
@@ -1420,24 +1683,95 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                 ));
             }
         }
-        if let AdditionalProperties::Allowed(Some(schema)) | AdditionalProperties::Schema(schema) =
-            additional_properties
-            && properties.is_empty()
-        {
-            let entry = format!("entry{}", frame.depth);
-            let key = format!("key{}", frame.depth);
-            if let Some(converted) = self.convert(
-                schema,
+        let entry = format!("entry{}", frame.depth);
+        let key = format!("key{}", frame.depth);
+        let entry_path = format!("pushPath({path}, {key})");
+        // The fallback every key that matches no pattern takes: the index signature's own
+        // conversion, or the value unchanged when the object declares none that converts.
+        let fallback = match additional_properties {
+            AdditionalProperties::Allowed(Some(schema)) | AdditionalProperties::Schema(schema) => {
+                self.convert(schema, direction, &entry, &entry_path, frame.nested())
+            }
+            _ => None,
+        };
+        // Each pattern's conversion is selected by testing the key the same way the emitted type's
+        // template-literal key matches it, so a key the type says is a `Date` is a key this
+        // converts. `collect_union_refusals` has already refused everything this cannot express.
+        //
+        // `covered` is the conversion a key takes when no test above it matched. It starts as the
+        // index signature's, and a pattern that types every key becomes it — while it is `None` no
+        // conversion covers an untested key, so the pass has to select the keys it does cover.
+        let mut covered = fallback;
+        let mut tests = Vec::new();
+        let mut converted = None;
+        for pattern in patterns.iter().rev() {
+            let Some(test) = pattern_key_test(pattern, &key) else {
+                continue;
+            };
+            let Some(matched) = self.convert(
+                &pattern.schema,
                 direction,
                 &entry,
-                &format!("pushPath({path}, {key})"),
+                &entry_path,
                 frame.nested(),
-            ) {
-                self.helpers.insert("pushPath");
-                object.whole = Some(format!(
-                    "Object.fromEntries(Object.entries({value}).map(([{key}, {entry}]) => [{key}, {converted}]))"
-                ));
+            ) else {
+                continue;
+            };
+            match test {
+                KeyTest::Every => {
+                    covered = Some(matched);
+                    converted = None;
+                    tests.clear();
+                }
+                KeyTest::When(test) => {
+                    converted = Some(match converted.or_else(|| covered.clone()) {
+                        // The pass visits only keys some test accepts, so the last one needs no
+                        // test of its own.
+                        None => matched,
+                        Some(otherwise) => format!("{test} ? {matched} : {otherwise}"),
+                    });
+                    tests.push(test);
+                }
             }
+        }
+        let covers_every_key = covered.is_some();
+        let Some(converted) = converted.or(covered) else {
+            return;
+        };
+        self.helpers.insert("pushPath");
+        // Two selections, both narrowing the keys this pass writes. Declared members are excluded
+        // because each is converted by its own part. Untested keys are excluded when nothing covers
+        // them — a pass that wrote them back unconverted would undo the conversions of any other
+        // pass over the same value, which is what an `allOf` of two index signatures produces.
+        let mut selections = Vec::new();
+        if !declared.is_empty() {
+            let skipped = declared
+                .iter()
+                .map(|name| render_ts_string(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            selections.push(format!("![{skipped}].includes({key})"));
+        }
+        if !covers_every_key {
+            tests.reverse();
+            selections.push(tests.join(" || "));
+        }
+        let selection = if selections.is_empty() {
+            String::new()
+        } else {
+            format!(".filter(([{key}]) => {})", selections.join(" && "))
+        };
+        let pass = format!(
+            "Object.fromEntries(Object.entries({value}){selection}.map(([{key}, {entry}]) => [{key}, {converted}]))"
+        );
+        // A pass that writes every key *is* the whole value and replaces it. Any other pass spreads
+        // over the value instead: the keys it leaves alone keep the type the value already gave
+        // them, which a replacement would widen to the union of converted and unconverted and no
+        // index signature would accept.
+        if selection.is_empty() {
+            object.whole = Some(pass);
+        } else {
+            object.bases.push(pass);
         }
     }
 
@@ -2732,8 +3066,8 @@ mod pair_tests {
     }
 
     #[test]
-    fn a_converting_index_signature_beside_declared_properties_is_refused() {
-        let (_files, diagnostics, _has_errors) = compile_document(
+    fn a_converting_index_signature_converts_beside_declared_properties() {
+        let (files, diagnostics, has_errors) = compile_document(
             notice_document(json!({
                 "Notice": {
                     "type": "object",
@@ -2745,9 +3079,28 @@ mod pair_tests {
             |config| config.types.date_time = DateTimeRepresentation::Date,
         );
 
-        let messages = unconvertible_messages(&diagnostics);
-        assert_eq!(messages.len(), 1, "{diagnostics:#?}");
-        assert!(messages[0].contains("index signature"), "{messages:?}");
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(
+            unconvertible_messages(&diagnostics).is_empty(),
+            "{diagnostics:#?}"
+        );
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        // The declared member keeps its own conversion and the entries pass skips it, so no key is
+        // converted twice and none is left a wire string.
+        assert!(
+            content.contains(
+                "...Object.fromEntries(Object.entries(value).filter(([key0]) => ![\"at\"].includes(key0)).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0,"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("at: decodeDateTimeDate(value.at,"),
+            "{content}"
+        );
     }
 
     /// Every message the unconvertible-transform refusal emitted. A loop rather than an iterator
@@ -2763,10 +3116,304 @@ mod pair_tests {
     }
 
     #[test]
-    fn a_converting_pattern_property_is_refused() {
+    fn a_pattern_matched_on_containment_converts_the_keys_it_shares_with_a_property() {
+        // An unanchored pattern types every key containing it, which includes a declared one. Both
+        // are the same type, so the property keeps its own conversion and the pass takes the rest.
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "required": ["created-at"],
+                    "properties": {
+                        "created-at": { "type": "string", "format": "date-time" }
+                    },
+                    "patternProperties": {
+                        "-at": { "type": "string", "format": "date-time" }
+                    }
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(
+            unconvertible_messages(&diagnostics).is_empty(),
+            "{diagnostics:#?}"
+        );
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        // Both selections at once: the declared member is skipped because its own part converts it,
+        // and every other key has to be one the pattern claims.
+        assert!(
+            content.contains(
+                ".filter(([key0]) => ![\"created-at\"].includes(key0) && key0.includes(\"-at\"))"
+            ),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn one_all_of_branchs_pass_does_not_undo_anothers() {
+        // Each branch contributes its own pass over the same value, so a pass that wrote back the
+        // keys it does not convert would overwrite the other branch's converted values with wire
+        // strings — under a type that says both are converted.
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "allOf": [
+                        {
+                            "type": "object",
+                            "patternProperties": {
+                                "^x-": { "type": "string", "format": "date-time" }
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "patternProperties": {
+                                "^y-": { "type": "string", "format": "date-time" }
+                            }
+                        }
+                    ]
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        for prefix in ["x-", "y-"] {
+            assert!(
+                content.contains(&format!(
+                    ".filter(([key0]) => key0.startsWith(\"{prefix}\")).map(([key0, entry0]) => [key0, decodeDateTimeDate("
+                )),
+                "{content}"
+            );
+        }
+        assert!(!content.contains(": entry0"), "{content}");
+    }
+
+    #[test]
+    fn a_pattern_that_types_every_key_converts_without_testing_one() {
+        // `$` matches at the end of every string, so its index signature is `[key: string]` and its
+        // conversion covers every key — the same shape a converting `additionalProperties` emits.
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "patternProperties": {
+                        "$": { "type": "string", "format": "date-time" }
+                    }
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        assert!(
+            content.contains(
+                "return Object.fromEntries(Object.entries(value).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0,"
+            ),
+            "{content}"
+        );
+        assert!(!content.contains(" ? "), "{content}");
+    }
+
+    #[test]
+    fn a_pattern_with_no_index_signature_leaves_the_index_signature_pass_alone() {
+        // The pattern declares no key type beside an index signature, so it promises nothing and
+        // selects nothing; the index signature's own conversion still covers every key.
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "patternProperties": {
+                        "^x-": { "type": "string", "format": "date-time" }
+                    },
+                    "additionalProperties": { "type": "string", "format": "date-time" }
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        assert!(!content.contains("startsWith"), "{content}");
+        assert!(
+            content.contains(
+                "Object.entries(value).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0,"
+            ),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn two_converting_patterns_that_can_match_one_key_are_refused() {
+        // `x--at` matches both, and one pass over the keys can apply only one conversion.
+        let (_files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "patternProperties": {
+                        "^x-": { "type": "string", "format": "date-time" },
+                        "-at": { "type": "string", "format": "date-time" }
+                    }
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        let messages = unconvertible_messages(&diagnostics);
+        assert_eq!(messages.len(), 1, "{diagnostics:#?}");
+        assert!(
+            messages[0].contains("both apply a date/time transform"),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn two_converting_patterns_with_disjoint_prefixes_both_convert() {
+        // No key starts with both, so neither conversion can claim a key the other does.
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "patternProperties": {
+                        "^x-": { "type": "string", "format": "date-time" },
+                        "^y-": { "type": "string", "format": "date-time" }
+                    }
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        // One pass over the keys either pattern claims, dispatching between them inside it.
+        assert!(
+            content.contains(
+                ".filter(([key0]) => key0.startsWith(\"x-\") || key0.startsWith(\"y-\"))"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("key0.startsWith(\"x-\") ? decode"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn an_index_signature_that_disagrees_with_a_converting_pattern_is_refused() {
+        // `x--at` matches both, so it would have to be both a `Date` and a `string`.
+        let (_files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "patternProperties": {
+                        "^x-": { "type": "string", "format": "date-time" },
+                        "-at": { "type": "string" }
+                    }
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        let messages = unconvertible_messages(&diagnostics);
+        assert_eq!(messages.len(), 1, "{diagnostics:#?}");
+        assert!(
+            messages[0].contains("types the keys it shares with"),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn a_property_outside_a_converting_patterns_keys_is_left_alone() {
+        // `note` does not start with `x-`, so the index signature never types it and its own type
+        // is nobody else's business.
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "required": ["note"],
+                    "properties": { "note": { "type": "string" } },
+                    "patternProperties": {
+                        "^x-": { "type": "string", "format": "date-time" }
+                    }
+                }
+            })),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        assert!(
+            content.contains(
+                ".filter(([key0]) => ![\"note\"].includes(key0) && key0.startsWith(\"x-\"))"
+            ),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_declared_property_the_index_signature_cannot_type_is_refused() {
+        // The emitted declaration is an intersection, so `note` would have to be a `Date` too. The
+        // codec is where TypeScript would say so, which is why this is refused before one is built.
+        let (_files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" },
+                        "note": { "type": "string" }
+                    },
+                    "additionalProperties": { "type": "string", "format": "date-time" }
+                }
+            })),
+            |config| config.types.date_time = DateTimeRepresentation::Date,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        let messages = unconvertible_messages(&diagnostics);
+        assert_eq!(
+            messages.len(),
+            1,
+            "only the mismatched one: {diagnostics:#?}"
+        );
+        assert!(messages[0].contains("property 'note'"), "{messages:?}");
+        assert!(messages[0].contains("'Date'"), "{messages:?}");
+    }
+
+    #[test]
+    fn a_converting_pattern_property_converts_the_keys_it_types() {
         // Emitted `{ [key: `x-${string}`]: Date }` and no codec at all before this: the index
         // signature promised a converted value nothing ever converted.
-        let (_files, diagnostics, _has_errors) = compile_document(
+        let (files, diagnostics, has_errors) = compile_document(
             notice_document(json!({
                 "Notice": {
                     "type": "object",
@@ -2778,11 +3425,23 @@ mod pair_tests {
             date_mode,
         );
 
-        let refusals = unconvertible_messages(&diagnostics);
-        assert_eq!(refusals.len(), 1, "{diagnostics:#?}");
+        assert!(!has_errors, "{diagnostics:#?}");
         assert!(
-            refusals[0].contains("pattern property '^x-'"),
-            "{refusals:?}"
+            unconvertible_messages(&diagnostics).is_empty(),
+            "{diagnostics:#?}"
+        );
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        // The key test is the template-literal key's own match rule, and a key it rejects is left
+        // out of the pass entirely rather than written back unconverted.
+        assert!(
+            content.contains(
+                "Object.entries(value).filter(([key0]) => key0.startsWith(\"x-\")).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0, P0, pushPath(path, key0))])"
+            ),
+            "{content}"
         );
     }
 
@@ -3991,7 +4650,7 @@ mod operation_pair_tests {
     }
 
     #[test]
-    fn a_converting_discriminated_response_entry_is_refused_before_an_unsafe_binding() {
+    fn a_converting_discriminated_response_entry_narrows_by_content_type() {
         let (files, diagnostics, has_errors) = compile_document(
             operation_document(
                 json!({
@@ -4015,24 +4674,88 @@ mod operation_pair_tests {
             date_mode,
         );
 
-        let messages = refused(&diagnostics);
-        assert_eq!(
-            messages.len(),
-            2,
-            "one per declared media entry: {diagnostics:#?}"
-        );
-        assert!(has_errors, "{diagnostics:#?}");
-        assert!(
-            messages[0].contains("narrowed by contentType on the result"),
-            "{messages:?}"
-        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(refused(&diagnostics).is_empty(), "{diagnostics:#?}");
+        // One pair per declared entry, named in the module whose arms carry it.
         let client = client_operation(&files, "readevent");
+        for name in [
+            "ReadEventResponse200ApplicationJson",
+            "ReadEventResponse200ApplicationVndApiJson",
+        ] {
+            assert!(
+                client.contains(&format!("export type {name} = ")),
+                "{client}"
+            );
+            assert!(
+                client.contains(&format!("export type {name}Wire = ")),
+                "{client}"
+            );
+        }
+        // The discriminant selects the codec, so the value each one reads and returns is the arm's
+        // own payload rather than the branch's union of them.
         assert!(
-            client.contains("contentType: \"application/json\""),
+            client.contains(
+                "  if (result.outcome === 200 && result.contentType === \"application/json\") {\n"
+            ),
             "{client}"
         );
-        assert!(!client.contains("ReadEventResultWire"), "{client}");
-        assert!(!client.contains("decodeReadEventResponse200"), "{client}");
+        assert!(
+            client.contains(
+                "      return { ...result, data: decodeReadEventResponse200ApplicationJson(result.data) };\n"
+            ),
+            "{client}"
+        );
+        assert!(client.contains("ReadEventResultWire"), "{client}");
+        let codecs = operation_module(&files, "readevent").expect("operation codec");
+        assert!(
+            codecs.contains("export function decodeReadEventResponse200ApplicationVndApiJson(value: ReadEventResponse200ApplicationVndApiJsonWire, path: ApplicationPath = []): ReadEventResponse200ApplicationVndApiJson"),
+            "{codecs}"
+        );
+        // The pairs are the client module's declarations, so that is where the codec imports them.
+        assert!(
+            codecs.contains("from \"../../operations/readevent.js\""),
+            "{codecs}"
+        );
+    }
+
+    #[test]
+    fn a_discriminated_response_whose_entries_all_keep_their_wire_form_binds_no_codec() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "readPlainEvent",
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": { "id": { "type": "string" } }
+                                    }
+                                },
+                                "text/plain": { "schema": { "type": "string" } }
+                            }
+                        }
+                    }
+                }),
+                event_schema(),
+            ),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        let client = client_operation(&files, "readplainevent");
+        // Nothing converts, so the branch declares one surface and names no pair.
+        assert!(!client.contains("ReadPlainEventResultWire"), "{client}");
+        assert!(
+            !client.contains("decodeReadPlainEventResponse200"),
+            "{client}"
+        );
+        assert!(
+            !client.contains("export type ReadPlainEventResponse200ApplicationJson"),
+            "{client}"
+        );
     }
 
     #[test]
@@ -4067,7 +4790,7 @@ mod operation_pair_tests {
         assert_eq!(
             refused(&diagnostics),
             [
-                "response '200' entry 'multipart/form-data' applies a date/time transform, but its decoded multipart object is rendered inline while the response converter accepts the status-wide media alias; set the representation back to string"
+                "response '200' entry 'multipart/form-data' applies a date/time transform, but its payload is the object its parts decode to rather than the shape its schema renders, and no emitted codec converts that object; set the representation back to string"
             ],
             "{diagnostics:#?}"
         );
@@ -4146,7 +4869,7 @@ mod operation_pair_tests {
         assert_eq!(
             refused(&diagnostics),
             [
-                "response '200' entry 'multipart/form-data' applies a date/time transform, but its decoded multipart object is rendered inline while the response converter accepts the status-wide media alias; set the representation back to string"
+                "response '200' entry 'multipart/form-data' applies a date/time transform, but its payload is the object its parts decode to rather than the shape its schema renders, and no emitted codec converts that object; set the representation back to string"
             ],
             "{diagnostics:#?}"
         );
@@ -4313,33 +5036,38 @@ mod operation_pair_tests {
             ),
             date_mode,
         );
-        assert!(has_errors, "{diagnostics:#?}");
-        assert_eq!(
-            diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1314")
-                .count(),
-            2,
-            "{diagnostics:#?}"
-        );
+        assert!(!has_errors, "{diagnostics:#?}");
         let content = operation_module(&files, "readmediaevent").expect("operation codec");
-        assert!(
-            content.contains("export function decodeReadMediaEventResponse200"),
-            "{content}"
-        );
+        // Only the JSON entry of each branch converts; the text and binary entries render `string`
+        // and `unknown`, which are the same declaration on both surfaces.
         assert!(
             content.contains(
-                "(typeof value === \"object\" && value !== null && !Array.isArray(value)) ? {"
+                "acceptedAt: decodeDateTimeDate(value.acceptedAt, P0, pushPath(path, \"acceptedAt\"))"
             ),
             "{content}"
         );
+        for name in [
+            "ReadMediaEventResponse200ApplicationJson",
+            "ReadMediaEventResponse201ApplicationJson",
+        ] {
+            assert!(
+                content.contains(&format!(
+                    "export function decode{name}(value: {name}Wire, path: ApplicationPath = []): {name}"
+                )),
+                "{content}"
+            );
+        }
         assert!(
-            content.contains("export function decodeReadMediaEventResponse201"),
-            "{content}"
+            !content.contains("decodeReadMediaEventResponse200("),
+            "the status-wide codec has no caller once the branch narrows: {content}"
         );
+        // The entry is tagged even though it is the branch's only JSON one, because these names
+        // index the arm space — one arm per declared entry — while the validators artifact tags the
+        // JSON subset and leaves a lone JSON entry untagged.
+        let client = client_operation(&files, "readmediaevent");
         assert!(
-            content.contains("decodeReadMediaEventResponse201(value: ReadMediaEventResponse201Wire, path: ApplicationPath = []): ReadMediaEventResponse201 {\n  return value;"),
-            "{content}"
+            client.contains("export type ReadMediaEventResponse200ApplicationJsonWire = "),
+            "{client}"
         );
     }
 

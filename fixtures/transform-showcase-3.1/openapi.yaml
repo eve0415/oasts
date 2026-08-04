@@ -234,6 +234,51 @@ paths:
       responses:
         '204':
           description: Accepted.
+  /events/timings:
+    get:
+      operationId: readEventTimings
+      summary: Convert a declared member and an index signature in one pass each.
+      responses:
+        '200':
+          description: The declared timings, plus whatever else the server recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventTimings'
+  /events/extensions:
+    get:
+      operationId: readEventExtensions
+      summary: Convert only the keys the pattern property's index signature types.
+      responses:
+        '200':
+          description: The recorded extension timestamps.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventExtensions'
+  /events/negotiated:
+    get:
+      operationId: readNegotiatedEvent
+      summary: Convert whichever response payload the negotiated content type selected.
+      responses:
+        '200':
+          description: The event, in the representation the server negotiated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+            application/vnd.summary+json:
+              schema:
+                type: object
+                required:
+                  - summarisedAt
+                properties:
+                  summarisedAt:
+                    type: string
+                    format: date-time
+            text/plain:
+              schema:
+                type: string
 components:
   schemas:
     Event:
@@ -253,6 +298,25 @@ components:
           format: date
         label:
           type: string
+    EventTimings:
+      type: object
+      description: A declared date-time member beside an index signature of the same shape.
+      required:
+        - startedAt
+      properties:
+        startedAt:
+          type: string
+          format: date-time
+      additionalProperties:
+        type: string
+        format: date-time
+    EventExtensions:
+      type: object
+      description: A pattern property whose keys the emitted index signature types.
+      patternProperties:
+        '^x-':
+          type: string
+          format: date-time
     EventDraft:
       type: object
       description: The request-surface twin of Event.

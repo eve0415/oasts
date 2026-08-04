@@ -52,6 +52,9 @@ let getLatestEvent: ExportedFunction;
 let submitEventForm: ExportedFunction;
 let uploadEvent: ExportedFunction;
 let submitDiscriminatedEvent: ExportedFunction;
+let readNegotiatedEvent: ExportedFunction;
+let readEventTimings: ExportedFunction;
+let readEventExtensions: ExportedFunction;
 // The same document under `validation.request: true`. Its request validators run on whatever the
 // conversion produced, so a call that would be well-formed on the wire and ill-formed as an
 // application value is what distinguishes the two orderings.
@@ -83,6 +86,17 @@ before(async () => {
     generatedRoot,
     "submitdiscriminatedevent",
     "submitDiscriminatedEvent",
+  );
+  readNegotiatedEvent = await operation(
+    generatedRoot,
+    "readnegotiatedevent",
+    "readNegotiatedEvent",
+  );
+  readEventTimings = await operation(generatedRoot, "readeventtimings", "readEventTimings");
+  readEventExtensions = await operation(
+    generatedRoot,
+    "readeventextensions",
+    "readEventExtensions",
   );
   validatedReadEvent = await operation(validatedRoot, "readevent", "readEvent");
   validatedGetLatestEvent = await operation(validatedRoot, "getlatestevent", "getLatestEvent");
@@ -191,6 +205,100 @@ test("a discriminated body converts only the selected media arm", async () => {
     occurredAt: "2024-03-01T12:00:00.000Z",
     label: "json",
   });
+});
+
+// One route, three negotiated payloads. Only a real server can settle which codec ran: the branch
+// declares one arm per media entry, and the emitted narrowing picks between them on a header the
+// type system never sees.
+function scriptNegotiated(contentType: string, body: string): void {
+  scriptRoute("GET", "/events/negotiated", {
+    status: 200,
+    headers: [["Content-Type", contentType]],
+    body: Buffer.from(body),
+  });
+}
+
+test("a discriminated response converts the arm its content type selected", async () => {
+  scriptNegotiated("application/vnd.summary+json", '{"summarisedAt":"2024-03-01T12:00:00Z"}');
+
+  const transport = createTransport({ baseUrl });
+  const result = requiredRecord(
+    await readNegotiatedEvent(transport, {}),
+    "readNegotiatedEvent result",
+  );
+
+  assert.equal(result.contentType, "application/vnd.summary+json");
+  const data = requiredRecord(result.data, "readNegotiatedEvent data");
+  assert.ok(data.summarisedAt instanceof Date, "summarisedAt should decode to a Date");
+  assert.equal(data.summarisedAt.getTime(), OCCURRED_AT.getTime());
+  // The other JSON arm's property is not in this payload, and its codec must not have run: it would
+  // have thrown on the absent required value rather than returned this arm.
+  assert.equal(data.occurredAt, undefined);
+});
+
+test("a sibling arm of the same status converts through its own codec", async () => {
+  scriptNegotiated("application/json", '{"id":"e1","occurredAt":"2024-03-01T12:00:00Z"}');
+
+  const transport = createTransport({ baseUrl });
+  const result = requiredRecord(
+    await readNegotiatedEvent(transport, {}),
+    "readNegotiatedEvent result",
+  );
+
+  assert.equal(result.contentType, "application/json");
+  const data = requiredRecord(result.data, "readNegotiatedEvent data");
+  assert.ok(data.occurredAt instanceof Date, "occurredAt should decode to a Date");
+  assert.equal(data.id, "e1");
+});
+
+test("an arm no codec is bound to is handed back unconverted", async () => {
+  scriptNegotiated("text/plain", "2024-03-01T12:00:00Z");
+
+  const transport = createTransport({ baseUrl });
+  const result = requiredRecord(
+    await readNegotiatedEvent(transport, {}),
+    "readNegotiatedEvent result",
+  );
+
+  assert.equal(result.contentType, "text/plain");
+  assert.equal(result.data, "2024-03-01T12:00:00Z");
+});
+
+test("an index signature converts the keys its declared members do not cover", async () => {
+  scriptRoute("GET", "/events/timings", {
+    status: 200,
+    headers: [["Content-Type", "application/json"]],
+    body: Buffer.from('{"startedAt":"2024-03-01T12:00:00Z","finishedAt":"2024-03-01T12:00:00Z"}'),
+  });
+
+  const transport = createTransport({ baseUrl });
+  const result = requiredRecord(await readEventTimings(transport, {}), "readEventTimings result");
+  const data = requiredRecord(result.data, "readEventTimings data");
+
+  // The declared member and the undeclared one both arrive converted, and neither was converted
+  // twice — a second pass over an already-decoded value would have thrown.
+  assert.ok(data.startedAt instanceof Date, "the declared member should decode to a Date");
+  assert.ok(data.finishedAt instanceof Date, "the index signature key should decode to a Date");
+  assert.equal(data.finishedAt.getTime(), OCCURRED_AT.getTime());
+});
+
+test("a pattern property converts only the keys its index signature types", async () => {
+  scriptRoute("GET", "/events/extensions", {
+    status: 200,
+    headers: [["Content-Type", "application/json"]],
+    body: Buffer.from('{"x-recorded":"2024-03-01T12:00:00Z","note":"kept as is"}'),
+  });
+
+  const transport = createTransport({ baseUrl });
+  const result = requiredRecord(
+    await readEventExtensions(transport, {}),
+    "readEventExtensions result",
+  );
+  const data = requiredRecord(result.data, "readEventExtensions data");
+
+  assert.ok(data["x-recorded"] instanceof Date, "a matching key should decode to a Date");
+  // The type says nothing about a key the pattern does not match, so neither does the conversion.
+  assert.equal(data["note"], "kept as is");
 });
 
 test("a wire value the grammar refuses is a response-transform failure", async () => {

@@ -303,14 +303,14 @@ fn emit_operation(
 ) -> String {
     let stem = uppercase_first(allocated_name);
     let transforming = model.transform_facts().enabled();
-    let wire_responses = response_transform_flags(model, plan);
-    let response_transforms = response_transform_bindings(plan, &stem, &wire_responses);
+    let conversions = response_conversions(model, plan, &stem);
+    let response_transforms = response_transform_bindings(plan, &stem, &conversions);
     let request_transforms = request_transform_binding(model, plan);
     // The object the request actually dispatches, named once: the validators read it and `execute`
     // receives it, and two spellings of the same choice would disagree as an undeclared binding in
     // the emitted module rather than as a failure here.
     let dispatch_root = if request_transforms { "wire" } else { "input" };
-    let mut operation_type_names = operation_type_imports(plan, &stem, &wire_responses);
+    let mut operation_type_names = operation_type_imports(plan, &stem, &conversions);
     let uses_typed_headers = plan
         .response_table
         .iter()
@@ -323,6 +323,7 @@ fn emit_operation(
         input,
         input_wire,
         request_twin,
+        entry_pairs,
         result_type,
         envelope_type,
         component_aliases,
@@ -350,12 +351,27 @@ fn emit_operation(
         }
         // A content-type-discriminated branch renders each media entry's own schema inline instead
         // of the status-wide alias, so those entries' component references import from here.
-        for response in &plan.response_table {
+        for (index, response) in plan.response_table.iter().enumerate() {
             if renders_payload_inline(response)
                 && matches!(response.payload, PayloadDisposition::Payload)
             {
-                for entry in &response.media {
-                    collect_response_entry_imports(&renderer, entry, &mut component_imports);
+                for (entry_index, entry) in response.media.iter().enumerate() {
+                    collect_response_entry_imports(
+                        &renderer,
+                        entry,
+                        TypeAxis::Application,
+                        &mut component_imports,
+                    );
+                    // A converting entry's wire twin names the wire form of every component its
+                    // payload reaches, the same rule the request twin follows.
+                    if entry_payload_alias(conversions.get(index), entry_index).is_some() {
+                        collect_response_entry_imports(
+                            &renderer,
+                            entry,
+                            TypeAxis::Wire,
+                            &mut component_imports,
+                        );
+                    }
                 }
             }
         }
@@ -378,20 +394,22 @@ fn emit_operation(
                 &extended
             };
             assign_import_aliases(
-                &client_declarations(&stem, &operation_type_names, transforming),
+                &client_declarations(&stem, &operation_type_names, transforming, &conversions),
                 reserved,
                 &component_imports,
                 &operation.source,
             )
         };
         renderer.set_import_aliases(aliases.clone());
-        let arms = response_result_arms(&renderer, plan, &stem, &[]);
+        let arms = response_result_arms(&renderer, plan, &stem, &conversions, false);
+        // Each converting media entry's payload pair, declared above the unions that name it.
+        let entry_pairs = render_entry_payload_pairs(&renderer, plan, &conversions);
         let mut result_type = render_result_type(&arms, plan, &stem, "");
         // The pre-conversion union is declared next to the converted one so a reader sees both
         // surfaces in the module that converts between them, and so `execute`'s type argument names
         // a declaration rather than an inline union.
         if !response_transforms.is_empty() {
-            let wire_arms = response_result_arms(&renderer, plan, &stem, &wire_responses);
+            let wire_arms = response_result_arms(&renderer, plan, &stem, &conversions, true);
             result_type.push('\n');
             result_type.push_str(&render_result_type(&wire_arms, plan, &stem, "Wire"));
         }
@@ -421,6 +439,7 @@ fn emit_operation(
             ),
             input_wire,
             request_twin,
+            entry_pairs,
             result_type,
             successful_envelope_union(&arms),
             aliases,
@@ -647,6 +666,7 @@ fn emit_operation(
         output.push_str(";\n\n");
     }
 
+    output.push_str(&entry_pairs);
     write_source_metadata(&mut output, &operation.source, 0);
     write_client_operation_tsdoc(
         &mut output,
@@ -780,41 +800,110 @@ struct ResponseCheck {
 struct ResponseTransform {
     /// The rendered `outcome` literal, the same value the result union's arm carries.
     outcome: String,
+    /// The `contentType` discriminant this codec is selected by, present exactly when the branch
+    /// converts entry by entry. Absent means one codec covers the whole branch.
+    content_type: Option<String>,
     /// The emitted codec this branch calls, from the operation's own transform module.
     decoder: String,
     /// Which field carries the payload — `default` spans both, so `result.ok` picks at runtime.
     body: ResponseBody,
 }
 
-/// Which declared responses carry a payload the transform layer converts, in `response_table`
-/// order.
+/// What the transform layer converts in one declared response.
+pub(super) enum ResponseConversion {
+    /// Nothing converts: the branch declares the same payload type on both surfaces.
+    None,
+    /// One codec converts the status-wide payload, keyed on the alias the types artifact declared
+    /// for the whole branch. A branch reaches this only when it declares exactly one media entry —
+    /// two would make it content-type discriminated — so the payload the alias names is that
+    /// entry's, and the index says which.
+    Whole(usize),
+    /// One codec per converting media entry, selected at runtime by the `contentType` discriminant
+    /// the branch already carries. Each pair is an index into the response's media list and the name
+    /// its payload types are declared under in the client's own operation module.
+    PerEntry(Vec<(usize, String)>),
+}
+
+/// What the transform layer converts in each declared response, in `response_table` order.
 ///
-/// A branch that renders its payload inline — content-type discriminated, or multipart — names one
-/// type per media entry rather than the status-wide alias the emitted codec is keyed on. Its media
-/// discriminant also lives beside `data` or `error`, while `write_response_transform` passes only
-/// that payload to the codec, so it cannot bind here. `unconvertible_transform_diagnostics` refuses
-/// those rather than leaving one silently unconverted under a type that says it converted.
-fn response_transform_flags(model: &EmissionModel<'_, '_>, plan: &OperationPlan) -> Vec<bool> {
+/// A content-type-discriminated branch renders one payload type per media entry rather than the
+/// status-wide alias, so a single status-wide codec could neither accept the narrowed arm's input
+/// nor return its output. Those branches convert entry by entry instead: the discriminant the arm
+/// already carries selects the codec, and each entry names its own payload pair.
+///
+/// A multipart-decoded payload is not reachable here. It renders as the object its parts decode to,
+/// which is not the shape any schema-keyed codec converts, so
+/// `unconvertible_transform_diagnostics` refuses one that would have converted rather than leaving
+/// it a wire string under a type that says `Date`.
+pub(super) fn response_conversions(
+    model: &EmissionModel<'_, '_>,
+    plan: &OperationPlan,
+    stem: &str,
+) -> Vec<ResponseConversion> {
     if !model.transform_facts().enabled() {
         return Vec::new();
     }
     plan.response_table
         .iter()
         .map(|response| {
-            matches!(response.payload, PayloadDisposition::Payload)
-                && !renders_payload_inline(response)
-                // JSON only, matching the types artifact's own twin rule: a `text/plain` payload
-                // stays a string on both surfaces, declares no wire twin, and gets no codec, so
-                // binding it here would import two symbols that were never emitted.
-                && response
-                    .media
-                    .iter()
-                    .any(|entry| {
-                        is_json(media_essence(&entry.media))
-                            && model.transform_facts().reaches(&entry.schema)
-                    })
+            if !matches!(response.payload, PayloadDisposition::Payload) {
+                return ResponseConversion::None;
+            }
+            // JSON only, matching the types artifact's own twin rule: a `text/plain` payload stays a
+            // string on both surfaces, declares no wire twin, and gets no codec, so binding one here
+            // would name two symbols that were never emitted.
+            let converts = |entry: &ResponseMediaPlan| {
+                entry.multipart.is_none()
+                    && is_json(media_essence(&entry.media))
+                    && model.transform_facts().reaches(&entry.schema)
+            };
+            if !response.content_type_discriminated {
+                let entry = response.media.iter().position(&converts);
+                return match entry {
+                    Some(entry) if !renders_payload_inline(response) => {
+                        ResponseConversion::Whole(entry)
+                    }
+                    _ => ResponseConversion::None,
+                };
+            }
+            // Named over every declared entry rather than only the converting ones, because the
+            // names live in the arm space: one arm per media entry, converting or not. The
+            // validators artifact tags the JSON subset instead, so a response mixing JSON with
+            // another media type can tag the same entry differently in the two artifacts — each is
+            // internally consistent, which is what the emitted code needs.
+            let media = response
+                .media
+                .iter()
+                .map(|entry| entry.media.as_str())
+                .collect::<Vec<_>>();
+            let names = response_media_names(&response_type_name(stem, response), &media);
+            let entries = response
+                .media
+                .iter()
+                .zip(names)
+                .enumerate()
+                .filter(|(_, (entry, _))| converts(entry))
+                .map(|(index, (_, name))| (index, name.name))
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
+                ResponseConversion::None
+            } else {
+                ResponseConversion::PerEntry(entries)
+            }
         })
         .collect()
+}
+
+/// The name one media entry's payload pair is declared under, or `None` when that entry does not
+/// convert and keeps the type it renders inline on both surfaces.
+fn entry_payload_alias(conversion: Option<&ResponseConversion>, index: usize) -> Option<&str> {
+    match conversion {
+        Some(ResponseConversion::PerEntry(entries)) => entries
+            .iter()
+            .find(|(entry, _)| *entry == index)
+            .map(|(_, name)| name.as_str()),
+        _ => None,
+    }
 }
 
 /// Whether the request surface carries a value the transform layer converts, and so binds an
@@ -869,18 +958,33 @@ pub(super) fn form_field_transforms(model: &EmissionModel<'_, '_>, field: &FormF
 fn response_transform_bindings(
     plan: &OperationPlan,
     stem: &str,
-    converts: &[bool],
+    conversions: &[ResponseConversion],
 ) -> Vec<ResponseTransform> {
-    plan.response_table
-        .iter()
-        .zip(converts.iter().copied())
-        .filter(|(_, converts)| *converts)
-        .map(|(response, _)| ResponseTransform {
-            outcome: outcome_literal(response),
-            decoder: format!("decode{}", response_type_name(stem, response)),
-            body: response_body_side(response.kind, &response.match_key),
-        })
-        .collect()
+    let mut bindings = Vec::new();
+    for (response, conversion) in plan.response_table.iter().zip(conversions) {
+        let outcome = outcome_literal(response);
+        let body = response_body_side(response.kind, &response.match_key);
+        match conversion {
+            ResponseConversion::None => {}
+            ResponseConversion::Whole(_) => bindings.push(ResponseTransform {
+                outcome,
+                content_type: None,
+                decoder: format!("decode{}", response_type_name(stem, response)),
+                body,
+            }),
+            ResponseConversion::PerEntry(entries) => {
+                for (index, name) in entries {
+                    bindings.push(ResponseTransform {
+                        outcome: outcome.clone(),
+                        content_type: Some(response.media[*index].media.clone()),
+                        decoder: format!("decode{name}"),
+                        body,
+                    });
+                }
+            }
+        }
+    }
+    bindings
 }
 
 fn validation_flags(model: &EmissionModel<'_, '_>) -> (bool, bool) {
@@ -1257,9 +1361,22 @@ fn result_function_body(
 /// nothing in `try` assigns it, which is what lets the failure arm read `status` and `meta`.
 fn write_response_transform(body: &mut String, transform: &ResponseTransform) {
     let ResponseTransform {
-        outcome, decoder, ..
+        outcome,
+        content_type,
+        decoder,
+        ..
     } = transform;
-    body.push_str(&format!("  if (result.outcome === {outcome}) {{\n"));
+    // The discriminant narrows `result` to the one arm this codec was built for, so both the value
+    // it reads and the value it returns are that entry's own payload type rather than the branch's
+    // union of them.
+    let narrowed = match content_type {
+        Some(media) => format!(
+            "result.outcome === {outcome} && result.contentType === {}",
+            render_ts_string(media)
+        ),
+        None => format!("result.outcome === {outcome}"),
+    };
+    body.push_str(&format!("  if ({narrowed}) {{\n"));
     body.push_str("    try {\n");
     match transform.body {
         ResponseBody::Data => {
@@ -1461,6 +1578,7 @@ fn client_declarations(
     stem: &str,
     operation_type_names: &BTreeSet<String>,
     transforming: bool,
+    conversions: &[ResponseConversion],
 ) -> BTreeSet<String> {
     let mut declared = BTreeSet::from([
         format!("{stem}Input"),
@@ -1480,6 +1598,16 @@ fn client_declarations(
             format!("{stem}InputWire"),
             format!("{stem}RequestWire"),
         ]);
+    }
+    // The per-entry payload pairs are declarations of this module too, so a component whose type
+    // name equals one of them has to be aliased rather than shadow it.
+    for conversion in conversions {
+        if let ResponseConversion::PerEntry(entries) = conversion {
+            for (_, name) in entries {
+                declared.insert(format!("{name}Wire"));
+                declared.insert(name.clone());
+            }
+        }
     }
     declared.extend(operation_type_names.iter().cloned());
     declared
@@ -1530,7 +1658,7 @@ fn write_component_imports(
 fn operation_type_imports(
     plan: &OperationPlan,
     stem: &str,
-    wire_responses: &[bool],
+    conversions: &[ResponseConversion],
 ) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     if plan.body_plan.as_ref().is_some_and(body_uses_json_alias) {
@@ -1543,7 +1671,9 @@ fn operation_type_imports(
             && !renders_payload_inline(response)
         {
             names.insert(response_type_name(stem, response));
-            if wire_responses.get(index).copied().unwrap_or(false) {
+            // Only a status-wide conversion reads the status-wide twin; a per-entry one declares
+            // its own pairs in this module and imports neither.
+            if matches!(conversions.get(index), Some(ResponseConversion::Whole(_))) {
                 names.insert(format!("{}Wire", response_type_name(stem, response)));
             }
         }
@@ -1906,14 +2036,49 @@ struct ResultArm {
     headers_interface: Option<String>,
 }
 
-/// The result union's arms. `wire` marks, per declared response, the branches whose payload the
-/// transform layer converts — those name their wire twin instead, which is the surface `execute`
-/// hands back before conversion. An empty slice asks for the application surface throughout.
+/// The payload pair each converting media entry declares: the type its arm carries, and the wire
+/// twin the pre-conversion arm carries.
+///
+/// Declared here rather than in the types artifact because a discriminated entry's payload is only
+/// ever named by this module's own arms and by the codec that converts between them — the same
+/// reason the request surface's `{Stem}Input` pair lives here.
+fn render_entry_payload_pairs(
+    renderer: &TypesEmitter<'_, '_, '_>,
+    plan: &OperationPlan,
+    conversions: &[ResponseConversion],
+) -> String {
+    let mut output = String::new();
+    for (response, conversion) in plan.response_table.iter().zip(conversions) {
+        let ResponseConversion::PerEntry(entries) = conversion else {
+            continue;
+        };
+        for (index, name) in entries {
+            let entry = &response.media[*index];
+            for (declared, axis) in [
+                (name.clone(), TypeAxis::Application),
+                (format!("{name}Wire"), TypeAxis::Wire),
+            ] {
+                write_source_metadata(&mut output, &entry.source, 0);
+                output.push_str("export type ");
+                output.push_str(&declared);
+                output.push_str(" = ");
+                output.push_str(&response_entry_payload_type(renderer, entry, axis));
+                output.push_str(";\n\n");
+            }
+        }
+    }
+    output
+}
+
+/// The result union's arms on one surface. `wire` asks for the pre-conversion surface `execute`
+/// hands back, where every payload the conversions name declares its wire twin instead; a payload no
+/// conversion names is the same declaration on both surfaces and renders identically either way.
 fn response_result_arms(
     renderer: &TypesEmitter<'_, '_, '_>,
     plan: &OperationPlan,
     stem: &str,
-    wire: &[bool],
+    conversions: &[ResponseConversion],
+    wire: bool,
 ) -> Vec<ResultArm> {
     let mut arms = Vec::new();
     for (index, response) in plan.response_table.iter().enumerate() {
@@ -1922,7 +2087,8 @@ fn response_result_arms(
             renderer,
             response,
             stem,
-            wire.get(index).copied().unwrap_or(false),
+            conversions.get(index),
+            wire,
         );
     }
     arms
@@ -1933,6 +2099,7 @@ fn push_response_result_arms(
     renderer: &TypesEmitter<'_, '_, '_>,
     response: &ResponsePlan,
     stem: &str,
+    conversion: Option<&ResponseConversion>,
     wire: bool,
 ) {
     let status = match response.kind {
@@ -1940,6 +2107,11 @@ fn push_response_result_arms(
         ResponseMatchKind::Range | ResponseMatchKind::Default => "number".to_owned(),
     };
     let outcome = outcome_literal(response);
+    let axis = if wire {
+        TypeAxis::Wire
+    } else {
+        TypeAxis::Application
+    };
     // Only computed when the response declares a header, keeping a header-less response's arms
     // free of any new allocation on this path.
     let headers_interface = response
@@ -1955,19 +2127,34 @@ fn push_response_result_arms(
             response
                 .media
                 .iter()
-                .map(|entry| {
+                .enumerate()
+                .map(|(index, entry)| {
                     (
                         // A non-discriminated branch has exactly one concrete entry and carries no
                         // `contentType` discriminant, so only the discriminated form names it.
                         response
                             .content_type_discriminated
                             .then(|| entry.media.clone()),
-                        response_entry_payload_type(renderer, entry),
+                        // A converting entry names the pair this module declares for it, so the arm
+                        // and the codec that produces it read one declaration rather than two
+                        // renderings of the same schema.
+                        match entry_payload_alias(conversion, index) {
+                            Some(alias) if wire => format!("{alias}Wire"),
+                            Some(alias) => alias.to_owned(),
+                            None => response_entry_payload_type(renderer, entry, axis),
+                        },
                     )
                 })
                 .collect()
         } else {
-            vec![(None, response_payload_type(response, stem, wire))]
+            vec![(
+                None,
+                response_payload_type(
+                    response,
+                    stem,
+                    wire && matches!(conversion, Some(ResponseConversion::Whole(_))),
+                ),
+            )]
         };
     // `default` is the one key that spans both outcomes, so each of its media entries yields a
     // success arm and a failure arm; every other key resolves to exactly one.
@@ -2024,17 +2211,24 @@ fn multipart_decoding_notes(plan: &OperationPlan) -> Vec<String> {
 /// The payload type one declared media entry renders to. A multipart entry is the decoded object;
 /// everything else goes through the types artifact's own rule, so the two artifacts cannot render
 /// the same non-multipart entry differently.
+/// The type one inline-rendered media entry's payload declares on the given surface.
+///
+/// The axis is the caller's, not a constant: an entry the transform layer converts declares its wire
+/// twin on the pre-conversion surface `execute` hands back, and its application form on the surface
+/// the caller sees. Rendering both from one axis would have the conversion read an already-decoded
+/// value.
 fn response_entry_payload_type(
     renderer: &TypesEmitter<'_, '_, '_>,
     entry: &ResponseMediaPlan,
+    axis: TypeAxis,
 ) -> String {
     match &entry.multipart {
-        Some(multipart) => render_multipart_response_type(renderer, multipart, 0),
+        Some(multipart) => render_multipart_response_type(renderer, multipart, axis, 0),
         None => renderer.media_payload_type(
             media_essence(&entry.media),
             &entry.schema,
             TypePosition::Response,
-            TypeAxis::Application,
+            axis,
         ),
     }
 }
@@ -2045,15 +2239,11 @@ fn response_entry_payload_type(
 fn collect_response_entry_imports(
     renderer: &TypesEmitter<'_, '_, '_>,
     entry: &ResponseMediaPlan,
+    axis: TypeAxis,
     imports: &mut BTreeMap<String, BTreeSet<String>>,
 ) {
     let Some(multipart) = &entry.multipart else {
-        renderer.collect_operation_imports(
-            &entry.schema,
-            TypePosition::Response,
-            TypeAxis::Application,
-            imports,
-        );
+        renderer.collect_operation_imports(&entry.schema, TypePosition::Response, axis, imports);
         return;
     };
     let shapes = multipart
@@ -2082,6 +2272,7 @@ fn collect_response_entry_imports(
 fn render_multipart_response_type(
     renderer: &TypesEmitter<'_, '_, '_>,
     plan: &MultipartResponsePlan,
+    axis: TypeAxis,
     indent: usize,
 ) -> String {
     let parts = plan
@@ -2090,7 +2281,7 @@ fn render_multipart_response_type(
         .map(|part| {
             (
                 part,
-                render_multipart_part_type(renderer, &part.shape, indent + 2),
+                render_multipart_part_type(renderer, &part.shape, axis, indent + 2),
             )
         })
         .collect::<Vec<_>>();
@@ -2109,7 +2300,7 @@ fn render_multipart_response_type(
         output.push_str(";\n");
     }
     if plan.open {
-        let fallback = render_multipart_part_type(renderer, &plan.additional, indent + 2);
+        let fallback = render_multipart_part_type(renderer, &plan.additional, axis, indent + 2);
         // `unknown` absorbs every other member, so the widening union is only built when the
         // fallback is something a declared property could fail to satisfy.
         let mut members = vec![fallback.clone()];
@@ -2136,6 +2327,7 @@ fn render_multipart_response_type(
 fn render_multipart_part_type(
     renderer: &TypesEmitter<'_, '_, '_>,
     shape: &MultipartResponseShape,
+    axis: TypeAxis,
     indent: usize,
 ) -> String {
     if shape.payload == MultipartResponsePayload::Binary {
@@ -2145,12 +2337,7 @@ fn render_multipart_part_type(
             "Uint8Array".to_owned()
         };
     }
-    renderer.render_type(
-        &shape.schema,
-        TypePosition::Response,
-        TypeAxis::Application,
-        indent,
-    )
+    renderer.render_type(&shape.schema, TypePosition::Response, axis, indent)
 }
 
 fn render_result_type(
@@ -2247,7 +2434,7 @@ fn response_payload_type(response: &ResponsePlan, stem: &str, wire: bool) -> Str
     }
 }
 
-fn response_type_name(stem: &str, response: &ResponsePlan) -> String {
+pub(super) fn response_type_name(stem: &str, response: &ResponsePlan) -> String {
     let suffix = match response.kind {
         ResponseMatchKind::Exact | ResponseMatchKind::Range => {
             response.match_key.to_ascii_uppercase()
@@ -5248,7 +5435,7 @@ mod tests {
         let mut sink = DiagnosticSink::new();
         let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
         let renderer = TypesEmitter::new(&model);
-        let arms = response_result_arms(&renderer, &plan, "Probe", &[]);
+        let arms = response_result_arms(&renderer, &plan, "Probe", &[], false);
         let output = render_result_type(&arms, &plan, "Probe", "");
         assert!(output.contains(
             "outcome: 100; ok: false; status: 100; error: undefined; meta: ResponseMeta"
@@ -5273,7 +5460,7 @@ mod tests {
             response_table: Vec::new(),
             ..plan
         };
-        let empty_arms = response_result_arms(&renderer, &empty, "Empty", &[]);
+        let empty_arms = response_result_arms(&renderer, &empty, "Empty", &[], false);
         let output = render_result_type(&empty_arms, &empty, "Empty", "");
         assert!(output.contains("| ResponsePhaseFailure<never>\n  | RequestPhaseFailure;\n"));
         assert_eq!(successful_envelope_union(&empty_arms), "never");
@@ -5514,7 +5701,7 @@ mod tests {
         let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
         let renderer = TypesEmitter::new(&model);
         let actual = render_result_type(
-            &response_result_arms(&renderer, &plan, "HeadHealth", &[]),
+            &response_result_arms(&renderer, &plan, "HeadHealth", &[], false),
             &plan,
             "HeadHealth",
             "",
