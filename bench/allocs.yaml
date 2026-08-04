@@ -219,9 +219,9 @@ keys:
         deallocs: 30
         allocBytes: 2788
       - stage: "emit"
-        allocs: 864
+        allocs: 893
         reallocs: 263
-        deallocs: 835
+        deallocs: 864
         allocBytes: 98378
     informational:
       peakBytes: 93424
@@ -299,9 +299,9 @@ keys:
         deallocs: 292
         allocBytes: 110185
       - stage: "analyze"
-        allocs: 119
+        allocs: 113
         reallocs: 16
-        deallocs: 71
+        deallocs: 65
         allocBytes: 7772
       - stage: "emit"
         allocs: 803

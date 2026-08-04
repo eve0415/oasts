@@ -45,6 +45,8 @@ pub struct NamingOverrideSuggestion {
 pub enum NamingOverrideNamespace {
     Schemas,
     Operations,
+    Webhooks,
+    Callbacks,
 }
 
 impl NamingOverrideNamespace {
@@ -52,6 +54,8 @@ impl NamingOverrideNamespace {
         match self {
             Self::Schemas => "schemas",
             Self::Operations => "operations",
+            Self::Webhooks => "webhooks",
+            Self::Callbacks => "callbacks",
         }
     }
 }

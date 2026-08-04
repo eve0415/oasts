@@ -171,6 +171,69 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CompositeEvent'
+  /events/form:
+    post:
+      operationId: submitEventForm
+      summary: Encode a date-time field before form-urlencoded serialization.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - occurredAt
+              properties:
+                occurredAt:
+                  type: string
+                  format: date-time
+                label:
+                  type: string
+      responses:
+        '204':
+          description: Accepted.
+  /events/multipart:
+    post:
+      operationId: uploadEvent
+      summary: Encode a date-time field before multipart serialization.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - occurredAt
+              properties:
+                occurredAt:
+                  type: string
+                  format: date-time
+                label:
+                  type: string
+      responses:
+        '204':
+          description: Accepted.
+  /events/discriminated:
+    post:
+      operationId: submitDiscriminatedEvent
+      summary: Dispatch request conversion by the selected concrete content type.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventDraft'
+          application/vnd.label+json:
+            schema:
+              type: object
+              required:
+                - label
+              properties:
+                label:
+                  type: string
+      responses:
+        '204':
+          description: Accepted.
 components:
   schemas:
     Event:

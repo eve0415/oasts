@@ -24,6 +24,7 @@ import {
   createScriptedServer,
   requiredFunction,
   requiredRecord,
+  requestHeader,
   type ExportedFunction,
 } from "./harness.ts";
 
@@ -48,6 +49,9 @@ let temporaryRoot: string;
 let createTransport: ExportedFunction;
 let readEvent: ExportedFunction;
 let getLatestEvent: ExportedFunction;
+let submitEventForm: ExportedFunction;
+let uploadEvent: ExportedFunction;
+let submitDiscriminatedEvent: ExportedFunction;
 // The same document under `validation.request: true`. Its request validators run on whatever the
 // conversion produced, so a call that would be well-formed on the wire and ill-formed as an
 // application value is what distinguishes the two orderings.
@@ -73,6 +77,13 @@ before(async () => {
   });
   readEvent = await operation(generatedRoot, "readevent", "readEvent");
   getLatestEvent = await operation(generatedRoot, "getlatestevent", "getLatestEvent");
+  submitEventForm = await operation(generatedRoot, "submiteventform", "submitEventForm");
+  uploadEvent = await operation(generatedRoot, "uploadevent", "uploadEvent");
+  submitDiscriminatedEvent = await operation(
+    generatedRoot,
+    "submitdiscriminatedevent",
+    "submitDiscriminatedEvent",
+  );
   validatedReadEvent = await operation(validatedRoot, "readevent", "readEvent");
   validatedGetLatestEvent = await operation(validatedRoot, "getlatestevent", "getLatestEvent");
   const transportModule: unknown = await import(
@@ -132,6 +143,54 @@ test("a request value encodes to its canonical wire form before serialization", 
     `/events/${OCCURRED_AT_PATH}?since=2023-01-02T03%3A04%3A05.678Z`,
     "both the path and the query value should carry canonical RFC 3339 text",
   );
+});
+
+test("a form field encodes before urlencoded serialization", async () => {
+  scriptRoute("POST", "/events/form", { status: 204 });
+
+  const transport = createTransport({ baseUrl });
+  await submitEventForm(transport, { body: { occurredAt: OCCURRED_AT, label: "form" } });
+
+  const received = requiredRequest(0);
+  assert.equal(requestHeader(received, "content-type"), "application/x-www-form-urlencoded");
+  const fields = new URLSearchParams(received.body.toString("utf8"));
+  assert.equal(fields.get("occurredAt"), "2024-03-01T12:00:00.000Z");
+  assert.equal(fields.get("label"), "form");
+});
+
+test("a multipart field encodes before part serialization", async () => {
+  scriptRoute("POST", "/events/multipart", { status: 204 });
+
+  const transport = createTransport({ baseUrl });
+  await uploadEvent(transport, { body: { occurredAt: OCCURRED_AT, label: "multipart" } });
+
+  const received = requiredRequest(0);
+  assert.match(requestHeader(received, "content-type") ?? "", /^multipart\/form-data; boundary=/);
+  const body = received.body.toString("utf8");
+  assert.match(body, /name="occurredAt"/);
+  assert.match(body, /2024-03-01T12:00:00\.000Z/);
+  assert.match(body, /name="label"/);
+  assert.match(body, /multipart/);
+});
+
+test("a discriminated body converts only the selected media arm", async () => {
+  scriptRoute("POST", "/events/discriminated", { status: 204 });
+
+  const transport = createTransport({ baseUrl });
+  await submitDiscriminatedEvent(transport, {
+    body: {
+      contentType: "application/json",
+      body: { occurredAt: OCCURRED_AT, label: "json" },
+    },
+  });
+
+  const received = requiredRequest(0);
+  assert.equal(requestHeader(received, "content-type"), "application/json");
+  const body: unknown = JSON.parse(received.body.toString("utf8"));
+  assert.deepEqual(requiredRecord(body, "discriminated request body"), {
+    occurredAt: "2024-03-01T12:00:00.000Z",
+    label: "json",
+  });
 });
 
 test("a wire value the grammar refuses is a response-transform failure", async () => {

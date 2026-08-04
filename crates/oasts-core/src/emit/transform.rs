@@ -24,13 +24,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use foldhash::HashMap;
 
-use crate::client_model::{BodyPlan, ClientModel, OperationPlan, PayloadDisposition};
+use crate::client_model::{
+    BodyPlan, ClientModel, FormFieldPlan, MultipartResponsePayload, OperationPlan,
+    PayloadDisposition, ResponseMediaPlan,
+};
 use crate::diag::Diagnostic;
 use crate::ir::{
     AdditionalProperties, Discriminator, Operation, ParamLocation, PrimitiveType, PropMeta,
     ResponseEntry, SchemaMeta, SchemaNode, SourceRef, TupleRest,
 };
-use crate::media::{is_json, is_xml};
+use crate::media::{is_json, is_xml, media_essence};
 use crate::transform::{JsonKinds, KindBranch, TransformFacts, TransformKind, UnionDispatch};
 
 use super::model::EmissionModel;
@@ -198,10 +201,9 @@ fn collect_union_refusals(
 /// Refuses every position that reaches a transform the client pipeline cannot carry.
 ///
 /// The emitted codecs convert one payload per position, keyed on the type that position declares.
-/// Three shapes declare something else: a form or multipart field serializes per field rather than
-/// as one document; a content-type-discriminated body is a union of `{ contentType, body }` shapes;
-/// a discriminated or multipart response names one type per media entry. Each is refused here,
-/// because emitting nothing for them would put a wire string behind a type that promises a `Date`.
+/// Inline-rendered response payloads and non-literal request discriminants declare shapes the
+/// operation codecs cannot carry. They are refused here because emitting nothing for them would put
+/// a wire string behind a type that promises a `Date`.
 fn unconvertible_transform_diagnostics(
     model: &EmissionModel<'_, '_>,
     plan: &OperationPlan,
@@ -215,12 +217,17 @@ fn unconvertible_transform_diagnostics(
             continue;
         }
         for entry in &response.media {
-            if model.transform_facts().reaches(&entry.schema) {
+            if inline_response_entry_transforms(model, entry) {
+                let mismatch = if response.content_type_discriminated {
+                    "its inline payload is narrowed by contentType on the result while the response converter passes only data or error to the status-wide codec"
+                } else {
+                    "its decoded multipart object is rendered inline while the response converter accepts the status-wide media alias"
+                };
                 diagnostics.push(source_diagnostic(
                     CODE_UNCONVERTIBLE_TRANSFORM,
                     format!(
-                        "response '{}' entry '{}' applies a date/time transform, which a per-media-entry payload cannot carry; set the representation back to string",
-                        response.match_key, entry.media
+                        "response '{}' entry '{}' applies a date/time transform, but {mismatch}; set the representation back to string",
+                        response.match_key, entry.media,
                     ),
                     &entry.source,
                 ));
@@ -229,45 +236,49 @@ fn unconvertible_transform_diagnostics(
     }
 }
 
+/// Whether an inline-rendered response entry actually exposes a transformed application value.
+/// Text and binary entries ignore their schemas when rendering, and multipart binary parts render
+/// `Uint8Array`; none of those positions can put a wire string behind a `Date` type.
+fn inline_response_entry_transforms(
+    model: &EmissionModel<'_, '_>,
+    entry: &ResponseMediaPlan,
+) -> bool {
+    let Some(multipart) = &entry.multipart else {
+        return is_json(media_essence(&entry.media))
+            && model.transform_facts().reaches(&entry.schema);
+    };
+    multipart
+        .parts
+        .iter()
+        .map(|part| &part.shape)
+        .chain(multipart.open.then_some(&multipart.additional))
+        .any(|shape| {
+            shape.payload != MultipartResponsePayload::Binary
+                && model.transform_facts().reaches(&shape.schema)
+        })
+}
+
 fn body_transform_refusals(
     model: &EmissionModel<'_, '_>,
     plan: Option<&BodyPlan>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    match plan {
-        Some(BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. }) => {
-            for field in fields {
-                if model.transform_facts().reaches(&field.schema) {
-                    diagnostics.push(source_diagnostic(
-                        CODE_UNCONVERTIBLE_TRANSFORM,
-                        format!(
-                            "form field '{}' applies a date/time transform, which per-field serialization cannot carry; set the representation back to string",
-                            field.name
-                        ),
-                        &field.source,
-                    ));
-                }
-            }
+    if let Some(BodyPlan::ContentTypeDiscriminated { arms, all_concrete }) = plan {
+        if !all_concrete
+            && arms.len() > 1
+            && let Some(arm) = arms
+                .iter()
+                .find(|arm| super::client::request_body_transforms(model, Some(&arm.plan)))
+        {
+            diagnostics.push(source_diagnostic(
+                CODE_UNCONVERTIBLE_TRANSFORM,
+                "a content-type-discriminated request body mixes media ranges with multiple arms, so its string contentType cannot select one date/time conversion; use concrete media types, or set the representation back to string",
+                &arm.source,
+            ));
         }
-        Some(BodyPlan::ContentTypeDiscriminated { arms, .. }) => {
-            for (_, arm) in arms {
-                if let BodyPlan::Json {
-                    schema: Some(schema),
-                    source,
-                    ..
-                } = arm
-                    && model.transform_facts().reaches(schema)
-                {
-                    diagnostics.push(source_diagnostic(
-                        CODE_UNCONVERTIBLE_TRANSFORM,
-                        "a content-type-discriminated request body applies a date/time transform, which its per-entry input shape cannot carry; set the representation back to string",
-                        source,
-                    ));
-                }
-                body_transform_refusals(model, Some(arm), diagnostics);
-            }
+        for arm in arms {
+            body_transform_refusals(model, Some(&arm.plan), diagnostics);
         }
-        _ => {}
     }
 }
 
@@ -806,15 +817,12 @@ fn operation_input_schema(
             operation_property(required),
         ));
     }
-    if let Some(BodyPlan::Json {
-        schema: Some(schema),
-        ..
-    }) = &plan.body_plan
-        && emitter.model.transform_facts().reaches(schema)
+    if let Some(body_plan) = &plan.body_plan
+        && super::client::request_body_transforms(emitter.model, Some(body_plan))
     {
         properties.push((
             "body".to_owned(),
-            schema.clone(),
+            request_body_schema(body_plan, operation.source.clone()),
             operation_property(
                 operation
                     .request_body
@@ -824,6 +832,114 @@ fn operation_input_schema(
         ));
     }
     object_schema(properties, operation.source.clone())
+}
+
+/// The request body's rendered client shape, restricted to body plans the encoder can bind.
+fn request_body_schema(plan: &BodyPlan, source: SourceRef) -> SchemaNode {
+    match plan {
+        BodyPlan::Json {
+            schema: Some(schema),
+            ..
+        } => schema.clone(),
+        BodyPlan::FormUrlencoded {
+            fields,
+            source: body_source,
+            ..
+        }
+        | BodyPlan::Multipart {
+            fields,
+            source: body_source,
+            ..
+        } => object_schema(
+            fields
+                .iter()
+                .map(|field| {
+                    (
+                        field.name.clone(),
+                        form_field_schema(field),
+                        operation_property(field.required),
+                    )
+                })
+                .collect(),
+            body_source.clone(),
+        ),
+        BodyPlan::Json { .. } | BodyPlan::TopLevelText { .. } | BodyPlan::TopLevelBinary { .. } => {
+            SchemaNode::Any {
+                meta: operation_schema_meta(source),
+            }
+        }
+        BodyPlan::ContentTypeDiscriminated { arms, all_concrete } => SchemaNode::AnyOf {
+            branches: arms
+                .iter()
+                .map(|arm| {
+                    let arm_source = arm.source.clone();
+                    object_schema(
+                        vec![
+                            (
+                                "contentType".to_owned(),
+                                string_schema(
+                                    arm_source.clone(),
+                                    all_concrete
+                                        .then(|| serde_json::Value::String(arm.media.clone())),
+                                ),
+                                operation_property(true),
+                            ),
+                            (
+                                "body".to_owned(),
+                                request_body_schema(&arm.plan, arm_source.clone()),
+                                operation_property(true),
+                            ),
+                        ],
+                        arm_source,
+                    )
+                })
+                .collect(),
+            discriminator: all_concrete.then(|| {
+                Box::new(Discriminator {
+                    property_name: "contentType".to_owned(),
+                    mapping: Vec::new(),
+                    source: source.clone(),
+                })
+            }),
+            meta: operation_schema_meta(source),
+        },
+    }
+}
+
+/// One form field's actual input shape. Content-selected values wrap their schema payload under
+/// `body`, while binary uploads render as `Blob | File` and carry no date/time value to convert.
+fn form_field_schema(field: &FormFieldPlan) -> SchemaNode {
+    if field.is_binary_upload() {
+        return SchemaNode::Any {
+            meta: operation_schema_meta(field.source.clone()),
+        };
+    }
+    if !field.wrapper.wrapped {
+        return field.schema.clone();
+    }
+    let properties = vec![
+        (
+            "body".to_owned(),
+            field.schema.clone(),
+            operation_property(true),
+        ),
+        (
+            "contentType".to_owned(),
+            string_schema(field.source.clone(), None),
+            operation_property(true),
+        ),
+    ];
+    object_schema(properties, field.source.clone())
+}
+
+fn string_schema(source: SourceRef, const_value: Option<serde_json::Value>) -> SchemaNode {
+    SchemaNode::Primitive {
+        ty: PrimitiveType::String,
+        format: None,
+        enum_values: None,
+        const_value,
+        meta: operation_schema_meta(source),
+    }
 }
 
 /// The media union represented by one response declaration in the types module.
@@ -2629,12 +2745,9 @@ mod pair_tests {
             |config| config.types.date_time = DateTimeRepresentation::Date,
         );
 
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1314"),
-            "{diagnostics:#?}"
-        );
+        let messages = unconvertible_messages(&diagnostics);
+        assert_eq!(messages.len(), 1, "{diagnostics:#?}");
+        assert!(messages[0].contains("index signature"), "{messages:?}");
     }
 
     /// Every message the unconvertible-transform refusal emitted. A loop rather than an iterator
@@ -3606,6 +3719,14 @@ mod operation_pair_tests {
             .expect("operation types")
     }
 
+    fn client_operation<'files>(files: &'files [GeneratedFile], base: &str) -> &'files str {
+        files
+            .iter()
+            .find(|file| file.relative_path == format!("client/operations/{base}.ts"))
+            .map(|file| file.content.as_str())
+            .expect("client operation")
+    }
+
     /// The messages an emission refused for a position no single codec is keyed on.
     fn refused(diagnostics: &[crate::diag::Diagnostic]) -> Vec<&str> {
         diagnostics
@@ -3626,11 +3747,11 @@ mod operation_pair_tests {
     }
 
     #[test]
-    fn a_converting_form_field_is_refused() {
-        let (_files, diagnostics, _has_errors) = compile_document(
+    fn a_converting_form_body_emits_a_field_encoder() {
+        let (files, diagnostics, has_errors) = compile_document(
             operation_document(
                 json!({
-                    "operationId": "readEvent",
+                    "operationId": "submitEventForm",
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -3640,8 +3761,6 @@ mod operation_pair_tests {
                                     "required": ["at"],
                                     "properties": {
                                         "at": { "type": "string", "format": "date-time" },
-                                        // Converts nothing, so the refusal walk's negative branch
-                                        // runs alongside its positive one.
                                         "label": { "type": "string" }
                                     }
                                 }
@@ -3655,24 +3774,76 @@ mod operation_pair_tests {
             date_mode,
         );
 
-        let messages = refused(&diagnostics);
-        assert_eq!(messages.len(), 1, "{diagnostics:#?}");
-        assert!(messages[0].contains("form field 'at'"), "{messages:?}");
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(refused(&diagnostics).is_empty(), "{diagnostics:#?}");
+        let content = operation_module(&files, "submiteventform").expect("operation codec");
+        assert!(
+            content.contains("at: encodeDateTimeDate(value.body.at"),
+            "{content}"
+        );
+        assert!(!content.contains("value.body.label"), "{content}");
     }
 
     #[test]
-    fn a_converting_discriminated_request_body_is_refused() {
-        let (_files, diagnostics, _has_errors) = compile_document(
+    fn a_converting_multipart_body_emits_the_exact_field_key() {
+        let (files, diagnostics, has_errors) = compile_document(
             operation_document(
                 json!({
-                    "operationId": "readEvent",
+                    "operationId": "uploadEvent",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["happened-at"],
+                                    "properties": {
+                                        "happened-at": {
+                                            "type": "string",
+                                            "format": "date-time"
+                                        },
+                                        "label": { "type": "string" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": { "204": { "description": "ok" } }
+                }),
+                json!({}),
+            ),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(refused(&diagnostics).is_empty(), "{diagnostics:#?}");
+        let content = operation_module(&files, "uploadevent").expect("operation codec");
+        assert!(
+            content.contains("\"happened-at\": encodeDateTimeDate(value.body[\"happened-at\"]"),
+            "{content}"
+        );
+        assert!(!content.contains("value.body.label"), "{content}");
+    }
+
+    #[test]
+    fn a_discriminated_request_body_dispatches_only_to_the_converting_arm() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "submitEvent",
                     "requestBody": {
                         "required": true,
                         "content": {
                             "application/json": {
                                 "schema": { "$ref": "#/components/schemas/Event" }
                             },
-                            "text/plain": { "schema": { "type": "string" } }
+                            "application/vnd.label+json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["label"],
+                                    "properties": { "label": { "type": "string" } }
+                                }
+                            }
                         }
                     },
                     "responses": { "204": { "description": "ok" } }
@@ -3682,17 +3853,146 @@ mod operation_pair_tests {
             date_mode,
         );
 
-        let messages = refused(&diagnostics);
-        assert_eq!(messages.len(), 1, "{diagnostics:#?}");
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(refused(&diagnostics).is_empty(), "{diagnostics:#?}");
+        let content = operation_module(&files, "submitevent").expect("operation codec");
         assert!(
-            messages[0].contains("content-type-discriminated request body"),
-            "{messages:?}"
+            content.contains("value.body.contentType === \"application/json\""),
+            "{content}"
+        );
+        assert!(
+            content.contains("body: encodeEvent(value.body.body"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("value.body.contentType === \"application/vnd.label+json\""),
+            "{content}"
+        );
+
+        let client = client_operation(&files, "submitevent");
+        assert!(
+            client.contains("contentType: \"application/json\""),
+            "{client}"
+        );
+        assert!(
+            client.contains("contentType: \"application/vnd.label+json\""),
+            "{client}"
         );
     }
 
     #[test]
-    fn a_converting_discriminated_response_entry_is_refused() {
-        let (_files, diagnostics, _has_errors) = compile_document(
+    fn a_transforming_request_body_mixed_with_a_media_range_is_refused() {
+        let (_files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "submitRangedEvent",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/Event" }
+                            },
+                            "text/*": { "schema": { "type": "string" } }
+                        }
+                    },
+                    "responses": { "204": { "description": "ok" } }
+                }),
+                event_schema(),
+            ),
+            date_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        assert_eq!(
+            refused(&diagnostics),
+            [
+                "a content-type-discriminated request body mixes media ranges with multiple arms, so its string contentType cannot select one date/time conversion; use concrete media types, or set the representation back to string"
+            ],
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn concrete_request_body_arms_encode_their_rendered_input_shapes() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "submitFlexibleEvent",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {},
+                            "application/octet-stream": {},
+                            "application/problem+json": {
+                                "schema": { "$ref": "#/components/schemas/Problem" }
+                            },
+                            "application/x-www-form-urlencoded": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["label"],
+                                    "properties": { "label": { "type": "string" } }
+                                }
+                            },
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["archive", "occurredAt"],
+                                    "properties": {
+                                        "archive": {},
+                                        "occurredAt": {
+                                            "type": "string",
+                                            "format": "date-time"
+                                        }
+                                    }
+                                },
+                                "encoding": {
+                                    "occurredAt": { "contentType": "text/plain, text/*" }
+                                }
+                            },
+                            "text/plain": { "schema": { "type": "string" } }
+                        }
+                    },
+                    "responses": { "204": { "description": "ok" } }
+                }),
+                json!({
+                    "Problem": {
+                        "type": "object",
+                        "properties": { "detail": { "type": "string" } }
+                    }
+                }),
+            ),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(refused(&diagnostics).is_empty(), "{diagnostics:#?}");
+        let content = operation_module(&files, "submitflexibleevent").expect("operation codec");
+        assert!(
+            content.contains("value.body.contentType === \"multipart/form-data\""),
+            "{content}"
+        );
+        assert!(
+            content.contains("encodeDateTimeDate(value.body.body.occurredAt.body"),
+            "{content}"
+        );
+        assert!(!content.contains("value.body.body.archive"), "{content}");
+
+        let client = client_operation(&files, "submitflexibleevent");
+        assert!(
+            client.contains("contentType: \"application/json\"; body: unknown"),
+            "{client}"
+        );
+        assert!(client.contains("body: Problem"), "{client}");
+        assert!(client.contains("archive: Blob | File"), "{client}");
+        assert!(
+            client.contains("occurredAt: { body: Date; contentType: string }"),
+            "{client}"
+        );
+    }
+
+    #[test]
+    fn a_converting_discriminated_response_entry_is_refused_before_an_unsafe_binding() {
+        let (files, diagnostics, has_errors) = compile_document(
             operation_document(
                 json!({
                     "operationId": "readEvent",
@@ -3721,7 +4021,135 @@ mod operation_pair_tests {
             2,
             "one per declared media entry: {diagnostics:#?}"
         );
-        assert!(messages[0].contains("response '200' entry"), "{messages:?}");
+        assert!(has_errors, "{diagnostics:#?}");
+        assert!(
+            messages[0].contains("narrowed by contentType on the result"),
+            "{messages:?}"
+        );
+        let client = client_operation(&files, "readevent");
+        assert!(
+            client.contains("contentType: \"application/json\""),
+            "{client}"
+        );
+        assert!(!client.contains("ReadEventResultWire"), "{client}");
+        assert!(!client.contains("decodeReadEventResponse200"), "{client}");
+    }
+
+    #[test]
+    fn a_converting_multipart_response_part_is_refused_with_its_own_reason() {
+        let (_files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "downloadEvent",
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "event": { "$ref": "#/components/schemas/Event" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+                event_schema(),
+            ),
+            date_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        assert_eq!(
+            refused(&diagnostics),
+            [
+                "response '200' entry 'multipart/form-data' applies a date/time transform, but its decoded multipart object is rendered inline while the response converter accepts the status-wide media alias; set the representation back to string"
+            ],
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn a_multipart_binary_part_does_not_claim_a_transform() {
+        let (_files, diagnostics, has_errors) = compile_document(
+            json!({
+                "openapi": "3.0.3",
+                "info": { "title": "t", "version": "1" },
+                "paths": {
+                    "/events": {
+                        "post": {
+                            "operationId": "downloadArchive",
+                            "responses": {
+                                "200": {
+                                    "description": "ok",
+                                    "content": {
+                                        "multipart/form-data": {
+                                            "schema": {
+                                                "type": "object",
+                                                "additionalProperties": false,
+                                                "properties": {
+                                                    "archive": {
+                                                        "type": "string",
+                                                        "format": "binary"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "components": { "schemas": event_schema() }
+            }),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(refused(&diagnostics).is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_converting_open_multipart_fallback_is_refused() {
+        let (_files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "downloadEventFields",
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "additionalProperties": {
+                                            "type": "string",
+                                            "format": "date-time"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+                json!({}),
+            ),
+            date_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        assert_eq!(
+            refused(&diagnostics),
+            [
+                "response '200' entry 'multipart/form-data' applies a date/time transform, but its decoded multipart object is rendered inline while the response converter accepts the status-wide media alias; set the representation back to string"
+            ],
+            "{diagnostics:#?}"
+        );
     }
 
     #[test]

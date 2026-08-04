@@ -39,10 +39,11 @@ use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
     CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode,
     TypeAxis, TypePosition, callback_operation, callback_parent_operation, import_extension,
-    lowercase_first, media_tag, property_in_position, push_indent, render_json_compact,
-    render_ts_string, response_status_type_suffix, source_diagnostic, uppercase_first,
-    warning_diagnostic,
+    lowercase_first, property_in_position, push_indent, render_json_compact, render_ts_string,
+    request_body_validator_positions, response_media_names, response_status_type_suffix,
+    source_diagnostic, uppercase_first, warning_diagnostic,
 };
+use crate::client_model::{PrimitiveDomainProjector, build_body_plan};
 use crate::media::is_json;
 
 /// Emitted verbatim as `validators/runtime.ts`; the generated-validator call ABI is fixed to it.
@@ -57,7 +58,7 @@ const CODE_REJECTED_KEYWORD: &str = "OASTS1501";
 const CODE_UNKNOWN_LEAF: &str = "OASTS1502";
 /// An applicator's subschema is not fully checkable, so emitting the outer check would be unsound.
 const CODE_INCOMPLETE_APPLICATOR: &str = "OASTS1503";
-/// Two JSON media entries on one response mangle to the same validator-name fragment.
+/// A JSON response media entry was renamed because its validator-name fragment collided.
 const CODE_MEDIA_TAG_COLLISION: &str = "OASTS1400";
 
 /// TypeScript aborts control-flow analysis at 2,000 recursive flow-node visits. The estimate below
@@ -73,8 +74,8 @@ const VALIDATOR_CFA_BUDGET: usize = 1_000;
 /// A response with a single JSON entry keeps the plain `validate{Stem}Response{Suffix}` name — the
 /// common case, where a second entry exists but is not JSON. Two or more JSON entries each get
 /// their own validator, suffixed by the media tag, because they are separate schemas the client
-/// selects between on `contentType`. A tag collision is fatal rather than silently disambiguated:
-/// the compiler never invents a suffix a caller cannot predict from the document.
+/// selects between on `contentType`. The shared response-media allocator resolves tag collisions
+/// positionally from the response's document order, so declaration and client-call names agree.
 fn response_body_validators<'ir>(
     response: &'ir crate::ir::ResponseEntry,
     stem: &str,
@@ -86,28 +87,27 @@ fn response_body_validators<'ir>(
         .iter()
         .filter(|media| is_json(&media.essence))
         .collect();
-    let Some(first) = json.first() else {
+    if json.is_empty() {
         return Vec::new();
-    };
-    if json.len() == 1 {
-        return vec![(format!("{stem}Response{suffix}"), &first.schema)];
     }
+    let media = json
+        .iter()
+        .map(|media| media.full.as_str())
+        .collect::<Vec<_>>();
+    let names = response_media_names(&format!("{stem}Response{suffix}"), &media);
     let mut named: Vec<(String, &SchemaNode)> = Vec::new();
-    let mut claimed: BTreeMap<String, &str> = BTreeMap::new();
-    for media in json {
-        let name = format!("{stem}Response{suffix}{}", media_tag(&media.full));
-        if let Some(previous) = claimed.insert(name.clone(), &media.full) {
-            sink.push(source_diagnostic(
+    for (media, name) in json.into_iter().zip(names) {
+        if let Some(previous) = name.collision {
+            sink.push(warning_diagnostic(
                 CODE_MEDIA_TAG_COLLISION,
                 format!(
-                    "response media types '{previous}' and '{}' produce the same validator name '{name}'",
-                    media.full
+                    "response media type '{}' produces the same validator name as '{previous}'; emitting it as '{}'",
+                    media.full, name.name
                 ),
                 &media.source,
             ));
-            continue;
         }
-        named.push((name, &media.schema));
+        named.push((name.name, &media.schema));
     }
     named
 }
@@ -138,6 +138,10 @@ const VALIDATOR_RESERVED_NAMES: &[&str] = &[
 
 pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
     let analyzed = model.analyzed;
+    // Built once per document, never per operation: this indexes every schema in the IR and
+    // walks each one's projection dependencies, so constructing it inside the operation loop
+    // would make request-body planning cost O(operations x schemas).
+    let projector = PrimitiveDomainProjector::new(&analyzed.ir);
 
     // Reject-handling walk: reachable schemas with unsupported keywords or unknown-leaf degradation
     // fail the run. Every component and every operation position is emitted, so walking the
@@ -199,7 +203,12 @@ pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> V
         if model.operation_files[allocated.operation_index].is_none() {
             continue;
         }
-        if let Some(file) = emit_operation(model, allocated.operation_index, &allocated.name) {
+        if let Some(file) = emit_operation(
+            model,
+            &projector,
+            allocated.operation_index,
+            &allocated.name,
+        ) {
             files.push(file);
         }
     }
@@ -213,6 +222,7 @@ pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> V
                 [allocated.operation_index];
             if let Some(file) = emit_operation_file(
                 model,
+                &projector,
                 operation,
                 &allocated.stem,
                 "webhooks",
@@ -233,6 +243,7 @@ pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> V
             let operation = callback_operation(&analyzed.ir, &analyzed.callback_names, allocated);
             if let Some(file) = emit_operation_file(
                 model,
+                &projector,
                 operation,
                 &allocated.stem,
                 "callbacks",
@@ -3754,6 +3765,7 @@ fn emit_component(
 
 fn emit_operation(
     model: &mut EmissionModel<'_, '_>,
+    projector: &PrimitiveDomainProjector<'_>,
     operation_index: usize,
     allocated_name: &str,
 ) -> Option<GeneratedFile> {
@@ -3762,6 +3774,7 @@ fn emit_operation(
     let operation = &analyzed.ir.operations[operation_index];
     emit_operation_file(
         model,
+        projector,
         operation,
         allocated_name,
         "operations",
@@ -3772,6 +3785,7 @@ fn emit_operation(
 
 fn emit_operation_file(
     model: &mut EmissionModel<'_, '_>,
+    projector: &PrimitiveDomainProjector<'_>,
     operation: &Operation,
     allocated_name: &str,
     directory: &str,
@@ -3780,8 +3794,15 @@ fn emit_operation_file(
 ) -> Option<GeneratedFile> {
     let stem = uppercase_first(allocated_name);
 
+    // Held across `positions` because a form field's schema is a projector-resolved clone owned by
+    // the plan rather than a node the IR can lend.
+    let body_plan = operation
+        .request_body
+        .as_ref()
+        .and_then(|body| build_body_plan(&body.media_types, projector));
+
     // Deterministic list of (export type name, schema, wire position) to validate: every parameter,
-    // the JSON request body, and every JSON response branch (4XX/default included).
+    // every request-body position, and every JSON response branch (4XX/default included).
     let mut positions: Vec<(String, &SchemaNode, TypePosition)> = Vec::new();
     for (export_type, parameter) in operation_parameter_validator_names(operation, &stem)
         .into_iter()
@@ -3789,17 +3810,10 @@ fn emit_operation_file(
     {
         positions.push((export_type, &parameter.schema, TypePosition::Request));
     }
-    if let Some(body) = &operation.request_body
-        && let Some(media) = body
-            .media_types
-            .iter()
-            .find(|media| is_json(&media.essence))
-    {
-        positions.push((
-            format!("{stem}RequestBody"),
-            &media.schema,
-            TypePosition::Request,
-        ));
+    if let Some(body) = &operation.request_body {
+        for position in request_body_validator_positions(body, body_plan.as_ref(), &stem) {
+            positions.push((position.name, position.schema, TypePosition::Request));
+        }
     }
     if include_responses {
         let mut responses: Vec<(String, &SchemaNode)> = Vec::new();
@@ -4458,6 +4472,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::client_model::build_client_model;
     use crate::config::load_config;
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
     use crate::emit::emit_artifacts;
@@ -4500,13 +4515,19 @@ mod tests {
         let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
         let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let source_tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
+        let client = if resolved.artifacts.client.enabled {
+            Some(build_client_model(&analyzed, &resolved, &mut sink))
+        } else {
+            None
+        };
         let files = emit_artifacts(
             &analyzed,
             &resolved,
-            &graph.source_tuples(),
-            None,
+            &source_tuples,
+            client.as_ref(),
             &mut sink,
         );
         (files, sink.into_sorted_vec())
@@ -5135,6 +5156,15 @@ mod tests {
             .clone()
     }
 
+    fn generated(files: &[GeneratedFile], relative_path: &str) -> String {
+        files
+            .iter()
+            .find(|file| file.relative_path == relative_path)
+            .expect("generated file")
+            .content
+            .clone()
+    }
+
     fn two_json_response_document(second_media: &str) -> Value {
         json!({
             "openapi": "3.1.0",
@@ -5234,10 +5264,8 @@ mod tests {
     }
 
     #[test]
-    fn oasts1400_rejects_colliding_media_tags() {
-        // `application/json;a-b=1` and `application/json;a.b=1` mangle identically. The compiler
-        // reports it rather than inventing a disambiguating suffix.
-        let (_files, diagnostics) = compile(json!({
+    fn oasts1400_warns_and_aliases_colliding_media_tags() {
+        let document = json!({
             "openapi": "3.1.0",
             "info": { "title": "t", "version": "1" },
             "paths": {
@@ -5256,40 +5284,165 @@ mod tests {
                     }
                 }
             }
-        }));
+        });
+        let (files, diagnostics) = compile_with_config(
+            document,
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "validators": true },
+                "client": {
+                    "authEnforcement": "types",
+                    "baseUrl": { "source": "literal", "value": "https://api.example.test" }
+                },
+                "validation": {
+                    "engine": "generated",
+                    "request": false,
+                    "response": true,
+                    "unchecked": "allow"
+                }
+            }),
+        );
+        assert_clean(&diagnostics);
         let collision = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == CODE_MEDIA_TAG_COLLISION)
             .expect("collision diagnostic");
-        assert_eq!(collision.severity, Severity::Error);
+        assert_eq!(collision.severity, Severity::Warning);
+        assert!(collision.message.contains("application/json;a-b=1"));
+        assert!(collision.message.contains("application/json;a.b=1"));
         assert!(
             collision
                 .message
-                .contains("validateReadthingResponse200ApplicationJsonAB")
-                || collision
-                    .message
-                    .contains("ReadthingResponse200ApplicationJsonAB"),
+                .contains("ReadthingResponse200ApplicationJsonAB12"),
             "{}",
             collision.message
         );
+        let content = operation_validators(&files, "readthing");
+        assert!(
+            content.contains("validateReadthingResponse200ApplicationJsonAB1("),
+            "{content}"
+        );
+        assert!(
+            content.contains("validateReadthingResponse200ApplicationJsonAB12("),
+            "{content}"
+        );
+        let client = generated(&files, "client/operations/readthing.ts");
+        for name in [
+            "validateReadthingResponse200ApplicationJsonAB1",
+            "validateReadthingResponse200ApplicationJsonAB12",
+        ] {
+            assert!(
+                content.contains(&format!("export function {name}(")),
+                "{content}"
+            );
+            assert!(client.contains(&format!("{name}(result.data")), "{client}");
+        }
     }
 
     #[test]
-    fn media_tag_is_total_over_every_byte_class() {
-        assert_eq!(media_tag("application/json"), "ApplicationJson");
+    fn three_colliding_media_tags_increment_the_alias() {
+        let (files, diagnostics) = compile(json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/thing": {
+                    "get": {
+                        "operationId": "readthing",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json;a-b=1": { "schema": { "type": "string" } },
+                                    "application/json;a.b=1": { "schema": { "type": "boolean" } },
+                                    "application/json;a+b=1": { "schema": { "type": "integer" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        assert_clean(&diagnostics);
+        let aliases = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_MEDIA_TAG_COLLISION)
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 2, "{diagnostics:#?}");
+        assert!(aliases.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("ReadthingResponse200ApplicationJsonAB12")
+        }));
+        assert!(aliases.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("ReadthingResponse200ApplicationJsonAB13")
+        }));
+        let content = operation_validators(&files, "readthing");
+        for name in [
+            "validateReadthingResponse200ApplicationJsonAB1",
+            "validateReadthingResponse200ApplicationJsonAB12",
+            "validateReadthingResponse200ApplicationJsonAB13",
+        ] {
+            assert!(
+                content.contains(&format!("export function {name}(")),
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_media_names_use_media_tags_for_multiple_json_entries() {
+        let media = ["application/json", "application/vnd.api+json"];
+        let names = response_media_names("ReadthingResponse200", &media);
+        assert_eq!(names[0].name, "ReadthingResponse200ApplicationJson");
+        assert_eq!(names[1].name, "ReadthingResponse200ApplicationVndApiJson");
+        let media = ["application/json;stream=watch", "text/*", "*/*"];
+        let names = response_media_names("ReadthingResponse200", &media);
         assert_eq!(
-            media_tag("application/vnd.api+json"),
-            "ApplicationVndApiJson"
+            names[0].name,
+            "ReadthingResponse200ApplicationJsonStreamWatch"
         );
-        assert_eq!(
-            media_tag("application/json;stream=watch"),
-            "ApplicationJsonStreamWatch"
-        );
-        assert_eq!(media_tag("text/*"), "TextWildcard");
-        assert_eq!(media_tag("*/*"), "WildcardWildcard");
+        assert_eq!(names[1].name, "ReadthingResponse200TextWildcard");
+        assert_eq!(names[2].name, "ReadthingResponse200WildcardWildcard");
         // A leading digit and a bare separator run both survive without producing empty tokens.
-        assert_eq!(media_tag("application/3d-model"), "Application3dModel");
-        assert_eq!(media_tag("---"), "");
+        let media = ["application/3d-model", "---"];
+        let names = response_media_names("ReadthingResponse200", &media);
+        assert_eq!(names[0].name, "ReadthingResponse200Application3dModel");
+        assert_eq!(names[1].name, "ReadthingResponse200Media");
+    }
+
+    #[test]
+    fn response_media_names_disambiguate_in_document_order() {
+        let media = [
+            "application/json;a-b=1",
+            "application/json;a.b=1",
+            "application/json;a+b=1",
+        ];
+        let names = response_media_names("ReadthingResponse200", &media);
+        assert_eq!(names[0].name, "ReadthingResponse200ApplicationJsonAB1");
+        assert_eq!(names[1].name, "ReadthingResponse200ApplicationJsonAB12");
+        assert_eq!(names[2].name, "ReadthingResponse200ApplicationJsonAB13");
+        assert_eq!(names[1].collision, Some(media[0]));
+        assert_eq!(names[2].collision, Some(media[0]));
+
+        // The literal `Tag2` owner makes the later `Tag` collision advance to `Tag3`.
+        let media = ["a-a", "a-a2", "a.a"];
+        let names = response_media_names("Response", &media);
+        assert_eq!(names[0].name, "ResponseAA");
+        assert_eq!(names[1].name, "ResponseAA2");
+        assert_eq!(names[2].name, "ResponseAA3");
+    }
+
+    #[test]
+    fn response_media_names_alias_empty_tags() {
+        let media = ["---", "..."];
+        let names = response_media_names("ReadthingResponse200", &media);
+        assert_eq!(names[0].name, "ReadthingResponse200Media");
+        assert_eq!(names[1].name, "ReadthingResponse200Media2");
+        assert_eq!(names[1].collision, Some(media[0]));
     }
 
     #[test]

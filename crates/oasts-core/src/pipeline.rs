@@ -551,7 +551,7 @@ components:
     }
 
     #[test]
-    fn pasted_schema_collision_suggestions_generate_without_a_path_collision() {
+    fn pasted_collision_suggestions_generate_without_a_path_collision() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("openapi.yaml"),
@@ -580,6 +580,15 @@ components:
   schemas:
     createdAt: { type: string }
     CreatedAt: { type: string }
+webhooks:
+  petCreated:
+    get:
+      responses:
+        "200": { description: ok }
+  pet-created:
+    get:
+      responses:
+        "200": { description: ok }
 "##,
         )
         .expect("OpenAPI");
@@ -598,6 +607,8 @@ components:
         let rendered = crate::diag::render_to_string(sink.into_sorted_vec());
         assert!(rendered.contains("      'CreatedAt': 'CreatedAt_1'\n"));
         assert!(rendered.contains("      'createdAt': 'CreatedAt_2'\n"));
+        assert!(rendered.contains("      'pet-created': 'PetCreated_1'\n"));
+        assert!(rendered.contains("      'petCreated': 'PetCreated_2'\n"));
 
         let resolved = json!({
             "schemaVersion": 1,
@@ -608,6 +619,10 @@ components:
                     "schemas": {
                         "CreatedAt": "CreatedAt_1",
                         "createdAt": "CreatedAt_2"
+                    },
+                    "webhooks": {
+                        "pet-created": "PetCreated_1",
+                        "petCreated": "PetCreated_2"
                     },
                     "operations": {
                         "get-lower": "fetchLower"
@@ -630,6 +645,8 @@ components:
         assert!(paths.contains("types/components/createdat-1.ts"));
         assert!(paths.contains("types/components/createdat-2.ts"));
         assert!(paths.contains("types/operations/fetchlower.ts"));
+        assert!(paths.contains("types/webhooks/petcreated-1get.ts"));
+        assert!(paths.contains("types/webhooks/petcreated-2get.ts"));
         assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
     }
 

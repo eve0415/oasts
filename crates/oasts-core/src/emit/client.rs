@@ -20,17 +20,15 @@ use crate::ir::{
 use crate::media::{is_json, media_essence};
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
-use super::media_tag;
-
 use super::model::EmissionModel;
 use super::paths::{TRANSFORM_SUBDIR, relative_import};
 use super::runtime_assets::{RuntimeSelection, emit_runtime_files};
 use super::validators::operation_parameter_validator_names;
 use super::{
-    ClientDocKind, Emitter as TypesEmitter, GeneratedFile, TypeAxis, TypePosition,
-    assign_import_aliases, encode_comment_text, import_clause, import_extension, push_indent,
-    render_property_key, render_ts_string, uppercase_first, write_client_operation_tsdoc,
-    write_source_metadata,
+    ClientDocKind, Emitter as TypesEmitter, GeneratedFile, RequestBodyAccess, TypeAxis,
+    TypePosition, assign_import_aliases, encode_comment_text, import_clause, import_extension,
+    push_indent, render_property_key, render_ts_string, request_body_validator_positions,
+    response_media_names, uppercase_first, write_client_operation_tsdoc, write_source_metadata,
 };
 
 pub(crate) fn emit_client_from_model(
@@ -340,7 +338,15 @@ fn emit_operation(
             );
         }
         if let Some(body) = &plan.body_plan {
-            collect_body_imports(&renderer, body, &mut component_imports);
+            collect_body_imports(
+                &renderer,
+                body,
+                TypeAxis::Application,
+                &mut component_imports,
+            );
+            if request_transforms {
+                collect_body_imports(&renderer, body, TypeAxis::Wire, &mut component_imports);
+            }
         }
         // A content-type-discriminated branch renders each media entry's own schema inline instead
         // of the status-wide alias, so those entries' component references import from here.
@@ -728,6 +734,10 @@ struct RequestCheck {
     /// Skip the call when the value is `undefined`, mirroring the transport's serialization
     /// presence test (`input[name] === undefined` is never serialized, so it is never validated).
     guarded: bool,
+    /// For a content-type-discriminated body arm: the `contentType` accessor and the media value
+    /// that selects this check. The test doubles as the presence guard, so such a check is never
+    /// additionally `guarded`.
+    content_type: Option<(String, String)>,
 }
 
 /// One JSON body validator call inside a documented branch: which `contentType` selects it (absent
@@ -780,9 +790,10 @@ struct ResponseTransform {
 /// order.
 ///
 /// A branch that renders its payload inline — content-type discriminated, or multipart — names one
-/// type per media entry rather than the status-wide alias the emitted codec is keyed on, so it
-/// cannot bind here. `unconvertible_transform_diagnostics` refuses those rather than leaving one
-/// silently unconverted under a type that says it converted.
+/// type per media entry rather than the status-wide alias the emitted codec is keyed on. Its media
+/// discriminant also lives beside `data` or `error`, while `write_response_transform` passes only
+/// that payload to the codec, so it cannot bind here. `unconvertible_transform_diagnostics` refuses
+/// those rather than leaving one silently unconverted under a type that says it converted.
 fn response_transform_flags(model: &EmissionModel<'_, '_>, plan: &OperationPlan) -> Vec<bool> {
     if !model.transform_facts().enabled() {
         return Vec::new();
@@ -825,21 +836,34 @@ pub(super) fn request_transform_binding(
     }
     plan.param_plans.iter().any(|parameter| {
         !parameter.caller_serialized && model.transform_facts().reaches(&parameter.schema)
-    }) || json_body_transforms(model, plan.body_plan.as_ref())
+    }) || request_body_transforms(model, plan.body_plan.as_ref())
 }
 
-/// Whether a request body's JSON payload converts, following the discriminated arms the same way
-/// the body renderer does.
-fn json_body_transforms(model: &EmissionModel<'_, '_>, plan: Option<&BodyPlan>) -> bool {
+/// Whether a request body carries an application value the operation encoder converts.
+pub(super) fn request_body_transforms(
+    model: &EmissionModel<'_, '_>,
+    plan: Option<&BodyPlan>,
+) -> bool {
     match plan {
         Some(BodyPlan::Json {
             schema: Some(schema),
             ..
         }) => model.transform_facts().reaches(schema),
-        // A discriminated body is a union of `{ contentType, body }` shapes, not one payload the
-        // operation's encoder is keyed on; it is refused rather than bound.
+        Some(BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. }) => {
+            fields
+                .iter()
+                .any(|field| form_field_transforms(model, field))
+        }
+        Some(BodyPlan::ContentTypeDiscriminated { arms, .. }) => arms
+            .iter()
+            .any(|arm| request_body_transforms(model, Some(&arm.plan))),
         _ => false,
     }
+}
+
+/// Whether one rendered form field carries its schema value rather than a binary upload handle.
+pub(super) fn form_field_transforms(model: &EmissionModel<'_, '_>, field: &FormFieldPlan) -> bool {
+    !field.is_binary_upload() && model.transform_facts().reaches(&field.schema)
 }
 
 fn response_transform_bindings(
@@ -917,23 +941,85 @@ fn request_validation_checks(
                 render_ts_string(&parameter.name)
             ),
             guarded: true,
+            content_type: None,
         });
     }
-    if let Some(BodyPlan::Json { .. }) = &plan.body_plan {
-        // A required body is always sent, so it is validated unconditionally; an optional body is
-        // skipped when absent, matching the parameter presence rule.
-        let required = operation
-            .request_body
-            .as_ref()
-            .is_some_and(|body| body.required);
-        checks.push(RequestCheck {
-            access: input_member(InputMember::Body, root),
-            validator: format!("validate{stem}RequestBody"),
-            base_path: "[\"body\"]".to_owned(),
-            guarded: !required,
-        });
+    // A required body is always sent, so it is validated unconditionally; an optional body — or any
+    // member reached through one — is skipped when absent, matching the parameter presence rule.
+    // Which positions exist, and what each is called, is decided in one place for all three
+    // emitters; a position with no sound access path is declared but never called.
+    if let Some(body) = &operation.request_body {
+        for position in request_body_validator_positions(body, plan.body_plan.as_ref(), stem) {
+            let Some(access) = position.access else {
+                continue;
+            };
+            let content_type = match &access {
+                RequestBodyAccess::Arm { media } => {
+                    let chain = if body.required { "." } else { "?." };
+                    let discriminant = format!(
+                        "{}{chain}contentType",
+                        input_member(InputMember::Body, root)
+                    );
+                    Some((discriminant, media.clone()))
+                }
+                RequestBodyAccess::Whole | RequestBodyAccess::Field { .. } => None,
+            };
+            checks.push(RequestCheck {
+                access: body_member_access(&access, root, body.required),
+                base_path: body_member_path(&access),
+                validator: format!("validate{}", position.name),
+                guarded: position.guarded,
+                content_type,
+            });
+        }
     }
     checks
+}
+
+/// The accessor for one request-body validator position, rooted at the dispatched object.
+///
+/// Every hop that can be absent is optional-chained: the body itself when it is not required, and a
+/// wrapper object when its field is optional. A guarded check then tests the whole expression, so an
+/// absent hop short-circuits to `undefined` and the call is skipped rather than throwing.
+fn body_member_access(access: &RequestBodyAccess, root: &str, body_required: bool) -> String {
+    let base = input_member(InputMember::Body, root);
+    let chain = if body_required { "." } else { "?." };
+    match access {
+        RequestBodyAccess::Whole => base,
+        RequestBodyAccess::Field { key, wrapped } => {
+            let property = render_property_key(key);
+            // A non-identifier key is bracket-accessed, and a bracket follows the object directly:
+            // `x.["k"]` is not TypeScript, while the optional form `x?.["k"]` is.
+            let mut access = if property == *key {
+                format!("{base}{chain}{key}")
+            } else if body_required {
+                format!("{base}[{property}]")
+            } else {
+                format!("{base}?.[{property}]")
+            };
+            if *wrapped {
+                access.push_str("?.body");
+            }
+            access
+        }
+        RequestBodyAccess::Arm { .. } => format!("{base}{chain}body"),
+    }
+}
+
+/// The issue path for one request-body validator position, mirroring the accessor hop for hop.
+fn body_member_path(access: &RequestBodyAccess) -> String {
+    match access {
+        RequestBodyAccess::Whole => "[\"body\"]".to_owned(),
+        RequestBodyAccess::Field { key, wrapped } => {
+            let key = render_ts_string(key);
+            if *wrapped {
+                format!("[\"body\", {key}, \"body\"]")
+            } else {
+                format!("[\"body\", {key}]")
+            }
+        }
+        RequestBodyAccess::Arm { .. } => "[\"body\", \"body\"]".to_owned(),
+    }
 }
 
 /// The response-side checks: each documented branch whose decoded body is JSON and carries an
@@ -987,22 +1073,23 @@ fn body_validation_checks(response: &ResponsePlan, stem: &str) -> Vec<BodyCheck>
     }
     let body = response_body_side(response.kind, &response.match_key);
     let base = response_type_name(stem, response);
+    let media_names = json
+        .iter()
+        .map(|media| media.media.as_str())
+        .collect::<Vec<_>>();
+    let names = response_media_names(&format!("validate{base}"), &media_names);
     if !response.content_type_discriminated {
         return vec![BodyCheck {
             content_type: None,
-            validator: format!("validate{base}"),
+            validator: names.into_iter().next().expect("one JSON media entry").name,
             body,
         }];
     }
-    let tagged = json.len() > 1;
     json.into_iter()
-        .map(|media| BodyCheck {
+        .zip(names)
+        .map(|(media, name)| BodyCheck {
             content_type: Some(media.media.clone()),
-            validator: if tagged {
-                format!("validate{base}{}", media_tag(&media.media))
-            } else {
-                format!("validate{base}")
-            },
+            validator: name.name,
             body,
         })
         .collect()
@@ -1116,8 +1203,15 @@ fn result_function_body(
     if !request.is_empty() {
         body.push_str("  const requestIssues: Issue[] = [];\n");
         for check in request {
-            if check.guarded {
-                body.push_str(&format!("  if ({} !== undefined) {{\n", check.access));
+            let condition = match (&check.content_type, check.guarded) {
+                (Some((discriminant, media)), _) => {
+                    Some(format!("{discriminant} === {}", render_ts_string(media)))
+                }
+                (None, true) => Some(format!("{} !== undefined", check.access)),
+                (None, false) => None,
+            };
+            if let Some(condition) = condition {
+                body.push_str(&format!("  if ({condition}) {{\n"));
                 body.push_str(&format!(
                     "    {}({}, {}, requestIssues);\n",
                     check.validator, check.access, check.base_path
@@ -1463,9 +1557,7 @@ fn operation_type_imports(
 fn body_uses_json_alias(plan: &BodyPlan) -> bool {
     match plan {
         BodyPlan::Json { .. } => true,
-        BodyPlan::ContentTypeDiscriminated { arms, .. } => {
-            arms.iter().any(|(_, arm)| body_uses_json_alias(arm))
-        }
+        BodyPlan::ContentTypeDiscriminated { .. } => json_body_count(plan) == 1,
         BodyPlan::TopLevelText { .. }
         | BodyPlan::TopLevelBinary { .. }
         | BodyPlan::FormUrlencoded { .. }
@@ -1476,6 +1568,7 @@ fn body_uses_json_alias(plan: &BodyPlan) -> bool {
 fn collect_body_imports(
     renderer: &TypesEmitter<'_, '_, '_>,
     plan: &BodyPlan,
+    axis: TypeAxis,
     imports: &mut BTreeMap<String, BTreeSet<String>>,
 ) {
     match plan {
@@ -1484,18 +1577,51 @@ fn collect_body_imports(
                 renderer.collect_operation_imports(
                     &field.schema,
                     TypePosition::Request,
-                    TypeAxis::Application,
+                    axis,
                     imports,
                 );
             }
         }
         BodyPlan::ContentTypeDiscriminated { arms, .. } => {
-            for (_, arm) in arms {
-                collect_body_imports(renderer, arm, imports);
+            let inline_json = json_body_count(plan) > 1;
+            for arm in arms {
+                collect_discriminated_body_imports(renderer, &arm.plan, axis, inline_json, imports);
             }
         }
         BodyPlan::Json { .. } | BodyPlan::TopLevelText { .. } | BodyPlan::TopLevelBinary { .. } => {
         }
+    }
+}
+
+fn collect_discriminated_body_imports(
+    renderer: &TypesEmitter<'_, '_, '_>,
+    plan: &BodyPlan,
+    axis: TypeAxis,
+    inline_json: bool,
+    imports: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    if let BodyPlan::Json {
+        schema: Some(schema),
+        ..
+    } = plan
+        && inline_json
+    {
+        renderer.collect_operation_imports(schema, TypePosition::Request, axis, imports);
+        return;
+    }
+    collect_body_imports(renderer, plan, axis, imports);
+}
+
+fn json_body_count(plan: &BodyPlan) -> usize {
+    match plan {
+        BodyPlan::Json { .. } => 1,
+        BodyPlan::ContentTypeDiscriminated { arms, .. } => {
+            arms.iter().map(|arm| json_body_count(&arm.plan)).sum()
+        }
+        BodyPlan::TopLevelText { .. }
+        | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::FormUrlencoded { .. }
+        | BodyPlan::Multipart { .. } => 0,
     }
 }
 
@@ -1652,22 +1778,52 @@ fn render_body_input(
         BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
             render_form_input(renderer, fields, indent, axis)
         }
-        BodyPlan::ContentTypeDiscriminated { arms, all_concrete } => arms
-            .iter()
-            .map(|(media, arm)| {
-                let content_type = if *all_concrete {
-                    render_ts_string(media)
-                } else {
-                    "string".to_owned()
-                };
-                format!(
-                    "{{ contentType: {content_type}; body: {} }}",
-                    render_body_input(renderer, arm, stem, indent, axis, body_twin)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" | "),
+        BodyPlan::ContentTypeDiscriminated { arms, all_concrete } => {
+            let inline_json = json_body_count(plan) > 1;
+            arms.iter()
+                .map(|arm| {
+                    let content_type = if *all_concrete {
+                        render_ts_string(&arm.media)
+                    } else {
+                        "string".to_owned()
+                    };
+                    format!(
+                        "{{ contentType: {content_type}; body: {} }}",
+                        render_discriminated_body_input(
+                            renderer,
+                            &arm.plan,
+                            stem,
+                            indent,
+                            axis,
+                            body_twin,
+                            inline_json,
+                        )
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        }
     }
+}
+
+fn render_discriminated_body_input(
+    renderer: &TypesEmitter<'_, '_, '_>,
+    plan: &BodyPlan,
+    stem: &str,
+    indent: usize,
+    axis: TypeAxis,
+    body_twin: bool,
+    inline_json: bool,
+) -> String {
+    if let BodyPlan::Json { schema, .. } = plan
+        && inline_json
+    {
+        return schema.as_ref().map_or_else(
+            || "unknown".to_owned(),
+            |schema| renderer.render_type(schema, TypePosition::Request, axis, indent),
+        );
+    }
+    render_body_input(renderer, plan, stem, indent, axis, body_twin)
 }
 
 fn render_form_input(
@@ -2619,8 +2775,8 @@ fn body_encoder_name(plan: &BodyPlan) -> &'static str {
 fn mark_body_encoders(plan: &BodyPlan, wanted: &mut [bool; TRANSPORT_VALUE_IMPORTS.len()]) {
     wanted[transport_import_index(body_encoder_name(plan))] = true;
     if let BodyPlan::ContentTypeDiscriminated { arms, .. } = plan {
-        for (_, arm) in arms {
-            mark_body_encoders(arm, wanted);
+        for arm in arms {
+            mark_body_encoders(&arm.plan, wanted);
         }
     }
 }
@@ -2691,12 +2847,12 @@ fn write_body_descriptor(
         }
         BodyPlan::ContentTypeDiscriminated { arms, .. } => {
             output.push_str("discriminatedBody([\n");
-            for (media, arm) in arms {
+            for arm in arms {
                 push_indent(output, indent + 2);
                 output.push('[');
-                output.push_str(&render_ts_string(media));
+                output.push_str(&render_ts_string(&arm.media));
                 output.push_str(", ");
-                write_body_descriptor(output, model, arm, indent + 2);
+                write_body_descriptor(output, model, &arm.plan, indent + 2);
                 output.push_str("],\n");
             }
             push_indent(output, indent);
@@ -3129,6 +3285,7 @@ mod tests {
     };
     use crate::config::{ResolvedConfig, load_config_from_json};
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
+    use crate::emit::emit_artifacts;
     use crate::ir::{
         AdditionalProperties, SchemaMeta, SchemaRef, ServerEntry, ServerVariable, SourceRef,
     };
@@ -5506,9 +5663,14 @@ mod tests {
             &mut HashSet::new()
         ));
 
+        let arm = |media: String, plan| crate::client_model::BodyPlanArm {
+            media,
+            plan,
+            source: SourceRef::default(),
+        };
         let body = BodyPlan::ContentTypeDiscriminated {
             arms: vec![
-                (
+                arm(
                     "multipart/form-data".to_owned(),
                     BodyPlan::Multipart {
                         media: "multipart/form-data".to_owned(),
@@ -5516,7 +5678,7 @@ mod tests {
                         source: SourceRef::default(),
                     },
                 ),
-                (
+                arm(
                     "application/x-www-form-urlencoded".to_owned(),
                     BodyPlan::FormUrlencoded {
                         media: "application/x-www-form-urlencoded".to_owned(),
@@ -5574,7 +5736,7 @@ mod tests {
                         source: SourceRef::default(),
                     },
                 ),
-                (
+                arm(
                     "application/json".to_owned(),
                     BodyPlan::Json {
                         media: "application/json".to_owned(),
@@ -5582,7 +5744,7 @@ mod tests {
                         source: SourceRef::default(),
                     },
                 ),
-                (
+                arm(
                     "text/plain".to_owned(),
                     BodyPlan::TopLevelText {
                         media: "text/plain".to_owned(),
@@ -5590,7 +5752,7 @@ mod tests {
                         source: SourceRef::default(),
                     },
                 ),
-                (
+                arm(
                     "application/octet-stream".to_owned(),
                     BodyPlan::TopLevelBinary {
                         media: "application/octet-stream".to_owned(),
@@ -5617,7 +5779,7 @@ mod tests {
             assert!(input.contains("Blob | File"));
             assert!(input.contains("encoded: string"));
             let mut imports = BTreeMap::new();
-            collect_body_imports(&renderer, &body, &mut imports);
+            collect_body_imports(&renderer, &body, TypeAxis::Application, &mut imports);
             let mut import_text = String::new();
             write_component_imports(
                 &mut import_text,
@@ -6334,6 +6496,15 @@ mod tests {
         request: bool,
         response: bool,
     ) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
+        emit_validation_files(document, request, response, "generated")
+    }
+
+    fn emit_validation_files(
+        document: &Value,
+        request: bool,
+        response: bool,
+        engine: &str,
+    ) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("openapi.json"),
@@ -6344,13 +6515,18 @@ mod tests {
             "schemaVersion": 1,
             "input": { "path": "openapi.json" },
             "output": "generated",
-            "artifacts": { "types": true, "client": true, "validators": true },
+            "artifacts": {
+                "types": true,
+                "client": true,
+                "validators": engine == "generated",
+                "zod": engine == "zod"
+            },
             "client": {
                 "authEnforcement": "types",
                 "baseUrl": { "source": "literal", "value": "https://api.example.test/v1" }
             },
             "validation": {
-                "engine": "generated",
+                "engine": engine,
                 "request": request,
                 "response": response,
                 "unchecked": "allow"
@@ -6363,12 +6539,11 @@ mod tests {
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
         let graph = load_graph(&config, &mut sink).expect("graph");
+        let source_tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
         let client = build_client_model(&analyzed, &config, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
-        drop(model);
+        let files = emit_artifacts(&analyzed, &config, &source_tuples, Some(&client), &mut sink);
         (files, sink.into_sorted_vec())
     }
 
@@ -6389,6 +6564,15 @@ mod tests {
             .iter()
             .find(|file| file.relative_path == format!("client/operations/{suffix}.ts"))
             .expect("operation file")
+            .content
+            .clone()
+    }
+
+    fn generated_file(files: &[GeneratedFile], relative_path: &str) -> String {
+        files
+            .iter()
+            .find(|file| file.relative_path == relative_path)
+            .expect("generated file")
             .content
             .clone()
     }
@@ -6624,6 +6808,285 @@ mod tests {
         ));
     }
 
+    // --- non-JSON request bodies ---------------------------------------------------------------
+
+    /// A form-urlencoded body with a required and an optional field, a multipart body mixing a
+    /// value field, a binary upload and a wrapped field, and a content-type-discriminated body with
+    /// one JSON arm and one text arm. One document so the cross-artifact check covers every shape.
+    fn non_json_bodies_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/form": {
+                    "post": {
+                        "operationId": "sendform",
+                        "requestBody": {
+                            "required": true,
+                            "content": { "application/x-www-form-urlencoded": { "schema": {
+                                "type": "object",
+                                "required": ["name"],
+                                "properties": {
+                                    "name": { "type": "string", "minLength": 1 },
+                                    "tag list": { "type": "array", "items": { "type": "string" } },
+                                    "tag-list": { "type": "array", "items": { "type": "string" } },
+                                    "***": { "type": "string" }
+                                }
+                            } } }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                },
+                "/upload": {
+                    "post": {
+                        "operationId": "sendupload",
+                        "requestBody": {
+                            "required": false,
+                            "content": { "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["meta"],
+                                    "properties": {
+                                        "meta": { "type": "object", "properties": { "label": { "type": "string" } } },
+                                        "file": { "type": "string", "format": "binary" },
+                                        "note": { "type": "object", "properties": { "text": { "type": "string" } } },
+                                        "extra note": { "type": "string" }
+                                    }
+                                },
+                                "encoding": {
+                                    "meta": { "contentType": "application/json" },
+                                    "note": { "contentType": "application/json, application/xml" }
+                                }
+                            } }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                },
+                "/either": {
+                    "post": {
+                        "operationId": "sendeither",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": { "schema": { "type": "object", "properties": { "a": { "type": "string" } } } },
+                                "text/plain": { "schema": { "type": "string" } }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                },
+                "/blob": {
+                    "post": {
+                        "operationId": "sendblob",
+                        "requestBody": {
+                            "required": true,
+                            "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                },
+                "/empty": {
+                    "post": {
+                        "operationId": "sendempty",
+                        "requestBody": { "required": true, "content": {} },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_body_with_no_schema_value_carries_no_validator() {
+        // A binary body is a `Blob`, and an empty content map plans nothing at all; neither carries
+        // a schema a validator could check, so neither emits a check or a declaration.
+        let (files, diagnostics) = emit_validated_files(&non_json_bodies_document(), true, false);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        for operation in ["sendblob", "sendempty"] {
+            let content = operation_file(&files, operation);
+            assert!(
+                !content.contains("requestIssues"),
+                "{operation}:\n{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn form_fields_are_validated_individually_and_guarded_by_requiredness() {
+        let content = emit_validated_operation(non_json_bodies_document(), "sendform", true, false);
+        // One validator per field, reached through the body rather than applied to it. The required
+        // field is always sent, so it is unguarded; the optional one is presence-guarded, and its
+        // non-identifier key is bracket-accessed exactly as a parameter's would be.
+        assert!(
+            content.contains(
+                r#"  const requestIssues: Issue[] = [];
+  validateSendformRequestBodyName(input.body.name, ["body", "name"], requestIssues);
+  if (input.body["tag list"] !== undefined) {
+    validateSendformRequestBodyTagList(input.body["tag list"], ["body", "tag list"], requestIssues);
+  }
+"#
+            ),
+            "form field checks mismatch:\n{content}"
+        );
+        // The body itself carries no validator: a form body has no schema of its own to check.
+        assert!(
+            !content.contains("validateSendformRequestBody("),
+            "{content}"
+        );
+        // `tag list` and `tag-list` collapse onto one identifier under Pascal normalization, so the
+        // later field takes a bumped suffix and each name still describes its own field. A key with
+        // no identifier content at all falls back to its position instead.
+        assert!(
+            content.contains(
+                r#"  if (input.body["tag-list"] !== undefined) {
+    validateSendformRequestBodyTagList2(input.body["tag-list"], ["body", "tag-list"], requestIssues);
+  }
+  if (input.body["***"] !== undefined) {
+    validateSendformRequestBodyField3(input.body["***"], ["body", "***"], requestIssues);
+  }"#
+            ),
+            "collision and fallback naming mismatch:\n{content}"
+        );
+    }
+
+    #[test]
+    fn a_multipart_binary_upload_carries_no_validator_and_an_optional_body_chains() {
+        let (files, diagnostics) = emit_validated_files(&non_json_bodies_document(), true, false);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let content = operation_file(&files, "sendupload");
+        // The body is optional, so every field access optional-chains through it — which is why the
+        // required `meta` field is still guarded. A wrapped field renders `{ body, contentType }`,
+        // so its validator applies to the payload and its issue path names that hop.
+        assert!(
+            content.contains(
+                r#"  const requestIssues: Issue[] = [];
+  if (input.body?.meta !== undefined) {
+    validateSenduploadRequestBodyMeta(input.body?.meta, ["body", "meta"], requestIssues);
+  }
+  if (input.body?.note?.body !== undefined) {
+    validateSenduploadRequestBodyNote(input.body?.note?.body, ["body", "note", "body"], requestIssues);
+  }
+"#
+            ),
+            "multipart checks mismatch:\n{content}"
+        );
+        // `file` renders `Blob | File`, which carries no schema value — neither called nor declared.
+        assert!(!content.contains("RequestBodyFile"), "{content}");
+        let validators = generated_file(&files, "validators/operations/sendupload.ts");
+        assert!(!validators.contains("RequestBodyFile"), "{validators}");
+        // The wrapper object is never itself validated, only its payload.
+        assert!(
+            !content.contains("validateSenduploadRequestBodyNote(input.body?.note,"),
+            "{content}"
+        );
+        // A non-identifier key under an optional body takes the optional element access: `x.["k"]`
+        // is not TypeScript, `x?.["k"]` is.
+        assert!(
+            content.contains(
+                r#"  if (input.body?.["extra note"] !== undefined) {
+    validateSenduploadRequestBodyExtraNote(input.body?.["extra note"], ["body", "extra note"], requestIssues);
+  }"#
+            ),
+            "optional bracket access mismatch:\n{content}"
+        );
+    }
+
+    #[test]
+    fn a_discriminated_body_validates_its_json_arm_under_the_content_type() {
+        let content =
+            emit_validated_operation(non_json_bodies_document(), "sendeither", true, false);
+        // The arm is selected by `contentType`, not by presence — the test already implies the body
+        // is there — and the payload sits under `.body`, mirroring the response side.
+        assert!(
+            content.contains(
+                r#"  const requestIssues: Issue[] = [];
+  if (input.body.contentType === "application/json") {
+    validateSendeitherRequestBody(input.body.body, ["body", "body"], requestIssues);
+  }
+"#
+            ),
+            "discriminated checks mismatch:\n{content}"
+        );
+        // A lone JSON arm keeps the bare name, and the `text/plain` arm carries no validator at all.
+        assert!(!content.contains("TextPlain"), "{content}");
+    }
+
+    #[test]
+    fn every_request_body_validator_the_client_calls_is_declared() {
+        // The invariant the shared position function exists to hold: the client emits the calls and
+        // the validators artifact emits the declarations, from one derivation. A drift between them
+        // emits TypeScript that imports a function nobody exported.
+        let (files, diagnostics) = emit_validated_files(&non_json_bodies_document(), true, false);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        /// Every `RequestBody` validator name following `marker` in `content`.
+        fn names(content: &str, marker: &str) -> BTreeSet<String> {
+            content
+                .match_indices(marker)
+                .map(|(index, _)| {
+                    let rest = &content[index + marker.len()..];
+                    let end = rest
+                        .find(|byte: char| !byte.is_ascii_alphanumeric())
+                        .unwrap_or(rest.len());
+                    rest[..end].to_owned()
+                })
+                .filter(|name| name.contains("RequestBody"))
+                .collect()
+        }
+        let mut called = BTreeSet::new();
+        let mut declared = BTreeSet::new();
+        for file in &files {
+            if file.relative_path.starts_with("client/operations/") {
+                called.extend(names(&file.content, "validate"));
+            } else if file.relative_path.starts_with("validators/operations/") {
+                declared.extend(names(&file.content, "export function validate"));
+            }
+        }
+        // Pinned by count, not just non-emptiness: a subset check passes vacuously if a change ever
+        // drops every body position, which is the regression this test exists to catch. Four form
+        // fields, three multipart fields, one discriminated JSON arm.
+        assert_eq!(called.len(), 8, "{called:?}");
+        // Computed eagerly rather than inside the message: an argument only evaluated on failure is
+        // never executed by a passing run, and would read as a permanently uncovered line.
+        let undeclared = called.difference(&declared).collect::<Vec<_>>();
+        assert!(
+            undeclared.is_empty(),
+            "client calls validators nobody declared: {undeclared:?}"
+        );
+    }
+
+    #[test]
+    fn a_text_json_body_keeps_its_declaration_and_gets_no_call() {
+        // `is_json` accepts `text/json`; `build_body_plan` does not, so such a body renders `string`
+        // whatever its schema says. The export stays — deleting it would break consumers — but no
+        // call is emitted, because validating a string against that schema would check the wrong
+        // value.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/json": { "post": {
+                "operationId": "sendtextjson",
+                "requestBody": {
+                    "required": true,
+                    "content": { "text/json": { "schema": { "type": "string" } } }
+                },
+                "responses": { "204": { "description": "ok" } }
+            } } }
+        });
+        let (files, diagnostics) = emit_validated_files(&document, true, false);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let validators = generated_file(&files, "validators/operations/sendtextjson.ts");
+        assert!(
+            validators.contains("export function validateSendtextjsonRequestBody"),
+            "{validators}"
+        );
+        let content = operation_file(&files, "sendtextjson");
+        assert!(
+            !content.contains("validateSendtextjsonRequestBody("),
+            "{content}"
+        );
+        assert!(!content.contains("requestIssues"), "{content}");
+    }
+
     #[test]
     fn request_validation_binds_a_cookie_parameter() {
         // A cookie parameter is a first-class fetch-client parameter: its request binding validates
@@ -6728,7 +7191,9 @@ mod tests {
                 }
             }
         });
-        let content = emit_validated_operation(document, "readthing", false, true);
+        let (files, diagnostics) = emit_validated_files(&document, false, true);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let content = operation_file(&files, "readthing");
         assert!(
             content.contains(
                 r#"  if (result.outcome === 200) {
@@ -6738,6 +7203,15 @@ mod tests {
     }"#
             ),
             "response block mismatch:\n{content}"
+        );
+        let validators = generated_file(&files, "validators/operations/readthing.ts");
+        assert!(
+            validators.contains("export function validateReadthingResponse200("),
+            "{validators}"
+        );
+        assert!(
+            !validators.contains("validateReadthingResponse200ApplicationJson"),
+            "{validators}"
         );
     }
 
@@ -6789,6 +7263,160 @@ mod tests {
             ),
             "{content}"
         );
+    }
+
+    fn colliding_response_media_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/thing": {
+                    "get": {
+                        "operationId": "readthing",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json;a-b=1": { "schema": { "type": "string" } },
+                                    "application/json;a.b=1": { "schema": { "type": "boolean" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn colliding_media_calls_match_generated_validator_declarations() {
+        let (files, diagnostics) =
+            emit_validated_files(&colliding_response_media_document(), false, true);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Severity::Error),
+            "{diagnostics:#?}"
+        );
+        let collision = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "OASTS1400")
+            .expect("media alias warning");
+        assert_eq!(collision.severity, Severity::Warning);
+        assert!(collision.message.contains("application/json;a-b=1"));
+        assert!(collision.message.contains("application/json;a.b=1"));
+        assert!(
+            collision
+                .message
+                .contains("ReadthingResponse200ApplicationJsonAB12")
+        );
+
+        let client = operation_file(&files, "readthing");
+        let validators = generated_file(&files, "validators/operations/readthing.ts");
+        for name in [
+            "validateReadthingResponse200ApplicationJsonAB1",
+            "validateReadthingResponse200ApplicationJsonAB12",
+        ] {
+            assert!(client.contains(&format!("{name}(result.data")), "{client}");
+            assert!(
+                validators.contains(&format!("export function {name}(")),
+                "{validators}"
+            );
+        }
+    }
+
+    #[test]
+    fn colliding_media_calls_match_zod_declarations() {
+        let (files, diagnostics) =
+            emit_validation_files(&colliding_response_media_document(), false, true, "zod");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Severity::Error),
+            "{diagnostics:#?}"
+        );
+        let collision = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "OASTS1400")
+            .expect("media alias warning");
+        assert_eq!(collision.severity, Severity::Warning);
+        assert!(
+            collision
+                .message
+                .contains("ReadthingResponse200ApplicationJsonAB12")
+        );
+
+        let client = operation_file(&files, "readthing");
+        let zod = generated_file(&files, "zod/operations/readthing.ts");
+        for name in [
+            "validateReadthingResponse200ApplicationJsonAB1",
+            "validateReadthingResponse200ApplicationJsonAB12",
+        ] {
+            assert!(client.contains(&format!("{name}(result.data")), "{client}");
+            assert!(zod.contains(&format!("export function {name}(")), "{zod}");
+        }
+    }
+
+    #[test]
+    fn three_colliding_media_calls_increment_without_reusing_an_alias() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/thing": {
+                    "get": {
+                        "operationId": "readthing",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json;a-b=1": { "schema": { "type": "string" } },
+                                    "application/json;a.b=1": { "schema": { "type": "boolean" } },
+                                    "application/json;a+b=1": { "schema": { "type": "integer" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = emit_validated_files(&document, false, true);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Severity::Error),
+            "{diagnostics:#?}"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS1400")
+                .count(),
+            2,
+            "{diagnostics:#?}"
+        );
+        let client = operation_file(&files, "readthing");
+        let validators = generated_file(&files, "validators/operations/readthing.ts");
+        for name in [
+            "validateReadthingResponse200ApplicationJsonAB1",
+            "validateReadthingResponse200ApplicationJsonAB12",
+            "validateReadthingResponse200ApplicationJsonAB13",
+        ] {
+            assert!(client.contains(&format!("{name}(result.data")), "{client}");
+            assert!(
+                validators.contains(&format!("export function {name}(")),
+                "{validators}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_media_tags_get_client_call_aliases() {
+        let media = ["---", "..."];
+        let names = response_media_names("validateReadthingResponse200", &media);
+        assert_eq!(names[0].name, "validateReadthingResponse200Media");
+        assert_eq!(names[1].name, "validateReadthingResponse200Media2");
+        assert_eq!(names[1].collision, Some(media[0]));
     }
 
     #[test]

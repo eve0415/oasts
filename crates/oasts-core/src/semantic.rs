@@ -34,7 +34,7 @@ const CODE_LINK_PARAMETER: &str = "OASTS1233";
 // Webhook and callback name stems allocate in their own scopes (see `allocate_webhook_names`
 // and `allocate_callback_names`) but share one collision/normalization-failure code: both are
 // the same failure shape (a generated identifier collides or fails to normalize) just applied
-// to a different declaration kind, and neither scope is user-configurable yet.
+// to a different declaration kind.
 const CODE_WEBHOOK_NAME: &str = "OASTS1321";
 // Config-category (exit code 2): an override key that names no declaration in the document.
 const CODE_OVERRIDE_UNMATCHED: &str = "OASTS0202";
@@ -283,8 +283,9 @@ pub fn analyze_with_options(
     lower_uninhabitable_all_ofs(&mut ir, sink);
     validate_unique_operation_ids(&ir, sink);
     let operation_names = allocate_operation_names(&ir, naming, sink);
-    let webhook_names = allocate_webhook_names(&ir, sink);
-    let callback_names = allocate_callback_names(&ir, &operation_names, &webhook_names, sink);
+    let webhook_names = allocate_webhook_names(&ir, naming, sink);
+    let callback_names =
+        allocate_callback_names(&ir, naming, &operation_names, &webhook_names, sink);
     let link_targets = resolve_links(&ir, sink);
     let schema_names = allocate_schema_names(&ir, naming, sink);
     report_unmatched_overrides(&ir, naming, sink);
@@ -677,6 +678,11 @@ fn operation_collision_diagnostic(
     )
 }
 
+struct PendingWebhookName<'ir> {
+    allocated: AllocatedWebhookName,
+    raw_name: &'ir str,
+}
+
 /// Allocates one name stem per webhook operation, in a collision scope entirely separate from
 /// `allocate_operation_names`.
 ///
@@ -685,26 +691,32 @@ fn operation_collision_diagnostic(
 /// at all — the two never share a directory. Tracking both kinds in the same `seen` map would
 /// make an unrelated webhook name perturb path-operation allocation (and vice versa), so this
 /// pass keeps its own map and never touches the operation-name one.
-fn allocate_webhook_names(ir: &Ir, sink: &mut DiagnosticSink) -> Vec<AllocatedWebhookName> {
+fn allocate_webhook_names(
+    ir: &Ir,
+    naming: &NamingConfig,
+    sink: &mut DiagnosticSink,
+) -> Vec<AllocatedWebhookName> {
     let mut names = Vec::new();
-    let mut seen: HashMap<String, (String, SourceRef)> = HashMap::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut collisions = Vec::new();
     for (webhook_index, webhook) in ir.webhooks.iter().enumerate() {
         for (operation_index, operation) in webhook.operations.iter().enumerate() {
-            match derive_webhook_stem(webhook, operation) {
+            match derive_webhook_stem(webhook, operation, naming) {
                 Ok(stem) => {
-                    report_collision(
-                        "webhook",
-                        CODE_WEBHOOK_NAME,
-                        &stem,
-                        &operation.source,
-                        &mut seen,
-                        sink,
-                    );
-                    names.push(AllocatedWebhookName {
-                        webhook_index,
-                        operation_index,
-                        stem,
-                        source: operation.source.clone(),
+                    let index = names.len();
+                    if let Some(previous_index) = seen.get(&stem) {
+                        collisions.push((index, *previous_index));
+                    } else {
+                        seen.insert(stem.clone(), index);
+                    }
+                    names.push(PendingWebhookName {
+                        allocated: AllocatedWebhookName {
+                            webhook_index,
+                            operation_index,
+                            stem,
+                            source: operation.source.clone(),
+                        },
+                        raw_name: &webhook.name,
                     });
                 }
                 Err((input, error)) => push_name_error(
@@ -718,14 +730,49 @@ fn allocate_webhook_names(ir: &Ir, sink: &mut DiagnosticSink) -> Vec<AllocatedWe
             }
         }
     }
-    names
+    let suggestions = (!collisions.is_empty()).then(|| {
+        fragment_override_suggestions(
+            NamingOverrideNamespace::Webhooks,
+            naming.file_case,
+            &naming.overrides.webhooks,
+            names
+                .iter()
+                .map(|name| FragmentSuggestionInput {
+                    stem: &name.allocated.stem,
+                    source_name: name.raw_name,
+                    prefix: "",
+                    composition_tail: capitalize_token(
+                        &ir.webhooks[name.allocated.webhook_index].operations
+                            [name.allocated.operation_index]
+                            .method,
+                    ),
+                })
+                .collect(),
+        )
+    });
+    for (index, previous_index) in collisions {
+        let name = &names[index];
+        sink.push(name_collision_diagnostic(
+            "webhook",
+            CODE_WEBHOOK_NAME,
+            &name.allocated.stem,
+            &names[previous_index].allocated.source,
+            &name.allocated.source,
+            suggestions
+                .as_ref()
+                .and_then(|suggestions| suggestions.get(&name.allocated.stem))
+                .cloned()
+                .unwrap_or_default(),
+        ));
+    }
+    names.into_iter().map(|name| name.allocated).collect()
 }
 
-/// Derives one webhook operation's name stem: the operation's own `operationId` if present
-/// (mirroring `derive_operation_name`, which never touches the method once an `operationId` is
-/// available), else the webhook's name plus the Pascal-cased HTTP method — the same
-/// Pascal-cased-token composition `derive_operation_name`'s fallback uses for path parts,
-/// applied to a webhook's name instead of a path template (webhooks have no path).
+/// Derives one webhook operation's name stem: an explicit `naming.overrides.webhooks` fragment
+/// plus the Pascal-cased HTTP method, else the operation's own `operationId` if present (mirroring
+/// `derive_operation_name`, which never touches the method once an `operationId` is available),
+/// else the normalized webhook name plus the method. The override intentionally wins over the
+/// `operationId`: an explicit user instruction outranks a derived name.
 ///
 /// The method is capitalized directly rather than run through `normalize_identifier`: it is one
 /// of the parser's fixed `METHODS` literals (never document-supplied), so it can never fail to
@@ -733,7 +780,15 @@ fn allocate_webhook_names(ir: &Ir, sink: &mut DiagnosticSink) -> Vec<AllocatedWe
 fn derive_webhook_stem(
     webhook: &Webhook,
     operation: &Operation,
+    naming: &NamingConfig,
 ) -> Result<String, (String, NormalizeError)> {
+    if let Some(name_stem) = naming.overrides.webhooks.get(&webhook.name) {
+        validate_final_identifier(name_stem).map_err(|error| (name_stem.clone(), error))?;
+        return Ok(format!(
+            "{name_stem}{}",
+            capitalize_token(&operation.method)
+        ));
+    }
     if let Some(operation_id) = &operation.operation_id {
         return normalize_identifier(operation_id, TargetCase::Pascal)
             .map_err(|error| (operation_id.clone(), error));
@@ -744,6 +799,18 @@ fn derive_webhook_stem(
         "{name_stem}{}",
         capitalize_token(&operation.method)
     ))
+}
+
+struct PendingCallbackName<'ir> {
+    allocated: AllocatedCallbackName,
+    raw_name: &'ir str,
+    method: &'ir str,
+    disambiguate: bool,
+}
+
+struct CallbackCollisionState {
+    seen: HashMap<String, usize>,
+    collisions: Vec<(usize, usize)>,
 }
 
 /// Allocates one name stem per callback-expression operation at every depth, in a single
@@ -761,12 +828,16 @@ fn derive_webhook_stem(
 /// anything nested beneath it.
 fn allocate_callback_names(
     ir: &Ir,
+    naming: &NamingConfig,
     operation_names: &[AllocatedOperationName],
     webhook_names: &[AllocatedWebhookName],
     sink: &mut DiagnosticSink,
 ) -> Vec<AllocatedCallbackName> {
     let mut names = Vec::new();
-    let mut seen: HashMap<String, (String, SourceRef)> = HashMap::new();
+    let mut collision_state = CallbackCollisionState {
+        seen: HashMap::new(),
+        collisions: Vec::new(),
+    };
     for allocated in operation_names {
         let operation = &ir.operations[allocated.operation_index];
         // Fast-reject before the parent-stem allocation: the vast majority of operations declare
@@ -781,8 +852,9 @@ fn allocate_callback_names(
                 operation_index: allocated.operation_index,
             },
             &parent_stem,
+            naming,
             &mut names,
-            &mut seen,
+            &mut collision_state,
             sink,
         );
     }
@@ -794,24 +866,67 @@ fn allocate_callback_names(
                 operation_index: allocated.operation_index,
             },
             &allocated.stem,
+            naming,
             &mut names,
-            &mut seen,
+            &mut collision_state,
             sink,
         );
     }
-    names
+    let suggestions = (!collision_state.collisions.is_empty()).then(|| {
+        fragment_override_suggestions(
+            NamingOverrideNamespace::Callbacks,
+            naming.file_case,
+            &naming.overrides.callbacks,
+            names
+                .iter()
+                .map(|name| FragmentSuggestionInput {
+                    stem: &name.allocated.stem,
+                    source_name: name.raw_name,
+                    // Callback overrides are global, so the same raw name can occur below
+                    // different parents. Keep the prefix to check each exact emitted stem.
+                    prefix: &name.allocated.parent_stem,
+                    composition_tail: format!(
+                        "{}{}",
+                        if name.disambiguate {
+                            format!("_{}", name.allocated.expression_index + 1)
+                        } else {
+                            String::new()
+                        },
+                        capitalize_token(name.method)
+                    ),
+                })
+                .collect(),
+        )
+    });
+    for (index, previous_index) in collision_state.collisions {
+        let name = &names[index];
+        sink.push(name_collision_diagnostic(
+            "callback",
+            CODE_WEBHOOK_NAME,
+            &name.allocated.stem,
+            &names[previous_index].allocated.source,
+            &name.allocated.source,
+            suggestions
+                .as_ref()
+                .and_then(|suggestions| suggestions.get(&name.allocated.stem))
+                .cloned()
+                .unwrap_or_default(),
+        ));
+    }
+    names.into_iter().map(|name| name.allocated).collect()
 }
 
 /// Allocates every callback declared directly on `operation`, then recurses into each allocated
 /// callback operation's own callbacks. `parent` and `parent_stem` describe the declaring
 /// operation (the recursion passes the just-allocated child as the parent of its nested
 /// callbacks).
-fn allocate_operation_callbacks(
-    operation: &Operation,
+fn allocate_operation_callbacks<'ir>(
+    operation: &'ir Operation,
     parent: &CallbackParent,
     parent_stem: &str,
-    names: &mut Vec<AllocatedCallbackName>,
-    seen: &mut HashMap<String, (String, SourceRef)>,
+    naming: &NamingConfig,
+    names: &mut Vec<PendingCallbackName<'ir>>,
+    collision_state: &mut CallbackCollisionState,
     sink: &mut DiagnosticSink,
 ) {
     for (callback_index, callback) in operation.callbacks.iter().enumerate() {
@@ -828,33 +943,37 @@ fn allocate_operation_callbacks(
                     expression_index,
                     disambiguate,
                     expression_operation,
+                    naming,
                 );
                 match allocation {
                     Ok(stem) => {
-                        report_collision(
-                            "callback",
-                            CODE_WEBHOOK_NAME,
-                            &stem,
-                            &expression_operation.source,
-                            seen,
-                            sink,
-                        );
                         let index = names.len();
-                        names.push(AllocatedCallbackName {
-                            parent: parent.clone(),
-                            parent_stem: parent_stem.to_owned(),
-                            callback_index,
-                            expression_index,
-                            operation_index_within_expression,
-                            stem: stem.clone(),
-                            source: expression_operation.source.clone(),
+                        if let Some(previous_index) = collision_state.seen.get(&stem) {
+                            collision_state.collisions.push((index, *previous_index));
+                        } else {
+                            collision_state.seen.insert(stem.clone(), index);
+                        }
+                        names.push(PendingCallbackName {
+                            allocated: AllocatedCallbackName {
+                                parent: parent.clone(),
+                                parent_stem: parent_stem.to_owned(),
+                                callback_index,
+                                expression_index,
+                                operation_index_within_expression,
+                                stem: stem.clone(),
+                                source: expression_operation.source.clone(),
+                            },
+                            raw_name: &callback.name,
+                            method: &expression_operation.method,
+                            disambiguate,
                         });
                         allocate_operation_callbacks(
                             expression_operation,
                             &CallbackParent::Callback { index },
                             &stem,
+                            naming,
                             names,
-                            seen,
+                            collision_state,
                             sink,
                         );
                     }
@@ -886,9 +1005,16 @@ fn derive_callback_stem(
     expression_index: usize,
     disambiguate: bool,
     operation: &Operation,
+    naming: &NamingConfig,
 ) -> Result<String, (String, NormalizeError)> {
-    let callback_name_stem = normalize_identifier(&callback.name, TargetCase::Pascal)
-        .map_err(|error| (callback.name.clone(), error))?;
+    let callback_name_stem = match naming.overrides.callbacks.get(&callback.name) {
+        Some(name_stem) => {
+            validate_final_identifier(name_stem).map_err(|error| (name_stem.clone(), error))?;
+            name_stem.clone()
+        }
+        None => normalize_identifier(&callback.name, TargetCase::Pascal)
+            .map_err(|error| (callback.name.clone(), error))?,
+    };
     let disambiguator = if disambiguate {
         format!("_{}", expression_index + 1)
     } else {
@@ -1162,6 +1288,23 @@ fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut Diagnos
             ));
         }
     }
+    for key in naming.overrides.webhooks.keys() {
+        if !ir.webhooks.iter().any(|webhook| &webhook.name == key) {
+            sink.push(unmatched_override_diagnostic("webhook", "webhooks", key));
+        }
+    }
+    for key in naming.overrides.callbacks.keys() {
+        let mut matched = false;
+        for_each_operation(ir, &mut |operation| {
+            matched |= operation
+                .callbacks
+                .iter()
+                .any(|callback| &callback.name == key);
+        });
+        if !matched {
+            sink.push(unmatched_override_diagnostic("callback", "callbacks", key));
+        }
+    }
 }
 
 fn unmatched_override_diagnostic(kind: &str, namespace: &str, key: &str) -> Diagnostic {
@@ -1249,31 +1392,153 @@ impl OverrideSuggester {
             })
             .collect()
     }
+
+    fn allocate_fragments(
+        &mut self,
+        namespace: NamingOverrideNamespace,
+        mut entries: Vec<FragmentSuggestionCandidate<'_>>,
+    ) -> Vec<NamingOverrideSuggestion> {
+        entries.sort_unstable_by_key(|entry| entry.source_name);
+        entries
+            .into_iter()
+            .map(|entry| {
+                let mut suffix = 1_u64;
+                loop {
+                    let fragment = format!("{}_{suffix}", entry.base);
+                    suffix += 1;
+                    let composed = entry
+                        .compositions
+                        .iter()
+                        .map(|(prefix, tail)| {
+                            let identifier = format!("{prefix}{fragment}{tail}");
+                            let file_base = crate::emit::file_base_name(
+                                &identifier,
+                                self.file_case,
+                            )
+                            .expect(
+                                "a valid TypeScript identifier always produces a safe file base",
+                            )
+                            .to_ascii_lowercase();
+                            (identifier, file_base)
+                        })
+                        .collect::<Vec<_>>();
+                    if composed.iter().any(|(identifier, file_base)| {
+                        self.taken_identifiers.contains(identifier)
+                            || self.taken_file_bases.contains(file_base)
+                    }) {
+                        continue;
+                    }
+                    for (identifier, file_base) in composed {
+                        self.taken_identifiers.insert(identifier);
+                        self.taken_file_bases.insert(file_base);
+                    }
+                    break NamingOverrideSuggestion {
+                        namespace,
+                        source_name: entry.source_name.to_owned(),
+                        identifier: fragment,
+                    };
+                }
+            })
+            .collect()
+    }
 }
 
-fn report_collision(
+struct FragmentSuggestionInput<'name> {
+    stem: &'name str,
+    source_name: &'name str,
+    prefix: &'name str,
+    composition_tail: String,
+}
+
+struct FragmentSuggestionCandidate<'name> {
+    source_name: &'name str,
+    base: &'name str,
+    compositions: Vec<(&'name str, &'name str)>,
+}
+
+fn fragment_override_suggestions(
+    namespace: NamingOverrideNamespace,
+    file_case: FileCase,
+    overrides: &BTreeMap<String, String>,
+    names: Vec<FragmentSuggestionInput<'_>>,
+) -> HashMap<String, Vec<NamingOverrideSuggestion>> {
+    let mut groups = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, name) in names.iter().enumerate() {
+        groups.entry(name.stem).or_default().push(index);
+    }
+    let fragments = names
+        .iter()
+        .map(|name| {
+            overrides.get(name.source_name).cloned().unwrap_or_else(|| {
+                normalize_identifier(name.source_name, TargetCase::Pascal)
+                    .unwrap_or_else(|_| name.stem.to_owned())
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut compositions_by_source = BTreeMap::<&str, Vec<(&str, &str)>>::new();
+    for name in &names {
+        compositions_by_source
+            .entry(name.source_name)
+            .or_default()
+            .push((name.prefix, &name.composition_tail));
+    }
+    let existing_file_names = names
+        .iter()
+        .filter_map(|name| crate::emit::file_base_name(name.stem, file_case).ok());
+    let mut suggester = OverrideSuggester::new(
+        file_case,
+        names.iter().map(|name| name.stem),
+        existing_file_names,
+    );
+    let mut suggestions = HashMap::new();
+    for (stem, indices) in groups {
+        if indices.len() < 2 {
+            continue;
+        }
+        let unique = indices
+            .iter()
+            .map(|index| names[*index].source_name)
+            .collect::<HashSet<_>>();
+        if unique.len() != indices.len() {
+            continue;
+        }
+        suggestions.insert(
+            stem.to_owned(),
+            suggester.allocate_fragments(
+                namespace,
+                indices
+                    .iter()
+                    .map(|index| FragmentSuggestionCandidate {
+                        source_name: names[*index].source_name,
+                        base: fragments[*index].as_str(),
+                        compositions: compositions_by_source[names[*index].source_name].clone(),
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    suggestions
+}
+
+fn name_collision_diagnostic(
     kind: &str,
     code: &'static str,
     name: &str,
+    previous_source: &SourceRef,
     source: &SourceRef,
-    seen: &mut HashMap<String, (String, SourceRef)>,
-    sink: &mut DiagnosticSink,
-) {
+    suggestions: Vec<NamingOverrideSuggestion>,
+) -> Diagnostic {
     // Exact match over case-folded match at the identifier layer, because TypeScript
     // identifiers are case-sensitive: two names differing only in case are two distinct,
     // legal types. Filesystem safety on case-insensitive volumes is enforced separately
     // by the path-collision check (`register_path` / OASTS1302 in `emit/model.rs`), so this
     // layer must not also reject case-only differences.
-    if let Some((_, previous_source)) = seen.get(name) {
-        let message = format!(
-            "{kind} name collision: '{name}' allocated at {} and {}",
-            previous_source.display(),
-            source.display()
-        );
-        sink.push(source_diagnostic(code, message, source));
-    } else {
-        seen.insert(name.to_owned(), (name.to_owned(), source.clone()));
-    }
+    let message = format!(
+        "{kind} name collision: '{name}' allocated at {} and {}",
+        previous_source.display(),
+        source.display()
+    );
+    source_diagnostic(code, message, source).with_naming_override_suggestions(suggestions)
 }
 
 fn casefold_collision<T>(
@@ -2248,6 +2513,32 @@ mod tests {
         }
     }
 
+    fn webhook_overrides(entries: &[(&str, &str)]) -> NamingConfig {
+        NamingConfig {
+            overrides: NameOverrides {
+                webhooks: entries
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        }
+    }
+
+    fn callback_overrides(entries: &[(&str, &str)]) -> NamingConfig {
+        NamingConfig {
+            overrides: NameOverrides {
+                callbacks: entries
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        }
+    }
+
     fn schema_names(analyzed: &Analyzed) -> Vec<&str> {
         analyzed
             .schema_names
@@ -2982,6 +3273,314 @@ mod tests {
             diagnostic.json_pointer.as_deref(),
             Some("/webhooks/pet-created/get")
         );
+        assert_eq!(
+            diagnostic.naming_override_suggestions.as_deref(),
+            Some(&vec![
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Webhooks,
+                    source_name: "pet-created".to_owned(),
+                    identifier: "PetCreated_1".to_owned(),
+                },
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Webhooks,
+                    source_name: "petCreated".to_owned(),
+                    identifier: "PetCreated_2".to_owned(),
+                },
+            ])
+        );
+        let rendered = crate::diag::render_to_string(sink.into_sorted_vec());
+        assert!(rendered.contains("    webhooks:\n"));
+        assert!(rendered.contains("      'pet-created': 'PetCreated_1'\n"));
+        assert!(rendered.contains("      'petCreated': 'PetCreated_2'\n"));
+    }
+
+    #[test]
+    fn webhook_fragment_suggestions_seed_from_composed_stems() {
+        // An internal `_N` cannot currently come from a normalized operationId, so construct the
+        // post-allocation table directly to pin this latent availability rule.
+        let suggestions = fragment_override_suggestions(
+            NamingOverrideNamespace::Webhooks,
+            FileCase::Kebab,
+            &BTreeMap::from([("alpha".to_owned(), "Hook".to_owned())]),
+            vec![
+                FragmentSuggestionInput {
+                    stem: "HookGet",
+                    source_name: "alpha",
+                    prefix: "",
+                    composition_tail: "Get".to_owned(),
+                },
+                FragmentSuggestionInput {
+                    stem: "HookGet",
+                    source_name: "beta",
+                    prefix: "",
+                    composition_tail: "Get".to_owned(),
+                },
+                FragmentSuggestionInput {
+                    stem: "Hook_1Get",
+                    source_name: "seeded",
+                    prefix: "",
+                    composition_tail: "Get".to_owned(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            suggestions["HookGet"],
+            vec![
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Webhooks,
+                    source_name: "alpha".to_owned(),
+                    identifier: "Hook_2".to_owned(),
+                },
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Webhooks,
+                    source_name: "beta".to_owned(),
+                    identifier: "Beta_1".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn webhook_fragment_suggestion_is_free_for_every_method() {
+        let mut alpha_get = operation(Vec::new());
+        alpha_get.source = source("/webhooks/alpha/get");
+        let mut alpha_post = operation(Vec::new());
+        alpha_post.method = "post".to_owned();
+        alpha_post.source = source("/webhooks/alpha/post");
+        let mut beta_get = operation(Vec::new());
+        beta_get.operation_id = Some("HookGet".to_owned());
+        beta_get.source = source("/webhooks/beta/get");
+        let mut seeded_post = operation(Vec::new());
+        seeded_post.method = "post".to_owned();
+        seeded_post.source = source("/webhooks/seeded/post");
+        let ir = Ir {
+            webhooks: vec![
+                Webhook {
+                    name: "alpha".to_owned(),
+                    operations: vec![alpha_get, alpha_post],
+                    source: source("/webhooks/alpha"),
+                },
+                Webhook {
+                    name: "beta".to_owned(),
+                    operations: vec![beta_get],
+                    source: source("/webhooks/beta"),
+                },
+                Webhook {
+                    name: "seeded".to_owned(),
+                    operations: vec![seeded_post],
+                    source: source("/webhooks/seeded"),
+                },
+            ],
+            ..Ir::default()
+        };
+        let initial_naming = webhook_overrides(&[("alpha", "Hook"), ("seeded", "Hook_1")]);
+        let mut collision_sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            ir.clone(),
+            &initial_naming,
+            &TypesConfig::default(),
+            &mut collision_sink,
+        );
+        let collision = collision_sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == CODE_WEBHOOK_NAME && diagnostic.message.contains("'HookGet'")
+            })
+            .expect("webhook collision diagnostic");
+        assert_eq!(
+            collision.naming_override_suggestions.as_deref(),
+            Some(&vec![
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Webhooks,
+                    source_name: "alpha".to_owned(),
+                    identifier: "Hook_2".to_owned(),
+                },
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Webhooks,
+                    source_name: "beta".to_owned(),
+                    identifier: "Beta_1".to_owned(),
+                },
+            ])
+        );
+
+        let mut resolved_naming = initial_naming;
+        resolved_naming
+            .overrides
+            .webhooks
+            .insert("alpha".to_owned(), "Hook_2".to_owned());
+        resolved_naming
+            .overrides
+            .webhooks
+            .insert("beta".to_owned(), "Beta_1".to_owned());
+        let mut sink = DiagnosticSink::new();
+        let analyzed =
+            analyze_with_options(ir, &resolved_naming, &TypesConfig::default(), &mut sink);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            analyzed
+                .webhook_names
+                .iter()
+                .map(|name| name.stem.as_str())
+                .collect::<Vec<_>>(),
+            ["Hook_2Get", "Hook_2Post", "Beta_1Get", "Hook_1Post"]
+        );
+    }
+
+    #[test]
+    fn webhook_override_fragment_resolves_a_stem_collision() {
+        let mut first = operation(Vec::new());
+        first.source = source("/webhooks/petCreated/get");
+        let mut second = operation(Vec::new());
+        second.source = source("/webhooks/pet-created/get");
+        let ir = Ir {
+            webhooks: vec![
+                Webhook {
+                    name: "petCreated".to_owned(),
+                    operations: vec![first],
+                    source: source("/webhooks/petCreated"),
+                },
+                Webhook {
+                    name: "pet-created".to_owned(),
+                    operations: vec![second],
+                    source: source("/webhooks/pet-created"),
+                },
+            ],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &webhook_overrides(&[("pet-created", "CreatedEvent")]),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            analyzed
+                .webhook_names
+                .iter()
+                .map(|allocated| allocated.stem.as_str())
+                .collect::<Vec<_>>(),
+            ["PetCreatedGet", "CreatedEventGet"]
+        );
+    }
+
+    #[test]
+    fn duplicate_raw_webhook_name_has_no_unusable_map_suggestion() {
+        let mut first = operation(Vec::new());
+        first.source = source("/webhooks/duplicate/get");
+        let mut second = operation(Vec::new());
+        second.source = source("/merged/webhooks/duplicate/get");
+        let ir = Ir {
+            webhooks: vec![
+                Webhook {
+                    name: "duplicate".to_owned(),
+                    operations: vec![first],
+                    source: source("/webhooks/duplicate"),
+                },
+                Webhook {
+                    name: "duplicate".to_owned(),
+                    operations: vec![second],
+                    source: source("/merged/webhooks/duplicate"),
+                },
+            ],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        let collision = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_WEBHOOK_NAME)
+            .expect("webhook collision diagnostic");
+        assert!(collision.naming_override_suggestions.is_none());
+    }
+
+    #[test]
+    fn webhook_suggestions_fall_back_to_operation_id_for_invalid_raw_names() {
+        let mut first = operation(Vec::new());
+        first.operation_id = Some("same-name".to_owned());
+        first.source = source("/webhooks/---/get");
+        let mut second = operation(Vec::new());
+        second.operation_id = Some("sameName".to_owned());
+        second.source = source("/webhooks/.../get");
+        let ir = Ir {
+            webhooks: vec![
+                Webhook {
+                    name: "---".to_owned(),
+                    operations: vec![first],
+                    source: source("/webhooks/---"),
+                },
+                Webhook {
+                    name: "...".to_owned(),
+                    operations: vec![second],
+                    source: source("/webhooks/..."),
+                },
+            ],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        let collision = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_WEBHOOK_NAME)
+            .expect("webhook collision diagnostic");
+        assert_eq!(
+            collision.naming_override_suggestions.as_deref(),
+            Some(&vec![
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Webhooks,
+                    source_name: "---".to_owned(),
+                    identifier: "SameName_1".to_owned(),
+                },
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Webhooks,
+                    source_name: "...".to_owned(),
+                    identifier: "SameName_2".to_owned(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn webhook_override_fragment_wins_over_operation_id() {
+        let mut webhook_operation = operation(Vec::new());
+        webhook_operation.operation_id = Some("customName".to_owned());
+        webhook_operation.source = source("/webhooks/petCreated/get");
+        let ir = Ir {
+            webhooks: vec![Webhook {
+                name: "petCreated".to_owned(),
+                operations: vec![webhook_operation],
+                source: source("/webhooks/petCreated"),
+            }],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &webhook_overrides(&[("petCreated", "CreatedEvent")]),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(analyzed.webhook_names[0].stem, "CreatedEventGet");
     }
 
     #[test]
@@ -3048,6 +3647,35 @@ mod tests {
             diagnostic.json_pointer.as_deref(),
             Some("/webhooks/petCreated/get")
         );
+    }
+
+    #[test]
+    fn webhook_override_rejects_an_invalid_identifier_fragment() {
+        let mut webhook_operation = operation(Vec::new());
+        webhook_operation.source = source("/webhooks/petCreated/get");
+        let ir = Ir {
+            webhooks: vec![Webhook {
+                name: "petCreated".to_owned(),
+                operations: vec![webhook_operation],
+                source: source("/webhooks/petCreated"),
+            }],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &webhook_overrides(&[("petCreated", "bad-name")]),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        assert!(analyzed.webhook_names.is_empty());
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_WEBHOOK_NAME
+                && diagnostic
+                    .message
+                    .contains("invalid webhook identifier 'bad-name'")
+        }));
     }
 
     #[test]
@@ -3198,6 +3826,43 @@ mod tests {
     }
 
     #[test]
+    fn callback_override_rejects_an_invalid_identifier_fragment() {
+        let mut parent = operation(Vec::new());
+        parent.operation_id = Some("subscribe".to_owned());
+        parent.source = source("/paths/~1subscribe/post");
+        parent.callbacks = vec![Callback {
+            name: "delivery".to_owned(),
+            expressions: vec![CallbackExpression {
+                expression: "{$request.body#/url}".to_owned(),
+                operations: vec![callback_leaf_operation(
+                    "post",
+                    "/paths/~1subscribe/post/callbacks/delivery/0/post",
+                )],
+                source: source("/paths/~1subscribe/post/callbacks/delivery/0"),
+            }],
+            source: source("/paths/~1subscribe/post/callbacks/delivery"),
+        }];
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            Ir {
+                operations: vec![parent],
+                ..Ir::default()
+            },
+            &callback_overrides(&[("delivery", "bad-name")]),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        assert!(analyzed.callback_names.is_empty());
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_WEBHOOK_NAME
+                && diagnostic
+                    .message
+                    .contains("invalid callback identifier 'bad-name'")
+        }));
+    }
+
+    #[test]
     fn callbacks_allocate_on_webhook_operations() {
         let mut webhook_operation = operation(Vec::new());
         webhook_operation.method = "post".to_owned();
@@ -3307,6 +3972,207 @@ mod tests {
         assert_eq!(
             analyzed.callback_names[1].parent_stem,
             "SubscribeDeliveryPost"
+        );
+    }
+
+    #[test]
+    fn callback_suggestion_composes_parent_and_expression_disambiguator() {
+        let callback = |name: &str| Callback {
+            name: name.to_owned(),
+            expressions: (0..2)
+                .map(|expression_index| CallbackExpression {
+                    expression: format!("{{$request.body#/url{expression_index}}}"),
+                    operations: vec![callback_leaf_operation(
+                        "post",
+                        &format!(
+                            "/paths/~1subscribe/post/callbacks/{name}/{expression_index}/post"
+                        ),
+                    )],
+                    source: source(&format!(
+                        "/paths/~1subscribe/post/callbacks/{name}/{expression_index}"
+                    )),
+                })
+                .collect(),
+            source: source(&format!("/paths/~1subscribe/post/callbacks/{name}")),
+        };
+        let mut parent = operation(Vec::new());
+        parent.operation_id = Some("subscribe".to_owned());
+        parent.source = source("/paths/~1subscribe/post");
+        parent.callbacks = vec![callback("delivery-status"), callback("deliveryStatus")];
+        let ir = Ir {
+            operations: vec![parent],
+            ..Ir::default()
+        };
+
+        let mut collision_sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            ir.clone(),
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut collision_sink,
+        );
+        let collision = collision_sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == CODE_WEBHOOK_NAME
+                    && diagnostic
+                        .message
+                        .contains("'SubscribeDeliveryStatus_1Post'")
+            })
+            .expect("callback collision diagnostic");
+        assert_eq!(
+            collision.naming_override_suggestions.as_deref(),
+            Some(&vec![
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Callbacks,
+                    source_name: "delivery-status".to_owned(),
+                    identifier: "DeliveryStatus_1".to_owned(),
+                },
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Callbacks,
+                    source_name: "deliveryStatus".to_owned(),
+                    identifier: "DeliveryStatus_2".to_owned(),
+                },
+            ])
+        );
+
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &callback_overrides(&[
+                ("delivery-status", "DeliveryStatus_1"),
+                ("deliveryStatus", "DeliveryStatus_2"),
+            ]),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            analyzed
+                .callback_names
+                .iter()
+                .map(|name| name.stem.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "SubscribeDeliveryStatus_1_1Post",
+                "SubscribeDeliveryStatus_1_2Post",
+                "SubscribeDeliveryStatus_2_1Post",
+                "SubscribeDeliveryStatus_2_2Post",
+            ]
+        );
+    }
+
+    #[test]
+    fn callback_override_resolves_a_collision_and_renames_nested_parent_stems() {
+        let nested_leaf = callback_leaf_operation(
+            "get",
+            "/paths/~1subscribe/post/callbacks/delivery-status/0/post/callbacks/retry/0/get",
+        );
+        let mut first_leaf = callback_leaf_operation(
+            "post",
+            "/paths/~1subscribe/post/callbacks/delivery-status/0/post",
+        );
+        first_leaf.callbacks = vec![Callback {
+            name: "retry".to_owned(),
+            expressions: vec![CallbackExpression {
+                expression: "{$request.body#/retryUrl}".to_owned(),
+                operations: vec![nested_leaf],
+                source: source(
+                    "/paths/~1subscribe/post/callbacks/delivery-status/0/post/callbacks/retry/0",
+                ),
+            }],
+            source: source(
+                "/paths/~1subscribe/post/callbacks/delivery-status/0/post/callbacks/retry",
+            ),
+        }];
+        let mut parent = operation(Vec::new());
+        parent.operation_id = Some("subscribe".to_owned());
+        parent.source = source("/paths/~1subscribe/post");
+        parent.callbacks = vec![
+            Callback {
+                name: "delivery-status".to_owned(),
+                expressions: vec![CallbackExpression {
+                    expression: "{$request.body#/url}".to_owned(),
+                    operations: vec![first_leaf],
+                    source: source("/paths/~1subscribe/post/callbacks/delivery-status/0"),
+                }],
+                source: source("/paths/~1subscribe/post/callbacks/delivery-status"),
+            },
+            Callback {
+                name: "deliveryStatus".to_owned(),
+                expressions: vec![CallbackExpression {
+                    expression: "{$request.body#/fallbackUrl}".to_owned(),
+                    operations: vec![callback_leaf_operation(
+                        "post",
+                        "/paths/~1subscribe/post/callbacks/deliveryStatus/0/post",
+                    )],
+                    source: source("/paths/~1subscribe/post/callbacks/deliveryStatus/0"),
+                }],
+                source: source("/paths/~1subscribe/post/callbacks/deliveryStatus"),
+            },
+        ];
+        let ir = Ir {
+            operations: vec![parent],
+            ..Ir::default()
+        };
+
+        let mut collision_sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            ir.clone(),
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut collision_sink,
+        );
+        let collision = collision_sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == CODE_WEBHOOK_NAME
+                    && diagnostic.message.contains("callback name collision")
+            })
+            .expect("callback collision diagnostic");
+        assert_eq!(
+            collision.naming_override_suggestions.as_deref(),
+            Some(&vec![
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Callbacks,
+                    source_name: "delivery-status".to_owned(),
+                    identifier: "DeliveryStatus_1".to_owned(),
+                },
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::Callbacks,
+                    source_name: "deliveryStatus".to_owned(),
+                    identifier: "DeliveryStatus_2".to_owned(),
+                },
+            ])
+        );
+        let rendered = crate::diag::render_to_string(collision_sink.into_sorted_vec());
+        assert!(rendered.contains("    callbacks:\n"));
+
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(
+            ir,
+            &callback_overrides(&[("delivery-status", "PrimaryDelivery")]),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            analyzed
+                .callback_names
+                .iter()
+                .map(|allocated| allocated.stem.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "SubscribePrimaryDeliveryPost",
+                "SubscribePrimaryDeliveryPostRetryGet",
+                "SubscribeDeliveryStatusPost",
+            ]
+        );
+        assert_eq!(
+            analyzed.callback_names[1].parent_stem,
+            "SubscribePrimaryDeliveryPost"
         );
     }
 
@@ -3636,6 +4502,11 @@ mod tests {
             overrides: NameOverrides {
                 schemas: BTreeMap::from([("ghost".to_owned(), "Ghost".to_owned())]),
                 operations: BTreeMap::from([("phantomOp".to_owned(), "PhantomOp".to_owned())]),
+                webhooks: BTreeMap::from([("ghost/webhook".to_owned(), "GhostWebhook".to_owned())]),
+                callbacks: BTreeMap::from([(
+                    "phantom~callback".to_owned(),
+                    "PhantomCallback".to_owned(),
+                )]),
                 ..NameOverrides::default()
             },
             ..NamingConfig::default()
@@ -3671,6 +4542,36 @@ mod tests {
         assert_eq!(
             operation_diagnostic.json_pointer.as_deref(),
             Some("/naming/overrides/operations/phantomOp")
+        );
+
+        let webhook_diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == CODE_OVERRIDE_UNMATCHED
+                    && diagnostic.message.contains("ghost/webhook")
+            })
+            .expect("unmatched webhook override");
+        assert_eq!(webhook_diagnostic.category, Category::Config);
+        assert!(webhook_diagnostic.message.contains("webhook"));
+        assert_eq!(
+            webhook_diagnostic.json_pointer.as_deref(),
+            Some("/naming/overrides/webhooks/ghost~1webhook")
+        );
+
+        let callback_diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == CODE_OVERRIDE_UNMATCHED
+                    && diagnostic.message.contains("phantom~callback")
+            })
+            .expect("unmatched callback override");
+        assert_eq!(callback_diagnostic.category, Category::Config);
+        assert!(callback_diagnostic.message.contains("callback"));
+        assert_eq!(
+            callback_diagnostic.json_pointer.as_deref(),
+            Some("/naming/overrides/callbacks/phantom~0callback")
         );
     }
 

@@ -669,16 +669,16 @@ impl Default for NamingConfig {
     }
 }
 
-/// Explicit final identifiers for named declarations, keyed by raw wire name.
+/// Explicit identifier replacements for named declarations, keyed by raw wire name.
 ///
 /// The nested per-namespace shape stays additive: a future namespace is a new field, not a
-/// breaking reshape. A value is the complete TypeScript identifier — `typePrefix`/`typeSuffix`
-/// are not applied on top, because the user wrote the exact name they want and decorating it
-/// would defeat the point. For `schemas` and `operations`, values are still validated and still
-/// participate in collision detection like any generated name, so an override resolves a
-/// collision only by naming a distinct identifier, never by bypassing the check; a key matching
-/// no declaration in the document is a config error (see identifier allocation), so a typo
-/// surfaces instead of silently leaving the original collision unexplained.
+/// breaking reshape. For `schemas` and `operations`, a value is the complete TypeScript identifier
+/// — `typePrefix`/`typeSuffix` are not applied on top, because the user wrote the exact name they
+/// want and decorating it would defeat the point. Values are still validated and still participate
+/// in collision detection like any generated name, so an override resolves a collision only by
+/// naming a distinct identifier, never by bypassing the check; a key matching no declaration in
+/// the document is a config error (see identifier allocation), so a typo surfaces instead of
+/// silently leaving the original collision unexplained.
 ///
 /// `pathSegments` is keyed by the raw URL path segment text as written in the path template
 /// (e.g. `foo-bar`), not by any name derived from it. Its values are validated the same way, but
@@ -692,7 +692,7 @@ impl Default for NamingConfig {
     feature = "json-schema",
     schemars(
         rename_all = "camelCase",
-        description = "Explicit final identifiers keyed by raw wire name, per namespace."
+        description = "Explicit identifier replacements keyed by raw wire name, per namespace."
     )
 )]
 pub struct NameOverrides {
@@ -701,6 +701,12 @@ pub struct NameOverrides {
     pub schemas: BTreeMap<String, String>,
     /// Keyed by the `operationId`; the value is the final operation identifier.
     pub operations: BTreeMap<String, String>,
+    /// Keyed by a raw document `webhooks` map key; the value replaces its normalized identifier
+    /// fragment for every method. This explicit fragment takes precedence over an `operationId`.
+    pub webhooks: BTreeMap<String, String>,
+    /// Keyed by a raw operation `callbacks` map key; the value replaces its normalized identifier
+    /// fragment wherever that callback name appears.
+    pub callbacks: BTreeMap<String, String>,
     /// Keyed by the raw URL path segment text; the value is the final identifier fragment bound
     /// for every declaration under that segment.
     pub path_segments: BTreeMap<String, String>,
@@ -3617,7 +3623,9 @@ mod tests {
         value["naming"] = json!({
             "overrides": {
                 "schemas": { "stream_liveInput": "StreamLiveInputId" },
-                "operations": { "deleteWebhook": "DeleteRealtimeKitWebhook" }
+                "operations": { "deleteWebhook": "DeleteRealtimeKitWebhook" },
+                "webhooks": { "pet-created": "PetCreatedEvent" },
+                "callbacks": { "delivery-status": "DeliveryStatusEvent" }
             }
         });
         let resolved = load_json(&value).expect("overrides should resolve");
@@ -3638,6 +3646,24 @@ mod tests {
                 .get("deleteWebhook")
                 .map(String::as_str),
             Some("DeleteRealtimeKitWebhook")
+        );
+        assert_eq!(
+            resolved
+                .naming
+                .overrides
+                .webhooks
+                .get("pet-created")
+                .map(String::as_str),
+            Some("PetCreatedEvent")
+        );
+        assert_eq!(
+            resolved
+                .naming
+                .overrides
+                .callbacks
+                .get("delivery-status")
+                .map(String::as_str),
+            Some("DeliveryStatusEvent")
         );
     }
 

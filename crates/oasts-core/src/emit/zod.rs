@@ -27,10 +27,12 @@ use super::validators::{
 };
 use super::{
     Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypeAxis, TypePosition,
-    callback_operation, callback_parent_operation, import_extension, lowercase_first, media_tag,
+    callback_operation, callback_parent_operation, import_extension, lowercase_first,
     property_in_position, push_indent, render_json_compact, render_ts_string,
-    response_status_type_suffix, source_diagnostic, uppercase_first,
+    request_body_validator_positions, response_media_names, response_status_type_suffix,
+    source_diagnostic, uppercase_first, warning_diagnostic,
 };
+use crate::client_model::{PrimitiveDomainProjector, build_body_plan};
 
 const ZOD_RUNTIME_TS: &str = include_str!("../../runtime/zod-runtime.ts");
 #[cfg(test)]
@@ -40,7 +42,7 @@ const VALIDATORS_RUNTIME_TS: &str = include_str!("../../runtime/validators-runti
 const CODE_REJECTED_KEYWORD: &str = "OASTS1504";
 /// A schema degraded to an unknown leaf, so no faithful Zod schema can be emitted.
 const CODE_UNKNOWN_LEAF: &str = "OASTS1505";
-/// Two JSON media entries on one response mangle to the same schema-name fragment.
+/// A JSON response media entry was renamed because its Zod schema-name fragment collided.
 const CODE_MEDIA_TAG_COLLISION: &str = "OASTS1400";
 
 const ZOD_RESERVED_NAMES: &[&str] = &[
@@ -79,6 +81,10 @@ const ZOD_RESERVED_NAMES: &[&str] = &[
 
 pub(crate) fn emit_zod_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
     let analyzed = model.analyzed;
+    // Built once per document, never per operation: this indexes every schema in the IR and
+    // walks each one's projection dependencies, so constructing it inside the operation loop
+    // would make request-body planning cost O(operations x schemas).
+    let projector = PrimitiveDomainProjector::new(&analyzed.ir);
     let mut rejects = Vec::new();
     {
         let emitter = Emitter::new(model);
@@ -116,7 +122,12 @@ pub(crate) fn emit_zod_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Gene
         }
     }
     for allocated in &analyzed.operation_names {
-        if let Some(file) = emit_operation(model, allocated.operation_index, &allocated.name) {
+        if let Some(file) = emit_operation(
+            model,
+            &projector,
+            allocated.operation_index,
+            &allocated.name,
+        ) {
             files.push(file);
         }
     }
@@ -130,6 +141,7 @@ pub(crate) fn emit_zod_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Gene
                 [allocated.operation_index];
             if let Some(file) = emit_operation_file(
                 model,
+                &projector,
                 operation,
                 &allocated.stem,
                 "webhooks",
@@ -150,6 +162,7 @@ pub(crate) fn emit_zod_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Gene
             let operation = callback_operation(&analyzed.ir, &analyzed.callback_names, allocated);
             if let Some(file) = emit_operation_file(
                 model,
+                &projector,
                 operation,
                 &allocated.stem,
                 "callbacks",
@@ -1651,6 +1664,7 @@ fn emit_component(
 
 fn emit_operation(
     model: &mut EmissionModel<'_, '_>,
+    projector: &PrimitiveDomainProjector<'_>,
     operation_index: usize,
     allocated_name: &str,
 ) -> Option<GeneratedFile> {
@@ -1658,6 +1672,7 @@ fn emit_operation(
     let operation = &model.analyzed.ir.operations[operation_index];
     emit_operation_file(
         model,
+        projector,
         operation,
         allocated_name,
         "operations",
@@ -1668,6 +1683,7 @@ fn emit_operation(
 
 fn emit_operation_file(
     model: &mut EmissionModel<'_, '_>,
+    projector: &PrimitiveDomainProjector<'_>,
     operation: &Operation,
     allocated_name: &str,
     directory: &str,
@@ -1675,6 +1691,12 @@ fn emit_operation_file(
     include_responses: bool,
 ) -> Option<GeneratedFile> {
     let stem = uppercase_first(allocated_name);
+    // Held across `positions` because a form field's schema is a projector-resolved clone owned by
+    // the plan rather than a node the IR can lend.
+    let body_plan = operation
+        .request_body
+        .as_ref()
+        .and_then(|body| build_body_plan(&body.media_types, projector));
     let mut positions = Vec::new();
     for (export_type, parameter) in operation_parameter_validator_names(operation, &stem)
         .into_iter()
@@ -1682,17 +1704,10 @@ fn emit_operation_file(
     {
         positions.push((export_type, &parameter.schema, TypePosition::Request));
     }
-    if let Some(body) = &operation.request_body
-        && let Some(media) = body
-            .media_types
-            .iter()
-            .find(|media| is_json(&media.essence))
-    {
-        positions.push((
-            format!("{stem}RequestBody"),
-            &media.schema,
-            TypePosition::Request,
-        ));
+    if let Some(body) = &operation.request_body {
+        for position in request_body_validator_positions(body, body_plan.as_ref(), &stem) {
+            positions.push((position.name, position.schema, TypePosition::Request));
+        }
     }
     if include_responses {
         let mut responses = Vec::new();
@@ -1915,28 +1930,27 @@ fn response_body_schemas<'ir>(
         .iter()
         .filter(|media| is_json(&media.essence))
         .collect::<Vec<_>>();
-    let Some(first) = json.first() else {
+    if json.is_empty() {
         return Vec::new();
-    };
-    if json.len() == 1 {
-        return vec![(format!("{stem}Response{suffix}"), &first.schema)];
     }
+    let media = json
+        .iter()
+        .map(|media| media.full.as_str())
+        .collect::<Vec<_>>();
+    let names = response_media_names(&format!("{stem}Response{suffix}"), &media);
     let mut named = Vec::new();
-    let mut claimed = BTreeMap::new();
-    for media in json {
-        let name = format!("{stem}Response{suffix}{}", media_tag(&media.full));
-        if let Some(previous) = claimed.insert(name.clone(), media.full.as_str()) {
-            sink.push(source_diagnostic(
+    for (media, name) in json.into_iter().zip(names) {
+        if let Some(previous) = name.collision {
+            sink.push(warning_diagnostic(
                 CODE_MEDIA_TAG_COLLISION,
                 format!(
-                    "response media types '{previous}' and '{}' produce the same zod schema name '{name}'",
-                    media.full
+                    "response media type '{}' produces the same zod schema name as '{previous}'; emitting it as '{}'",
+                    media.full, name.name
                 ),
                 &media.source,
             ));
-            continue;
         }
-        named.push((name, &media.schema));
+        named.push((name.name, &media.schema));
     }
     named
 }
@@ -2263,6 +2277,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::client_model::build_client_model;
     use crate::config::load_config;
     use crate::diag::{DiagnosticSink, Severity};
     use crate::emit::emit_artifacts;
@@ -2302,13 +2317,19 @@ mod tests {
         let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
         let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let source_tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
+        let client = if resolved.artifacts.client.enabled {
+            Some(build_client_model(&analyzed, &resolved, &mut sink))
+        } else {
+            None
+        };
         let files = emit_artifacts(
             &analyzed,
             &resolved,
-            &graph.source_tuples(),
-            None,
+            &source_tuples,
+            client.as_ref(),
             &mut sink,
         );
         (files, sink.into_sorted_vec())
@@ -3766,8 +3787,8 @@ mod tests {
     }
 
     #[test]
-    fn colliding_json_response_media_tags_report_oasts1400_and_keep_the_first_schema() {
-        let (files, diagnostics) = compile(json!({
+    fn colliding_json_response_media_tags_warn_and_emit_the_alias() {
+        let document = json!({
             "openapi": "3.1.0",
             "info": { "title": "t", "version": "1" },
             "paths": {
@@ -3786,18 +3807,38 @@ mod tests {
                     }
                 }
             }
-        }));
+        });
+        let (files, diagnostics) = compile_with_config(
+            document,
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "zod": true },
+                "client": {
+                    "authEnforcement": "types",
+                    "baseUrl": { "source": "literal", "value": "https://api.example.test" }
+                },
+                "validation": {
+                    "engine": "zod",
+                    "request": false,
+                    "response": true,
+                    "unchecked": "allow"
+                }
+            }),
+        );
+        assert_clean(&diagnostics);
         let collision = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == CODE_MEDIA_TAG_COLLISION)
             .expect("media tag collision diagnostic");
-        assert_eq!(collision.severity, Severity::Error);
+        assert_eq!(collision.severity, Severity::Warning);
         assert!(collision.message.contains("application/json;a-b=1"));
         assert!(collision.message.contains("application/json;a.b=1"));
         assert!(
             collision
                 .message
-                .contains("ReadThingResponse200ApplicationJsonAB")
+                .contains("ReadThingResponse200ApplicationJsonAB12")
         );
         let operation = generated(&files, "zod/operations/readthing.ts");
         assert_eq!(
@@ -3808,7 +3849,86 @@ mod tests {
             "one declaration, its z.infer reference, and the validate wrapper remain: {operation}"
         );
         assert!(operation.contains("= z.string();"));
-        assert!(!operation.contains("= z.boolean();"));
+        assert_eq!(
+            operation
+                .matches("readThingResponse200ApplicationJsonAB12Schema")
+                .count(),
+            3,
+            "the aliased declaration, its z.infer reference, and validate wrapper are emitted: {operation}"
+        );
+        assert!(operation.contains("= z.boolean();"));
+        let client = generated(&files, "client/operations/readthing.ts");
+        for name in [
+            "validateReadThingResponse200ApplicationJsonAB1",
+            "validateReadThingResponse200ApplicationJsonAB12",
+        ] {
+            assert!(
+                operation.contains(&format!("export function {name}(")),
+                "{operation}"
+            );
+            assert!(client.contains(&format!("{name}(result.data")), "{client}");
+        }
+    }
+
+    #[test]
+    fn three_colliding_response_media_tags_increment_zod_aliases() {
+        let (files, diagnostics) = compile(json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/thing": {
+                    "get": {
+                        "operationId": "readThing",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json;a-b=1": { "schema": { "type": "string" } },
+                                    "application/json;a.b=1": { "schema": { "type": "boolean" } },
+                                    "application/json;a+b=1": { "schema": { "type": "integer" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        assert_clean(&diagnostics);
+        let aliases = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_MEDIA_TAG_COLLISION)
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 2, "{diagnostics:#?}");
+        assert!(aliases.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("ReadThingResponse200ApplicationJsonAB12")
+        }));
+        assert!(aliases.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("ReadThingResponse200ApplicationJsonAB13")
+        }));
+        let operation = generated(&files, "zod/operations/readthing.ts");
+        for name in [
+            "validateReadThingResponse200ApplicationJsonAB1",
+            "validateReadThingResponse200ApplicationJsonAB12",
+            "validateReadThingResponse200ApplicationJsonAB13",
+        ] {
+            assert!(
+                operation.contains(&format!("export function {name}(")),
+                "{operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_response_media_tags_get_zod_aliases() {
+        let media = ["---", "..."];
+        let names = response_media_names("ReadThingResponse200", &media);
+        assert_eq!(names[0].name, "ReadThingResponse200Media");
+        assert_eq!(names[1].name, "ReadThingResponse200Media2");
+        assert_eq!(names[1].collision, Some(media[0]));
     }
 
     #[test]

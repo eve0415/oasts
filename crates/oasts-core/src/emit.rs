@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::client_model::ClientModel;
+use crate::client_model::{BodyPlan, BodyPlanArm, ClientModel, FormFieldPlan};
 #[cfg(test)]
 use crate::composition::CODE_COMPOSITION;
 use crate::composition::{finite_values, json_equal};
@@ -31,7 +31,7 @@ use crate::config::{
 };
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
-    AdditionalProperties, Discriminator, Ir, MediaType, Operation, Param, ParamLocation,
+    AdditionalProperties, Body, Discriminator, Ir, MediaType, Operation, Param, ParamLocation,
     PatternProperty, PatternPropertyKey, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader,
     ResponseStatus, SchemaDocs, SchemaNode, SchemaRef, SourceRef, TupleRest, finite_parts,
 };
@@ -39,6 +39,7 @@ use crate::media::{is_json, is_xml};
 use crate::num::{first_number_outside_binary64, render_number_value};
 use crate::semantic::{
     AllocatedCallbackName, AllocatedSchemaName, Analyzed, CallbackParent, EnumMember, ResolvedLink,
+    TargetCase, normalize_identifier,
 };
 
 mod client;
@@ -4258,12 +4259,83 @@ fn accumulate_shape_variants(schema: &SchemaNode, acc: &mut (bool, bool)) {
     }
 }
 
+pub(super) struct ResponseMediaName<'media> {
+    pub(super) name: String,
+    pub(super) collision: Option<&'media str>,
+}
+
+/// Names every JSON body a response declares, given that response's **full** media list in declared
+/// order. A sole JSON entry keeps `base`; two or more append their media tag, with an empty tag
+/// composed as `Media`. The first entry claiming a name keeps it; a later collision appends `2`,
+/// then increments until it finds an unclaimed name, so the suffix stays predictable from the
+/// response's own media-entry order even when a literal tag already claimed a numbered candidate.
+/// `collision` names the earlier entry whose plain name caused the alias.
+///
+/// Two obligations sit on the caller, because the validators, zod, and client emitters each emit
+/// one side of the same symbol: the first two emit the declaration, the client emits the call. A
+/// caller that passes a different subset, or a different order, emits a call to a function that was
+/// never declared.
+///
+/// *Which* entries: exactly the response's JSON entries, and nothing else. All three callers spell
+/// that `is_json`, but on different fields — validators and zod on `MediaType::essence`, the client
+/// on the full `ResponseMediaPlan::media`. Those agree because `is_json` runs `media_essence` on
+/// whatever it is handed, so a parameterized value classifies by its base type either way; it is
+/// keyed on the essence by design, exactly as `is_xml` beside it documents.
+///
+/// *In what order*: the declared media order. Validators and zod filter `ResponseEntry::media_types`
+/// directly; the client filters `ResponsePlan::media`, which is built as an order-preserving map
+/// over that same slice. Request bodies are *not* like this — `build_body_plan` sorts its
+/// discriminated arms by media type — so a future sort applied to response media would silently
+/// swap which schema each alias names. `client_model` pins that with a test.
+///
+/// Selection stays with the callers rather than moving in here so this function remains total over
+/// any media string, which is what its unit tests exercise; a JSON-only parameter would make the
+/// empty-tag path above unreachable and untestable.
+pub(super) fn response_media_names<'media>(
+    base: &str,
+    media: &[&'media str],
+) -> Vec<ResponseMediaName<'media>> {
+    // The overwhelmingly common response declares one JSON entry, which is never tagged and has
+    // nothing to collide against. Answering it here keeps the claim map off that path entirely.
+    if media.len() == 1 {
+        return vec![ResponseMediaName {
+            name: base.to_owned(),
+            collision: None,
+        }];
+    }
+    let mut claimed = BTreeMap::new();
+    media
+        .iter()
+        .map(|media| {
+            let tag = media_tag(media);
+            let mut name = if tag.is_empty() {
+                format!("{base}Media")
+            } else {
+                format!("{base}{tag}")
+            };
+            let collision = claimed.get(&name).copied();
+            if collision.is_some() {
+                let plain = name;
+                let mut next = 2;
+                loop {
+                    name = format!("{plain}{next}");
+                    if !claimed.contains_key(&name) {
+                        break;
+                    }
+                    next += 1;
+                }
+            }
+            claimed.insert(name.clone(), *media);
+            ResponseMediaName { name, collision }
+        })
+        .collect()
+}
+
 /// The exported-name fragment identifying one media entry, mangled from its canonical full media
 /// string: `*` becomes `Wildcard`, every other non-alphanumeric ASCII byte is a token separator,
 /// and each token is uppercase-first and concatenated (`application/vnd.api+json` →
-/// `ApplicationVndApiJson`). Total by construction — it never invents a disambiguating suffix, so a
-/// collision between two distinct media strings is a diagnostic rather than a silent rename.
-pub(super) fn media_tag(media: &str) -> String {
+/// `ApplicationVndApiJson`).
+fn media_tag(media: &str) -> String {
     let mut tag = String::with_capacity(media.len());
     let mut fresh = true;
     for byte in media.chars() {
@@ -4282,6 +4354,181 @@ pub(super) fn media_tag(media: &str) -> String {
         }
     }
     tag
+}
+
+/// Where one request-body validator position reads its value, relative to the dispatch root.
+pub(super) enum RequestBodyAccess {
+    /// The body itself: `<root>.body`.
+    Whole,
+    /// One form field: `<root>.body.<key>`, or `<root>.body.<key>.body` when the field is wrapped,
+    /// because a wrapped field renders `{ body, contentType }` and the schema describes the payload
+    /// rather than the wrapper.
+    Field { key: String, wrapped: bool },
+    /// One content-type arm: `<root>.body.body`, selected by testing `<root>.body.contentType`
+    /// against `media` rather than by a presence guard.
+    Arm { media: String },
+}
+
+/// One request-body position: a validator the validators/zod artifacts declare, and — when the
+/// value can be reached soundly — a call the client emits against it.
+pub(super) struct RequestBodyPosition<'a> {
+    /// Export-type name, without the `validate` prefix.
+    pub name: String,
+    pub schema: &'a SchemaNode,
+    /// How the client reaches the value, or `None` when the position is declaration-only.
+    pub access: Option<RequestBodyAccess>,
+    /// Whether the client must test the value for presence before calling.
+    pub guarded: bool,
+}
+
+/// Every request-body validator position for one operation, derived once for all three emitters.
+///
+/// The same obligation as `response_media_names` above: validators and zod emit the declarations,
+/// the client emits the calls, and a caller that derives a different set emits a call to a function
+/// that was never declared. `emit_validators_from_model` gets only the `EmissionModel`, so this
+/// works from the IR `Body` plus the `BodyPlan` each caller already has — the client from
+/// `OperationPlan::body_plan`, validators and zod from `build_body_plan` over the same
+/// `Body::media_types` with a `PrimitiveDomainProjector`, which is how that plan was built.
+///
+/// *Naming*: the JSON body keeps the bare `{stem}RequestBody` it has always had. Form fields take
+/// `{stem}RequestBody{Field}`, which cannot collide with a parameter's `{stem}{Location}{Name}`
+/// because `Location` is one of the four fixed titles and none of them is `RequestBody`; the same
+/// bump loop as `operation_parameter_validator_names` resolves fields that collapse onto one
+/// identifier under Pascal normalization. Discriminated arms go through `response_media_names`, so
+/// a lone JSON arm keeps the bare name and two or more are tagged by media.
+///
+/// *Order*: `build_body_plan` sorts discriminated arms by media type, so arm order is **not**
+/// declaration order. Both emitters read that same sorted slice, so positional derivation agrees —
+/// but note the contrast with the response side, which preserves declared media order; applying one
+/// side's assumption to the other silently swaps which schema each name describes.
+///
+/// *Declaration-only positions*: `is_json` (validators, zod) accepts `text/json`, while
+/// `is_request_json` (`build_body_plan`) does not, so a `text/json` body plans as `TopLevelText` and
+/// renders `string` whatever its schema says. Dropping it would delete an existing export, and
+/// calling it would validate a string against a schema that need not describe one, so the
+/// declaration is kept and no call is emitted.
+pub(super) fn request_body_validator_positions<'a>(
+    body: &'a Body,
+    plan: Option<&'a BodyPlan>,
+    stem: &str,
+) -> Vec<RequestBodyPosition<'a>> {
+    let base = format!("{stem}RequestBody");
+    let Some(plan) = plan else {
+        return Vec::new();
+    };
+    match plan {
+        BodyPlan::Json { media, .. } => body
+            .media_types
+            .iter()
+            .find(|entry| &entry.full == media)
+            .map(|entry| {
+                vec![RequestBodyPosition {
+                    name: base,
+                    schema: &entry.schema,
+                    access: Some(RequestBodyAccess::Whole),
+                    guarded: !body.required,
+                }]
+            })
+            .unwrap_or_default(),
+        BodyPlan::TopLevelText { media, .. } => body
+            .media_types
+            .iter()
+            .find(|entry| &entry.full == media && is_json(&entry.essence))
+            .map(|entry| {
+                vec![RequestBodyPosition {
+                    name: base,
+                    schema: &entry.schema,
+                    access: None,
+                    guarded: false,
+                }]
+            })
+            .unwrap_or_default(),
+        BodyPlan::TopLevelBinary { .. } => Vec::new(),
+        BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
+            form_field_positions(fields, &base, body.required)
+        }
+        BodyPlan::ContentTypeDiscriminated { arms, .. } => {
+            discriminated_arm_positions(body, arms, &base)
+        }
+    }
+}
+
+/// One position per form field that carries a schema value. A binary upload renders `Blob | File`,
+/// so it has no schema value to check and contributes nothing.
+fn form_field_positions<'a>(
+    fields: &'a [FormFieldPlan],
+    base: &str,
+    body_required: bool,
+) -> Vec<RequestBodyPosition<'a>> {
+    let mut used: HashSet<String> = HashSet::new();
+    // Seeded so a field whose fragment is empty cannot land on the bare body name.
+    used.insert(base.to_owned());
+    let mut positions = Vec::new();
+    for (index, field) in fields.iter().enumerate() {
+        if field.is_binary_upload() {
+            continue;
+        }
+        let fragment = normalize_identifier(&field.name, TargetCase::Pascal)
+            .unwrap_or_else(|_| format!("Field{index}"));
+        let candidate = format!("{base}{fragment}");
+        let mut name = candidate.clone();
+        let mut suffix = index;
+        while !used.insert(name.clone()) {
+            name = format!("{candidate}{suffix}");
+            suffix += 1;
+        }
+        positions.push(RequestBodyPosition {
+            name,
+            schema: &field.schema,
+            access: Some(RequestBodyAccess::Field {
+                key: field.name.clone(),
+                wrapped: field.wrapper.wrapped,
+            }),
+            // An absent body makes every field access absent too, so a required field still needs
+            // the guard when the body itself is optional.
+            guarded: !field.required || !body_required,
+        });
+    }
+    positions
+}
+
+/// One position per arm whose own plan is JSON. A text or binary arm carries nothing to check.
+///
+/// The schema comes from the arm's IR media entry rather than from `BodyPlan::Json::schema`, which
+/// is `None` for a media object that declared no schema — taking it from the plan would delete the
+/// export such a body already has.
+fn discriminated_arm_positions<'a>(
+    body: &'a Body,
+    arms: &'a [BodyPlanArm],
+    base: &str,
+) -> Vec<RequestBodyPosition<'a>> {
+    let json = arms
+        .iter()
+        .filter(|arm| matches!(arm.plan, BodyPlan::Json { .. }))
+        .filter_map(|arm| {
+            body.media_types
+                .iter()
+                .find(|entry| entry.full == arm.media)
+                .map(|entry| (arm, &entry.schema))
+        })
+        .collect::<Vec<_>>();
+    let medias = json
+        .iter()
+        .map(|(arm, _)| arm.media.as_str())
+        .collect::<Vec<_>>();
+    json.iter()
+        .zip(response_media_names(base, &medias))
+        .map(|((arm, schema), name)| RequestBodyPosition {
+            name: name.name,
+            schema,
+            // The content-type test doubles as the presence guard: an absent body has no
+            // `contentType` to match.
+            access: Some(RequestBodyAccess::Arm {
+                media: arm.media.clone(),
+            }),
+            guarded: false,
+        })
+        .collect()
 }
 
 /// Inserts the `esnext.temporal` lib reference into an assembled file that names a `Temporal` type.

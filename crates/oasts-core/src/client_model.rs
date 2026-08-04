@@ -107,6 +107,13 @@ pub struct ParameterPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BodyPlanArm {
+    pub media: String,
+    pub plan: BodyPlan,
+    pub source: SourceRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BodyPlan {
     Json {
         media: String,
@@ -134,7 +141,7 @@ pub enum BodyPlan {
         source: SourceRef,
     },
     ContentTypeDiscriminated {
-        arms: Vec<(String, BodyPlan)>,
+        arms: Vec<BodyPlanArm>,
         all_concrete: bool,
     },
 }
@@ -150,7 +157,7 @@ impl BodyPlan {
     }
 
     #[must_use]
-    pub fn discriminated_arms(&self) -> Option<(&[(String, Self)], bool)> {
+    pub fn discriminated_arms(&self) -> Option<(&[BodyPlanArm], bool)> {
         if let Self::ContentTypeDiscriminated { arms, all_concrete } = self {
             Some((arms, *all_concrete))
         } else {
@@ -167,6 +174,20 @@ pub struct FormFieldPlan {
     pub serialization: FieldSerializationPlan,
     pub wrapper: FieldWrapperPlan,
     pub source: SourceRef,
+}
+
+impl FormFieldPlan {
+    /// Whether this field is sent as an upload handle rather than as its declared schema value.
+    /// Such a field renders `Blob | File`, so it carries nothing a codec could convert and nothing
+    /// a projector could invert. The type renderer keeps its own `match` arm instead of calling
+    /// this, because there it must stay exhaustive over `FieldSerializationPlan`.
+    #[must_use]
+    pub fn is_binary_upload(&self) -> bool {
+        matches!(
+            &self.serialization,
+            FieldSerializationPlan::Content { media, .. } if media.binary_upload
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -711,9 +732,13 @@ pub(crate) fn build_body_plan(
         // by canonical-full-type byte order, independent of source declaration order.
         let mut arms = media_types
             .iter()
-            .map(|media| (media.full.clone(), body_plan_for_media(media, projector)))
+            .map(|media| BodyPlanArm {
+                media: media.full.clone(),
+                plan: body_plan_for_media(media, projector),
+                source: media.source.clone(),
+            })
             .collect::<Vec<_>>();
-        arms.sort_by(|(left, _), (right, _)| left.cmp(right));
+        arms.sort_by(|left, right| left.media.cmp(&right.media));
         return Some(BodyPlan::ContentTypeDiscriminated {
             arms,
             all_concrete: media_types
@@ -3076,7 +3101,7 @@ mod tests {
         // request body declares `text/plain` before `application/json`).
         assert_eq!(
             arms.iter()
-                .map(|(media, _)| media.as_str())
+                .map(|arm| arm.media.as_str())
                 .collect::<Vec<_>>(),
             ["application/json", "text/plain"]
         );
@@ -3160,6 +3185,52 @@ mod tests {
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
     }
 
+    /// `emit::response_media_names` aliases colliding media tags positionally, and validators and
+    /// zod feed it `ResponseEntry::media_types` while the client feeds it `ResponsePlan::media`.
+    /// The two must stay in the same order or a collision would name the declaration after one
+    /// schema and the call after another. Request arms are sorted by media type; responses must
+    /// not be.
+    #[test]
+    fn response_media_plans_preserve_the_declared_media_order() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/report": {
+                    "get": {
+                        "operationId": "report",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/vnd.zeta+json": { "schema": { "type": "object" } },
+                                    "application/vnd.alpha+json": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let declared = analyzed.ir.operations[0].responses[0]
+            .media_types
+            .iter()
+            .map(|media| media.full.as_str())
+            .collect::<Vec<_>>();
+        let planned = model.operations[0].response_table[0]
+            .media
+            .iter()
+            .map(|media| media.media.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(declared, planned);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
     #[test]
     fn schemaless_response_media_plan_carries_the_ir_node() {
         // A `content` entry with no `schema` keyword still carries the IR's unconstrained node, so
@@ -3238,7 +3309,7 @@ mod tests {
         // regardless of source order.
         assert_eq!(
             arms.iter()
-                .map(|(media, _)| media.as_str())
+                .map(|arm| arm.media.as_str())
                 .collect::<Vec<_>>(),
             ["application/json;v=1", "application/json;v=2"]
         );
@@ -3246,7 +3317,7 @@ mod tests {
         // Essence-based classification: a parameterized JSON key still serializes as JSON.
         assert!(
             arms.iter()
-                .all(|(_, plan)| matches!(plan, BodyPlan::Json { .. }))
+                .all(|arm| matches!(arm.plan, BodyPlan::Json { .. }))
         );
         // Accept lists canonical full response forms in deterministic order.
         assert_eq!(
@@ -4932,11 +5003,11 @@ mod tests {
             .as_ref()
             .and_then(BodyPlan::discriminated_arms)
             .expect("discriminated opaque body");
-        assert!(arms.iter().any(|(media, plan)| {
-            media == "text/xml" && matches!(plan, BodyPlan::TopLevelText { .. })
+        assert!(arms.iter().any(|arm| {
+            arm.media == "text/xml" && matches!(arm.plan, BodyPlan::TopLevelText { .. })
         }));
-        assert!(arms.iter().all(|(media, plan)| {
-            media == "text/xml" || matches!(plan, BodyPlan::TopLevelBinary { .. })
+        assert!(arms.iter().all(|arm| {
+            arm.media == "text/xml" || matches!(arm.plan, BodyPlan::TopLevelBinary { .. })
         }));
         assert!(
             opaque.response_table[0]

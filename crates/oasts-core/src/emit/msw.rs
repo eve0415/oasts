@@ -6,6 +6,15 @@
 //! already been emitted by the time this runs, so renaming a component here would leave the two
 //! artifacts naming the same schema differently. Identifier clashes go through the same file-local
 //! import aliasing the client uses instead.
+//!
+//! That containment is what makes this artifact refuse a position reaching a date/time transform
+//! (`OASTS1508`/`OASTS1509`). The refusal is a deliberate limitation, not an impossibility: the
+//! conversion is perfectly expressible, but the codecs are emitted under the client's output
+//! directory, so importing them would break the one rule above and emit a module that does not
+//! exist for a consumer who enabled msw without the client. Lifting it means teaching the
+//! transform emitter to emit a second, msw-local copy of the codecs — duplicating emitted code
+//! for every consumer who enables both — which is a cost this artifact has chosen not to pay.
+//! Reproducing the transform, not refusing it, is the part that would need that work.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -780,7 +789,7 @@ fn inspect_body_projection(
             if model.transform_facts().reaches(schema) {
                 diagnostics.push(body_projection_diagnostic(
                     source,
-                    "the application type applies a date/time transform that the standalone MSW artifact cannot reproduce",
+                    "the application type applies a date/time transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach",
                 ));
             }
         }
@@ -790,7 +799,7 @@ fn inspect_body_projection(
                     diagnostics.push(body_projection_diagnostic(
                         &field.source,
                         &format!(
-                            "form field '{}' applies a date/time transform that the standalone MSW artifact cannot reproduce",
+                            "form field '{}' applies a date/time transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach",
                             field.name
                         ),
                     ));
@@ -857,7 +866,7 @@ fn inspect_body_projection(
                     diagnostics.push(body_projection_diagnostic(
                         &field.source,
                         &format!(
-                            "multipart field '{}' applies a date/time transform that the standalone MSW artifact cannot reproduce",
+                            "multipart field '{}' applies a date/time transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach",
                             field.name
                         ),
                     ));
@@ -865,8 +874,8 @@ fn inspect_body_projection(
             }
         }
         BodyPlan::ContentTypeDiscriminated { arms, .. } => {
-            for (_, arm) in arms {
-                inspect_body_projection(model, arm, diagnostics);
+            for arm in arms {
+                inspect_body_projection(model, &arm.plan, diagnostics);
             }
         }
         BodyPlan::Json { schema: None, .. }
@@ -904,9 +913,9 @@ fn render_request_body_descriptor(
     output.push_str(", media: [\n");
     match plan {
         BodyPlan::ContentTypeDiscriminated { arms, .. } => {
-            for (_, arm) in arms {
+            for arm in arms {
                 output.push_str("    ");
-                write_request_body_media_descriptor(&mut output, model, arm)?;
+                write_request_body_media_descriptor(&mut output, model, &arm.plan)?;
                 output.push_str(",\n");
             }
         }
@@ -1209,15 +1218,15 @@ fn render_request_body_type(
         }
         BodyPlan::ContentTypeDiscriminated { arms, all_concrete } => arms
             .iter()
-            .map(|(media, arm)| {
+            .map(|arm| {
                 let discriminant = if *all_concrete {
-                    render_ts_string(media)
+                    render_ts_string(&arm.media)
                 } else {
                     "string".to_owned()
                 };
                 format!(
                     "{{ contentType: {discriminant}; body: {} }}",
-                    render_request_body_type(renderer, model, arm, indent)
+                    render_request_body_type(renderer, model, &arm.plan, indent)
                 )
             })
             .collect::<Vec<_>>()
@@ -1298,8 +1307,8 @@ fn collect_request_body_imports(
             }
         }
         BodyPlan::ContentTypeDiscriminated { arms, .. } => {
-            for (_, arm) in arms {
-                collect_request_body_imports(renderer, arm, imports);
+            for arm in arms {
+                collect_request_body_imports(renderer, &arm.plan, imports);
             }
         }
         BodyPlan::Json { schema: None, .. }
@@ -1328,7 +1337,7 @@ fn plan_projected_parameters(
                 parameter.content_media_type.as_deref().unwrap_or("unknown")
             ))
         } else if model.transform_facts().reaches(&parameter.schema) {
-            Some("the application type applies a date/time transform that the standalone MSW artifact cannot reproduce".to_owned())
+            Some("the application type applies a date/time transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach".to_owned())
         } else if plan.resolved.style == ParamStyle::Label
             && plan.resolved.explode
             && projector.admits_collection(&parameter.schema)
@@ -2981,13 +2990,14 @@ paths:
         assert!(write_multipart_field_descriptor(&mut output, &model, &empty_field).is_err());
 
         let nested = BodyPlan::ContentTypeDiscriminated {
-            arms: vec![(
-                "application/*".to_owned(),
-                BodyPlan::ContentTypeDiscriminated {
+            arms: vec![crate::client_model::BodyPlanArm {
+                media: "application/*".to_owned(),
+                plan: BodyPlan::ContentTypeDiscriminated {
                     arms: Vec::new(),
                     all_concrete: false,
                 },
-            )],
+                source: source.clone(),
+            }],
             all_concrete: false,
         };
         assert!(render_request_body_descriptor(&model, &nested, true, &source).is_err());
