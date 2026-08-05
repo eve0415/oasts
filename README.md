@@ -4,9 +4,9 @@
 
 **Compile OpenAPI 3.0/3.1 into TypeScript types and a zero-dependency typed client — deterministic, fast, Rust-powered.**
 
-[![npm version](https://img.shields.io/npm/v/oasts)](https://www.npmjs.com/package/oasts)
-[![npm downloads](https://img.shields.io/npm/dm/oasts)](https://www.npmjs.com/package/oasts)
-[![license: MIT](https://img.shields.io/npm/l/oasts)](./LICENSE)
+[![npm version](https://img.shields.io/npm/v/@oasts/cli)](https://www.npmjs.com/package/@oasts/cli)
+[![npm downloads](https://img.shields.io/npm/dm/@oasts/cli)](https://www.npmjs.com/package/@oasts/cli)
+[![license: MIT](https://img.shields.io/npm/l/@oasts/cli)](./LICENSE)
 
 </div>
 
@@ -38,10 +38,10 @@ Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtim
 ## Quick start
 
 ```sh
-pnpm add -D oasts
+pnpm add -D @oasts/cli
 ```
 
-Node 24 or newer. Drop an `oasts.yaml` next to your spec:
+The package is `@oasts/cli`; the command it installs is `oasts`. Node 24 or newer. Drop an `oasts.yaml` next to your spec:
 
 ```yaml
 schemaVersion: 1
