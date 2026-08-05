@@ -479,6 +479,92 @@ fn parse_generated_summary(line: &str) -> Option<usize> {
     Some(count)
 }
 
+/// Why a config run failed, so that a generator defect cannot hide among the corpus's
+/// known-bad documents.
+///
+/// Half the corpus fails for reasons that are not the generator's: a document that contradicts
+/// OpenAPI, a refusal whose remedy the diagnostic already prints, a construct the project
+/// documents as out of scope. Counting those as failures makes a red run the normal state, and a
+/// real regression invisible inside it.
+///
+/// Classification is by diagnostic code alone. Diagnostics carry no category of their own, and
+/// matching on message text would break the first time a message is reworded. A code the table
+/// does not name is a defect: the table is an allowlist, so a newly introduced refusal reads as a
+/// defect until someone classifies it deliberately.
+///
+/// The declaration order is the precedence order — a run's outcome is the greatest category among
+/// its errors, so one unclassified code outweighs any number of classified ones.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Outcome {
+    /// The run succeeded.
+    Ok,
+    /// Every error has a config knob that resolves it.
+    RefusedWithRemedy,
+    /// Every error names a construct the project documents as out of scope.
+    Unsupported,
+    /// Every error is the document violating OpenAPI or JSON Schema.
+    InvalidDocument,
+    /// Something else. This is the bucket that matters.
+    GeneratorDefect,
+}
+
+impl Outcome {
+    /// Every variant, in precedence order — the tally renders in this order rather than in
+    /// whatever order the corpus happened to produce.
+    const ALL: [Self; 5] = [
+        Self::Ok,
+        Self::RefusedWithRemedy,
+        Self::Unsupported,
+        Self::InvalidDocument,
+        Self::GeneratorDefect,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::RefusedWithRemedy => "refused-with-remedy",
+            Self::Unsupported => "unsupported",
+            Self::InvalidDocument => "invalid-document",
+            Self::GeneratorDefect => "generator-defect",
+        }
+    }
+}
+
+/// The category of one diagnostic code. See [`Outcome`] for why this is keyed on the code alone.
+fn classify(code: &str) -> Outcome {
+    match code {
+        // The document contradicts OpenAPI or JSON Schema. No generator change accepts these; the
+        // fix belongs upstream, in the document.
+        "OASTS1011"     // a $ref whose JSON pointer resolves to nothing
+        | "OASTS1201"   // a duplicate operationId, which OpenAPI requires to be unique
+        | "OASTS1421"   // a form media whose schema has no properties to name its fields with
+        | "OASTS1434"   // a security requirement naming a scheme components never declares
+        | "OASTS1441"   // OpenAPI 3.0: non-oauth2/openIdConnect requirement scopes MUST be empty
+        => Outcome::InvalidDocument,
+
+        // A config knob resolves it, and the diagnostic prints the block to paste. A public type
+        // name is the user's to choose, so these stay fatal by design.
+        "OASTS1202"     // a component name collision -> naming.overrides.schemas
+        | "OASTS1512"   // a path segment that is not a usable name -> naming.overrides.pathSegments
+        => Outcome::RefusedWithRemedy,
+
+        // Constructs the project documents as out of scope.
+        "OASTS1403"     // XML
+        | "OASTS1405"   // a text request media whose schema does not project to string
+        | "OASTS1501"   // validators: a rejected validation keyword
+        | "OASTS1502"   // validators: an unknown leaf there is nothing to check
+        | "OASTS1504"   // zod: a rejected validation keyword
+        | "OASTS1505"   // zod: an unknown leaf
+        => Outcome::Unsupported,
+
+        // No arm for the msw projection refusals (OASTS1506-1510): each is scoped to the operation
+        // that earned it and carries warning severity, so it never reaches an outcome. They are
+        // still work owed — a parameter whose wire form has no unique inverse gets no handler —
+        // but the document generates, and a category here would never be read.
+        _ => Outcome::GeneratorDefect,
+    }
+}
+
 #[derive(Debug)]
 struct ConfigReport {
     config: ConfigKind,
@@ -494,6 +580,23 @@ struct ConfigReport {
     base_url_fallback_used: bool,
     diagnostics: Vec<ParsedDiagnostic>,
     typecheck: Option<TypecheckReport>,
+}
+
+impl ConfigReport {
+    /// A nonzero exit whose diagnostics did not parse is a defect rather than an absence: the
+    /// harness could not see why the run failed, which is exactly the case that must not be
+    /// quietly filed under a known-bad document.
+    fn outcome(&self) -> Outcome {
+        if self.exit_code == 0 {
+            return Outcome::Ok;
+        }
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .map(|diagnostic| classify(&diagnostic.code))
+            .max()
+            .unwrap_or(Outcome::GeneratorDefect)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1176,6 +1279,22 @@ fn human_ts_code_order(
     ordered
 }
 
+/// Counts config runs per outcome. Every variant is present, including the zeroes: a tally that
+/// omits `generator-defect` when it is empty reads as if the category were never checked.
+fn tally_outcomes(reports: &[SpecReport]) -> Vec<(Outcome, usize)> {
+    Outcome::ALL
+        .into_iter()
+        .map(|outcome| {
+            let count = reports
+                .iter()
+                .flat_map(|spec| &spec.configs)
+                .filter(|config| config.outcome() == outcome)
+                .count();
+            (outcome, count)
+        })
+        .collect()
+}
+
 fn report_yaml(
     reports: &[SpecReport],
     codes: &BTreeMap<String, CodeReport>,
@@ -1184,6 +1303,10 @@ fn report_yaml(
 ) -> String {
     let mut out = String::from("schemaVersion: 1\n");
     let _ = writeln!(out, "typecheckRan: {typecheck_ran}");
+    out.push_str("outcomes:\n");
+    for (outcome, count) in tally_outcomes(reports) {
+        let _ = writeln!(out, "  {}: {count}", outcome.name());
+    }
     out.push_str("specs:\n");
     for spec in reports {
         let _ = writeln!(out, "  - name: {}", yaml_quote(&spec.name));
@@ -1202,6 +1325,7 @@ fn report_yaml(
             for config in &spec.configs {
                 let _ = writeln!(out, "      {}:", config.config.name());
                 let _ = writeln!(out, "        exitCode: {}", config.exit_code);
+                let _ = writeln!(out, "        outcome: {}", config.outcome().name());
                 let _ = writeln!(out, "        wallMs: {}", config.wall_ms);
                 let _ = writeln!(
                     out,
@@ -1299,6 +1423,15 @@ fn report_yaml(
         for (code, report) in codes {
             let _ = writeln!(out, "  {}:", yaml_quote(code));
             let _ = writeln!(out, "    severity: {}", report.severity);
+            // A category answers "why did a run fail", so a code that only ever warns has none —
+            // rendering one would file a benign warning under `generator-defect`, which is what
+            // `classify` returns for anything the table does not name.
+            match report.severity.as_str() {
+                "warning" => out.push_str("    category: null\n"),
+                _ => {
+                    let _ = writeln!(out, "    category: {}", classify(code).name());
+                }
+            }
             let _ = writeln!(out, "    specCount: {}", report.spec_count);
             let _ = writeln!(out, "    occurrenceCount: {}", report.occurrence_count);
             out.push_str("    sample:\n");
@@ -1406,8 +1539,9 @@ fn print_summary(
         for config in &spec.configs {
             let _ = write!(
                 line,
-                "  {} exit={} files={} det/parse={}/{} tsc={} e/w={}/{}",
+                "  {} {} exit={} files={} det/parse={}/{} tsc={} e/w={}/{}",
                 config.config.name(),
+                config.outcome().name(),
                 config.exit_code,
                 config.emitted_file_count,
                 verdict(config.determinism_passed),
@@ -1425,6 +1559,11 @@ fn print_summary(
         }
         let _ = writeln!(out, "{line}");
     }
+    let mut tally = String::from("outcomes:");
+    for (outcome, count) in tally_outcomes(reports) {
+        let _ = write!(tally, "  {}={count}", outcome.name());
+    }
+    let _ = writeln!(out, "{tally}");
     if codes.is_empty() {
         let _ = writeln!(out, "codes: none");
     } else {
@@ -1749,6 +1888,97 @@ mod tests {
         assert_eq!(shared.occurrence_count, 4);
         assert_eq!(shared.samples.len(), 3);
         assert_eq!(human_code_order(&codes)[0].0, "OASTS1200");
+    }
+
+    #[test]
+    fn outcome_is_ok_only_on_a_clean_exit() {
+        let mut report = config_report(ConfigKind::Types, Vec::new());
+        report.exit_code = 0;
+        assert_eq!(report.outcome(), Outcome::Ok);
+    }
+
+    #[test]
+    fn outcome_reads_the_classification_of_its_errors() {
+        for (code, expected) in [
+            ("OASTS1441", Outcome::InvalidDocument),
+            ("OASTS1202", Outcome::RefusedWithRemedy),
+            ("OASTS1403", Outcome::Unsupported),
+        ] {
+            let report = config_report(
+                ConfigKind::Full,
+                vec![diagnostic(Severity::Error, code, "boom")],
+            );
+            assert_eq!(report.outcome(), expected, "{code}");
+        }
+    }
+
+    /// The point of the categories: a classified failure must never mask an unclassified one.
+    #[test]
+    fn an_unclassified_error_outweighs_every_classified_one() {
+        let report = config_report(
+            ConfigKind::Full,
+            vec![
+                diagnostic(Severity::Error, "OASTS1441", "invalid document"),
+                diagnostic(Severity::Error, "OASTS1202", "remedy exists"),
+                diagnostic(Severity::Error, "OASTS1403", "out of scope"),
+                diagnostic(Severity::Error, "OASTS9999", "nobody classified this"),
+            ],
+        );
+        assert_eq!(report.outcome(), Outcome::GeneratorDefect);
+    }
+
+    /// Warnings never decide an outcome — a failing run is described by what failed it.
+    #[test]
+    fn warnings_do_not_reach_the_outcome() {
+        let report = config_report(
+            ConfigKind::Full,
+            vec![
+                diagnostic(Severity::Warning, "OASTS9999", "unclassified warning"),
+                diagnostic(Severity::Error, "OASTS1403", "out of scope"),
+            ],
+        );
+        assert_eq!(report.outcome(), Outcome::Unsupported);
+    }
+
+    /// A nonzero exit the harness could not read a diagnostic out of is the worst case, not the
+    /// absence of one.
+    #[test]
+    fn an_unreadable_failure_is_a_defect() {
+        let report = config_report(ConfigKind::Full, Vec::new());
+        assert_eq!(report.outcome(), Outcome::GeneratorDefect);
+    }
+
+    #[test]
+    fn the_tally_reports_every_category_including_the_empty_ones() {
+        let spec = SpecReport {
+            name: "alpha".to_owned(),
+            title: "Alpha".to_owned(),
+            client: true,
+            configs: vec![
+                config_report(
+                    ConfigKind::Full,
+                    vec![diagnostic(Severity::Error, "OASTS1403", "out of scope")],
+                ),
+                config_report(
+                    ConfigKind::Types,
+                    vec![diagnostic(Severity::Error, "OASTS1441", "invalid")],
+                ),
+            ],
+            harness_error: None,
+        };
+
+        let tally = tally_outcomes(&[spec]);
+
+        assert_eq!(
+            tally,
+            vec![
+                (Outcome::Ok, 0),
+                (Outcome::RefusedWithRemedy, 0),
+                (Outcome::Unsupported, 1),
+                (Outcome::InvalidDocument, 1),
+                (Outcome::GeneratorDefect, 0),
+            ]
+        );
     }
 
     #[test]

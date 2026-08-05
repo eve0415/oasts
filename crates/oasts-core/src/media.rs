@@ -84,12 +84,17 @@ pub(crate) fn media_essence(media: &str) -> &str {
         .trim_end()
 }
 
-/// Whether a media type is JSON-family (RFC 8259 `application/json`, the de-facto `text/json`
-/// alias, or any `+json` structured suffix), keyed on the essence so a parameterized value
-/// classifies by its base type.
+/// Whether a media type is JSON-family (RFC 8259 `application/json` or any `+json` structured
+/// suffix), keyed on the essence so a parameterized value classifies by its base type.
+///
+/// `text/json` is deliberately absent. It was never registered — RFC 8259 registers
+/// `application/json` — and recognizing it split this compiler in two: a `text/json` body decoded
+/// as JSON coming back and was carried as text going out, so one document's media type meant two
+/// things. A document that carries JSON says `application/json`; one that says `text/json` gets the
+/// same treatment as every other `text/*`.
 pub(crate) fn is_json(media: &str) -> bool {
     let essence = media_essence(media);
-    matches!(essence, "application/json" | "text/json")
+    essence == "application/json"
         || essence
             .rsplit_once('/')
             .is_some_and(|(_, subtype)| subtype.ends_with("+json"))
@@ -295,13 +300,20 @@ mod tests {
     fn recognizes_only_the_declared_json_families() {
         for media in [
             "application/json",
+            "application/json; charset=utf-8",
             "application/problem+json",
-            "text/json",
-            "text/json; charset=utf-8",
         ] {
             assert!(is_json(media), "{media}");
         }
-        for media in ["text/plain", "text/x-json", "application/json-seq"] {
+        // `text/json` sits with the rejections on purpose: unregistered, and recognizing it made
+        // one media type mean JSON in a response and text in a request.
+        for media in [
+            "text/plain",
+            "text/json",
+            "text/json; charset=utf-8",
+            "text/x-json",
+            "application/json-seq",
+        ] {
             assert!(!is_json(media), "{media}");
         }
     }

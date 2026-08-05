@@ -1211,9 +1211,7 @@ fn request_validation_checks(
     // emitters; a position with no sound access path is declared but never called.
     if let Some(body) = &operation.request_body {
         for position in request_body_validator_positions(body, plan.body_plan.as_ref(), stem) {
-            let Some(access) = position.access else {
-                continue;
-            };
+            let access = position.access;
             let content_type = match &access {
                 RequestBodyAccess::Arm { media } => {
                     let chain = if body.required { "." } else { "?." };
@@ -7671,37 +7669,64 @@ mod tests {
         );
     }
 
+    /// `text/json` is an ordinary `text/*` media, so it must emit exactly what `text/plain` emits.
+    ///
+    /// It used to emit something else: the compiler's JSON test accepted `text/json` while
+    /// `build_body_plan` did not, so the body rendered `string` while a validator was still
+    /// exported for the declared schema — an export nothing could call, because validating a
+    /// string against that schema would check the wrong value. Asserting equality against
+    /// `text/plain` rather than asserting the absence of that export is deliberate: it pins the
+    /// two paths together, so a future rule that special-cases `text/json` again fails here
+    /// whichever direction it drifts.
     #[test]
-    fn a_text_json_body_keeps_its_declaration_and_gets_no_call() {
-        // `is_json` accepts `text/json`; `build_body_plan` does not, so such a body renders `string`
-        // whatever its schema says. The export stays — deleting it would break consumers — but no
-        // call is emitted, because validating a string against that schema would check the wrong
-        // value.
-        let document = json!({
-            "openapi": "3.1.0",
-            "info": { "title": "t", "version": "1" },
-            "paths": { "/json": { "post": {
-                "operationId": "sendtextjson",
-                "requestBody": {
-                    "required": true,
-                    "content": { "text/json": { "schema": { "type": "string" } } }
-                },
-                "responses": { "204": { "description": "ok" } }
-            } } }
-        });
-        let (files, diagnostics) = emit_validated_files(&document, true, false);
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-        let validators = generated_file(&files, "validators/operations/sendtextjson.ts");
-        assert!(
-            validators.contains("export function validateSendtextjsonRequestBody"),
-            "{validators}"
+    fn a_text_json_body_emits_exactly_what_a_text_plain_body_emits() {
+        let document = |media: &str| {
+            json!({
+                "openapi": "3.1.0",
+                "info": { "title": "t", "version": "1" },
+                "paths": { "/json": { "post": {
+                    "operationId": "sendtext",
+                    "requestBody": {
+                        "required": true,
+                        "content": { media: { "schema": { "type": "string" } } }
+                    },
+                    "responses": { "204": { "description": "ok" } }
+                } } }
+            })
+        };
+
+        let (json_files, json_diagnostics) =
+            emit_validated_files(&document("text/json"), true, false);
+        let (plain_files, plain_diagnostics) =
+            emit_validated_files(&document("text/plain"), true, false);
+
+        assert!(json_diagnostics.is_empty(), "{json_diagnostics:#?}");
+        assert!(plain_diagnostics.is_empty(), "{plain_diagnostics:#?}");
+        assert_eq!(
+            json_files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            plain_files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>()
         );
-        let content = operation_file(&files, "sendtextjson");
-        assert!(
-            !content.contains("validateSendtextjsonRequestBody("),
-            "{content}"
+        // The provenance header carries a digest of the document's own bytes, which differ by the
+        // media string under test and nothing else.
+        let without_digest = |content: String| {
+            content
+                .lines()
+                .filter(|line| !line.starts_with("// Source digest:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            without_digest(
+                operation_file(&json_files, "sendtext").replace("text/json", "text/plain")
+            ),
+            without_digest(operation_file(&plain_files, "sendtext"))
         );
-        assert!(!content.contains("requestIssues"), "{content}");
     }
 
     #[test]

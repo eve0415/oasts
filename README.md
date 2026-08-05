@@ -188,9 +188,10 @@ const http = createOpenApiHttp<paths>();
 const handler = http.get("/pets/{petId}", ({ response }) => response("200").json(pet));
 ```
 
-Paths that MSW's matcher cannot express are refused at generation time rather than emitted as a
-handler that silently never matches — the failure mode that otherwise surfaces as an unrelated
-test's unhandled-request warning.
+An operation MSW cannot mock — a path its matcher cannot express, a parameter whose wire form has no
+unique inverse — gets no handler and a warning naming it, rather than a handler that silently never
+matches, which otherwise surfaces as some unrelated test's unhandled-request warning. The rest of
+the document still generates: one operation the mock cannot express should not cost you the others.
 
 ## TanStack Query
 

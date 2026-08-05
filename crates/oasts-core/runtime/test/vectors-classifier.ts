@@ -4,7 +4,7 @@
 // Classifier vectors are derived from the frozen contract's normative, exhaustive, ORDERED
 // clause list: "(1) `text/event-stream` and streaming-marked types -> the streaming
 // branch ... checked first so a streaming-marked `+json` type ... is never silently buffered;
-// (2) `application/json`, `text/json`, and any media type whose subtype ends in `+json` -> JSON
+// (2) `application/json` and any media type whose subtype ends in `+json` -> JSON
 // decoding; (3) `application/xml`, `text/xml`, and any `+xml` suffix with a structurally projected
 // schema -> generation diagnostic; schema-absent and string-projected XML-family media are binary;
 // (4) `multipart/*` response bodies -> generation diagnostic; (5)
@@ -14,11 +14,12 @@
 // ArrayBuffer outcome).
 //
 // UnknownHttpError mapping vectors are derived from the frozen contract's unmatched-response
-// algorithm ("bodyless handling first; an actual `application/json`/`text/json`/`+json` type decodes as
+// algorithm ("bodyless handling first; an actual `application/json`/`+json` type decodes as
 // `unknown`; `text/*` and `application/x-www-form-urlencoded` decode as text; every other or
 // missing content type yields `ArrayBuffer`") and the frozen contract's frozen `UnknownHttpError`
 // union, which the frozen contract states follows that algorithm "one-to-one" (bodyless -> `empty`;
-// JSON/`text/json`/`+json` -> `json`; other `text/*` and form-urlencoded -> `text`; every other or missing
+// JSON/`+json` -> `json`; `text/*` (including the unregistered `text/json`) and form-urlencoded ->
+// `text`; every other or missing
 // content type -> `binary`).
 
 export type ClassifierClass =
@@ -69,12 +70,6 @@ export const CLASSIFIER_VECTORS: readonly ClassifierVector[] = [
     cite: "frozen contract clause 2",
     description: "A +json suffix subtype decodes as JSON.",
     mediaType: "application/vnd.api+json",
-    expectedClass: "json",
-  },
-  {
-    cite: "frozen contract clause 2",
-    description: "The de-facto text/json alias decodes as JSON.",
-    mediaType: "text/json",
     expectedClass: "json",
   },
   // Clause 3: structural XML is a diagnostic; opaque XML is binary.
@@ -136,6 +131,14 @@ export const CLASSIFIER_VECTORS: readonly ClassifierVector[] = [
     cite: "frozen contract clause 5",
     description: "text/plain decodes as text.",
     mediaType: "text/plain",
+    expectedClass: "text",
+  },
+  {
+    cite: "frozen contract clause 5",
+    description:
+      "text/json is unregistered — RFC 8259 registers application/json — so clause 2 does not " +
+      "claim it and it decodes as the text/* it declares.",
+    mediaType: "text/json",
     expectedClass: "text",
   },
   {
@@ -220,10 +223,10 @@ export const UNKNOWN_HTTP_ERROR_VECTORS: readonly UnknownHttpErrorVector[] = [
   },
   {
     cite: "frozen contract",
-    description: "text/json with a body decodes as json.",
+    description: "text/json with a body decodes as text.",
     contentType: "text/json",
     bodyPresent: true,
-    expectedKind: "json",
+    expectedKind: "text",
   },
   {
     cite: "frozen contract",

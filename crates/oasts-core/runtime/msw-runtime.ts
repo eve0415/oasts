@@ -27,10 +27,9 @@ export type ResponsePayloadKind = "json" | "text" | "binary" | "stream";
  *
  * `payloads` maps each of the operation's declared content types onto how it is written. The kernel
  * is *told* rather than asked on purpose: it used to classify the content type itself, and its rule
- * disagreed with the compiler's on `text/json` — which this compiler counts as JSON, being the
- * de-facto alias. A body typed as its declared schema was then written with `String(...)` and
- * reached the wire as `[object Object]`. Two copies of one rule is the defect; deleting the copy
- * is the fix.
+ * drifted from the compiler's — a body typed as its declared schema was then written with
+ * `String(...)` and reached the wire as `[object Object]`. Two copies of one rule is the defect;
+ * deleting the copy is the fix, and it holds however the compiler's own rule changes.
  */
 export function respondWith(
   status: number,

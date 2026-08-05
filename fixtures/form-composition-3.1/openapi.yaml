@@ -1,0 +1,138 @@
+openapi: 3.1.0
+info:
+  title: Form composition
+  version: 1.0.0
+servers:
+  - url: https://forms.example.test
+paths:
+  /all-of:
+    post:
+      operationId: viaAllOf
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/Forum'
+                - $ref: '#/components/schemas/Text'
+      responses:
+        '204':
+          description: Accepted.
+  /one-of:
+    post:
+      operationId: viaOneOf
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Forum'
+                - $ref: '#/components/schemas/Text'
+      responses:
+        '204':
+          description: Accepted.
+  /any-of:
+    post:
+      operationId: viaAnyOf
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              anyOf:
+                - $ref: '#/components/schemas/Forum'
+                - $ref: '#/components/schemas/Text'
+      responses:
+        '204':
+          description: Accepted.
+  /shared-enum-any-of:
+    post:
+      operationId: viaSharedEnumAnyOf
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              anyOf:
+                - type: object
+                  required:
+                    - kind
+                  properties:
+                    kind:
+                      type: string
+                      enum:
+                        - forum
+                - type: object
+                  required:
+                    - kind
+                  properties:
+                    kind:
+                      type: string
+                      enum:
+                        - text
+      responses:
+        '204':
+          description: Accepted.
+  /nested:
+    post:
+      operationId: viaNested
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              oneOf:
+                - allOf:
+                    - $ref: '#/components/schemas/NestedLeftBase'
+                    - $ref: '#/components/schemas/NestedLeftExtra'
+                - $ref: '#/components/schemas/NestedRight'
+      responses:
+        '204':
+          description: Accepted.
+components:
+  schemas:
+    Forum:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+        applied_tags:
+          type: array
+          items:
+            type: string
+    Text:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+        invitable:
+          type: boolean
+    NestedLeftBase:
+      type: object
+      required:
+        - common
+      properties:
+        common:
+          type: string
+        left:
+          type: boolean
+    NestedLeftExtra:
+      type: object
+      properties:
+        count:
+          type: integer
+    NestedRight:
+      type: object
+      required:
+        - common
+      properties:
+        common:
+          type: string
+        right:
+          type: string

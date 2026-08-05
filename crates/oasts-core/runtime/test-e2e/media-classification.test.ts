@@ -63,7 +63,9 @@ after(async () => {
   await rm(temporaryRoot, { recursive: true, force: true });
 });
 
-test("text/json sends a text request and decodes a JSON response", async () => {
+test("text/json is text in both directions, not the JSON it looks like", async () => {
+  // Unregistered — RFC 8259 registers application/json — so it gets no special handling. The body
+  // comes back as the string on the wire, quotes and all, rather than parsed into an object.
   scriptRoute("POST", "/json", {
     status: 202,
     headers: [["Content-Type", "text/json"]],
@@ -81,5 +83,5 @@ test("text/json sends a text request and decodes a JSON response", async () => {
   assert.equal(requestHeader(received, "Accept"), "text/json");
   assert.equal(received.body.toString("utf8"), "hello");
   assert.equal(result.outcome, 202);
-  assert.deepEqual(result.data, { accepted: true });
+  assert.equal(result.data, '{"accepted":true}');
 });

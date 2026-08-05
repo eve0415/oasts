@@ -15,6 +15,12 @@
 //! transform emitter to emit a second, msw-local copy of the codecs — duplicating emitted code
 //! for every consumer who enables both — which is a cost this artifact has chosen not to pay.
 //! Reproducing the transform, not refusing it, is the part that would need that work.
+//!
+//! Every refusal here is scoped to one operation and carries warning severity, because `pipeline`
+//! discards every generated file the moment any error is raised: an error would let one operation
+//! this artifact cannot mock take down the handlers for all the others. The operation still gets
+//! no handler and the reason is still named — what changes is that the rest of the document
+//! survives. A missing handler is visible at the import site, so nothing here is silent.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,12 +28,13 @@ use super::paths::relative_import;
 use super::{
     EmissionModel, Emitter as TypesEmitter, GeneratedFile, TypeAxis, TypePosition,
     assign_import_aliases, import_clause, import_extension, render_property_key, render_ts_string,
-    render_ts_value, runtime_assets::rewrite_relative_ts_imports, source_diagnostic,
-    uppercase_first, warning_diagnostic, write_source_metadata,
+    render_ts_value, runtime_assets::rewrite_relative_ts_imports, uppercase_first,
+    warning_diagnostic, write_source_metadata,
 };
 use crate::client_model::{
-    BodyPlan, FieldSerializationPlan, FormFieldPlan, HelperId, ParameterPlan, PartMediaPlan,
-    PayloadKind, PrimitiveDomainProjector, body_plan_for_media, build_body_plan, parameter_plan,
+    BodyPlan, FieldSerializationPlan, FormFieldPlan, FormPropertiesError, HelperId, ParameterPlan,
+    PartMediaPlan, PayloadKind, PrimitiveDomainProjector, body_plan_for_media, build_body_plan,
+    collect_form_properties, parameter_plan,
 };
 use crate::composition::{finite_values, json_equal};
 use crate::diag::Diagnostic;
@@ -57,10 +64,12 @@ const CODE_BODY_PROJECTION: &str = "OASTS1509";
 /// A parameter serialization loses boundaries before the handler can project its value.
 const CODE_NONINVERTIBLE_PARAMETER: &str = "OASTS1510";
 /// A streaming body has no buffered value to project, in either direction, so this artifact
-/// emits no handler for the operation at all. A warning rather than an error: one operation the
-/// mock cannot express must not take the whole document down with it, which is what every other
-/// refusal in this emitter currently does.
+/// emits no handler for the operation at all.
 const CODE_STREAMING_OPERATION: &str = "OASTS1514";
+
+/// A form body whose schema declares no properties. The handler is still emitted; it just has no
+/// body fields to project.
+const CODE_UNCONSTRAINED_FORM_BODY: &str = "OASTS1515";
 
 const MAX_PARAMETER_SHAPE_DEPTH: usize = 10;
 
@@ -144,7 +153,7 @@ fn path_pattern(path_template: &[Segment], source: &SourceRef) -> Result<String,
                 SegmentPart::Literal(literal) => {
                     if let Some(offending) = literal.chars().find(|c| *c == UNESCAPABLE_PATH_SYNTAX)
                     {
-                        return Err(source_diagnostic(
+                        return Err(warning_diagnostic(
                             CODE_UNMATCHABLE_PATH,
                             format!(
                                 "path literal '{literal}' contains '{offending}', which the MSW request matcher always reads as a wildcard; no escape makes it match literally"
@@ -437,7 +446,7 @@ fn emit_operation(
     file_base: &str,
 ) -> Option<GeneratedFile> {
     let Some(method) = msw_method(&operation.method) else {
-        model.sink.push(source_diagnostic(
+        model.sink.push(warning_diagnostic(
             CODE_UNMATCHABLE_METHOD,
             format!(
                 "HTTP method '{}' has no MSW http handler factory",
@@ -730,8 +739,10 @@ fn emit_operation(
     })
 }
 
+/// Takes the model mutably because the unconstrained-body warning is the one diagnostic here that
+/// does not stop the handler being emitted, so it cannot travel in the `Err` channel.
 fn plan_projected_body(
-    model: &EmissionModel<'_, '_>,
+    model: &mut EmissionModel<'_, '_>,
     operation: &Operation,
 ) -> Result<Option<ProjectedBody>, Vec<Diagnostic>> {
     let Some(body) = &operation.request_body else {
@@ -749,17 +760,30 @@ fn plan_projected_body(
         if matches!(
             media.essence.as_str(),
             "application/x-www-form-urlencoded" | "multipart/form-data"
-        ) && !matches!(
-            projector.resolve_schema(&media.schema),
-            Some(SchemaNode::Object { .. })
-        ) {
-            diagnostics.push(body_projection_diagnostic(
-                &media.source,
-                &format!(
+        ) && let Err(error) = collect_form_properties(&media.schema, &projector)
+        {
+            let reason = match error {
+                // Valid OpenAPI that simply declares nothing, so the handler is still emitted —
+                // with an empty projection. Said here rather than left to the client's OASTS1428,
+                // because that one only runs when the client artifact is enabled and `types + msw`
+                // is a configuration the documentation puts in front of people.
+                FormPropertiesError::Unconstrained => {
+                    model.sink.push(warning_diagnostic(
+                        CODE_UNCONSTRAINED_FORM_BODY,
+                        format!(
+                            "request media '{}' declares no schema properties, so its handler projects no body fields",
+                            media.essence
+                        ),
+                        &media.source,
+                    ));
+                    continue;
+                }
+                FormPropertiesError::NotObject => format!(
                     "request media '{}' requires an object schema to correlate encoded fields with declared properties",
                     media.essence
                 ),
-            ));
+            };
+            diagnostics.push(body_projection_diagnostic(&media.source, &reason));
         }
     }
     inspect_body_projection(model, &plan, &mut diagnostics);
@@ -906,9 +930,11 @@ fn streaming_operation_diagnostic(source: &SourceRef, media: &str) -> Diagnostic
 }
 
 fn body_projection_diagnostic(source: &SourceRef, reason: &str) -> Diagnostic {
-    source_diagnostic(
+    warning_diagnostic(
         CODE_BODY_PROJECTION,
-        format!("request body cannot be projected into its declared type: {reason}"),
+        format!(
+            "request body cannot be projected into its declared type, so no handler is emitted: {reason}"
+        ),
         source,
     )
 }
@@ -1421,10 +1447,10 @@ fn plan_projected_parameters(
 }
 
 fn noninvertible_parameter_diagnostic(parameter: &Param, style: &str, reason: &str) -> Diagnostic {
-    source_diagnostic(
+    warning_diagnostic(
         CODE_NONINVERTIBLE_PARAMETER,
         format!(
-            "parameter '{}' with {style} serialization is not invertible: {reason}",
+            "parameter '{}' with {style} serialization is not invertible, so no handler is emitted: {reason}",
             parameter.name
         ),
         &parameter.source,
@@ -1432,10 +1458,10 @@ fn noninvertible_parameter_diagnostic(parameter: &Param, style: &str, reason: &s
 }
 
 fn parameter_projection_diagnostic(parameter: &Param, style: &str, reason: &str) -> Diagnostic {
-    source_diagnostic(
+    warning_diagnostic(
         CODE_PARAMETER_PROJECTION,
         format!(
-            "parameter '{}' with {style} serialization cannot be projected into its declared type: {reason}",
+            "parameter '{}' with {style} serialization cannot be projected into its declared type, so no handler is emitted: {reason}",
             parameter.name
         ),
         &parameter.source,
@@ -2217,7 +2243,7 @@ fn embedded_assets(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
 mod tests {
     use super::*;
     use crate::config::{DateTimeRepresentation, ResolvedConfig, load_config};
-    use crate::diag::DiagnosticSink;
+    use crate::diag::{DiagnosticSink, Severity};
     use crate::emit::emit_artifacts;
     use crate::ir::{PropMeta, SchemaMeta, SchemaRef};
     use crate::loader::load_graph;
@@ -2884,6 +2910,79 @@ paths:
                 && file.relative_path != "msw/handlers/sendscalarform.ts"
                 && file.relative_path != "msw/handlers/sendscalarmultipart.ts"
         }));
+    }
+
+    #[test]
+    fn composed_form_body_projects_without_oasts1509() {
+        let document = r#"
+openapi: 3.1.0
+info: { title: Composed form, version: 1.0.0 }
+paths:
+  /threads:
+    post:
+      operationId: createThread
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              anyOf:
+                - $ref: '#/components/schemas/Forum'
+                - $ref: '#/components/schemas/Text'
+      responses: { "204": { description: ok } }
+components:
+  schemas:
+    Forum:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        applied_tags: { type: array, items: { type: string } }
+    Text:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        invitable: { type: boolean }
+"#;
+        let (files, diagnostics) = generate_with_diagnostics(document, MSW_CONFIG);
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let handler = generated(&files, "msw/handlers/createthread.ts");
+        assert!(handler.contains("name: \"name\""));
+        assert!(handler.contains("name: \"applied_tags\""));
+        assert!(handler.contains("name: \"invitable\""));
+    }
+
+    /// A Media Type Object may omit `schema`, and a document that does is valid. The handler has
+    /// nothing to project, but that is a reason to emit an empty projection — not to refuse the
+    /// operation and, with it, every other handler in the document.
+    #[test]
+    fn a_form_body_without_a_schema_still_gets_a_handler() {
+        let document = r#"
+openapi: 3.1.0
+info: { title: Unconstrained form, version: 1.0.0 }
+paths:
+  /form:
+    post:
+      operationId: sendForm
+      requestBody:
+        content:
+          application/x-www-form-urlencoded: {}
+      responses: { "204": { description: ok } }
+"#;
+        let (files, diagnostics) = generate_with_diagnostics(document, MSW_CONFIG);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, CODE_UNCONSTRAINED_FORM_BODY);
+        assert_eq!(diagnostics[0].severity, Severity::Warning);
+        // The message is a plain string on purpose: a format argument that builds a value only on
+        // failure never executes on a passing run, and the coverage gate reads that as a miss.
+        assert!(
+            files
+                .iter()
+                .any(|file| file.relative_path == "msw/handlers/sendform.ts"),
+            "no handler emitted for the unconstrained form body"
+        );
     }
 
     #[test]
@@ -3631,13 +3730,15 @@ components:
     #[test]
     fn the_payload_map_names_every_declared_media_and_its_wire_form() {
         // The kernel is told how each declared media is written rather than classifying it, so the
-        // compiler and the runtime cannot disagree. text/json is the case that proves it: this
-        // compiler counts it as JSON, and a runtime rule keyed on "application/json or +json"
-        // silently wrote it out with String(...).
+        // compiler and the runtime cannot disagree. A structured-suffix type is the case that
+        // proves it: a runtime rule keyed on `contentType === "application/json"` writes this one
+        // out with String(...) and puts [object Object] on the wire.
         let files = generate(UNCONSTRAINED, MSW_CONFIG);
-        let handler = generated(&files, "msw/handlers/gettextjson.ts");
+        let handler = generated(&files, "msw/handlers/getproblemjson.ts");
         assert!(
-            handler.contains(r#"const responsePayloads = { ["text/json"]: "json" } as const;"#),
+            handler.contains(
+                r#"const responsePayloads = { ["application/problem+json"]: "json" } as const;"#
+            ),
             "{handler}"
         );
         assert!(
@@ -3847,7 +3948,7 @@ paths:
               schema: { $ref: '#/components/schemas/HttpResponse' }
             application/problem+json:
               schema: { $ref: '#/components/schemas/HttpResponse' }
-            text/json:
+            application/vnd.api+json:
               schema: { $ref: '#/components/schemas/GetValueResponseBody' }
 components:
   schemas:

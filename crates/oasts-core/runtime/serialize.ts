@@ -976,9 +976,9 @@ function wireClassifiedPayload(
   contentType: string | undefined,
 ): Exclude<MultipartResponsePayload, "wire"> {
   const essence = partMediaEssence(contentType);
-  // The same JSON family the compiler recognizes everywhere else: RFC 8259 application/json, the
-  // de-facto text/json alias, and any `+json` structured suffix.
-  if (essence === "application/json" || essence === "text/json" || essence.endsWith("+json")) {
+  // The same JSON family the compiler recognizes everywhere else: RFC 8259 application/json and
+  // any `+json` structured suffix. Unregistered aliases like text/json are text, as they are there.
+  if (essence === "application/json" || essence.endsWith("+json")) {
     return "json";
   }
   if (essence.startsWith("text/") || essence === "application/x-www-form-urlencoded") {

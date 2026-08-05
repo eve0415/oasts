@@ -15,7 +15,6 @@ import type {
   SendTextJsonInput,
   SendTextJsonResult,
 } from "../generated/client/operations/sendtextjson.js";
-import type { TextJsonResponse } from "../generated/types/components/textjsonresponse.js";
 
 type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
@@ -36,8 +35,10 @@ type AssertSvgResponseIsOpaque = Expect<
   Equal<Extract<RoundTripSvgResult, { outcome: 200 }>["data"], unknown>
 >;
 type AssertTextJsonRequestIsText = Expect<Equal<SendTextJsonInput["body"], string>>;
-type AssertTextJsonResponseKeepsSchema = Expect<
-  Equal<Extract<SendTextJsonResult, { outcome: 202 }>["data"], TextJsonResponse>
+// text/json is unregistered, so both directions are text: the response arrives as the string on
+// the wire, exactly like the text/plain operation below.
+type AssertTextJsonResponseIsText = Expect<
+  Equal<Extract<SendTextJsonResult, { outcome: 202 }>["data"], string>
 >;
 type AssertPlainTextRequestStaysString = Expect<Equal<SendPlainTextInput["body"], string>>;
 
@@ -49,6 +50,6 @@ export type {
   AssertSvgRequestIsOpaque,
   AssertSvgResponseIsOpaque,
   AssertTextJsonRequestIsText,
-  AssertTextJsonResponseKeepsSchema,
+  AssertTextJsonResponseIsText,
   AssertPlainTextRequestStaysString,
 };

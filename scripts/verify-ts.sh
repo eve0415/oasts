@@ -73,7 +73,7 @@ echo "compile-assert matrix ok: variant-name-shadow-3.0"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/uninhabitable-allof-3.0/compile-assert/cases.ts"
 echo "compile-assert matrix ok: uninhabitable-allof-3.0"
 
-for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server-variables-enum-3.1 relative-server-3.1 wire-fidelity-3.1 media-classification-3.1 multipart-response-3.0 streaming-3.1; do
+for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server-variables-enum-3.1 relative-server-3.1 wire-fidelity-3.1 media-classification-3.1 form-composition-3.1 multipart-response-3.0 streaming-3.1; do
   # A fixture whose client config lives in a separate file says so on disk.
   fixture_config=oasts.yaml
   if [[ -f "fixtures/$f/oasts-client.yaml" ]]; then
@@ -114,6 +114,9 @@ echo "compile-assert matrix ok: relative-server-3.1"
 
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-media-classification-3.1/compile-assert/cases.ts"
 echo "compile-assert matrix ok: media-classification-3.1"
+
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-form-composition-3.1/compile-assert/cases.ts"
+echo "compile-assert matrix ok: form-composition-3.1"
 
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-multipart-response-3.0/compile-assert/cases.ts"
 echo "compile-assert matrix ok: multipart-response-3.0"

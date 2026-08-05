@@ -1,5 +1,6 @@
 //! Client artifact planning over the normalized OpenAPI IR.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
 
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -10,8 +11,8 @@ use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::headers::forbidden_request_header_name;
 use crate::ir::{
     AdditionalProperties, EncodingObject, Ir, MediaType, NamedSecurityScheme, OAuthFlow,
-    OasVersion, Operation, ParamLocation, ParamStyle, PrimitiveType, ResponseStatus, SchemaNode,
-    SecKind, SecurityRequirement, ServerEntry, SourceRef,
+    OasVersion, Operation, ParamLocation, ParamStyle, PrimitiveType, ResponseStatus, SchemaMeta,
+    SchemaNode, SecKind, SecurityRequirement, ServerEntry, SourceRef,
 };
 use crate::loader::append_pointer;
 use crate::media::{MediaRangeKind, is_json, media_essence};
@@ -39,6 +40,8 @@ const CODE_NON_OAUTH_REQUIREMENT_SCOPES: &str = "OASTS1441";
 const CODE_URLENCODED_CONTENT_TYPE_IGNORED: &str = "OASTS1425";
 const CODE_MULTIPART_30_STYLE_IGNORED: &str = "OASTS1426";
 const CODE_MULTIPART_STYLE_UNDEFINED: &str = "OASTS1427";
+const CODE_FORM_SCHEMA_PROPERTIES: &str = "OASTS1421";
+const CODE_FORM_SCHEMA_UNCONSTRAINED: &str = "OASTS1428";
 const JSON_PART_MEDIA: &str = "application/json";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -787,7 +790,7 @@ pub(crate) fn body_plan_for_media(
             media: media.full.clone(),
             source: media.source.clone(),
         }
-    } else if is_request_json(&media.essence) {
+    } else if is_json(&media.essence) {
         BodyPlan::Json {
             media: media.full.clone(),
             schema,
@@ -820,34 +823,26 @@ pub(crate) fn body_plan_for_media(
     }
 }
 
-fn is_request_json(media: &str) -> bool {
-    media == "application/json"
-        || media
-            .rsplit_once('/')
-            .is_some_and(|(_, subtype)| subtype.ends_with("+json"))
-}
-
 fn form_fields(
     media: &MediaType,
     multipart: bool,
     projector: &PrimitiveDomainProjector<'_>,
 ) -> Vec<FormFieldPlan> {
-    let Some(SchemaNode::Object { properties, .. }) = projector.resolve_schema(&media.schema)
-    else {
+    let Ok(properties) = collect_form_properties(&media.schema, projector) else {
         return Vec::new();
     };
     properties
-        .iter()
-        .map(|(name, schema, meta)| {
+        .into_iter()
+        .map(|property| {
             let encoding = media
                 .encodings
                 .iter()
-                .find(|(field, _)| field == name)
+                .find(|(field, _)| field == property.name)
                 .map(|(_, encoding)| encoding);
             field_plan(
-                name,
-                schema,
-                meta.required,
+                property.name,
+                property.schema.as_ref(),
+                property.required,
                 encoding,
                 media,
                 multipart,
@@ -855,6 +850,334 @@ fn form_fields(
             )
         })
         .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FormProperty<'schema> {
+    pub(crate) name: &'schema str,
+    pub(crate) schema: Cow<'schema, SchemaNode>,
+    pub(crate) required: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum FormProperties<'schema> {
+    Object(&'schema [(String, SchemaNode, crate::ir::PropMeta)]),
+    Collected(Vec<FormProperty<'schema>>),
+}
+
+pub(crate) enum FormPropertiesIter<'schema> {
+    Object(std::slice::Iter<'schema, (String, SchemaNode, crate::ir::PropMeta)>),
+    Collected(std::vec::IntoIter<FormProperty<'schema>>),
+}
+
+impl<'schema> Iterator for FormPropertiesIter<'schema> {
+    type Item = FormProperty<'schema>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Object(properties) => {
+                properties.next().map(|(name, schema, meta)| FormProperty {
+                    name,
+                    schema: Cow::Borrowed(schema),
+                    required: meta.required,
+                })
+            }
+            Self::Collected(properties) => properties.next(),
+        }
+    }
+}
+
+impl<'schema> IntoIterator for FormProperties<'schema> {
+    type Item = FormProperty<'schema>;
+    type IntoIter = FormPropertiesIter<'schema>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Object(properties) => FormPropertiesIter::Object(properties.iter()),
+            Self::Collected(properties) => FormPropertiesIter::Collected(properties.into_iter()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FormPropertiesError {
+    /// The schema constrains nothing — absent, `{}`, or an unsupported construct. The document is
+    /// valid; it just says nothing this encoding can correlate.
+    Unconstrained,
+    /// The schema positively excludes an object, so the document contradicts the encoding.
+    NotObject,
+}
+
+/// Collects the named fields a flat form encoding can correlate with wire names.
+///
+/// `allOf` is a conjunction, so a property required by any branch is required by the result.
+/// `oneOf` and `anyOf` are alternatives, so a property is required only when every branch declares
+/// it as required. First occurrence order is preserved across both branch and property traversal;
+/// the hash map is lookup-only and never contributes iteration order.
+pub(crate) fn collect_form_properties<'schema, 'ir>(
+    schema: &'schema SchemaNode,
+    projector: &'schema PrimitiveDomainProjector<'ir>,
+) -> Result<FormProperties<'schema>, FormPropertiesError>
+where
+    'ir: 'schema,
+{
+    // An absent schema, `{}`, and an unsupported construct all reach here projecting to the full
+    // domain: the document is valid and simply says nothing, which is a different fact from a
+    // schema that says "string" where the encoding needs named properties. Only the latter can be
+    // called a contradiction, so only the latter refuses.
+    match projector.project(schema) {
+        Projection::Known(domain)
+            if domain_is_required_with_optional_null(domain, Domain::OBJECT) => {}
+        Projection::Known(Domain::FULL) | Projection::Unsupported => {
+            return Err(FormPropertiesError::Unconstrained);
+        }
+        Projection::Known(_) => return Err(FormPropertiesError::NotObject),
+    }
+    collect_form_properties_inner(schema, projector, &mut HashSet::new())
+}
+
+fn collect_form_properties_inner<'schema, 'ir>(
+    schema: &'schema SchemaNode,
+    projector: &'schema PrimitiveDomainProjector<'ir>,
+    visiting: &mut HashSet<usize>,
+) -> Result<FormProperties<'schema>, FormPropertiesError>
+where
+    'ir: 'schema,
+{
+    match schema {
+        SchemaNode::Ref { target, .. } => {
+            let Some(index) =
+                schema_index(&projector.indices, &target.source_id, &target.json_pointer)
+            else {
+                return Ok(FormProperties::Collected(Vec::new()));
+            };
+            if !visiting.insert(index) {
+                return Ok(FormProperties::Collected(Vec::new()));
+            }
+            let properties = projector.schemas.get(index).map_or_else(
+                || Ok(FormProperties::Collected(Vec::new())),
+                |resolved| collect_form_properties_inner(&resolved.schema, projector, visiting),
+            );
+            visiting.remove(&index);
+            properties
+        }
+        SchemaNode::Object { properties, .. } => Ok(FormProperties::Object(properties)),
+        SchemaNode::AllOf { branches, .. } => {
+            merge_form_property_branches(branches, projector, visiting, FormPropertyMerge::AllOf)
+        }
+        SchemaNode::OneOf { branches, .. } | SchemaNode::AnyOf { branches, .. } => {
+            merge_form_property_branches(branches, projector, visiting, FormPropertyMerge::AnyOf)
+        }
+        SchemaNode::Primitive { .. }
+        | SchemaNode::Finite { .. }
+        | SchemaNode::Array { .. }
+        | SchemaNode::Tuple { .. }
+        | SchemaNode::Any { .. }
+        | SchemaNode::Never { .. }
+        | SchemaNode::Unknown { .. } => Ok(FormProperties::Collected(Vec::new())),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FormPropertyMerge {
+    AllOf,
+    AnyOf,
+}
+
+fn merge_form_property_branches<'schema, 'ir>(
+    branches: &'schema [SchemaNode],
+    projector: &'schema PrimitiveDomainProjector<'ir>,
+    visiting: &mut HashSet<usize>,
+    merge: FormPropertyMerge,
+) -> Result<FormProperties<'schema>, FormPropertiesError>
+where
+    'ir: 'schema,
+{
+    let mut merged = Vec::<FormProperty<'schema>>::new();
+    let mut slot_by_name = HashMap::<&'schema str, usize>::new();
+    let mut required_counts = Vec::<usize>::new();
+    let mut present_counts = Vec::<usize>::new();
+    for branch in branches {
+        let properties = collect_form_properties_inner(branch, projector, visiting)?;
+        for property in properties.into_iter() {
+            if let Some(&slot) = slot_by_name.get(property.name) {
+                if !schemas_structurally_equal(
+                    merged[slot].schema.as_ref(),
+                    property.schema.as_ref(),
+                ) {
+                    merge_form_property_schema(&mut merged[slot].schema, property.schema, merge);
+                }
+                present_counts[slot] += 1;
+                required_counts[slot] += usize::from(property.required);
+                if matches!(merge, FormPropertyMerge::AllOf) {
+                    merged[slot].required |= property.required;
+                }
+            } else {
+                let slot = merged.len();
+                slot_by_name.insert(property.name, slot);
+                required_counts.push(usize::from(property.required));
+                present_counts.push(1);
+                merged.push(property);
+            }
+        }
+    }
+    if matches!(merge, FormPropertyMerge::AnyOf) {
+        for (slot, property) in merged.iter_mut().enumerate() {
+            property.required =
+                present_counts[slot] == branches.len() && required_counts[slot] == branches.len();
+        }
+    }
+    Ok(FormProperties::Collected(merged))
+}
+
+fn merge_form_property_schema<'schema>(
+    existing: &mut Cow<'schema, SchemaNode>,
+    incoming: Cow<'schema, SchemaNode>,
+    merge: FormPropertyMerge,
+) {
+    match (merge, &mut *existing) {
+        (FormPropertyMerge::AllOf, Cow::Owned(SchemaNode::AllOf { branches, .. }))
+        | (FormPropertyMerge::AnyOf, Cow::Owned(SchemaNode::AnyOf { branches, .. })) => {
+            branches.push(incoming.into_owned());
+            return;
+        }
+        _ => {}
+    }
+    let previous = std::mem::replace(
+        existing,
+        Cow::Owned(SchemaNode::Any {
+            meta: SchemaMeta::default(),
+        }),
+    )
+    .into_owned();
+    *existing = Cow::Owned(match merge {
+        FormPropertyMerge::AllOf => SchemaNode::AllOf {
+            branches: vec![previous, incoming.into_owned()],
+            meta: SchemaMeta::default(),
+        },
+        FormPropertyMerge::AnyOf => SchemaNode::AnyOf {
+            branches: vec![previous, incoming.into_owned()],
+            discriminator: None,
+            meta: SchemaMeta::default(),
+        },
+    });
+}
+
+/// Whether two branches' declarations of one property name describe the same thing.
+///
+/// Provenance and prose are cleared first. Two branches documenting the same field with different
+/// wording describe the same field, and refusing over a `description` would reject documents whose
+/// only sin is being written twice. What survives the clearing — type, constraints, applicators —
+/// is what decides the encoding and the emitted type, so a difference there is a real conflict.
+fn schemas_structurally_equal(left: &SchemaNode, right: &SchemaNode) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    clear_schema_provenance(&mut left);
+    clear_schema_provenance(&mut right);
+    left == right
+}
+
+fn clear_schema_provenance(schema: &mut SchemaNode) {
+    let meta = match schema {
+        SchemaNode::Ref { meta, .. }
+        | SchemaNode::Primitive { meta, .. }
+        | SchemaNode::Finite { meta, .. }
+        | SchemaNode::Object { meta, .. }
+        | SchemaNode::Array { meta, .. }
+        | SchemaNode::Tuple { meta, .. }
+        | SchemaNode::AllOf { meta, .. }
+        | SchemaNode::OneOf { meta, .. }
+        | SchemaNode::AnyOf { meta, .. }
+        | SchemaNode::Any { meta }
+        | SchemaNode::Never { meta }
+        | SchemaNode::Unknown { meta, .. } => meta,
+    };
+    meta.source = SourceRef::default();
+    meta.docs = crate::ir::SchemaDocs::default();
+    if let Some(applicators) = meta.validation_applicators.as_deref_mut() {
+        for nested in applicators
+            .not
+            .iter_mut()
+            .chain(applicators.property_names.iter_mut())
+            .chain(applicators.unevaluated_properties.iter_mut())
+            .chain(applicators.unevaluated_items.iter_mut())
+        {
+            clear_schema_provenance(nested);
+        }
+        for pattern in &mut applicators.pattern_properties {
+            clear_schema_provenance(&mut pattern.schema);
+        }
+        if let Some(contains) = applicators.contains.as_deref_mut() {
+            clear_schema_provenance(&mut contains.schema);
+        }
+        for (_, dependent) in &mut applicators.dependent_schemas {
+            clear_schema_provenance(dependent);
+        }
+        if let Some(conditional) = applicators.conditional.as_deref_mut() {
+            clear_schema_provenance(&mut conditional.condition);
+            if let Some(then_schema) = conditional.then_schema.as_deref_mut() {
+                clear_schema_provenance(then_schema);
+            }
+            if let Some(else_schema) = conditional.else_schema.as_deref_mut() {
+                clear_schema_provenance(else_schema);
+            }
+        }
+    }
+    match schema {
+        SchemaNode::Object {
+            properties,
+            additional_properties,
+            ..
+        } => {
+            for (_, property, _) in properties {
+                clear_schema_provenance(property);
+            }
+            if let AdditionalProperties::Allowed(Some(additional))
+            | AdditionalProperties::Schema(additional) = additional_properties
+            {
+                clear_schema_provenance(additional);
+            }
+        }
+        SchemaNode::Array { items, .. } => clear_schema_provenance(items),
+        SchemaNode::Tuple {
+            prefix_items, rest, ..
+        } => {
+            for item in prefix_items {
+                clear_schema_provenance(item);
+            }
+            if let crate::ir::TupleRest::Schema(rest) = rest {
+                clear_schema_provenance(rest);
+            }
+        }
+        SchemaNode::AllOf { branches, .. } => {
+            for branch in branches {
+                clear_schema_provenance(branch);
+            }
+        }
+        SchemaNode::OneOf {
+            branches,
+            discriminator,
+            ..
+        }
+        | SchemaNode::AnyOf {
+            branches,
+            discriminator,
+            ..
+        } => {
+            for branch in branches {
+                clear_schema_provenance(branch);
+            }
+            if let Some(discriminator) = discriminator.as_deref_mut() {
+                discriminator.source = SourceRef::default();
+            }
+        }
+        SchemaNode::Ref { .. }
+        | SchemaNode::Primitive { .. }
+        | SchemaNode::Finite { .. }
+        | SchemaNode::Any { .. }
+        | SchemaNode::Never { .. }
+        | SchemaNode::Unknown { .. } => {}
+    }
 }
 
 fn field_plan(
@@ -1844,11 +2167,16 @@ fn diagnose_form_media(
     if !multipart && media.essence != "application/x-www-form-urlencoded" {
         return;
     }
-    let Some(SchemaNode::Object { properties, .. }) = projector.resolve_schema(&media.schema)
-    else {
-        return;
+    let properties = match collect_form_properties(&media.schema, projector) {
+        Ok(properties) => properties,
+        Err(error) => {
+            sink.push(form_properties_diagnostic(media, error));
+            return;
+        }
     };
-    for (name, schema, _) in properties {
+    for property in properties.into_iter() {
+        let name = property.name;
+        let schema = property.schema.as_ref();
         if multipart && contains_control(name) {
             sink.push(source_diagnostic(
                 "OASTS1414",
@@ -2016,6 +2344,33 @@ fn diagnose_form_media(
         if multipart {
             diagnose_multipart_headers(name, encoding, projector, sink);
         }
+    }
+}
+
+fn form_properties_diagnostic(media: &MediaType, error: FormPropertiesError) -> Diagnostic {
+    match error {
+        // A warning, not an error: the document is valid OpenAPI — `schema` is an optional field of
+        // the Media Type Object — so refusing would reject a document that is merely underspecified.
+        // It still has to be said, because the encoder that comes out of it carries no fields and
+        // therefore sends an empty body.
+        FormPropertiesError::Unconstrained => source_diagnostic(
+            CODE_FORM_SCHEMA_UNCONSTRAINED,
+            format!(
+                "request media '{}' declares no schema properties, so its encoder carries no fields and sends an empty body",
+                media.essence
+            ),
+            &media.source,
+            Severity::Warning,
+        ),
+        FormPropertiesError::NotObject => source_diagnostic(
+            CODE_FORM_SCHEMA_PROPERTIES,
+            format!(
+                "request media '{}' schema declares no object properties to correlate with encoded field names",
+                media.essence
+            ),
+            &media.source,
+            Severity::Error,
+        ),
     }
 }
 
@@ -2212,7 +2567,7 @@ fn diagnose_request_media(
             // convert. Reaching that rule would refuse a perfectly sendable byte stream over the
             // shape of a schema nothing ever reads.
         } else if media.essence.starts_with("text/")
-            && !is_request_json(&media.essence)
+            && !is_json(&media.essence)
             && media.schema_present
             && projection_excludes_string(projector.project(&media.schema))
         {
@@ -2662,9 +3017,10 @@ mod tests {
     use crate::config::{ResolvedConfig, load_config_from_json};
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
     use crate::ir::{
-        Ir, MediaType, NamedSchema, NamedSecurityScheme, OasVersion, Operation, ParamLocation,
-        ParamStyle, PrimitiveType, ResponseStatus, SchemaMeta, SchemaNode, SchemaRef, SecKind,
-        SourceRef,
+        AdditionalProperties, ConditionalApplicator, ContainsApplicator, Discriminator, Ir,
+        MediaType, NamedSchema, NamedSecurityScheme, OasVersion, Operation, ParamLocation,
+        ParamStyle, PatternProperty, PrimitiveType, PropMeta, ResponseStatus, SchemaMeta,
+        SchemaNode, SchemaRef, SecKind, SourceRef, TupleRest, ValidationApplicators,
     };
     use crate::loader::load_graph;
     use crate::parse::parse;
@@ -2943,6 +3299,728 @@ mod tests {
         let mut sink = DiagnosticSink::new();
         let _ = build_client_model(&analyzed, &config, &mut sink);
         sink.into_sorted_vec()
+    }
+
+    fn form_document(media: &str, schema: Value) -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "paths": { "/forms": { "post": {
+                "operationId": "sendForm",
+                "requestBody": {
+                    "required": true,
+                    "content": { media: { "schema": schema } }
+                },
+                "responses": { "204": { "description": "ok" } }
+            }}}
+        })
+    }
+
+    fn planned_form_fields(media: &str, schema: Value) -> (Vec<FormFieldPlan>, Vec<Diagnostic>) {
+        let document = form_document(media, schema);
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+        let fields = match model.operations[0].body_plan.as_ref().expect("body plan") {
+            BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
+                fields.clone()
+            }
+            plan => panic!("expected form body plan, got {plan:#?}"),
+        };
+        (fields, sink.into_sorted_vec())
+    }
+
+    #[test]
+    fn allof_form_body_merges_properties_in_declaration_order() {
+        let (fields, diagnostics) = planned_form_fields(
+            "application/x-www-form-urlencoded",
+            json!({
+                "allOf": [
+                    {
+                        "type": "object",
+                        "required": ["left", "shared"],
+                        "properties": {
+                            "left": { "type": "string" },
+                            "shared": { "type": "string" }
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "required": ["right"],
+                        "properties": {
+                            "shared": { "type": "string" },
+                            "right": { "type": "boolean" }
+                        }
+                    }
+                ]
+            }),
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.required))
+                .collect::<Vec<_>>(),
+            [("left", true), ("shared", true), ("right", true)]
+        );
+    }
+
+    #[test]
+    fn oneof_form_body_unions_properties_and_requires_only_common_required_names() {
+        let (fields, diagnostics) = planned_form_fields(
+            "application/x-www-form-urlencoded",
+            json!({
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                            "name": { "type": "string" },
+                            "forum": { "type": "boolean" }
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                            "name": { "type": "string" },
+                            "text": { "type": "integer" }
+                        }
+                    }
+                ]
+            }),
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.required))
+                .collect::<Vec<_>>(),
+            [("name", true), ("forum", false), ("text", false)]
+        );
+    }
+
+    /// The rule that decides whether valid callers work at runtime. An instance of a `oneOf` may
+    /// match one branch only, so a name the other branch requires is a name this instance will not
+    /// carry — and `serializeUrlencoded` throws on a missing required field. Required has to mean
+    /// "required whichever branch you sent", which is required in every branch.
+    #[test]
+    fn a_name_required_by_one_alternative_is_optional_on_the_merged_list() {
+        let (fields, diagnostics) = planned_form_fields(
+            "application/x-www-form-urlencoded",
+            json!({
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "required": ["shared", "only_left"],
+                        "properties": {
+                            "shared": { "type": "string" },
+                            "only_left": { "type": "string" }
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "required": ["shared"],
+                        "properties": {
+                            "shared": { "type": "string" },
+                            "only_left": { "type": "string" }
+                        }
+                    }
+                ]
+            }),
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.required))
+                .collect::<Vec<_>>(),
+            [("shared", true), ("only_left", false)]
+        );
+    }
+
+    #[test]
+    fn anyof_multipart_body_unions_properties() {
+        let (fields, diagnostics) = planned_form_fields(
+            "multipart/form-data",
+            json!({
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "required": ["shared", "first"],
+                        "properties": {
+                            "shared": { "type": "string" },
+                            "first": { "type": "string" }
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "required": ["shared", "second"],
+                        "properties": {
+                            "shared": { "type": "string" },
+                            "second": { "type": "boolean" }
+                        }
+                    }
+                ]
+            }),
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.required))
+                .collect::<Vec<_>>(),
+            [("shared", true), ("first", false), ("second", false)]
+        );
+    }
+
+    #[test]
+    fn nested_allof_inside_oneof_merges_recursively() {
+        let (fields, diagnostics) = planned_form_fields(
+            "application/x-www-form-urlencoded",
+            json!({
+                "oneOf": [
+                    {
+                        "allOf": [
+                            {
+                                "type": "object",
+                                "required": ["common"],
+                                "properties": { "common": { "type": "string" } }
+                            },
+                            {
+                                "type": "object",
+                                "properties": { "left": { "type": "boolean" } }
+                            }
+                        ]
+                    },
+                    {
+                        "type": "object",
+                        "required": ["common"],
+                        "properties": {
+                            "common": { "type": "string" },
+                            "right": { "type": "integer" }
+                        }
+                    }
+                ]
+            }),
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.required))
+                .collect::<Vec<_>>(),
+            [("common", true), ("left", false), ("right", false)]
+        );
+    }
+
+    #[test]
+    fn alternative_property_required_in_only_one_branch_is_optional() {
+        let (fields, diagnostics) = planned_form_fields(
+            "application/x-www-form-urlencoded",
+            json!({
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "required": ["shared"],
+                        "properties": { "shared": { "type": "string" } }
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "shared": { "type": "string" } }
+                    }
+                ]
+            }),
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(fields.len(), 1);
+        assert!(!fields[0].required);
+    }
+
+    #[test]
+    fn scalar_form_body_reports_oasts1421_at_the_media_entry() {
+        let document = form_document(
+            "application/x-www-form-urlencoded",
+            json!({ "type": "string" }),
+        );
+        let diagnostics = client_diagnostics(&document);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_FORM_SCHEMA_PROPERTIES)
+            .expect("OASTS1421 diagnostic");
+
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(
+            diagnostic
+                .message
+                .contains("application/x-www-form-urlencoded")
+        );
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/paths/~1forms/post/requestBody/content/application~1x-www-form-urlencoded")
+        );
+    }
+
+    #[test]
+    fn anyof_form_property_with_different_enums_merges_as_anyof() {
+        let document = form_document(
+            "application/x-www-form-urlencoded",
+            json!({
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": { "value": { "type": "integer", "enum": [4] } }
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "value": { "type": "integer", "enum": [5] } }
+                    }
+                ]
+            }),
+        );
+        let (_temp, analyzed, _config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let media = &analyzed.ir.operations[0]
+            .request_body
+            .as_ref()
+            .expect("request body")
+            .media_types[0];
+        let projector = PrimitiveDomainProjector::new(&analyzed.ir);
+        let properties = collect_form_properties(&media.schema, &projector)
+            .expect("composed form properties")
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(properties.len(), 1);
+        let schema = properties[0].schema.as_ref();
+        assert!(matches!(
+            schema,
+            SchemaNode::AnyOf {
+                branches,
+                discriminator,
+                meta,
+            } if branches.len() == 2
+                && discriminator.is_none()
+                && meta == &SchemaMeta::default()
+                && matches!(
+                branches.as_slice(),
+                [
+                    SchemaNode::Primitive {
+                        enum_values: Some(first),
+                        ..
+                    },
+                    SchemaNode::Primitive {
+                        enum_values: Some(second),
+                        ..
+                    }
+                ] if first == &[json!(4)] && second == &[json!(5)]
+            )
+        ));
+    }
+
+    #[test]
+    fn allof_form_property_with_different_constraints_merges_as_allof() {
+        let document = form_document(
+            "application/x-www-form-urlencoded",
+            json!({
+                "allOf": [
+                    {
+                        "type": "object",
+                        "properties": { "value": { "type": "integer", "minimum": 1 } }
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "value": { "type": "integer", "minimum": 2 } }
+                    }
+                ]
+            }),
+        );
+        let (_temp, analyzed, _config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let media = &analyzed.ir.operations[0]
+            .request_body
+            .as_ref()
+            .expect("request body")
+            .media_types[0];
+        let projector = PrimitiveDomainProjector::new(&analyzed.ir);
+        let mut properties = collect_form_properties(&media.schema, &projector)
+            .expect("composed form properties")
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(properties.len(), 1);
+        let schema = properties[0].schema.as_ref();
+        assert!(matches!(
+            schema,
+            SchemaNode::AllOf { branches, meta }
+                if branches.len() == 2 && meta == &SchemaMeta::default()
+        ));
+
+        merge_form_property_schema(
+            &mut properties[0].schema,
+            Cow::Owned(SchemaNode::Primitive {
+                ty: PrimitiveType::Boolean,
+                format: None,
+                enum_values: None,
+                const_value: None,
+                meta: SchemaMeta::default(),
+            }),
+            FormPropertyMerge::AllOf,
+        );
+        assert!(matches!(
+            properties[0].schema.as_ref(),
+            SchemaNode::AllOf { branches, .. } if branches.len() == 3
+        ));
+    }
+
+    #[test]
+    fn three_disagreeing_form_property_alternatives_make_one_flat_anyof() {
+        let document = form_document(
+            "application/x-www-form-urlencoded",
+            json!({
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": { "value": { "type": "integer", "enum": [1] } }
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "value": { "type": "integer", "enum": [2] } }
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "value": { "type": "integer", "enum": [3] } }
+                    }
+                ]
+            }),
+        );
+        let (_temp, analyzed, _config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let media = &analyzed.ir.operations[0]
+            .request_body
+            .as_ref()
+            .expect("request body")
+            .media_types[0];
+        let projector = PrimitiveDomainProjector::new(&analyzed.ir);
+        let properties = collect_form_properties(&media.schema, &projector)
+            .expect("composed form properties")
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(properties.len(), 1);
+        assert!(matches!(
+            properties[0].schema.as_ref(),
+            SchemaNode::AnyOf { branches, .. } if branches.len() == 3
+        ));
+    }
+
+    #[test]
+    fn structurally_equal_form_property_duplicates_stay_borrowed_and_unwrapped() {
+        let document = form_document(
+            "application/x-www-form-urlencoded",
+            json!({
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": { "value": { "type": "integer", "enum": [4] } }
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "value": { "type": "integer", "enum": [4] } }
+                    }
+                ]
+            }),
+        );
+        let (_temp, analyzed, _config) = analyzed(
+            &document,
+            json!({ "authEnforcement": "types", "baseUrl": { "source": "runtime" } }),
+        );
+        let media = &analyzed.ir.operations[0]
+            .request_body
+            .as_ref()
+            .expect("request body")
+            .media_types[0];
+        let projector = PrimitiveDomainProjector::new(&analyzed.ir);
+        let properties = collect_form_properties(&media.schema, &projector)
+            .expect("composed form properties")
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(properties.len(), 1);
+        assert!(matches!(properties[0].schema, Cow::Borrowed(_)));
+        assert!(matches!(
+            properties[0].schema.as_ref(),
+            SchemaNode::Primitive { .. }
+        ));
+    }
+
+    #[test]
+    fn structural_form_property_equality_ignores_every_nested_source() {
+        let string_schema = |pointer: &str| SchemaNode::Primitive {
+            ty: PrimitiveType::String,
+            format: None,
+            enum_values: None,
+            const_value: None,
+            meta: SchemaMeta {
+                source: SourceRef::new("schema.yaml", pointer),
+                ..SchemaMeta::default()
+            },
+        };
+        let applicators = ValidationApplicators {
+            not: Some(Box::new(string_schema("/not"))),
+            property_names: Some(Box::new(string_schema("/propertyNames"))),
+            pattern_properties: vec![PatternProperty {
+                pattern: "^x".to_owned(),
+                schema: string_schema("/patternProperties"),
+                type_key: None,
+            }],
+            contains: Some(Box::new(ContainsApplicator {
+                schema: Box::new(string_schema("/contains")),
+                min_contains: Some(1),
+                max_contains: Some(2),
+            })),
+            dependent_schemas: vec![("flag".to_owned(), string_schema("/dependentSchemas/flag"))],
+            conditional: Some(Box::new(ConditionalApplicator {
+                condition: Box::new(string_schema("/if")),
+                then_schema: Some(Box::new(string_schema("/then"))),
+                else_schema: Some(Box::new(string_schema("/else"))),
+            })),
+            unevaluated_properties: Some(Box::new(string_schema("/unevaluatedProperties"))),
+            unevaluated_items: Some(Box::new(string_schema("/unevaluatedItems"))),
+        };
+        let mut left = SchemaNode::AllOf {
+            branches: vec![
+                SchemaNode::Ref {
+                    target: SchemaRef {
+                        source_id: "schema.yaml".to_owned(),
+                        json_pointer: "/component".to_owned(),
+                    },
+                    meta: SchemaMeta {
+                        source: SourceRef::new("schema.yaml", "/ref"),
+                        ..SchemaMeta::default()
+                    },
+                },
+                string_schema("/primitive"),
+                SchemaNode::Finite {
+                    enum_values: Some(vec![json!("value")]),
+                    const_value: None,
+                    meta: SchemaMeta {
+                        source: SourceRef::new("schema.yaml", "/finite"),
+                        ..SchemaMeta::default()
+                    },
+                },
+                SchemaNode::Object {
+                    properties: vec![(
+                        "field".to_owned(),
+                        string_schema("/object/properties/field"),
+                        PropMeta {
+                            required: true,
+                            read_only: false,
+                            write_only: false,
+                        },
+                    )],
+                    additional_properties: AdditionalProperties::Schema(Box::new(string_schema(
+                        "/object/additionalProperties",
+                    ))),
+                    dependent_required: Vec::new(),
+                    finite: None,
+                    extra_required: Vec::new(),
+                    meta: SchemaMeta {
+                        source: SourceRef::new("schema.yaml", "/object"),
+                        ..SchemaMeta::default()
+                    },
+                },
+                SchemaNode::Object {
+                    properties: Vec::new(),
+                    additional_properties: AdditionalProperties::Allowed(Some(Box::new(
+                        string_schema("/openObject/additionalProperties"),
+                    ))),
+                    dependent_required: Vec::new(),
+                    finite: None,
+                    extra_required: Vec::new(),
+                    meta: SchemaMeta {
+                        source: SourceRef::new("schema.yaml", "/openObject"),
+                        ..SchemaMeta::default()
+                    },
+                },
+                SchemaNode::Array {
+                    items: Box::new(string_schema("/array/items")),
+                    finite: None,
+                    meta: SchemaMeta {
+                        source: SourceRef::new("schema.yaml", "/array"),
+                        ..SchemaMeta::default()
+                    },
+                },
+                SchemaNode::Tuple {
+                    prefix_items: vec![string_schema("/tuple/prefixItems/0")],
+                    rest: TupleRest::Schema(Box::new(string_schema("/tuple/items"))),
+                    finite: None,
+                    meta: SchemaMeta {
+                        source: SourceRef::new("schema.yaml", "/tuple"),
+                        ..SchemaMeta::default()
+                    },
+                },
+                SchemaNode::AllOf {
+                    branches: vec![string_schema("/allOf/0")],
+                    meta: SchemaMeta {
+                        source: SourceRef::new("schema.yaml", "/allOf"),
+                        ..SchemaMeta::default()
+                    },
+                },
+                SchemaNode::OneOf {
+                    branches: vec![string_schema("/oneOf/0")],
+                    discriminator: Some(Box::new(Discriminator {
+                        property_name: "kind".to_owned(),
+                        mapping: Vec::new(),
+                        source: SourceRef::new("schema.yaml", "/oneOf/discriminator"),
+                    })),
+                    meta: SchemaMeta {
+                        source: SourceRef::new("schema.yaml", "/oneOf"),
+                        ..SchemaMeta::default()
+                    },
+                },
+                SchemaNode::AnyOf {
+                    branches: vec![string_schema("/anyOf/0")],
+                    discriminator: Some(Box::new(Discriminator {
+                        property_name: "kind".to_owned(),
+                        mapping: Vec::new(),
+                        source: SourceRef::new("schema.yaml", "/anyOf/discriminator"),
+                    })),
+                    meta: SchemaMeta {
+                        source: SourceRef::new("schema.yaml", "/anyOf"),
+                        ..SchemaMeta::default()
+                    },
+                },
+                SchemaNode::Any {
+                    meta: SchemaMeta {
+                        validation_applicators: Some(Box::default()),
+                        source: SourceRef::new("schema.yaml", "/any"),
+                        ..SchemaMeta::default()
+                    },
+                },
+                SchemaNode::Never {
+                    meta: SchemaMeta {
+                        source: SourceRef::new("schema.yaml", "/never"),
+                        ..SchemaMeta::default()
+                    },
+                },
+                SchemaNode::Unknown {
+                    reason: "test".to_owned(),
+                    meta: SchemaMeta {
+                        source: SourceRef::new("schema.yaml", "/unknown"),
+                        ..SchemaMeta::default()
+                    },
+                },
+            ],
+            meta: SchemaMeta {
+                validation_applicators: Some(Box::new(applicators)),
+                source: SourceRef::new("schema.yaml", "/root"),
+                ..SchemaMeta::default()
+            },
+        };
+        let mut right = left.clone();
+        clear_schema_provenance(&mut right);
+
+        assert!(schemas_structurally_equal(&left, &right));
+        clear_schema_provenance(&mut left);
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn form_property_ref_collection_cycle_and_missing_edges_are_total() {
+        let missing = SchemaNode::Ref {
+            target: SchemaRef {
+                source_id: "missing.yaml".to_owned(),
+                json_pointer: "/schema".to_owned(),
+            },
+            meta: SchemaMeta::default(),
+        };
+        let empty_ir = Ir::default();
+        let empty_projector = PrimitiveDomainProjector::new(&empty_ir);
+        assert!(
+            collect_form_properties_inner(&missing, &empty_projector, &mut HashSet::new())
+                .expect("missing refs are total")
+                .into_iter()
+                .next()
+                .is_none()
+        );
+
+        let mut invalid_indices = HashMap::new();
+        invalid_indices.insert(("missing.yaml", "/schema"), 0);
+        let invalid_projector = PrimitiveDomainProjector {
+            schemas: &[],
+            indices: invalid_indices,
+            domains: Vec::new(),
+        };
+        assert!(
+            collect_form_properties_inner(&missing, &invalid_projector, &mut HashSet::new())
+                .expect("an absent indexed schema is total")
+                .into_iter()
+                .next()
+                .is_none()
+        );
+
+        let source = SourceRef::new("cycle.yaml", "/components/schemas/Cycle");
+        let cycle_ir = Ir {
+            schemas: vec![NamedSchema {
+                name: "Cycle".to_owned(),
+                schema: SchemaNode::Ref {
+                    target: SchemaRef {
+                        source_id: source.source_id.clone(),
+                        json_pointer: source.json_pointer.clone(),
+                    },
+                    meta: SchemaMeta::default(),
+                },
+                source,
+            }],
+            ..Ir::default()
+        };
+        let cycle_projector = PrimitiveDomainProjector::new(&cycle_ir);
+        let mut visiting = HashSet::new();
+        visiting.insert(0);
+        assert!(
+            collect_form_properties_inner(
+                &cycle_ir.schemas[0].schema,
+                &cycle_projector,
+                &mut visiting,
+            )
+            .expect("cycles are total")
+            .into_iter()
+            .next()
+            .is_none()
+        );
+
+        let unknown = SchemaNode::Unknown {
+            reason: "test".to_owned(),
+            meta: SchemaMeta::default(),
+        };
+        assert!(
+            collect_form_properties_inner(&unknown, &empty_projector, &mut HashSet::new())
+                .expect("unknown schemas are total")
+                .into_iter()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected form body plan")]
+    fn planned_form_fields_rejects_a_non_form_plan() {
+        let _ = planned_form_fields("application/json", json!({ "type": "object" }));
     }
 
     fn classifier_media(name: &str, streaming_marked: bool) -> MediaType {
@@ -4217,7 +5295,14 @@ mod tests {
             DeepObjectEncoding::Strict,
             &mut diagnostic_sink,
         );
-        assert!(diagnostic_sink.as_slice().is_empty());
+        assert_eq!(diagnostic_sink.as_slice().len(), 1);
+        // `classifier_media` carries no schema, which is a valid Media Type Object — so this is the
+        // unconstrained warning, not the refusal a schema contradicting the encoding would earn.
+        assert_eq!(
+            diagnostic_sink.as_slice()[0].code,
+            CODE_FORM_SCHEMA_UNCONSTRAINED
+        );
+        assert_eq!(diagnostic_sink.as_slice()[0].severity, Severity::Warning);
         assert!(!invalid_style_combination(
             ParamLocation::Cookie,
             ParamStyle::Form,
@@ -4904,7 +5989,9 @@ mod tests {
             // a way to launder an undecodable entry into a byte stream that generates cleanly.
             ("multipart/mixed", true, DecoderClass::MultipartUnnamed),
             ("application/json", false, DecoderClass::Json),
-            ("text/json", false, DecoderClass::Json),
+            // Unregistered, so it decodes as the `text/*` it says it is rather than as the JSON it
+            // probably means.
+            ("text/json", false, DecoderClass::Text),
             ("application/vnd.api+json", false, DecoderClass::Json),
             ("application/xml", false, DecoderClass::Binary),
             ("text/xml", false, DecoderClass::Binary),
@@ -5425,8 +6512,11 @@ mod tests {
         assert!(rejected[0].message.contains("multipart/mixed"));
     }
 
+    /// `text/json` is text in both directions. It used to be text on the way out and JSON on the
+    /// way back, which made one media type in one document mean two things; unregistering it here
+    /// is what closed that. A document that carries JSON says `application/json`.
     #[test]
-    fn text_json_uses_text_requests_and_keeps_json_response_classification() {
+    fn text_json_is_text_in_both_directions() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -5444,12 +6534,7 @@ mod tests {
                             "202": {
                                 "description": "accepted",
                                 "content": {
-                                    "text/json": {
-                                        "schema": {
-                                            "type": "object",
-                                            "properties": { "accepted": { "type": "boolean" } }
-                                        }
-                                    }
+                                    "text/json": { "schema": { "type": "string" } }
                                 }
                             }
                         }
@@ -5474,7 +6559,7 @@ mod tests {
         assert_eq!(operation.response_table[0].media[0].media, "text/json");
         assert_eq!(
             operation.response_table[0].media[0].decoder,
-            DecoderClass::Json
+            DecoderClass::Text
         );
     }
 

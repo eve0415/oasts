@@ -47,7 +47,7 @@ const PAYLOADS = {
   "application/json": "json",
   "application/json; charset=utf-8": "json",
   "application/problem+json": "json",
-  "text/json": "json",
+  "text/json": "text",
   "text/plain; charset=iso-8859-1": "text",
   "application/octet-stream": "binary",
   "text/event-stream": "stream",
@@ -120,11 +120,15 @@ describe("respondWith", () => {
     assert.equal(await response.text(), "");
   });
 
-  test("serializes every JSON-family media the compiler recognises, text/json included", async () => {
-    // text/json is the de-facto JSON alias and the compiler counts it as JSON, so a body typed as
-    // its declared schema must reach the wire as JSON. The kernel used to decide this itself with a
-    // rule that missed the alias, and wrote `[object Object]` instead.
-    for (const contentType of ["application/json", "application/problem+json", "text/json"]) {
+  test("serializes every JSON-family media the compiler recognises, parameters and suffixes included", async () => {
+    // A body typed as its declared schema must reach the wire as JSON for every media the compiler
+    // calls JSON — including a parameterized type and a structured suffix. The kernel used to
+    // decide this itself with a rule that missed those, and wrote `[object Object]` instead.
+    for (const contentType of [
+      "application/json",
+      "application/json; charset=utf-8",
+      "application/problem+json",
+    ]) {
       const response = respondWith(200, contentType, { message: "hello" }, PAYLOADS);
       assert.equal(response.headers.get("Content-Type"), contentType);
       assert.deepEqual(await response.json(), { message: "hello" }, contentType);

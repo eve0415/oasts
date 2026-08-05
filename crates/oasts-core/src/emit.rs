@@ -4499,8 +4499,9 @@ pub(super) struct RequestBodyPosition<'a> {
     /// Export-type name, without the `validate` prefix.
     pub name: String,
     pub schema: &'a SchemaNode,
-    /// How the client reaches the value, or `None` when the position is declaration-only.
-    pub access: Option<RequestBodyAccess>,
+    /// How the client reaches the value. Every position has one: the declaration-only case existed
+    /// only while two predicates disagreed about `text/json`, and that disagreement is gone.
+    pub access: RequestBodyAccess,
     /// Whether the client must test the value for presence before calling.
     pub guarded: bool,
 }
@@ -4526,11 +4527,10 @@ pub(super) struct RequestBodyPosition<'a> {
 /// but note the contrast with the response side, which preserves declared media order; applying one
 /// side's assumption to the other silently swaps which schema each name describes.
 ///
-/// *Declaration-only positions*: `is_json` (validators, zod) accepts `text/json`, while
-/// `is_request_json` (`build_body_plan`) does not, so a `text/json` body plans as `TopLevelText` and
-/// renders `string` whatever its schema says. Dropping it would delete an existing export, and
-/// calling it would validate a string against a schema that need not describe one, so the
-/// declaration is kept and no call is emitted.
+/// There used to be a fourth case here, for a body the validators counted as JSON while
+/// `build_body_plan` counted as text — the two disagreed about `text/json` — which produced a
+/// validator export nothing could call. One predicate answers both questions now, so that position
+/// cannot arise and the arm that carried it is gone.
 pub(super) fn request_body_validator_positions<'a>(
     body: &'a Body,
     plan: Option<&'a BodyPlan>,
@@ -4549,27 +4549,17 @@ pub(super) fn request_body_validator_positions<'a>(
                 vec![RequestBodyPosition {
                     name: base,
                     schema: &entry.schema,
-                    access: Some(RequestBodyAccess::Whole),
+                    access: RequestBodyAccess::Whole,
                     guarded: !body.required,
                 }]
             })
             .unwrap_or_default(),
-        BodyPlan::TopLevelText { media, .. } => body
-            .media_types
-            .iter()
-            .find(|entry| &entry.full == media && is_json(&entry.essence))
-            .map(|entry| {
-                vec![RequestBodyPosition {
-                    name: base,
-                    schema: &entry.schema,
-                    access: None,
-                    guarded: false,
-                }]
-            })
-            .unwrap_or_default(),
-        // Neither carries a schema value a validator or a transform could bind to: binary bodies
-        // are opaque bytes, and a streaming body has no whole value at all.
-        BodyPlan::TopLevelBinary { .. } | BodyPlan::TopLevelStream { .. } => Vec::new(),
+        // None of the three carries a schema value a validator or a transform could bind to: a text
+        // body renders `string` whatever its schema says, binary bodies are opaque bytes, and a
+        // streaming body has no whole value at all.
+        BodyPlan::TopLevelText { .. }
+        | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::TopLevelStream { .. } => Vec::new(),
         BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
             form_field_positions(fields, &base, body.required)
         }
@@ -4606,10 +4596,10 @@ fn form_field_positions<'a>(
         positions.push(RequestBodyPosition {
             name,
             schema: &field.schema,
-            access: Some(RequestBodyAccess::Field {
+            access: RequestBodyAccess::Field {
                 key: field.name.clone(),
                 wrapped: field.wrapper.wrapped,
-            }),
+            },
             // An absent body makes every field access absent too, so a required field still needs
             // the guard when the body itself is optional.
             guarded: !field.required || !body_required,
@@ -4649,9 +4639,9 @@ fn discriminated_arm_positions<'a>(
             schema,
             // The content-type test doubles as the presence guard: an absent body has no
             // `contentType` to match.
-            access: Some(RequestBodyAccess::Arm {
+            access: RequestBodyAccess::Arm {
                 media: arm.media.clone(),
-            }),
+            },
             guarded: false,
         })
         .collect()

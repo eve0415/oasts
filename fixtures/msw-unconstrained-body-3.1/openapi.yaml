@@ -53,15 +53,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/OpenBody"
-  /text-json:
+  /problem-json:
     get:
-      operationId: getTextJson
-      summary: The de-facto JSON alias, which is JSON on the wire despite the text/ prefix.
+      operationId: getProblemJson
+      summary: A structured-suffix JSON type, which a naive equality check on application/json misses.
       responses:
         "200":
           description: A JSON body.
           content:
-            text/json:
+            application/problem+json:
               schema:
                 $ref: "#/components/schemas/Thing"
 components:
