@@ -1,5 +1,6 @@
 import { defineConfig } from "oxfmt";
 
 export default defineConfig({
-  ignorePatterns: ["node_modules/**", "napi/**", "dist/**"],
+  // npm/** is regenerated wholesale by `napi create-npm-dirs`.
+  ignorePatterns: ["node_modules/**", "napi/**", "dist/**", "npm/**"],
 });

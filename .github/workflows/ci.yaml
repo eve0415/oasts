@@ -1,0 +1,351 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same ref makes the older run's answer worthless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI failure should name the failing assertion, not a backtrace-less panic line.
+  RUST_BACKTRACE: 1
+
+# Nothing here needs x64, and ARM is what bench/allocs.yaml was recorded on.
+jobs:
+  rust-lint:
+    name: rustfmt + clippy
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rustup installs the rust-toolchain.toml pin, with rustfmt/clippy, on first cargo call.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-test:
+    name: cargo test
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  # The binding is a release build with fat LTO, so it is built once and shared
+  # rather than rebuilt in each of the three jobs that need it.
+  napi:
+    name: build napi binding
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Versions come from devEngines; the action installs the workspace itself.
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
+      - name: Build binding
+        run: pnpm -C packages/oasts build:napi
+
+      - name: Upload binding
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: napi
+          path: packages/oasts/napi/
+          retention-days: 1
+
+  ts-lint:
+    name: oxfmt + oxlint
+    runs-on: ubuntu-24.04-arm
+    needs: napi
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
+      - name: Download binding
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: napi
+          path: packages/oasts/napi/
+
+      # oasts-gen writes packages/oasts/config.ts, which is gitignored and absent
+      # on a fresh checkout; oxlint's typeCheck pass reads it.
+      - name: Generate config surface
+        run: cargo run -p oasts-gen
+
+      - name: Lint packages/oasts
+        working-directory: packages/oasts
+        run: pnpm exec oxfmt --check . && pnpm exec oxlint
+
+      - name: Lint crates/oasts-core/runtime
+        working-directory: crates/oasts-core/runtime
+        run: pnpm exec oxfmt --check . && pnpm exec oxlint
+
+  ts-test:
+    name: node test + coverage floors
+    runs-on: ubuntu-24.04-arm
+    needs: napi
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
+      - name: Download binding
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: napi
+          path: packages/oasts/napi/
+
+      - name: Node coverage gate
+        run: scripts/coverage-ts.sh
+
+  e2e:
+    name: packed CLI e2e
+    runs-on: ubuntu-24.04-arm
+    needs: napi
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
+      - name: Download binding
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: napi
+          path: packages/oasts/napi/
+
+      # tsdown bundles the generated config.ts into the public entry.
+      - name: Generate config surface
+        run: cargo run -p oasts-gen
+
+      - name: e2e
+        run: pnpm -C packages/oasts test:e2e
+
+  # Each frozen vector set was authored from its contract before the implementation
+  # existed; these gates are SHA-256 checks that the freeze was never edited after.
+  freeze:
+    name: frozen entry-gate vectors
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify frozen vectors
+        run: |
+          for gate in auth msw streaming tanstack transform validators zod; do
+            scripts/"$gate"-gate.sh
+          done
+
+  verify-ts:
+    name: tsc --strict on generated output
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
+      - name: Build CLI
+        run: cargo build -p oasts
+
+      - name: Typecheck generated output
+        run: scripts/verify-ts.sh
+
+  consume:
+    name: generated clients as consumed artifacts
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
+      - name: Consume gate
+        run: scripts/consume-gate.sh
+
+  workflows:
+    name: workflow audit
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install zizmor
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          tool: zizmor
+
+      # The token buys the online audits; contents:read is all they need.
+      - name: Audit workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor .github/workflows/
+
+      # zizmor reads workflows for security, not validity: a job edge pointing at
+      # a deleted job passes it and makes GitHub reject the whole file at startup.
+      - name: Check workflows
+        env:
+          VERSION: 1.7.12
+          SHA256: 325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
+        run: |
+          set -euo pipefail
+          archive=actionlint_${VERSION}_linux_arm64.tar.gz
+          curl -fsSLO "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/${archive}"
+          echo "${SHA256}  ${archive}" | sha256sum --check --strict
+          tar xzf "${archive}" actionlint
+          ./actionlint
+
+  # scripts/allocs-gate.sh stays a local gate. Measured on this runner, whose
+  # architecture matches the baseline's: pathological-3.1 emit drifts by -12
+  # allocs/deallocs and nothing else. The counters follow the checkout path, so
+  # a baseline would have to be per-path, not per-target.
+  coverage:
+    name: rust coverage floor
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Coverage gate
+        run: scripts/coverage.sh
+
+  # One status to require in branch protection, so adding a job above does not
+  # mean editing the protection rule.
+  ci:
+    name: CI
+    runs-on: ubuntu-24.04-arm
+    if: always()
+    needs:
+      - rust-lint
+      - rust-test
+      - ts-lint
+      - ts-test
+      - e2e
+      - freeze
+      - verify-ts
+      - consume
+      - coverage
+      - workflows
+    permissions:
+      contents: read
+
+    steps:
+      - name: Fail if any job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
