@@ -37,6 +37,7 @@ use crate::ir::{
 };
 use crate::media::{is_json, is_xml};
 use crate::num::{first_number_outside_binary64, render_number_value};
+use crate::response_media::{StreamKind, media_carries_json_value, media_stream_kind};
 use crate::semantic::{
     AllocatedCallbackName, AllocatedSchemaName, Analyzed, CallbackParent, EnumMember, ResolvedLink,
     TargetCase, normalize_identifier,
@@ -487,16 +488,29 @@ struct EmittedOperation {
     file: GeneratedFile,
     diagnostics: Vec<Diagnostic>,
     has_response_headers: bool,
+    names_sse_event: bool,
+}
+
+/// Whether this operation's rendered types name `SseEvent` — that is, whether any response declares
+/// an SSE branch. The request side never does: a streaming request body renders as bytes.
+fn operation_names_sse_event(operation: &Operation) -> bool {
+    operation.responses.iter().any(|response| {
+        response.media_types.iter().any(|media| {
+            media_stream_kind(&media.essence, media.streaming_marked) == Some(StreamKind::Sse)
+        })
+    })
 }
 
 fn append_operation_emissions(
     files: &mut Vec<GeneratedFile>,
     diagnostics: &mut Vec<Diagnostic>,
     any_response_headers: &mut bool,
+    any_sse_event: &mut bool,
     emissions: Vec<EmittedOperation>,
 ) {
     for emission in emissions {
         *any_response_headers |= emission.has_response_headers;
+        *any_sse_event |= emission.names_sse_event;
         diagnostics.extend(emission.diagnostics);
         files.push(emission.file);
     }
@@ -618,6 +632,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             )
             .collect::<Vec<_>>();
         let mut any_response_headers = false;
+        let mut any_sse_event = false;
         let operations = factory
             .model
             .analyzed
@@ -639,6 +654,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             &mut files,
             &mut diagnostics,
             &mut any_response_headers,
+            &mut any_sse_event,
             operations,
         );
         // Webhook and callback operations reuse the operation renderer verbatim; their response
@@ -661,6 +677,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             &mut files,
             &mut diagnostics,
             &mut any_response_headers,
+            &mut any_sse_event,
             webhooks,
         );
         // A document with any webhook gets the `Webhooks` descriptor, including a webhook whose
@@ -689,6 +706,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             &mut files,
             &mut diagnostics,
             &mut any_response_headers,
+            &mut any_sse_event,
             callbacks,
         );
         if factory.model.callback_files.iter().any(Option::is_some) {
@@ -696,6 +714,9 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         }
         if any_response_headers {
             files.push(factory.worker().emit_headers_helper_file());
+        }
+        if any_sse_event {
+            files.push(factory.worker().emit_stream_helper_file());
         }
         files.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
         (files, diagnostics)
@@ -903,6 +924,25 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         body.push_str("response: ");
         body.push_str(&response);
         body.push_str(" };\n");
+    }
+
+    /// Emits `SseEvent<TData>` once, only when some emitted response declares an SSE branch, on
+    /// the same rule the header helper follows. It is a second declaration of the shape the client
+    /// runtime already exports: this artifact ships without the client, so it cannot import from a
+    /// runtime that may not be emitted, and the two are structurally identical and unify wherever
+    /// both are present.
+    fn emit_stream_helper_file(&self) -> GeneratedFile {
+        let mut content = self.header();
+        content.push_str("export type SseEvent<TData> = {\n");
+        content.push_str("  data: TData;\n");
+        content.push_str("  event?: string;\n");
+        content.push_str("  id?: string;\n");
+        content.push_str("  retry?: number;\n");
+        content.push_str("};\n");
+        GeneratedFile {
+            relative_path: format!("{}/stream.ts", self.model.dirs.types),
+            content,
+        }
     }
 
     /// Emits the shared `TypedHeaders<K>` helper once, only when at least one emitted
@@ -2469,6 +2509,7 @@ impl Emitter<'_, '_, '_> {
                 .responses
                 .iter()
                 .any(|response| !response.headers.is_empty()),
+            names_sse_event: operation_names_sse_event(operation),
         }
     }
 
@@ -2499,7 +2540,7 @@ impl Emitter<'_, '_, '_> {
         }
         if let Some(body) = &operation.request_body
             && let Some(media_type) = select_request_media(&body.media_types)
-            && is_json(&media_type.essence)
+            && media_carries_json_value(&media_type.essence, media_type.streaming_marked)
         {
             self.collect_operation_imports(
                 &media_type.schema,
@@ -2531,21 +2572,43 @@ impl Emitter<'_, '_, '_> {
         }
         for response in &operation.responses {
             for media_type in &response.media_types {
-                if is_json(&media_type.essence) {
+                // An SSE entry renders its schema too — as the event's decoded `data` — so it names
+                // the same components a JSON entry would. A raw stream renders as bytes and names
+                // nothing, which is why this asks for the family rather than for "is it streaming".
+                let sse = media_stream_kind(&media_type.essence, media_type.streaming_marked)
+                    == Some(StreamKind::Sse);
+                if !sse
+                    && !media_carries_json_value(&media_type.essence, media_type.streaming_marked)
+                {
+                    continue;
+                }
+                // An event is rendered on the application surface whatever the configured
+                // representation, because the runtime converts one before yielding it — so it names
+                // the application components and only those, on the branch's wire alias as well.
+                // A buffered entry names the application form, and its twin as well when it
+                // converts.
+                if sse {
                     self.collect_operation_imports(
                         &media_type.schema,
                         TypePosition::Response,
                         TypeAxis::Application,
                         &mut imports,
                     );
-                    if self.response_transforms(response) {
-                        self.collect_operation_imports(
-                            &media_type.schema,
-                            TypePosition::Response,
-                            TypeAxis::Wire,
-                            &mut imports,
-                        );
-                    }
+                    continue;
+                }
+                self.collect_operation_imports(
+                    &media_type.schema,
+                    TypePosition::Response,
+                    TypeAxis::Application,
+                    &mut imports,
+                );
+                if self.response_transforms(response) {
+                    self.collect_operation_imports(
+                        &media_type.schema,
+                        TypePosition::Response,
+                        TypeAxis::Wire,
+                        &mut imports,
+                    );
                 }
             }
             for (_, header) in &response.headers {
@@ -2594,6 +2657,11 @@ impl Emitter<'_, '_, '_> {
             .borrow_mut()
             .extend(alias_diagnostics);
         self.write_imports(&mut content, imports, "../components/");
+        if operation_names_sse_event(operation) {
+            content.push_str("import type { SseEvent } from \"../stream");
+            content.push_str(&import_extension(self.model));
+            content.push_str("\";\n\n");
+        }
 
         write_source_metadata(&mut content, &operation.source, 0);
         write_operation_tsdoc(&mut content, operation, &self.model.config.documentation, 0);
@@ -2801,6 +2869,7 @@ impl Emitter<'_, '_, '_> {
             let body_type = self.media_payload_type(
                 &media_type.essence,
                 &media_type.schema,
+                media_stream_kind(&media_type.essence, media_type.streaming_marked),
                 TypePosition::Request,
                 axis,
             );
@@ -2883,7 +2952,8 @@ impl Emitter<'_, '_, '_> {
     /// Whether any JSON media entry of this response converts, and so declares a payload twin.
     pub(super) fn response_transforms(&self, response: &ResponseEntry) -> bool {
         response.media_types.iter().any(|media_type| {
-            is_json(&media_type.essence) && self.model.transform_facts().reaches(&media_type.schema)
+            media_carries_json_value(&media_type.essence, media_type.streaming_marked)
+                && self.model.transform_facts().reaches(&media_type.schema)
         })
     }
 
@@ -2898,7 +2968,7 @@ impl Emitter<'_, '_, '_> {
                 .as_ref()
                 .and_then(|body| select_request_media(&body.media_types))
                 .is_some_and(|media_type| {
-                    is_json(&media_type.essence)
+                    media_carries_json_value(&media_type.essence, media_type.streaming_marked)
                         && self.model.transform_facts().reaches(&media_type.schema)
                 })
     }
@@ -2911,6 +2981,7 @@ impl Emitter<'_, '_, '_> {
             let rendered = self.media_payload_type(
                 &media_type.essence,
                 &media_type.schema,
+                media_stream_kind(&media_type.essence, media_type.streaming_marked),
                 TypePosition::Response,
                 TypeAxis::Wire,
             );
@@ -2930,6 +3001,7 @@ impl Emitter<'_, '_, '_> {
             let rendered = self.media_payload_type(
                 &media_type.essence,
                 &media_type.schema,
+                media_stream_kind(&media_type.essence, media_type.streaming_marked),
                 TypePosition::Response,
                 TypeAxis::Application,
             );
@@ -2948,9 +3020,38 @@ impl Emitter<'_, '_, '_> {
         &self,
         essence: &str,
         schema: &SchemaNode,
+        stream: Option<StreamKind>,
         position: TypePosition,
         axis: TypeAxis,
     ) -> String {
+        // The two directions deliberately disagree, and this is the one place that says so. A
+        // response stream is the thing the client hands back, so SSE arrives as typed events; a
+        // request stream is bytes in both families, because framing typed events would put every
+        // framing, transform and validation failure after the request was already dispatched,
+        // where the result model has no arm to report it in. The frame encoder is a separate
+        // export the caller composes instead.
+        match (stream, position) {
+            (Some(_), TypePosition::Request) => {
+                return "ReadableStream<Uint8Array>".to_owned();
+            }
+            (Some(StreamKind::Sse), TypePosition::Response | TypePosition::Neutral) => {
+                // Always the application surface, whichever axis was asked for. The runtime
+                // converts each event before yielding it, so both surfaces see the application
+                // form: there is no wire twin for a stream because there is no moment at which a
+                // consumer holds an unconverted one. A branch that pairs an event stream with a
+                // buffered entry depends on that — the buffered arm's wire twin is what `execute`
+                // hands back, and an event arm that disagreed across the two would leave the
+                // emitted module unable to compile against its own declared result.
+                return format!(
+                    "AsyncIterable<SseEvent<{}>>",
+                    self.render_type(schema, position, TypeAxis::Application, 0)
+                );
+            }
+            (Some(StreamKind::Raw), TypePosition::Response | TypePosition::Neutral) => {
+                return "ReadableStream<Uint8Array>".to_owned();
+            }
+            (None, _) => {}
+        }
         if is_json(essence) {
             self.render_type(schema, position, axis, 0)
         } else if essence.starts_with("text/") && !is_xml(essence) {
@@ -3585,6 +3686,10 @@ pub(super) fn write_client_operation_tsdoc(
     config: &DocumentationConfig,
     kind: ClientDocKind,
     unchecked_response: bool,
+    // Whether any success branch resolves as a stream. Independent of `unchecked_response`: a
+    // stream's proof is weaker whatever the validation setting, because the result resolves before
+    // a single body byte has been read.
+    streaming_response: bool,
     // Per-response notes the client emitter owns because they describe runtime decoding, not the
     // declared schema — the multipart part-mapping rules, whose behaviour the specification leaves
     // undefined and which therefore has to be readable at the call site.
@@ -3640,6 +3745,14 @@ pub(super) fn write_client_operation_tsdoc(
                     0,
                     Cow::Borrowed(
                         "Successful response data is decoded but unchecked against the OpenAPI schema.",
+                    ),
+                );
+            }
+            if streaming_response {
+                tsdoc.remarks.insert(
+                    0,
+                    Cow::Borrowed(
+                        "A streaming branch resolves when the response headers arrive, so `ok: true` attests only the matched status, the selected media type, and that the stream handle was created. Each server-sent event proves its own framing and decoding as it is yielded, and carries the wire form of its schema; a raw byte stream is never checked against a schema at all.",
                     ),
                 );
             }
@@ -4454,7 +4567,9 @@ pub(super) fn request_body_validator_positions<'a>(
                 }]
             })
             .unwrap_or_default(),
-        BodyPlan::TopLevelBinary { .. } => Vec::new(),
+        // Neither carries a schema value a validator or a transform could bind to: binary bodies
+        // are opaque bytes, and a streaming body has no whole value at all.
+        BodyPlan::TopLevelBinary { .. } | BodyPlan::TopLevelStream { .. } => Vec::new(),
         BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
             form_field_positions(fields, &base, body.required)
         }
@@ -8558,6 +8673,278 @@ mod tests {
             !headerless_files
                 .iter()
                 .any(|file| file.relative_path == "types/headers.ts")
+        );
+    }
+
+    #[test]
+    fn an_event_payload_renders_its_application_form_on_both_surfaces() {
+        // The runtime converts each event before yielding it, so an event names the application
+        // component whichever surface asks — there is no moment at which a consumer holds an
+        // unconverted one, and so no wire twin for a stream. The pre-conversion result the buffered
+        // arm needs is where that matters: an event arm that disagreed across the two surfaces
+        // would leave the emitted module unable to return its own declared result.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "components": {
+                "schemas": {
+                    "Tick": {
+                        "type": "object",
+                        "required": ["at"],
+                        "properties": { "at": { "type": "string", "format": "date-time" } }
+                    }
+                }
+            },
+            "paths": {
+                "/report": {
+                    "get": {
+                        "operationId": "readReport",
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": {
+                                    "application/json": { "schema": { "$ref": "#/components/schemas/Tick" } },
+                                    "text/event-stream": { "schema": { "$ref": "#/components/schemas/Tick" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        // The representation requires the client artifact, which is also the artifact whose result
+        // type the mismatch would have made unsatisfiable.
+        let (files, diagnostics) = compile(
+            document,
+            json!({
+                "types": { "dateTime": "date" },
+                "artifacts": { "types": true, "client": true },
+                "client": { "authEnforcement": "types", "baseUrl": { "source": "runtime" } },
+                "validation": { "engine": "off", "request": false, "response": false, "unchecked": "allow" }
+            }),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let types = files
+            .iter()
+            .find(|file| file.relative_path == "types/operations/readreport.ts")
+            .expect("types operation file");
+        let types_body = types.content.clone();
+        // Both surfaces of the status-wide alias: the buffered arm differs across them, the event
+        // arm does not.
+        assert!(
+            types_body.contains("ReadReportResponse200 = Tick | AsyncIterable<SseEvent<Tick>>;"),
+            "{types_body}"
+        );
+        assert!(
+            types_body
+                .contains("ReadReportResponse200Wire = TickWire | AsyncIterable<SseEvent<Tick>>;"),
+            "{types_body}"
+        );
+        // The event names the application component and only that, so the wire alias imports both
+        // forms and each arm reads the one it declares.
+        assert!(
+            types_body.contains("import type { Tick, TickWire } from \"../components/tick.js\";"),
+            "{types_body}"
+        );
+
+        // No configured representation, nothing to convert, no difference to render.
+        let (_, quiet) = compile(
+            json!({
+                "openapi": "3.1.0",
+                "info": { "title": "test", "version": "1" },
+                "paths": {
+                    "/ticks": {
+                        "get": {
+                            "operationId": "watchTicks",
+                            "responses": {
+                                "200": {
+                                    "description": "OK",
+                                    "content": {
+                                        "text/event-stream": { "schema": { "type": "string" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            json!({}),
+        );
+        assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
+    #[test]
+    fn the_sse_event_helper_is_emitted_only_when_a_response_declares_an_event_stream() {
+        let streaming = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/ticks": {
+                    "get": {
+                        "operationId": "watchTicks",
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": {
+                                    "text/event-stream": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (streaming_files, diagnostics) = compile(streaming, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let helper = streaming_files
+            .iter()
+            .find(|file| file.relative_path == "types/stream.ts")
+            .expect("SseEvent helper emitted for a document with an SSE response");
+        let helper_body = generated_body(helper);
+        assert!(
+            helper_body.contains(
+                "export type SseEvent<TData> = {\n  data: TData;\n  event?: string;\n  id?: string;\n  retry?: number;\n};\n"
+            ),
+            "{helper_body}"
+        );
+        // The operation module writes the word `SseEvent`, so it imports the helper it just caused
+        // to exist rather than redeclaring the shape per module.
+        let operation = streaming_files
+            .iter()
+            .find(|file| file.relative_path.ends_with("watchticks.ts"))
+            .expect("operation file");
+        assert!(
+            operation
+                .content
+                .contains("import type { SseEvent } from \"../stream"),
+            "{}",
+            operation.content
+        );
+
+        // A document with no SSE branch stays exactly as it was before the helper existed.
+        let buffered = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/ticks": {
+                    "get": {
+                        "operationId": "watchTicks",
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": {
+                                    "application/json": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (buffered_files, diagnostics) = compile(buffered, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            !buffered_files
+                .iter()
+                .any(|file| file.relative_path == "types/stream.ts")
+        );
+        let operation = buffered_files
+            .iter()
+            .find(|file| file.relative_path.ends_with("watchticks.ts"))
+            .expect("operation file");
+        assert!(
+            !operation.content.contains("SseEvent"),
+            "{}",
+            operation.content
+        );
+    }
+
+    #[test]
+    fn a_streaming_payload_is_events_only_in_a_response_and_bytes_in_every_request_position() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/publish": {
+                    "post": {
+                        "operationId": "publishTicks",
+                        "requestBody": {
+                            "required": true,
+                            "content": { "text/event-stream": { "schema": { "type": "string" } } }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": {
+                                    "text/event-stream": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/upload": {
+                    "post": {
+                        "operationId": "uploadBlob",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/octet-stream": { "x-oasts-streaming": true }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "OK",
+                                "content": {
+                                    "application/octet-stream": { "x-oasts-streaming": true }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let publish = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("publishticks.ts"))
+            .expect("operation file");
+        // Both families send bytes: framing typed events for the caller would move every framing
+        // and conversion failure past the point where the request was already dispatched.
+        assert!(
+            publish
+                .content
+                .contains("body: ReadableStream<Uint8Array>;"),
+            "{}",
+            publish.content
+        );
+        // SSE is the one streaming position that has a schema at all, and it describes each event's
+        // decoded `data` — so the response is events, not the whole body.
+        assert!(
+            publish
+                .content
+                .contains("export type PublishTicksResponse200 = AsyncIterable<SseEvent<string>>;"),
+            "{}",
+            publish.content
+        );
+
+        let upload = files
+            .iter()
+            .find(|file| file.relative_path.ends_with("uploadblob.ts"))
+            .expect("operation file");
+        assert!(
+            upload.content.contains("body: ReadableStream<Uint8Array>;"),
+            "{}",
+            upload.content
+        );
+        // A raw stream carries no schema position in either direction, so it stays bytes.
+        assert!(
+            upload
+                .content
+                .contains("export type UploadBlobResponse200 = ReadableStream<Uint8Array>;"),
+            "{}",
+            upload.content
         );
     }
 

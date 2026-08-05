@@ -1156,11 +1156,14 @@ fn response_codecs(
                 application,
                 declared_by: PayloadModule::Types,
             }),
+            // An event entry is no different here: its pair names the event, and the schema it
+            // converts is the one the entry declares — which is the event's, because that is what
+            // an SSE entry's schema describes.
             ResponseConversion::PerEntry(entries) => {
-                for (index, name) in entries {
-                    let entry = &response.media[*index];
+                for conversion in entries {
+                    let entry = &response.media[conversion.index];
                     codecs.push(ResponseCodec {
-                        application: name.clone(),
+                        application: conversion.name.clone(),
                         schema: entry.schema.clone(),
                         source: entry.source.clone(),
                         declared_by: PayloadModule::Client,
@@ -1509,11 +1512,12 @@ fn request_body_schema(plan: &BodyPlan, source: SourceRef) -> SchemaNode {
                 .collect(),
             body_source.clone(),
         ),
-        BodyPlan::Json { .. } | BodyPlan::TopLevelText { .. } | BodyPlan::TopLevelBinary { .. } => {
-            SchemaNode::Any {
-                meta: operation_schema_meta(source),
-            }
-        }
+        BodyPlan::Json { .. }
+        | BodyPlan::TopLevelText { .. }
+        | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::TopLevelStream { .. } => SchemaNode::Any {
+            meta: operation_schema_meta(source),
+        },
         BodyPlan::ContentTypeDiscriminated { arms, all_concrete } => SchemaNode::AnyOf {
             branches: arms
                 .iter()

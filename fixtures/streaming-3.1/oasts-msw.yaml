@@ -1,0 +1,11 @@
+# The mock artifact over the same document: streaming responses become resolver-supplied byte
+# streams, and the two streaming request bodies are skipped with a warning because a stream has no
+# buffered value a handler could project. Emitted handlers import `msw` bare, so this config is
+# verified on the row that links node_modules.
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-msw
+artifacts:
+  types: true
+  msw: true

@@ -40,6 +40,16 @@ export type SuccessEnvelope<R> = R extends { readonly ok: true; readonly data: i
   ? { data: D; meta: M }
   : never;
 
+// One dispatched server-sent event. `data` is the event's data buffer after JSON decoding — the
+// declared schema describes that decoded value, never the raw field text — and the three optional
+// members carry the SSE fields the standard makes available to a dispatched event.
+export type SseEvent<TData> = {
+  data: TData;
+  event?: string;
+  id?: string;
+  retry?: number;
+};
+
 export type StreamFailure =
   | { kind: 'sse'; eventsYielded: number; cause: unknown }
   | { kind: 'raw'; bytesRead: number; cause: unknown };

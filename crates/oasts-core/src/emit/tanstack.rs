@@ -21,7 +21,7 @@ use super::{
     GeneratedFile, render_literal_key, render_property_key, render_ts_string, source_diagnostic,
     uppercase_first, warning_diagnostic, write_source_metadata,
 };
-use crate::client_model::{ClientModel, OperationPlan, PayloadDisposition};
+use crate::client_model::{BodyPlan, ClientModel, DecoderClass, OperationPlan, PayloadDisposition};
 use crate::ir::{Operation, ParamLocation, Segment, SegmentPart, SourceRef};
 use crate::semantic::{TargetCase, normalize_identifier};
 
@@ -751,6 +751,46 @@ fn is_read(operation: &Operation) -> bool {
     )
 }
 
+/// Whether any arm of this body can be a stream. A discriminated body is checked arm by arm: the
+/// caller picks the wire type at the call site, so an operation offering one streaming media among
+/// several buffered ones can still be handed a stream, and a retry would resend an exhausted one.
+fn body_can_stream(plan: &BodyPlan) -> bool {
+    match plan {
+        BodyPlan::TopLevelStream { .. } => true,
+        BodyPlan::ContentTypeDiscriminated { arms, .. } => {
+            arms.iter().any(|arm| body_can_stream(&arm.plan))
+        }
+        BodyPlan::Json { .. }
+        | BodyPlan::TopLevelText { .. }
+        | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::FormUrlencoded { .. }
+        | BodyPlan::Multipart { .. } => false,
+    }
+}
+
+/// The reason a streaming operation gets no descriptor at all, or `None` when it streams nothing.
+/// A request-side stream counts too: it is single-consumption in the same way, so a retried
+/// mutation would send an exhausted body.
+fn streaming_ineligibility(plan: &OperationPlan) -> Option<&'static str> {
+    if plan.body_plan.as_ref().is_some_and(body_can_stream) {
+        return Some(
+            "its request body can be a stream, which cannot be consumed twice and so cannot be retried",
+        );
+    }
+    let streams = plan.response_table.iter().any(|response| {
+        matches!(response.payload, PayloadDisposition::Payload)
+            && response.media.iter().any(|media| {
+                matches!(
+                    media.decoder,
+                    DecoderClass::StreamingSse | DecoderClass::StreamingRaw
+                )
+            })
+    });
+    streams.then_some(
+        "it responds with a stream, which is consumable once and cannot be handed to two cache readers",
+    )
+}
+
 /// Whether a read operation may emit a query descriptor.
 ///
 /// A query function resolving `undefined` is rejected, and a descriptor resolves the operation's
@@ -933,6 +973,17 @@ fn emit_operation(
     let stem = uppercase_first(allocated_name);
     let encodes = request_transform_binding(model, plan);
 
+    // A streaming operation is excluded on both sides, not just the query side: a stream handle is
+    // consumable exactly once, so caching one under a query key hands every later cache reader an
+    // already-drained iterable, and a mutation descriptor would resolve one into the same trap.
+    if let Some(reason) = streaming_ineligibility(plan) {
+        model.sink.push(warning_diagnostic(
+            CODE_INELIGIBLE_QUERY,
+            format!("operation '{allocated_name}' emits no descriptor: {reason}"),
+            &operation.source,
+        ));
+        return None;
+    }
     let body = if is_read(operation) {
         if let Err(reason) = is_query_eligible(plan) {
             model.sink.push(warning_diagnostic(
@@ -2986,6 +3037,94 @@ paths:
                 .iter()
                 .any(|file| file.relative_path.starts_with("tanstack/operations/")),
             "neither operation can be named, so neither emits a descriptor"
+        );
+    }
+
+    #[test]
+    fn a_streaming_operation_gets_no_descriptor_on_either_the_read_or_the_write_path() {
+        const STREAMING: &str = r#"
+openapi: 3.1.0
+info:
+  title: Streaming
+  version: 1.0.0
+paths:
+  /ticks:
+    get:
+      operationId: watchTicks
+      responses:
+        '200':
+          description: a stream of ticks
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /upload:
+    post:
+      operationId: uploadBlob
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            x-oasts-streaming: true
+      responses:
+        '204':
+          description: accepted
+  /either:
+    post:
+      operationId: publishEither
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+          text/event-stream:
+            schema:
+              type: object
+      responses:
+        '204':
+          description: accepted
+"#;
+        let (files, diagnostics) = emit(STREAMING, TANSTACK_CONFIG);
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.relative_path.starts_with("tanstack/operations/")),
+            "neither side may emit a descriptor"
+        );
+
+        let reasons = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_INELIGIBLE_QUERY)
+            .map(|diagnostic| {
+                // A refusal here must not discard the rest of the generated document, so the
+                // severity is as much the contract as the message is.
+                assert_eq!(diagnostic.severity, crate::diag::Severity::Warning);
+                diagnostic.message.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reasons.len(), 3, "{reasons:?}");
+        // The read side: a stream handle is drained by its first cache reader, so caching one hands
+        // every later reader an exhausted iterable.
+        assert!(
+            reasons.iter().any(|reason| reason.contains("watchTicks")
+                && reason.contains("it responds with a stream")),
+            "{reasons:?}"
+        );
+        // The write side is refused for the mirror reason, which is why the check runs before the
+        // query/mutation split: a retried mutation would resend an already-consumed body.
+        assert!(
+            reasons.iter().any(|reason| reason.contains("uploadBlob")
+                && reason.contains("its request body can be a stream")),
+            "{reasons:?}"
+        );
+        // A body offering one streaming media beside a buffered one is refused on the same ground:
+        // the caller picks the arm at the call site, so the descriptor cannot know it got the
+        // buffered one, and a retry of the streaming arm resends an exhausted body.
+        assert!(
+            reasons.iter().any(|reason| reason.contains("publishEither")
+                && reason.contains("its request body can be a stream")),
+            "{reasons:?}"
         );
     }
 }

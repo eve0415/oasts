@@ -1,0 +1,20 @@
+# The query artifact over the same document: every streaming operation is skipped, so this tree
+# proves the skip leaves a compiling module set rather than a dangling import.
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-tanstack
+artifacts:
+  types: true
+  client: true
+  tanstack: true
+client:
+  authEnforcement: types
+  baseUrl:
+    source: server
+    index: 0
+validation:
+  engine: "off"
+  request: false
+  response: false
+  unchecked: allow

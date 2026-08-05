@@ -45,6 +45,7 @@ use super::{
 };
 use crate::client_model::{PrimitiveDomainProjector, build_body_plan};
 use crate::media::is_json;
+use crate::response_media::media_has_validatable_schema;
 
 /// Emitted verbatim as `validators/runtime.ts`; the generated-validator call ABI is fixed to it.
 const VALIDATORS_RUNTIME_TS: &str = include_str!("../../runtime/validators-runtime.ts");
@@ -85,7 +86,7 @@ fn response_body_validators<'ir>(
     let json: Vec<&crate::ir::MediaType> = response
         .media_types
         .iter()
-        .filter(|media| is_json(&media.essence))
+        .filter(|media| media_has_validatable_schema(&media.essence, media.streaming_marked))
         .collect();
     if json.is_empty() {
         return Vec::new();

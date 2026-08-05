@@ -1,0 +1,6 @@
+# SHA-256 manifest of the streaming frozen entry-gate files; scripts/streaming-gate.sh verifies it.
+# These files were authored from the pinned streaming contract before any implementation existed
+# and are never edited afterward — the implementation is written to satisfy them.
+files:
+  - path: crates/oasts-core/runtime/test/vectors-streaming.ts
+    sha256: c49d829672c21847024578f107bdd3da63bf93d793836fff319325046e161960

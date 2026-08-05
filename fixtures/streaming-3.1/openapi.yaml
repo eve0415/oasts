@@ -1,0 +1,181 @@
+openapi: 3.1.0
+info:
+  title: Streaming
+  version: 1.0.0
+servers:
+  - url: https://stream.example.test
+components:
+  schemas:
+    Tick:
+      type: object
+      required:
+        - seq
+      properties:
+        seq:
+          type: integer
+        label:
+          type: string
+        # Converted under a date/time representation: the event's own codec applies it as the
+        # runtime yields each event, so the branch renders its application form.
+        at:
+          type: string
+          format: date-time
+    Problem:
+      type: object
+      required:
+        - reason
+      properties:
+        reason:
+          type: string
+paths:
+  # An SSE success branch beside a buffered error branch: the common shape.
+  /ticks:
+    get:
+      operationId: watchTicks
+      responses:
+        '200':
+          description: A stream of ticks.
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/Tick'
+        '429':
+          description: Too many watchers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  # A documented non-2xx streaming branch: ok is false and the handle lands in error.
+  /ticks/guarded:
+    get:
+      operationId: watchGuardedTicks
+      responses:
+        '200':
+          description: A stream of ticks.
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/Tick'
+        '503':
+          description: A stream of failure notices.
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  # A raw byte stream, marked rather than inferred.
+  /blob:
+    get:
+      operationId: downloadBlob
+      responses:
+        '200':
+          description: Bytes, streamed.
+          content:
+            application/octet-stream:
+              x-oasts-streaming: true
+  # One status declaring a buffered entry beside a streaming one, so contentType narrows between a
+  # decoded payload and a stream handle and each arm keeps its own validation position.
+  /report:
+    get:
+      operationId: readReport
+      responses:
+        '200':
+          description: Either a whole report or a stream of its lines.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tick'
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/Tick'
+  # A streaming mark on a JSON-family media: the payload is bytes, so the entry must not reach the
+  # validator or conversion pipelines that select on the JSON essence.
+  /marked:
+    get:
+      operationId: watchMarkedJson
+      responses:
+        '200':
+          description: JSON by essence, bytes by contract.
+          content:
+            application/json:
+              x-oasts-streaming: true
+              schema:
+                $ref: '#/components/schemas/Tick'
+  # A request body offering one streaming media beside a buffered one.
+  /publish/either:
+    post:
+      operationId: publishEither
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Tick'
+          text/event-stream:
+            schema:
+              $ref: '#/components/schemas/Tick'
+      responses:
+        '204':
+          description: Accepted.
+  # Range and default keys carrying streaming entries.
+  /ranged:
+    get:
+      operationId: watchRanged
+      responses:
+        '2XX':
+          description: Any success streams.
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/Tick'
+        default:
+          description: Anything else streams too.
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  # A streaming request body, both families.
+  /publish:
+    post:
+      operationId: publishTicks
+      requestBody:
+        required: true
+        content:
+          text/event-stream:
+            schema:
+              $ref: '#/components/schemas/Tick'
+      responses:
+        '204':
+          description: Accepted.
+  /upload:
+    post:
+      operationId: uploadBlob
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            x-oasts-streaming: true
+      responses:
+        '204':
+          description: Accepted.
+  # Bodyless statuses declaring streaming media: a contradictory schema. The payload is undefined
+  # because that is what the runtime delivers, and no handle is ever created.
+  /probe:
+    head:
+      operationId: probeTicks
+      responses:
+        '200':
+          description: HEAD fixes the body to null whatever the description says.
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/Tick'
+  /drain:
+    get:
+      operationId: drainTicks
+      responses:
+        '204':
+          description: An exact bodyless status cannot carry a stream.
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/Tick'

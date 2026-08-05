@@ -20,7 +20,7 @@ export type NoPayloadGuard<T, NoPayloadMatch> = T extends { match: NoPayloadMatc
   : unknown;
 
 /** How a declared response media is written to the wire, as decided at generation time. */
-export type ResponsePayloadKind = "json" | "text" | "binary";
+export type ResponsePayloadKind = "json" | "text" | "binary" | "stream";
 
 /**
  * Builds the response a resolver asked for.
@@ -57,12 +57,17 @@ export function respondWith(
     // JavaScript can still get here, and guessing would put the wrong bytes on the wire.
     throw new TypeError(`content type ${contentType} is not declared for this response`);
   }
+  // A stream is handed to the Response constructor as-is: the resolver owns the framing (the
+  // client runtime's SSE frame encoder is exported for exactly that), and cancellation and
+  // mid-stream errors then propagate through the stream itself rather than through this call.
   const responseBody =
-    payload === "json"
-      ? (JSON.stringify(body) ?? null)
-      : payload === "binary"
-        ? bytesOf(body)
-        : String(body);
+    payload === "stream"
+      ? streamOf(body)
+      : payload === "json"
+        ? (JSON.stringify(body) ?? null)
+        : payload === "binary"
+          ? bytesOf(body)
+          : String(body);
   return new HttpResponse(responseBody, {
     status,
     headers: { "Content-Type": contentType },
@@ -80,6 +85,16 @@ function bytesOf(body: unknown) {
     return null;
   }
   throw new TypeError("a binary response body must be bytes");
+}
+
+function streamOf(body: unknown): ReadableStream<Uint8Array> | null {
+  if (body instanceof ReadableStream) {
+    return body;
+  }
+  if (body === null || body === undefined) {
+    return null;
+  }
+  throw new TypeError("a streaming response body must be a ReadableStream");
 }
 
 /**

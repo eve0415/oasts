@@ -1,0 +1,23 @@
+# The same document under a date/time representation. Every buffered payload converts, and so does
+# every event: an event stream's codec binds to the event rather than to the body, and the runtime
+# calls it as each event is yielded. This config is what keeps the two features crossed in a gate,
+# which is where an uncompilable mixed-media result type would show up.
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-transform
+artifacts:
+  types: true
+  client: true
+types:
+  dateTime: date
+client:
+  authEnforcement: types
+  baseUrl:
+    source: server
+    index: 0
+validation:
+  engine: "off"
+  request: false
+  response: false
+  unchecked: allow

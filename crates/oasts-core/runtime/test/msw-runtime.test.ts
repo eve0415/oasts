@@ -50,9 +50,37 @@ const PAYLOADS = {
   "text/json": "json",
   "text/plain; charset=iso-8859-1": "text",
   "application/octet-stream": "binary",
+  "text/event-stream": "stream",
 } as const;
 
 describe("respondWith", () => {
+  test("hands a resolver's stream to the response untouched", async () => {
+    // The resolver owns the framing — the frame encoder is exported for it — so the kernel must
+    // not buffer, re-encode, or otherwise interpose on the bytes it was given.
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"seq":1}\n\n'));
+        controller.close();
+      },
+    });
+    const response = respondWith(200, "text/event-stream", stream, PAYLOADS);
+    assert.equal(response.headers.get("Content-Type"), "text/event-stream");
+    assert.equal(await response.text(), 'data: {"seq":1}\n\n');
+  });
+
+  test("an absent streaming body is an empty response, not an error", async () => {
+    const response = respondWith(200, "text/event-stream", undefined, PAYLOADS);
+    assert.equal(await response.text(), "");
+  });
+
+  test("a streaming body that is not a stream is refused", () => {
+    assert.throws(
+      () => respondWith(200, "text/event-stream", "data: hi", PAYLOADS),
+      /must be a ReadableStream/u,
+    );
+  });
+
   test("serializes JSON with the declared content type", async () => {
     const response = respondWith(201, "application/json; charset=utf-8", { id: 1 }, PAYLOADS);
     assert.equal(response.status, 201);

@@ -19,6 +19,7 @@ use crate::ir::{
 };
 use crate::media::is_json;
 use crate::num::render_number_value;
+use crate::response_media::media_has_validatable_schema;
 
 use super::model::EmissionModel;
 use super::runtime_assets::rewrite_relative_ts_imports;
@@ -1928,7 +1929,7 @@ fn response_body_schemas<'ir>(
     let json = response
         .media_types
         .iter()
-        .filter(|media| is_json(&media.essence))
+        .filter(|media| media_has_validatable_schema(&media.essence, media.streaming_marked))
         .collect::<Vec<_>>();
     if json.is_empty() {
         return Vec::new();

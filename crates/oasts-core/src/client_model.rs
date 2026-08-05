@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, VecDeque};
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde_json::Value;
 
-use crate::config::{DeepObjectEncoding, ResolvedBaseUrl, ResolvedConfig};
+use crate::config::{DeepObjectEncoding, ResolvedBaseUrl, ResolvedConfig, UncheckedPolicy};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::headers::forbidden_request_header_name;
 use crate::ir::{
@@ -24,7 +24,8 @@ pub use crate::response_media::ResponseMediaKind as DecoderClass;
 use crate::response_media::response_status_name;
 use crate::response_media::{
     ResponseMediaProjector, ResponseSchemaProjection, classify_response_media,
-    diagnose_operation_response_media, xml_requires_structural_mapping,
+    diagnose_operation_response_media, diagnose_unchecked_raw_streams,
+    xml_requires_structural_mapping,
 };
 use crate::semantic::Analyzed;
 
@@ -130,6 +131,11 @@ pub enum BodyPlan {
         schema: Option<SchemaNode>,
         source: SourceRef,
     },
+    /// A streaming request body: the caller's byte stream reaches fetch untouched. It carries no
+    /// schema on purpose — the bytes are never validated and never transformed, because both are
+    /// whole-value operations over a value that does not exist yet at dispatch time, so a schema
+    /// here would only invite a check that has no failure branch to report into.
+    TopLevelStream { media: String, source: SourceRef },
     FormUrlencoded {
         media: String,
         fields: Vec<FormFieldPlan>,
@@ -440,8 +446,22 @@ pub fn build_client_model(
     let deep_object = config.compat.deep_object_encoding;
     let oas_version = analyzed.ir.version;
     diagnose_security_schemes(&analyzed.ir, sink);
+    // The config layer already answered the pure-config half of the unchecked-data policy, before
+    // any document was read. This is the half only the document can answer.
+    let unchecked = config
+        .validation
+        .as_ref()
+        .map_or(UncheckedPolicy::Warn, |validation| validation.unchecked);
     for operation in &analyzed.ir.operations {
         diagnose_operation_response_media(operation, &projector, sink);
+        if unchecked != UncheckedPolicy::Allow {
+            diagnose_unchecked_raw_streams(
+                operation,
+                &projector,
+                unchecked == UncheckedPolicy::Error,
+                sink,
+            );
+        }
     }
     let security_schemes = index_security_schemes(&analyzed.ir);
     let operations: Vec<_> = analyzed
@@ -758,7 +778,16 @@ pub(crate) fn body_plan_for_media(
     projector: &PrimitiveDomainProjector<'_>,
 ) -> BodyPlan {
     let schema = media.schema_present.then(|| media.schema.clone());
-    if is_request_json(&media.essence) {
+    // Streaming is decided before every other essence rule, exactly as it is on the response side:
+    // a marked `+json` or `text/*` body must never be silently buffered by the rule that would
+    // otherwise claim it. A media class the compiler already refuses never reaches here — the
+    // request diagnostics run that refusal first.
+    if media.streaming_marked || media.essence == "text/event-stream" {
+        BodyPlan::TopLevelStream {
+            media: media.full.clone(),
+            source: media.source.clone(),
+        }
+    } else if is_request_json(&media.essence) {
         BodyPlan::Json {
             media: media.full.clone(),
             schema,
@@ -2164,17 +2193,10 @@ fn diagnose_request_media(
     sink: &mut DiagnosticSink,
 ) {
     for media in media_types {
-        if media.streaming_marked || media.essence == "text/event-stream" {
-            sink.push(source_diagnostic(
-                "OASTS1402",
-                format!(
-                    "request body media '{}' requires streaming support, which is not yet available",
-                    media.essence
-                ),
-                &media.source,
-                Severity::Error,
-            ));
-        } else if xml_requires_structural_mapping(media, projector) {
+        // XML needing structural mapping is refused before the streaming mark is read, so the
+        // vendor extension cannot launder a media class this compiler already rejects into an
+        // opaque byte stream. The response classifier applies the same precedence.
+        if xml_requires_structural_mapping(media, projector) {
             sink.push(source_diagnostic(
                 "OASTS1403",
                 format!(
@@ -2184,6 +2206,11 @@ fn diagnose_request_media(
                 &media.source,
                 Severity::Error,
             ));
+        } else if media.streaming_marked || media.essence == "text/event-stream" {
+            // A streaming request body is carried, not classified further: the string-projection
+            // rule below is about converting a typed value to text, and a stream has no value to
+            // convert. Reaching that rule would refuse a perfectly sendable byte stream over the
+            // shape of a schema nothing ever reads.
         } else if media.essence.starts_with("text/")
             && !is_request_json(&media.essence)
             && media.schema_present
@@ -2649,9 +2676,30 @@ mod tests {
         (temp, analyzed, config)
     }
 
+    /// Same as `analyzed`, with the validation block spelled out. Only the tests that turn
+    /// validation on need it; everything else keeps the engine off.
+    fn analyzed_with_validation(
+        document: &Value,
+        client: Value,
+        validation: Value,
+    ) -> (TempDir, Analyzed, ResolvedConfig) {
+        let (temp, analyzed, config, sink) =
+            analyzed_with_options(document, client, Some(validation));
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        (temp, analyzed, config)
+    }
+
     fn analyzed_with_diagnostics(
         document: &Value,
         client: Value,
+    ) -> (TempDir, Analyzed, ResolvedConfig, DiagnosticSink) {
+        analyzed_with_options(document, client, None)
+    }
+
+    fn analyzed_with_options(
+        document: &Value,
+        client: Value,
+        validation: Option<Value>,
     ) -> (TempDir, Analyzed, ResolvedConfig, DiagnosticSink) {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
@@ -2663,9 +2711,16 @@ mod tests {
             "schemaVersion": 1,
             "input": { "path": "openapi.json" },
             "output": "generated",
-            "artifacts": { "types": true, "client": true },
+            "artifacts": {
+                "types": true,
+                "client": true,
+                // The generated engine requires this artifact, and the tests that turn validation
+                // on are exactly the ones that name that engine.
+                "validators": validation.is_some()
+            },
             "client": client,
-            "validation": { "engine": "off", "unchecked": "allow" }
+            "validation": validation
+                .unwrap_or_else(|| json!({ "engine": "off", "unchecked": "allow" }))
         });
         let config = load_config_from_json(
             &temp.path().join("oasts.json"),
@@ -4837,8 +4892,17 @@ mod tests {
         let ir = Ir::default();
         let projector = PrimitiveDomainProjector::new(&ir);
         for (media, marked, expected) in [
-            ("text/event-stream", false, DecoderClass::Streaming),
-            ("application/stream+json", true, DecoderClass::Streaming),
+            ("text/event-stream", false, DecoderClass::StreamingSse),
+            ("text/event-stream", true, DecoderClass::StreamingSse),
+            ("application/stream+json", true, DecoderClass::StreamingRaw),
+            // The mark makes an eligible media type an opaque byte stream, whatever the buffered
+            // classifier would have made of it.
+            ("text/plain", true, DecoderClass::StreamingRaw),
+            ("application/octet-stream", true, DecoderClass::StreamingRaw),
+            ("application/json", true, DecoderClass::StreamingRaw),
+            // A media class the buffered classifier refuses keeps its own refusal: the mark is not
+            // a way to launder an undecodable entry into a byte stream that generates cleanly.
+            ("multipart/mixed", true, DecoderClass::MultipartUnnamed),
             ("application/json", false, DecoderClass::Json),
             ("text/json", false, DecoderClass::Json),
             ("application/vnd.api+json", false, DecoderClass::Json),
@@ -4876,10 +4940,231 @@ mod tests {
             classify_response_media(&unsupported_xml, &projector),
             DecoderClass::Binary
         );
+
+        // Structural XML is refused, and the mark does not change that.
+        let mut structural_xml = classifier_media("application/xml", true);
+        structural_xml.schema_present = true;
+        structural_xml.schema = SchemaNode::Object {
+            properties: Vec::new(),
+            additional_properties: AdditionalProperties::Allowed(None),
+            dependent_required: Vec::new(),
+            finite: None,
+            extra_required: Vec::new(),
+            meta: test_meta("/structural-xml"),
+        };
+        assert_eq!(
+            classify_response_media(&structural_xml, &projector),
+            DecoderClass::Xml
+        );
     }
 
     #[test]
-    fn oasts1402_streaming_precedes_other_response_classifiers() {
+    fn a_streaming_request_body_is_carried_as_a_stream_with_no_diagnostic() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "servers": [{ "url": "https://stream.example.test" }],
+            "paths": {
+                "/publish": {
+                    "post": {
+                        "operationId": "publish",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "text/event-stream": { "schema": { "type": "object" } }
+                            }
+                        },
+                        "responses": { "204": { "description": "accepted" } }
+                    }
+                },
+                "/upload": {
+                    "post": {
+                        "operationId": "upload",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/octet-stream": { "x-oasts-streaming": true }
+                            }
+                        },
+                        "responses": { "204": { "description": "accepted" } }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed(
+            &document,
+            json!({
+                "authEnforcement": "types",
+                "baseUrl": { "source": "server", "index": 0 }
+            }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let model = build_client_model(&analyzed, &config, &mut sink);
+
+        assert!(sink.into_sorted_vec().is_empty());
+        for operation in &model.operations {
+            assert!(
+                matches!(operation.body_plan, Some(BodyPlan::TopLevelStream { .. })),
+                "{:?}",
+                operation.body_plan
+            );
+        }
+    }
+
+    #[test]
+    fn a_raw_stream_is_unchecked_data_whatever_the_validation_setting() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "servers": [{ "url": "https://stream.example.test" }],
+            "paths": {
+                "/blob": {
+                    "get": {
+                        "operationId": "downloadBlob",
+                        "responses": {
+                            "200": {
+                                "description": "raw bytes",
+                                "content": {
+                                    "application/octet-stream": { "x-oasts-streaming": true }
+                                }
+                            },
+                            "503": {
+                                "description": "an error branch streams too, and is not data",
+                                "content": {
+                                    "application/octet-stream": { "x-oasts-streaming": true }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/events": {
+                    "get": {
+                        "operationId": "watchEvents",
+                        "responses": {
+                            "200": {
+                                "description": "checked per event, so never unchecked data",
+                                "content": {
+                                    "text/event-stream": { "schema": { "type": "object" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        // Response validation is ON in every case: this half of the policy is the one the config
+        // layer cannot answer, so being on must not silence it.
+        // The SSE branch contributes nothing here: its events are validated one at a time when
+        // response validation is on, so it is not unchecked data under any policy.
+        for (policy, expected) in [
+            ("error", vec!["OASTS1407"]),
+            ("warn", vec!["OASTS1408"]),
+            ("allow", Vec::new()),
+        ] {
+            let (_temp, analyzed, config) = analyzed_with_validation(
+                &document,
+                json!({
+                    "authEnforcement": "types",
+                    "baseUrl": { "source": "server", "index": 0 }
+                }),
+                json!({
+                    "engine": "generated",
+                    "request": true,
+                    "response": true,
+                    "unchecked": policy
+                }),
+            );
+            let mut sink = DiagnosticSink::new();
+            let _ = build_client_model(&analyzed, &config, &mut sink);
+            let codes = sink
+                .into_sorted_vec()
+                .into_iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>();
+            assert_eq!(codes, expected, "unchecked: {policy}");
+        }
+    }
+
+    #[test]
+    fn a_range_or_default_key_can_be_selected_on_a_2xx_so_its_raw_stream_is_unchecked_data() {
+        // The policy only speaks about data the caller receives on success. A `2XX` key and a
+        // `default` key can both be the branch a 2xx response selects, so a raw stream under either
+        // is unchecked success data; a `4XX` key never can, so its stream is an error payload the
+        // policy has nothing to say about.
+        let document = json!({
+            "openapi": "3.1.0",
+            "servers": [{ "url": "https://stream.example.test" }],
+            "paths": {
+                "/ranged": {
+                    "get": {
+                        "operationId": "watchRanged",
+                        "responses": {
+                            "2XX": {
+                                "description": "any success streams",
+                                "content": {
+                                    "application/octet-stream": { "x-oasts-streaming": true }
+                                }
+                            },
+                            "4XX": {
+                                "description": "a client error streams too, and is not data",
+                                "content": {
+                                    "application/octet-stream": { "x-oasts-streaming": true }
+                                }
+                            },
+                            "default": {
+                                "description": "anything else streams too",
+                                "content": {
+                                    "application/octet-stream": { "x-oasts-streaming": true }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_temp, analyzed, config) = analyzed_with_validation(
+            &document,
+            json!({
+                "authEnforcement": "types",
+                "baseUrl": { "source": "server", "index": 0 }
+            }),
+            json!({
+                "engine": "generated",
+                "request": true,
+                "response": true,
+                "unchecked": "warn"
+            }),
+        );
+        let mut sink = DiagnosticSink::new();
+        let _ = build_client_model(&analyzed, &config, &mut sink);
+        let reported = sink
+            .into_sorted_vec()
+            .into_iter()
+            .map(|diagnostic| (diagnostic.code, diagnostic.message))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            reported
+                .iter()
+                .map(|(code, _)| *code)
+                .collect::<Vec<&str>>(),
+            ["OASTS1408", "OASTS1408"],
+            "{reported:?}"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(_, message)| message.contains("response key '2XX'")),
+            "{reported:?}"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(_, message)| message.contains("response key 'default'")),
+            "{reported:?}"
+        );
+    }
+
+    #[test]
+    fn a_streaming_mark_reaches_every_media_class_the_classifier_does_not_refuse() {
         let document = json!({
             "openapi": "3.1.0",
             "paths": {
@@ -4915,20 +5200,15 @@ mod tests {
                 }
             }
         });
-        let diagnostics = client_diagnostics(&document);
+        let codes = client_diagnostics(&document)
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
 
-        assert_eq!(
-            diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1402")
-                .count(),
-            3
-        );
-        assert!(
-            !diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1403")
-        );
+        // Nothing is refused: the marked `+json` response streams, and the marked `+xml` one has a
+        // schema needing no structural mapping, so it is opaque bytes the mark can legitimately
+        // claim rather than a class the XML rule owns.
+        assert!(codes.is_empty(), "{codes:?}");
     }
 
     #[test]

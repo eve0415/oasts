@@ -313,11 +313,21 @@ fn render_serialize(
         );
     }
 
-    render_regions(asset, &|id| match id {
+    let rendered = render_regions(asset, &|id| match id {
         RegionId::Core => true,
         RegionId::Helper(helper) => selected.contains(helper),
         RegionId::Auth => false,
-    })
+    });
+    // Every dropped region leaves the blank line that separated it from its neighbour, so the file
+    // ends with a run of them whose length is a function of which helpers this client happened to
+    // select. That is deterministic but meaningless — and it makes an unrelated document's output
+    // move whenever a new region is added to the end of the asset. One trailing newline, always.
+    // Truncated in place rather than copied: this runs once per emitted client, and the allocation
+    // counters gate that path.
+    let mut rendered = rendered;
+    rendered.truncate(rendered.trim_end().len());
+    rendered.push('\n');
+    rendered
 }
 
 fn specialize_transport(

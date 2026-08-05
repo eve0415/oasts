@@ -22,6 +22,18 @@ export type ScriptedResponse = {
   // Delays the body past the flushed headers, staggering response-start from response-complete
   // for tests that need a window in between (e.g. a mid-flight abort).
   readonly delayBodyMs?: number;
+  // A sequence of writes replacing the single `body` write, for a response the client is meant to
+  // read incrementally. Headers flush first, so the result resolves while the body is still open.
+  readonly chunks?: readonly ScriptedChunk[];
+};
+
+// One write in a chunked response. `destroy` kills the socket instead of writing, which is how a
+// mid-stream network failure is produced — ending the response cleanly would look like a complete
+// body to the client, which is the opposite of what those tests need.
+export type ScriptedChunk = {
+  readonly bytes?: Uint8Array;
+  readonly delayMs?: number;
+  readonly destroy?: boolean;
 };
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
@@ -89,16 +101,59 @@ export type ScriptedServer = {
   readonly requests: CapturedRequest[];
   readonly scriptRoute: (method: string, url: string, response: ScriptedResponse) => void;
   readonly requiredRequest: (index: number) => CapturedRequest;
+  // How many chunked responses the client closed before the server finished writing them. A
+  // cancelled `for await` has to reach the socket, and this is the only place that is observable
+  // from outside the client.
+  readonly cancelledResponses: () => number;
   // Starts listening on an ephemeral loopback port and resolves the resulting base URL.
   readonly start: () => Promise<string>;
   readonly stop: () => Promise<void>;
 };
+
+// Set by the writer whenever the server is the one closing the response, so the `close` listener
+// can tell a client hang-up from an end or a scripted mid-stream kill. Without it a scripted
+// `destroy` looks exactly like a cancellation and the count means nothing.
+type ChunkedState = { serverClosed: boolean };
+
+// Writes each chunk in turn, honouring per-chunk delays, and stops early if the client hangs up.
+// Awaiting the drain callback is what gives the test backpressure rather than a burst.
+async function writeChunks(
+  response: ServerResponse,
+  chunks: readonly ScriptedChunk[],
+  state: ChunkedState,
+): Promise<void> {
+  for (const chunk of chunks) {
+    if (response.writableEnded || response.destroyed) {
+      return;
+    }
+    if (chunk.delayMs !== undefined) {
+      await new Promise((resolve) => setTimeout(resolve, chunk.delayMs));
+    }
+    if (chunk.destroy === true) {
+      state.serverClosed = true;
+      response.destroy(new Error("scripted mid-stream failure"));
+      return;
+    }
+    if (chunk.bytes !== undefined) {
+      await new Promise<void>((resolve) => {
+        response.write(chunk.bytes, () => {
+          resolve();
+        });
+      });
+    }
+  }
+  if (!response.writableEnded && !response.destroyed) {
+    state.serverClosed = true;
+    response.end();
+  }
+}
 
 // A single scripted route table and capture list, shared by the server handler below and by the
 // `scriptRoute`/`requiredRequest` helpers a suite's tests call directly.
 export function createScriptedServer(): ScriptedServer {
   const routes = new Map<string, ScriptedResponse>();
   const requests: CapturedRequest[] = [];
+  let cancelled = 0;
   let server: Server;
 
   function scriptRoute(method: string, url: string, response: ScriptedResponse): void {
@@ -128,6 +183,17 @@ export function createScriptedServer(): ScriptedServer {
             response.setHeader(name, value);
           }
           response.writeHead(scripted.status);
+          if (scripted.chunks !== undefined) {
+            const state: ChunkedState = { serverClosed: false };
+            response.on("close", () => {
+              if (!state.serverClosed) {
+                cancelled += 1;
+              }
+            });
+            response.flushHeaders();
+            void writeChunks(response, scripted.chunks, state);
+            return;
+          }
           const end = (): void => {
             response.end(scripted.body);
           };
@@ -159,5 +225,13 @@ export function createScriptedServer(): ScriptedServer {
     });
   }
 
-  return { routes, requests, scriptRoute, requiredRequest, start, stop };
+  return {
+    routes,
+    requests,
+    scriptRoute,
+    requiredRequest,
+    cancelledResponses: () => cancelled,
+    start,
+    stop,
+  };
 }

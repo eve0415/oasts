@@ -249,12 +249,12 @@ keys:
         deallocs: 24
         allocBytes: 18194
       - stage: "emit"
-        allocs: 1304
-        reallocs: 314
-        deallocs: 1247
-        allocBytes: 306911
+        allocs: 1310
+        reallocs: 342
+        deallocs: 1250
+        allocBytes: 317960
     informational:
-      peakBytes: 283120
+      peakBytes: 293479
   - fixture: "petstore-3.0-tanstack"
     config: "oasts-tanstack.yaml"
     stages:

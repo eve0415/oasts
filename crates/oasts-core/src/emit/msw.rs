@@ -23,7 +23,7 @@ use super::{
     EmissionModel, Emitter as TypesEmitter, GeneratedFile, TypeAxis, TypePosition,
     assign_import_aliases, import_clause, import_extension, render_property_key, render_ts_string,
     render_ts_value, runtime_assets::rewrite_relative_ts_imports, source_diagnostic,
-    uppercase_first, write_source_metadata,
+    uppercase_first, warning_diagnostic, write_source_metadata,
 };
 use crate::client_model::{
     BodyPlan, FieldSerializationPlan, FormFieldPlan, HelperId, ParameterPlan, PartMediaPlan,
@@ -56,6 +56,11 @@ const CODE_BODY_PROJECTION: &str = "OASTS1509";
 
 /// A parameter serialization loses boundaries before the handler can project its value.
 const CODE_NONINVERTIBLE_PARAMETER: &str = "OASTS1510";
+/// A streaming body has no buffered value to project, in either direction, so this artifact
+/// emits no handler for the operation at all. A warning rather than an error: one operation the
+/// mock cannot express must not take the whole document down with it, which is what every other
+/// refusal in this emitter currently does.
+const CODE_STREAMING_OPERATION: &str = "OASTS1514";
 
 const MAX_PARAMETER_SHAPE_DEPTH: usize = 10;
 
@@ -781,6 +786,9 @@ fn inspect_body_projection(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match plan {
+        BodyPlan::TopLevelStream { media, source } => {
+            diagnostics.push(streaming_operation_diagnostic(source, media));
+        }
         BodyPlan::Json {
             schema: Some(schema),
             source,
@@ -884,6 +892,19 @@ fn inspect_body_projection(
     }
 }
 
+/// The operation streams, so this artifact emits nothing for it. Warning severity is the whole
+/// point: `pipeline` discards every generated file when any error is raised, so an error here would
+/// make one streaming operation refuse the entire document's handlers.
+fn streaming_operation_diagnostic(source: &SourceRef, media: &str) -> Diagnostic {
+    warning_diagnostic(
+        CODE_STREAMING_OPERATION,
+        format!(
+            "operation streams media '{media}', which has no buffered value a handler could project, so no handler is emitted"
+        ),
+        source,
+    )
+}
+
 fn body_projection_diagnostic(source: &SourceRef, reason: &str) -> Diagnostic {
     source_diagnostic(
         CODE_BODY_PROJECTION,
@@ -922,6 +943,7 @@ fn render_request_body_descriptor(
         BodyPlan::Json { .. }
         | BodyPlan::TopLevelText { .. }
         | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::TopLevelStream { .. }
         | BodyPlan::FormUrlencoded { .. }
         | BodyPlan::Multipart { .. } => {
             output.push_str("    ");
@@ -944,6 +966,16 @@ fn write_request_body_media_descriptor(
         BodyPlan::TopLevelBinary { media, source, .. } => (media, "binary", source),
         BodyPlan::FormUrlencoded { media, source, .. } => (media, "urlencoded", source),
         BodyPlan::Multipart { media, source, .. } => (media, "multipart", source),
+        BodyPlan::TopLevelStream { source, .. } => {
+            // Unreachable from any document: `inspect_body_projection` recurses into
+            // content-discriminated arms and refuses a stream — nested or top-level — before the
+            // descriptor is rendered at all. The arm stays because the match must be exhaustive,
+            // and because a refusal is the right answer if some future path does reach it.
+            return Err((
+                source.clone(),
+                "a streaming request body has no buffered value a handler could project".to_owned(),
+            ));
+        }
         BodyPlan::ContentTypeDiscriminated { .. } => {
             return Err((
                 SourceRef::default(),
@@ -1210,6 +1242,9 @@ fn render_request_body_type(
         ),
         BodyPlan::TopLevelText { .. } => "string".to_owned(),
         BodyPlan::TopLevelBinary { .. } => "Uint8Array".to_owned(),
+        // Unreachable: a streaming operation is refused before any type is rendered for it. The
+        // arm exists so adding a body kind is a compile error here rather than a silent `unknown`.
+        BodyPlan::TopLevelStream { .. } => "never".to_owned(),
         BodyPlan::FormUrlencoded { fields, .. } => {
             render_projected_form_type(renderer, model, fields, false, indent)
         }
@@ -1313,7 +1348,8 @@ fn collect_request_body_imports(
         }
         BodyPlan::Json { schema: None, .. }
         | BodyPlan::TopLevelText { .. }
-        | BodyPlan::TopLevelBinary { .. } => {}
+        | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::TopLevelStream { .. } => {}
     }
 }
 
@@ -1960,6 +1996,9 @@ fn response_body_type(
     media: &crate::ir::MediaType,
     projector: &PrimitiveDomainProjector<'_>,
 ) -> String {
+    if matches!(response_payload_kind(media, projector), "stream") {
+        return "ReadableStream<Uint8Array>".to_owned();
+    }
     if response_body_uses_schema(media, projector) {
         renderer.render_type(
             &media.schema,
@@ -1976,7 +2015,7 @@ fn response_body_uses_schema(
     media: &crate::ir::MediaType,
     projector: &PrimitiveDomainProjector<'_>,
 ) -> bool {
-    !matches!(response_payload_kind(media, projector), "binary")
+    !matches!(response_payload_kind(media, projector), "binary" | "stream")
 }
 
 /// How a declared response media is written to the wire.
@@ -1993,8 +2032,11 @@ fn response_payload_kind(
     match classify_response_media(media, projector) {
         ResponseMediaKind::Json => "json",
         ResponseMediaKind::Text => "text",
-        ResponseMediaKind::Streaming
-        | ResponseMediaKind::Xml
+        // Both streaming families reach the wire the same way here: the resolver returns bytes it
+        // has already framed. The client side is where SSE and raw diverge, because that is the
+        // side that has to decode them.
+        ResponseMediaKind::StreamingSse | ResponseMediaKind::StreamingRaw => "stream",
+        ResponseMediaKind::Xml
         | ResponseMediaKind::Multipart
         | ResponseMediaKind::MultipartUnnamed
         | ResponseMediaKind::Binary => "binary",
@@ -4135,5 +4177,148 @@ paths:
                 );
             }
         }
+    }
+
+    // --- streaming media --------------------------------------------------------------------------
+
+    const STREAMING_REQUEST: &str = r#"
+openapi: 3.1.0
+info:
+  title: Streaming
+  version: 1.0.0
+paths:
+  /publish:
+    post:
+      operationId: publishTicks
+      requestBody:
+        required: true
+        content:
+          text/event-stream:
+            schema:
+              type: string
+      responses:
+        "204":
+          description: Accepted.
+  /notes:
+    post:
+      operationId: createNote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: string
+      responses:
+        "204":
+          description: Accepted.
+"#;
+
+    #[test]
+    fn a_streaming_request_body_warns_and_costs_only_its_own_handler() {
+        let (files, diagnostics) = generate_with_diagnostics(STREAMING_REQUEST, MSW_CONFIG);
+        let streaming = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "OASTS1514")
+            .expect("the streaming operation is reported");
+        // Severity is the rule here, not a detail: `pipeline` discards every generated file as soon
+        // as any error is raised, so an error would make one streaming operation refuse the whole
+        // document's handlers.
+        assert_eq!(streaming.severity, crate::diag::Severity::Warning);
+        assert!(
+            streaming.message.contains("text/event-stream"),
+            "{}",
+            streaming.message
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.relative_path == "msw/handlers/publishticks.ts"),
+            "a streaming request body has no buffered value a handler could project"
+        );
+        // The sibling operation is what proves the warning cost nothing beyond its own handler.
+        generated(&files, "msw/handlers/createnote.ts");
+    }
+
+    #[test]
+    fn a_streaming_response_is_written_as_bytes_the_resolver_has_already_framed() {
+        let document = r#"
+openapi: 3.1.0
+info:
+  title: Streaming
+  version: 1.0.0
+paths:
+  /ticks:
+    get:
+      operationId: watchTicks
+      responses:
+        "200":
+          description: A stream of ticks.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "503":
+          description: Raw bytes.
+          content:
+            application/octet-stream:
+              x-oasts-streaming: true
+"#;
+        let files = generate(document, MSW_CONFIG);
+        let handler = generated(&files, "msw/handlers/watchticks.ts");
+        // Both families are one kind on this side: the resolver hands back bytes it framed itself.
+        // SSE and raw only diverge on the client, which is the side that has to decode them.
+        assert!(
+            handler
+                .contains("contentType: \"text/event-stream\"; body: ReadableStream<Uint8Array>"),
+            "{handler}"
+        );
+        assert!(
+            handler.contains(
+                "contentType: \"application/octet-stream\"; body: ReadableStream<Uint8Array>"
+            ),
+            "{handler}"
+        );
+    }
+
+    #[test]
+    fn a_streaming_media_has_neither_a_request_descriptor_nor_a_projected_type() {
+        // Both sites below are unreachable through a document: `inspect_body_projection` recurses
+        // into discriminated arms and refuses the operation before either one runs. They are
+        // defence in depth against a future caller that renders a plan without inspecting it first,
+        // so they are exercised the only way they can be — by calling them.
+        let temp = TempDir::new().expect("temp dir");
+        fs::write(temp.path().join("openapi.yaml"), MINIMAL).expect("write document");
+        fs::write(temp.path().join("oasts.yaml"), MSW_CONFIG).expect("write config");
+        let mut sink = DiagnosticSink::new();
+        let resolved = load_config(None, temp.path()).expect("config loads");
+        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let ir = parse(&graph, &mut sink).expect("document parses");
+        drop(graph);
+        let analyzed = analyze(ir, &resolved, &mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let source = SourceRef::default();
+        let stream = BodyPlan::TopLevelStream {
+            media: "text/event-stream".to_owned(),
+            source: source.clone(),
+        };
+
+        let nested = BodyPlan::ContentTypeDiscriminated {
+            arms: vec![crate::client_model::BodyPlanArm {
+                media: "text/event-stream".to_owned(),
+                plan: stream.clone(),
+                source: source.clone(),
+            }],
+            all_concrete: true,
+        };
+        let (_source, reason) = render_request_body_descriptor(&model, &nested, true, &source)
+            .expect_err("a streaming arm has no descriptor");
+        assert!(reason.contains("streaming request body"), "{reason}");
+
+        let renderer = TypesEmitter::new(&model);
+        // `never`, not `unknown`: nothing can be written for a value that was never buffered.
+        assert_eq!(
+            render_request_body_type(&renderer, &model, &stream, 2),
+            "never"
+        );
     }
 }

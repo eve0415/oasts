@@ -17,7 +17,8 @@ use crate::ir::{
     Operation, Param, ParamLocation, ParamStyle, PrimitiveType, SchemaNode, SecKind, SegmentPart,
     ServerVariable,
 };
-use crate::media::{is_json, media_essence};
+use crate::media::media_essence;
+use crate::response_media::StreamKind;
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 use super::model::EmissionModel;
@@ -63,6 +64,15 @@ pub(crate) fn emit_client_from_model(
         // the only ones importing it, which is what keeps it out of an unrelated operation's bundle.
         if plan.response_table.iter().any(response_decodes_multipart) {
             helper_ids.insert(MULTIPART_RESPONSE_REGION.to_owned());
+        }
+        if plan_decodes_sse(plan) {
+            helper_ids.insert(SSE_DECODE_REGION.to_owned());
+            helper_ids.insert(RAW_STREAM_REGION.to_owned());
+        } else if plan_reads_raw_stream(plan) {
+            helper_ids.insert(RAW_STREAM_REGION.to_owned());
+        }
+        if plan.body_plan.as_ref().is_some_and(body_sends_event_stream) {
+            helper_ids.insert(SSE_ENCODE_REGION.to_owned());
         }
         let relative_path = format!("{}/operations/{file_base}.ts", model.dirs.client);
         model.register_path(&relative_path, &operation.source);
@@ -315,6 +325,21 @@ fn emit_operation(
         .response_table
         .iter()
         .any(|response| response.has_headers);
+    // The client names `SseEvent` from the runtime rather than the types artifact: it already
+    // imports the rest of the result vocabulary from there, and the runtime is emitted for every
+    // client, while the types artifact's own copy exists for the case where no client is.
+    // Only the branches this module renders inline actually write the word: an alias-path branch
+    // names its payload through the types artifact, which imports its own copy. Importing it
+    // regardless would leave an unused binding in most streaming modules, which is a hard failure
+    // under a consumer's `noUnusedLocals`.
+    let uses_sse_event = plan.response_table.iter().any(|response| {
+        matches!(response.payload, PayloadDisposition::Payload)
+            && renders_payload_inline(response)
+            && response
+                .media
+                .iter()
+                .any(|entry| entry.decoder == DecoderClass::StreamingSse)
+    });
     let mut component_imports = BTreeMap::<String, BTreeSet<String>>::new();
     let documentation = model.config.documentation.clone();
     // Everything that renders a component type lives in this one borrow scope, because the scope
@@ -369,6 +394,21 @@ fn emit_operation(
                             &renderer,
                             entry,
                             TypeAxis::Wire,
+                            &mut component_imports,
+                        );
+                    }
+                }
+            }
+            // An event pair is declared here whether or not the branch renders its arms inline —
+            // a stream is one payload on both surfaces, so a branch can name its status-wide alias
+            // and still declare the event pair its codec converts between.
+            for entry_index in 0..response.media.len() {
+                if event_pair_alias(conversions.get(index), entry_index).is_some() {
+                    for axis in [TypeAxis::Application, TypeAxis::Wire] {
+                        renderer.collect_operation_imports(
+                            &response.media[entry_index].schema,
+                            TypePosition::Response,
+                            axis,
                             &mut component_imports,
                         );
                     }
@@ -476,12 +516,31 @@ fn emit_operation(
         .validation
         .as_ref()
         .is_some_and(|validation| !validation.response);
+    let streaming_response = plan.response_table.iter().any(|response| {
+        matches!(response.payload, PayloadDisposition::Payload)
+            && !matches!(
+                response_body_side(response.kind, &response.match_key),
+                ResponseBody::Error
+            )
+            && response.media.iter().any(|entry| {
+                matches!(
+                    entry.decoder,
+                    DecoderClass::StreamingSse | DecoderClass::StreamingRaw
+                )
+            })
+    });
     let decoding_notes = multipart_decoding_notes(plan);
     let (validate_request, validate_response) = validation_flags(model);
     let request_checks =
         request_validation_checks(operation, plan, &stem, validate_request, dispatch_root);
     let response_checks = response_validation_checks(plan, &stem, validate_response);
-    let validation_binding = !request_checks.is_empty() || !response_checks.is_empty();
+    let event_checks = event_pipelines(plan, &stem, validate_response, &conversions);
+    // Only the checks that name a validator: a per-event pipeline that converts without validating
+    // names no validator module, and changes nothing about the functions this module declares —
+    // its codec runs inside the runtime, so `orThrow` still delegates straight to the kernel.
+    let validation_binding = !request_checks.is_empty()
+        || !response_checks.is_empty()
+        || event_checks.iter().any(|check| check.validator.is_some());
     let mut output = model.header();
     write_component_imports(
         &mut output,
@@ -517,9 +576,11 @@ fn emit_operation(
         )));
         output.push_str(";\n");
     }
-    output.push_str(
-        "import type { RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError } from ",
-    );
+    output.push_str(if uses_sse_event {
+        "import type { RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, SseEvent, UnknownHttpError } from "
+    } else {
+        "import type { RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError } from "
+    });
     output.push_str(&render_ts_string(&relative_import(
         self_path,
         &[model.dirs.runtime, "result"],
@@ -553,6 +614,12 @@ fn emit_operation(
         .collect::<BTreeSet<_>>();
     if plan.response_table.iter().any(response_decodes_multipart) {
         helper_names.insert(MULTIPART_RESPONSE_DECODER);
+    }
+    if plan_decodes_sse(plan) {
+        helper_names.insert(SSE_DECODER);
+    }
+    if plan_reads_raw_stream(plan) {
+        helper_names.insert(RAW_STREAM_READER);
     }
     if !helper_names.is_empty() {
         output.push_str("import { ");
@@ -613,19 +680,29 @@ fn emit_operation(
             &mut output,
             &request_checks,
             &response_checks,
-            file_base,
-            &extension,
-            self_path,
-            validation_artifact_dir(model),
+            &event_checks,
+            &ValidatorModule {
+                from_file: self_path,
+                artifact: validation_artifact_dir(model),
+                file_base,
+                extension: &extension,
+            },
         );
     }
     // The operation's own codec module, one import for both directions: the encoder the request
-    // conversion calls and every decoder its converting response branches call.
-    // One decoder per declared response plus at most one encoder, so the names are distinct by
-    // construction; sorting is the only thing the emitted order needs.
+    // conversion calls, every decoder its converting response branches call, and the per-event
+    // decoder each converting event stream hands the runtime.
+    // One decoder per declared response and per converting event stream, plus at most one encoder,
+    // so the names are distinct by construction; sorting is the only thing the emitted order needs.
     let mut codec_names = response_transforms
         .iter()
         .map(|transform| transform.decoder.clone())
+        .chain(
+            event_checks
+                .iter()
+                .filter_map(|check| check.pair.as_ref())
+                .map(|pair| format!("decode{pair}")),
+        )
         .collect::<Vec<_>>();
     if request_transforms {
         codec_names.push(format!("encode{stem}Input"));
@@ -649,6 +726,7 @@ fn emit_operation(
         &model.config.documentation,
         ClientDocKind::Declaration,
         unchecked_response,
+        streaming_response,
         &decoding_notes,
     );
     output.push_str("export type ");
@@ -674,6 +752,7 @@ fn emit_operation(
         &model.config.documentation,
         ClientDocKind::Declaration,
         unchecked_response,
+        streaming_response,
         &decoding_notes,
     );
     output.push_str(&result_type);
@@ -682,8 +761,20 @@ fn emit_operation(
     output.push_str(&render_call_args(&plan.auth_plan, auth_enforcement, &stem));
     output.push('\n');
 
+    for check in &event_checks {
+        write_event_check(&mut output, check);
+        output.push('\n');
+    }
+
     write_source_metadata(&mut output, &operation.source, 0);
-    write_descriptor(&mut output, model, operation, plan, allocated_name);
+    write_descriptor(
+        &mut output,
+        model,
+        operation,
+        plan,
+        allocated_name,
+        &event_checks,
+    );
     output.push('\n');
 
     write_source_metadata(&mut output, &operation.source, 0);
@@ -693,6 +784,7 @@ fn emit_operation(
         &model.config.documentation,
         ClientDocKind::ResultFunction,
         unchecked_response,
+        streaming_response,
         &decoding_notes,
     );
     output.push_str("export async function ");
@@ -721,6 +813,7 @@ fn emit_operation(
         &model.config.documentation,
         ClientDocKind::ThrowFunction,
         unchecked_response,
+        streaming_response,
         &decoding_notes,
     );
     output.push_str("export async function ");
@@ -818,10 +911,20 @@ pub(super) enum ResponseConversion {
     /// two would make it content-type discriminated — so the payload the alias names is that
     /// entry's, and the index says which.
     Whole(usize),
-    /// One codec per converting media entry, selected at runtime by the `contentType` discriminant
-    /// the branch already carries. Each pair is an index into the response's media list and the name
-    /// its payload types are declared under in the client's own operation module.
-    PerEntry(Vec<(usize, String)>),
+    /// One codec per converting media entry, named in the client's own operation module.
+    PerEntry(Vec<EntryConversion>),
+}
+
+/// One media entry's codec: where it sits in the response's media list, the name its payload types
+/// are declared under in the client's own operation module, and which value it converts.
+pub(super) struct EntryConversion {
+    pub(super) index: usize,
+    pub(super) name: String,
+    /// Set for an event stream, whose codec converts one event rather than the branch's payload.
+    /// The payload is `AsyncIterable<SseEvent<…>>`, which no schema-keyed codec converts, so the
+    /// pair this names is the event's — and the runtime calls the codec through the descriptor's
+    /// per-event hook instead of the client converting a returned body.
+    pub(super) per_event: bool,
 }
 
 /// What the transform layer converts in each declared response, in `response_table` order.
@@ -852,12 +955,26 @@ pub(super) fn response_conversions(
             // JSON only, matching the types artifact's own twin rule: a `text/plain` payload stays a
             // string on both surfaces, declares no wire twin, and gets no codec, so binding one here
             // would name two symbols that were never emitted.
+            // Keyed on the decoder, so a streaming-marked `+json` entry — `+json` by essence, a byte
+            // stream by payload — is excluded here exactly as it is in the types artifact's twin
+            // rule. Binding a codec to one would convert a `ReadableStream`, and would name a wire
+            // twin the types artifact never declared.
             let converts = |entry: &ResponseMediaPlan| {
                 entry.multipart.is_none()
-                    && is_json(media_essence(&entry.media))
+                    && entry.decoder == DecoderClass::Json
                     && model.transform_facts().reaches(&entry.schema)
             };
-            if !response.content_type_discriminated {
+            // An event stream's codec converts one event, and the status-wide alias names the
+            // stream rather than the event — so a converting event entry is named per entry even on
+            // a branch that carries no `contentType` discriminant, where `Whole` would otherwise
+            // apply. Streaming-marked entries of the JSON family are excluded by the decoder for
+            // the same reason they are above: their payload is bytes, not events.
+            let converts_events = |entry: &ResponseMediaPlan| {
+                entry.decoder == DecoderClass::StreamingSse
+                    && model.transform_facts().reaches(&entry.schema)
+            };
+            if !response.content_type_discriminated && !response.media.iter().any(&converts_events)
+            {
                 let entry = response.media.iter().position(&converts);
                 return match entry {
                     Some(entry) if !renders_payload_inline(response) => {
@@ -882,8 +999,25 @@ pub(super) fn response_conversions(
                 .iter()
                 .zip(names)
                 .enumerate()
-                .filter(|(_, (entry, _))| converts(entry))
-                .map(|(index, (_, name))| (index, name.name))
+                .filter_map(|(index, (entry, name))| {
+                    // `Event` distinguishes the pair from the entry's own payload, which an event
+                    // entry still declares wherever the branch renders its arms inline.
+                    if converts_events(entry) {
+                        Some(EntryConversion {
+                            index,
+                            name: format!("{}Event", name.name),
+                            per_event: true,
+                        })
+                    } else if converts(entry) {
+                        Some(EntryConversion {
+                            index,
+                            name: name.name,
+                            per_event: false,
+                        })
+                    } else {
+                        None
+                    }
+                })
                 .collect::<Vec<_>>();
             if entries.is_empty() {
                 ResponseConversion::None
@@ -894,16 +1028,37 @@ pub(super) fn response_conversions(
         .collect()
 }
 
-/// The name one media entry's payload pair is declared under, or `None` when that entry does not
-/// convert and keeps the type it renders inline on both surfaces.
-fn entry_payload_alias(conversion: Option<&ResponseConversion>, index: usize) -> Option<&str> {
+/// The conversion one media entry declares, whatever it converts.
+fn entry_conversion(
+    conversion: Option<&ResponseConversion>,
+    index: usize,
+) -> Option<&EntryConversion> {
     match conversion {
-        Some(ResponseConversion::PerEntry(entries)) => entries
-            .iter()
-            .find(|(entry, _)| *entry == index)
-            .map(|(_, name)| name.as_str()),
+        Some(ResponseConversion::PerEntry(entries)) => {
+            entries.iter().find(|entry| entry.index == index)
+        }
         _ => None,
     }
+}
+
+/// The name one media entry's payload pair is declared under, or `None` when that entry does not
+/// convert and keeps the type it renders inline on both surfaces.
+///
+/// An event entry answers `None` too: its payload is the stream, which is the same declaration on
+/// both surfaces because the runtime converts each event before yielding it. What it declares a
+/// pair for is the event, which `event_pair_alias` names.
+fn entry_payload_alias(conversion: Option<&ResponseConversion>, index: usize) -> Option<&str> {
+    entry_conversion(conversion, index)
+        .filter(|entry| !entry.per_event)
+        .map(|entry| entry.name.as_str())
+}
+
+/// The name one media entry's *event* pair is declared under, for an entry whose codec the runtime
+/// calls once per yielded event.
+fn event_pair_alias(conversion: Option<&ResponseConversion>, index: usize) -> Option<&str> {
+    entry_conversion(conversion, index)
+        .filter(|entry| entry.per_event)
+        .map(|entry| entry.name.as_str())
 }
 
 /// Whether the request surface carries a value the transform layer converts, and so binds an
@@ -973,11 +1128,13 @@ fn response_transform_bindings(
                 body,
             }),
             ResponseConversion::PerEntry(entries) => {
-                for (index, name) in entries {
+                // An event entry binds no post-execute call: its codec runs inside the runtime, once
+                // per yielded event, so by the time the result is in hand it has already converted.
+                for entry in entries.iter().filter(|entry| !entry.per_event) {
                     bindings.push(ResponseTransform {
                         outcome: outcome.clone(),
-                        content_type: Some(response.media[*index].media.clone()),
-                        decoder: format!("decode{name}"),
+                        content_type: Some(response.media[entry.index].media.clone()),
+                        decoder: format!("decode{}", entry.name),
                         body,
                     });
                 }
@@ -1161,40 +1318,141 @@ fn response_validation_checks(
 /// discriminated branch yields one call per JSON media entry, each gated on that entry's
 /// `contentType`, so the schema that runs is the one the selected entry declared.
 ///
-/// The two naming cases mirror the validators emitter: one JSON entry keeps the plain
+/// Every entry of this response the validators artifact emitted a validator for, paired with the
+/// name it declared that validator under and with the entry's index in the response.
+///
+/// The list is the naming input, so it has to be the *same* list the validators emitter filters —
+/// `media_has_validatable_schema`, which admits a whole JSON value and an event stream's per-event
+/// schema and refuses a raw stream. Filtering a subset here and naming from it would tag the same
+/// entry differently in the two artifacts, and this module would import a name that was never
+/// emitted. The two naming cases mirror that emitter as well: one entry keeps the plain
 /// `validate{Stem}Response{Suffix}` name, and two or more are tagged by media.
-fn body_validation_checks(response: &ResponsePlan, stem: &str) -> Vec<BodyCheck> {
+fn response_validator_names<'plan>(
+    response: &'plan ResponsePlan,
+    stem: &str,
+) -> Vec<(usize, &'plan ResponseMediaPlan, String)> {
     if !matches!(response.payload, PayloadDisposition::Payload) {
         return Vec::new();
     }
-    let json = response
+    let validated = response
         .media
         .iter()
-        .filter(|media| is_json(&media.media))
+        .enumerate()
+        .filter(|(_, media)| {
+            matches!(
+                media.decoder,
+                DecoderClass::Json | DecoderClass::StreamingSse
+            )
+        })
+        .collect::<Vec<_>>();
+    if validated.is_empty() {
+        return Vec::new();
+    }
+    let media_names = validated
+        .iter()
+        .map(|(_, media)| media.media.as_str())
+        .collect::<Vec<_>>();
+    let base = response_type_name(stem, response);
+    let names = response_media_names(&format!("validate{base}"), &media_names);
+    validated
+        .into_iter()
+        .zip(names)
+        .map(|((index, media), name)| (index, media, name.name))
+        .collect()
+}
+
+/// The post-execute checks: the buffered entries only. An event stream is checked once per event
+/// inside the runtime instead, because its schema describes an event and not the body.
+fn body_validation_checks(response: &ResponsePlan, stem: &str) -> Vec<BodyCheck> {
+    let json = response_validator_names(response, stem)
+        .into_iter()
+        .filter(|(_, media, _)| media.decoder == DecoderClass::Json)
         .collect::<Vec<_>>();
     if json.is_empty() {
         return Vec::new();
     }
     let body = response_body_side(response.kind, &response.match_key);
-    let base = response_type_name(stem, response);
-    let media_names = json
-        .iter()
-        .map(|media| media.media.as_str())
-        .collect::<Vec<_>>();
-    let names = response_media_names(&format!("validate{base}"), &media_names);
     if !response.content_type_discriminated {
         return vec![BodyCheck {
             content_type: None,
-            validator: names.into_iter().next().expect("one JSON media entry").name,
+            validator: json.into_iter().next().expect("one JSON media entry").2,
             body,
         }];
     }
     json.into_iter()
-        .zip(names)
-        .map(|(media, name)| BodyCheck {
+        .map(|(_, media, validator)| BodyCheck {
             content_type: Some(media.media.clone()),
-            validator: name.name,
+            validator,
             body,
+        })
+        .collect()
+}
+
+/// One event stream's per-event pipeline: which media entry it belongs to, the validator it calls
+/// and the codec it applies — either may be absent — and the name of the function the operation
+/// module declares to wrap them.
+pub(super) struct EventCheck {
+    pub(super) response_index: usize,
+    pub(super) media_index: usize,
+    pub(super) validator: Option<String>,
+    /// The event pair this converts between, absent when the representation converts nothing this
+    /// schema reaches. `decode{pair}` is the codec and `{pair}Wire` the value it accepts.
+    pub(super) pair: Option<String>,
+    pub(super) function: String,
+}
+
+/// The per-event pipelines this operation declares: one per event stream that validates its events,
+/// converts them, or both.
+///
+/// The two halves are independent — response validation is a config switch and a conversion follows
+/// from the representation the schema reaches — so this is keyed on their union rather than on
+/// either one. The runtime calls the wrapper once per yielded event, before the event reaches the
+/// consumer and before the progress counter moves, which is the position the contract puts per-item
+/// checking at.
+fn event_pipelines(
+    plan: &OperationPlan,
+    stem: &str,
+    validate: bool,
+    conversions: &[ResponseConversion],
+) -> Vec<EventCheck> {
+    plan.response_table
+        .iter()
+        .enumerate()
+        .flat_map(|(response_index, response)| {
+            let validators = if validate {
+                response_validator_names(response, stem)
+            } else {
+                Vec::new()
+            };
+            response
+                .media
+                .iter()
+                .enumerate()
+                .filter(|(_, media)| media.decoder == DecoderClass::StreamingSse)
+                .filter_map(move |(media_index, _)| {
+                    let validator = validators
+                        .iter()
+                        .find(|(index, _, _)| *index == media_index)
+                        .map(|(_, _, name)| name.clone());
+                    let pair = event_pair_alias(conversions.get(response_index), media_index)
+                        .map(str::to_owned);
+                    // The wrapper is named after whichever half is present, and the two agree
+                    // wherever both are: each is `response_media_names` over the same status, and
+                    // an event entry is in both name spaces.
+                    let base = match (&validator, &pair) {
+                        (Some(validator), _) => validator.trim_start_matches("validate").to_owned(),
+                        (None, Some(pair)) => pair.strip_suffix("Event").unwrap_or(pair).to_owned(),
+                        (None, None) => return None,
+                    };
+                    Some(EventCheck {
+                        response_index,
+                        media_index,
+                        function: format!("check{base}Event"),
+                        validator,
+                        pair,
+                    })
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -1229,16 +1487,30 @@ fn input_member(member: InputMember<'_>, root: &str) -> String {
     }
 }
 
+/// Where one operation's validator imports resolve from and to: the module doing the importing, and
+/// the bound engine's artifact directory, file and extension it imports out of. Grouped because the
+/// four travel together and mean nothing apart.
+struct ValidatorModule<'a> {
+    from_file: &'a str,
+    artifact: &'a str,
+    file_base: &'a str,
+    extension: &'a str,
+}
+
 /// The `Issue` type import plus the per-operation checks pulled from the bound engine's artifact.
 fn write_validator_imports(
     output: &mut String,
     request: &[RequestCheck],
     response: &[ResponseCheck],
-    file_base: &str,
-    extension: &str,
-    from_file: &str,
-    artifact: &str,
+    events: &[EventCheck],
+    module: &ValidatorModule<'_>,
 ) {
+    let ValidatorModule {
+        from_file,
+        artifact,
+        file_base,
+        extension,
+    } = *module;
     output.push_str("import type { Issue } from ");
     output.push_str(&render_ts_string(&relative_import(
         from_file,
@@ -1259,6 +1531,7 @@ fn write_validator_imports(
                 .iter()
                 .filter_map(|check| check.headers_validator.as_deref()),
         )
+        .chain(events.iter().filter_map(|check| check.validator.as_deref()))
         .collect::<BTreeSet<_>>();
     output.push_str("import { ");
     output.push_str(&validators.into_iter().collect::<Vec<_>>().join(", "));
@@ -1476,6 +1749,48 @@ fn write_response_validation(body: &mut String, response: &[ResponseCheck]) {
 
 /// One validator call, selecting `result.data` or `result.error` by the branch's side — or both,
 /// chosen at runtime on `result.ok`, for a `default` branch that spans them.
+/// The per-event pipeline the runtime calls once per yielded event: validate, then convert.
+///
+/// A failure throws rather than returning one, because by the time an event is decoded the result
+/// has already resolved and there is no arm left to report into — the runtime catches the throw and
+/// surfaces it as the stream's `StreamFailure`, with the issue list as its cause.
+///
+/// The order is contractual and this is where it is fixed: a validator describes the wire value, so
+/// it runs before the codec replaces that value with its application form. Where nothing converts,
+/// the value is returned unchanged — validation is assert-only, so the event the consumer receives
+/// is the one that was checked.
+///
+/// The parameter names the event's wire type wherever this converts, because that is what the codec
+/// accepts; the runtime's own `unknown` meets it at the descriptor's hook slot, which is declared
+/// for exactly that.
+fn write_event_check(output: &mut String, check: &EventCheck) {
+    let EventCheck {
+        validator,
+        pair,
+        function,
+        ..
+    } = check;
+    let parameter = match pair {
+        Some(pair) => format!("{pair}Wire"),
+        None => "unknown".to_owned(),
+    };
+    output.push_str(&format!(
+        "function {function}(data: {parameter}): unknown {{\n"
+    ));
+    if let Some(validator) = validator {
+        output.push_str("  const eventIssues: Issue[] = [];\n");
+        output.push_str(&format!("  {validator}(data, [], eventIssues);\n"));
+        output.push_str("  if (eventIssues.length > 0) {\n");
+        output.push_str("    throw eventIssues;\n");
+        output.push_str("  }\n");
+    }
+    match pair {
+        Some(pair) => output.push_str(&format!("  return decode{pair}(data);\n")),
+        None => output.push_str("  return data;\n"),
+    }
+    output.push_str("}\n");
+}
+
 fn write_body_validator_call(body: &mut String, indent: &str, check: &BodyCheck) {
     let validator = &check.validator;
     match check.body {
@@ -1603,9 +1918,9 @@ fn client_declarations(
     // name equals one of them has to be aliased rather than shadow it.
     for conversion in conversions {
         if let ResponseConversion::PerEntry(entries) = conversion {
-            for (_, name) in entries {
-                declared.insert(format!("{name}Wire"));
-                declared.insert(name.clone());
+            for entry in entries {
+                declared.insert(format!("{}Wire", entry.name));
+                declared.insert(entry.name.clone());
             }
         }
     }
@@ -1690,6 +2005,7 @@ fn body_uses_json_alias(plan: &BodyPlan) -> bool {
         BodyPlan::ContentTypeDiscriminated { .. } => json_body_count(plan) == 1,
         BodyPlan::TopLevelText { .. }
         | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::TopLevelStream { .. }
         | BodyPlan::FormUrlencoded { .. }
         | BodyPlan::Multipart { .. } => false,
     }
@@ -1718,8 +2034,10 @@ fn collect_body_imports(
                 collect_discriminated_body_imports(renderer, &arm.plan, axis, inline_json, imports);
             }
         }
-        BodyPlan::Json { .. } | BodyPlan::TopLevelText { .. } | BodyPlan::TopLevelBinary { .. } => {
-        }
+        BodyPlan::Json { .. }
+        | BodyPlan::TopLevelText { .. }
+        | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::TopLevelStream { .. } => {}
     }
 }
 
@@ -1750,6 +2068,7 @@ fn json_body_count(plan: &BodyPlan) -> usize {
         }
         BodyPlan::TopLevelText { .. }
         | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::TopLevelStream { .. }
         | BodyPlan::FormUrlencoded { .. }
         | BodyPlan::Multipart { .. } => 0,
     }
@@ -1905,6 +2224,7 @@ fn render_body_input(
         }
         BodyPlan::TopLevelText { .. } => "string".to_owned(),
         BodyPlan::TopLevelBinary { .. } => "Uint8Array".to_owned(),
+        BodyPlan::TopLevelStream { .. } => "ReadableStream<Uint8Array>".to_owned(),
         BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
             render_form_input(renderer, fields, indent, axis)
         }
@@ -2052,17 +2372,23 @@ fn render_entry_payload_pairs(
         let ResponseConversion::PerEntry(entries) = conversion else {
             continue;
         };
-        for (index, name) in entries {
-            let entry = &response.media[*index];
+        for conversion in entries {
+            let entry = &response.media[conversion.index];
             for (declared, axis) in [
-                (name.clone(), TypeAxis::Application),
-                (format!("{name}Wire"), TypeAxis::Wire),
+                (conversion.name.clone(), TypeAxis::Application),
+                (format!("{}Wire", conversion.name), TypeAxis::Wire),
             ] {
                 write_source_metadata(&mut output, &entry.source, 0);
                 output.push_str("export type ");
                 output.push_str(&declared);
                 output.push_str(" = ");
-                output.push_str(&response_entry_payload_type(renderer, entry, axis));
+                // An event pair names the event, not the payload: the schema describes what one
+                // event carries, and the payload it is reached through is the stream around it.
+                output.push_str(&if conversion.per_event {
+                    renderer.render_type(&entry.schema, TypePosition::Response, axis, 0)
+                } else {
+                    response_entry_payload_type(renderer, entry, axis)
+                });
                 output.push_str(";\n\n");
             }
         }
@@ -2227,6 +2553,11 @@ fn response_entry_payload_type(
         None => renderer.media_payload_type(
             media_essence(&entry.media),
             &entry.schema,
+            match entry.decoder {
+                DecoderClass::StreamingSse => Some(StreamKind::Sse),
+                DecoderClass::StreamingRaw => Some(StreamKind::Raw),
+                _ => None,
+            },
             TypePosition::Response,
             axis,
         ),
@@ -2495,6 +2826,7 @@ fn write_descriptor(
     operation: &Operation,
     plan: &OperationPlan,
     allocated_name: &str,
+    event_checks: &[EventCheck],
 ) {
     output.push_str("const descriptor: OperationDescriptor = {\n  operationId: ");
     output.push_str(&render_ts_string(
@@ -2578,7 +2910,7 @@ fn write_descriptor(
     output.push_str("],\n  security: ");
     output.push_str(&security_field(&plan.auth_plan));
     output.push_str(",\n  responses: [\n");
-    for response in &plan.response_table {
+    for (response_index, response) in plan.response_table.iter().enumerate() {
         output.push_str("    { match: ");
         output.push_str(&render_ts_string(&response.match_key));
         output.push_str(", kind: ");
@@ -2602,15 +2934,30 @@ fn write_descriptor(
             },
         );
         output.push_str(", media: [");
+        // A statically bodyless branch drops its streaming entries: the contract is that such a
+        // branch never forms a streaming branch or creates a handle, so naming a reader for one
+        // would be a promise the runtime cannot keep — and it would drag the event parser into a
+        // client that never reads a stream. Buffered entries stay exactly where they were, so no
+        // non-streaming descriptor moves a byte.
+        let bodyless = matches!(response.payload, PayloadDisposition::StaticBodyless);
         output.push_str(
             &response
                 .media
                 .iter()
-                .map(|media| {
+                .enumerate()
+                .filter(|(_, media)| !(bodyless && media.decoder.is_streaming()))
+                .map(|(media_index, media)| {
+                    let on_event = event_checks
+                        .iter()
+                        .find(|check| {
+                            check.response_index == response_index
+                                && check.media_index == media_index
+                        })
+                        .map(|check| check.function.as_str());
                     format!(
                         "[{}, {}]",
                         render_ts_string(&media.media),
-                        render_response_decoder(media)
+                        render_response_decoder(media, on_event)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -2912,7 +3259,7 @@ fn auth_kind_param(kind: &AuthKind) -> Option<&str> {
 /// clause; keeping it a fixed sorted table rather than a collected set is what makes the clause
 /// byte-stable across runs without allocating a set per module. `transport_value_imports_are_sorted`
 /// pins the ordering.
-const TRANSPORT_VALUE_IMPORTS: [&str; 16] = [
+const TRANSPORT_VALUE_IMPORTS: [&str; 17] = [
     "authAlternatives",
     "basicCredential",
     "bearerCredential",
@@ -2927,6 +3274,7 @@ const TRANSPORT_VALUE_IMPORTS: [&str; 16] = [
     "multipartBody",
     "mutualTlsCredential",
     "queryKeyCredential",
+    "streamBody",
     "textBody",
     "urlencodedBody",
 ];
@@ -2951,6 +3299,7 @@ fn body_encoder_name(plan: &BodyPlan) -> &'static str {
         BodyPlan::Json { .. } => "jsonBody",
         BodyPlan::TopLevelText { .. } => "textBody",
         BodyPlan::TopLevelBinary { .. } => "binaryBody",
+        BodyPlan::TopLevelStream { .. } => "streamBody",
         BodyPlan::FormUrlencoded { .. } => "urlencodedBody",
         BodyPlan::Multipart { .. } => "multipartBody",
         BodyPlan::ContentTypeDiscriminated { .. } => "discriminatedBody",
@@ -2977,7 +3326,8 @@ fn write_body_descriptor(
     match plan {
         BodyPlan::Json { media, .. }
         | BodyPlan::TopLevelText { media, .. }
-        | BodyPlan::TopLevelBinary { media, .. } => {
+        | BodyPlan::TopLevelBinary { media, .. }
+        | BodyPlan::TopLevelStream { media, .. } => {
             write_simple_body(output, body_encoder_name(plan), media);
         }
         BodyPlan::FormUrlencoded { media, fields, .. } => {
@@ -3347,7 +3697,21 @@ fn style_name(style: ParamStyle) -> &'static str {
 /// and for multipart the decoder function itself alongside its plan. Shipping the function through
 /// the descriptor rather than tagging it is what keeps the parser out of every other client — the
 /// transport never names it, so nothing but a multipart operation module pulls it in.
-fn render_response_decoder(media: &ResponseMediaPlan) -> String {
+fn render_response_decoder(media: &ResponseMediaPlan, on_event: Option<&str>) -> String {
+    // A streaming entry ships its reader the same way, and for the same reason: the transport never
+    // names the SSE parser, so only an operation that declares one links it. `onEvent` is the
+    // per-event validate-and-convert pipeline; it is null until a later step binds one, and the
+    // runtime skips per-event checking when it is.
+    match media.decoder {
+        DecoderClass::StreamingSse => {
+            return format!(
+                "{{ sse: {SSE_DECODER}, onEvent: {} }}",
+                on_event.unwrap_or("null")
+            );
+        }
+        DecoderClass::StreamingRaw => return format!("{{ raw: {RAW_STREAM_READER} }}"),
+        _ => {}
+    }
     let Some(plan) = &media.multipart else {
         return render_ts_string(decoder_name(media.decoder));
     };
@@ -3382,7 +3746,8 @@ fn decoder_name(decoder: DecoderClass) -> &'static str {
         DecoderClass::Json => "json",
         DecoderClass::Text => "text",
         DecoderClass::Binary => "binary",
-        DecoderClass::Streaming
+        DecoderClass::StreamingSse
+        | DecoderClass::StreamingRaw
         | DecoderClass::Xml
         | DecoderClass::Multipart
         | DecoderClass::MultipartUnnamed => {
@@ -3421,9 +3786,57 @@ fn helper_region_id(helper: HelperId) -> &'static str {
 const MULTIPART_RESPONSE_REGION: &str = "multipart-response";
 const MULTIPART_RESPONSE_DECODER: &str = "decodeMultipartResponse";
 
+/// The two streaming regions and their exports. `sse-decode` builds on `stream-raw`'s saturating
+/// progress counter, so selecting the first always selects the second; a raw-only client selects
+/// `stream-raw` alone and never carries the event parser.
+const SSE_DECODE_REGION: &str = "sse-decode";
+const SSE_DECODER: &str = "decodeSseStream";
+/// The frame encoder is the caller's half of a streaming request body: the input is a byte stream,
+/// and this is what turns typed events into one. It is emitted for the operations that document
+/// that pairing and for no others — the generated module never imports it, the caller does.
+const SSE_ENCODE_REGION: &str = "sse-encode";
+const RAW_STREAM_REGION: &str = "stream-raw";
+const RAW_STREAM_READER: &str = "readRawStream";
+
 fn response_decodes_multipart(response: &ResponsePlan) -> bool {
     matches!(response.payload, PayloadDisposition::Payload)
         && response.media.iter().any(|media| media.multipart.is_some())
+}
+
+/// Whether a branch actually creates a stream handle. A statically bodyless branch never does,
+/// however its media is declared — the type says `undefined` because that is what the runtime
+/// delivers — so it must not drag the streaming regions in either.
+fn response_streams(response: &ResponsePlan, kind: DecoderClass) -> bool {
+    matches!(response.payload, PayloadDisposition::Payload)
+        && response.media.iter().any(|media| media.decoder == kind)
+}
+
+/// Whether any arm of this body sends `text/event-stream`. Checked arm by arm, because a caller
+/// picking that arm out of several needs the encoder just as much as one with no choice.
+fn body_sends_event_stream(plan: &BodyPlan) -> bool {
+    match plan {
+        BodyPlan::TopLevelStream { media, .. } => media_essence(media) == "text/event-stream",
+        BodyPlan::ContentTypeDiscriminated { arms, .. } => {
+            arms.iter().any(|arm| body_sends_event_stream(&arm.plan))
+        }
+        BodyPlan::Json { .. }
+        | BodyPlan::TopLevelText { .. }
+        | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::FormUrlencoded { .. }
+        | BodyPlan::Multipart { .. } => false,
+    }
+}
+
+fn plan_decodes_sse(plan: &OperationPlan) -> bool {
+    plan.response_table
+        .iter()
+        .any(|response| response_streams(response, DecoderClass::StreamingSse))
+}
+
+fn plan_reads_raw_stream(plan: &OperationPlan) -> bool {
+    plan.response_table
+        .iter()
+        .any(|response| response_streams(response, DecoderClass::StreamingRaw))
 }
 
 /// Whether a response branch renders its payload type in the operation module instead of reading
@@ -3557,6 +3970,22 @@ mod tests {
     /// The same emission under a configured `dateTime: date` representation, which is the only way
     /// to make any position reach the transform layer.
     fn emit_transforming_operation(document: Value, suffix: &str) -> (String, Vec<Diagnostic>) {
+        let (files, diagnostics) = emit_transforming_files(document, false);
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == format!("client/operations/{suffix}.ts"))
+            .expect("operation file")
+            .content;
+        (content, diagnostics)
+    }
+
+    /// Every client file the transforming emission writes, with response validation on or off. The
+    /// two per-event halves are independent switches, so a test that means to observe one wrapper
+    /// carrying both has to turn the other on.
+    fn emit_transforming_files(
+        document: Value,
+        validate: bool,
+    ) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("openapi.json"),
@@ -3567,13 +3996,17 @@ mod tests {
             "schemaVersion": 1,
             "input": { "path": "openapi.json" },
             "output": "generated",
-            "artifacts": { "types": true, "client": true },
+            "artifacts": { "types": true, "client": true, "validators": validate },
             "client": {
                 "authEnforcement": "types",
                 "baseUrl": { "source": "literal", "value": "https://api.example.test/v1" }
             },
             "types": { "dateTime": "date" },
-            "validation": { "engine": "off", "unchecked": "allow" }
+            "validation": if validate {
+                json!({ "engine": "generated", "request": true, "response": true, "unchecked": "allow" })
+            } else {
+                json!({ "engine": "off", "unchecked": "allow" })
+            }
         });
         let config = load_config_from_json(
             &temp.path().join("oasts.json"),
@@ -3588,13 +4021,7 @@ mod tests {
         let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
         let files = emit_client_from_model(&mut model, &client);
         drop(model);
-        let content = files
-            .iter()
-            .find(|file| file.relative_path == format!("client/operations/{suffix}.ts"))
-            .expect("operation file")
-            .content
-            .clone();
-        (content, sink.into_sorted_vec())
+        (files, sink.into_sorted_vec())
     }
 
     /// One operation returning a component whose only property converts.
@@ -4613,6 +5040,7 @@ mod tests {
             &config.documentation,
             ClientDocKind::ResultFunction,
             false,
+            false,
             &[],
         );
         assert!(flat_parameter_docs.contains("@param X-Trace - Line one."));
@@ -5094,7 +5522,8 @@ mod tests {
             "binary"
         );
         for decoder in [
-            DecoderClass::Streaming,
+            DecoderClass::StreamingSse,
+            DecoderClass::StreamingRaw,
             DecoderClass::Xml,
             DecoderClass::Multipart,
             DecoderClass::MultipartUnnamed,
@@ -6146,6 +6575,7 @@ mod tests {
             &analyzed.ir.operations[0],
             &plan,
             "descriptorProbe",
+            &[],
         );
         assert!(output.contains("allowReserved: true"));
         assert!(output.contains("bodyless: true"));
@@ -7799,5 +8229,535 @@ mod tests {
             "{disabled}"
         );
         assert!(!disabled.contains("responseIssues"), "{disabled}");
+    }
+
+    // --- streaming responses and request bodies --------------------------------------------------
+
+    /// One `GET` whose 200 declares exactly `media`, so the plan carries a single streaming entry.
+    fn single_media_stream_document(operation_id: &str, path: &str, media: Value) -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "paths": {
+                path: {
+                    "get": {
+                        "operationId": operation_id,
+                        "responses": {
+                            "200": { "description": "streamed", "content": media }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn only_a_client_that_sends_events_carries_the_frame_encoder() {
+        // The encoder is the caller's half of a streaming request body: the input is a byte stream,
+        // and this is what turns typed events into one. A client that only *reads* streams has
+        // nothing to frame, so it must not carry it.
+        let sending = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/publish": {
+                    "post": {
+                        "operationId": "publishTicks",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": { "schema": { "type": "object" } },
+                                "text/event-stream": { "schema": { "type": "object" } }
+                            }
+                        },
+                        "responses": { "204": { "description": "accepted" } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = emit_all_client_files(&sending);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let serialize = runtime_file(&files, "serialize.ts");
+        assert!(
+            serialize.contains("export function encodeSseEvents<TData>("),
+            "an operation that can send events carries the encoder: {serialize}"
+        );
+
+        let (reading, reading_diagnostics) = emit_all_client_files(&single_media_stream_document(
+            "watchTicks",
+            "/ticks",
+            json!({ "text/event-stream": { "schema": { "type": "string" } } }),
+        ));
+        assert!(reading_diagnostics.is_empty(), "{reading_diagnostics:#?}");
+        assert!(
+            !runtime_file(&reading, "serialize.ts").contains("encodeSseEvents"),
+            "a read-only streaming client frames nothing and carries no encoder"
+        );
+    }
+
+    #[test]
+    fn an_sse_operation_drags_in_the_raw_region_it_is_built_on_without_naming_its_reader() {
+        let (sse_files, diagnostics) = emit_all_client_files(&single_media_stream_document(
+            "watchTicks",
+            "/ticks",
+            json!({ "text/event-stream": { "schema": { "type": "string" } } }),
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        // `sse-decode` is written against helpers that live in `stream-raw`, so selecting the event
+        // decoder has to select the raw region too or the emitted runtime does not compile.
+        let serialize = runtime_file(&sse_files, "serialize.ts");
+        assert!(
+            serialize.contains("export function decodeSseStream("),
+            "{serialize}"
+        );
+        assert!(
+            serialize.contains("export function readRawStream("),
+            "{serialize}"
+        );
+        // The module itself names only the decoder it calls: the raw reader is a region dependency,
+        // not an import, and importing it would leave an unused binding.
+        let operation = &sse_files
+            .iter()
+            .find(|file| file.relative_path == "client/operations/watchticks.ts")
+            .expect("operation module")
+            .content;
+        assert!(
+            operation.contains("import { decodeSseStream } from \"../../runtime/serialize.js\";"),
+            "{operation}"
+        );
+
+        let (raw_files, diagnostics) = emit_all_client_files(&single_media_stream_document(
+            "downloadBlob",
+            "/blob",
+            json!({ "application/octet-stream": { "x-oasts-streaming": true } }),
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        // A raw-only operation must not link the event parser it never runs.
+        let serialize = runtime_file(&raw_files, "serialize.ts");
+        assert!(
+            serialize.contains("export function readRawStream("),
+            "{serialize}"
+        );
+        assert!(
+            !serialize.contains("export function decodeSseStream("),
+            "{serialize}"
+        );
+        let operation = &raw_files
+            .iter()
+            .find(|file| file.relative_path == "client/operations/downloadblob.ts")
+            .expect("operation module")
+            .content;
+        assert!(
+            operation.contains("import { readRawStream } from \"../../runtime/serialize.js\";"),
+            "{operation}"
+        );
+    }
+
+    #[test]
+    fn only_a_branch_rendering_its_payload_inline_imports_sseevent_and_ships_a_stream_decoder() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/report": {
+                    "get": {
+                        "operationId": "readReport",
+                        "responses": {
+                            "200": {
+                                "description": "either family",
+                                "content": {
+                                    "text/event-stream": { "schema": { "type": "string" } },
+                                    "application/octet-stream": { "x-oasts-streaming": true }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/ticks": {
+                    "get": {
+                        "operationId": "watchTicks",
+                        "responses": {
+                            "200": {
+                                "description": "one entry, so the status-wide alias carries it",
+                                "content": {
+                                    "text/event-stream": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = emit_all_client_files(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+        let discriminated = &files
+            .iter()
+            .find(|file| file.relative_path == "client/operations/readreport.ts")
+            .expect("operation module")
+            .content;
+        // Two entries on one status discriminate on content type, so this module renders each arm's
+        // payload itself — and only then does it write the word `SseEvent`.
+        assert!(
+            discriminated.contains(
+                "import type { RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, SseEvent, UnknownHttpError } from \"../../runtime/result.js\";"
+            ),
+            "{discriminated}"
+        );
+        assert!(
+            discriminated.contains(
+                "data: AsyncIterable<SseEvent<string>>; contentType: \"text/event-stream\""
+            ),
+            "{discriminated}"
+        );
+        assert!(
+            discriminated.contains(
+                "data: ReadableStream<Uint8Array>; contentType: \"application/octet-stream\""
+            ),
+            "{discriminated}"
+        );
+        // Each family ships its own reader through the descriptor, so the transport never names
+        // either one and an operation links only what it declares.
+        assert!(
+            discriminated.contains(
+                "media: [[\"text/event-stream\", { sse: decodeSseStream, onEvent: null }], [\"application/octet-stream\", { raw: readRawStream }]]"
+            ),
+            "{discriminated}"
+        );
+
+        let alias_path = &files
+            .iter()
+            .find(|file| file.relative_path == "client/operations/watchticks.ts")
+            .expect("operation module")
+            .content;
+        // The alias-path branch names its payload through the types artifact, which imports its own
+        // copy of `SseEvent`. Importing it here too would be an unused binding, which is a hard
+        // failure under a consumer's `noUnusedLocals`.
+        assert!(!alias_path.contains("SseEvent"), "{alias_path}");
+    }
+
+    /// One SSE-only branch whose events convert, one whose schema reaches no representation, and one
+    /// status pairing a converting buffered entry with a converting event stream.
+    fn converting_event_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "T", "version": "1.0.0" },
+            "paths": {
+                "/ticks": {
+                    "get": {
+                        "operationId": "watchTicks",
+                        "responses": {
+                            "200": {
+                                "description": "one entry, so no contentType discriminant",
+                                "content": {
+                                    "text/event-stream": { "schema": { "$ref": "#/components/schemas/Event" } }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/plain": {
+                    "get": {
+                        "operationId": "watchPlain",
+                        "responses": {
+                            "200": {
+                                "description": "nothing here reaches a representation",
+                                "content": { "text/event-stream": { "schema": { "type": "string" } } }
+                            }
+                        }
+                    }
+                },
+                "/report": {
+                    "get": {
+                        "operationId": "readReport",
+                        "responses": {
+                            "200": {
+                                "description": "a buffered entry beside an event stream",
+                                "content": {
+                                    "application/json": { "schema": { "$ref": "#/components/schemas/Event" } },
+                                    "text/event-stream": { "schema": { "$ref": "#/components/schemas/Event" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Event": {
+                        "type": "object",
+                        "required": ["at"],
+                        "properties": { "at": { "type": "string", "format": "date-time" } }
+                    }
+                }
+            }
+        })
+    }
+
+    fn operation_module(files: &[GeneratedFile], base: &str) -> String {
+        files
+            .iter()
+            .find(|file| file.relative_path == format!("client/operations/{base}.ts"))
+            .expect("operation module")
+            .content
+            .clone()
+    }
+
+    #[test]
+    fn a_converting_event_stream_binds_its_codec_to_the_descriptor_hook() {
+        let (files, diagnostics) = emit_transforming_files(converting_event_document(), false);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+        let alias_path = operation_module(&files, "watchticks");
+        // The pair is the event's, not the payload's: the payload is the stream around it, which is
+        // the same declaration on both surfaces because the runtime converts before it yields.
+        assert!(
+            alias_path.contains("export type WatchTicksResponse200Event = Event;"),
+            "{alias_path}"
+        );
+        assert!(
+            alias_path.contains("export type WatchTicksResponse200EventWire = EventWire;"),
+            "{alias_path}"
+        );
+        assert!(
+            alias_path.contains(
+                "function checkWatchTicksResponse200Event(data: WatchTicksResponse200EventWire): unknown {\n  return decodeWatchTicksResponse200Event(data);\n}\n"
+            ),
+            "{alias_path}"
+        );
+        assert!(
+            alias_path
+                .contains("{ sse: decodeSseStream, onEvent: checkWatchTicksResponse200Event }"),
+            "{alias_path}"
+        );
+        // Nothing converts after the call, so no pre-conversion result surface is declared and the
+        // function still hands the kernel its own result type.
+        assert!(!alias_path.contains("WatchTicksResultWire"), "{alias_path}");
+        assert!(
+            alias_path.contains(
+                "  return execute<WatchTicksResult>(transport, descriptor, input, args[0]);\n"
+            ),
+            "{alias_path}"
+        );
+
+        // A schema no representation reaches declares no pair and binds no hook.
+        let plain = operation_module(&files, "watchplain");
+        assert!(plain.contains("onEvent: null }"), "{plain}");
+        assert!(!plain.contains("WatchPlainResponse200Event"), "{plain}");
+
+        // On a discriminated status the two entries convert through different mechanisms: the
+        // buffered arm after the call, the event arm inside the runtime.
+        let inline = operation_module(&files, "readreport");
+        assert!(
+            inline.contains(
+                "data: AsyncIterable<SseEvent<Event>>; contentType: \"text/event-stream\""
+            ),
+            "{inline}"
+        );
+        assert!(
+            inline.contains(
+                "      return { ...result, data: decodeReadReportResponse200ApplicationJson(result.data) };\n"
+            ),
+            "{inline}"
+        );
+        assert!(
+            inline.contains(
+                "onEvent: checkReadReportResponse200TextEventStreamEvent }]], hasContentTypeDiscriminant: true }"
+            ),
+            "{inline}"
+        );
+        // The event arm is the one payload the two result surfaces agree on.
+        assert!(
+            inline.contains(
+                "data: ReadReportResponse200ApplicationJsonWire; contentType: \"application/json\""
+            ),
+            "{inline}"
+        );
+    }
+
+    #[test]
+    fn a_per_event_pipeline_validates_before_it_converts() {
+        // The two halves are independent switches, and the order they compose in is contractual: a
+        // validator describes the wire value, so it runs before the codec replaces it.
+        let (files, _) = emit_transforming_files(converting_event_document(), true);
+        let content = operation_module(&files, "watchticks");
+        assert!(
+            content.contains(
+                "function checkWatchTicksResponse200Event(data: WatchTicksResponse200EventWire): unknown {\n  const eventIssues: Issue[] = [];\n  validateWatchTicksResponse200(data, [], eventIssues);\n  if (eventIssues.length > 0) {\n    throw eventIssues;\n  }\n  return decodeWatchTicksResponse200Event(data);\n}\n"
+            ),
+            "{content}"
+        );
+        // Validation alone still returns the checked value unchanged.
+        let plain = operation_module(&files, "watchplain");
+        assert!(
+            plain.contains(
+                "function checkWatchPlainResponse200Event(data: unknown): unknown {\n  const eventIssues: Issue[] = [];\n  validateWatchPlainResponse200(data, [], eventIssues);\n  if (eventIssues.length > 0) {\n    throw eventIssues;\n  }\n  return data;\n}\n"
+            ),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn a_streaming_success_branch_documents_that_ok_true_precedes_any_body_byte() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/ticks": {
+                    "get": {
+                        "operationId": "watchTicks",
+                        "responses": {
+                            "200": {
+                                "description": "streamed",
+                                "content": {
+                                    "text/event-stream": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/count": {
+                    "get": {
+                        "operationId": "countTicks",
+                        "responses": {
+                            "200": {
+                                "description": "buffered",
+                                "content": {
+                                    "application/json": { "schema": { "type": "integer" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = emit_all_client_files(&document);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        const REMARK: &str = "A streaming branch resolves when the response headers arrive, so `ok: true` attests only the matched status";
+
+        let streaming = &files
+            .iter()
+            .find(|file| file.relative_path == "client/operations/watchticks.ts")
+            .expect("operation module")
+            .content;
+        // Both call variants carry it: the weaker proof is a property of the result, not of which
+        // entry point produced it.
+        assert_eq!(streaming.matches(REMARK).count(), 2, "{streaming}");
+
+        let buffered = &files
+            .iter()
+            .find(|file| file.relative_path == "client/operations/countticks.ts")
+            .expect("operation module")
+            .content;
+        assert!(!buffered.contains(REMARK), "{buffered}");
+    }
+
+    #[test]
+    fn a_streaming_request_body_is_bytes_on_the_input_and_ships_the_stream_encoder() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/upload": {
+                    "post": {
+                        "operationId": "uploadBlob",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/octet-stream": { "x-oasts-streaming": true }
+                            }
+                        },
+                        "responses": { "204": { "description": "accepted" } }
+                    }
+                }
+            }
+        });
+        let (content, diagnostics) = emit_operation(document, "uploadblob");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(
+            content.contains("  body: ReadableStream<Uint8Array>;"),
+            "{content}"
+        );
+        // The encoder travels in the descriptor rather than as a `kind` tag, so a client that sends
+        // no stream never links `streamBody`.
+        assert!(
+            content.contains("body: streamBody(\"application/octet-stream\"),"),
+            "{content}"
+        );
+        assert!(content.contains("streamBody,"), "{content}");
+    }
+
+    #[test]
+    fn a_statically_bodyless_branch_drops_its_streaming_media_and_keeps_its_buffered_entries() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/probe": {
+                    "head": {
+                        "operationId": "probeTicks",
+                        "responses": {
+                            "200": {
+                                "description": "HEAD fixes the body to null",
+                                "content": {
+                                    "text/event-stream": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/drain": {
+                    "get": {
+                        "operationId": "drainTicks",
+                        "responses": {
+                            "204": {
+                                "description": "an exact bodyless status cannot carry a stream",
+                                "content": {
+                                    "application/json": { "schema": { "type": "integer" } },
+                                    "text/event-stream": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = emit_all_client_files(&document);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<&str>>(),
+            ["OASTS1406", "OASTS1406", "OASTS1406"],
+            "{diagnostics:#?}"
+        );
+
+        // A `HEAD` branch never creates a handle, so naming a reader for one would be a promise the
+        // runtime cannot keep.
+        let head = &files
+            .iter()
+            .find(|file| file.relative_path == "client/operations/probeticks.ts")
+            .expect("operation module")
+            .content;
+        assert!(
+            head.contains("bodyless: true, media: [], hasContentTypeDiscriminant:"),
+            "{head}"
+        );
+
+        // The buffered entry beside it is untouched: no non-streaming descriptor moves a byte.
+        let drain = &files
+            .iter()
+            .find(|file| file.relative_path == "client/operations/drainticks.ts")
+            .expect("operation module")
+            .content;
+        assert!(
+            drain.contains("bodyless: true, media: [[\"application/json\", \"json\"]],"),
+            "{drain}"
+        );
+
+        // Neither branch streams, so neither drags the stream regions into the runtime.
+        let serialize = runtime_file(&files, "serialize.ts");
+        assert!(
+            !serialize.contains("export function decodeSseStream("),
+            "{serialize}"
+        );
+        assert!(
+            !serialize.contains("export function readRawStream("),
+            "{serialize}"
+        );
     }
 }

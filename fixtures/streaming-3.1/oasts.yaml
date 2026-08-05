@@ -1,0 +1,21 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+artifacts:
+  types: true
+  client: true
+  validators: true
+client:
+  authEnforcement: types
+  aggregate: true
+  baseUrl:
+    source: server
+    index: 0
+validation:
+  engine: generated
+  request: true
+  response: true
+  # A raw streaming success branch is permanently unchecked; this fixture acknowledges it rather
+  # than exercising the diagnostic, which has its own unit vectors.
+  unchecked: allow

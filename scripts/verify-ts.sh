@@ -73,7 +73,7 @@ echo "compile-assert matrix ok: variant-name-shadow-3.0"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/uninhabitable-allof-3.0/compile-assert/cases.ts"
 echo "compile-assert matrix ok: uninhabitable-allof-3.0"
 
-for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server-variables-enum-3.1 relative-server-3.1 wire-fidelity-3.1 media-classification-3.1 multipart-response-3.0; do
+for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server-variables-enum-3.1 relative-server-3.1 wire-fidelity-3.1 media-classification-3.1 multipart-response-3.0 streaming-3.1; do
   # A fixture whose client config lives in a separate file says so on disk.
   fixture_config=oasts.yaml
   if [[ -f "fixtures/$f/oasts-client.yaml" ]]; then
@@ -213,11 +213,28 @@ generate_and_verify msw-openapi-msw-3.1 oasts-msw.yaml "$work/msw-openapi-msw" m
 # application type and `JSON.stringify` produces the wire the client's codecs parse.
 generate_and_verify transform-msw-3.1 oasts-msw.yaml "$work/transform-msw" msw \
   "transform-msw-3.1" link
+# The same streaming document under a date/time representation. It is the only row where streaming
+# and the conversion layer are crossed, which is where an event payload rendered on the wrong
+# surface shows up — as a result type the emitted module cannot satisfy.
+generate_and_verify streaming-3.1 oasts-transform.yaml "$work/streaming-transform" transform \
+  "streaming-3.1 (date)"
+# Both per-event halves at once. They are independent switches, so this is the only row where one
+# per-event wrapper both validates and converts — and the only one that typechecks a validator call
+# against the wire type the codec then consumes.
+generate_and_verify streaming-3.1 oasts-transform-validated.yaml "$work/streaming-transform-validated" \
+  transform "streaming-3.1 (date, validated)"
+# Streaming responses reach a resolver as a byte stream it framed itself; the two streaming request
+# bodies are skipped, and this row is what proves the skip leaves the rest of the tree compiling.
+generate_and_verify streaming-3.1 oasts-msw.yaml "$work/streaming-msw" msw "streaming-3.1" link
 
 # The tanstack artifact. Descriptors import no TanStack package, so unlike the msw and zod rows this
 # one needs no node_modules link — if it ever does, something started depending on a peer.
 generate_and_verify tanstack-showcase-3.1 oasts-tanstack.yaml "$work/tanstack-showcase" tanstack \
   "tanstack-showcase-3.1"
+# Every streaming operation is skipped here, so this row is the proof that the skip leaves a
+# module set that still resolves rather than a descriptor index naming files that were never written.
+generate_and_verify streaming-3.1 oasts-tanstack.yaml "$work/streaming-tanstack" tanstack \
+  "streaming-3.1"
 # The same document under a non-string date/time representation. A query key must hold wire values,
 # so the descriptor encodes before it keys — and so must the invalidation list, or a mutation would
 # name an entity key holding an application value that no query ever stored.
@@ -316,4 +333,6 @@ for flavor in zod-showcase/generated-zod zod-showcase-mini/generated-zod-mini; d
   echo "zod + dual-engine conformance ok: validators-showcase-3.1 ($flavor)"
 done
 
-node --test crates/oasts-core/runtime/test-e2e/
+node --test crates/oasts-core/runtime/test-e2e/index.js
+# Separate process on purpose; test-e2e/streaming-index.js says why.
+node --test crates/oasts-core/runtime/test-e2e/streaming-index.js

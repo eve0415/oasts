@@ -1,0 +1,25 @@
+# The same document with both per-event halves on at once: response validation checks each event
+# against its schema, and a date/time representation converts it. The two are independent switches,
+# so this is the only config where one wrapper carries both — and the order it carries them in is
+# the contract, because a validator describes the wire value the codec is about to replace.
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-transform-validated
+artifacts:
+  types: true
+  client: true
+  validators: true
+types:
+  dateTime: date
+client:
+  authEnforcement: types
+  baseUrl:
+    source: server
+    index: 0
+validation:
+  engine: generated
+  request: true
+  response: true
+  # A raw streaming success branch is permanently unchecked, as in the plain config.
+  unchecked: allow

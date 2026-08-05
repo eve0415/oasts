@@ -4,6 +4,7 @@ import {
   type RequestPhaseFailure,
   type ResponseMeta,
   type ResponsePhaseFailure,
+  type SseEvent,
   type SuccessEnvelope,
   type UnknownHttpError,
 } from './result.ts';
@@ -207,7 +208,57 @@ export type MultipartResponseDecoder = {
   readonly plan: MultipartResponsePlan;
 };
 
-export type ResponseMediaDecoder = 'json' | 'text' | 'binary' | MultipartResponseDecoder;
+// A streaming response entry ships its reader for the same reason a multipart one ships its
+// decoder, and is discriminated by the property it carries rather than by a tag: adding a tag to
+// `MultipartResponseDecoder` would churn every already-emitted client for a distinction only these
+// two new arms need. `sse` is always `decodeSseStream` and `raw` always `readRawStream`; both stay
+// descriptor fields so a client with no streaming response links neither.
+// The per-event hook's declaration lives on a method, so its parameter is compared bivariantly:
+// what the parser hands the hook is one `JSON.parse` result, which is `unknown`, while a hook that
+// converts names the wire type its schema declares. That is the same claim `execute<…ResultWire>`
+// already makes about a buffered body, made in the one place the two surfaces meet — and the hook's
+// own validator is what checks it whenever response validation is on.
+type SseEventHookHost = {
+  hook(data: unknown): unknown;
+};
+
+export type SseEventHook = SseEventHookHost['hook'];
+
+export type SseResponseDecoder = {
+  readonly sse: (
+    body: ReadableStream<Uint8Array>,
+    signal: AbortSignal,
+    onEvent: SseEventHook | null,
+  ) => AsyncIterable<SseEvent<unknown>>;
+  // The generated per-event validate-then-convert pipeline, or null when the operation declares
+  // neither. It rides the descriptor because the parser knows nothing of schemas.
+  readonly onEvent: SseEventHook | null;
+};
+
+export type RawResponseDecoder = {
+  readonly raw: (
+    body: ReadableStream<Uint8Array>,
+    signal: AbortSignal,
+  ) => ReadableStream<Uint8Array>;
+};
+
+export type ResponseMediaDecoder =
+  | 'json'
+  | 'text'
+  | 'binary'
+  | MultipartResponseDecoder
+  | SseResponseDecoder
+  | RawResponseDecoder;
+
+// The decoders that need the whole body in hand. Naming the complement as its own type is what lets
+// the streaming check narrow in both directions, so the buffered path below stays exactly as it was.
+type BufferedResponseDecoder = 'json' | 'text' | 'binary' | MultipartResponseDecoder;
+
+function isStreamingResponseDecoder(
+  decoder: ResponseMediaDecoder,
+): decoder is SseResponseDecoder | RawResponseDecoder {
+  return typeof decoder !== 'string' && ('sse' in decoder || 'raw' in decoder);
+}
 
 export type ResponsePlan = {
   readonly match: string;
@@ -296,6 +347,9 @@ function isTimeoutReason(reason: unknown): boolean {
 export type SerializedBody = {
   readonly body: BodyInit | null;
   readonly contentType: string | null;
+  // Set only by a streaming body. Fetch requires `duplex` exactly when the body is a stream, so it
+  // travels with the body that needs it rather than being something a caller has to know to pass.
+  readonly duplex?: 'half';
 };
 
 type MultipartWrapper = {
@@ -1292,6 +1346,20 @@ export function textBody(contentType: string): BodyEncoder {
   };
 }
 
+// The bytes are passed to fetch untouched: a streaming body is never validated and never
+// transformed, because both are whole-value operations over a value that does not exist yet at
+// dispatch time, and a per-chunk check would have no branch to report into once the request has
+// been sent. A stream that errors mid-flight surfaces as fetch's own rejection.
+/** A streaming request body under the declared media type. */
+export function streamBody(contentType: string): BodyEncoder {
+  return (input) => {
+    if (!(input instanceof ReadableStream)) {
+      throw new TypeError('streaming body must be a ReadableStream');
+    }
+    return Promise.resolve({ body: input, contentType, duplex: 'half' });
+  };
+}
+
 /** A binary request body under the declared media type. */
 export function binaryBody(contentType: string): BodyEncoder {
   return (input) => {
@@ -1318,7 +1386,11 @@ export function discriminatedBody(
     );
     const arm = arms[selected.index];
     const encoded = await arm[1](input.body);
-    return { body: encoded.body, contentType: selected.concrete };
+    // The selected concrete type replaces the arm's declared one, but everything else the arm
+    // decided about the body — `duplex` for a streaming arm — has to survive the swap.
+    return encoded.duplex === undefined
+      ? { body: encoded.body, contentType: selected.concrete }
+      : { body: encoded.body, contentType: selected.concrete, duplex: encoded.duplex };
   };
 }
 
@@ -1642,6 +1714,15 @@ async function responseBytes(
   }
 }
 
+// What the pre-read media selection carries forward to the buffered decode: the declared media key
+// the result reports, the received media parameters (the multipart boundary lives only there), and
+// the decoder itself, already narrowed to the ones that need the whole body.
+type BufferedSelection = {
+  readonly media: string;
+  readonly parameters: ParsedMediaType['parameters'];
+  readonly decoder: BufferedResponseDecoder;
+};
+
 async function assembleResponse(
   provenanceUrl: string,
   response: Response,
@@ -1650,18 +1731,50 @@ async function assembleResponse(
 ): Promise<ExecutionResult> {
   const match = plan === null ? null : responseOutcome(plan);
   const rawContentType = response.headers.get('Content-Type');
-  if (
-    plan !== null &&
-    !plan.bodyless &&
-    plan.media.length !== 0 &&
-    (response.status === 204 || response.status === 205 || response.status === 304)
-  ) {
-    return decodeFailure(
-      provenanceUrl,
-      response,
-      match,
-      `bodyless status ${String(response.status)} cannot satisfy declared content for ${plan.match}`,
-    );
+  // Media selection happens here, before a single body byte is read: a streaming branch has to
+  // resolve at the response headers and hand the caller a body nothing has drained. Selection is
+  // pure, so hoisting it changes no failure ordering — the buffered path below consumes what this
+  // decided instead of deciding again, and every one of its failures still fires where it did.
+  let buffered: BufferedSelection | null = null;
+  if (plan !== null && !plan.bodyless && plan.media.length !== 0) {
+    if (response.status === 204 || response.status === 205 || response.status === 304) {
+      return decodeFailure(
+        provenanceUrl,
+        response,
+        match,
+        `bodyless status ${String(response.status)} cannot satisfy declared content for ${plan.match}`,
+      );
+    }
+    const selected = selectedResponseMedia(rawContentType, plan.media);
+    if (selected !== null) {
+      const decoder = selected.entry[1];
+      if (isStreamingResponseDecoder(decoder)) {
+        if (response.body === null) {
+          // A declared stream that carries no body at all is the same contract violation as a
+          // declared payload with no bytes.
+          return decodeFailure(
+            provenanceUrl,
+            response,
+            match,
+            `streaming response branch ${plan.match} received no body`,
+          );
+        }
+        return matchedResponseResult(
+          plan,
+          response.status,
+          'sse' in decoder
+            ? decoder.sse(response.body, signal, decoder.onEvent)
+            : decoder.raw(response.body, signal),
+          selected.entry[0],
+          responseMeta(provenanceUrl, response),
+        );
+      }
+      buffered = {
+        media: selected.entry[0],
+        parameters: selected.actual.parameters,
+        decoder,
+      };
+    }
   }
 
   const read = await responseBytes(provenanceUrl, response, match, signal);
@@ -1724,8 +1837,7 @@ async function assembleResponse(
     );
   }
 
-  const selected = selectedResponseMedia(rawContentType, plan.media);
-  if (selected === null) {
+  if (buffered === null) {
     return decodeFailure(
       provenanceUrl,
       response,
@@ -1739,15 +1851,15 @@ async function assembleResponse(
     // The multipart decoder is reached only through the descriptor, so a client with no multipart
     // response never links it. It takes the received media parameters because the boundary lives
     // there and nowhere else.
-    const decoder = selected.entry[1];
+    const decoder = buffered.decoder;
     const payload = typeof decoder === 'string'
       ? await decodedBody(read, decoder)
-      : decoder.decode(new Uint8Array(read), selected.actual.parameters, decoder.plan);
+      : decoder.decode(new Uint8Array(read), buffered.parameters, decoder.plan);
     return matchedResponseResult(
       plan,
       response.status,
       payload,
-      selected.entry[0],
+      buffered.media,
       responseMeta(provenanceUrl, response),
     );
   } catch (cause) {
@@ -1755,7 +1867,7 @@ async function assembleResponse(
       provenanceUrl,
       response,
       match,
-      `response body decoding failed for ${selected.entry[0]}`,
+      `response body decoding failed for ${buffered.media}`,
       cause,
     );
   }
@@ -1948,6 +2060,9 @@ export async function execute<S extends string = never>(
       ...splitOptions.standard,
       method: descriptor.method,
       body: serialized.body,
+      // After the caller's own fetch options, because a stream body without it is not constructible
+      // at all — this is a requirement of the body, not a preference a caller can override.
+      ...(serialized.duplex === undefined ? {} : { duplex: serialized.duplex }),
       headers,
       signal: options?.signal,
     });
