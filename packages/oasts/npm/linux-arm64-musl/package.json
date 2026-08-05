@@ -1,0 +1,48 @@
+{
+  "name": "@oasts/binding-linux-arm64-musl",
+  "version": "0.0.0",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "oasts.linux-arm64-musl.node",
+  "files": [
+    "oasts.linux-arm64-musl.node"
+  ],
+  "description": "OpenAPI-to-TypeScript compiler with fully typed errors, compile-time auth checks, and a zero-dependency fetch client — plus first-party Zod, TanStack Query, and MSW artifacts.",
+  "keywords": [
+    "openapi",
+    "openapi3",
+    "swagger",
+    "typescript",
+    "codegen",
+    "compiler",
+    "api-client",
+    "fetch",
+    "zod",
+    "msw",
+    "tanstack-query",
+    "napi-rs",
+    "rust"
+  ],
+  "author": "eve0415",
+  "homepage": "https://github.com/eve0415/oasts#readme",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eve0415/oasts.git",
+    "directory": "packages/oasts"
+  },
+  "bugs": "https://github.com/eve0415/oasts/issues",
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "musl"
+  ]
+}

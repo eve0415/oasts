@@ -1,7 +1,31 @@
 {
   "name": "oasts",
   "version": "0.0.0",
-  "description": "Types-only OpenAPI to TypeScript generator",
+  "description": "OpenAPI-to-TypeScript compiler with fully typed errors, compile-time auth checks, and a zero-dependency fetch client — plus first-party Zod, TanStack Query, and MSW artifacts.",
+  "keywords": [
+    "openapi",
+    "openapi3",
+    "swagger",
+    "typescript",
+    "codegen",
+    "compiler",
+    "api-client",
+    "fetch",
+    "zod",
+    "msw",
+    "tanstack-query",
+    "napi-rs",
+    "rust"
+  ],
+  "homepage": "https://github.com/eve0415/oasts#readme",
+  "bugs": "https://github.com/eve0415/oasts/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eve0415/oasts.git",
+    "directory": "packages/oasts"
+  },
+  "license": "MIT",
+  "author": "eve0415",
   "bin": {
     "oasts": "./dist/cli.js"
   },
@@ -10,12 +34,32 @@
     "!dist/*.node"
   ],
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
     "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "napi": {
+    "binaryName": "oasts",
+    "packageName": "@oasts/binding",
+    "npmClient": "pnpm",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "aarch64-unknown-linux-musl",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-pc-windows-msvc",
+      "x86_64-pc-windows-msvc"
+    ]
   },
   "scripts": {
     "build": "tsdown",

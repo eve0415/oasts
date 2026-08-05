@@ -32,6 +32,15 @@ packages/oasts/napi/
 packages/oasts/dist/
 .pnpm-store/
 
+# Release staging. `napi artifacts` collects the per-target .node files built elsewhere into
+# artifacts/, then copies each into its platform package under npm/; the manifests there are
+# committed, the binaries never are. README.md and LICENSE are the copies `prepack` takes from
+# the repo root so the published tarball carries them.
+packages/oasts/artifacts/
+packages/oasts/npm/*/*.node
+packages/oasts/README.md
+packages/oasts/LICENSE
+
 # Local git worktrees for delegated work
 .worktrees/
 
