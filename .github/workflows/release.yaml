@@ -1,6 +1,6 @@
 name: Release
 
-# Pushing a signed `v<version>` tag publishes nine packages: the `oasts` JavaScript
+# Pushing a signed `v<version>` tag publishes nine packages: the `@oasts/cli` JavaScript
 # package and one `@oasts/binding-*` per target. Everything the release runs is written
 # out here rather than behind a package.json script, so the whole publish path is
 # reviewable in one file and a dependency cannot redefine a step of it.
@@ -74,7 +74,7 @@ jobs:
               exit 1
             fi
           done
-          # A prerelease must not become what `pnpm add oasts` resolves to.
+          # A prerelease must not become what `pnpm add @oasts/cli` resolves to.
           case "$version" in
             *-*) npm_tag=next ;;
             *) npm_tag=latest ;;
@@ -373,7 +373,7 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Publish oasts
+      - name: Publish @oasts/cli
         env:
           NPM_TAG: ${{ needs.plan.outputs.npm-tag }}
         run: pnpm publish packages/oasts --tag "$NPM_TAG" --access public --provenance --no-git-checks --ignore-scripts
