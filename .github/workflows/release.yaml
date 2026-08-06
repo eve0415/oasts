@@ -8,8 +8,6 @@ on:
   push:
     tags:
       - "v*"
-    branches:
-      - ci/release-fixes
   # A dry run: everything up to and including `stage` runs, and the two jobs that can
   # reach npm are gated on a tag. Half the build matrix targets a platform no runner
   # here can execute, so being able to exercise all eight without spending a version
