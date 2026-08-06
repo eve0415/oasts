@@ -69,8 +69,8 @@ jobs:
       # One version is written down in this repository: `[workspace.package] version` in
       # the root Cargo.toml. Every crate inherits it, the compiler stamps it into the
       # header of every file it generates, and `stage` stamps it into the nine npm
-      # manifests — which carry a placeholder in git precisely so releasing never means
-      # editing nine files that can disagree with each other.
+      # manifests — whose own committed `version` is never read, so releasing is one
+      # edit and a tag rather than nine files that can disagree with each other.
       - name: Read the version Cargo.toml declares
         id: version
         run: |
@@ -326,10 +326,11 @@ jobs:
       - name: Copy the README and LICENSE into the package
         run: cp README.md LICENSE packages/oasts/
 
-      # The nine manifests hold a 0.0.0 placeholder in git and get the real version here,
-      # from Cargo.toml by way of `plan`. The dependency map is derived from the package
-      # directories rather than restated, so `napi.targets` stays the one place the
-      # platform list is written down.
+      # Whatever version the nine manifests carry in git is overwritten here, from
+      # Cargo.toml by way of `plan` — nothing reads the committed value, so it is left
+      # wherever it last landed rather than maintained. The dependency map is derived
+      # from the package directories rather than restated, so `napi.targets` stays the
+      # one place the platform list is written down.
       - name: Stamp the version and point the package at its bindings
         env:
           VERSION: ${{ needs.plan.outputs.version }}
