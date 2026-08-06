@@ -21,17 +21,8 @@ pub mod transform;
 pub mod writer;
 pub mod zod_peer;
 
-/// Crate version string embedded in generated file headers.
+/// Crate version string embedded in generated file headers. Inherited from the workspace
+/// `[workspace.package] version`, which is the one place a release version is written down.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn version_matches_cargo() {
-        assert_eq!(version(), "0.0.1");
-    }
 }
