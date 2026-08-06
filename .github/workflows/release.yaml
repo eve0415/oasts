@@ -393,8 +393,10 @@ jobs:
       - plan
       - stage
     # A dry run stops here: everything above it has already proven the tree, and nothing
-    # below it should run without a signed tag behind it.
-    if: startsWith(github.ref, 'refs/tags/')
+    # below it should run without a signed tag behind it. The event is half the condition
+    # because a dispatch can name a tag as its ref — releasing stays the one thing only a
+    # tag *push* does, rather than becoming something a button can also do.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04-arm
     environment: release
     permissions:
@@ -456,7 +458,7 @@ jobs:
     needs:
       - plan
       - publish
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: write
