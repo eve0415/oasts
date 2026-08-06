@@ -1,6 +1,6 @@
 {
   "name": "@oasts/cli",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "OpenAPI-to-TypeScript compiler with fully typed errors, compile-time auth checks, and a zero-dependency fetch client — plus first-party Zod, TanStack Query, and MSW artifacts.",
   "keywords": [
     "api-client",
