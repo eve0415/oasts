@@ -1061,7 +1061,12 @@ function mostSpecificMedia(actual: ParsedMediaType, declared: readonly string[])
     if (score < 0) {
       continue;
     }
-    if (score > bestScore || (score === bestScore && key < declared[best])) {
+    // Only meaningful once a key has been chosen, which a non-negative equal score implies.
+    const incumbent = best < 0 ? undefined : declared[best];
+    if (
+      score > bestScore ||
+      (score === bestScore && incumbent !== undefined && key < incumbent)
+    ) {
       best = index;
       bestScore = score;
     }
@@ -1069,10 +1074,22 @@ function mostSpecificMedia(actual: ParsedMediaType, declared: readonly string[])
   return best;
 }
 
-function selectedMediaType(
+/** Reads an admitted entry that is already the media string itself. */
+const mediaItself = (entry: string): string => entry;
+
+// Returns the matching entry alongside its index. Callers that key a parallel array by position
+// take the index; the content-discriminated body takes the entry, which is how it reaches its
+// encoder without indexing back into the array the index came from.
+function selectedMediaType<T>(
   input: unknown,
-  admitted: readonly string[],
-): { readonly declared: string; readonly concrete: string; readonly index: number } {
+  admitted: readonly T[],
+  mediaOf: (entry: T) => string,
+): {
+  readonly declared: string;
+  readonly concrete: string;
+  readonly index: number;
+  readonly entry: T;
+} {
   if (typeof input !== 'string') {
     throw new TypeError('a concrete contentType selection is required');
   }
@@ -1082,7 +1099,8 @@ function selectedMediaType(
   }
 
   for (const tier of ['exact', 'range', 'any'] as const) {
-    for (const [index, declared] of admitted.entries()) {
+    for (const [index, entry] of admitted.entries()) {
+      const declared = mediaOf(entry);
       const parsed = parseMediaType(declared);
       if (parsed === null) {
         continue;
@@ -1099,7 +1117,7 @@ function selectedMediaType(
         (tier === 'range' && range) ||
         (tier === 'any' && any)
       ) {
-        return { declared, concrete: serializeMediaType(actual), index };
+        return { declared, concrete: serializeMediaType(actual), index, entry };
       }
     }
   }
@@ -1141,7 +1159,7 @@ function serializeUrlencoded(
         kind = field.payloads[0];
       } else {
         const wrapper = urlencodedWrapper(value);
-        const selected = selectedMediaType(wrapper.contentType, field.contentType.admitted);
+        const selected = selectedMediaType(wrapper.contentType, field.contentType.admitted, mediaItself);
         kind = field.payloads[selected.index];
         body = wrapper.body;
       }
@@ -1171,12 +1189,14 @@ function serializeUrlencoded(
     if (!isParamValue(value)) {
       throw new TypeError(`form field ${field.name} has an unsupported value`);
     }
+    // Spread rather than assign: a field that declares no style is not a field whose style is
+    // undefined, and exactOptionalPropertyTypes makes a consumer's compiler say so.
     fields.push({
       name: field.name,
       value,
-      style: field.style,
-      explode: field.explode,
-      allowReserved: field.allowReserved,
+      ...(field.style === undefined ? {} : { style: field.style }),
+      ...(field.explode === undefined ? {} : { explode: field.explode }),
+      ...(field.allowReserved === undefined ? {} : { allowReserved: field.allowReserved }),
     });
   }
   return { body: encodeFormUrlencodedBody(fields), contentType };
@@ -1252,7 +1272,7 @@ function multipartMedia(
   }
   const admitted =
     plan.contentType.kind === 'fixed' ? [plan.contentType.value] : plan.contentType.admitted;
-  const chosen = selectedMediaType(selected, admitted);
+  const chosen = selectedMediaType(selected, admitted, mediaItself);
   // `payloads` is absent only for the fixed single-media wrapper case, which has one payload kind.
   const payload = plan.payloads === undefined ? plan.payload : plan.payloads[chosen.index];
   if (payload === undefined) {
@@ -1278,11 +1298,12 @@ async function multipartPart(plan: MultipartFieldPlan, value: unknown): Promise<
   }
   const media = multipartMedia(plan, wrapper?.contentType);
   const payload = await multipartPayload(media.payload, body);
+  const filename = plan.filename ? selectedFilename ?? blobFilename(body) : undefined;
   return {
     name: plan.name,
     payload,
-    contentType: media.contentType,
-    filename: plan.filename ? selectedFilename ?? blobFilename(body) : undefined,
+    ...(media.contentType === undefined ? {} : { contentType: media.contentType }),
+    ...(filename === undefined ? {} : { filename }),
   };
 }
 
@@ -1380,12 +1401,8 @@ export function discriminatedBody(
     if (!isRecord(input)) {
       throw new TypeError('content-discriminated body requires a wrapper');
     }
-    const selected = selectedMediaType(
-      input.contentType,
-      arms.map(([contentType]) => contentType),
-    );
-    const arm = arms[selected.index];
-    const encoded = await arm[1](input.body);
+    const selected = selectedMediaType(input.contentType, arms, ([contentType]) => contentType);
+    const encoded = await selected.entry[1](input.body);
     // The selected concrete type replaces the arm's declared one, but everything else the arm
     // decided about the body — `duplex` for a streaming arm — has to survive the swap.
     return encoded.duplex === undefined
@@ -1609,7 +1626,8 @@ function selectedResponseMedia(
     actual,
     media.map((entry) => entry[0]),
   );
-  return index < 0 ? null : { entry: media[index], actual };
+  const entry = index < 0 ? undefined : media[index];
+  return entry === undefined ? null : { entry, actual };
 }
 
 async function decodedBody(
@@ -2064,7 +2082,9 @@ export async function execute<S extends string = never>(
       // at all — this is a requirement of the body, not a preference a caller can override.
       ...(serialized.duplex === undefined ? {} : { duplex: serialized.duplex }),
       headers,
-      signal: options?.signal,
+      // `signal` is not a standard fetch option this transport forwards, so nothing below can be
+      // overridden by omitting it — and omitting it is what an absent signal actually means.
+      ...(options?.signal === undefined ? {} : { signal: options.signal }),
     });
     if (finalRequest.signal.aborted) {
       return abortedRequest(finalRequest.signal.reason);

@@ -92,54 +92,6 @@ function serializeSimpleValue(
   return renderPrimitive(value, policy);
 }
 
-function serializeLabelValue(
-  value: ParamValue,
-  explode: boolean,
-  policy: ComponentPolicy,
-): string {
-  if (!explode) {
-    return `.${serializeSimpleValue(value, false, policy)}`;
-  }
-  if (isParamArray(value)) {
-    return value.map((item) => `.${renderPrimitive(item, policy)}`).join("");
-  }
-  if (isParamObject(value)) {
-    return Object.entries(value)
-      .map(
-        ([key, item]) =>
-          `.${renderComponent(key, policy)}=${renderPrimitive(item, policy)}`,
-      )
-      .join("");
-  }
-  return `.${renderPrimitive(value, policy)}`;
-}
-
-function serializeMatrixValue(
-  name: string,
-  value: ParamValue,
-  explode: boolean,
-  policy: ComponentPolicy,
-): string {
-  const encodedName = renderName(name);
-  if (!explode) {
-    return `;${encodedName}=${serializeSimpleValue(value, false, policy)}`;
-  }
-  if (isParamArray(value)) {
-    return value
-      .map((item) => `;${encodedName}=${renderPrimitive(item, policy)}`)
-      .join("");
-  }
-  if (isParamObject(value)) {
-    return Object.entries(value)
-      .map(
-        ([key, item]) =>
-          `;${renderComponent(key, policy)}=${renderPrimitive(item, policy)}`,
-      )
-      .join("");
-  }
-  return `;${encodedName}=${renderPrimitive(value, policy)}`;
-}
-
 function serializeQueryFormValue(
   name: string,
   value: ParamValue,
@@ -177,20 +129,6 @@ function serializeDelimitedQueryValue(
 ): string {
   return `${renderName(name)}=${value
     .map((item) => renderPrimitive(item, allowReserved))
-    .join(separator)}`;
-}
-
-function serializeDelimitedObjectValue(
-  name: string,
-  value: Readonly<Record<string, ParamPrimitive>>,
-  separator: "%20" | "%7C",
-  allowReserved: boolean,
-): string {
-  return `${renderName(name)}=${Object.entries(value)
-    .flatMap(([key, item]) => [
-      renderComponent(key, allowReserved),
-      renderPrimitive(item, allowReserved),
-    ])
     .join(separator)}`;
 }
 
@@ -233,21 +171,11 @@ function serializeDeepObjectDispatched(
   return `${renderName(name)}=${renderPrimitive(value, allowReserved)}`;
 }
 
-// The JSON text a content-sourced parameter (OpenAPI Parameter Object `content` with a JSON-family
-// media type) puts on the wire before location encoding. `JSON.stringify` returns `undefined` for a
-// value it cannot represent (a function, a symbol, or bare `undefined`); the caller-facing types
-// never admit those, but the guard turns a would-be `undefined` wire value into a clear failure.
-function contentJsonString(value: unknown): string {
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) {
-    throw new TypeError("content parameter value is not JSON-serializable");
-  }
-  return serialized;
-}
-
 function consumeToken(input: string, start: number): number {
   let index = start;
-  while (index < input.length && TCHAR.includes(input[index])) {
+  // The length check runs first, so charAt is only ever asked for an in-range index — which matters
+  // because `includes("")` is true for every string and would otherwise never terminate.
+  while (index < input.length && TCHAR.includes(input.charAt(index))) {
     index += 1;
   }
   return index;
@@ -369,6 +297,20 @@ export function serializeContentJsonQuery(
   // Content JSON query parameter: the JSON text becomes one `name=value` pair whose value takes the
   // component encoding form query values use.
   return serializeQueryFormValue(name, contentJsonString(value), false, false);
+}
+//#endregion
+
+//#region oxs:helper:content-json-value
+// The JSON text a content-sourced parameter (OpenAPI Parameter Object `content` with a JSON-family
+// media type) puts on the wire before location encoding. `JSON.stringify` returns `undefined` for a
+// value it cannot represent (a function, a symbol, or bare `undefined`); the caller-facing types
+// never admit those, but the guard turns a would-be `undefined` wire value into a clear failure.
+function contentJsonString(value: unknown): string {
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) {
+    throw new TypeError("content parameter value is not JSON-serializable");
+  }
+  return serialized;
 }
 //#endregion
 
@@ -523,7 +465,9 @@ export function parseMediaType(input: string): ParsedMediaType | null {
       index += 1;
       let closed = false;
       while (index < input.length) {
-        const character = input[index];
+        // charAt over [] because the loop condition already proves the index is in range, and it
+        // types as string rather than string | undefined without adding a check that never fires.
+        const character = input.charAt(index);
         if (character === '"') {
           closed = true;
           index += 1;
@@ -697,15 +641,17 @@ function buildMultipartBody(
     return UTF8_ENCODER.encode(`--${boundary}--`);
   }
 
-  const chunks: Uint8Array[] = [
-    UTF8_ENCODER.encode(`--${boundary}\r\n`),
-    encapsulatedParts[0],
-  ];
-  for (let index = 1; index < encapsulatedParts.length; index += 1) {
-    chunks.push(
-      UTF8_ENCODER.encode(`\r\n--${boundary}\r\n`),
-      encapsulatedParts[index],
-    );
+  // Iterated by value rather than by index, and the inter-part delimiter is encoded once instead
+  // of once per part.
+  const between = UTF8_ENCODER.encode(`\r\n--${boundary}\r\n`);
+  const chunks: Uint8Array[] = [UTF8_ENCODER.encode(`--${boundary}\r\n`)];
+  let first = true;
+  for (const part of encapsulatedParts) {
+    if (!first) {
+      chunks.push(between);
+    }
+    chunks.push(part);
+    first = false;
   }
   chunks.push(UTF8_ENCODER.encode(`\r\n--${boundary}--`));
   return concatMultipartBytes(chunks);
@@ -1101,6 +1047,30 @@ export function serializePathLabelExplode(
 }
 //#endregion
 
+//#region oxs:helper:path-label-value
+function serializeLabelValue(
+  value: ParamValue,
+  explode: boolean,
+  policy: ComponentPolicy,
+): string {
+  if (!explode) {
+    return `.${serializeSimpleValue(value, false, policy)}`;
+  }
+  if (isParamArray(value)) {
+    return value.map((item) => `.${renderPrimitive(item, policy)}`).join("");
+  }
+  if (isParamObject(value)) {
+    return Object.entries(value)
+      .map(
+        ([key, item]) =>
+          `.${renderComponent(key, policy)}=${renderPrimitive(item, policy)}`,
+      )
+      .join("");
+  }
+  return `.${renderPrimitive(value, policy)}`;
+}
+//#endregion
+
 //#region oxs:helper:path-matrix
 export function serializePathMatrix(
   name: string,
@@ -1118,6 +1088,34 @@ export function serializePathMatrixExplode(
   _allowReserved: boolean,
 ): string {
   return serializeMatrixValue(name, value, true, false);
+}
+//#endregion
+
+//#region oxs:helper:path-matrix-value
+function serializeMatrixValue(
+  name: string,
+  value: ParamValue,
+  explode: boolean,
+  policy: ComponentPolicy,
+): string {
+  const encodedName = renderName(name);
+  if (!explode) {
+    return `;${encodedName}=${serializeSimpleValue(value, false, policy)}`;
+  }
+  if (isParamArray(value)) {
+    return value
+      .map((item) => `;${encodedName}=${renderPrimitive(item, policy)}`)
+      .join("");
+  }
+  if (isParamObject(value)) {
+    return Object.entries(value)
+      .map(
+        ([key, item]) =>
+          `;${renderComponent(key, policy)}=${renderPrimitive(item, policy)}`,
+      )
+      .join("");
+  }
+  return `;${encodedName}=${renderPrimitive(value, policy)}`;
 }
 //#endregion
 
@@ -1158,6 +1156,22 @@ export function serializeQueryDeepObjectExtended(
   allowReserved: boolean,
 ): string {
   return serializeDeepObjectDispatched(name, value, allowReserved);
+}
+//#endregion
+
+//#region oxs:helper:query-delimited-object-value
+function serializeDelimitedObjectValue(
+  name: string,
+  value: Readonly<Record<string, ParamPrimitive>>,
+  separator: "%20" | "%7C",
+  allowReserved: boolean,
+): string {
+  return `${renderName(name)}=${Object.entries(value)
+    .flatMap(([key, item]) => [
+      renderComponent(key, allowReserved),
+      renderPrimitive(item, allowReserved),
+    ])
+    .join(separator)}`;
 }
 //#endregion
 

@@ -872,7 +872,9 @@ function parseBodyMediaType(input: string): ParsedBodyMediaType | null {
       index += 1;
       let closed = false;
       while (index < input.length) {
-        const character = input[index];
+        // charAt over [] because the loop condition already proves the index is in range, and it
+        // types as string rather than string | undefined without adding a check that never fires.
+        const character = input.charAt(index);
         if (character === '"') {
           closed = true;
           index += 1;
@@ -914,7 +916,9 @@ function parseBodyMediaType(input: string): ParsedBodyMediaType | null {
 
 function consumeBodyToken(input: string, start: number): number {
   let index = start;
-  while (index < input.length && BODY_TCHAR.includes(input[index])) {
+  // The length check runs first, so charAt is only ever asked for an in-range index — which matters
+  // because `includes("")` is true for every string and would otherwise never terminate.
+  while (index < input.length && BODY_TCHAR.includes(input.charAt(index))) {
     index += 1;
   }
   return index;
@@ -1061,10 +1065,20 @@ function projectWireValue(context: ProjectionContext, descriptor: ParameterDescr
 }
 
 function cookieValue(context: ProjectionContext, name: string): string | typeof MISSING {
-  if (context.cookies === undefined || !Object.hasOwn(context.cookies, name)) {
+  const cookies = context.cookies;
+  if (cookies === undefined) {
     return MISSING;
   }
-  return context.cookies[name];
+  // An own-entry scan rather than a keyed read. It keeps an inherited member (`toString`,
+  // `constructor`) from being read as a cookie the way `Object.hasOwn` did, and unlike a keyed read
+  // it needs no arm for a present-but-undefined value — a state a string-valued record cannot hold,
+  // and so a branch no request could ever take.
+  for (const [key, value] of Object.entries(cookies)) {
+    if (key === name) {
+      return value;
+    }
+  }
+  return MISSING;
 }
 
 function rawPathParameter(
@@ -1122,13 +1136,14 @@ function queryPairs(url: string): readonly QueryPair[] {
 
 function singleQueryValue(pairs: readonly QueryPair[], name: string): string | typeof MISSING {
   const matching = pairs.filter((pair) => pair.name === name);
-  if (matching.length === 0) {
+  const [first] = matching;
+  if (first === undefined) {
     return MISSING;
   }
   if (matching.length !== 1) {
     throw new TypeError(`query parameter ${name} occurs more than once`);
   }
-  return matching[0].rawValue;
+  return first.rawValue;
 }
 
 function decodePathValue(
@@ -1211,9 +1226,10 @@ function decodeQueryFormExplode(
   descriptor: ParameterDescriptor,
 ): unknown {
   const direct = pairs.filter((pair) => pair.name === descriptor.name);
+  const soleDirect = direct.length === 1 ? direct[0] : undefined;
   return decodeComposedShape(
     descriptor.shape,
-    direct.length === 1 && direct[0].rawValue === "null",
+    soleDirect !== undefined && soleDirect.rawValue === "null",
     (shape) => {
       if (shape.kind === "array") {
         return direct.length === 0
@@ -1256,6 +1272,7 @@ function decodeDeepObject(
   extended: boolean,
 ): unknown {
   const direct = pairs.filter((pair) => pair.name === name);
+  const soleDirect = direct.length === 1 ? direct[0] : undefined;
   const prefix = `${name}[`;
   const nested = pairs.flatMap((pair) =>
     pair.name.startsWith(prefix) && pair.name.endsWith("]")
@@ -1264,7 +1281,7 @@ function decodeDeepObject(
   );
   return decodeComposedShape(
     shape,
-    direct.length === 1 && direct[0].rawValue === "null",
+    soleDirect !== undefined && soleDirect.rawValue === "null",
     (structural) => {
       if (extended && structural.kind === "array") {
         if (nested.length === 0) {
@@ -1303,9 +1320,12 @@ function parseIndex(value: string): number {
 
 function decodeMatrixExplode(raw: string, name: string, shape: ParameterShape): unknown {
   const entries = raw === "" ? [] : matrixEntries(raw);
+  // The sole entry, when there is exactly one. Both the null probe below and the primitive branch
+  // ask the same question, so they read one binding instead of indexing twice.
+  const sole = entries.length === 1 ? entries[0] : undefined;
   return decodeComposedShape(
     shape,
-    entries.length === 1 && entries[0].name === name && entries[0].rawValue === "null",
+    sole !== undefined && sole.name === name && sole.rawValue === "null",
     (structural) => {
       if (raw === "") {
         if (structural.kind === "array") {
@@ -1325,10 +1345,10 @@ function decodeMatrixExplode(raw: string, name: string, shape: ParameterShape): 
       if (structural.kind === "object") {
         return decodeObjectPairs(entries, structural, decodeComponentValue);
       }
-      if (entries.length !== 1 || entries[0].name !== name) {
+      if (sole === undefined || sole.name !== name) {
         throw new TypeError("matrix primitive has malformed framing");
       }
-      return decodeComponentValue(entries[0].rawValue, structural);
+      return decodeComponentValue(sole.rawValue, structural);
     },
   );
 }
@@ -1431,9 +1451,18 @@ function decodeAlternatingObject(
   if (parts.length % 2 !== 0) {
     throw new TypeError("non-exploded object has an odd number of components");
   }
+  // Paired by carrying the name across one iteration rather than by indexing two positions. The
+  // even-length check above already proves every name has a successor, but an index cannot say so
+  // to the compiler — and restating it as a guard would be a branch no input can reach.
   const pairs: QueryPair[] = [];
-  for (let index = 0; index < parts.length; index += 2) {
-    pairs.push({ name: decodeName(parts[index]), rawValue: parts[index + 1] });
+  let pendingName: string | null = null;
+  for (const part of parts) {
+    if (pendingName === null) {
+      pendingName = part;
+      continue;
+    }
+    pairs.push({ name: decodeName(pendingName), rawValue: part });
+    pendingName = null;
   }
   return decodeObjectPairs(pairs, shape, decodeValue);
 }
@@ -1660,22 +1689,26 @@ function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
 }
 
 function decodeSingleCandidate<T, R>(candidates: readonly T[], decode: (candidate: T) => R): R {
-  const decoded: R[] = [];
+  // Held in a wrapper rather than as a bare R, because R may itself admit undefined and "no branch
+  // accepted this" has to stay distinguishable from "a branch decoded it to undefined".
+  let accepted: { readonly value: R } | undefined;
   for (const candidate of candidates) {
+    let value: R;
     try {
-      decoded.push(decode(candidate));
+      value = decode(candidate);
     } catch {
       continue;
     }
+    if (accepted === undefined) {
+      accepted = { value };
+    } else if (!jsonEqual(value, accepted.value)) {
+      throw new TypeError("parameter has more than one distinct declared decoding");
+    }
   }
-  if (decoded.length === 0) {
+  if (accepted === undefined) {
     throw new TypeError("parameter matches no declared schema branch");
   }
-  const first = decoded[0];
-  if (decoded.some((candidate) => !jsonEqual(candidate, first))) {
-    throw new TypeError("parameter has more than one distinct declared decoding");
-  }
-  return first;
+  return accepted.value;
 }
 
 function decodeIntersection(

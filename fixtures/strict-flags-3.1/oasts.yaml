@@ -1,0 +1,6 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+artifacts:
+  types: true

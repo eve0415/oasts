@@ -1,0 +1,18 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-client
+artifacts:
+  types: true
+  client: true
+  validators: true
+client:
+  authEnforcement: types
+  aggregate: true
+  baseUrl:
+    source: runtime
+validation:
+  engine: generated
+  request: true
+  response: true
+  unchecked: allow

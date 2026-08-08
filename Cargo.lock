@@ -464,6 +464,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast-glob"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cc9868289ee02952b341465ce66e67adec151227afedacf9137c0adb1e53943"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -844,6 +853,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "json-strip-comments"
+version = "3.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01ed659c5f428031b9c1fb7de6729af2eb491654d4bcd416a5b5b704986b9658"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1094,9 +1112,11 @@ name = "oasts-core"
 version = "0.0.2"
 dependencies = [
  "divan",
+ "fast-glob",
  "fluent-uri",
  "foldhash",
  "itoa",
+ "json-strip-comments",
  "memchr",
  "rayon",
  "ryu",

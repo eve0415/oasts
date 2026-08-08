@@ -1,0 +1,590 @@
+openapi: 3.1.0
+# Every feature here is present because it reaches an emitted site that a consumer compiler flag
+# rejects — not because it is interesting on its own. The mapping is one operation or component per
+# row of the flag matrix the gate runs, so removing anything silently drops a row.
+info:
+  title: Oasts consumer strict-flag surface
+  version: 1.0.0
+servers:
+  - url: https://strict.api.example.test/v1
+paths:
+  # Path styles, both explode settings of each: every one is a separate helper region, so a
+  # single setting per style would leave half of them out of the emitted tree the gate compiles.
+  /labels/{labelId}/{labelSet}/{ids}:
+    get:
+      operationId: readLabel
+      parameters:
+        - name: labelId
+          in: path
+          required: true
+          style: label
+          explode: false
+          schema:
+            type: string
+        - name: labelSet
+          in: path
+          required: true
+          style: label
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: ids
+          in: path
+          required: true
+          style: simple
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+      responses:
+        '204':
+          description: The label exists and carries no body.
+  /matrix/{matrixId}/{matrixPair}:
+    get:
+      operationId: readMatrix
+      parameters:
+        - name: matrixId
+          in: path
+          required: true
+          style: matrix
+          explode: true
+          schema:
+            type: object
+            required:
+              - row
+            properties:
+              row:
+                type: integer
+              column:
+                type: integer
+        - name: matrixPair
+          in: path
+          required: true
+          style: matrix
+          explode: false
+          schema:
+            type: array
+            items:
+              type: integer
+      responses:
+        '204':
+          description: The coordinate exists.
+  # The msw projection surface: an enum path parameter plus array query parameters exploded both
+  # ways, plus the delimited and deepObject styles. Projection is serialization run backwards, so
+  # every style here is a distinct branch on the msw side.
+  /kinds/{kind}:
+    get:
+      operationId: listByKind
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          style: simple
+          explode: false
+          schema:
+            type: string
+            enum:
+              - feline
+              - canine
+        - name: tags
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: fields
+          in: query
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+        - name: spaces
+          in: query
+          style: spaceDelimited
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+        - name: pipes
+          in: query
+          style: pipeDelimited
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+        # Object-valued delimited parameters, which are a different helper from the array-valued
+        # ones above and the only thing that reads `serializeDelimitedObjectValue`.
+        - name: spaceObject
+          in: query
+          style: spaceDelimited
+          explode: false
+          schema:
+            type: object
+            properties:
+              owner:
+                type: string
+              active:
+                type: boolean
+        - name: pipeObject
+          in: query
+          style: pipeDelimited
+          explode: false
+          schema:
+            type: object
+            properties:
+              owner:
+                type: string
+              active:
+                type: boolean
+        - name: filter
+          in: query
+          style: deepObject
+          explode: true
+          schema:
+            type: object
+            properties:
+              owner:
+                type: string
+              active:
+                type: boolean
+        - name: X-Trace
+          in: header
+          style: simple
+          explode: false
+          schema:
+            type: string
+        # The exploded header form, which is its own helper region.
+        - name: X-Dims
+          in: header
+          style: simple
+          explode: true
+          schema:
+            type: object
+            properties:
+              width:
+                type: integer
+              height:
+                type: integer
+      responses:
+        '200':
+          description: The matching pets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Pet'
+  # Parameters and a response header carried as JSON content, which is what selects the
+  # `contentJsonString` helper and the three `oxs:helper:content-json-*` regions.
+  /content/{ref}:
+    get:
+      operationId: readByContentRef
+      parameters:
+        - name: ref
+          in: path
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+        - name: filter
+          in: query
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: array
+                    items:
+                      type: string
+        - name: X-Ctx
+          in: header
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant:
+                    type: string
+      responses:
+        '200':
+          description: A pet with the applied filter echoed back.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+          headers:
+            X-Filter-Echo:
+              description: The applied filter echoed as JSON.
+              content:
+                application/json:
+                  schema:
+                    type: object
+                    properties:
+                      status:
+                        type: array
+                        items:
+                          type: string
+  # Multipart with one part that declares no filename beside one that does. The absent filename is
+  # the point: the emitted part literal must leave the key absent rather than set it to undefined.
+  /uploads:
+    post:
+      operationId: uploadAsset
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - caption
+                - asset
+                - tags
+              properties:
+                caption:
+                  type: string
+                asset:
+                  type: string
+                  format: binary
+                tags:
+                  type: array
+                  items:
+                    type: string
+            encoding:
+              tags:
+                style: form
+                explode: true
+      responses:
+        '204':
+          description: The upload was stored.
+  # A multipart *response*. Decoding is a separate and much larger runtime region than encoding,
+  # and nothing above selects it, so without this operation it never reaches the compiler here.
+  /bundle:
+    get:
+      operationId: readBundle
+      responses:
+        '200':
+          description: The bundle parts.
+          content:
+            multipart/form-data:
+              schema:
+                type: object
+                required:
+                  - manifest
+                  - archive
+                additionalProperties: false
+                properties:
+                  # Deliberately free of date/time formats: a multipart response carrying one is a
+                  # named refusal (OASTS1314), and this fixture also runs under the transform config.
+                  manifest:
+                    $ref: '#/components/schemas/Manifest'
+                  archive:
+                    type: string
+                    contentEncoding: binary
+  # A raw byte stream, marked rather than inferred, which selects the raw-stream region.
+  /blob:
+    get:
+      operationId: downloadBlob
+      responses:
+        '200':
+          description: Bytes, streamed.
+          content:
+            application/octet-stream:
+              x-oasts-streaming: true
+  # A urlencoded body whose fields declare no encoding entry at all, so every emitted field literal
+  # omits style/explode/allowReserved rather than passing undefined for them.
+  /forms:
+    post:
+      operationId: submitForm
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                labels:
+                  type: array
+                  items:
+                    type: string
+                profile:
+                  type: object
+                  properties:
+                    nickname:
+                      type: string
+      responses:
+        '204':
+          description: The form was accepted.
+  # Two request media types on one operation, which is the only shape that reaches the
+  # content-discriminated body path and its indexed arm lookup.
+  /notes:
+    post:
+      operationId: writeNote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Note'
+          text/plain:
+            schema:
+              type: string
+      responses:
+        '204':
+          description: The note was written.
+  # An SSE response. Streaming operations do not route their orThrow form through executeOrThrow,
+  # so this operation is what makes an unconditional import of it unused.
+  /ticks:
+    get:
+      operationId: watchTicks
+      responses:
+        '200':
+          description: A stream of ticks.
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/Tick'
+        '429':
+          description: Too many watchers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  # An SSE *request* body. Encoding events is a different runtime region from decoding them, and
+  # only a request body sending text/event-stream selects it.
+  /publish:
+    post:
+      operationId: publishTicks
+      requestBody:
+        required: true
+        content:
+          text/event-stream:
+            schema:
+              $ref: '#/components/schemas/Tick'
+      responses:
+        '204':
+          description: Accepted.
+  # The only secured operation. Its CallArgs alias consumes the scheme type parameter; every other
+  # operation's does not, which is the contrast the unused-type-parameter row needs.
+  /pets:
+    post:
+      operationId: createPet
+      security:
+        - bearerAuth: []
+        - headerKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Envelope'
+      responses:
+        '200':
+          description: The created pet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+        '4XX':
+          description: A documented client error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  # The recursive component, reachable as an operation result so the zod artifact emits its
+  # self-referential annotation rather than only a component module nothing imports.
+  /tree/{nodeId}:
+    get:
+      operationId: readTree
+      parameters:
+        - name: nodeId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The matching tree node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TreeNode'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    headerKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+  schemas:
+    # `date` and `date-time` together are what select the RFC 3339 day-table lookup in both
+    # validator runtimes, and the date/time transform layer in the client runtime.
+    Pet:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        tag:
+          type: string
+        birthday:
+          type: string
+          format: date
+        createdAt:
+          type: string
+          format: date-time
+    Note:
+      type: object
+      required:
+        - body
+      properties:
+        body:
+          type: string
+        postedAt:
+          type: string
+          format: date-time
+    Manifest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+        size:
+          type: integer
+    Tick:
+      type: object
+      required:
+        - seq
+      properties:
+        seq:
+          type: integer
+        at:
+          type: string
+          format: date-time
+    Problem:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: integer
+        message:
+          type: string
+    # A self-reference through an optional array property. The optionality is what the recursive
+    # zod annotation has to keep, and what exactOptionalPropertyTypes rejects when it does not.
+    TreeNode:
+      type: object
+      required:
+        - value
+      properties:
+        value:
+          type: string
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/TreeNode'
+    # The keyword families whose emitted validators declare evaluation-tracking parameters and
+    # per-branch issue locals. Each is here because one of those bindings is emitted for it.
+    UnevaluatedChoice:
+      type: object
+      anyOf:
+        - required:
+            - alpha
+          properties:
+            alpha:
+              type: string
+        - required:
+            - beta
+          properties:
+            beta:
+              type: integer
+      unevaluatedProperties: false
+    UnevaluatedSequence:
+      type: array
+      prefixItems:
+        - type: string
+      contains:
+        type: integer
+      minContains: 1
+      unevaluatedItems: false
+    # The array mirror of UnevaluatedChoice. The object form leaves the emitted per-branch *item*
+    # recorder unread; this one leaves the *property* recorder unread, and only both together
+    # cover the pair.
+    UnevaluatedArrayChoice:
+      type: array
+      anyOf:
+        - prefixItems:
+            - type: string
+        - prefixItems:
+            - type: integer
+            - type: integer
+      unevaluatedItems: false
+    ContainsRange:
+      type: array
+      contains:
+        type: integer
+      minContains: 2
+      maxContains: 3
+    ConditionalProfile:
+      type: object
+      properties:
+        kind:
+          type: string
+        companyName:
+          type: string
+        personalName:
+          type: string
+      if:
+        required:
+          - kind
+        properties:
+          kind:
+            const: business
+      then:
+        required:
+          - companyName
+      else:
+        required:
+          - personalName
+    Envelope:
+      type: object
+      properties:
+        pet:
+          $ref: '#/components/schemas/Pet'
+        tree:
+          $ref: '#/components/schemas/TreeNode'
+        containsRange:
+          $ref: '#/components/schemas/ContainsRange'
+        conditionalProfile:
+          $ref: '#/components/schemas/ConditionalProfile'
+        unevaluatedChoice:
+          $ref: '#/components/schemas/UnevaluatedChoice'
+        unevaluatedSequence:
+          $ref: '#/components/schemas/UnevaluatedSequence'
+        unevaluatedArrayChoice:
+          $ref: '#/components/schemas/UnevaluatedArrayChoice'

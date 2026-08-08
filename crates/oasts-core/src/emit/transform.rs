@@ -778,7 +778,13 @@ pub(crate) fn emit_transform_from_model(
         transform_file(
             model,
             "runtime.ts",
-            rewrite_relative_ts_imports(TRANSFORM_RUNTIME_TS, &model.config.emit.import_extension),
+            rewrite_relative_ts_imports(
+                super::strip_temporal_reference(
+                    TRANSFORM_RUNTIME_TS,
+                    model.consumer_provides_temporal,
+                ),
+                &model.config.emit.import_extension,
+            ),
         ),
         transform_file(
             model,
@@ -1089,11 +1095,15 @@ fn emit_component_pairs(
         ));
     }
     content.push('\n');
-    write_pointer_constants(&mut content, &pointers);
+    write_pointer_constants(&mut content, &pointers, &bodies);
     content.push_str(&bodies);
     Some(GeneratedFile {
         relative_path,
-        content: super::insert_temporal_reference(content, header_len),
+        content: super::insert_temporal_reference(
+            content,
+            header_len,
+            emitter.model.consumer_provides_temporal,
+        ),
     })
 }
 
@@ -1402,11 +1412,15 @@ fn emit_operation_pairs(
         ));
     }
     content.push('\n');
-    write_pointer_constants(&mut content, &pointers);
+    write_pointer_constants(&mut content, &pointers, &bodies);
     content.push_str(&bodies);
     Some(GeneratedFile {
         relative_path,
-        content: super::insert_temporal_reference(content, header_len),
+        content: super::insert_temporal_reference(
+            content,
+            header_len,
+            emitter.model.consumer_provides_temporal,
+        ),
     })
 }
 
@@ -1658,10 +1672,19 @@ fn pointer_constant(pointers: &mut Vec<SourceRef>, source: &SourceRef) -> String
 /// Hoisted rather than inlined at each call: the same location is named by both directions of a
 /// pair, so one constant halves the emitted bytes it would otherwise cost, and a stable order keeps
 /// double generation byte-identical.
-fn write_pointer_constants(content: &mut String, pointers: &[SourceRef]) {
+///
+/// A location is skipped when `bodies` never names it. An `allOf` merge renders each branch's
+/// conversion — allocating its pointer as a side effect — and then keeps only the merged one, so
+/// the discarded branch would otherwise leave a constant nothing reads. Indices stay as allocated
+/// so a skip never renumbers a pointer a body already names.
+fn write_pointer_constants(content: &mut String, pointers: &[SourceRef], bodies: &str) {
     for (index, pointer) in pointers.iter().enumerate() {
+        let name = format!("P{index}");
+        if !super::reads_identifier(bodies, &name) {
+            continue;
+        }
         content.push_str(&format!(
-            "const P{index} = {{ logicalSourceId: {}, jsonPointer: {} }};\n",
+            "const {name} = {{ logicalSourceId: {}, jsonPointer: {} }};\n",
             render_ts_string(&pointer.source_id),
             render_ts_string(&pointer.json_pointer)
         ));
@@ -4716,6 +4739,43 @@ mod pair_tests {
         assert!(!content.contains("from \"./notice.js\""), "{content}");
     }
 
+    /// An `allOf` merge renders each branch's conversion — allocating its pointer — and then keeps
+    /// only the merged one, so the discarded branch left a constant nothing named. That is an error
+    /// in a consumer compiling generated code with `noUnusedLocals`.
+    #[test]
+    fn a_pointer_no_conversion_names_is_not_emitted() {
+        let content = pairs(
+            json!({
+                "Left": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": { "at": { "type": "string", "format": "date-time" } }
+                },
+                "Notice": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/Left" },
+                        {
+                            "type": "object",
+                            "required": ["at"],
+                            "properties": { "at": { "type": "string", "format": "date-time" } }
+                        }
+                    ]
+                }
+            }),
+            "notice",
+            date_mode,
+        )
+        .expect("pairs");
+        for index in 0..4 {
+            let declared = content.contains(&format!("const P{index} = "));
+            let named = content.contains(&format!("P{index}, pushPath"));
+            assert_eq!(
+                declared, named,
+                "P{index} declared={declared} named={named}\n{content}"
+            );
+        }
+    }
+
     #[test]
     fn pointer_constants_are_hoisted_in_first_seen_order_and_shared_by_both_directions() {
         let content = pairs(
@@ -6549,5 +6609,31 @@ mod operation_pair_tests {
         );
         assert!(!has_errors, "{diagnostics:#?}");
         assert!(operation_module(&files, "readlabel").is_none());
+    }
+}
+
+#[cfg(test)]
+mod temporal_reference_tests {
+    use super::TRANSFORM_RUNTIME_TS;
+
+    /// The transform runtime carries the directive in its own source rather than getting it from
+    /// the inserter, so it needs the separate strip — and this is what says so if the asset's first
+    /// line ever moves.
+    #[test]
+    fn the_embedded_transform_runtime_leads_with_the_temporal_reference() {
+        assert!(
+            TRANSFORM_RUNTIME_TS
+                .starts_with("/// <reference lib=\"esnext.temporal\" preserve=\"true\" />\n")
+        );
+        assert_eq!(
+            crate::emit::strip_temporal_reference(TRANSFORM_RUNTIME_TS, false),
+            TRANSFORM_RUNTIME_TS
+        );
+        let stripped = crate::emit::strip_temporal_reference(TRANSFORM_RUNTIME_TS, true);
+        assert!(!stripped.starts_with("/// <reference"));
+        assert!(
+            stripped.contains("Temporal."),
+            "the asset still names Temporal"
+        );
     }
 }

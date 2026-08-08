@@ -213,7 +213,7 @@ jobs:
           done
 
   verify-ts:
-    name: tsc --strict on generated output
+    name: consumer flag matrix on generated output
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read

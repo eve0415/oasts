@@ -488,6 +488,13 @@ fn emit_operation(
         let renderer = TypesEmitter::new(model);
         for response in &operation.responses {
             for media in &response.media_types {
+                // Byte-oriented media render as `Uint8Array` or a stream of it, so the schema's
+                // components are named nowhere in the module — importing them anyway leaves an
+                // unread binding in the consumer's compile. `paths.ts` already reads the same
+                // predicate; this is the site that did not.
+                if !response_body_uses_schema(media, &response_projector) {
+                    continue;
+                }
                 renderer.collect_operation_imports(
                     &media.schema,
                     TypePosition::Response,
@@ -4357,12 +4364,21 @@ paths:
           content:
             text/event-stream:
               schema:
-                type: string
+                $ref: '#/components/schemas/Tick'
         "503":
           description: Raw bytes.
           content:
             application/octet-stream:
               x-oasts-streaming: true
+components:
+  schemas:
+    Tick:
+      type: object
+      required:
+        - seq
+      properties:
+        seq:
+          type: integer
 "#;
         let files = generate(document, MSW_CONFIG);
         let handler = generated(&files, "msw/handlers/watchticks.ts");
@@ -4379,6 +4395,51 @@ paths:
             ),
             "{handler}"
         );
+        // The declared schema never reaches the emitted body type for a byte-oriented response, so
+        // importing its component leaves an unread binding — an error in a consumer compiling
+        // generated code with `noUnusedLocals`.
+        assert!(!handler.contains("import type { Tick }"), "{handler}");
+    }
+
+    /// A multipart response is the other byte-oriented shape: the resolver hands back the encoded
+    /// bytes, so the part schemas' components are named nowhere in the emitted module.
+    #[test]
+    fn a_multipart_response_handler_imports_no_part_components() {
+        let document = r#"openapi: 3.1.0
+info:
+  title: multipart response
+  version: 1.0.0
+paths:
+  /bundle:
+    get:
+      operationId: readBundle
+      responses:
+        "200":
+          description: Bundle parts.
+          content:
+            multipart/form-data:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - manifest
+                properties:
+                  manifest:
+                    $ref: '#/components/schemas/Manifest'
+components:
+  schemas:
+    Manifest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+"#;
+        let files = generate(document, MSW_CONFIG);
+        let handler = generated(&files, "msw/handlers/readbundle.ts");
+        assert!(handler.contains("body: Uint8Array"), "{handler}");
+        assert!(!handler.contains("import type { Manifest }"), "{handler}");
     }
 
     #[test]

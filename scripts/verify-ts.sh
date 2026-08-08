@@ -18,6 +18,28 @@ done
 
 shopt -s globstar
 
+# The consumer compiler-flag matrix. None of these five flags is part of `strict`, so
+# output a consumer with a stricter tsconfig cannot compile passes a `--strict`-only gate. The claim
+# the artifacts make is that their output compiles in the consumer's project rather than in ours, so
+# the bar is checked where every other output contract in this repo is checked: over an emitted tree.
+#
+# exactOptionalPropertyTypes runs off AND on. On-only would admit a shape valid only *with* the
+# flag, which breaks consumers who have it off — the mirror of the hole the msw block below closes.
+#
+# This list is the contract. A claim made anywhere else that the gate does not check here is
+# exactly the drift these rows exist to end.
+#
+# Args: label exact-optional file... — the files come last because a tree expands to many of them.
+strict_flag_matrix() {
+  local label=$1 exact_optional=$2
+  shift 2
+  pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext \
+    --moduleResolution bundler --noUncheckedIndexedAccess --noUnusedLocals --noUnusedParameters \
+    --exactOptionalPropertyTypes "$exact_optional" --noImplicitOverride \
+    "$@"
+  echo "consumer flag matrix ok: $label (exactOptionalPropertyTypes=$exact_optional)"
+}
+
 # Shared body for the client and validators fixture checks: copy the fixture, strip any prior
 # generated output, generate under one config and typecheck it, then regenerate into a sibling dir
 # and diff to prove generation is byte-stable. The gate label and message differ per caller, so they
@@ -34,8 +56,13 @@ generate_and_verify() {
     ln -s "$PWD/crates/oasts-core/runtime/node_modules" "$d/node_modules"
   fi
   (cd "$d" && "$OLDPWD/$bin" generate --config "$cfg")
-  pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$d"/generated*/**/*.ts
-  echo "tsc --strict $label ok: $message"
+  # The consumer flag matrix over every emitted tree, exactOptionalPropertyTypes off and
+  # on. `--strict` alone is the bar this gate used to hold, and it is a bar no consumer compiles at:
+  # none of these five flags is part of `strict`, so output that only passes `--strict` can still be
+  # uncompilable in the project it was generated into.
+  for exact_optional in false true; do
+    strict_flag_matrix "$message" "$exact_optional" "$d"/generated*/**/*.ts
+  done
   cp -r "fixtures/$f" "$d-repeat"
   rm -rf "$d-repeat"/generated*
   (cd "$d-repeat" && "$OLDPWD/$bin" generate --config "$cfg")
@@ -334,6 +361,33 @@ for flavor in zod-showcase/generated-zod zod-showcase-mini/generated-zod-mini; d
     OASTS_VALIDATORS_GENERATED_ROOT="$work/validators-validators-showcase-3.1-oasts/generated" \
     node --test crates/oasts-core/runtime/test-conformance/zod-runner.ts
   echo "zod + dual-engine conformance ok: validators-showcase-3.1 ($flavor)"
+done
+
+# The two fixtures authored for the flag matrix. strict-flags-3.1 carries one document under every
+# artifact; unused-helper-regions-3.1 is the counter-case, a client selecting none of the
+# label/matrix/delimited-object/content helpers — the only shape that can see a helper the emitter
+# cannot strip, because those are unused exactly when nothing selects them.
+strict_flag_runs=(
+  "strict-flags-3.1 oasts.yaml strict-flags-types"
+  "strict-flags-3.1 oasts-client.yaml strict-flags-client"
+  "strict-flags-3.1 oasts-zod.yaml strict-flags-zod"
+  "strict-flags-3.1 oasts-zod-mini.yaml strict-flags-zod-mini"
+  "strict-flags-3.1 oasts-msw.yaml strict-flags-msw"
+  "strict-flags-3.1 oasts-tanstack.yaml strict-flags-tanstack"
+  "strict-flags-3.1 oasts-transform.yaml strict-flags-transform"
+  "unused-helper-regions-3.1 oasts.yaml unused-helper-regions"
+)
+for run in "${strict_flag_runs[@]}"; do
+  read -r fixture config dir <<<"$run"
+  generate_and_verify "$fixture" "$config" "$work/$dir" strict-flags "$fixture ($config)" link
+done
+
+# The compile-assert reads the client tree. It is the only thing that can decide the emitted
+# `CallArgs` scheme parameter question: the alias is consumed by `Transport<S>`-typed call sites,
+# the orThrow companion and the aggregate, none of which an assertion over emitted text can reach.
+for exact_optional in false true; do
+  strict_flag_matrix "strict-flags-3.1 compile-assert" "$exact_optional" \
+    "$work/strict-flags-client/compile-assert/cases.ts"
 done
 
 node --test crates/oasts-core/runtime/test-e2e/index.js

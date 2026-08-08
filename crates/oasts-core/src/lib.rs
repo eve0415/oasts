@@ -18,6 +18,7 @@ mod response_media;
 pub mod semantic;
 mod syntax;
 pub mod transform;
+mod tsconfig;
 pub mod writer;
 pub mod zod_peer;
 

@@ -210,10 +210,12 @@ function isLeapYear(year: number): boolean {
 }
 
 function isValidDate(year: number, month: number, day: number): boolean {
-  if (month < 1 || month > 12) {
+  // The table lookup is the month range check: anything outside 1..12 indexes past the table.
+  const daysInMonth = DAYS_IN_MONTH[month - 1];
+  if (daysInMonth === undefined) {
     return false;
   }
-  const maxDay = month === 2 && isLeapYear(year) ? 29 : DAYS_IN_MONTH[month - 1];
+  const maxDay = month === 2 && isLeapYear(year) ? 29 : daysInMonth;
   return day >= 1 && day <= maxDay;
 }
 
@@ -238,10 +240,12 @@ export function isDateTime(s: string): boolean {
   if (match === null) {
     return false;
   }
+  const offset = match[7];
   return (
+    offset !== undefined &&
     isValidDate(Number(match[1]), Number(match[2]), Number(match[3])) &&
     isValidTime(Number(match[4]), Number(match[5]), Number(match[6])) &&
-    isValidOffset(match[7])
+    isValidOffset(offset)
   );
 }
 
@@ -260,8 +264,11 @@ export function isTime(s: string): boolean {
   if (match === null) {
     return false;
   }
+  const offset = match[4];
   return (
-    isValidTime(Number(match[1]), Number(match[2]), Number(match[3])) && isValidOffset(match[4])
+    offset !== undefined &&
+    isValidTime(Number(match[1]), Number(match[2]), Number(match[3])) &&
+    isValidOffset(offset)
   );
 }
 

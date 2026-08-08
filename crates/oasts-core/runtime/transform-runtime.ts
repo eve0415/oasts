@@ -88,7 +88,8 @@ function isLeapYear(year: number): boolean {
   return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
 }
 
-function daysInMonth(year: number, month: number): number {
+// undefined when the month falls outside 1..12: the table lookup is the range check.
+function daysInMonth(year: number, month: number): number | undefined {
   return month === 2 && isLeapYear(year) ? 29 : DAYS_IN_MONTH[month - 1];
 }
 
@@ -193,7 +194,8 @@ function parseDateTime(value: unknown, maxFractionDigits: number): WireDateTime 
   const hour = Number(hourText);
   const minute = Number(minuteText);
   const second = Number(secondText);
-  if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) {
+  const maxDay = daysInMonth(year, month);
+  if (maxDay === undefined || day < 1 || day > maxDay) {
     return null;
   }
   // Second 60 is legal RFC 3339 but neither Date nor Instant can hold a leap second.
@@ -325,7 +327,8 @@ export function decodePlainDate(
   const year = Number(match[1]);
   const month = Number(match[2]);
   const day = Number(match[3]);
-  if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) {
+  const maxDay = daysInMonth(year, month);
+  if (maxDay === undefined || day < 1 || day > maxDay) {
     throw wireFailure(value, pointer, path);
   }
   return new temporal.PlainDate(year, month, day);

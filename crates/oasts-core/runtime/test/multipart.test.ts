@@ -43,6 +43,29 @@ describe("multipart body", () => {
     assert.deepEqual(encoded.body, UTF8_ENCODER.encode("--oxb-e3b0c44298fc1c149afbf4c8--"));
   });
 
+  // The frozen vectors pin whole bodies. This pins the delimiter *sequence* on its own, which is
+  // the thing a rewrite of the chunk assembly can get wrong without breaking any single vector:
+  // an opening delimiter before the first part, one between each neighbouring pair, and a closing
+  // one at the end — never an inter-part delimiter before the first part or after the last.
+  test("assembles one opening, one inter-part and one closing delimiter", async () => {
+    for (const count of [1, 2, 3, 5]) {
+      const parts = Array.from({ length: count }, (_unused, index) => ({
+        name: `f${index}`,
+        payload: UTF8_ENCODER.encode(`p${index}`),
+      }));
+      const encoded = await encodeMultipart(parts);
+      const text = new TextDecoder().decode(encoded.body);
+      const boundary = encoded.boundary;
+
+      assert.ok(text.startsWith(`--${boundary}\r\n`));
+      assert.ok(text.endsWith(`\r\n--${boundary}--`));
+      assert.equal(text.split(`\r\n--${boundary}\r\n`).length - 1, count - 1);
+      for (const [index] of parts.entries()) {
+        assert.ok(text.includes(`p${index}`));
+      }
+    }
+  });
+
   test("rejects a runtime field name that cannot be represented", async () => {
     await assert.rejects(
       encodeMultipart([{ name: "bad\nname", payload: new Uint8Array() }]),

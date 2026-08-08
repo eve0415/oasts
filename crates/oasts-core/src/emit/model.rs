@@ -43,6 +43,13 @@ pub(crate) struct EmissionModel<'input, 'sink> {
     /// Where each artifact's files land. Every emitted path and every cross-artifact import is
     /// built from these, so no emitter spells another artifact's directory.
     pub(crate) dirs: ArtifactDirs<'input>,
+    /// Whether the consumer's own `lib` already declares `Temporal`, so emitted code can leave the
+    /// `esnext.temporal` reference directive out.
+    ///
+    /// The one fact outside version, config and input that reaches emitted bytes. It is read from
+    /// the tsconfig committed beside the project, which is shared versioned state rather than a
+    /// per-developer setting — and `typescript.tsconfig: off` opts out of reading it at all.
+    pub(crate) consumer_provides_temporal: bool,
     digest: String,
     schema_targets: HashMap<String, HashMap<String, SchemaTarget>>,
     pub(crate) component_files: Vec<Option<String>>,
@@ -71,6 +78,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             analyzed,
             config,
             dirs: ArtifactDirs::new(config),
+            consumer_provides_temporal: false,
             digest,
             schema_targets: HashMap::new(),
             component_files: vec![None; analyzed.ir.schemas.len()],

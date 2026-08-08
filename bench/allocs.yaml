@@ -169,10 +169,10 @@ keys:
         deallocs: 30
         allocBytes: 2788
       - stage: "emit"
-        allocs: 430
-        reallocs: 130
-        deallocs: 415
-        allocBytes: 30838
+        allocs: 442
+        reallocs: 162
+        deallocs: 427
+        allocBytes: 31238
     informational:
       peakBytes: 93424
   - fixture: "petstore-3.0-msw"
@@ -194,12 +194,12 @@ keys:
         deallocs: 30
         allocBytes: 2788
       - stage: "emit"
-        allocs: 1261
-        reallocs: 242
-        deallocs: 1234
-        allocBytes: 241451
+        allocs: 1273
+        reallocs: 277
+        deallocs: 1246
+        allocBytes: 246730
     informational:
-      peakBytes: 169063
+      peakBytes: 172737
   - fixture: "petstore-3.0-zod"
     config: "oasts-zod.yaml"
     stages:
@@ -219,10 +219,10 @@ keys:
         deallocs: 30
         allocBytes: 2788
       - stage: "emit"
-        allocs: 893
-        reallocs: 263
-        deallocs: 864
-        allocBytes: 98378
+        allocs: 906
+        reallocs: 305
+        deallocs: 877
+        allocBytes: 100554
     informational:
       peakBytes: 93424
   - fixture: "petstore-3.0-client"
@@ -249,12 +249,12 @@ keys:
         deallocs: 24
         allocBytes: 18194
       - stage: "emit"
-        allocs: 1310
-        reallocs: 342
-        deallocs: 1250
-        allocBytes: 317960
+        allocs: 1331
+        reallocs: 353
+        deallocs: 1267
+        allocBytes: 335232
     informational:
-      peakBytes: 293479
+      peakBytes: 308457
   - fixture: "petstore-3.0-tanstack"
     config: "oasts-tanstack.yaml"
     stages:
@@ -279,12 +279,12 @@ keys:
         deallocs: 30
         allocBytes: 18020
       - stage: "emit"
-        allocs: 1811
-        reallocs: 460
-        deallocs: 1772
-        allocBytes: 436651
+        allocs: 1823
+        reallocs: 471
+        deallocs: 1784
+        allocBytes: 470207
     informational:
-      peakBytes: 279006
+      peakBytes: 304294
   - fixture: "tictactoe-3.1"
     config: "oasts.yaml"
     stages:
@@ -300,14 +300,14 @@ keys:
         allocBytes: 110185
       - stage: "analyze"
         allocs: 113
-        reallocs: 16
+        reallocs: 17
         deallocs: 65
-        allocBytes: 7772
+        allocBytes: 7145
       - stage: "emit"
-        allocs: 803
-        reallocs: 227
-        deallocs: 774
-        allocBytes: 73731
+        allocs: 815
+        reallocs: 279
+        deallocs: 786
+        allocBytes: 74187
     informational:
       peakBytes: 185293
   - fixture: "client-showcase-3.1"
@@ -332,14 +332,14 @@ keys:
         allocs: 715
         reallocs: 34
         deallocs: 175
-        allocBytes: 88291
+        allocBytes: 89003
       - stage: "emit"
-        allocs: 3979
-        reallocs: 905
-        deallocs: 3908
-        allocBytes: 690105
+        allocs: 3994
+        reallocs: 1016
+        deallocs: 3923
+        allocBytes: 705441
     informational:
-      peakBytes: 526840
+      peakBytes: 534341
   - fixture: "auth-showcase-3.1"
     config: "oasts.yaml"
     stages:
@@ -364,12 +364,12 @@ keys:
         deallocs: 189
         allocBytes: 45476
       - stage: "emit"
-        allocs: 2904
-        reallocs: 766
-        deallocs: 2847
-        allocBytes: 446619
+        allocs: 2916
+        reallocs: 843
+        deallocs: 2859
+        allocBytes: 473679
     informational:
-      peakBytes: 379090
+      peakBytes: 404454
   - fixture: "pathological-3.1"
     config: "oasts.yaml"
     stages:
@@ -389,9 +389,9 @@ keys:
         deallocs: 524
         allocBytes: 53113
       - stage: "emit"
-        allocs: 4340
-        reallocs: 1037
-        deallocs: 4231
-        allocBytes: 496233
+        allocs: 4352
+        reallocs: 1332
+        deallocs: 4243
+        allocBytes: 498725
     informational:
       peakBytes: 943538

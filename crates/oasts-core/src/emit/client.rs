@@ -635,8 +635,13 @@ fn emit_operation(
     // The kernel entry points plus whichever body encoders this operation's descriptor names,
     // written in the table's order so adding an encoder cannot reorder the clause run to run.
     let mut transport_values = [false; TRANSPORT_VALUE_IMPORTS.len()];
-    for name in TRANSPORT_KERNEL_IMPORTS {
-        transport_values[transport_import_index(name)] = true;
+    transport_values[transport_import_index("execute")] = true;
+    // `executeOrThrow` only appears when nothing is bound. A validated or converting operation's
+    // orThrow variant delegates to `unwrap` over its own base function instead, so importing the
+    // runtime entry point unconditionally leaves it unread — which is an error in a consumer
+    // project compiling generated code under `noUnusedLocals`.
+    if !(validation_binding || binds_transform) {
+        transport_values[transport_import_index("executeOrThrow")] = true;
     }
     if !plan.auth_plan.is_empty() {
         transport_values[transport_import_index("authAlternatives")] = true;
@@ -3008,8 +3013,11 @@ fn render_call_args(
     stem: &str,
 ) -> String {
     if call_args_is_unconditional(auth_plan, enforcement) {
+        // The parameter is kept so every operation's alias has the same arity and an explicit
+        // instantiation still resolves, and `_`-prefixed so `noUnusedParameters` in a consumer's
+        // project does not report the one alias body that never mentions it.
         return format!(
-            "export type {stem}CallArgs<S extends string> = [options?: CallOptions];\n"
+            "export type {stem}CallArgs<_S extends string> = [options?: CallOptions];\n"
         );
     }
     let widened_tuple = auth_options_tuple(auth_plan, full_rec);
@@ -3276,9 +3284,6 @@ const TRANSPORT_VALUE_IMPORTS: [&str; 17] = [
     "textBody",
     "urlencodedBody",
 ];
-
-/// The two kernel entry points every operation module writes.
-const TRANSPORT_KERNEL_IMPORTS: [&str; 2] = ["execute", "executeOrThrow"];
 
 /// The name's slot in `TRANSPORT_VALUE_IMPORTS`. Looked up rather than hand-numbered so adding an
 /// import cannot silently renumber the others.
@@ -4439,7 +4444,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ GetPetResponse200, GetPetResponseDefault }} from \"../../types/operations/getpet.js\";\nimport type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ serializePathSimple, serializeQueryFormExplode }} from \"../../runtime/serialize.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetInput = {{\n  /**\n   * The pet identifier.\n   */\n  petId: string;\n  /**\n   * The result limit.\n   */\n  limit?: number;\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetResult =\n  | {{ outcome: 200; ok: true; status: 200; data: GetPetResponse200; meta: ResponseMeta }}\n  | {{ outcome: \"default\"; ok: true; status: number; data: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ outcome: \"default\"; ok: false; status: number; error: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<200 | \"default\">\n  | RequestPhaseFailure;\n\nexport type GetPetCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"getPet\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"pets\" }}],\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"param\", name: \"petId\" }}],\n  ],\n  params: [\n    {{ name: \"petId\", location: \"path\", required: true, serialize: serializePathSimple, allowReserved: false }},\n    {{ name: \"limit\", location: \"query\", required: false, serialize: serializeQueryFormExplode, allowReserved: false }},\n  ],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  security: null,\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n    {{ match: \"default\", kind: \"default\", status: null, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function getPet<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<GetPetResult> {{\n  return execute<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function getPetOrThrow<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<{{ data: GetPetResponse200; meta: ResponseMeta }} | {{ data: GetPetResponseDefault; meta: ResponseMeta }}> {{\n  return executeOrThrow<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ GetPetResponse200, GetPetResponseDefault }} from \"../../types/operations/getpet.js\";\nimport type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ serializePathSimple, serializeQueryFormExplode }} from \"../../runtime/serialize.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetInput = {{\n  /**\n   * The pet identifier.\n   */\n  petId: string;\n  /**\n   * The result limit.\n   */\n  limit?: number;\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Responses\n * \n * - 200: found\n * - default: fallback\n */\nexport type GetPetResult =\n  | {{ outcome: 200; ok: true; status: 200; data: GetPetResponse200; meta: ResponseMeta }}\n  | {{ outcome: \"default\"; ok: true; status: number; data: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ outcome: \"default\"; ok: false; status: number; error: GetPetResponseDefault; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<200 | \"default\">\n  | RequestPhaseFailure;\n\nexport type GetPetCallArgs<_S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"getPet\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"pets\" }}],\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"param\", name: \"petId\" }}],\n  ],\n  params: [\n    {{ name: \"petId\", location: \"path\", required: true, serialize: serializePathSimple, allowReserved: false }},\n    {{ name: \"limit\", location: \"query\", required: false, serialize: serializeQueryFormExplode, allowReserved: false }},\n  ],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  security: null,\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n    {{ match: \"default\", kind: \"default\", status: null, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function getPet<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<GetPetResult> {{\n  return execute<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1pets~1{{petId}}/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * Responses\n * \n * - 200: found\n * - default: fallback\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function getPetOrThrow<S extends string = never>(transport: Transport<S>, input: GetPetInput, ...args: GetPetCallArgs<S>): Promise<{{ data: GetPetResponse200; meta: ResponseMeta }} | {{ data: GetPetResponseDefault; meta: ResponseMeta }}> {{\n  return executeOrThrow<GetPetResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let expected = expected.replace(
             "export type GetPetInput = {\n  /**\n   * The pet identifier.\n   */\n  petId: string;\n  /**\n   * The result limit.\n   */\n  limit?: number;\n};",
@@ -4484,7 +4489,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, multipartBody, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetInput = {{\n  body: {{\n    meta: {{ body: {{\n      tag?: string;\n    }}; contentType: \"application/json\" | \"application/cbor\" }};\n    title: string;\n    file: Blob | File;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetResult =\n  | {{ outcome: 204; ok: true; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<204>\n  | RequestPhaseFailure;\n\nexport type UploadAssetCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadAsset\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"uploads\" }}],\n  ],\n  params: [],\n  body: multipartBody([\n    {{ name: \"meta\", required: true, repeated: false, wrapper: true, payload: \"json\", contentType: {{ kind: \"selected\", admitted: [\"application/json\", \"application/cbor\"] }}, payloads: [\"json\", \"json\"], filename: false }},\n    {{ name: \"title\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"text/plain\" }}, filename: false }},\n    {{ name: \"file\", required: true, repeated: false, wrapper: false, payload: \"binary\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: true }},\n  ]),\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: null,\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function uploadAsset<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<UploadAssetResult> {{\n  return execute<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function uploadAssetOrThrow<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<{{ data: undefined; meta: ResponseMeta }}> {{\n  return executeOrThrow<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, multipartBody, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetInput = {{\n  body: {{\n    meta: {{ body: {{\n      tag?: string;\n    }}; contentType: \"application/json\" | \"application/cbor\" }};\n    title: string;\n    file: Blob | File;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nexport type UploadAssetResult =\n  | {{ outcome: 204; ok: true; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<204>\n  | RequestPhaseFailure;\n\nexport type UploadAssetCallArgs<_S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadAsset\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"uploads\" }}],\n  ],\n  params: [],\n  body: multipartBody([\n    {{ name: \"meta\", required: true, repeated: false, wrapper: true, payload: \"json\", contentType: {{ kind: \"selected\", admitted: [\"application/json\", \"application/cbor\"] }}, payloads: [\"json\", \"json\"], filename: false }},\n    {{ name: \"title\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"text/plain\" }}, filename: false }},\n    {{ name: \"file\", required: true, repeated: false, wrapper: false, payload: \"binary\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: true }},\n  ]),\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: null,\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function uploadAsset<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<UploadAssetResult> {{\n  return execute<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1uploads/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function uploadAssetOrThrow<S extends string = never>(transport: Transport<S>, input: UploadAssetInput, ...args: UploadAssetCallArgs<S>): Promise<{{ data: undefined; meta: ResponseMeta }}> {{\n  return executeOrThrow<UploadAssetResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "uploadasset");
         assert_eq!(actual, expected);
@@ -4520,7 +4525,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, multipartBody, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteInput = {{\n  body: {{\n    note: string;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteResult =\n  | {{ outcome: 204; ok: true; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<204>\n  | RequestPhaseFailure;\n\nexport type UploadNoteCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadNote\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"notes\" }}],\n  ],\n  params: [],\n  body: multipartBody([\n    {{ name: \"note\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: false }},\n  ]),\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: null,\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function uploadNote<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<UploadNoteResult> {{\n  return execute<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function uploadNoteOrThrow<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<{{ data: undefined; meta: ResponseMeta }}> {{\n  return executeOrThrow<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, multipartBody, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteInput = {{\n  body: {{\n    note: string;\n  }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nexport type UploadNoteResult =\n  | {{ outcome: 204; ok: true; status: 204; data: undefined; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<204>\n  | RequestPhaseFailure;\n\nexport type UploadNoteCallArgs<_S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1notes/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"uploadNote\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"notes\" }}],\n  ],\n  params: [],\n  body: multipartBody([\n    {{ name: \"note\", required: true, repeated: false, wrapper: false, payload: \"text\", contentType: {{ kind: \"fixed\", value: \"application/octet-stream\" }}, filename: false }},\n  ]),\n  accept: null,\n  credentialHeaders: [\"authorization\"],\n  security: null,\n  responses: [\n    {{ match: \"204\", kind: \"exact\", status: 204, bodyless: false, media: [], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function uploadNote<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<UploadNoteResult> {{\n  return execute<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1notes/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function uploadNoteOrThrow<S extends string = never>(transport: Transport<S>, input: UploadNoteInput, ...args: UploadNoteCallArgs<S>): Promise<{{ data: undefined; meta: ResponseMeta }}> {{\n  return executeOrThrow<UploadNoteResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "uploadnote");
         assert_eq!(actual, expected);
@@ -4596,7 +4601,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ SendMessageRequest, SendMessageResponse200 }} from \"../../types/operations/sendmessage.js\";\nimport type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ discriminatedBody, execute, executeOrThrow, jsonBody, textBody, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageInput = {{\n  body: {{ contentType: \"application/json\"; body: SendMessageRequest[\"body\"] }} | {{ contentType: \"text/plain\"; body: string }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageResult =\n  | {{ outcome: 200; ok: true; status: 200; data: SendMessageResponse200; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<200>\n  | RequestPhaseFailure;\n\nexport type SendMessageCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"sendMessage\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"messages\" }}],\n  ],\n  params: [],\n  body: discriminatedBody([\n    [\"application/json\", jsonBody(\"application/json\")],\n    [\"text/plain\", textBody(\"text/plain\")],\n  ]),\n  accept: \"text/plain\",\n  credentialHeaders: [\"authorization\"],\n  security: null,\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"text/plain\", \"text\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function sendMessage<S extends string = never>(transport: Transport<S>, input: SendMessageInput, ...args: SendMessageCallArgs<S>): Promise<SendMessageResult> {{\n  return execute<SendMessageResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function sendMessageOrThrow<S extends string = never>(transport: Transport<S>, input: SendMessageInput, ...args: SendMessageCallArgs<S>): Promise<{{ data: SendMessageResponse200; meta: ResponseMeta }}> {{\n  return executeOrThrow<SendMessageResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ SendMessageRequest, SendMessageResponse200 }} from \"../../types/operations/sendmessage.js\";\nimport type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ discriminatedBody, execute, executeOrThrow, jsonBody, textBody, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageInput = {{\n  body: {{ contentType: \"application/json\"; body: SendMessageRequest[\"body\"] }} | {{ contentType: \"text/plain\"; body: string }};\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nexport type SendMessageResult =\n  | {{ outcome: 200; ok: true; status: 200; data: SendMessageResponse200; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<200>\n  | RequestPhaseFailure;\n\nexport type SendMessageCallArgs<_S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1messages/post\nconst descriptor: OperationDescriptor = {{\n  operationId: \"sendMessage\",\n  method: \"POST\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"messages\" }}],\n  ],\n  params: [],\n  body: discriminatedBody([\n    [\"application/json\", jsonBody(\"application/json\")],\n    [\"text/plain\", textBody(\"text/plain\")],\n  ]),\n  accept: \"text/plain\",\n  credentialHeaders: [\"authorization\"],\n  security: null,\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"text/plain\", \"text\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function sendMessage<S extends string = never>(transport: Transport<S>, input: SendMessageInput, ...args: SendMessageCallArgs<S>): Promise<SendMessageResult> {{\n  return execute<SendMessageResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1messages/post\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function sendMessageOrThrow<S extends string = never>(transport: Transport<S>, input: SendMessageInput, ...args: SendMessageCallArgs<S>): Promise<{{ data: SendMessageResponse200; meta: ResponseMeta }}> {{\n  return executeOrThrow<SendMessageResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "sendmessage");
         assert_eq!(actual, expected);
@@ -6145,13 +6150,14 @@ mod tests {
 
     /// The import clause is written by walking `TRANSPORT_VALUE_IMPORTS` in place, so the table's
     /// own order IS the emitted order — an out-of-order entry would silently produce an unsorted
-    /// import line, and `TRANSPORT_KERNEL_IMPORTS` must keep pointing at the two kernel names.
+    /// import line. The two kernel entry points are named literally at the call site, so their
+    /// lookups have to keep resolving.
     #[test]
     fn transport_value_imports_are_sorted() {
         let mut sorted = TRANSPORT_VALUE_IMPORTS;
         sorted.sort_unstable();
         assert_eq!(sorted, TRANSPORT_VALUE_IMPORTS);
-        for name in TRANSPORT_KERNEL_IMPORTS {
+        for name in ["execute", "executeOrThrow"] {
             assert_eq!(TRANSPORT_VALUE_IMPORTS[transport_import_index(name)], name);
         }
     }
@@ -6746,7 +6752,7 @@ mod tests {
                 AuthEnforcement::Types,
                 "AnonymousIncluded"
             ),
-            "export type AnonymousIncludedCallArgs<S extends string> = [options?: CallOptions];\n"
+            "export type AnonymousIncludedCallArgs<_S extends string> = [options?: CallOptions];\n"
         );
     }
 
@@ -7070,7 +7076,7 @@ mod tests {
             vec![vec![auth_scheme("bearerAuth", AuthKind::Bearer, &[])]];
         assert_eq!(
             render_call_args(&secured, AuthEnforcement::Runtime, "InheritedRootOnly"),
-            "export type InheritedRootOnlyCallArgs<S extends string> = [options?: CallOptions];\n"
+            "export type InheritedRootOnlyCallArgs<_S extends string> = [options?: CallOptions];\n"
         );
     }
 
@@ -7103,8 +7109,78 @@ mod tests {
         ));
         assert!(
             actual
-                .contains("export type PingCallArgs<S extends string> = [options?: CallOptions];")
+                .contains("export type PingCallArgs<_S extends string> = [options?: CallOptions];")
         );
+    }
+
+    /// Two bindings an operation module emitted unconditionally and did not always read. Both are
+    /// errors in a consumer compiling generated code with `noUnusedLocals`/`noUnusedParameters`,
+    /// which is a bar this repo's own `--strict` gate does not reach.
+    #[test]
+    fn unread_kernel_import_and_scheme_parameter_are_not_emitted() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "security": [{ "bearerAuth": [] }],
+            "paths": {
+                "/open": {
+                    "get": {
+                        "operationId": "readOpen",
+                        "security": [],
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": { "application/json": { "schema": { "type": "object" } } }
+                            }
+                        }
+                    }
+                },
+                "/secured": {
+                    "get": {
+                        "operationId": "readSecured",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": { "application/json": { "schema": { "type": "object" } } }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "securitySchemes": { "bearerAuth": { "type": "http", "scheme": "bearer" } }
+            }
+        });
+
+        // Nothing bound: the orThrow variant really does call the runtime entry point.
+        let (unbound, diagnostics) = emit_operation(document.clone(), "readopen");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(unbound.contains("executeOrThrow"));
+        // No auth-conditional tuple, so the scheme parameter is declared and never read.
+        assert!(
+            unbound.contains(
+                "export type ReadOpenCallArgs<_S extends string> = [options?: CallOptions];"
+            ),
+            "{unbound}"
+        );
+
+        // Response validation bound: orThrow goes through `unwrap` over the base function instead,
+        // so the runtime entry point is never named and must not be imported.
+        let bound = emit_validated_operation(document.clone(), "readopen", false, true);
+        assert!(!bound.contains("executeOrThrow"), "{bound}");
+        assert!(bound.contains("import { unwrap } from"), "{bound}");
+
+        // The secured operation is the contrast: its tuple reads the parameter, so it keeps the
+        // plain name and every reference to it still resolves.
+        let (secured, diagnostics) = emit_operation(document, "readsecured");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(
+            secured.contains(
+                "export type ReadSecuredCallArgs<S extends string> = [string] extends [S] ?"
+            ),
+            "{secured}"
+        );
+        assert!(!secured.contains("ReadSecuredCallArgs<_S"), "{secured}");
     }
 
     // --- generated validation binding ----------------------------------------------------------
@@ -8176,7 +8252,7 @@ mod tests {
             }
         });
         let expected = format!(
-            "{HEADER}import type {{ ListItemsResponse200 }} from \"../../types/operations/listitems.js\";\nimport type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1items/get\nexport type ListItemsInput = {{}};\n\n// Source: workspace/openapi.json#/paths/~1items/get\nexport type ListItemsResult =\n  | {{ outcome: 200; ok: true; status: 200; data: ListItemsResponse200; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<200>\n  | RequestPhaseFailure;\n\nexport type ListItemsCallArgs<S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1items/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"listItems\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"items\" }}],\n  ],\n  params: [],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  security: null,\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function listItems<S extends string = never>(transport: Transport<S>, input: ListItemsInput, ...args: ListItemsCallArgs<S>): Promise<ListItemsResult> {{\n  return execute<ListItemsResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function listItemsOrThrow<S extends string = never>(transport: Transport<S>, input: ListItemsInput, ...args: ListItemsCallArgs<S>): Promise<{{ data: ListItemsResponse200; meta: ResponseMeta }}> {{\n  return executeOrThrow<ListItemsResult>(transport, descriptor, input, args[0]);\n}}\n"
+            "{HEADER}import type {{ ListItemsResponse200 }} from \"../../types/operations/listitems.js\";\nimport type {{ RequestPhaseFailure, ResponseMeta, ResponsePhaseFailure, UnknownHttpError }} from \"../../runtime/result.js\";\nimport {{ execute, executeOrThrow, type CallOptions, type OperationDescriptor, type Transport }} from \"../../runtime/transport.js\";\n\n// Source: workspace/openapi.json#/paths/~1items/get\nexport type ListItemsInput = {{}};\n\n// Source: workspace/openapi.json#/paths/~1items/get\nexport type ListItemsResult =\n  | {{ outcome: 200; ok: true; status: 200; data: ListItemsResponse200; meta: ResponseMeta }}\n  | {{ outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }}\n  | ResponsePhaseFailure<200>\n  | RequestPhaseFailure;\n\nexport type ListItemsCallArgs<_S extends string> = [options?: CallOptions];\n\n// Source: workspace/openapi.json#/paths/~1items/get\nconst descriptor: OperationDescriptor = {{\n  operationId: \"listItems\",\n  method: \"GET\",\n  path: [\n    [{{ kind: \"literal\", text: \"/\" }}, {{ kind: \"literal\", text: \"items\" }}],\n  ],\n  params: [],\n  body: null,\n  accept: \"application/json\",\n  credentialHeaders: [\"authorization\"],\n  security: null,\n  responses: [\n    {{ match: \"200\", kind: \"exact\", status: 200, bodyless: false, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false }},\n  ],\n  baseUrl: {{ kind: \"literal\", value: \"https://api.example.test/v1\" }},\n  fetchDefaults: {{}},\n}};\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns A typed result covering every documented response and failure.\n */\nexport async function listItems<S extends string = never>(transport: Transport<S>, input: ListItemsInput, ...args: ListItemsCallArgs<S>): Promise<ListItemsResult> {{\n  return execute<ListItemsResult>(transport, descriptor, input, args[0]);\n}}\n\n// Source: workspace/openapi.json#/paths/~1items/get\n/**\n * @remarks\n * Successful response data is decoded but unchecked against the OpenAPI schema.\n * \n * @returns The successful response data and its response metadata.\n */\nexport async function listItemsOrThrow<S extends string = never>(transport: Transport<S>, input: ListItemsInput, ...args: ListItemsCallArgs<S>): Promise<{{ data: ListItemsResponse200; meta: ResponseMeta }}> {{\n  return executeOrThrow<ListItemsResult>(transport, descriptor, input, args[0]);\n}}\n"
         );
         let (actual, diagnostics) = emit_operation(document, "listitems");
         assert_eq!(

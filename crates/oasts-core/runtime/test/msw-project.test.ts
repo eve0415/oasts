@@ -1189,4 +1189,67 @@ describe("MSW malformed parameter projection", () => {
     });
     expectDecodeError(() => content('{"fixed":"x","extra":"bad"}', numericAdditional));
   });
+
+  // Projection is serialization run backwards, so every lookup here can legitimately come back
+  // empty. These pin what each of those states does, because the narrowings that make the file
+  // compile under noUncheckedIndexedAccess all sit on exactly these lookups — and a narrowing that
+  // quietly changed one of them would otherwise show up only in a consumer's mock.
+  test("empty lookups keep their outcomes when the index misses", () => {
+    // A cookie name that names an Object.prototype member is absent, not inherited. Reading the
+    // record without an own-property check would hand the resolver a function.
+    for (const inherited of ["toString", "constructor", "__proto__"]) {
+      assert.equal(
+        projectOptional(
+          { ...pathContext("value"), cookies: {} },
+          "cookie",
+          "query-form",
+          STRING_SHAPE,
+          inherited,
+        ),
+        undefined,
+      );
+    }
+
+    // A single-occurrence query lookup: absent is absent, one resolves, and a repeat is an error
+    // rather than a silent first-wins.
+    assert.equal(
+      projectOptional(queryContext("other=1"), "query", "query-form", STRING_SHAPE),
+      undefined,
+    );
+    assert.equal(
+      projectRequired(queryContext("p=one"), "query", "query-form", STRING_SHAPE),
+      "one",
+    );
+    expectDecodeError(() =>
+      projectRequired(queryContext("p=one&p=two"), "query", "query-form", STRING_SHAPE),
+    );
+
+    // A non-exploded object decodes name/value alternately, so an odd component count has no
+    // final value to pair and must fail rather than pair a name with undefined.
+    expectDecodeError(() =>
+      projectRequired(queryContext("p=k,a,orphan"), "query", "query-form", STRING_OBJECT_SHAPE),
+    );
+
+    // Exploded matrix framing: a primitive needs exactly one entry, under its own name.
+    assert.equal(
+      projectRequired(pathContext(";p=x"), "path", "path-matrix-explode", STRING_SHAPE),
+      "x",
+    );
+    expectDecodeError(() =>
+      projectRequired(pathContext(";other=x"), "path", "path-matrix-explode", STRING_SHAPE),
+    );
+    expectDecodeError(() =>
+      projectRequired(pathContext(";p=x;p=y"), "path", "path-matrix-explode", STRING_SHAPE),
+    );
+
+    // A union whose branches disagree has no single decoding; one that no branch accepts has none.
+    const union = { kind: "union", variants: [STRING_SHAPE, NUMBER_SHAPE] } as const;
+    assert.equal(projectRequired(pathContext("plain"), "path", "path-simple", union), "plain");
+    expectDecodeError(() =>
+      projectRequired(pathContext("x"), "path", "path-simple", {
+        kind: "union",
+        variants: [NUMBER_SHAPE, BOOLEAN_SHAPE],
+      }),
+    );
+  });
 });

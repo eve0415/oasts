@@ -45,6 +45,8 @@ const CODE_BASE_URL: &str = "OASTS0181";
 const CODE_NAMING: &str = "OASTS0201";
 const CODE_EMIT: &str = "OASTS0211";
 const CODE_TRUST_LIMITS: &str = "OASTS0221";
+/// The `typescript` block. Sits above the highest allocated config code, which stops at 0242.
+const CODE_TYPESCRIPT: &str = "OASTS0251";
 pub(crate) const CODE_BLOCK_UNSUPPORTED: &str = "OASTS0222";
 
 const DISCOVERY_NAMES: [&str; 8] = [
@@ -135,6 +137,8 @@ pub struct RawConfig {
     pub remote: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub limits: Option<LimitsConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub typescript: Option<RawTypescript>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub compat: Option<CompatConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
@@ -768,6 +772,32 @@ impl Default for EmitConfig {
     }
 }
 
+/// How the consumer's `tsconfig.json` is located.
+///
+/// This is the only consumer-side file that reaches emitted bytes: it decides whether generated
+/// code carries the `esnext.temporal` reference directive. `off` is therefore the setting a build
+/// reaches for when it needs output that does not depend on anything outside version, config and
+/// input — it answers "the consumer does not provide Temporal" and always emits the directive.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum TsconfigSource {
+    /// Nearest `tsconfig.json` at or above the resolved output directory.
+    #[default]
+    Auto,
+    /// Read nothing.
+    Off,
+    /// A path resolved below `workspaceRoot`, like every other path in this config.
+    Path(PathBuf),
+}
+
+/// The `typescript` block, before path resolution.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct RawTypescript {
+    /// `auto`, `off`, or a path relative to the config directory.
+    pub tsconfig: Option<String>,
+}
+
 /// Local file trust options.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -922,6 +952,7 @@ pub struct ResolvedConfig {
     pub local_allow_paths: Vec<PathBuf>,
     pub limits: LimitsConfig,
     pub compat: CompatConfig,
+    pub tsconfig: TsconfigSource,
 }
 
 /// A discovered configuration candidate before script-support policy is applied.
@@ -1298,6 +1329,13 @@ pub fn resolve_config(
         }
     }
 
+    let tsconfig = resolve_tsconfig_source(
+        raw.typescript.as_ref(),
+        &workspace_root,
+        source_path,
+        &mut sink,
+    );
+
     let has_errors = sink.has_errors();
     let diagnostics = sink.into_sorted_vec();
     if has_errors {
@@ -1332,6 +1370,7 @@ pub fn resolve_config(
         local_allow_paths,
         limits,
         compat,
+        tsconfig,
     })
 }
 
@@ -1383,6 +1422,38 @@ fn resolve_input(
             ));
             None
         }
+    }
+}
+
+/// Resolves `typescript.tsconfig`.
+///
+/// `auto` and `off` are the two words; anything else is a path, held to the same below-workspace
+/// containment every other path in this config gets. A path is resolved against the config
+/// directory the way `input` and `output` are, so a config can name a tsconfig beside itself.
+fn resolve_tsconfig_source(
+    raw: Option<&RawTypescript>,
+    workspace_root: &Path,
+    source: &Path,
+    sink: &mut DiagnosticSink,
+) -> TsconfigSource {
+    let Some(value) = raw.and_then(|block| block.tsconfig.as_deref()) else {
+        return TsconfigSource::Auto;
+    };
+    match value {
+        "auto" => TsconfigSource::Auto,
+        "off" => TsconfigSource::Off,
+        path => match resolve_below(workspace_root, Path::new(path), false) {
+            Ok(resolved) => TsconfigSource::Path(resolved),
+            Err(reason) => {
+                sink.push(config_error(
+                    CODE_TYPESCRIPT,
+                    format!("invalid typescript.tsconfig: {reason}"),
+                    Some(source),
+                    Some("/typescript/tsconfig"),
+                ));
+                TsconfigSource::Auto
+            }
+        },
     }
 }
 
@@ -2798,6 +2869,39 @@ mod tests {
             value["output"] = json!(output);
             assert_code(load_json(&value), CODE_OUTPUT);
         }
+    }
+
+    #[test]
+    fn typescript_tsconfig_takes_two_words_or_a_contained_path() {
+        let base = || {
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true }
+            })
+        };
+        // Absent and the two words.
+        assert_eq!(
+            load_json(&base()).expect("resolves").tsconfig,
+            TsconfigSource::Auto
+        );
+        for (word, expected) in [("auto", TsconfigSource::Auto), ("off", TsconfigSource::Off)] {
+            let mut value = base();
+            value["typescript"] = json!({ "tsconfig": word });
+            assert_eq!(load_json(&value).expect("resolves").tsconfig, expected);
+        }
+        // A path resolves below the workspace root like every other path in this config.
+        let mut value = base();
+        value["typescript"] = json!({ "tsconfig": "./tsconfig.build.json" });
+        assert!(matches!(
+            load_json(&value).expect("resolves").tsconfig,
+            TsconfigSource::Path(path) if path.ends_with("tsconfig.build.json")
+        ));
+        // And one that escapes it is refused by name.
+        let mut value = base();
+        value["typescript"] = json!({ "tsconfig": "../outside/tsconfig.json" });
+        assert_code(load_json(&value), CODE_TYPESCRIPT);
     }
 
     #[cfg(unix)]

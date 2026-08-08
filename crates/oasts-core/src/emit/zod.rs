@@ -292,6 +292,16 @@ struct SchemaRenderer<'a, 'input, 'sink> {
     current_schema_name: &'a str,
     runtime_values: &'a mut BTreeSet<&'static str>,
     imports: &'a mut SiblingImports,
+    /// Set when this component reaches itself across a `z.lazy` thunk.
+    ///
+    /// TypeScript resolves a cycle closed by property getters unaided, and refuses one closed by a
+    /// thunk (TS7022) — so the thunk is the only edge that makes the explicit schema annotation
+    /// load-bearing. Recorded here, at the site that *chose* getter or thunk, because that choice
+    /// is not recoverable from the rendered text: a `z.lazy` for a sibling that never refers back
+    /// is not on any cycle, and treating it as one puts the annotation back on the ordinary
+    /// recursive component — reinstating the very `exactOptionalPropertyTypes` failure the absent
+    /// annotation exists to avoid.
+    lazy_closes_cycle: &'a mut bool,
 }
 
 impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
@@ -314,6 +324,8 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
                     if self_is_deferred {
                         self.current_schema_name.to_owned()
                     } else {
+                        // A self reference with nothing to defer it: the thunk is the cycle.
+                        *self.lazy_closes_cycle = true;
                         format!("z.lazy(() => {})", self.current_schema_name)
                     }
                 } else {
@@ -322,6 +334,17 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
                         &target.file_base,
                         schema_name.clone(),
                     );
+                    if let Some(current) = self.current_schema
+                        && reaches_component(
+                            self.model,
+                            &self.model.analyzed.ir.schemas[target.index].schema,
+                            current,
+                            &mut BTreeSet::new(),
+                        )
+                    {
+                        // The sibling refers back, so this thunk sits on a cycle through us.
+                        *self.lazy_closes_cycle = true;
+                    }
                     format!("z.lazy(() => {schema_name})")
                 }
             }
@@ -1614,12 +1637,8 @@ fn emit_component(
     let cyclic = participates_in_reference_cycle(model, schema_index);
     for (export_name, wire_name, position) in variants {
         let declared_type = wire_name.as_deref().unwrap_or(&export_name);
-        let type_expression = cyclic.then(|| {
-            let emitter = Emitter::new(model);
-            imports.collect_types(&emitter, &schema.schema, position);
-            emitter.render_type(&schema.schema, position, TypeAxis::Wire, 0)
-        });
         let schema_name = schema_const_name(&export_name);
+        let mut lazy_closes_cycle = false;
         let expression = SchemaRenderer {
             model,
             position,
@@ -1627,13 +1646,30 @@ fn emit_component(
             current_schema_name: &schema_name,
             runtime_values: &mut runtime_values,
             imports: &mut imports,
+            lazy_closes_cycle: &mut lazy_closes_cycle,
         }
         .render(&schema.schema);
-        // The annotation is rendered here, at the one site that knows a cycle needs one, so
-        // `render_decl` never has to ask which flavor is in play.
-        let annotation = type_expression.as_ref().map(|type_expression| {
+        // A cycle only defeats TypeScript's inference when one of its back edges is a `z.lazy`
+        // thunk; a cycle closed entirely by property getters resolves on its own. Annotating those
+        // is not merely redundant, it is unsound: `ZodType<T>` wants an output whose optional
+        // members exclude `undefined`, and no zod object infers that, so a consumer compiling with
+        // `exactOptionalPropertyTypes` cannot assign the schema to its own annotation.
+        //
+        // `lazy_closes_cycle` is set by the renderer itself, at the one site that chose getter or
+        // thunk. Over-approximating here is NOT free: a `z.lazy` for a sibling that never refers
+        // back is on no cycle, and annotating because of it puts `ZodType<T>` back on the ordinary
+        // recursive component — which is exactly the assignment `exactOptionalPropertyTypes`
+        // rejects.
+        //
+        // The annotated type is rendered only once that is settled. Rendering it eagerly would
+        // also collect its component imports, and an annotation that is then dropped leaves those
+        // imports named nowhere — `noUnusedLocals` reports the unread type import in the consumer's
+        // own compile, which is the same class of defect the drop exists to remove.
+        let annotation = (cyclic && lazy_closes_cycle).then(|| {
+            let emitter = Emitter::new(model);
+            imports.collect_types(&emitter, &schema.schema, position);
             (
-                type_expression.as_str(),
+                emitter.render_type(&schema.schema, position, TypeAxis::Wire, 0),
                 format!("{}<{declared_type}>", schema_type(model.config.zod.flavor)),
             )
         });
@@ -1643,7 +1679,7 @@ fn emit_component(
             &schema_name,
             annotation
                 .as_ref()
-                .map(|(expression, annotation)| (*expression, annotation.as_str())),
+                .map(|(expression, annotation)| (expression.as_str(), annotation.as_str())),
             &expression,
         ));
     }
@@ -1792,12 +1828,14 @@ fn emit_operation_file(
         // here and the renderer below can take it mutably.
         drop(emitter);
         let schema_name = schema_const_name(export_type);
+        let mut lazy_closes_cycle = false;
         let expression = SchemaRenderer {
             model,
             position,
             current_schema: None,
             current_schema_name: &schema_name,
             runtime_values: &mut runtime_values,
+            lazy_closes_cycle: &mut lazy_closes_cycle,
             imports: &mut imports,
         }
         .render(schema);
@@ -1889,11 +1927,13 @@ fn render_headers(
             format!("required:{}", header.required),
         ];
         if !opaque {
+            let mut lazy_closes_cycle = false;
             let expression = SchemaRenderer {
                 model,
                 position: TypePosition::Response,
                 current_schema: None,
                 current_schema_name: schema_name,
+                lazy_closes_cycle: &mut lazy_closes_cycle,
                 runtime_values,
                 imports,
             }
@@ -2403,10 +2443,7 @@ mod tests {
         // points, which is why the flavor is a rendering detail rather than a second emitter.
         let document = doc(json!({
             "Bag": { "type": "object", "additionalProperties": { "type": "integer" } },
-            "Node": {
-                "type": "object",
-                "properties": { "next": { "$ref": "#/components/schemas/Node" } }
-            }
+            "Node": { "$ref": "#/components/schemas/Node" }
         }));
         let config = json!({
             "schemaVersion": 1,
@@ -2516,7 +2553,14 @@ mod tests {
         let tree = component(&files, "tree");
         assert!(tree.contains("get \"children\"() { return z.optional(z.array(treeSchema)); }"));
         assert!(tree.contains("z.optional(z.lazy(() => otherSchema))"));
-        assert!(tree.contains("import { type Other, otherSchema } from \"./other.js\";"));
+        // Value-only: with no annotation to render, the component's structural type is never
+        // written, so importing the sibling's *type* would leave it unread in the consumer's
+        // compile. The schema binding is still imported, because the thunk names it.
+        assert!(
+            tree.contains("import { otherSchema } from \"./other.js\";"),
+            "{tree}"
+        );
+        assert!(!tree.contains("type Other,"), "{tree}");
     }
 
     #[test]
@@ -2644,15 +2688,72 @@ mod tests {
         );
     }
 
+    /// A self-referential object reaches itself through a getter, and TypeScript resolves a getter
+    /// cycle on its own. The annotation it used to carry was therefore never load-bearing — and it
+    /// was actively wrong: `ZodType<T>` demands an output whose optional members exclude
+    /// `undefined`, which is not what any zod object infers, so a consumer with
+    /// `exactOptionalPropertyTypes` could not compile the module.
+    #[test]
+    fn a_getter_reachable_cycle_carries_no_annotation() {
+        let (files, diagnostics) = compile(doc(json!({
+            "TreeNode": {
+                "type": "object",
+                "required": ["value"],
+                "properties": {
+                    "value": { "type": "string" },
+                    "children": {
+                        "type": "array",
+                        "items": { "$ref": "#/components/schemas/TreeNode" }
+                    }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let tree = component(&files, "treenode");
+        assert!(tree.contains("get \"children\"()"), "{tree}");
+        assert!(!tree.contains("z.ZodType<"), "{tree}");
+        assert!(
+            tree.contains("export type TreeNode = z.infer<typeof treeNodeSchema>;"),
+            "{tree}"
+        );
+    }
+
+    /// The shape the `z.lazy(` text probe got wrong: a component whose own cycle is closed by a
+    /// getter, but which also references a sibling that never refers back. The sibling's thunk is
+    /// on no cycle, so the annotation is still not load-bearing — and emitting one would reinstate
+    /// the `exactOptionalPropertyTypes` failure this whole path exists to remove.
+    #[test]
+    fn a_getter_cycle_beside_an_acyclic_sibling_ref_stays_unannotated() {
+        let (files, diagnostics) = compile(doc(json!({
+            "Meta": {
+                "type": "object",
+                "properties": { "label": { "type": "string" } }
+            },
+            "TreeNode": {
+                "type": "object",
+                "required": ["value"],
+                "properties": {
+                    "value": { "type": "string" },
+                    "meta": { "$ref": "#/components/schemas/Meta" },
+                    "children": {
+                        "type": "array",
+                        "items": { "$ref": "#/components/schemas/TreeNode" }
+                    }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let tree = component(&files, "treenode");
+        assert!(tree.contains("z.lazy(() => metaSchema)"), "{tree}");
+        assert!(tree.contains("get \"children\"()"), "{tree}");
+        assert!(!tree.contains("z.ZodType<"), "{tree}");
+    }
+
     #[test]
     fn a_schema_in_a_reference_cycle_keeps_its_explicit_annotation() {
-        // Only a cycle needs the annotation, and it needs it in both the self-referential and the
-        // mutual case — TypeScript cannot infer either without one.
+        // A cycle whose back edge is a `z.lazy` thunk still needs the annotation: TypeScript
+        // reports TS7022 without one. Only getter-reachable cycles resolve on their own.
         let (files, diagnostics) = compile(doc(json!({
-            "Node": {
-                "type": "object",
-                "properties": { "child": { "$ref": "#/components/schemas/Node" } }
-            },
             "Ping": {
                 "type": "object",
                 "properties": { "pong": { "$ref": "#/components/schemas/Pong" } }
@@ -2664,10 +2765,6 @@ mod tests {
         })));
         assert_clean(&diagnostics);
         for (path, expected) in [
-            (
-                "zod/components/node.ts",
-                "export const nodeSchema: z.ZodType<Node> =",
-            ),
             (
                 "zod/components/ping.ts",
                 "export const pingSchema: z.ZodType<Ping> =",
@@ -2705,6 +2802,18 @@ mod tests {
                         "child": { "$ref": "#/components/schemas/Node" },
                         "event": { "$ref": "#/components/schemas/Event" }
                     }
+                },
+                "Ping": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" },
+                        "pong": { "$ref": "#/components/schemas/Pong" }
+                    }
+                },
+                "Pong": {
+                    "type": "object",
+                    "properties": { "ping": { "$ref": "#/components/schemas/Ping" } }
                 }
             })),
             json!({
@@ -2740,20 +2849,38 @@ mod tests {
 
         let node = component(&files, "node");
         assert!(
-            node.contains("import { type EventWire, eventSchema } from \"./event.js\";"),
+            node.contains("import { eventSchema } from \"./event.js\";"),
             "{node}"
         );
+        assert!(!node.contains("type EventWire,"), "{node}");
+        // `Node` reaches itself only through a getter, and its `z.lazy` names a sibling that never
+        // refers back — so no thunk sits on its cycle and the annotation is not load-bearing. It
+        // used to carry one, and that annotation was unassignable under
+        // `exactOptionalPropertyTypes`: `ZodType<T>` wants optional members without `undefined`,
+        // which no zod object infers. The wire type comes from the schema instead, which is the
+        // form the artifact contract asks for everywhere the cycle does not force otherwise.
+        assert!(!node.contains("z.ZodType<"), "{node}");
         assert!(
-            node.contains("export type NodeWire = {\n  at: string;"),
-            "{node}"
-        );
-        assert!(
-            node.contains("export const nodeSchema: z.ZodType<NodeWire> ="),
+            node.contains("export type NodeWire = z.infer<typeof nodeSchema>;"),
             "{node}"
         );
         assert!(
             node.contains("export function validateNode(value: unknown,"),
             "{node}"
+        );
+
+        // The mutual pair is the shape whose cycle really does run through a thunk, so it keeps its
+        // annotation — and a transforming component that keeps one is the only path on which the
+        // annotated type is rendered on the wire axis.
+        let ping = component(&files, "ping");
+        assert!(ping.contains("z.lazy(() => pongSchema)"), "{ping}");
+        assert!(
+            ping.contains("export const pingSchema: z.ZodType<PingWire> ="),
+            "{ping}"
+        );
+        assert!(
+            ping.contains("export type PingWire = {\n  at: string;"),
+            "{ping}"
         );
     }
 
@@ -3969,10 +4096,12 @@ mod tests {
         let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
         let mut runtime_values = BTreeSet::new();
         let mut imports = SiblingImports::default();
+        let mut lazy_closes_cycle = false;
         let mut renderer = SchemaRenderer {
             model: &model,
             position: TypePosition::Neutral,
             current_schema: None,
+            lazy_closes_cycle: &mut lazy_closes_cycle,
             current_schema_name: "missingSchema",
             runtime_values: &mut runtime_values,
             imports: &mut imports,

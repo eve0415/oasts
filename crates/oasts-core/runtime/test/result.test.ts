@@ -41,6 +41,15 @@ test("result declarations preserve frozen source blocks", () => {
   }
 });
 
+const transformError = (cause: unknown): TransformError =>
+  new TransformError({
+    direction: "request",
+    code: "invalid-wire-value",
+    sourcePointer: { logicalSourceId: "source", jsonPointer: "#" },
+    applicationPath: [],
+    cause,
+  });
+
 test("result classes preserve their frozen surface", () => {
   assert.ok(source.includes("export class ApiError<Failed> extends Error {"));
   assert.ok(source.includes("export class TransformError extends Error {"));
@@ -62,16 +71,16 @@ test("result classes preserve their frozen surface", () => {
   )) {
     if (line.includes("readonly name:")) {
       // The real class uses override plus an initializer to establish Error.name at runtime.
-      assert.equal(
-        new TransformError({
-          direction: "request",
-          code: "invalid-wire-value",
-          sourcePointer: { logicalSourceId: "source", jsonPointer: "#" },
-          applicationPath: [],
-          cause: undefined,
-        }).name,
-        "TransformError",
-      );
+      assert.equal(transformError(undefined).name, "TransformError");
+    } else if (line.includes("readonly cause:")) {
+      // `cause` shadows Error's own optional member, so the real class marks it override —
+      // required by noImplicitOverride in a consumer's tsconfig. `override` is a checking
+      // modifier and not part of the declared surface, so the frozen line is honoured by the
+      // member being present, always-set, and carrying what the constructor was given.
+      assert.ok(source.includes(`override ${line.trimStart()}`));
+      const sentinel = { reason: "frozen" };
+      assert.equal(transformError(sentinel).cause, sentinel);
+      assert.ok("cause" in transformError(undefined));
     } else {
       assert.ok(source.includes(line));
     }

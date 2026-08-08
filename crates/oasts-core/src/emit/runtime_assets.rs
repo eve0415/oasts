@@ -271,6 +271,31 @@ fn validate_transport(asset: &ParsedAsset<'_>) {
     );
 }
 
+/// serialize.ts helpers that no descriptor names: each is a private function shared by a family of
+/// style regions, and it is emitted when any member of that family is. They live in their own
+/// regions rather than in core because core is never stripped — a client that selects none of the
+/// callers would otherwise carry the helper unused, which the consumer's own `noUnusedLocals`
+/// reports as an error in generated code.
+const SERIALIZE_PRIVATE_HELPERS: &[(&str, &[&str])] = &[
+    (
+        "content-json-value",
+        &[
+            "content-json-header",
+            "content-json-path",
+            "content-json-query",
+        ],
+    ),
+    ("path-label-value", &["path-label", "path-label-explode"]),
+    ("path-matrix-value", &["path-matrix", "path-matrix-explode"]),
+    (
+        "query-delimited-object-value",
+        &[
+            "query-pipe-delimited-object",
+            "query-space-delimited-object",
+        ],
+    ),
+];
+
 fn render_serialize(
     asset: &ParsedAsset<'_>,
     helper_ids: &BTreeSet<String>,
@@ -290,6 +315,11 @@ fn render_serialize(
             ]
             .map(str::to_owned),
         );
+    }
+    for (private, callers) in SERIALIZE_PRIVATE_HELPERS {
+        if callers.iter().any(|caller| selected.contains(*caller)) {
+            selected.insert((*private).to_owned());
+        }
     }
     let available = asset
         .parts
@@ -746,6 +776,41 @@ mod tests {
         assert!(!serialize.contains("export function serializePathLabel"));
         assert!(!serialize.contains("//#region"));
         assert!(!serialize.contains("//#endregion"));
+    }
+
+    /// The four private helpers that only some parameter styles reach. They sat in the core region,
+    /// which is never stripped, so a client selecting none of the styles that call them emitted
+    /// them unused — which `noUnusedLocals` reports in the consumer's own compile.
+    #[test]
+    fn style_private_helpers_follow_the_regions_that_call_them() {
+        let (_temp, config) = resolved_config(json!({}));
+
+        let (bare, _) = emit_with(
+            &config,
+            ["path-simple", "query-form"],
+            &ResolvedBaseUrl::Server { index: 0 },
+        );
+        let serialize = content(&bare, "serialize.ts");
+        assert!(!serialize.contains("function serializeLabelValue"));
+        assert!(!serialize.contains("function serializeMatrixValue"));
+        assert!(!serialize.contains("function serializeDelimitedObjectValue"));
+        assert!(!serialize.contains("function contentJsonString"));
+
+        for (helper, private) in [
+            ("path-label", "function serializeLabelValue"),
+            ("path-matrix", "function serializeMatrixValue"),
+            (
+                "query-space-delimited-object",
+                "function serializeDelimitedObjectValue",
+            ),
+            ("content-json-query", "function contentJsonString"),
+        ] {
+            let (selected, _) = emit_with(&config, [helper], &ResolvedBaseUrl::Server { index: 0 });
+            assert!(
+                content(&selected, "serialize.ts").contains(private),
+                "{helper} must still emit {private}"
+            );
+        }
     }
 
     #[test]

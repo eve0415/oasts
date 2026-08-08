@@ -63,7 +63,8 @@ export class TransformError extends Error {
   readonly code: 'temporal-unavailable' | 'invalid-wire-value' | 'invalid-application-value';
   readonly sourcePointer: SourcePointer;
   readonly applicationPath: ApplicationPath;
-  readonly cause: unknown;
+  // `Error` declares an optional `cause`; this narrows it to always-present, which is an override.
+  override readonly cause: unknown;
   constructor(fields: {
     direction: 'request' | 'response';
     code: 'temporal-unavailable' | 'invalid-wire-value' | 'invalid-application-value';

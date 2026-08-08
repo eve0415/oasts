@@ -1,0 +1,72 @@
+openapi: 3.1.0
+# The counter-case to strict-flags-3.1. That document selects every serialization helper, so it can
+# never see a helper that the emitter *cannot* strip. This one selects as few as a client can:
+# plain `form` query parameters, a `simple` path parameter, a `simple` header, and a JSON body.
+#
+# Deliberately absent, and the reason this fixture exists — do not add any of them here:
+#   - `label` and `matrix` path parameters
+#   - `spaceDelimited` / `pipeDelimited` parameters over an object
+#   - `deepObject` query parameters
+#   - `content`-typed parameters of any kind
+info:
+  title: Oasts unused helper regions
+  version: 1.0.0
+servers:
+  - url: https://minimal.api.example.test/v1
+paths:
+  /items/{itemId}:
+    get:
+      operationId: readItem
+      parameters:
+        - name: itemId
+          in: path
+          required: true
+          style: simple
+          explode: false
+          schema:
+            type: string
+        - name: tags
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: X-Trace
+          in: header
+          style: simple
+          explode: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The matching item.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+  /items:
+    post:
+      operationId: createItem
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Item'
+      responses:
+        '204':
+          description: The item was stored.
+components:
+  schemas:
+    Item:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+        name:
+          type: string

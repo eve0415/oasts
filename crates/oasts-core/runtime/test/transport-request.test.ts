@@ -504,6 +504,61 @@ describe("request serialization and fetch contract", () => {
     assert.equal(captured.headers.get("content-type"), "application/problem+json; charset=utf-8");
     assert.deepEqual(await captured.json(), { code: 4 });
   });
+
+  // Three request literals whose members are optional. A plan that declares nothing for one of
+  // them is not the same as a plan that declares it undefined, and the wire has to agree — these
+  // pin what "the plan said nothing" actually sends.
+  test("undeclared optional members send the default wire, not an undefined one", async () => {
+    const requests: Request[] = [];
+    const transport = createTransport({
+      fetch: async (request) => {
+        requests.push(request);
+        return new Response();
+      },
+    });
+
+    // A urlencoded field with no style/explode/allowReserved takes the form defaults, which are
+    // form/exploded/not-reserved — the same wire an explicit undefined would have produced.
+    await execute(
+      transport,
+      operation({
+        method: "POST",
+        body: urlencodedBody("application/x-www-form-urlencoded", [
+          { name: "tags", required: true },
+        ]),
+      }),
+      { body: { tags: ["one", "two"] } },
+    );
+    assert.equal(await requests[0]?.text(), "tags=one&tags=two");
+
+    // A multipart part whose plan declares no filename carries no filename directive at all.
+    await execute(
+      transport,
+      operation({
+        method: "POST",
+        body: multipartBody([
+          {
+            name: "note",
+            required: true,
+            repeated: false,
+            wrapper: false,
+            payload: "text",
+            contentType: { kind: "none" },
+            filename: false,
+          },
+        ]),
+      }),
+      { body: { note: "hello" } },
+    );
+    const multipart = await requests[1]?.text();
+    assert.ok(multipart?.includes('Content-Disposition: form-data; name="note"'));
+    assert.ok(!multipart?.includes("filename"));
+
+    // A call with no signal still produces a request carrying the transport's dependent signal.
+    await execute(transport, operation({ method: "GET" }), {});
+    assert.ok(requests[2]?.signal instanceof AbortSignal);
+    assert.equal(requests[2]?.signal.aborted, false);
+  });
 });
 
 describe("request failures", () => {

@@ -495,6 +495,91 @@ mod tests {
         );
     }
 
+    /// The one emission decision a consumer's own file reaches: a committed tsconfig whose `lib`
+    /// already declares `Temporal` means generated code does not repeat the reference directive.
+    /// End to end through the CLI, because that is the path a consumer actually takes.
+    #[test]
+    fn a_consumer_lib_that_declares_temporal_drops_the_reference_directive() {
+        let document = serde_json::to_vec(&json!({
+            "openapi": "3.1.0",
+            "info": { "title": "temporal", "version": "1" },
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "Event": {
+                        "type": "object",
+                        "required": ["at"],
+                        "properties": { "at": { "type": "string", "format": "date-time" } }
+                    }
+                }
+            }
+        }))
+        .expect("OpenAPI JSON");
+        let config = concat!(
+            "schemaVersion: 1\n",
+            "workspaceRoot: .\n",
+            "input:\n  path: ./openapi.json\n",
+            "output: ./generated\n",
+            "artifacts:\n  types: true\n  client: true\n",
+            "client:\n  authEnforcement: types\n  baseUrl:\n    source: runtime\n",
+            "types:\n  dateTime: temporal\n",
+            "validation:\n  engine: 'off'\n  unchecked: allow\n",
+        );
+        let directive = "/// <reference lib=\"esnext.temporal\" preserve=\"true\" />";
+
+        let carries_directive = |tsconfig: Option<&str>, extra_config: &str| -> usize {
+            let temp = tempfile::tempdir().expect("tempdir");
+            fs::write(temp.path().join("openapi.json"), &document).expect("document");
+            fs::write(
+                temp.path().join("oasts.yaml"),
+                format!("{config}{extra_config}"),
+            )
+            .expect("config");
+            if let Some(tsconfig) = tsconfig {
+                fs::write(temp.path().join("tsconfig.json"), tsconfig).expect("tsconfig");
+            }
+            let (code, _stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
+            assert_eq!(code, 0, "{stderr}");
+            let mut count = 0;
+            let mut stack = vec![temp.path().join("generated")];
+            while let Some(directory) = stack.pop() {
+                for entry in fs::read_dir(&directory).expect("read generated") {
+                    let path = entry.expect("entry").path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if fs::read_to_string(&path).is_ok_and(|body| body.contains(directive)) {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        };
+
+        // No tsconfig, and one whose lib cannot supply Temporal: the directive is carried.
+        assert!(carries_directive(None, "") > 0);
+        assert!(carries_directive(Some(r#"{ "compilerOptions": { "lib": ["ES2023"] } }"#), "") > 0);
+        // A lib that does supply it: nothing repeats the declaration.
+        assert_eq!(
+            carries_directive(
+                Some(r#"{ "compilerOptions": { "lib": ["ES2023", "ESNext.Temporal"] } }"#),
+                ""
+            ),
+            0
+        );
+        assert_eq!(
+            carries_directive(Some(r#"{ "compilerOptions": { "target": "ESNext" } }"#), ""),
+            0
+        );
+        // And opting out of reading it puts the directive back, which is what makes output that
+        // depends on version, config and input alone still reachable.
+        assert!(
+            carries_directive(
+                Some(r#"{ "compilerOptions": { "lib": ["ESNext"] } }"#),
+                "typescript:\n  tsconfig: 'off'\n",
+            ) > 0
+        );
+    }
+
     #[test]
     fn yaml_config_with_every_supported_option_generates_successfully() {
         let temp = tempfile::tempdir().expect("tempdir");

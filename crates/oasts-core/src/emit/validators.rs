@@ -20,6 +20,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde_json::{Number, Value};
@@ -35,6 +36,7 @@ use crate::num::render_number_value;
 use crate::semantic::{TargetCase, normalize_identifier};
 
 use super::model::EmissionModel;
+use super::reads_identifier;
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
     CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode,
@@ -716,6 +718,46 @@ struct BranchEvaluation {
     callbacks: EvaluationCallbacks,
     properties: Option<String>,
     items: Option<String>,
+    /// Byte range of the two lines declaring the property recorder, and of the item pair. A branch
+    /// only reports one evaluation kind unless the schema asks for both, so the other pair is
+    /// dropped once the branch body has been emitted and shown not to reference it.
+    property_declaration: Option<Range<usize>>,
+    item_declaration: Option<Range<usize>>,
+}
+
+/// The two declared types the `value` parameter takes across emitted validator signatures.
+const VALUE_UNKNOWN: &str = "unknown";
+const VALUE_RECORD: &str = "{ [key: string]: unknown }";
+
+/// The `value` parameter, `_`-prefixed when the body never reads it. An uninhabitable schema's
+/// validator rejects every instance without inspecting one, and a branch helper past the
+/// control-flow-analysis limit delegates without touching it.
+fn value_parameter(body: &str, declared_type: &str) -> String {
+    let prefix = if reads_identifier(body, "value") {
+        ""
+    } else {
+        "_"
+    };
+    format!("{prefix}value: {declared_type}")
+}
+
+/// The evaluation-tracking parameter list, `_`-prefixed on whichever the body never reads. They
+/// stay declared so every validator keeps one calling convention and every delegate call keeps its
+/// arity; `noUnusedParameters` exempts the prefixed spelling and reports the plain one.
+fn evaluation_parameters(body: &str) -> String {
+    let property = if reads_identifier(body, "evaluatedProperty") {
+        ""
+    } else {
+        "_"
+    };
+    let item = if reads_identifier(body, "evaluatedItem") {
+        ""
+    } else {
+        "_"
+    };
+    format!(
+        "{property}evaluatedProperty?: (key: string) => void, {item}evaluatedItem?: (index: number) => void"
+    )
 }
 
 impl EvaluationCallbacks {
@@ -812,23 +854,29 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         suffix: &str,
     ) -> BranchEvaluation {
         let mut callbacks = EvaluationCallbacks::default();
+        let mut property_declaration = None;
         let properties = evaluation.property.as_ref().map(|_| {
             let values = format!("branchProperties{suffix}");
             let callback = format!("recordBranchProperty{suffix}");
+            let start = self.out.len();
             self.line(&format!("const {values}: string[] = [];"));
             self.line(&format!(
                 "const {callback} = (key: string): void => {{ {values}.push(key); }};"
             ));
+            property_declaration = Some(start..self.out.len());
             callbacks.property = Some(callback);
             values
         });
+        let mut item_declaration = None;
         let items = evaluation.item.as_ref().map(|_| {
             let values = format!("branchItems{suffix}");
             let callback = format!("recordBranchItem{suffix}");
+            let start = self.out.len();
             self.line(&format!("const {values}: number[] = [];"));
             self.line(&format!(
                 "const {callback} = (index: number): void => {{ {values}.push(index); }};"
             ));
+            item_declaration = Some(start..self.out.len());
             callbacks.item = Some(callback);
             values
         });
@@ -836,6 +884,45 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             callbacks,
             properties,
             items,
+            property_declaration,
+            item_declaration,
+        }
+    }
+
+    /// Drops whichever branch recorder the emitted branch never passed on. The enclosing schema
+    /// declares both evaluation kinds whenever it tracks either, so a branch that only reports
+    /// properties would otherwise carry an item recorder nothing reads — and a collection nothing
+    /// ever fills, which the merge below would then walk for no reason.
+    ///
+    /// Called after the branch body is emitted; the incomplete-applicator paths truncate `self.out`
+    /// and return before reaching it, so the recorded ranges are only ever read while still valid.
+    fn prune_unused_branch_evaluation(&mut self, branch: &mut BranchEvaluation) {
+        // Items first: dropping the earlier property pair would move this range.
+        for (declaration, callback, values) in [
+            (
+                &mut branch.item_declaration,
+                &mut branch.callbacks.item,
+                &mut branch.items,
+            ),
+            (
+                &mut branch.property_declaration,
+                &mut branch.callbacks.property,
+                &mut branch.properties,
+            ),
+        ] {
+            // Zipped rather than unwrapped one at a time: `branch_evaluation` writes the
+            // declaration and the callback name together or not at all, so a shape where only one
+            // of them is present has no way to arise and no arm should claim to handle it.
+            let Some((range, name)) = declaration.clone().zip(callback.clone()) else {
+                continue;
+            };
+            if reads_identifier(&self.out[range.end..], &name) {
+                continue;
+            }
+            self.out.replace_range(range, "");
+            *declaration = None;
+            *callback = None;
+            *values = None;
         }
     }
 
@@ -959,10 +1046,12 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             &EvaluationCallbacks::root(),
         );
         let helper_body = std::mem::replace(&mut self.out, parent_out);
+        let evaluation_parameters = evaluation_parameters(&helper_body);
+        let value_parameter = value_parameter(&helper_body, VALUE_UNKNOWN);
         self.indent = parent_indent;
         self.counter = parent_counter;
         self.helpers.push(format!(
-            "function {name}(value: unknown, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): void {{\n{helper_body}}}\n\n"
+            "function {name}({value_parameter}, path: readonly (string | number)[], issues: Issue[], {evaluation_parameters}): void {{\n{helper_body}}}\n\n"
         ));
         if evaluation.is_empty() {
             self.line(&format!("{name}({val}, {path}, {iss});"));
@@ -1492,10 +1581,11 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             }
             self.close("}");
             let helper_body = std::mem::replace(&mut self.out, parent_out);
+            let value_parameter = value_parameter(&helper_body, VALUE_RECORD);
             self.indent = parent_indent;
             self.counter = parent_counter;
             self.helpers.push(format!(
-                "function {name}(value: {{ [key: string]: unknown }}, keys: readonly string[], path: readonly (string | number)[], issues: Issue[]): void {{\n{helper_body}}}\n\n"
+                "function {name}({value_parameter}, keys: readonly string[], path: readonly (string | number)[], issues: Issue[]): void {{\n{helper_body}}}\n\n"
             ));
             calls.push(name);
         }
@@ -1723,10 +1813,12 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 self.close("}");
             }
             let helper_body = std::mem::replace(&mut self.out, parent_out);
+            let evaluation_parameters = evaluation_parameters(&helper_body);
+            let value_parameter = value_parameter(&helper_body, VALUE_RECORD);
             self.indent = parent_indent;
             self.counter = parent_counter;
             self.helpers.push(format!(
-                "function {name}(value: {{ [key: string]: unknown }}, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): void {{\n{helper_body}}}\n\n"
+                "function {name}({value_parameter}, path: readonly (string | number)[], issues: Issue[], {evaluation_parameters}): void {{\n{helper_body}}}\n\n"
             ));
             calls.push(name);
         }
@@ -1759,7 +1851,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
 
         let scratch = format!("issues{}", self.fresh());
         self.line(&format!("const {scratch}: Issue[] = [];"));
-        let condition_evaluation = self.branch_evaluation(evaluation, &scratch);
+        let mut condition_evaluation = self.branch_evaluation(evaluation, &scratch);
         let complete = self.gen_child_schema(
             "if".to_owned(),
             &conditional.condition,
@@ -1780,6 +1872,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             return;
         }
 
+        self.prune_unused_branch_evaluation(&mut condition_evaluation);
         self.open(&format!("if ({scratch}.length === 0) {{"));
         self.merge_branch_evaluation(&condition_evaluation, evaluation);
         if let Some(schema) = &conditional.then_schema {
@@ -2764,10 +2857,11 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         self.close("}");
         self.close("}");
         let helper_body = std::mem::replace(&mut self.out, parent_out);
+        let value_parameter = value_parameter(&helper_body, VALUE_RECORD);
         self.indent = parent_indent;
         self.counter = parent_counter;
         self.helpers.push(format!(
-            "function {name}(value: {{ [key: string]: unknown }}, keys: readonly string[], path: readonly (string | number)[], issues: Issue[]): void {{\n{helper_body}}}\n\n"
+            "function {name}({value_parameter}, keys: readonly string[], path: readonly (string | number)[], issues: Issue[]): void {{\n{helper_body}}}\n\n"
         ));
         self.line(&format!("{name}({val}, {keys_expr}, {path}, {iss});"));
     }
@@ -3188,10 +3282,12 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 &EvaluationCallbacks::root(),
             );
             let helper_body = std::mem::replace(&mut self.out, parent_out);
+            let evaluation_parameters = evaluation_parameters(&helper_body);
+            let value_parameter = value_parameter(&helper_body, VALUE_UNKNOWN);
             self.indent = parent_indent;
             self.counter = parent_counter;
             self.helpers.push(format!(
-                "function {name}(value: unknown, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): void {{\n{helper_body}}}\n\n"
+                "function {name}({value_parameter}, path: readonly (string | number)[], issues: Issue[], {evaluation_parameters}): void {{\n{helper_body}}}\n\n"
             ));
             self.line(&format!(
                 "{name}({val}, {path}, {iss}, {}, {});",
@@ -3298,10 +3394,12 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 });
                 self.line(&format!("return {helper_counter};"));
                 let helper_body = std::mem::replace(&mut self.out, parent_out);
+                let evaluation_parameters = evaluation_parameters(&helper_body);
+                let value_parameter = value_parameter(&helper_body, VALUE_UNKNOWN);
                 self.indent = parent_indent;
                 self.counter = parent_counter;
                 self.helpers.push(format!(
-                    "function {name}(value: unknown, path: readonly (string | number)[], limit: number, evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): number {{\n{helper_body}}}\n\n"
+                    "function {name}({value_parameter}, path: readonly (string | number)[], limit: number, {evaluation_parameters}): number {{\n{helper_body}}}\n\n"
                 ));
                 self.open(&format!("if ({counter} < {limit}) {{"));
                 self.line(&format!(
@@ -3343,7 +3441,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             let scratch_index = self.fresh();
             let scratch = format!("issues{scratch_index}");
             self.line(&format!("const {scratch}: Issue[] = [];"));
-            let branch_evaluation = self.branch_evaluation(evaluation, &scratch);
+            let mut branch_evaluation = self.branch_evaluation(evaluation, &scratch);
             self.gen_child_schema(
                 format!("{}/{}", kind.keyword(), offset + branch_index),
                 branch,
@@ -3352,6 +3450,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 &scratch,
                 &branch_evaluation.callbacks,
             );
+            self.prune_unused_branch_evaluation(&mut branch_evaluation);
             self.open(&format!("if ({scratch}.length === 0) {{"));
             self.line(&format!("{counter} += 1;"));
             self.merge_branch_evaluation(&branch_evaluation, evaluation);
@@ -4303,8 +4402,10 @@ fn location_title(location: ParamLocation) -> &'static str {
 fn render_validator(export_name: &str, declared_type: &str, body: &str) -> String {
     let const_name = format!("{}Validator", lowercase_first(export_name));
     let mut output = String::new();
+    let evaluation_parameters = evaluation_parameters(body);
+    let value_parameter = value_parameter(body, VALUE_UNKNOWN);
     output.push_str(&format!(
-        "export function validate{export_name}(value: unknown, path: readonly (string | number)[], issues: Issue[], evaluatedProperty?: (key: string) => void, evaluatedItem?: (index: number) => void): void {{\n"
+        "export function validate{export_name}({value_parameter}, path: readonly (string | number)[], issues: Issue[], {evaluation_parameters}): void {{\n"
     ));
     output.push_str(body);
     output.push_str("}\n\n");
@@ -6664,6 +6765,88 @@ mod tests {
             "validateReferencedProperties(value, path, issues, recordProperty0, evaluatedItem);"
         ));
         assert!(referenced.contains("!evaluatedProperties0.includes(key)"));
+    }
+
+    /// Two bindings a validator module emitted whether or not the schema reached them: the
+    /// evaluation-tracking parameters on every validator, and a per-branch recorder for the
+    /// evaluation kind the branch never reports. Both are errors in a consumer compiling generated
+    /// code under `noUnusedParameters`/`noUnusedLocals`.
+    #[test]
+    fn unread_evaluation_bindings_are_not_emitted() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Plain": {
+                "type": "object",
+                "properties": { "a": { "type": "string" } }
+            },
+            "Scalar": { "type": "string", "minLength": 1 },
+            "PropertyChoice": {
+                "type": "object",
+                "anyOf": [
+                    { "required": ["alpha"], "properties": { "alpha": { "type": "string" } } },
+                    { "required": ["beta"], "properties": { "beta": { "type": "integer" } } }
+                ],
+                "unevaluatedProperties": false
+            },
+            "ItemChoice": {
+                "type": "array",
+                "anyOf": [
+                    { "prefixItems": [{ "type": "string" }] },
+                    { "prefixItems": [{ "type": "integer" }, { "type": "integer" }] }
+                ],
+                "unevaluatedItems": false
+            }
+        })));
+        assert_clean(&diagnostics);
+
+        // A scalar can report neither kind, so both parameters are prefixed.
+        let scalar = component(&files, "scalar");
+        assert!(
+            scalar.contains("_evaluatedProperty?: (key: string) => void"),
+            "{scalar}"
+        );
+        assert!(
+            scalar.contains("_evaluatedItem?: (index: number) => void"),
+            "{scalar}"
+        );
+
+        // An object reports the properties it evaluated to whatever encloses it, so it reads the
+        // property parameter and never the item one — the halves move independently.
+        let plain = component(&files, "plain");
+        assert!(
+            plain.contains(", evaluatedProperty?: (key: string) => void"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("_evaluatedItem?: (index: number) => void"),
+            "{plain}"
+        );
+
+        // An object choice records properties per branch and never items, so only the property
+        // recorder is emitted — and the parameter it forwards keeps its plain name.
+        let property_choice = component(&files, "propertychoice");
+        assert!(
+            property_choice.contains("const recordBranchProperty"),
+            "{property_choice}"
+        );
+        assert!(
+            !property_choice.contains("const recordBranchItem"),
+            "{property_choice}"
+        );
+        assert!(
+            property_choice.contains("evaluatedProperty?: (key: string) => void"),
+            "{property_choice}"
+        );
+
+        // The array mirror: the item recorder is emitted and the property one is not.
+        let item_choice = component(&files, "itemchoice");
+        assert!(
+            item_choice.contains("const recordBranchItem"),
+            "{item_choice}"
+        );
+        assert!(
+            !item_choice.contains("const recordBranchProperty"),
+            "{item_choice}"
+        );
     }
 
     #[test]

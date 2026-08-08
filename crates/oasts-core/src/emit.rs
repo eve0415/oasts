@@ -310,6 +310,49 @@ fn has_unsafe_path(value: &str) -> bool {
         || value.as_bytes().get(1) == Some(&b':')
 }
 
+/// Whether `body` mentions `name` as a whole identifier in code rather than in a message.
+///
+/// Whole-identifier because `evaluatedItem` is a prefix of `evaluatedItems0` and
+/// `recordBranchPropertyissues2` of `…issues20`. Quoted text is skipped because emitted validators
+/// carry issue messages — `issue(path, "value not allowed")` names `value` without reading it.
+/// Template literals are scanned through: their interpolations hold real reads, and the worst a
+/// word in the literal text can do is keep a parameter's plain name, which the gate then reports.
+///
+/// A match preceded by `.` is a member access, not a read of the binding: emitted conversions write
+/// `value.at`, so a schema property named after a hoisted constant would otherwise make that
+/// constant look read and re-emit it unused.
+///
+/// Both mistakes fail loudly rather than silently: a missed read emits `_name` while the body says
+/// `name` (TS2304), and a phantom read emits `name` unread (TS6133). The consumer flag matrix in
+/// `scripts/verify-ts.sh` is what catches either.
+pub(crate) fn reads_identifier(body: &str, name: &str) -> bool {
+    let boundary = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+    let bytes = body.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'"' || byte == b'\'' {
+            index += 1;
+            while index < bytes.len() && bytes[index] != byte {
+                index += if bytes[index] == b'\\' { 2 } else { 1 };
+            }
+            index += 1;
+            continue;
+        }
+        if bytes[index..].starts_with(name.as_bytes()) {
+            let end = index + name.len();
+            let preceding = index.checked_sub(1).map(|before| bytes[before]);
+            let before_ok = preceding.is_none_or(|byte| !boundary(byte) && byte != b'.');
+            let after_ok = end == bytes.len() || !boundary(bytes[end]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
 pub(crate) fn is_reserved_device(value: &str) -> bool {
     let device = value
         .split('.')
@@ -357,7 +400,15 @@ pub fn emit_artifacts(
     client_model: Option<&ClientModel>,
     sink: &mut DiagnosticSink,
 ) -> Vec<GeneratedFile> {
+    // The consumer's own compiler options, read once per run. This is the single point at which
+    // anything outside version, config and input reaches emitted bytes, so it is resolved here
+    // rather than deep in an emitter — and it fails safe: anything unreadable answers "not
+    // provided", which keeps the reference directive.
+    let (consumer_provides_temporal, tsconfig_diagnostics) =
+        crate::tsconfig::consumer_provides_temporal(&config.output, &config.tsconfig);
+    sink.extend(tsconfig_diagnostics);
     let mut model = EmissionModel::new(analyzed, config, source_digest(source_tuples), sink);
+    model.consumer_provides_temporal = consumer_provides_temporal;
     let mut files = emit_types_from_model(&mut model);
     if let Some(client_model) = client_model {
         files.extend(client::emit_client_from_model(&mut model, client_model));
@@ -1501,7 +1552,11 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         }
         GeneratedFile {
             relative_path: format!("{}/components/{file_base}.ts", self.model.dirs.types),
-            content: insert_temporal_reference(content, header_len),
+            content: insert_temporal_reference(
+                content,
+                header_len,
+                self.model.consumer_provides_temporal,
+            ),
         }
     }
 
@@ -4656,8 +4711,12 @@ fn discriminated_arm_positions<'a>(
 ///
 /// It goes after the generated header, which is the first line of every emitted file: a triple-slash
 /// directive may be preceded by comments, and by nothing else.
-pub(super) fn insert_temporal_reference(content: String, header_len: usize) -> String {
-    if !content[header_len..].contains("Temporal.") {
+pub(super) fn insert_temporal_reference(
+    content: String,
+    header_len: usize,
+    consumer_provides_temporal: bool,
+) -> String {
+    if consumer_provides_temporal || !content[header_len..].contains("Temporal.") {
         return content;
     }
     let mut output = String::with_capacity(content.len() + TEMPORAL_REFERENCE.len());
@@ -4668,6 +4727,24 @@ pub(super) fn insert_temporal_reference(content: String, header_len: usize) -> S
 }
 
 const TEMPORAL_REFERENCE: &str = "/// <reference lib=\"esnext.temporal\" preserve=\"true\" />\n\n";
+
+/// The same directive as an embedded asset writes it — one newline, not the blank line the inserter
+/// adds — so an asset that ships with it can have it taken back out.
+const TEMPORAL_REFERENCE_LINE: &str =
+    "/// <reference lib=\"esnext.temporal\" preserve=\"true\" />\n";
+
+/// Removes an embedded asset's own leading Temporal reference.
+///
+/// Assets that name `Temporal` carry the directive in their source rather than getting it from
+/// `insert_temporal_reference`, so a consumer whose `lib` already declares Temporal needs it taken
+/// off here too — otherwise one file keeps a directive every other file dropped.
+pub(super) fn strip_temporal_reference(asset: &str, consumer_provides_temporal: bool) -> &str {
+    if consumer_provides_temporal {
+        asset.strip_prefix(TEMPORAL_REFERENCE_LINE).unwrap_or(asset)
+    } else {
+        asset
+    }
+}
 
 pub(super) fn source_diagnostic(
     code: &'static str,
