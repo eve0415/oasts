@@ -1,0 +1,150 @@
+openapi: 3.1.0
+info:
+  title: Filters showcase
+  version: 1.0.0
+servers:
+  - url: https://api.test/v1
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      tags: [pets, public]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PetSummary"
+    post:
+      operationId: createPet
+      tags: [pets, write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PetInput"
+      responses:
+        "201":
+          description: created
+      callbacks:
+        petStored:
+          "{$request.body#/callbackUrl}":
+            post:
+              operationId: onPetStored
+              requestBody:
+                content:
+                  application/json:
+                    schema:
+                      $ref: "#/components/schemas/CallbackOnly"
+              responses:
+                "204":
+                  description: acked
+  /pets/{petId}:
+    put:
+      # No operationId: this operation abstains from the operations axis and can only be
+      # selected by tag, path, or method.
+      tags: [pets, write]
+      parameters:
+        - name: petId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PetInput"
+      responses:
+        "204":
+          description: ok
+    delete:
+      operationId: deletePet
+      tags: [pets]
+      deprecated: true
+      parameters:
+        - name: petId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: ok
+  /admin/pets:
+    get:
+      operationId: adminListPets
+      tags: [admin, internal]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/petSummary"
+webhooks:
+  petCreated:
+    post:
+      operationId: onPetCreated
+      tags: [events]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookOnly"
+      responses:
+        "204":
+          description: ok
+components:
+  schemas:
+    # `PetSummary` and `petSummary` allocate the same TypeScript identifier. Reachable at the
+    # same time they are a hard collision; a filter that drops one of the two operations that
+    # reach them makes the document generate.
+    PetSummary:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+    petSummary:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: integer
+    PetInput:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        callbackUrl:
+          type: string
+          format: uri
+    # Reachable only from the webhook.
+    WebhookOnly:
+      type: object
+      required: [petId]
+      properties:
+        petId:
+          type: string
+    # Reachable only from the callback of a surviving operation.
+    CallbackOnly:
+      type: object
+      required: [stored]
+      properties:
+        stored:
+          type: boolean
+    # Reachable from nothing: pruned unless orphans are kept.
+    Orphan:
+      type: object
+      properties:
+        unused:
+          type: string

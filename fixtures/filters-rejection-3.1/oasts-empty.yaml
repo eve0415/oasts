@@ -1,0 +1,10 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+# Each pattern matches on its own axis, but no operation satisfies both.
+filters:
+  tags:
+    include: [internal]
+  paths:
+    include: ["/pets"]

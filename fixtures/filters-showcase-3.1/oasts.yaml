@@ -1,0 +1,10 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+# Excluding the admin prefix drops the one operation that reaches `petSummary`, which is what
+# makes this document generate at all: reachable together, `PetSummary` and `petSummary` allocate
+# the same identifier and collide.
+filters:
+  paths:
+    exclude: ["/^\\/admin\\/.*/"]

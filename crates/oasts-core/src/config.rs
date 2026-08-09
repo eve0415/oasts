@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Number, Value};
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
+use crate::filter::Filters;
 use crate::syntax::parse_yaml_value;
 
 const CODE_IO: &str = "OASTS0001";
@@ -72,6 +73,11 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
+/// The serde default for boolean options that keep their subject unless turned off.
+const fn default_true() -> bool {
+    true
+}
+
 #[cfg(feature = "json-schema")]
 pub fn config_json_schema() -> serde_json::Value {
     schemars::schema_for!(RawConfig).to_value()
@@ -115,6 +121,8 @@ pub struct RawConfig {
     pub specs: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub shared: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub filters: Option<FiltersConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub artifacts: Option<ArtifactsConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
@@ -237,6 +245,55 @@ pub struct ArtifactsConfig {
     pub tanstack: Option<ArtifactSetting>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub msw: Option<ArtifactSetting>,
+}
+
+/// One include/exclude pattern list for a single selection axis.
+///
+/// Both keys are optional; an absent list constrains nothing.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "Include and exclude patterns for one selection axis. A pattern is exact string equality, or a slash-delimited regex with an optional trailing 'i' flag. Exclude beats include."
+    )
+)]
+pub struct AxisFilter {
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub include: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub exclude: Option<Vec<String>>,
+}
+
+/// Operation selection and component pruning, before patterns are compiled.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "Restricts generated output to a subset of the document. An operation survives when every configured, applicable axis admits it."
+    )
+)]
+pub struct FiltersConfig {
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub tags: Option<AxisFilter>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub operations: Option<AxisFilter>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub paths: Option<AxisFilter>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub methods: Option<AxisFilter>,
+    /// `false` drops operations marked `deprecated: true`. Never applies to component schemas —
+    /// a schema a surviving operation references is kept regardless.
+    #[serde(default = "default_true")]
+    pub deprecated: bool,
+    /// `true` keeps component schemas no surviving operation reaches.
+    #[serde(default)]
+    pub orphans: bool,
 }
 
 /// Client options before defaults and cross-field validation are applied.
@@ -941,6 +998,8 @@ pub struct ResolvedConfig {
     pub input: PathBuf,
     pub output: PathBuf,
     pub namespace: String,
+    /// Operation selection and component pruning; `None` when the config declares no block.
+    pub filters: Option<Filters>,
     pub artifacts: ResolvedArtifactsConfig,
     pub types: TypesConfig,
     pub zod: ZodConfig,
@@ -1335,6 +1394,7 @@ pub fn resolve_config(
         source_path,
         &mut sink,
     );
+    let filters = crate::filter::resolve(raw.filters.as_ref(), source_path, &mut sink);
 
     let has_errors = sink.has_errors();
     let diagnostics = sink.into_sorted_vec();
@@ -1359,6 +1419,7 @@ pub fn resolve_config(
         input,
         output,
         namespace,
+        filters,
         artifacts,
         types,
         zod: raw.zod.unwrap_or_default(),
@@ -2246,6 +2307,8 @@ fn to_u32(value: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::filter::{CODE_FILTER_PATTERN, PatternKind};
+
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use serde_json::json;
@@ -4067,6 +4130,141 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == CODE_IO)
+        );
+    }
+
+    fn config_with_filters(filters: Value) -> Value {
+        let mut value = valid_json_value();
+        value["filters"] = filters;
+        value
+    }
+
+    #[test]
+    fn filters_block_resolves_with_defaults() {
+        let resolved = load_json(&config_with_filters(json!({
+            "tags": { "include": ["pets"] }
+        })))
+        .expect("filters should resolve");
+        let filters = resolved.filters.expect("filters");
+        assert!(filters.deprecated, "deprecated defaults to keep");
+        assert!(!filters.orphans, "orphans defaults to prune");
+        assert!(filters.declares_selection_axis());
+    }
+
+    #[test]
+    fn filters_orphans_only_declares_no_selection_axis() {
+        let resolved =
+            load_json(&config_with_filters(json!({ "orphans": true }))).expect("filters");
+        let filters = resolved.filters.expect("filters");
+        assert!(!filters.declares_selection_axis());
+        assert!(filters.orphans);
+    }
+
+    #[test]
+    fn filters_empty_axis_declares_no_selection_axis() {
+        let resolved = load_json(&config_with_filters(
+            json!({ "tags": {}, "paths": { "include": [] } }),
+        ))
+        .expect("filters");
+        let filters = resolved.filters.expect("filters");
+        assert!(
+            !filters.declares_selection_axis(),
+            "an axis with no patterns selects nothing"
+        );
+    }
+
+    #[test]
+    fn filters_absent_block_resolves_to_none() {
+        let resolved = load_json(&valid_json_value()).expect("config");
+        assert!(resolved.filters.is_none());
+    }
+
+    #[test]
+    fn filters_path_shaped_patterns_stay_exact() {
+        let resolved = load_json(&config_with_filters(json!({
+            "paths": { "include": ["/", "/pets"], "exclude": ["/^get"] }
+        })))
+        .expect("path-shaped patterns are exact, not malformed");
+        let paths = resolved
+            .filters
+            .expect("filters")
+            .paths
+            .expect("paths axis");
+        assert!(
+            paths
+                .include
+                .iter()
+                .chain(&paths.exclude)
+                .all(|pattern| matches!(pattern.kind(), PatternKind::Exact)),
+            "a leading slash alone does not open a regex"
+        );
+        assert!(
+            paths.include[0].matches("/"),
+            "the root path stays expressible"
+        );
+    }
+
+    #[test]
+    fn filters_multi_segment_path_patterns_stay_exact() {
+        let resolved = load_json(&config_with_filters(json!({
+            "paths": { "include": ["/pets/{petId}"] }
+        })))
+        .expect("a multi-segment path is not a regex literal");
+        let paths = resolved
+            .filters
+            .expect("filters")
+            .paths
+            .expect("paths axis");
+        assert!(matches!(paths.include[0].kind(), PatternKind::Exact));
+        assert!(paths.include[0].matches("/pets/{petId}"));
+    }
+
+    #[test]
+    fn filters_uncompilable_regex_is_a_config_error() {
+        assert_code(
+            load_json(&config_with_filters(
+                json!({ "methods": { "include": ["/[unclosed/"] } }),
+            )),
+            CODE_FILTER_PATTERN,
+        );
+    }
+
+    #[test]
+    fn filters_malformed_pattern_names_its_json_pointer() {
+        let diagnostics = assert_code(
+            load_json(&config_with_filters(
+                json!({ "operations": { "include": ["listPets", "/[unclosed/"] } }),
+            )),
+            CODE_FILTER_PATTERN,
+        );
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_FILTER_PATTERN)
+            .expect("pattern diagnostic");
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/filters/operations/include/1")
+        );
+    }
+
+    #[test]
+    fn filters_accept_exact_and_regex_patterns() {
+        let resolved = load_json(&config_with_filters(json!({
+            "tags": { "include": ["pets"], "exclude": ["/^internal$/i"] },
+            "paths": { "include": ["/pets"] },
+            "methods": { "exclude": ["DELETE"] },
+            "deprecated": false
+        })))
+        .expect("filters should resolve");
+        let filters = resolved.filters.expect("filters");
+        assert!(!filters.deprecated);
+        let tags = filters.tags.as_ref().expect("tags axis");
+        assert_eq!(tags.include.len(), 1);
+        assert_eq!(tags.exclude.len(), 1);
+        let paths = filters.paths.as_ref().expect("paths axis");
+        assert!(
+            matches!(paths.include[0].kind(), PatternKind::Exact),
+            "a path-shaped string with no closing slash is exact"
         );
     }
 }

@@ -207,12 +207,16 @@ mod tests {
         temp
     }
 
+    /// A project around a schema-only document.
+    ///
+    /// These documents declare no operations, so every component is unreachable and the default
+    /// pruning would emit nothing. `orphans: true` is the escape hatch for exactly that shape.
     fn raw_json_project(document: &str) -> tempfile::TempDir {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("openapi.json"), document).expect("OpenAPI JSON");
         fs::write(
             temp.path().join("oasts.json"),
-            r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated"}"#,
+            r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated","filters":{"orphans":true}}"#,
         )
         .expect("config JSON");
         temp
@@ -413,7 +417,7 @@ mod tests {
 
             fs::write(
                 temp.path().join("oasts.json"),
-                r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated","types":{"enum":"const"}}"#,
+                r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated","filters":{"orphans":true},"types":{"enum":"const"}}"#,
             )
             .expect("const config JSON");
             let (code, _, stderr) = invoke(
@@ -604,6 +608,7 @@ mod tests {
                 "output: ./generated\n",
                 "namespace: Complete\n",
                 "artifacts:\n  types: true\n",
+                "filters:\n  orphans: true\n  deprecated: true\n",
                 "types:\n  enum: literal\n  enumExtensions: accept\n  dateTime: string\n  date: string\n  readonly: true\n",
                 "naming:\n  fileCase: kebab\n  typeCase: pascal\n  propertyCase: preserve\n  operationCase: camel\n  enumMemberCase: pascal\n  typePrefix: ''\n  typeSuffix: ''\n",
                 "documentation:\n  enabled: true\n  summary: true\n  description: true\n  deprecated: true\n  examples: true\n  constraints: true\n",
@@ -628,6 +633,7 @@ mod tests {
                 "input": { "path": "./openapi.json" },
                 "output": "./generated-json",
                 "namespace": "Complete",
+                "filters": { "orphans": true, "deprecated": true },
                 "artifacts": {
                     "types": { "enabled": true, "directory": "types" },
                     "client": { "enabled": false },
@@ -876,7 +882,8 @@ mod tests {
         fs::write(
             temp.path().join("oasts.json"),
             format!(
-                r#"{{"schemaVersion":1,"input":{{"path":"./openapi.json"}},"output":"./generated","artifacts":{artifacts}}}"#
+                // A schema-only document: every component is unreachable, so pruning is opted out of.
+                r#"{{"schemaVersion":1,"input":{{"path":"./openapi.json"}},"output":"./generated","filters":{{"orphans":true}},"artifacts":{artifacts}}}"#
             ),
         )
         .expect("config JSON");
@@ -941,6 +948,31 @@ mod tests {
         );
         assert_eq!(code, 0);
         assert!(!stderr.contains("OASTS0241"), "{stderr}");
+    }
+
+    #[test]
+    fn generate_warns_when_pruning_leaves_nothing_to_emit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("openapi.json"),
+            r#"{"openapi":"3.1.0","paths":{},"components":{"schemas":{"Pet":{"type":"object"}}}}"#,
+        )
+        .expect("OpenAPI JSON");
+        fs::write(
+            temp.path().join("oasts.json"),
+            r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated"}"#,
+        )
+        .expect("config JSON");
+
+        let (code, stdout, stderr) = invoke(
+            &["oasts", "generate", "--config", "oasts.json"],
+            temp.path(),
+        );
+
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(stdout, "generated 0 files\n");
+        assert!(stderr.contains("warning[OASTS1119]"), "{stderr}");
+        assert!(stderr.contains("filters.orphans"), "{stderr}");
     }
 
     #[test]

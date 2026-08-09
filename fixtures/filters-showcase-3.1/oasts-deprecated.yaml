@@ -1,0 +1,8 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-deprecated
+filters:
+  paths:
+    exclude: ["/^\\/admin\\/.*/"]
+  deprecated: false

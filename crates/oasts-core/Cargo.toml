@@ -25,8 +25,8 @@ yaml-rust2 = { version = "=0.11.0", default-features = false }
 schemars = { version = "=1.2.2", optional = true }
 memchr = "=2.8.3"
 rayon = "=1.11.0"
+regex-lite = "=0.1.9"
 json-strip-comments = "=3.1.2"
-fast-glob = "=1.1.0"
 
 [dev-dependencies]
 divan = "=0.1.21"

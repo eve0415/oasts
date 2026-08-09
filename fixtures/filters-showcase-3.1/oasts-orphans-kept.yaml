@@ -1,0 +1,15 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-orphans-kept
+filters:
+  paths:
+    exclude: ["/^\\/admin\\/.*/"]
+  # Keeping orphans keeps `Orphan` — and also keeps `petSummary`, which the path filter made
+  # unreachable but did not delete. Its identifier collision with `PetSummary` comes back with
+  # it, so this config has to resolve the collision by hand.
+  orphans: true
+naming:
+  overrides:
+    schemas:
+      petSummary: PetSummaryLegacy

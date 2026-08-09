@@ -1,7 +1,7 @@
 //! Per-stage allocation tracker for the `oasts-core` compile pipeline.
 //!
-//! Runs `oasts_core::pipeline::compile`'s stages in-process (`loadGraph`, `parse`, `analyze`,
-//! optionally `clientModel`, `emit`) under a counting `#[global_allocator]`, recording
+//! Runs `oasts_core::pipeline::compile`'s stages in-process (`loadGraph`, `parse`, `filter`,
+//! `analyze`, optionally `clientModel`, `emit`) under a counting `#[global_allocator]`, recording
 //! allocs/reallocs/deallocs/bytes per stage plus one peak-live-bytes figure per key. `--update`
 //! measures every present, non-`cloudflare-3.0` fixture and merges the result into the committed
 //! `bench/allocs.yaml`; `--check` re-measures only the manifest's gated (`committed: true`) keys
@@ -26,6 +26,7 @@ use oasts_core::client_model::build_client_model;
 use oasts_core::config::load_config;
 use oasts_core::diag::{self, DiagnosticSink};
 use oasts_core::emit::emit_artifacts;
+use oasts_core::filter;
 use oasts_core::loader::load_graph;
 use oasts_core::parse::parse;
 use oasts_core::semantic::analyze;
@@ -323,6 +324,16 @@ fn measure_key(entry: &FixtureEntry, fixture_dir: &Path) -> Result<KeySnapshot, 
     let Some(ir) = ir else {
         return Err(stage_failure(&key_label, "parse", sink));
     };
+
+    // Filtering and pruning run between parse and analyze in production, so the harness runs them
+    // here too — a stage the compile path takes but the measurement skipped would make every
+    // number below it describe a pipeline that does not exist.
+    let ir = run_stage(&mut stages, "filter", || {
+        filter::apply(ir, config.filters.as_ref(), &config.config_path, &mut sink)
+    });
+    if sink.has_errors() {
+        return Err(stage_failure(&key_label, "filter", sink));
+    }
 
     // Production retains only the owned source digest inputs after parse, so mirror that lifetime
     // here before measuring analysis. `source_tuples` historically belongs to the emit allocation

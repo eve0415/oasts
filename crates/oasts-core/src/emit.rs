@@ -34,6 +34,7 @@ use crate::ir::{
     AdditionalProperties, Body, Discriminator, Ir, MediaType, Operation, Param, ParamLocation,
     PatternProperty, PatternPropertyKey, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader,
     ResponseStatus, SchemaDocs, SchemaNode, SchemaRef, SourceRef, TupleRest, finite_parts,
+    mapping_schema_ref,
 };
 use crate::media::{is_json, is_xml};
 use crate::num::{first_number_outside_binary64, render_number_value};
@@ -1316,14 +1317,11 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     /// a `file#/...` value resolves the file relative to that document. `None` means the value
     /// designates no allocated schema (a dangling mapping target).
     fn resolve_mapping_target(&self, discriminator: &Discriminator, target: &str) -> Option<usize> {
-        let base = discriminator.source.source_id.as_str();
-        let (source_id, pointer) = match target.split_once('#') {
-            None => (base.to_owned(), format!("/components/schemas/{target}")),
-            Some(("", fragment)) => (base.to_owned(), fragment.to_owned()),
-            Some((file, fragment)) => (join_relative_source(base, file), fragment.to_owned()),
-        };
+        // One resolution rule, shared with the reachability walk that decides whether a mapping
+        // target survives pruning — the two must never disagree about what a mapping value names.
+        let reference = mapping_schema_ref(&discriminator.source, target);
         self.model
-            .schema_target(&source_id, &pointer)
+            .schema_target(&reference.source_id, &reference.json_pointer)
             .map(|target| target.index)
     }
 
@@ -3307,24 +3305,6 @@ fn tag_key(value: &Value) -> String {
         Value::String(value) => value.clone(),
         _ => render_json_compact(value, ObjectKeyMode::Plain),
     }
-}
-
-/// Resolves a relative file reference against a logical source id (e.g. `workspace/openapi.json`),
-/// normalizing `.` and `..` segments, so a `file#/...` discriminator mapping value can be looked up
-/// in the schema target index. Returns the resolved logical source id.
-fn join_relative_source(base: &str, relative: &str) -> String {
-    let mut segments: Vec<&str> = base.split('/').collect();
-    segments.pop();
-    for part in relative.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            segment => segments.push(segment),
-        }
-    }
-    segments.join("/")
 }
 
 fn render_literal_union(values: &[Value]) -> String {
@@ -6567,6 +6547,8 @@ mod tests {
         let rich = Operation {
             method: "post".to_owned(),
             path_template: Vec::new(),
+            tags: Vec::new(),
+            path: None,
             operation_id: Some("rich".to_owned()),
             summary: None,
             description: Some("Rich operation.".to_owned()),
@@ -6641,6 +6623,8 @@ mod tests {
         let empty = Operation {
             method: "get".to_owned(),
             path_template: Vec::new(),
+            tags: Vec::new(),
+            path: None,
             operation_id: Some("empty".to_owned()),
             summary: None,
             description: None,
@@ -8152,7 +8136,10 @@ mod tests {
     #[test]
     fn discriminator_join_relative_source_normalizes_segments() {
         assert_eq!(
-            join_relative_source("workspace/nested/openapi.json", "./sibling/../shared.json"),
+            crate::ir::join_relative_source(
+                "workspace/nested/openapi.json",
+                "./sibling/../shared.json"
+            ),
             "workspace/nested/shared.json"
         );
     }

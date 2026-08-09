@@ -16,6 +16,47 @@ pub fn is_root_component_pointer(json_pointer: &str) -> bool {
         .is_some_and(|name| !name.is_empty() && !name.contains('/'))
 }
 
+/// Resolves a relative file reference against a logical source id (e.g. `workspace/openapi.json`),
+/// normalizing `.` and `..` segments, so a `file#/...` discriminator mapping value can be resolved
+/// to the source it names.
+#[must_use]
+pub fn join_relative_source(base: &str, relative: &str) -> String {
+    let mut segments: Vec<&str> = base.split('/').collect();
+    segments.pop();
+    for part in relative.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    segments.join("/")
+}
+
+/// Resolves one discriminator `mapping` value to the schema identity it names, using the same
+/// rules emission applies: a bare name is a root component of the declaring document, a leading
+/// `#` is a pointer into it, and a `file#pointer` is relative to the declaring document.
+#[must_use]
+pub fn mapping_schema_ref(source: &SourceRef, target: &str) -> SchemaRef {
+    let base = source.source_id.as_str();
+    match target.split_once('#') {
+        None => SchemaRef {
+            source_id: base.to_owned(),
+            json_pointer: format!("/components/schemas/{target}"),
+        },
+        Some(("", fragment)) => SchemaRef {
+            source_id: base.to_owned(),
+            json_pointer: fragment.to_owned(),
+        },
+        Some((file, fragment)) => SchemaRef {
+            source_id: join_relative_source(base, file),
+            json_pointer: fragment.to_owned(),
+        },
+    }
+}
+
 /// Stable source identity attached to parsed nodes.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct SourceRef {
@@ -56,10 +97,29 @@ pub struct Ir {
     pub root_security: Vec<SecurityRequirement>,
     /// Entry-document named security schemes, in source insertion order.
     pub security_schemes: Vec<NamedSecurityScheme>,
+    /// Declarations that filtering and pruning removed.
+    ///
+    /// Naming overrides are judged against the document as written, so an override naming one of
+    /// these is not reported as a typo — default-on pruning must never turn a config that was
+    /// valid into an error.
+    pub removed: RemovedDeclarations,
     /// The entry document's declared OpenAPI version, carried from the parser so version-dependent
     /// rules read the document's own version rather than inferring it from the first media type —
     /// media-less documents (204-only, header-only) have no media to infer from.
     pub version: OasVersion,
+}
+
+/// The names of declarations that filtering and pruning removed, in source order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RemovedDeclarations {
+    pub schemas: Vec<String>,
+    /// Operation ids; an operation without one contributes nothing, because an override cannot
+    /// have named it either.
+    pub operations: Vec<String>,
+    /// JSON pointers of removed operations, for link targets written as an `operationRef`.
+    pub operation_pointers: Vec<String>,
+    pub webhooks: Vec<String>,
+    pub callbacks: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +147,17 @@ pub struct NamedSchema {
 pub struct Operation {
     pub method: String,
     pub path_template: Vec<Segment>,
+    /// Operation tags in source order; empty when the operation declares none.
+    ///
+    /// Tags are advisory metadata, so a non-array `tags` value and non-string entries inside
+    /// one are skipped silently rather than diagnosed — a malformed tag must not fail an
+    /// otherwise valid document.
+    pub tags: Vec<String>,
+    /// The raw path template as written, e.g. `/pets/{petId}`. `None` for webhook and callback
+    /// operations, which have no path — filters keyed on paths abstain on those rather than
+    /// rejecting them. `path_template` cannot serve here: it is empty both for `/` and for a
+    /// webhook.
+    pub path: Option<String>,
     pub operation_id: Option<String>,
     pub summary: Option<String>,
     pub description: Option<String>,

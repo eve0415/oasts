@@ -1,0 +1,8 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+# A closed regex literal whose body does not compile.
+filters:
+  operations:
+    include: ["/[unclosed/"]

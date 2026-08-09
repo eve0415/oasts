@@ -4,6 +4,7 @@ pub mod config;
 pub mod diag;
 pub mod driver;
 pub mod emit;
+pub mod filter;
 mod headers;
 pub mod ir;
 pub mod loader;

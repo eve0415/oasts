@@ -2,6 +2,10 @@ schemaVersion: 1
 input:
   path: ./openapi.yaml
 output: ./generated
+# The frozen validator contract asserts on component schemas that no operation references,
+# so this showcase opts out of unreachable-component pruning.
+filters:
+  orphans: true
 artifacts:
   types: true
   validators: true

@@ -1,0 +1,27 @@
+# SHA-256 manifest of the filtering entry-gate files; scripts/filters-gate.sh verifies it.
+# compile-assert/cases.ts was authored from the filtering contract before any output existed and
+# passed unmodified against the first generated tree. The document and configs were settled with
+# the implementation. Editing any of them afterwards is a deliberate re-freeze, not a quiet one.
+files:
+  - path: fixtures/filters-showcase-3.1/openapi.yaml
+    sha256: 7763f274071648de2277a5a267953ab717feed27a3d9243b030320c1e7bc4656
+  - path: fixtures/filters-showcase-3.1/oasts.yaml
+    sha256: 10b418ddf7d412179654d2b0744e951b7ab64e3ed84f70294c494cc50182bbed
+  - path: fixtures/filters-showcase-3.1/oasts-unfiltered.yaml
+    sha256: 668005b763715f0b6b81c0d9af9320d9c58bf7da35be4838daad983560459857
+  - path: fixtures/filters-showcase-3.1/oasts-tags.yaml
+    sha256: 5ef08b79967de76bed30a2cff281e44ec3e3be11261e93d511c078207219fb1b
+  - path: fixtures/filters-showcase-3.1/oasts-orphans-kept.yaml
+    sha256: 1101517c1b3d6ea9e4fe35ea7a06516a44b11dfbce9748da58d53b8a6a506edb
+  - path: fixtures/filters-showcase-3.1/oasts-deprecated.yaml
+    sha256: a6caa1516ba910d932c1cdc19098ac5c7122336c8ee286db2c6318717d81c534
+  - path: fixtures/filters-showcase-3.1/compile-assert/cases.ts
+    sha256: b8c30c9a673ee9f0f0e8d414ed7ca85c873035c19596cdb0d15aeec53703bb05
+  - path: fixtures/filters-rejection-3.1/openapi.yaml
+    sha256: 7fb7461049aa7b4bf1f85d055542cf095cd4f4ca50f3a381fe2431e98f800fec
+  - path: fixtures/filters-rejection-3.1/oasts-bad-pattern.yaml
+    sha256: a3b00ddc031a13c0b64eb053c8a001f6c820138bbf1fd04145086eedaab5233d
+  - path: fixtures/filters-rejection-3.1/oasts-unmatched.yaml
+    sha256: a4cb6375d70cbbc26bcf68291bc7e0ee8fb4007e7b073a2167b92899527b5e15
+  - path: fixtures/filters-rejection-3.1/oasts-empty.yaml
+    sha256: 5445df37b67b55d3e2f9f3fa93802865fec3afdd018b3b3dcba35e9785170a8d

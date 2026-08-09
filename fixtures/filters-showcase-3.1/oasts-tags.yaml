@@ -1,0 +1,8 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-tags
+filters:
+  tags:
+    include: [pets]
+    exclude: [internal]

@@ -22,6 +22,7 @@ Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtim
 - **Auth the compiler checks.** An operation's security requirements compile into its call signature, so calling one whose auth you never configured is a type error rather than a 401 you find in staging. `client.authEnforcement: runtime` moves the check to call time instead, where an unsatisfied requirement comes back as an `auth` result.
 - **Zero-dependency generated client.** The typed fetch client is emitted next to your types. No runtime package to version-match, nothing in your dependency tree.
 - **Dates as dates.** `types.dateTime`/`types.date` make a `date-time` or `date` schema a `Date` or a `Temporal` value in your code while the wire keeps its string. Conversion happens before request validation and after response decoding, so validators only ever see wire values, and a value neither side can represent comes back as a `request-transform`/`response-transform` result rather than a throw.
+- **Generate the slice you use.** A `filters` block narrows output by tag, operationId, path, and method, and component schemas nothing reaches are dropped by default — on Sentry's spec that is all 188 of them, on Okta's 260. A pattern that stops matching anything fails the build instead of quietly shrinking your client, and so does a filter that would leave nothing to generate.
 - **Rust-powered.** Cold starts in milliseconds; full specs the size of GitHub's compile in well under a second.
 
 ## Features

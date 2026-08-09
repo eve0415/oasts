@@ -23,6 +23,13 @@ pub fn compile(
 ) -> Option<Vec<GeneratedFile>> {
     let graph = load_graph(config, sink)?;
     let ir = parse(&graph, sink)?;
+    // Filtering and pruning run before analysis so name allocation, collision detection and path
+    // registration see only survivors, and a filter diagnostic short-circuits here rather than
+    // cascading into downstream naming errors.
+    let ir = crate::filter::apply(ir, config.filters.as_ref(), &config.config_path, sink);
+    if sink.has_errors() {
+        return None;
+    }
     // Parsing owns every downstream value in the IR. Keep only the source digest inputs so the
     // JSON document tree is released before analysis or emitted-file buffers can overlap with it.
     let source_tuples = graph.source_tuples();
@@ -321,9 +328,26 @@ paths:
         compile_multifile_with_naming(files, None, should_emit)
     }
 
+    fn compile_multifile_with_filters(
+        files: &[(&str, &str)],
+        filters: Value,
+        should_emit: bool,
+    ) -> (DiagnosticSink, Option<Vec<GeneratedFile>>) {
+        compile_multifile_with_overrides(files, None, Some(filters), should_emit)
+    }
+
     fn compile_multifile_with_naming(
         files: &[(&str, &str)],
         naming: Option<Value>,
+        should_emit: bool,
+    ) -> (DiagnosticSink, Option<Vec<GeneratedFile>>) {
+        compile_multifile_with_overrides(files, naming, None, should_emit)
+    }
+
+    fn compile_multifile_with_overrides(
+        files: &[(&str, &str)],
+        naming: Option<Value>,
+        filters: Option<Value>,
         should_emit: bool,
     ) -> (DiagnosticSink, Option<Vec<GeneratedFile>>) {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -341,6 +365,9 @@ paths:
         });
         if let Some(naming) = naming {
             raw["naming"] = naming;
+        }
+        if let Some(filters) = filters {
+            raw["filters"] = filters;
         }
         let config = load_config_from_json(
             &temp.path().join("oasts.json"),
@@ -428,12 +455,19 @@ CrossFileB:
         // An external schema and a root component both named `Shared` produce the
         // byte-identical identifier `Shared`. A genuine exact collision stays fatal:
         // refusing to guess which shape wins is the whole point of the check.
+        // The operation references both, because an unreferenced component is pruned
+        // before name allocation and a pruned schema cannot collide.
         let openapi = r##"openapi: "3.1.0"
 info: { title: collide, version: "1" }
 paths:
   /collide:
     get:
       operationId: get-collide
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Shared"
       responses:
         "200":
           description: ok
@@ -470,6 +504,11 @@ paths:
   /hostname:
     get:
       operationId: get-hostname
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/custom-hostname"
       responses:
         "200":
           description: ok
@@ -1202,6 +1241,245 @@ content:
             content("validators/components/dog.ts")
                 .contains("issues.push(issue(path, \"value not allowed\"));")
         );
+    }
+
+    fn filters_showcase(config: &str) -> (DiagnosticSink, Option<Vec<crate::emit::GeneratedFile>>) {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/filters-showcase-3.1");
+        let config = load_config(Some(&fixture.join(config)), &fixture)
+            .expect("resolved showcase fixture config");
+        let mut sink = DiagnosticSink::new();
+        let files = compile(&config, true, &mut sink);
+        (sink, files)
+    }
+
+    fn emitted_paths(files: &[crate::emit::GeneratedFile]) -> BTreeSet<&str> {
+        files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect()
+    }
+
+    const LINKED_OPENAPI: &str = r##"openapi: "3.1.0"
+info: { title: linked, version: "1" }
+paths:
+  /source:
+    get:
+      operationId: source
+      tags: [keep]
+      responses:
+        "200":
+          description: ok
+          links:
+            byId:
+              operationId: target
+            byRef:
+              operationRef: "#/paths/~1target/get"
+  /target:
+    get:
+      operationId: target
+      tags: [drop]
+      responses:
+        "204": { description: ok }
+"##;
+
+    #[test]
+    fn a_link_whose_target_the_filter_removed_is_dropped_rather_than_reported() {
+        // The document is correct; the config removed the target. Blaming the document for that
+        // would make selecting one tag a build failure pointing at a line the user cannot fix.
+        let (sink, files) = compile_multifile_with_filters(
+            &[("openapi.yaml", LINKED_OPENAPI)],
+            json!({ "tags": { "include": ["keep"] } }),
+            true,
+        );
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let files = files.expect("filtering a link target still generates");
+        let paths = emitted_paths(&files);
+        assert!(paths.contains("types/operations/source.ts"), "{paths:#?}");
+        assert!(!paths.contains("types/operations/target.ts"), "{paths:#?}");
+    }
+
+    #[test]
+    fn a_link_target_missing_from_the_document_is_still_reported() {
+        let (sink, files) = compile_multifile(
+            &[(
+                "openapi.yaml",
+                r##"openapi: "3.1.0"
+info: { title: linked, version: "1" }
+paths:
+  /source:
+    get:
+      operationId: source
+      responses:
+        "200":
+          description: ok
+          links:
+            byId:
+              operationId: nosuchtarget
+"##,
+            )],
+            true,
+        );
+
+        assert!(files.is_none());
+        let codes: Vec<&str> = sink.as_slice().iter().map(|d| d.code).collect();
+        assert!(codes.contains(&"OASTS1231"), "{codes:?}");
+    }
+
+    #[test]
+    fn a_parse_error_keeps_its_exit_code_when_filters_are_configured() {
+        // The operation is rejected by the parser, so a pattern naming it matches nothing. That
+        // is the document's defect, not the config's, and a config diagnostic here would raise
+        // the run's exit code from 1 to 2 and point at the wrong file.
+        let (sink, files) = compile_multifile_with_filters(
+            &[(
+                "openapi.yaml",
+                r##"openapi: "3.1.0"
+info: { title: broken, version: "1" }
+paths:
+  /bad:
+    get:
+      $ref: "#/paths/~1target"
+      operationId: broken
+      responses: { '204': { description: ok } }
+  /target:
+    post:
+      operationId: target
+      responses: { '204': { description: ok } }
+"##,
+            )],
+            json!({ "operations": { "include": ["broken"] } }),
+            true,
+        );
+
+        assert!(files.is_none());
+        let codes: Vec<&str> = sink.as_slice().iter().map(|d| d.code).collect();
+        assert!(codes.contains(&"OASTS1116"), "{codes:?}");
+        assert!(
+            !codes.contains(&"OASTS0262"),
+            "the config is not at fault: {codes:?}"
+        );
+        assert_eq!(sink.worst_exit_code(), 1);
+    }
+
+    #[test]
+    fn filters_showcase_unfiltered_collides_and_emits_nothing() {
+        // `PetSummary` and `petSummary` allocate the same identifier. Both are reachable with no
+        // filters, so the document cannot generate.
+        let (sink, files) = filters_showcase("oasts-unfiltered.yaml");
+
+        assert!(files.is_none(), "an exact collision must suppress output");
+        let diagnostics = sink.as_slice();
+        let collided = diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "OASTS1202");
+        assert!(collided, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_filter_rescues_the_name_collision() {
+        // Excluding `/admin/` drops the only operation reaching `petSummary`; pruning then drops
+        // the schema, and the collision goes with it. This is a consequence of filtering running
+        // on the IR before name allocation, and nothing else pins it.
+        let (sink, files) = filters_showcase("oasts.yaml");
+        let files = files.expect("filtering resolves the collision");
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let paths = emitted_paths(&files);
+        assert!(paths.contains("types/components/petsummary.ts"));
+        assert!(
+            !paths.contains("types/operations/adminlistpets.ts"),
+            "the excluded operation is gone: {paths:#?}"
+        );
+        assert!(
+            !paths.contains("types/components/orphan.ts"),
+            "the unreachable component is pruned: {paths:#?}"
+        );
+        assert!(
+            paths.contains("types/components/webhookonly.ts")
+                && paths.contains("types/components/callbackonly.ts"),
+            "webhooks and callbacks are reachability roots: {paths:#?}"
+        );
+    }
+
+    #[test]
+    fn keeping_orphans_emits_the_unreachable_component() {
+        let (sink, files) = filters_showcase("oasts-orphans-kept.yaml");
+        let files = files.expect("orphans kept");
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let paths = emitted_paths(&files);
+        assert!(paths.contains("types/components/orphan.ts"));
+        assert!(
+            paths.contains("types/components/petsummarylegacy.ts"),
+            "keeping orphans keeps the filtered-out schema too, renamed by an override: {paths:#?}"
+        );
+    }
+
+    #[test]
+    fn dropping_deprecated_operations_removes_only_that_operation() {
+        let (sink, files) = filters_showcase("oasts-deprecated.yaml");
+        let files = files.expect("deprecated dropped");
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let paths = emitted_paths(&files);
+        assert!(
+            !paths.contains("types/operations/deletepet.ts"),
+            "{paths:#?}"
+        );
+        assert!(paths.contains("types/operations/listpets.ts"));
+    }
+
+    #[test]
+    fn a_tag_filter_removes_the_webhook_it_empties() {
+        let (sink, files) = filters_showcase("oasts-tags.yaml");
+        let files = files.expect("tag filtering");
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let paths = emitted_paths(&files);
+        assert!(
+            !paths.iter().any(|path| path.starts_with("types/webhooks/")),
+            "the webhook's only operation is tagged `events`: {paths:#?}"
+        );
+        assert!(
+            !paths.contains("types/components/webhookonly.ts"),
+            "the component only that webhook reached is pruned with it: {paths:#?}"
+        );
+    }
+
+    fn filters_rejection(config: &str) -> Vec<crate::diag::Diagnostic> {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/filters-rejection-3.1");
+        match load_config(Some(&fixture.join(config)), &fixture) {
+            // A malformed pattern fails before any document is loaded.
+            Err(diagnostics) => diagnostics,
+            Ok(resolved) => {
+                let mut sink = DiagnosticSink::new();
+                assert!(compile(&resolved, true, &mut sink).is_none());
+                sink.as_slice().to_vec()
+            }
+        }
+    }
+
+    #[test]
+    fn filter_rejection_fixtures_report_their_code_and_exit_two() {
+        for (config, code) in [
+            ("oasts-bad-pattern.yaml", "OASTS0261"),
+            ("oasts-unmatched.yaml", "OASTS0262"),
+            ("oasts-empty.yaml", "OASTS0263"),
+        ] {
+            let diagnostics = filters_rejection(config);
+            let reported = diagnostics.iter().any(|diagnostic| diagnostic.code == code);
+            assert!(reported, "{config} should report {code}: {diagnostics:#?}");
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .expect("just asserted present");
+            assert_eq!(diagnostic.category, crate::diag::Category::Config);
+            assert_eq!(diagnostic.category.exit_code(), 2);
+            assert!(diagnostic.json_pointer.is_some(), "{diagnostic:#?}");
+        }
     }
 
     #[test]

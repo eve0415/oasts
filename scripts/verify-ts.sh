@@ -390,6 +390,25 @@ for exact_optional in false true; do
     "$work/strict-flags-client/compile-assert/cases.ts"
 done
 
+# Filtering: every scenario config generates a distinct tree, and each is held to the same
+# consumer flag matrix and double-generation byte identity as everything else. The compile-assert
+# reads the default tree, where the only filter excludes the `/admin/` path prefix.
+filters_runs=(
+  "filters-showcase-3.1 oasts.yaml filters-showcase"
+  "filters-showcase-3.1 oasts-tags.yaml filters-showcase-tags"
+  "filters-showcase-3.1 oasts-orphans-kept.yaml filters-showcase-orphans-kept"
+  "filters-showcase-3.1 oasts-deprecated.yaml filters-showcase-deprecated"
+)
+for run in "${filters_runs[@]}"; do
+  read -r fixture config dir <<<"$run"
+  generate_and_verify "$fixture" "$config" "$work/$dir" filters "$fixture ($config)"
+done
+
+for exact_optional in false true; do
+  strict_flag_matrix "filters-showcase-3.1 compile-assert" "$exact_optional" \
+    "$work/filters-showcase/compile-assert/cases.ts"
+done
+
 node --test crates/oasts-core/runtime/test-e2e/index.js
 # Separate process on purpose; test-e2e/streaming-index.js says why.
 node --test crates/oasts-core/runtime/test-e2e/streaming-index.js

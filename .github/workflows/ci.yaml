@@ -208,7 +208,7 @@ jobs:
 
       - name: Verify frozen vectors
         run: |
-          for gate in auth msw streaming tanstack transform validators zod; do
+          for gate in auth filters msw streaming tanstack transform validators zod; do
             scripts/"$gate"-gate.sh
           done
 

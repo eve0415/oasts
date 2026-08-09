@@ -307,7 +307,8 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         options.config_json = Some(
-            r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated"}"#
+            // A schema-only document: every component is unreachable, so pruning is opted out of.
+            r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated","filters":{"orphans":true}}"#
                 .to_owned(),
         );
         let result = run(options);

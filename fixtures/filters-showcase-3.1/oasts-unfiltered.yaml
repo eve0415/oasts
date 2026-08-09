@@ -1,0 +1,6 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-unfiltered
+# No filters: `PetSummary` and `petSummary` are both reachable and the identifier collision is
+# fatal. This config exists to pin that, and never generates.

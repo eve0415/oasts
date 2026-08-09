@@ -1,0 +1,19 @@
+openapi: 3.1.0
+info:
+  title: Filter rejection
+  version: "1"
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      tags: [pets]
+      responses:
+        "204":
+          description: ok
+  /admin/pets:
+    get:
+      operationId: adminListPets
+      tags: [internal]
+      responses:
+        "204":
+          description: ok

@@ -643,6 +643,8 @@ mod tests {
         Operation {
             method: "get".to_owned(),
             path_template: Vec::new(),
+            tags: Vec::new(),
+            path: None,
             operation_id: None,
             summary: None,
             description: None,

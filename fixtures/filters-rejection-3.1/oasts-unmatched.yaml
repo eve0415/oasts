@@ -1,0 +1,8 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+# `listPets` exists; `nosuchoperation` does not.
+filters:
+  operations:
+    include: [listPets, nosuchoperation]

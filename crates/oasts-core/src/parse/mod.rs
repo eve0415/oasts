@@ -11,10 +11,11 @@ use crate::ir::{
     EnumExtensionData, ExclusiveBound, FiniteConstraint, Ir, Link, LinkTarget, MediaType,
     NamedSchema, NamedSecurityScheme, NumericConstraints, OAuthFlow, OAuthFlows, OasVersion,
     ObjectConstraints, Operation, Param, ParamLocation, ParamStyle, PatternProperty,
-    PatternPropertyKey, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader, ResponseStatus,
-    SchemaDocs, SchemaMeta, SchemaNode, SchemaRef, SecKind, SecurityRequirement, Segment,
-    SegmentPart, ServerEntry, ServerVariable, SourceRef, StringConstraints, TupleRest,
-    ValidationApplicators, Webhook, box_if_populated, is_root_component_pointer,
+    PatternPropertyKey, PrimitiveType, PropMeta, RemovedDeclarations, ResponseEntry,
+    ResponseHeader, ResponseStatus, SchemaDocs, SchemaMeta, SchemaNode, SchemaRef, SecKind,
+    SecurityRequirement, Segment, SegmentPart, ServerEntry, ServerVariable, SourceRef,
+    StringConstraints, TupleRest, ValidationApplicators, Webhook, box_if_populated,
+    is_root_component_pointer, mapping_schema_ref,
 };
 use crate::loader::{
     DocId, DocumentGraph, DynamicResolution, append_pointer, append_pointer_index,
@@ -25,6 +26,11 @@ const CODE_VERSION: &str = "OASTS1101";
 const CODE_SHAPE: &str = "OASTS1102";
 const CODE_UNSUPPORTED: &str = "OASTS1103";
 const CODE_RESPONSE_STATUS: &str = "OASTS1104";
+/// A status range written in lowercase. OpenAPI specifies the uppercase wildcard, but real
+/// documents ship `4xx`, so it is canonicalized and reported rather than rejected.
+const CODE_RESPONSE_STATUS_CASE: &str = "OASTS1120";
+/// Two keys in one responses object that name the same status once canonicalized.
+const CODE_RESPONSE_STATUS_DUPLICATE: &str = "OASTS1121";
 const CODE_PATH_PARAMETER: &str = "OASTS1105";
 const CODE_REFERENCE: &str = "OASTS1106";
 const CODE_MEDIA_TYPE: &str = "OASTS1107";
@@ -358,6 +364,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             root_servers,
             root_security,
             security_schemes,
+            removed: RemovedDeclarations::default(),
             version: self.version,
         }
     }
@@ -776,6 +783,8 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         Operation {
             method: method.to_owned(),
             path_template,
+            tags: string_array_field(object, "tags"),
+            path: path_context.map(str::to_owned),
             operation_id: string_field(object, "operationId"),
             summary: string_field(object, "summary"),
             description: string_field(object, "description"),
@@ -1097,6 +1106,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             );
             return Vec::new();
         }
+        // A responses object holds a handful of entries, so a linear scan beats hashing and
+        // keeps `ResponseStatus` free of a `Hash` bound it needs nowhere else.
+        let mut seen_statuses: Vec<ResponseStatus> = Vec::new();
         object
             .iter()
             .filter_map(|(key, value)| {
@@ -1111,7 +1123,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                             Diagnostic::input(
                                 CODE_RESPONSE_STATUS,
                                 format!(
-                                    "invalid response status key '{key}'; status keys are case-sensitive, use 'default', a three-digit code, or an uppercase range like '4XX'"
+                                    "invalid response status key '{key}'; use 'default', a three-digit code, or a range like '4XX'"
                                 ),
                             )
                             .with_source(self.source_id(node.doc_id))
@@ -1120,6 +1132,34 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                         return None;
                     }
                 };
+                if let ResponseStatus::Range(canonical) = &status
+                    && canonical != key
+                {
+                    let mut diagnostic = Diagnostic::input(
+                        CODE_RESPONSE_STATUS_CASE,
+                        format!(
+                            "response status range '{key}' is lowercase; OpenAPI specifies the uppercase wildcard, so it is read as '{canonical}'"
+                        ),
+                    )
+                    .with_source(self.source_id(node.doc_id))
+                    .with_json_pointer(&pointer);
+                    diagnostic.severity = Severity::Warning;
+                    self.sink.push(diagnostic);
+                }
+                if seen_statuses.contains(&status) {
+                    self.sink.push(
+                        Diagnostic::input(
+                            CODE_RESPONSE_STATUS_DUPLICATE,
+                            format!(
+                                "response status key '{key}' names a status another key in the same responses object already declares"
+                            ),
+                        )
+                        .with_source(self.source_id(node.doc_id))
+                        .with_json_pointer(&pointer),
+                    );
+                    return None;
+                }
+                seen_statuses.push(status.clone());
                 let response_node = self.resolve_object(
                     NodeView {
                         doc_id: node.doc_id,
@@ -3527,7 +3567,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
 }
 
 /// Collects every `$ref` target reachable inside one schema tree.
-fn collect_schema_refs(schema: &SchemaNode, out: &mut Vec<SchemaRef>) {
+pub(crate) fn collect_schema_refs(schema: &SchemaNode, out: &mut Vec<SchemaRef>) {
     match schema {
         SchemaNode::Ref { target, .. } => out.push(target.clone()),
         SchemaNode::Object {
@@ -3559,11 +3599,30 @@ fn collect_schema_refs(schema: &SchemaNode, out: &mut Vec<SchemaRef>) {
                 collect_schema_refs(schema, out);
             }
         }
-        SchemaNode::AllOf { branches, .. }
-        | SchemaNode::AnyOf { branches, .. }
-        | SchemaNode::OneOf { branches, .. } => {
+        SchemaNode::AllOf { branches, .. } => {
             for branch in branches {
                 collect_schema_refs(branch, out);
+            }
+        }
+        SchemaNode::AnyOf {
+            branches,
+            discriminator,
+            ..
+        }
+        | SchemaNode::OneOf {
+            branches,
+            discriminator,
+            ..
+        } => {
+            for branch in branches {
+                collect_schema_refs(branch, out);
+            }
+            // A discriminator mapping names a component the branches need not `$ref` — it is a
+            // reference in every sense that matters here, even though it is not spelled `$ref`.
+            if let Some(discriminator) = discriminator {
+                for (_, target) in &discriminator.mapping {
+                    out.push(mapping_schema_ref(&discriminator.source, target));
+                }
             }
         }
         SchemaNode::Primitive { .. }
@@ -3610,7 +3669,7 @@ fn collect_schema_refs(schema: &SchemaNode, out: &mut Vec<SchemaRef>) {
 /// encoding header schema), and response media types. Encoding headers are
 /// emitted by the client but were previously not collected, so an external
 /// `$ref` there silently degraded to `unknown` with no import or diagnostic.
-fn collect_operation_refs(operation: &Operation, out: &mut Vec<SchemaRef>) {
+pub(crate) fn collect_operation_refs(operation: &Operation, out: &mut Vec<SchemaRef>) {
     for parameter in &operation.parameters {
         collect_schema_refs(&parameter.schema, out);
     }
@@ -3777,8 +3836,12 @@ fn parse_response_status(value: &str) -> Option<ResponseStatus> {
     {
         return Some(ResponseStatus::Exact(value.to_owned()));
     }
-    if bytes.len() == 3 && matches!(bytes[0], b'1'..=b'5') && &bytes[1..] == b"XX" {
-        return Some(ResponseStatus::Range(value.to_owned()));
+    if bytes.len() == 3 && matches!(bytes[0], b'1'..=b'5') && bytes[1..].eq_ignore_ascii_case(b"XX")
+    {
+        // Canonicalized here rather than tolerated downstream: the string reaches emitted MSW
+        // matchers and the client's response-match keys verbatim, so a `4xx` that survived parse
+        // would ship as a status range no response ever carries.
+        return Some(ResponseStatus::Range(value.to_ascii_uppercase()));
     }
     None
 }
@@ -4236,6 +4299,20 @@ fn string_field(object: &Map<String, Value>, key: &str) -> Option<String> {
 
 fn bool_field(object: &Map<String, Value>, key: &str) -> bool {
     object.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Reads an array-of-strings field, skipping a non-array value and non-string entries.
+fn string_array_field(object: &Map<String, Value>, key: &str) -> Vec<String> {
+    object
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or_else(Vec::new, |values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
 }
 
 #[cfg(test)]
@@ -4988,30 +5065,38 @@ mod tests {
         }
     }
 
+    /// A document whose `$defs` entry and `components.schemas` entry can be made to collide.
+    ///
+    /// The operation references both, because an unreferenced component is pruned before name
+    /// allocation runs and a pruned schema cannot collide with anything.
     fn entry_defs_document(definition_name: &str, component_name: Option<&str>) -> Value {
         let mut schemas = Map::new();
+        let mut operation = json!({
+            "responses": {
+                "200": {
+                    "description": "ok",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": format!("#/$defs/{definition_name}") }
+                        }
+                    }
+                }
+            }
+        });
         if let Some(component_name) = component_name {
             schemas.insert(component_name.to_owned(), json!({ "type": "integer" }));
+            operation["requestBody"] = json!({
+                "content": {
+                    "application/json": {
+                        "schema": { "$ref": format!("#/components/schemas/{component_name}") }
+                    }
+                }
+            });
         }
         json!({
             "openapi": "3.1.0",
             "info": { "title": "t", "version": "1" },
-            "paths": {
-                "/value": {
-                    "get": {
-                        "responses": {
-                            "200": {
-                                "description": "ok",
-                                "content": {
-                                    "application/json": {
-                                        "schema": { "$ref": format!("#/$defs/{definition_name}") }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
+            "paths": { "/value": { "get": operation } },
             "$defs": {
                 definition_name: { "type": "string" }
             },
@@ -9458,11 +9543,12 @@ mod tests {
         });
         let (_temp, _ir, sink) = parse_value(&document);
         assert!(sink.as_slice().iter().any(|diagnostic| {
-            diagnostic.code == CODE_RESPONSE_STATUS
+            diagnostic.code == CODE_RESPONSE_STATUS_CASE
+                && diagnostic.severity == Severity::Warning
                 && diagnostic.message.contains("'4xx'")
-                && diagnostic.message.contains("case-sensitive")
                 && diagnostic.message.contains("'4XX'")
         }));
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
     }
 
     /// A mapping value that is not a JSON string cannot name a schema, so it drops out of tag
@@ -9961,5 +10047,187 @@ mod tests {
         let mut refs = Vec::new();
         collect_schema_refs(&open_tuple, &mut refs);
         assert_eq!(refs.len(), 1);
+    }
+
+    #[test]
+    fn a_lowercase_status_range_is_accepted_and_canonicalized() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/pets": { "get": {
+                "operationId": "listPets",
+                "responses": {
+                    "200": { "description": "ok" },
+                    "4xx": { "description": "client error" }
+                }
+            } } }
+        });
+
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let statuses: Vec<&ResponseStatus> = ir.operations[0]
+            .responses
+            .iter()
+            .map(|response| &response.status)
+            .collect();
+        assert!(
+            statuses.contains(&&ResponseStatus::Range("4XX".to_owned())),
+            "a lowercase range is stored in its canonical form: {statuses:?}"
+        );
+        let diagnostics = sink.as_slice();
+        let reported = diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CODE_RESPONSE_STATUS_CASE);
+        assert!(reported, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn an_uppercase_status_range_is_accepted_without_a_warning() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/pets": { "get": {
+                "operationId": "listPets",
+                "responses": { "4XX": { "description": "client error" } }
+            } } }
+        });
+
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
+        assert_eq!(
+            ir.operations[0].responses[0].status,
+            ResponseStatus::Range("4XX".to_owned())
+        );
+    }
+
+    #[test]
+    fn two_status_keys_naming_one_range_are_rejected() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/pets": { "get": {
+                "operationId": "listPets",
+                "responses": {
+                    "4XX": { "description": "client error" },
+                    "4xx": { "description": "the same range again" }
+                }
+            } } }
+        });
+
+        let (_temp, _ir, sink) = parse_value(&document);
+
+        let diagnostics = sink.as_slice();
+        let reported = diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CODE_RESPONSE_STATUS_DUPLICATE);
+        assert!(reported, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn a_status_key_that_is_neither_a_code_nor_a_range_is_still_rejected() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/pets": { "get": {
+                "operationId": "listPets",
+                "responses": { "nonsense": { "description": "no" } }
+            } } }
+        });
+
+        let (_temp, _ir, sink) = parse_value(&document);
+
+        let diagnostics = sink.as_slice();
+        let reported = diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CODE_RESPONSE_STATUS);
+        assert!(reported, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn operations_carry_tags_and_the_raw_path() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/": { "get": { "operationId": "root", "responses": { "204": { "description": "ok" } } } },
+                "/pets/{petId}": {
+                    "get": {
+                        "operationId": "readPet",
+                        "tags": ["pets", "public"],
+                        "parameters": [
+                            { "name": "petId", "in": "path", "required": true, "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            },
+            "webhooks": {
+                "petCreated": {
+                    "post": { "operationId": "onPet", "tags": ["events"], "responses": { "204": { "description": "ok" } } }
+                }
+            }
+        });
+
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let root = ir
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id.as_deref() == Some("root"))
+            .expect("root operation");
+        assert_eq!(root.path.as_deref(), Some("/"));
+        assert!(root.tags.is_empty());
+
+        let read = ir
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id.as_deref() == Some("readPet"))
+            .expect("readPet operation");
+        assert_eq!(read.path.as_deref(), Some("/pets/{petId}"));
+        assert_eq!(read.tags, vec!["pets".to_owned(), "public".to_owned()]);
+
+        let hook = &ir.webhooks[0].operations[0];
+        assert_eq!(hook.path, None, "a webhook operation has no path");
+        assert_eq!(hook.tags, vec!["events".to_owned()]);
+    }
+
+    #[test]
+    fn malformed_tags_are_skipped_rather_than_diagnosed() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/pets": {
+                    "get": { "operationId": "listPets", "tags": "pets", "responses": { "204": { "description": "ok" } } },
+                    "post": { "operationId": "addPet", "tags": ["pets", 7], "responses": { "204": { "description": "ok" } } }
+                }
+            }
+        });
+
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let list = ir
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id.as_deref() == Some("listPets"))
+            .expect("listPets operation");
+        assert!(
+            list.tags.is_empty(),
+            "a non-array tags value yields no tags"
+        );
+        let add = ir
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id.as_deref() == Some("addPet"))
+            .expect("addPet operation");
+        assert_eq!(
+            add.tags,
+            vec!["pets".to_owned()],
+            "a non-string entry is skipped"
+        );
     }
 }

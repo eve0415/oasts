@@ -2,6 +2,10 @@ schemaVersion: 1
 input:
   path: ./openapi.yaml
 output: ./generated
+# Every component in this document is unreachable from an operation: the document
+# exists to exercise schema-level behaviour, so pruning would leave nothing to emit.
+filters:
+  orphans: true
 artifacts:
   types: true
   validators: true

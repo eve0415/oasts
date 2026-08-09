@@ -2,3 +2,28 @@ schemaVersion: 1
 input:
   path: ./openapi.json
 output: ./generated
+# Cloudflare's document declares pairs of names that differ only by separator or case, so each
+# pair allocates one TypeScript identifier. The compiler refuses to guess which shape wins and
+# prints exactly these overrides; a real consumer of this spec has to paste them too.
+naming:
+  overrides:
+    schemas:
+      'aaa_audit-logs-response-collection': 'AaaAuditLogsResponseCollection_1'
+      'aaa_audit_logs_response_collection': 'AaaAuditLogsResponseCollection_2'
+      'bill-subs-api_component-value': 'BillSubsApiComponentValue_1'
+      'bill-subs-api_component_value': 'BillSubsApiComponentValue_2'
+      'bill-subs-api_rate-plan': 'BillSubsApiRatePlan_1'
+      'bill-subs-api_rate_plan': 'BillSubsApiRatePlan_2'
+      'dns-firewall_dns-firewall-reverse-dns-response': 'DnsFirewallDnsFirewallReverseDnsResponse_1'
+      'dns-firewall_dns_firewall_reverse_dns_response': 'DnsFirewallDnsFirewallReverseDnsResponse_2'
+      'intel-sinkholes_api-response-common-failure': 'IntelSinkholesApiResponseCommonFailure_1'
+      'intel-sinkholes_api_response_common_failure': 'IntelSinkholesApiResponseCommonFailure_2'
+      'load-balancing_origin-healthy': 'LoadBalancingOriginHealthy_1'
+      'load-balancing_origin_healthy': 'LoadBalancingOriginHealthy_2'
+      'stream_liveInput': 'StreamLiveInput_1'
+      'stream_live_input': 'StreamLiveInput_2'
+      'stream_watermarkAtUpload': 'StreamWatermarkAtUpload_1'
+      'stream_watermark_at_upload': 'StreamWatermarkAtUpload_2'
+    operations:
+      'DeleteWebhook': 'deleteWebhook_1'
+      'deleteWebhook': 'deleteWebhook_2'

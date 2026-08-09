@@ -18,4 +18,4 @@ files:
   - path: fixtures/validators-showcase-3.1/openapi.yaml
     sha256: a22cab2669a29940a5b5e533c23388ce7e64e9ea091e1ab5c3e83e61c6b1bc56
   - path: fixtures/validators-showcase-3.1/oasts-zod.yaml
-    sha256: 7d4d065d4373aeb1337ef7d17f9b94db3ae9aa5576eab4b2790355e84dfee659
+    sha256: dc2f08c49d6356e0857155a2458a9ab69ed77b5260916e1c1c5f8da68dd713a0

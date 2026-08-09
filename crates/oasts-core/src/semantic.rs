@@ -373,6 +373,10 @@ fn validate_unique_operation_ids(ir: &Ir, sink: &mut DiagnosticSink) {
 fn resolve_links(ir: &Ir, sink: &mut DiagnosticSink) -> Vec<ResolvedLink> {
     // Resolve each link target in O(1). Both maps keep the first operation for a given key, so a
     // lookup lands on the same operation `Iterator::position` (first match) returned before.
+    //
+    // A target the filter removed is not a broken link: the document is correct and the config
+    // took the target away, so the link is dropped without a diagnostic. Reporting it would make
+    // selecting a subset fail against a line the user cannot fix.
     let mut by_operation_id: HashMap<&str, usize> = HashMap::new();
     let mut by_json_pointer: HashMap<&str, usize> = HashMap::new();
     for (index, operation) in ir.operations.iter().enumerate() {
@@ -390,7 +394,7 @@ fn resolve_links(ir: &Ir, sink: &mut DiagnosticSink) -> Vec<ResolvedLink> {
                 let target_operation_index = match &link.target {
                     LinkTarget::OperationId(operation_id) => {
                         let target = by_operation_id.get(operation_id.as_str()).copied();
-                        if target.is_none() {
+                        if target.is_none() && !ir.removed.operations.contains(operation_id) {
                             sink.push(source_diagnostic(
                                 CODE_LINK_OPERATION_ID,
                                 format!(
@@ -403,10 +407,16 @@ fn resolve_links(ir: &Ir, sink: &mut DiagnosticSink) -> Vec<ResolvedLink> {
                         target
                     }
                     LinkTarget::OperationRef(operation_ref) => {
-                        let target = operation_ref
-                            .strip_prefix('#')
-                            .and_then(|fragment| by_json_pointer.get(fragment).copied());
-                        if target.is_none() {
+                        let fragment = operation_ref.strip_prefix('#');
+                        let target =
+                            fragment.and_then(|fragment| by_json_pointer.get(fragment).copied());
+                        let filtered_out = fragment.is_some_and(|fragment| {
+                            ir.removed
+                                .operation_pointers
+                                .iter()
+                                .any(|pointer| pointer == fragment)
+                        });
+                        if target.is_none() && !filtered_out {
                             sink.push(source_diagnostic(
                                 CODE_LINK_OPERATION_REF,
                                 format!(
@@ -1263,24 +1273,26 @@ fn collect_schema_override_suggestions(
 ///
 /// This is a config error (exit code 2): a typo that silently did nothing would leave the
 /// collision the override was meant to resolve still unexplained, sending the user hunting.
+/// A key naming a declaration that filtering or pruning removed is not a typo, so those names
+/// count as declared — otherwise default-on pruning would break configs that were valid.
 /// The check needs the document, so it runs here rather than at config load. Keys are visited
 /// in the map's sorted order, so the diagnostics are deterministic.
 fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut DiagnosticSink) {
     for key in naming.overrides.schemas.keys() {
-        if !ir
+        let declared = ir
             .schemas
             .iter()
-            .any(|schema| &schema.name == key && is_overrideable_schema(&schema.source))
-        {
+            .any(|schema| &schema.name == key && is_overrideable_schema(&schema.source));
+        if !declared && !ir.removed.schemas.contains(key) {
             sink.push(unmatched_override_diagnostic("schema", "schemas", key));
         }
     }
     for key in naming.overrides.operations.keys() {
-        if !ir
+        let declared = ir
             .operations
             .iter()
-            .any(|operation| operation.operation_id.as_deref() == Some(key.as_str()))
-        {
+            .any(|operation| operation.operation_id.as_deref() == Some(key.as_str()));
+        if !declared && !ir.removed.operations.contains(key) {
             sink.push(unmatched_override_diagnostic(
                 "operation",
                 "operations",
@@ -1289,7 +1301,8 @@ fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut Diagnos
         }
     }
     for key in naming.overrides.webhooks.keys() {
-        if !ir.webhooks.iter().any(|webhook| &webhook.name == key) {
+        let declared = ir.webhooks.iter().any(|webhook| &webhook.name == key);
+        if !declared && !ir.removed.webhooks.contains(key) {
             sink.push(unmatched_override_diagnostic("webhook", "webhooks", key));
         }
     }
@@ -1301,7 +1314,7 @@ fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut Diagnos
                 .iter()
                 .any(|callback| &callback.name == key);
         });
-        if !matched {
+        if !matched && !ir.removed.callbacks.contains(key) {
             sink.push(unmatched_override_diagnostic("callback", "callbacks", key));
         }
     }
@@ -2667,6 +2680,8 @@ mod tests {
         Operation {
             method: "get".to_owned(),
             path_template: path,
+            tags: Vec::new(),
+            path: None,
             operation_id: None,
             summary: None,
             description: None,
