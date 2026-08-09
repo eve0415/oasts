@@ -605,11 +605,15 @@ fn render_key_element(element: &KeyElement) -> String {
             let key = render_literal_key(&parameter.wire);
             // Property shorthand whenever the wire name is already the parameter identifier, which
             // is the common case and the shape the key contract shows.
-            if key == parameter.identifier {
+            let present = if key == parameter.identifier {
                 format!("{{ {} }}", parameter.identifier)
             } else {
                 format!("{{ {key}: {} }}", parameter.identifier)
-            }
+            };
+            // TanStack's stable hash drops undefined-valued object properties. An empty array is
+            // therefore the missing-value representation: it is serializable and structurally
+            // distinct from the object every present path value contributes.
+            format!("{} === undefined ? [] : {present}", parameter.identifier)
         }
         KeyElement::Mixed(runs) => {
             let rendered: Vec<String> = runs.iter().map(render_key_element).collect();
@@ -649,7 +653,7 @@ impl KeyFactory {
             &extension,
         )));
         output.push_str(
-            ";\n\n// What a path parameter contributes to a key. Wider than `ParamValue` because a\n             // `content`-typed parameter carries arbitrary JSON, and one signature has to serve\n             // every operation on the path — the client is what checks the value against its own\n             // schema; a key only has to be able to hold it.\n             export type KeyValue = ParamValue | { readonly [key: string]: KeyValue } | readonly KeyValue[];\n\n",
+            ";\n\n// What a path parameter contributes to a key. Wider than `ParamValue` because a\n             // `content`-typed parameter carries arbitrary JSON, and one signature has to serve\n             // every operation on the path — the client is what checks the value against its own\n             // schema; a key only has to be able to hold it. A factory also accepts `undefined`\n             // for an optional path parameter and encodes it as a distinct array segment.\n             export type KeyValue = ParamValue | { readonly [key: string]: KeyValue } | readonly KeyValue[];\n\n",
         );
 
         for binding in self.bindings.values() {
@@ -660,7 +664,7 @@ impl KeyFactory {
                 let signature: Vec<String> = binding
                     .parameters
                     .iter()
-                    .map(|parameter| format!("{}: KeyValue", parameter.identifier))
+                    .map(|parameter| format!("{}: KeyValue | undefined", parameter.identifier))
                     .collect();
                 output.push_str(&format!(
                     "export const {} = ({}) => {body};\n\n",
@@ -791,6 +795,20 @@ fn streaming_ineligibility(plan: &OperationPlan) -> Option<&'static str> {
     )
 }
 
+/// Whether `orThrow` can resolve a client envelope rather than always throwing.
+///
+/// An operation whose every documented response is an error has no success arm, so the client types
+/// its throwing wrapper `Promise<never>`. Reads never reach here — `is_query_eligible` refuses them
+/// first — but writes are emitted regardless, and `never` carries no `.data` to unwrap.
+fn has_successful_response(plan: &OperationPlan) -> bool {
+    plan.response_table.iter().any(|response| {
+        !matches!(
+            response_body_side(response.kind, &response.match_key),
+            ResponseBody::Error
+        )
+    })
+}
+
 /// Whether a read operation may emit a query descriptor.
 ///
 /// A query function resolving `undefined` is rejected, and a descriptor resolves the operation's
@@ -864,12 +882,24 @@ fn member_access(base: &str, name: &str) -> String {
 }
 
 /// The call that produces one binding's key from an input expression.
-fn binding_call(binding: &KeyBinding, input: &str) -> String {
+fn binding_call(binding: &KeyBinding, operation: &Operation, input: &str) -> String {
     if binding.is_function() {
         let arguments: Vec<String> = binding
             .parameters
             .iter()
-            .map(|parameter| member_access(&format!("{input}.path"), &parameter.wire))
+            .map(|parameter| {
+                let required = operation.parameters.iter().any(|candidate| {
+                    candidate.location == ParamLocation::Path
+                        && candidate.name == parameter.wire
+                        && candidate.required
+                });
+                let path = if required {
+                    format!("{input}.path")
+                } else {
+                    format!("{input}.path?")
+                };
+                member_access(&path, &parameter.wire)
+            })
             .collect();
         format!("{}({})", binding.name, arguments.join(", "))
     } else {
@@ -1002,6 +1032,7 @@ fn emit_operation(
             allocated_name,
             &stem,
             encodes,
+            has_successful_response(plan),
         )?
     };
 
@@ -1114,7 +1145,7 @@ fn query_body(
     let key_input = if encodes { "wire" } else { "input" };
     let sections = input_sections(operation);
     let key = if sections.is_empty() {
-        binding_call(binding, key_input)
+        binding_call(binding, operation, key_input)
     } else {
         // Whether the caller supplied any of the declared sections is a runtime fact, so the
         // append is a runtime decision. See `withInput` for why appending unconditionally breaks
@@ -1125,7 +1156,7 @@ fn query_body(
             .collect();
         format!(
             "withInput({}, {{ {} }})",
-            binding_call(binding, key_input),
+            binding_call(binding, operation, key_input),
             fields.join(", ")
         )
     };
@@ -1174,6 +1205,7 @@ fn mutation_body(
     allocated_name: &str,
     stem: &str,
     encodes: bool,
+    unwraps_payload: bool,
 ) -> Option<ModuleBody> {
     let binding = factory.binding(&operation.path_template)?;
     let mut bindings = BTreeSet::new();
@@ -1188,10 +1220,10 @@ fn mutation_body(
         && let Some(parent) = factory.parent_binding(&operation.path_template)
     {
         bindings.insert(parent.name.clone());
-        affects.push(binding_call(parent, key_input));
+        affects.push(binding_call(parent, operation, key_input));
     }
     bindings.insert(binding.name.clone());
-    affects.push(binding_call(binding, key_input));
+    affects.push(binding_call(binding, operation, key_input));
 
     // A collection-level mutation on an unparameterized path reads nothing from its input, and a
     // consumer compiling the generated tree with `noUnusedParameters` would be told so. The
@@ -1215,9 +1247,11 @@ fn mutation_body(
         render_ts_string(allocated_name)
     ));
     // TanStack supplies no signal to a mutation function, so `args` passes through untouched and
-    // the transport is never wrapped.
+    // the transport is never wrapped. `.data` unwraps the client envelope to the payload; an
+    // operation with no success arm has no envelope to unwrap, and keeps the awaited `never`.
+    let data_access = if unwraps_payload { ".data" } else { "" };
     content.push_str(&format!(
-        "    mutationFn: async (input: {stem}Input) => (await {allocated_name}OrThrow(transport, input, ...args)).data,\n"
+        "    mutationFn: async (input: {stem}Input) => (await {allocated_name}OrThrow(transport, input, ...args)){data_access},\n"
     ));
     content.push_str("  };\n}\n\n");
 
@@ -1494,7 +1528,7 @@ paths:
         // `/pets/mine` and `/pets/{petId}` with petId = "mine" cannot collide at any prefix depth.
         assert!(
             keys.contains(
-                "export const apiPetsByPetId = (petId: KeyValue) => [\"api\", \"pets\", { petId }] as const;"
+                "export const apiPetsByPetId = (petId: KeyValue | undefined) => [\"api\", \"pets\", petId === undefined ? [] : { petId }] as const;"
             ),
             "{keys}"
         );
@@ -1503,13 +1537,13 @@ paths:
         // entity needs its key, so it still gets a binding.
         assert!(
             keys.contains(
-                "export const apiPetsByPetIdToysAll = (petId: KeyValue) => [\"api\", \"pets\", { petId }, \"toys\"] as const;"
+                "export const apiPetsByPetIdToysAll = (petId: KeyValue | undefined) => [\"api\", \"pets\", petId === undefined ? [] : { petId }, \"toys\"] as const;"
             ),
             "{keys}"
         );
         assert!(
             keys.contains(
-                "export const apiPetsByPetIdToysByToyId = (petId: KeyValue, toyId: KeyValue) => [\"api\", \"pets\", { petId }, \"toys\", { toyId }] as const;"
+                "export const apiPetsByPetIdToysByToyId = (petId: KeyValue | undefined, toyId: KeyValue | undefined) => [\"api\", \"pets\", petId === undefined ? [] : { petId }, \"toys\", toyId === undefined ? [] : { toyId }] as const;"
             ),
             "{keys}"
         );
@@ -1518,13 +1552,13 @@ paths:
         // extensions distinct at every prefix depth.
         assert!(
             keys.contains(
-                "export const apiReportsByIdJson = (id: KeyValue) => [\"api\", \"reports\", [{ id }, \".json\"]] as const;"
+                "export const apiReportsByIdJson = (id: KeyValue | undefined) => [\"api\", \"reports\", [id === undefined ? [] : { id }, \".json\"]] as const;"
             ),
             "{keys}"
         );
         assert!(
             keys.contains(
-                "export const apiReportsByIdXml = (id: KeyValue) => [\"api\", \"reports\", [{ id }, \".xml\"]] as const;"
+                "export const apiReportsByIdXml = (id: KeyValue | undefined) => [\"api\", \"reports\", [id === undefined ? [] : { id }, \".xml\"]] as const;"
             ),
             "{keys}"
         );
@@ -2047,7 +2081,7 @@ paths:
         let (keys, diagnostics) = keys_for(MIXED, &config);
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
         assert!(
-            keys.contains("export const apiAByIdJp = (id: KeyValue) =>"),
+            keys.contains("export const apiAByIdJp = (id: KeyValue | undefined) =>"),
             "{keys}"
         );
     }
@@ -2086,6 +2120,38 @@ paths:
         assert!(
             warning.message.contains("documents no successful response"),
             "{warning:?}"
+        );
+    }
+
+    /// The read above is refused outright, but a write with the same responses is still emitted —
+    /// so it is the mutation side that has to stop unwrapping. `orThrow` is typed `Promise<never>`
+    /// there, and `never` has no `.data` (TS2339 in a consumer's build).
+    #[test]
+    fn a_write_documenting_no_successful_response_keeps_the_awaited_never() {
+        const NO_SUCCESS_WRITE: &str = r#"
+openapi: 3.1.0
+info:
+  title: No success
+  version: 1.0.0
+paths:
+  /pets:
+    post:
+      operationId: createPet
+      responses:
+        '404':
+          description: gone
+          content:
+            application/json:
+              schema:
+                type: object
+"#;
+        let (files, _) = emit(NO_SUCCESS_WRITE, TANSTACK_CONFIG);
+        let module = emitted(&files, "tanstack/operations/createpet.ts");
+        assert!(
+            module.contains(
+                "mutationFn: async (input: CreatePetInput) => (await createPetOrThrow(transport, input, ...args)),"
+            ),
+            "{module}"
         );
     }
 
@@ -2298,6 +2364,92 @@ paths:
     }
 
     #[test]
+    fn an_optional_path_parameter_is_guarded_in_query_and_invalidation_keys() {
+        const OPTIONAL_PATH: &str = r#"
+openapi: 3.1.0
+info:
+  title: Optional path
+  version: 1.0.0
+paths:
+  /hooks/{id}:
+    parameters:
+      - name: id
+        in: path
+        schema:
+          type: string
+    get:
+      operationId: getHook
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+    delete:
+      operationId: deleteHook
+      responses:
+        '204':
+          description: gone
+  /events/{occurredAt}:
+    parameters:
+      - name: occurredAt
+        in: path
+        schema:
+          type: string
+          format: date-time
+    get:
+      operationId: readEvent
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+    put:
+      operationId: updateEvent
+      responses:
+        '204':
+          description: updated
+"#;
+        let config =
+            TANSTACK_CONFIG.replace("validation:", "types:\n  dateTime: date\nvalidation:");
+        let (files, diagnostics) = emit(OPTIONAL_PATH, &config);
+
+        let keys = emitted(&files, "tanstack/keys.ts");
+        assert!(
+            keys.contains("export const apiHooksById = (id: KeyValue | undefined) => [\"api\", \"hooks\", id === undefined ? [] : { id }] as const;"),
+            "{keys}"
+        );
+
+        let query = emitted(&files, "tanstack/operations/gethook.ts");
+        assert!(
+            query.contains("queryKey: apiHooksById(input.path?.id),"),
+            "{query}"
+        );
+        let mutation = emitted(&files, "tanstack/operations/deletehook.ts");
+        assert!(
+            mutation.contains("return [apiHooksAll, apiHooksById(input.path?.id)] as const;"),
+            "{mutation}"
+        );
+
+        let wire_query = emitted(&files, "tanstack/operations/readevent.ts");
+        assert!(
+            wire_query.contains("queryKey: apiEventsByOccurredAt(wire.path?.occurredAt),"),
+            "{wire_query}"
+        );
+        let wire_mutation = emitted(&files, "tanstack/operations/updateevent.ts");
+        assert!(
+            wire_mutation.contains(
+                "return [apiEventsAll, apiEventsByOccurredAt(wire.path?.occurredAt)] as const;"
+            ),
+            "{wire_mutation}"
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
     fn every_way_a_read_can_be_bodyless_suppresses_its_descriptor_and_warns() {
         let (files, diagnostics) = emit(DOCUMENT, TANSTACK_CONFIG);
         for file in [
@@ -2504,7 +2656,7 @@ paths:
             "{keys}"
         );
         assert!(
-            keys.contains("export const apiFiltersByFilter = (filter: KeyValue) =>"),
+            keys.contains("export const apiFiltersByFilter = (filter: KeyValue | undefined) =>"),
             "{keys}"
         );
     }
@@ -2699,7 +2851,7 @@ paths:
         let keys = emitted(&files, "tanstack/keys.ts");
         assert!(
             keys.contains(
-                "(thingId: KeyValue) => [\"api\", \"things\", { \"thing-id\": thingId }] as const"
+                "(thingId: KeyValue | undefined) => [\"api\", \"things\", thingId === undefined ? [] : { \"thing-id\": thingId }] as const"
             ),
             "{keys}"
         );

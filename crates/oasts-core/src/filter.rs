@@ -14,7 +14,7 @@ use regex_lite::RegexBuilder;
 use crate::config::{AxisFilter, FiltersConfig};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{Ir, Operation, RemovedDeclarations, SchemaRef};
-use crate::parse::{collect_operation_refs, collect_schema_refs};
+use crate::parse::{RefOrigin, collect_operation_refs, collect_schema_refs};
 
 /// A malformed filter pattern: a regex literal whose body does not compile.
 pub(crate) const CODE_FILTER_PATTERN: &str = "OASTS0261";
@@ -621,7 +621,7 @@ fn prune_unreachable_schemas(ir: &mut Ir) {
         );
     }
 
-    let mut queue: Vec<SchemaRef> = Vec::new();
+    let mut queue: Vec<(SchemaRef, RefOrigin)> = Vec::new();
     for operation in &ir.operations {
         collect_operation_refs(operation, &mut queue);
     }
@@ -632,7 +632,10 @@ fn prune_unreachable_schemas(ir: &mut Ir) {
     }
 
     let mut reached = vec![false; ir.schemas.len()];
-    while let Some(reference) = queue.pop() {
+    // A discriminator mapping target reaches a component the branches need not `$ref`, so it
+    // counts as reachability here exactly like a `$ref` does; one that names nothing simply
+    // misses the index below.
+    while let Some((reference, _)) = queue.pop() {
         // A reference that names no schema — an inline subschema, or a pointer into a non-schema
         // component — has nothing to mark and nothing to walk.
         let Some(&position) = index.get(&(

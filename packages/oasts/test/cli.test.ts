@@ -100,7 +100,8 @@ test("warnings reach stderr on successful runs", async () => {
   );
   writeFileSync(
     join(directory, "oasts.config.ts"),
-    'export default { schemaVersion: 1, input: { path: "./openapi.json" }, output: "./generated" };\n',
+    // A schema-only document: every component is unreachable, so pruning is opted out of.
+    'export default { schemaVersion: 1, input: { path: "./openapi.json" }, output: "./generated", filters: { orphans: true } };\n',
   );
   const generated = await invoke(["generate"], directory);
   assert.equal(generated.code, 0);

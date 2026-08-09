@@ -413,7 +413,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             })
             .collect();
 
-        let mut queue: Vec<SchemaRef> = Vec::new();
+        let mut queue: Vec<(SchemaRef, RefOrigin)> = Vec::new();
         for schema in schemas.iter() {
             collect_schema_refs(&schema.schema, &mut queue);
         }
@@ -433,22 +433,37 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             cursor += 1;
             // A root component of the entry document is already a named schema; anything deeper
             // under `components/schemas` is an inline schema that still needs materializing.
-            if queue[index].source_id == entry_source
-                && is_root_component_pointer(&queue[index].json_pointer)
+            if queue[index].0.source_id == entry_source
+                && is_root_component_pointer(&queue[index].0.json_pointer)
             {
                 continue;
             }
-            let key = {
-                let target = &queue[index];
-                (target.source_id.clone(), target.json_pointer.clone())
+            let (key, origin) = {
+                let (target, origin) = &queue[index];
+                (
+                    (target.source_id.clone(), target.json_pointer.clone()),
+                    *origin,
+                )
             };
             if materialized.contains(&key) {
                 continue;
             }
             let node = documents_by_source
                 .get(key.0.as_str())
-                .and_then(|&doc_id| self.graph.node_at(doc_id, &key.1))
-                .expect("the loader validated every reference target before parsing");
+                .and_then(|&doc_id| self.graph.node_at(doc_id, &key.1));
+            let Some(node) = node else {
+                // A mapping value is not a `$ref`, so nothing validated it upstream and a document
+                // is free to point one at a pointer that resolves to nothing. Emission reports the
+                // dangling entry (OASTS1308) and drops its tag, so there is nothing to materialize
+                // here and nothing to say twice. A `$ref` reaching this arm would mean the loader
+                // let an unresolved target through, which is why the assert stays.
+                debug_assert_eq!(
+                    origin,
+                    RefOrigin::DiscriminatorMapping,
+                    "the loader validated every reference target before parsing"
+                );
+                continue;
+            };
             let doc_id = node.doc_id;
             let document_stem = self
                 .graph
@@ -3566,10 +3581,20 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
     }
 }
 
+/// Why a collected target names a schema, which decides whether it is guaranteed to resolve.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RefOrigin {
+    /// A `$ref`. The loader resolved and validated every one of these before parsing began.
+    Reference,
+    /// A discriminator `mapping` value. The loader never sees these, so the target may name
+    /// nothing at all — real documents ship mappings that point into thin air.
+    DiscriminatorMapping,
+}
+
 /// Collects every `$ref` target reachable inside one schema tree.
-pub(crate) fn collect_schema_refs(schema: &SchemaNode, out: &mut Vec<SchemaRef>) {
+pub(crate) fn collect_schema_refs(schema: &SchemaNode, out: &mut Vec<(SchemaRef, RefOrigin)>) {
     match schema {
-        SchemaNode::Ref { target, .. } => out.push(target.clone()),
+        SchemaNode::Ref { target, .. } => out.push((target.clone(), RefOrigin::Reference)),
         SchemaNode::Object {
             properties,
             additional_properties,
@@ -3621,7 +3646,10 @@ pub(crate) fn collect_schema_refs(schema: &SchemaNode, out: &mut Vec<SchemaRef>)
             // reference in every sense that matters here, even though it is not spelled `$ref`.
             if let Some(discriminator) = discriminator {
                 for (_, target) in &discriminator.mapping {
-                    out.push(mapping_schema_ref(&discriminator.source, target));
+                    out.push((
+                        mapping_schema_ref(&discriminator.source, target),
+                        RefOrigin::DiscriminatorMapping,
+                    ));
                 }
             }
         }
@@ -3669,7 +3697,7 @@ pub(crate) fn collect_schema_refs(schema: &SchemaNode, out: &mut Vec<SchemaRef>)
 /// encoding header schema), and response media types. Encoding headers are
 /// emitted by the client but were previously not collected, so an external
 /// `$ref` there silently degraded to `unknown` with no import or diagnostic.
-pub(crate) fn collect_operation_refs(operation: &Operation, out: &mut Vec<SchemaRef>) {
+pub(crate) fn collect_operation_refs(operation: &Operation, out: &mut Vec<(SchemaRef, RefOrigin)>) {
     for parameter in &operation.parameters {
         collect_schema_refs(&parameter.schema, out);
     }
@@ -5929,7 +5957,7 @@ mod tests {
 
         assert_eq!(
             refs.iter()
-                .map(|target| target.json_pointer.as_str())
+                .map(|(target, _)| target.json_pointer.as_str())
                 .collect::<Vec<_>>(),
             [
                 "/NotTarget",
@@ -6093,14 +6121,14 @@ mod tests {
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         let mut refs = Vec::new();
         collect_schema_refs(schema_named(&ir, "BookendedAsPlain"), &mut refs);
-        assert_eq!(refs[0].json_pointer, "/components/schemas/PlainTarget");
+        assert_eq!(refs[0].0.json_pointer, "/components/schemas/PlainTarget");
 
         for name in ["DynamicTarget", "RecursiveTarget", "RecursivePlain"] {
             let mut refs = Vec::new();
             collect_schema_refs(schema_named(&ir, name), &mut refs);
             assert!(
                 refs.iter()
-                    .any(|target| target.json_pointer == format!("/components/schemas/{name}")),
+                    .any(|(target, _)| target.json_pointer == format!("/components/schemas/{name}")),
                 "{name}: {refs:?}"
             );
         }
@@ -6132,7 +6160,7 @@ mod tests {
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         let mut refs = Vec::new();
         collect_schema_refs(schema_named(&ir, "LexicalOuter"), &mut refs);
-        assert!(refs.iter().any(|target| {
+        assert!(refs.iter().any(|(target, _)| {
             target.json_pointer == "/components/schemas/LexicalOuter/properties/inner"
         }));
     }
@@ -10033,7 +10061,7 @@ mod tests {
 
         assert_eq!(
             refs.iter()
-                .map(|target| target.json_pointer.as_str())
+                .map(|(target, _)| target.json_pointer.as_str())
                 .collect::<Vec<_>>(),
             ["/$defs/First", "/$defs/Rest"]
         );
@@ -10047,6 +10075,61 @@ mod tests {
         let mut refs = Vec::new();
         collect_schema_refs(&open_tuple, &mut refs);
         assert_eq!(refs.len(), 1);
+    }
+
+    /// A `$ref` is resolved and validated by the loader before parsing, but a discriminator
+    /// `mapping` value is not — nothing upstream ever looks at it. Vendor documents ship mappings
+    /// that point at pointers resolving to nothing, so materialization has to walk past one
+    /// instead of trusting the loader's guarantee and unwrapping.
+    ///
+    /// The `$defs` reference is what puts materialization on the path at all; without it a
+    /// single-document input returns before the worklist runs.
+    #[test]
+    fn a_discriminator_mapping_naming_nothing_does_not_abort_materialization() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/value": { "get": {
+                "operationId": "readValue",
+                "responses": { "200": {
+                    "description": "ok",
+                    "content": { "application/json": { "schema": {
+                        "$ref": "#/$defs/Wrapper"
+                    } } }
+                } }
+            } } },
+            "$defs": {
+                "Wrapper": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/Cat" },
+                        { "$ref": "#/components/schemas/Dog" }
+                    ],
+                    "discriminator": {
+                        "propertyName": "kind",
+                        "mapping": {
+                            "cat": "#/components/schemas/Cat",
+                            "ghost": "#/paths/~1value/get/responses/200/content/application~1json/schema/allOf/0"
+                        }
+                    }
+                }
+            },
+            "components": { "schemas": {
+                "Cat": { "type": "object", "properties": { "kind": { "const": "cat" } } },
+                "Dog": { "type": "object", "properties": { "kind": { "const": "dog" } } }
+            } }
+        });
+
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        // The resolvable half of the mapping still reaches its component, so the dangling entry
+        // is skipped rather than aborting the walk that would have materialized it.
+        let names: Vec<&str> = ir
+            .schemas
+            .iter()
+            .map(|schema| schema.name.as_str())
+            .collect();
+        assert!(names.contains(&"Cat"), "{names:?}");
     }
 
     #[test]

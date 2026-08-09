@@ -364,9 +364,9 @@ keys:
         deallocs: 30
         allocBytes: 18020
       - stage: "emit"
-        allocs: 1850
+        allocs: 1851
         reallocs: 471
-        deallocs: 1811
+        deallocs: 1812
         allocBytes: 470528
     informational:
       peakBytes: 304455
