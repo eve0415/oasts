@@ -1817,20 +1817,34 @@ impl ObjectParts {
         // Broken across lines rather than joined: a real schema converts several properties, and a
         // single-line object literal runs to hundreds of columns in generated output no formatter is
         // ever allowed to touch.
-        let inner = " ".repeat(frame.indent + 2);
-        let closing = " ".repeat(frame.indent);
         let mut base = value.to_owned();
         for name in &self.omitted {
             base = format!("omit({base}, {})", render_ts_string(name));
         }
         let mut spreads = vec![format!("...{base}")];
         spreads.extend(self.bases.iter().map(|base| format!("...{base}")));
-        spreads.extend(self.passes.iter().map(|pass| format!("...{pass}")));
         spreads.extend(self.parts);
-        Some(format!(
+        let literal_frame = if self.passes.is_empty() {
+            frame
+        } else {
+            frame.inner()
+        };
+        let inner = " ".repeat(literal_frame.indent + 2);
+        let closing = " ".repeat(literal_frame.indent);
+        let literal = format!(
             "{{\n{inner}{},\n{closing}}}",
             spreads.join(&format!(",\n{inner}"))
-        ))
+        );
+        if self.passes.is_empty() {
+            Some(literal)
+        } else {
+            let argument = " ".repeat(frame.indent + 2);
+            let closing = " ".repeat(frame.indent);
+            Some(format!(
+                "Object.assign(\n{argument}{literal},\n{argument}{}\n{closing})",
+                self.passes.join(&format!(",\n{argument}"))
+            ))
+        }
     }
 }
 
@@ -2417,7 +2431,7 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             format!(".filter(([{key}]) => {})", selections.join(" && "))
         };
         let pass = format!(
-            "Object.fromEntries(Object.entries({value}){selection}.map(([{key}, {entry}]) => [{key}, {converted}]))"
+            "Object.fromEntries(Object.entries({value}){selection}.map(([{key}, {entry}]) => [{key}, {converted}] as const))"
         );
         // A pass that writes every key *is* the whole value and replaces it. Any other pass spreads
         // over the value instead: the keys it leaves alone keep the type the value already gave
@@ -3859,7 +3873,7 @@ mod pair_tests {
         // converted twice and none is left a wire string.
         assert!(
             content.contains(
-                "...Object.fromEntries(Object.entries(value).filter(([key0]) => ![\"at\"].includes(key0)).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0,"
+                "Object.fromEntries(Object.entries(value).filter(([key0]) => ![\"at\"].includes(key0)).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0,"
             ),
             "{content}"
         );
@@ -4087,9 +4101,9 @@ mod pair_tests {
             .find("...decodeBase(value, path)")
             .expect("the ref base");
         let pass = content
-            .find("...Object.fromEntries")
+            .find("Object.fromEntries")
             .expect("the key-selected pass");
-        assert!(base < pass, "the pass must spread last: {content}");
+        assert!(base < pass, "the pass must assign last: {content}");
     }
 
     #[test]
@@ -4608,13 +4622,15 @@ mod pair_tests {
             .expect("notice codec module")
             .content;
         // The key test is the template-literal key's own match rule, and a key it rejects is left
-        // out of the pass entirely rather than written back unconverted.
+        // out of the pass entirely rather than written back unconverted. `Object.assign` preserves
+        // the converted entry type beside the source's broad unknown index signature.
         assert!(
             content.contains(
-                "Object.entries(value).filter(([key0]) => key0.startsWith(\"x-\")).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0, P0, pushPath(path, key0))])"
+                "Object.entries(value).filter(([key0]) => key0.startsWith(\"x-\")).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0, P0, pushPath(path, key0))] as const)"
             ),
             "{content}"
         );
+        assert!(content.contains("return Object.assign("), "{content}");
     }
 
     #[test]
