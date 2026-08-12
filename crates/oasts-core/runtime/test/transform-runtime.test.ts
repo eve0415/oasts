@@ -15,8 +15,10 @@ import {
   encodePlainDate,
   isInstant,
   isPlainDate,
+  losslessInt64,
   omit,
   pushPath,
+  withLosslessJson,
 } from "../transform-runtime.ts";
 import {
   CANONICAL_DATE_TIME,
@@ -91,6 +93,45 @@ describe("pushPath", () => {
 
   test("extends the root path", () => {
     assert.deepEqual(pushPath([], "at"), ["at"]);
+  });
+});
+
+describe("lossless JSON paths", () => {
+  test("reads exact integer values only from the active schema path", () => {
+    const exact = { pets: [{ bornAt: 9_007_199_254_740_993n }] };
+
+    assert.equal(
+      withLosslessJson(exact, () => losslessInt64(PATH)),
+      9_007_199_254_740_993n,
+    );
+    assert.equal(
+      withLosslessJson(42, () => losslessInt64([])),
+      42,
+    );
+  });
+
+  test("restores an outer exact document after a nested walk", () => {
+    assert.equal(
+      withLosslessJson({ id: 1n }, () => {
+        assert.equal(
+          withLosslessJson({ id: 2n }, () => losslessInt64(["id"])),
+          2n,
+        );
+        return losslessInt64(["id"]);
+      }),
+      1n,
+    );
+  });
+
+  test("rejects paths that do not select an integer", () => {
+    assert.throws(
+      () => withLosslessJson(42n, () => losslessInt64(["missing"])),
+      /path does not exist/u,
+    );
+    assert.throws(
+      () => withLosslessJson({ value: "42" }, () => losslessInt64(["value"])),
+      /path is not an integer/u,
+    );
   });
 });
 

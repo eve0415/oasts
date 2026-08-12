@@ -242,8 +242,18 @@ export type RawResponseDecoder = {
   ) => ReadableStream<Uint8Array>;
 };
 
+// Like an SSE event hook, a generated reviver names the wire type its schema declares while the
+// transport crosses that boundary with a JSON.parse result. The method extraction keeps that
+// schema-specific parameter bivariant without weakening either side to an unchecked cast.
+type LosslessJsonReviverHost = {
+  revive(value: unknown, lossless: unknown): unknown;
+};
+
+type LosslessJsonReviver = LosslessJsonReviverHost['revive'];
+
 export type LosslessJsonResponseDecoder = {
   readonly json: 'int64';
+  readonly revive: LosslessJsonReviver;
 };
 
 export type ResponseMediaDecoder =
@@ -1677,7 +1687,10 @@ async function decodedBody(
   }
   if (typeof decoder !== 'string') {
     const text = await new Response(bytes).text();
-    return jsonParseHasSource ? JSON.parse(text, losslessInt64Reviver) : JSON.parse(text);
+    const value: unknown = JSON.parse(text);
+    return jsonParseHasSource
+      ? decoder.revive(value, JSON.parse(text, losslessInt64Reviver))
+      : value;
   }
   if (decoder === 'text') {
     return new Response(bytes).text();

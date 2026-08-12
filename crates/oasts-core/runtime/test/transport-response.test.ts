@@ -155,7 +155,13 @@ describe("response matching and decoding", () => {
     const marked = await callWith(
       new Response(body, { headers: { "Content-Type": "application/json" } }),
       operation({
-        responses: [responsePlan({ media: [["application/json", { json: "int64" }]] })],
+        responses: [
+          responsePlan({
+            media: [
+              ["application/json", { json: "int64", revive: (_value, lossless) => lossless }],
+            ],
+          }),
+        ],
       }),
     );
     const ordinary = await callWith(
@@ -176,6 +182,42 @@ describe("response matching and decoding", () => {
     if (isDocumented(ordinary) && ordinary.ok) {
       const data = ordinary.data;
       assert.equal(isRecord(data) ? typeof data.id : "missing", "number");
+    }
+  });
+
+  test("keeps unrelated unsafe integer fields on their declared number surface", async () => {
+    const result = await callWith(
+      new Response('{"id":9007199254740993,"amount":9007199254740995}', {
+        headers: { "Content-Type": "application/json" },
+      }),
+      operation({
+        responses: [
+          responsePlan({
+            media: [
+              [
+                "application/json",
+                {
+                  json: "int64",
+                  revive: (value, lossless) => {
+                    if (!isRecord(value) || !isRecord(lossless)) {
+                      return value;
+                    }
+                    return { ...value, id: lossless.id };
+                  },
+                },
+              ],
+            ],
+          }),
+        ],
+      }),
+    );
+
+    assert.ok(isDocumented(result) && result.ok);
+    if (isDocumented(result) && result.ok) {
+      assert.deepEqual(result.data, {
+        id: 9_007_199_254_740_993n,
+        amount: Number("9007199254740995"),
+      });
     }
   });
 

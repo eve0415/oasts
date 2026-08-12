@@ -32,6 +32,34 @@ export function pushPath(path: ApplicationPath, key: string | number): Applicati
   return [...path, key];
 }
 
+let losslessJsonValue: unknown;
+
+/** Runs a synchronous schema walk against the exact parse of the same JSON document. */
+export function withLosslessJson<T>(lossless: unknown, revive: () => T): T {
+  const previous = losslessJsonValue;
+  losslessJsonValue = lossless;
+  try {
+    return revive();
+  } finally {
+    losslessJsonValue = previous;
+  }
+}
+
+/** Reads the exact integer token at one schema-selected path in the active JSON document. */
+export function losslessInt64(path: ApplicationPath): number | bigint {
+  let value = losslessJsonValue;
+  for (const key of path) {
+    if (typeof value !== "object" || value === null) {
+      throw new TypeError("lossless JSON path does not exist");
+    }
+    value = Reflect.get(value, key);
+  }
+  if (typeof value !== "number" && typeof value !== "bigint") {
+    throw new TypeError("lossless JSON path is not an integer");
+  }
+  return value;
+}
+
 /**
  * Runs one conversion, turning any non-`TransformError` throw into one.
  *

@@ -15,7 +15,7 @@ function responsePlan(): ResponsePlan {
     kind: "exact",
     status: 200,
     bodyless: false,
-    media: [["application/json", { json: "int64" }]],
+    media: [["application/json", { json: "int64", revive: (_value, lossless) => lossless }]],
     hasContentTypeDiscriminant: false,
   };
 }

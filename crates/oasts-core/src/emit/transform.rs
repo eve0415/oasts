@@ -879,9 +879,13 @@ fn transform_module_imports() -> BTreeMap<String, BTreeSet<String>> {
             TransformKind::DatePlainDate,
             TransformKind::IntegerBigInt,
         ] {
-            kernel.insert(direction.codec(kind).to_owned());
+            if let Some(codec) = direction.codec(kind) {
+                kernel.insert(codec.to_owned());
+            }
         }
     }
+    kernel.insert("losslessInt64".to_owned());
+    kernel.insert("withLosslessJson".to_owned());
     imports.insert("runtime".to_owned(), kernel);
     imports
 }
@@ -964,6 +968,11 @@ fn render_component_pairs(
             continue;
         };
         let application = target.variant_name(position);
+        let export_name = if position == TypePosition::Neutral {
+            name.to_owned()
+        } else {
+            application.clone()
+        };
         for direction in [Direction::Decode, Direction::Encode] {
             let mut builder = PairBuilder::new(emitter, position, aliases);
             builder.pointers = rendered.pointers;
@@ -971,22 +980,45 @@ fn render_component_pairs(
             builder.pair_imports = rendered.pair_imports;
             let expression = builder
                 .convert(&schema.schema, direction, "value", "path", Frame::ROOT)
-                .unwrap_or_else(|| "value".to_owned());
+                .unwrap_or("value".to_owned());
             rendered.pointers = builder.pointers;
             rendered.helpers = builder.helpers;
             rendered.pair_imports = builder.pair_imports;
-            let (parameter, returns) = match direction {
-                Direction::Decode => (wire.as_str(), application.as_str()),
-                Direction::Encode => (application.as_str(), wire.as_str()),
+            let (parameter, returns) = if direction == Direction::Decode {
+                (wire.as_str(), application.as_str())
+            } else {
+                (application.as_str(), wire.as_str())
             };
             rendered.bodies.push_str(&format!(
                 "\nexport function {}{}(value: {parameter}, path: {path_type} = []): {returns} {{\n  return {expression};\n}}\n",
                 direction.prefix(),
-                if position == TypePosition::Neutral {
-                    name.to_owned()
-                } else {
-                    application.clone()
-                },
+                export_name,
+            ));
+        }
+        if emitter
+            .model
+            .transform_facts()
+            .reaches_kind(&schema.schema, TransformKind::IntegerBigInt)
+        {
+            let mut builder = PairBuilder::new(emitter, position, aliases);
+            builder.pointers = rendered.pointers;
+            builder.helpers = rendered.helpers;
+            builder.pair_imports = rendered.pair_imports;
+            let expression = builder
+                .convert(
+                    &schema.schema,
+                    Direction::Revive,
+                    "value",
+                    "path",
+                    Frame::ROOT,
+                )
+                .unwrap_or("value".to_owned());
+            rendered.pointers = builder.pointers;
+            rendered.helpers = builder.helpers;
+            rendered.pair_imports = builder.pair_imports;
+            rendered.bodies.push_str(&format!(
+                "\nexport function revive{}(value: {wire}, path: {path_type} = []): {wire} {{\n  return {expression};\n}}\n",
+                export_name,
             ));
         }
     }
@@ -1042,6 +1074,13 @@ fn emit_component_pairs(
         for direction in [Direction::Decode, Direction::Encode] {
             declared.insert(format!("{}{stem}", direction.prefix()));
         }
+        if emitter
+            .model
+            .transform_facts()
+            .reaches_kind(&schema.schema, TransformKind::IntegerBigInt)
+        {
+            declared.insert(format!("revive{stem}"));
+        }
     }
     // A sibling pair this module calls is bound here too, and its name is derived from a component
     // the document named — so `decodeInstant` can arrive from a sibling as readily as from the
@@ -1049,7 +1088,7 @@ fn emit_component_pairs(
     // here is what makes the *kernel* import yield, leaving the sibling its own name.
     let module_imports = transform_module_imports();
     for allocated in &emitter.model.analyzed.schema_names {
-        for direction in [Direction::Decode, Direction::Encode] {
+        for direction in [Direction::Decode, Direction::Encode, Direction::Revive] {
             let pair = format!("{}{}", direction.prefix(), allocated.name);
             if module_imports.values().any(|names| names.contains(&pair)) {
                 declared.insert(pair);
@@ -1275,6 +1314,33 @@ fn render_operation_pairs(
         rendered.bodies.push_str(&format!(
             "\nexport function decode{application}(value: {wire}, path: {path_type} = []): {application} {{\n  return {body};\n}}\n"
         ));
+        if emitter
+            .model
+            .transform_facts()
+            .reaches_kind(&codec.schema, TransformKind::IntegerBigInt)
+        {
+            let mut builder = PairBuilder::new(emitter, TypePosition::Response, aliases);
+            builder.pointers = rendered.pointers;
+            builder.helpers = rendered.helpers;
+            builder.pair_imports = rendered.pair_imports;
+            let expression = builder
+                .convert(
+                    &codec.schema,
+                    Direction::Revive,
+                    "value",
+                    "path",
+                    Frame::ROOT,
+                )
+                .unwrap_or("value".to_owned());
+            builder.helpers.insert("withLosslessJson");
+            rendered.pointers = builder.pointers;
+            rendered.helpers = builder.helpers;
+            rendered.pair_imports = builder.pair_imports;
+            let with_lossless = local_import_name("withLosslessJson", &aliases.kernel);
+            rendered.bodies.push_str(&format!(
+                "\nexport function revive{application}(value: {wire}, lossless: unknown, path: {path_type} = []): {wire} {{\n  return {with_lossless}(lossless, () => ({expression}));\n}}\n"
+            ));
+        }
     }
     rendered
 }
@@ -1319,11 +1385,18 @@ fn emit_operation_pairs(
         declared.insert(codec.application.clone());
         declared.insert(format!("{}Wire", codec.application));
         declared.insert(format!("decode{}", codec.application));
+        if emitter
+            .model
+            .transform_facts()
+            .reaches_kind(&codec.schema, TransformKind::IntegerBigInt)
+        {
+            declared.insert(format!("revive{}", codec.application));
+        }
     }
     let own_declared = declared.clone();
     let module_imports = transform_module_imports();
     for allocated in &emitter.model.analyzed.schema_names {
-        for direction in [Direction::Decode, Direction::Encode] {
+        for direction in [Direction::Decode, Direction::Encode, Direction::Revive] {
             let pair = format!("{}{}", direction.prefix(), allocated.name);
             if module_imports.values().any(|names| names.contains(&pair)) {
                 declared.insert(pair);
@@ -1683,7 +1756,7 @@ fn guarded_body(
     let pointer = pointer_constant(pointers, source);
     let label = match direction {
         Direction::Encode => "request",
-        Direction::Decode => "response",
+        Direction::Decode | Direction::Revive => "response",
     };
     format!("guarded(() => ({expression}), \"{label}\", {pointer})")
 }
@@ -1731,19 +1804,21 @@ fn write_pointer_constants(content: &mut String, pointers: &[SourceRef], bodies:
 enum Direction {
     Decode,
     Encode,
+    Revive,
 }
 
 impl Direction {
-    const fn codec(self, kind: TransformKind) -> &'static str {
+    const fn codec(self, kind: TransformKind) -> Option<&'static str> {
         match (self, kind) {
-            (Self::Decode, TransformKind::DateTimeDate) => "decodeDateTimeDate",
-            (Self::Encode, TransformKind::DateTimeDate) => "encodeDateTimeDate",
-            (Self::Decode, TransformKind::DateTimeInstant) => "decodeInstant",
-            (Self::Encode, TransformKind::DateTimeInstant) => "encodeInstant",
-            (Self::Decode, TransformKind::DatePlainDate) => "decodePlainDate",
-            (Self::Encode, TransformKind::DatePlainDate) => "encodePlainDate",
-            (Self::Decode, TransformKind::IntegerBigInt) => "decodeInt64",
-            (Self::Encode, TransformKind::IntegerBigInt) => "encodeInt64",
+            (Self::Decode, TransformKind::DateTimeDate) => Some("decodeDateTimeDate"),
+            (Self::Encode, TransformKind::DateTimeDate) => Some("encodeDateTimeDate"),
+            (Self::Decode, TransformKind::DateTimeInstant) => Some("decodeInstant"),
+            (Self::Encode, TransformKind::DateTimeInstant) => Some("encodeInstant"),
+            (Self::Decode, TransformKind::DatePlainDate) => Some("decodePlainDate"),
+            (Self::Encode, TransformKind::DatePlainDate) => Some("encodePlainDate"),
+            (Self::Decode, TransformKind::IntegerBigInt) => Some("decodeInt64"),
+            (Self::Encode, TransformKind::IntegerBigInt) => Some("encodeInt64"),
+            (Self::Revive, _) => None,
         }
     }
 
@@ -1751,6 +1826,7 @@ impl Direction {
         match self {
             Self::Decode => "decode",
             Self::Encode => "encode",
+            Self::Revive => "revive",
         }
     }
 }
@@ -2000,8 +2076,18 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
         frame: Frame,
     ) -> Option<String> {
         if let Some(kind) = self.facts().site(node) {
+            if direction == Direction::Revive {
+                if kind != TransformKind::IntegerBigInt {
+                    return None;
+                }
+                self.helpers.insert("losslessInt64");
+                let helper = local_import_name("losslessInt64", &self.aliases.kernel);
+                return Some(format!("{helper}({path})"));
+            }
             let pointer = self.pointer(&node.meta().source);
-            let codec = direction.codec(kind);
+            let codec = direction
+                .codec(kind)
+                .expect("decode and encode directions always have a transform codec");
             self.helpers.insert(codec);
             let local = local_import_name(codec, &self.aliases.kernel);
             return Some(format!("{local}({value}, {pointer}, {path})"));
@@ -2016,6 +2102,14 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                     .model
                     .schema_target(&target.source_id, &target.json_pointer)
                     .filter(|target| target.transforms)?;
+                if direction == Direction::Revive
+                    && !self.facts().reaches_kind(
+                        &self.emitter.model.analyzed.ir.schemas[target.index].schema,
+                        TransformKind::IntegerBigInt,
+                    )
+                {
+                    return None;
+                }
                 let name = format!(
                     "{}{}",
                     direction.prefix(),
@@ -3579,9 +3673,11 @@ mod tests {
             .remove("runtime")
             .expect("the kernel import entry")
             .into_iter()
+            .filter(|name| name.starts_with("decode") || name.starts_with("encode"))
             .collect();
         aliasable.sort_unstable();
         assert_eq!(declared, aliasable);
+        assert_eq!(Direction::Revive.codec(TransformKind::IntegerBigInt), None);
     }
 
     #[test]
@@ -3638,6 +3734,11 @@ mod pair_tests {
 
     fn bigint_mode(config: &mut ResolvedConfig) {
         config.types.integer = IntegerRepresentation::Bigint;
+    }
+
+    fn date_and_bigint_mode(config: &mut ResolvedConfig) {
+        date_mode(config);
+        bigint_mode(config);
     }
 
     /// The emitted pair module for one component, or `None` when the component emits none.
@@ -3750,30 +3851,62 @@ mod pair_tests {
     fn integer_bigint_pairs_call_the_int64_kernel_codecs() {
         let content = pairs(
             json!({
+                "Dated": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" }
+                    }
+                },
                 "Notice": {
                     "type": "object",
-                    "required": ["id"],
+                    "required": ["id", "at", "dated", "requestId", "responseId"],
                     "properties": {
                         "id": {
                             "oneOf": [
                                 { "type": "integer", "format": "int64" },
                                 { "type": "string" }
                             ]
+                        },
+                        "at": { "type": "string", "format": "date-time" },
+                        "dated": { "$ref": "#/components/schemas/Dated" },
+                        "requestId": {
+                            "type": "integer",
+                            "format": "int64",
+                            "writeOnly": true
+                        },
+                        "responseId": {
+                            "type": "integer",
+                            "format": "int64",
+                            "readOnly": true
                         }
                     }
                 }
             }),
             "notice",
-            bigint_mode,
+            date_and_bigint_mode,
         )
         .expect("a bigint int64 component emits a pair module");
         assert!(
-            content.contains("decodeInt64, encodeInt64")
+            content.contains("decodeInt64")
+                && content.contains("encodeInt64")
                 && content.contains("from \"../runtime.js\";"),
             "{content}"
         );
         assert!(content.contains("decodeInt64(value.id"), "{content}");
         assert!(content.contains("encodeInt64(value.id"), "{content}");
+        assert!(
+            content.contains("export function reviveNotice("),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function reviveNoticeRequest("),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function reviveNoticeResponse("),
+            "{content}"
+        );
         assert!(
             content.contains("typeof value.id === \"bigint\" ? encodeInt64(value.id"),
             "{content}"

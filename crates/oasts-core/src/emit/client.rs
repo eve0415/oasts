@@ -315,7 +315,7 @@ fn emit_operation(
     let stem = uppercase_first(allocated_name);
     let transforming = model.transform_facts().enabled();
     let conversions = response_conversions(model, plan, &stem);
-    let response_transforms = response_transform_bindings(plan, &stem, &conversions);
+    let response_transforms = response_transform_bindings(model, plan, &stem, &conversions);
     let request_transforms = request_transform_binding(model, plan);
     // The object the request actually dispatches, named once: the validators read it and `execute`
     // receives it, and two spellings of the same choice would disagree as an undeclared binding in
@@ -704,6 +704,11 @@ fn emit_operation(
         .iter()
         .map(|transform| transform.decoder.clone())
         .chain(
+            response_transforms
+                .iter()
+                .filter_map(|transform| transform.reviver.clone()),
+        )
+        .chain(
             event_checks
                 .iter()
                 .filter_map(|check| check.pair.as_ref())
@@ -780,6 +785,7 @@ fn emit_operation(
         plan,
         allocated_name,
         &event_checks,
+        &response_transforms,
     );
     output.push('\n');
 
@@ -904,6 +910,8 @@ struct ResponseTransform {
     content_type: Option<String>,
     /// The emitted codec this branch calls, from the operation's own transform module.
     decoder: String,
+    /// The path-scoped exact-integer revival this JSON entry hands to the transport.
+    reviver: Option<String>,
     /// Which field carries the payload — `default` spans both, so `result.ok` picks at runtime.
     body: ResponseBody,
 }
@@ -1155,6 +1163,7 @@ pub(super) fn form_field_transforms(model: &EmissionModel<'_, '_>, field: &FormF
 }
 
 fn response_transform_bindings(
+    model: &EmissionModel<'_, '_>,
     plan: &OperationPlan,
     stem: &str,
     conversions: &[ResponseConversion],
@@ -1165,10 +1174,14 @@ fn response_transform_bindings(
         let body = response_body_side(response.kind, &response.match_key);
         match conversion {
             ResponseConversion::None => {}
-            ResponseConversion::Whole(_) => bindings.push(ResponseTransform {
+            ResponseConversion::Whole(index) => bindings.push(ResponseTransform {
                 outcome,
                 content_type: None,
                 decoder: format!("decode{}", response_type_name(stem, response)),
+                reviver: model
+                    .transform_facts()
+                    .reaches_kind(&response.media[*index].schema, TransformKind::IntegerBigInt)
+                    .then(|| format!("revive{}", response_type_name(stem, response))),
                 body,
             }),
             ResponseConversion::PerEntry(entries) => {
@@ -1179,6 +1192,13 @@ fn response_transform_bindings(
                         outcome: outcome.clone(),
                         content_type: Some(response.media[entry.index].media.clone()),
                         decoder: format!("decode{}", entry.name),
+                        reviver: model
+                            .transform_facts()
+                            .reaches_kind(
+                                &response.media[entry.index].schema,
+                                TransformKind::IntegerBigInt,
+                            )
+                            .then(|| format!("revive{}", entry.name)),
                         body,
                     });
                 }
@@ -2881,6 +2901,7 @@ fn write_descriptor(
     plan: &OperationPlan,
     allocated_name: &str,
     event_checks: &[EventCheck],
+    response_transforms: &[ResponseTransform],
 ) {
     output.push_str("const descriptor: OperationDescriptor = {\n  operationId: ");
     output.push_str(&render_ts_string(
@@ -3012,10 +3033,24 @@ fn write_descriptor(
                         && model
                             .transform_facts()
                             .reaches_kind(&media.schema, TransformKind::IntegerBigInt);
+                    let outcome = outcome_literal(response);
+                    let reviver = lossless_int64.then(|| {
+                        response_transforms
+                            .iter()
+                            .find(|transform| {
+                                transform.outcome == outcome
+                                    && transform
+                                        .content_type
+                                        .as_deref()
+                                        .is_none_or(|content_type| content_type == media.media)
+                            })
+                            .and_then(|transform| transform.reviver.as_deref())
+                            .expect("an int64 JSON response has a path-scoped reviver")
+                    });
                     format!(
                         "[{}, {}]",
                         render_ts_string(&media.media),
-                        render_response_decoder(media, on_event, lossless_int64)
+                        render_response_decoder(media, on_event, reviver)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -3758,7 +3793,7 @@ fn style_name(style: ParamStyle) -> &'static str {
 fn render_response_decoder(
     media: &ResponseMediaPlan,
     on_event: Option<&str>,
-    lossless_int64: bool,
+    int64_reviver: Option<&str>,
 ) -> String {
     // A streaming entry ships its reader the same way, and for the same reason: the transport never
     // names the SSE parser, so only an operation that declares one links it. `onEvent` is the
@@ -3774,8 +3809,8 @@ fn render_response_decoder(
         DecoderClass::StreamingRaw => return format!("{{ raw: {RAW_STREAM_READER} }}"),
         _ => {}
     }
-    if lossless_int64 {
-        return "{ json: \"int64\" }".to_owned();
+    if let Some(reviver) = int64_reviver {
+        return format!("{{ json: \"int64\", revive: {reviver} }}");
     }
     let Some(plan) = &media.multipart else {
         return render_ts_string(decoder_name(media.decoder));
@@ -4151,7 +4186,8 @@ mod tests {
                                                 "id": { "type": "integer", "format": "int64" }
                                             }
                                         }
-                                    }
+                                    },
+                                    "text/plain": { "schema": { "type": "string" } }
                                 }
                             }
                         }
@@ -4171,7 +4207,7 @@ mod tests {
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
         let bigint = operation_file(&files, "readcounter");
         assert!(
-            bigint.contains("media: [[\"application/json\", { json: \"int64\" }]]"),
+            bigint.contains("media: [[\"application/json\", { json: \"int64\", revive: reviveReadCounterResponse200ApplicationJson }], [\"text/plain\", \"text\"]], hasContentTypeDiscriminant: true"),
             "{bigint}"
         );
 
@@ -6708,6 +6744,7 @@ mod tests {
             &analyzed.ir.operations[0],
             &plan,
             "descriptorProbe",
+            &[],
             &[],
         );
         assert!(output.contains("allowReserved: true"));

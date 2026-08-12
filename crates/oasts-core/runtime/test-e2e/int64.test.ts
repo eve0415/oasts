@@ -21,6 +21,7 @@ const binary = path.join(repoRoot, "target/debug/oasts");
 const fixtureSource = path.join(repoRoot, "fixtures/int64-transform-3.1");
 const EXACT_INT64 = 12_345_678_901_234_567_890n;
 const EXACT_DIGITS = "12345678901234567890";
+const ROUNDED_AMOUNT = Number("9007199254740995");
 
 async function operation(root: string, file: string, name: string): Promise<ExportedFunction> {
   const module: unknown = await import(
@@ -114,8 +115,8 @@ after(async () => {
   await rm(temporaryRoot, { recursive: true, force: true });
 });
 
-test('emitted client decodes 12345678901234567890n and request raw bytes equal {"id":12345678901234567890}', async () => {
-  const responseBytes = Buffer.from(`{"id":${EXACT_DIGITS}}`);
+test('emitted client scopes exact revival to int64 and sends raw bytes equal {"id":12345678901234567890}', async () => {
+  const responseBytes = Buffer.from(`{"id":${EXACT_DIGITS},"amount":9007199254740995}`);
   scriptRoute("GET", "/counters/latest", {
     status: 200,
     headers: [["Content-Type", "application/json"]],
@@ -135,6 +136,7 @@ test('emitted client decodes 12345678901234567890n and request raw bytes equal {
   assert.equal(readResult.outcome, 200);
   const data = requiredRecord(readResult.data, "getLatestCounter data");
   assert.equal(data.id, EXACT_INT64);
+  assert.equal(data.amount, ROUNDED_AMOUNT);
 
   const writeResult = requiredRecord(
     await recordCounter(transport, { body: { id: EXACT_INT64 } }),
@@ -145,7 +147,7 @@ test('emitted client decodes 12345678901234567890n and request raw bytes equal {
 });
 
 test("generated validation preserves the exact int64 response and request", async () => {
-  const responseBytes = Buffer.from(`{"id":${EXACT_DIGITS}}`);
+  const responseBytes = Buffer.from(`{"id":${EXACT_DIGITS},"amount":9007199254740995}`);
   scriptRoute("GET", "/counters/latest", {
     status: 200,
     headers: [["Content-Type", "application/json"]],
@@ -163,7 +165,9 @@ test("generated validation preserves the exact int64 response and request", asyn
     "validated getLatestCounter result",
   );
   assert.equal(readResult.outcome, 200);
-  assert.equal(requiredRecord(readResult.data, "validated response data").id, EXACT_INT64);
+  const data = requiredRecord(readResult.data, "validated response data");
+  assert.equal(data.id, EXACT_INT64);
+  assert.equal(data.amount, ROUNDED_AMOUNT);
 
   const writeResult = requiredRecord(
     await validatedRecordCounter(transport, { body: { id: EXACT_INT64 } }),
@@ -174,7 +178,7 @@ test("generated validation preserves the exact int64 response and request", asyn
 });
 
 test("Zod validation preserves the exact int64 response and request", async () => {
-  const responseBytes = Buffer.from(`{"id":${EXACT_DIGITS}}`);
+  const responseBytes = Buffer.from(`{"id":${EXACT_DIGITS},"amount":9007199254740995}`);
   scriptRoute("GET", "/counters/latest", {
     status: 200,
     headers: [["Content-Type", "application/json"]],
@@ -192,7 +196,9 @@ test("Zod validation preserves the exact int64 response and request", async () =
     "Zod getLatestCounter result",
   );
   assert.equal(readResult.outcome, 200);
-  assert.equal(requiredRecord(readResult.data, "Zod response data").id, EXACT_INT64);
+  const data = requiredRecord(readResult.data, "Zod response data");
+  assert.equal(data.id, EXACT_INT64);
+  assert.equal(data.amount, ROUNDED_AMOUNT);
 
   const writeResult = requiredRecord(
     await zodRecordCounter(transport, { body: { id: EXACT_INT64 } }),
