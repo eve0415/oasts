@@ -1917,9 +1917,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         let has_included_properties = properties
             .iter()
             .any(|&(_, _, meta)| property_in_position(meta, position));
-        let literal = if !has_included_properties {
-            "{}".to_owned()
-        } else {
+        let literal = if has_included_properties {
             let mut output = String::from("{\n");
             for &(name, schema, meta) in properties
                 .iter()
@@ -1950,6 +1948,15 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             push_indent(&mut output, indent);
             output.push('}');
             output
+        } else {
+            // `{}` is not an object type in TypeScript — it admits every non-nullish value,
+            // including primitives. An index signature is what the document actually declared:
+            // open objects take any key, a closed object with no properties takes none.
+            // Structural spelling, not `Record<...>`, for the reason at the typed arm below.
+            match additional_properties {
+                AdditionalProperties::Forbidden => "{ [key: string]: never }".to_owned(),
+                _ => "{ [key: string]: unknown }".to_owned(),
+            }
         };
         match additional_properties {
             AdditionalProperties::Allowed(None) | AdditionalProperties::Forbidden => literal,
@@ -6746,6 +6753,36 @@ mod tests {
     }
 
     #[test]
+    fn an_object_with_no_properties_is_not_the_empty_type() {
+        // `{}` in TypeScript means "anything except null/undefined", so a field typed `{}`
+        // accepts 42 and "hello". An index signature says what the document actually said.
+        let (files, _diagnostics) = compile(
+            openapi(json!({
+                "Odd": { "type": "object", "properties": {
+                    "openTrue": { "type": "object", "additionalProperties": true },
+                    "openOmitted": { "type": "object", "properties": {} },
+                    "closed": { "type": "object", "additionalProperties": false }
+                } }
+            })),
+            json!({}),
+        );
+        let odd = generated_body(schema_file(&files, "odd"));
+        assert!(
+            odd.contains("openTrue?: { [key: string]: unknown };"),
+            "{odd}"
+        );
+        assert!(
+            odd.contains("openOmitted?: { [key: string]: unknown };"),
+            "{odd}"
+        );
+        assert!(odd.contains("closed?: { [key: string]: never };"), "{odd}");
+        assert!(
+            !odd.contains(": {};"),
+            "no bare empty type may survive: {odd}"
+        );
+    }
+
+    #[test]
     fn string_property_and_additional_property_encoders_snapshot() {
         assert_eq!(
             render_ts_string("\"\\\n\u{2028}\u{2029}"),
@@ -6835,8 +6872,9 @@ mod tests {
             .find(|file| file.relative_path.ends_with("onlypattern.ts"))
             .expect("OnlyPattern file");
         assert!(
-            generated_body(only_pattern)
-                .contains("export type OnlyPattern = { [key: `x-${string}`]: number };")
+            generated_body(only_pattern).contains(
+                "export type OnlyPattern = { [key: string]: unknown } & { [key: `x-${string}`]: number };"
+            )
         );
         let patterned_all_of = files
             .iter()
