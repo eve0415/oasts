@@ -22,7 +22,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use foldhash::HashMap;
+use foldhash::{HashMap, HashSet, HashSetExt};
+use serde_json::Value;
 
 use crate::client_model::{
     BodyPlan, ClientModel, FormFieldPlan, MultipartResponsePayload, OperationPlan,
@@ -43,7 +44,8 @@ use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
     CODE_TRANSFORM_UNION, CODE_UNCONVERTIBLE_TRANSFORM, Emitter, GeneratedFile, SchemaChildMode,
     TypeAxis, TypePosition, import_extension, property_in_position, render_literal_key,
-    render_property_key, render_ts_string, source_diagnostic, uppercase_first,
+    render_property_key, render_ts_string, render_ts_value, source_diagnostic, tag_key,
+    uppercase_first,
 };
 
 /// Emitted as `client/transform/runtime.ts`; the generated-transform call ABI is fixed to it.
@@ -62,7 +64,7 @@ pub(crate) enum ResolvedDispatch {
     /// `i`; a branch proving several literals selects on any of them.
     Discriminator {
         property: String,
-        tags: Vec<Vec<String>>,
+        tags: Vec<Vec<Value>>,
     },
 }
 
@@ -94,6 +96,29 @@ pub(crate) fn resolve_dispatch(
             emitter.prove_discriminator_tags(branches, discriminator, &mapping_targets)
             && emitter.discriminator_branches_fix_a_literal(branches, &discriminator.property_name)
         {
+            let tags = branches
+                .iter()
+                .zip(tags)
+                .map(|(branch, tags)| {
+                    let fixed = emitter
+                        .merged_object_property_finite(
+                            branch,
+                            &discriminator.property_name,
+                            &mut HashSet::new(),
+                        )
+                        .values
+                        .unwrap_or_default();
+                    tags.into_iter()
+                        .map(|tag| {
+                            fixed
+                                .iter()
+                                .find(|value| tag_key(value) == tag)
+                                .cloned()
+                                .unwrap_or(Value::String(tag))
+                        })
+                        .collect()
+                })
+                .collect();
             return Some(Ok(ResolvedDispatch::Discriminator {
                 property: discriminator.property_name.clone(),
                 tags,
@@ -2497,7 +2522,7 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                     .filter_map(|(index, literals)| {
                         let test = literals
                             .iter()
-                            .map(|tag| format!("{access} === {}", render_ts_string(tag)))
+                            .map(|tag| format!("{access} === {}", render_ts_value(tag)))
                             .collect::<Vec<_>>()
                             .join(" || ");
                         (!test.is_empty()).then_some((test, index))
@@ -3252,6 +3277,57 @@ mod tests {
             content.contains("value.kind === \"scheduled\""),
             "{content}"
         );
+    }
+
+    #[test]
+    fn a_non_string_discriminator_dispatches_on_its_own_literal_type() {
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Scheduled": {
+                    "type": "object",
+                    "required": ["kind", "at"],
+                    "properties": {
+                        "kind": { "type": "integer", "const": 1 },
+                        "at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Cancelled": {
+                    "type": "object",
+                    "required": ["kind", "on"],
+                    "properties": {
+                        "kind": { "type": "integer", "const": 2 },
+                        "on": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Archived": {
+                    "type": "object",
+                    "required": ["kind", "until"],
+                    "properties": {
+                        "kind": { "type": "string", "const": "cat" },
+                        "until": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Notice": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/Scheduled" },
+                        { "$ref": "#/components/schemas/Cancelled" },
+                        { "$ref": "#/components/schemas/Archived" }
+                    ],
+                    "discriminator": { "propertyName": "kind" }
+                }
+            })),
+            |config| config.types.date_time = DateTimeRepresentation::Date,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(refusals(&diagnostics).is_empty(), "{diagnostics:#?}");
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        assert!(content.contains("value.kind === 1"), "{content}");
+        assert!(!content.contains("value.kind === \"1\""), "{content}");
+        assert!(content.contains("value.kind === \"cat\""), "{content}");
     }
 
     #[test]
