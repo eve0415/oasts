@@ -1818,11 +1818,12 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                             false,
                         )
                     });
-                // A named member surviving is what licenses dropping an empty one: an
-                // annotation- or validation-only sibling beside a `$ref` must not print as
-                // `WidgetMeta & {}`. With no named member the drop would change a
-                // wholly-anonymous `allOf` that merges to `{}` into `unknown`.
-                let has_named = branches.iter().any(is_named_branch);
+                // Only `unknown` is dropped, and `{}` deliberately is not. An annotation- or
+                // validation-only sibling beside a `$ref` lowers to a branch carrying just
+                // constraints, which renders `unknown` and disappears here — that is what
+                // keeps `allOf: [$ref], minLength: 3` printing as the bare name. `{}` says
+                // something a member cannot say otherwise: it admits every value except
+                // `null` and `undefined`, so it is what narrows a nullable named branch.
                 let anonymous_merged = merged.is_some();
                 let mut pending_merge = merged;
                 let mut members = Vec::with_capacity(branches.len());
@@ -1841,7 +1842,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     };
                     // Tested before parenthesizing, or a member needing parentheses would
                     // survive the drop as `(unknown)`.
-                    if rendered == "unknown" || (has_named && rendered == "{}") {
+                    if rendered == "unknown" {
                         continue;
                     }
                     members.push(if from_merge {
@@ -7899,6 +7900,29 @@ mod tests {
             mixed.contains("export type ViaAllOfMixed = WidgetMeta & {")
                 && mixed.contains("c?: string;"),
             "{mixed}"
+        );
+    }
+
+    #[test]
+    fn empty_object_branch_survives_beside_a_named_branch() {
+        // `{}` is not a member that says nothing: in TypeScript it admits every value except
+        // `null` and `undefined`, so intersecting it with a nullable named branch is what
+        // removes the `null`. Dropping it as noise widens the type back.
+        let document = openapi(json!({
+            "MaybeObject": { "anyOf": [
+                { "type": "object", "properties": { "a": { "type": "string" } } },
+                { "type": "null" }
+            ] },
+            "Constrained": { "allOf": [
+                { "$ref": "#/components/schemas/MaybeObject" },
+                { "type": "object" }
+            ] }
+        }));
+        let (files, _diagnostics) = compile(document, json!({}));
+        let constrained = generated_body(schema_file(&files, "constrained")).to_owned();
+        assert!(
+            constrained.contains("export type Constrained = MaybeObject & {};"),
+            "{constrained}"
         );
     }
 
