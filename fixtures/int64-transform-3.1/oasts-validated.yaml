@@ -11,6 +11,7 @@ client:
   baseUrl:
     source: runtime
 types:
+  dateTime: date
   integer: bigint
 validation:
   engine: generated

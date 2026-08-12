@@ -41,7 +41,9 @@ let getLatestCounter: ExportedFunction;
 let recordCounter: ExportedFunction;
 let readCounter: ExportedFunction;
 let readContentCounter: ExportedFunction;
+let readMixedCounter: ExportedFunction;
 let submitCounterForm: ExportedFunction;
+let submitMixedCounterForm: ExportedFunction;
 let submitCounterMultipart: ExportedFunction;
 let validatedCreateTransport: ExportedFunction;
 let validatedGetLatestCounter: ExportedFunction;
@@ -76,7 +78,13 @@ before(async () => {
   recordCounter = await operation(generatedRoot, "recordcounter", "recordCounter");
   readCounter = await operation(generatedRoot, "readcounter", "readCounter");
   readContentCounter = await operation(generatedRoot, "readcontentcounter", "readContentCounter");
+  readMixedCounter = await operation(generatedRoot, "readmixedcounter", "readMixedCounter");
   submitCounterForm = await operation(generatedRoot, "submitcounterform", "submitCounterForm");
+  submitMixedCounterForm = await operation(
+    generatedRoot,
+    "submitmixedcounterform",
+    "submitMixedCounterForm",
+  );
   submitCounterMultipart = await operation(
     generatedRoot,
     "submitcountermultipart",
@@ -302,6 +310,33 @@ test("urlencoded and multipart text fields keep exact bigint digits", async () =
   );
   assert.equal(multipartResult.outcome, 204);
   assert.match(requiredRequest(1).body.toString("utf8"), new RegExp(`\\r\\n${EXACT_DIGITS}\\r\\n`));
+});
+
+test("non-JSON codecs preserve bigint leaves while encoding adjacent dates", async () => {
+  const at = new Date("2026-08-12T01:02:03.000Z");
+  scriptRoute(
+    "GET",
+    `/mixed?filter[at]=${encodeURIComponent(at.toISOString())}&filter[id]=${EXACT_DIGITS}`,
+    { status: 204 },
+  );
+  scriptRoute("POST", "/mixed-form", { status: 204 });
+  const transport = createTransport({ baseUrl });
+
+  const parameterResult = requiredRecord(
+    await readMixedCounter(transport, { query: { filter: { at, id: EXACT_INT64 } } }),
+    "readMixedCounter result",
+  );
+  assert.equal(parameterResult.outcome, 204);
+
+  const formResult = requiredRecord(
+    await submitMixedCounterForm(transport, { body: { filter: [at, EXACT_INT64] } }),
+    "submitMixedCounterForm result",
+  );
+  assert.equal(formResult.outcome, 204);
+  assert.equal(
+    requiredRequest(1).body.toString("utf8"),
+    `filter=${encodeURIComponent(at.toISOString())}&filter=${EXACT_DIGITS}`,
+  );
 });
 
 test("degraded runtime keeps safe int64 and returns transform failures for unsafe values", () => {

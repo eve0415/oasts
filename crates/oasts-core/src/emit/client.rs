@@ -363,6 +363,14 @@ fn emit_operation(
                 TypeAxis::Application,
                 &mut component_imports,
             );
+            if request_transforms && parameter_transforms(model, parameter) {
+                renderer.collect_operation_imports(
+                    &parameter.schema,
+                    TypePosition::Request,
+                    TypeAxis::Wire,
+                    &mut component_imports,
+                );
+            }
         }
         if let Some(body) = &plan.body_plan {
             collect_body_imports(
@@ -1098,7 +1106,10 @@ pub(super) fn request_transform_binding(
         || request_body_transforms(model, plan.body_plan.as_ref())
 }
 
-fn reaches_non_integer_transform(model: &EmissionModel<'_, '_>, schema: &SchemaNode) -> bool {
+pub(super) fn reaches_non_integer_transform(
+    model: &EmissionModel<'_, '_>,
+    schema: &SchemaNode,
+) -> bool {
     [
         TransformKind::DateTimeDate,
         TransformKind::DateTimeInstant,
@@ -1115,11 +1126,15 @@ pub(super) fn parameter_transforms(
     if parameter.caller_serialized {
         return false;
     }
-    if parameter.resolved.helper.is_content_json() {
+    if parameter_encodes_int64(parameter) {
         model.transform_facts().reaches(&parameter.schema)
     } else {
         reaches_non_integer_transform(model, &parameter.schema)
     }
+}
+
+pub(super) fn parameter_encodes_int64(parameter: &ParameterPlan) -> bool {
+    parameter.resolved.helper.is_content_json()
 }
 
 /// Whether a request body carries an application value the operation encoder converts.
@@ -1149,17 +1164,20 @@ pub(super) fn form_field_transforms(model: &EmissionModel<'_, '_>, field: &FormF
     if field.is_binary_upload() {
         return false;
     }
-    let int64_needs_raw_json = field.serialization.content_media().is_some_and(|media| {
-        media
-            .payloads
-            .iter()
-            .all(|payload| *payload == PayloadKind::Json)
-    });
-    if int64_needs_raw_json {
+    if form_field_encodes_int64(field) {
         model.transform_facts().reaches(&field.schema)
     } else {
         reaches_non_integer_transform(model, &field.schema)
     }
+}
+
+pub(super) fn form_field_encodes_int64(field: &FormFieldPlan) -> bool {
+    field.serialization.content_media().is_some_and(|media| {
+        media
+            .payloads
+            .iter()
+            .all(|payload| *payload == PayloadKind::Json)
+    })
 }
 
 fn response_transform_bindings(

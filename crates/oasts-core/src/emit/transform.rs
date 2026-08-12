@@ -1038,6 +1038,30 @@ fn render_component_pairs(
                 export_name,
             ));
         }
+        if super::client::reaches_non_integer_transform(emitter.model, &schema.schema) {
+            let mut builder = PairBuilder::new(emitter, position, aliases);
+            builder.pointers = rendered.pointers;
+            builder.helpers = rendered.helpers;
+            builder.pair_imports = rendered.pair_imports;
+            builder.non_json_encode = true;
+            builder.inline_non_json_refs = true;
+            builder.inlining.push(index);
+            let expression = builder
+                .convert(
+                    &schema.schema,
+                    Direction::Encode,
+                    "value",
+                    "path",
+                    Frame::ROOT,
+                )
+                .unwrap_or("value".to_owned());
+            rendered.pointers = builder.pointers;
+            rendered.helpers = builder.helpers;
+            rendered.pair_imports = builder.pair_imports;
+            rendered.bodies.push_str(&format!(
+                "\nexport function encode{export_name}NonJson(value: {application}, path: {path_type} = []): {wire} {{\n  return {expression};\n}}\n"
+            ));
+        }
         if emitter
             .model
             .transform_facts()
@@ -1116,6 +1140,9 @@ fn emit_component_pairs(
         };
         for direction in [Direction::Decode, Direction::Encode] {
             declared.insert(format!("{}{stem}", direction.prefix()));
+        }
+        if super::client::reaches_non_integer_transform(emitter.model, &schema.schema) {
+            declared.insert(format!("encode{stem}NonJson"));
         }
         if emitter
             .model
@@ -1314,6 +1341,7 @@ fn render_operation_pairs(
         let wire = format!("{application}Wire");
         let schema = operation_input_schema(emitter, operation, plan);
         let mut builder = PairBuilder::new(emitter, TypePosition::Request, aliases);
+        builder.non_json_roots = non_json_request_roots(emitter, plan);
         let converted = builder.convert(&schema, Direction::Encode, "value", "path", Frame::ROOT);
         rendered.pointers = builder.pointers;
         rendered.helpers = builder.helpers;
@@ -1637,6 +1665,53 @@ fn operation_input_schema(
         ));
     }
     object_schema(properties, operation.source.clone())
+}
+
+/// Schema roots whose request codec converts date leaves for a non-JSON serializer. Integer leaves
+/// below these roots remain bigint primitives: raw-JSON values belong only at JSON boundaries.
+fn non_json_request_roots(emitter: &Emitter<'_, '_, '_>, plan: &OperationPlan) -> Vec<SourceRef> {
+    let mut roots = plan
+        .param_plans
+        .iter()
+        .filter(|parameter| {
+            super::client::parameter_transforms(emitter.model, parameter)
+                && !super::client::parameter_encodes_int64(parameter)
+        })
+        .map(|parameter| parameter.schema.meta().source.clone())
+        .collect::<Vec<_>>();
+    if let Some(body) = &plan.body_plan {
+        collect_non_json_body_roots(emitter, body, &mut roots);
+    }
+    roots
+}
+
+fn collect_non_json_body_roots(
+    emitter: &Emitter<'_, '_, '_>,
+    plan: &BodyPlan,
+    roots: &mut Vec<SourceRef>,
+) {
+    match plan {
+        BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
+            roots.extend(
+                fields
+                    .iter()
+                    .filter(|field| {
+                        super::client::form_field_transforms(emitter.model, field)
+                            && !super::client::form_field_encodes_int64(field)
+                    })
+                    .map(|field| field.schema.meta().source.clone()),
+            );
+        }
+        BodyPlan::ContentTypeDiscriminated { arms, .. } => {
+            for arm in arms {
+                collect_non_json_body_roots(emitter, &arm.plan, roots);
+            }
+        }
+        BodyPlan::Json { .. }
+        | BodyPlan::TopLevelText { .. }
+        | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::TopLevelStream { .. } => {}
+    }
 }
 
 /// The request body's rendered client shape, restricted to body plans the encoder can bind.
@@ -2055,6 +2130,13 @@ struct PairBuilder<'a, 'model, 'input, 'sink> {
     /// walk. A component whose branch points back at an ancestor would inline forever; that branch
     /// falls back to its own codec call, which is where the recursion belongs.
     inlining: Vec<usize>,
+    /// Roots encoded for parameter or form-style serializers. These codecs still convert dates but
+    /// preserve every int64 below the root as the bigint primitive those serializers accept.
+    non_json_roots: Vec<SourceRef>,
+    non_json_encode: bool,
+    /// Component-scoped non-JSON encoders inline references so their date-only semantics propagate
+    /// without creating a parallel recursive codec graph.
+    inline_non_json_refs: bool,
 }
 
 impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
@@ -2071,6 +2153,9 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             pair_imports: BTreeMap::new(),
             helpers: BTreeSet::new(),
             inlining: Vec::new(),
+            non_json_roots: Vec::new(),
+            non_json_encode: false,
+            inline_non_json_refs: false,
         }
     }
 
@@ -2102,7 +2187,20 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
         path: &str,
         frame: Frame,
     ) -> Option<String> {
-        let inner = self.convert_inner(node, direction, value, path, frame)?;
+        let enters_non_json = direction == Direction::Encode
+            && !self.non_json_encode
+            && self
+                .non_json_roots
+                .iter()
+                .any(|source| source == &node.meta().source);
+        if enters_non_json {
+            self.non_json_encode = true;
+        }
+        let inner = self.convert_inner(node, direction, value, path, frame);
+        if enters_non_json {
+            self.non_json_encode = false;
+        }
+        let inner = inner?;
         // A nullable node admits null in both surfaces, and no codec accepts it.
         if node.meta().nullable {
             return Some(format!("{value} === null ? null : {inner}"));
@@ -2119,6 +2217,9 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
         frame: Frame,
     ) -> Option<String> {
         if let Some(kind) = self.facts().site(node) {
+            if self.non_json_encode && kind == TransformKind::IntegerBigInt {
+                return None;
+            }
             if direction == Direction::Revive {
                 if kind != TransformKind::IntegerBigInt {
                     return None;
@@ -2145,6 +2246,28 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                     .model
                     .schema_target(&target.source_id, &target.json_pointer)
                     .filter(|target| target.transforms)?;
+                if self.non_json_encode {
+                    let node = &self.emitter.model.analyzed.ir.schemas[target.index].schema;
+                    if !super::client::reaches_non_integer_transform(self.emitter.model, node) {
+                        return None;
+                    }
+                    if self.inline_non_json_refs {
+                        if self.inlining.contains(&target.index) {
+                            return None;
+                        }
+                        self.inlining.push(target.index);
+                        let converted = self.convert(node, direction, value, path, frame);
+                        self.inlining.pop();
+                        return converted;
+                    }
+                    let name = format!("encode{}NonJson", target.variant_name(self.position));
+                    self.pair_imports
+                        .entry(target.file_base.clone())
+                        .or_default()
+                        .insert(name.clone());
+                    let local = local_import_name(&name, &self.aliases.siblings);
+                    return Some(format!("{local}({value}, {path})"));
+                }
                 if direction == Direction::Revive
                     && !self.facts().reaches_kind(
                         &self.emitter.model.analyzed.ir.schemas[target.index].schema,
@@ -2190,7 +2313,10 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                     frame.nested(),
                 )?;
                 self.helpers.insert("pushPath");
-                Some(format!("{value}.map(({item}, {index}) => {element})"))
+                Some(format!(
+                    "{value}.map(({item}, {index}) => {})",
+                    parenthesize_arrow_object(element)
+                ))
             }
             SchemaNode::Tuple {
                 prefix_items, rest, ..
@@ -2622,8 +2748,9 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                 self.helpers.insert("pushPath");
                 converted = true;
                 parts.push(format!(
-                    "...{value}.slice({}).map(({item}, {index}) => {element})",
-                    prefix_items.len()
+                    "...{value}.slice({}).map(({item}, {index}) => {})",
+                    prefix_items.len(),
+                    parenthesize_arrow_object(element)
                 ));
             } else {
                 parts.push(format!("...{value}.slice({})", prefix_items.len()));
@@ -2749,6 +2876,14 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             return None;
         }
         Some(format!("{} : {value}", rendered.join(" : ")))
+    }
+}
+
+fn parenthesize_arrow_object(expression: String) -> String {
+    if expression.starts_with('{') {
+        format!("({expression})")
+    } else {
+        expression
     }
 }
 
@@ -3957,6 +4092,53 @@ mod pair_tests {
     }
 
     #[test]
+    fn non_json_component_encoder_parenthesizes_inlined_object_array_items() {
+        let content = pairs(
+            json!({
+                "Counter": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "Item": {
+                    "type": "object",
+                    "required": ["at", "counter"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" },
+                        "counter": { "$ref": "#/components/schemas/Counter" }
+                    }
+                },
+                "Collection": {
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/Item" }
+                        }
+                    }
+                },
+                "Notice": { "$ref": "#/components/schemas/Collection" }
+            }),
+            "collection",
+            date_and_bigint_mode,
+        )
+        .expect("a converting component emits a pair module");
+        let non_json = content
+            .split_once("export function encodeCollectionNonJson")
+            .map(|(_, body)| body)
+            .expect("non-JSON component encoder");
+        assert!(non_json.contains(".map((item0, index0) => ({"), "{content}");
+        assert!(
+            non_json.contains("encodeDateTimeDate(item0.at"),
+            "{content}"
+        );
+        assert!(!non_json.contains("encodeInt64"), "{content}");
+    }
+
+    #[test]
     fn integer_number_default_emits_no_wire_twin_or_pair() {
         let (files, diagnostics, has_errors) = compile_document(
             notice_document(json!({
@@ -5162,7 +5344,7 @@ mod pair_tests {
     }
 
     #[test]
-    fn pointer_constants_are_hoisted_in_first_seen_order_and_shared_by_both_directions() {
+    fn pointer_constants_are_hoisted_in_first_seen_order_and_shared_by_every_codec() {
         let content = pairs(
             json!({
                 "Notice": {
@@ -5183,7 +5365,7 @@ mod pair_tests {
         assert!(!content.contains("P2"), "{content}");
         assert_eq!(
             content.matches("P0, pushPath(path, \"a\")").count(),
-            2,
+            3,
             "{content}"
         );
     }
@@ -5586,7 +5768,7 @@ mod pair_tests {
             content.matches("at: decodeDateTimeDate(value.at,").count(),
             1
         );
-        assert_eq!(content.matches("...omit(value, \"at\"),").count(), 2);
+        assert_eq!(content.matches("...omit(value, \"at\"),").count(), 3);
     }
 
     #[test]
@@ -5686,8 +5868,8 @@ mod pair_tests {
         );
         assert_eq!(
             content.matches("...value,").count(),
-            2,
-            "one spread each way: {content}"
+            3,
+            "one spread per codec: {content}"
         );
     }
 
@@ -6977,6 +7159,86 @@ mod operation_pair_tests {
             "{content}"
         );
         assert!(!content.contains("encodeInt64(value.path.id"), "{content}");
+    }
+
+    #[test]
+    fn non_json_parameters_and_form_fields_encode_dates_without_encoding_int64() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "submitMixedCounter",
+                    "parameters": [{
+                        "name": "filter",
+                        "in": "query",
+                        "required": true,
+                        "style": "deepObject",
+                        "explode": true,
+                        "schema": { "$ref": "#/components/schemas/DatedCounter" }
+                    }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/x-www-form-urlencoded": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["values"],
+                                    "properties": {
+                                        "values": {
+                                            "type": "array",
+                                            "items": {
+                                                "oneOf": [
+                                                    { "type": "string", "format": "date-time" },
+                                                    { "type": "integer", "format": "int64" }
+                                                ]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": { "204": { "description": "done" } }
+                }),
+                json!({
+                    "DatedCounter": {
+                        "type": "object",
+                        "required": ["at", "id"],
+                        "properties": {
+                            "at": { "type": "string", "format": "date-time" },
+                            "id": { "type": "integer", "format": "int64" }
+                        }
+                    }
+                }),
+            ),
+            date_and_bigint_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = operation_module(&files, "submitmixedcounter").expect("operation codec");
+        assert!(
+            content.contains("encodeDatedCounterNonJson(value.query.filter"),
+            "{content}"
+        );
+        assert!(content.contains("encodeDateTimeDate(item0"), "{content}");
+        assert!(!content.contains("encodeInt64"), "{content}");
+        let component = files
+            .iter()
+            .find(|file| file.relative_path == "client/transform/components/datedcounter.ts")
+            .map(|file| file.content.as_str())
+            .expect("component codec");
+        let non_json = component
+            .split_once("export function encodeDatedCounterNonJson")
+            .map(|(_, body)| body)
+            .expect("non-JSON component encoder");
+        assert!(
+            non_json.contains("encodeDateTimeDate(value.at"),
+            "{component}"
+        );
+        assert!(!non_json.contains("encodeInt64"), "{component}");
+        let client = client_operation(&files, "submitmixedcounter");
+        assert!(
+            client.contains("import type { DatedCounter, DatedCounterWire }"),
+            "{client}"
+        );
     }
 
     #[test]

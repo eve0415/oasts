@@ -69,6 +69,20 @@ paths:
       responses:
         '204':
           description: Found.
+  /mixed:
+    get:
+      operationId: readMixedCounter
+      parameters:
+        - name: filter
+          in: query
+          required: true
+          style: deepObject
+          explode: true
+          schema:
+            $ref: '#/components/schemas/DatedCounter'
+      responses:
+        '204':
+          description: Found.
   /form:
     post:
       operationId: submitCounterForm
@@ -93,6 +107,29 @@ paths:
       responses:
         '204':
           description: Submitted.
+  /mixed-form:
+    post:
+      operationId: submitMixedCounterForm
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - filter
+              properties:
+                filter:
+                  type: array
+                  items:
+                    oneOf:
+                      - type: string
+                        format: date-time
+                      - type: integer
+                        format: int64
+      responses:
+        '204':
+          description: Submitted.
 components:
   schemas:
     Counter:
@@ -106,3 +143,15 @@ components:
           multipleOf: 2
         amount:
           type: number
+    DatedCounter:
+      type: object
+      required:
+        - at
+        - id
+      properties:
+        at:
+          type: string
+          format: date-time
+        id:
+          type: integer
+          format: int64
