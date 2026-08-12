@@ -5877,7 +5877,7 @@ mod tests {
                 "Thing": {
                     "type": "object",
                     "properties": {
-                        "id": { "type": "integer", "format": "int64" }
+                        "id": { "type": "integer", "format": "int64", "minimum": 1 }
                     }
                 }
             })),
@@ -5896,6 +5896,11 @@ mod tests {
             content.contains("const integer1 = int64WireValue(value0);"),
             "{content}"
         );
+        assert!(
+            content.contains("const number1 = Number(integer1);"),
+            "{content}"
+        );
+        assert!(content.contains("if (number1 < 1) {"), "{content}");
         assert!(!content.contains("isInt64(value0)"), "{content}");
     }
 
