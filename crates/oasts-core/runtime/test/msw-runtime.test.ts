@@ -95,6 +95,13 @@ describe("respondWith", () => {
     assert.equal(await undefinedBody.text(), "");
   });
 
+  test("native JSON serialization cannot encode a bigint response", () => {
+    assert.throws(
+      () => respondWith(200, "application/json", { id: 42n }, PAYLOADS),
+      /serialize a BigInt/u,
+    );
+  });
+
   test("preserves text and its declared content type", async () => {
     const response = respondWith(202, "text/plain; charset=iso-8859-1", "accepted", PAYLOADS);
     assert.equal(response.status, 202);
