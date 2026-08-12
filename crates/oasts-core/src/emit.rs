@@ -2123,8 +2123,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                                 .map(|tag| render_ts_string(tag))
                                 .collect::<Vec<_>>()
                                 .join(" | ");
+                            let readonly = if self.model.config.types.readonly {
+                                "readonly "
+                            } else {
+                                ""
+                            };
                             rendered = format!(
-                                "({member} & {{ {}: {literals} }})",
+                                "({member} & {{ {readonly}{}: {literals} }})",
                                 render_property_key(property)
                             );
                         }
@@ -8764,6 +8769,34 @@ mod tests {
             1,
             "{diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn tagged_projection_honors_readonly_configuration() {
+        let document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "string" }
+            } },
+            "Dog": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "string" }
+            } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind", "mapping": {
+                         "cat": "#/components/schemas/Cat", "dog": "#/components/schemas/Dog"
+                     } } }
+        }));
+        let (files, diagnostics) = compile(
+            document,
+            json!({ "types": { "discriminatedUnions": "tagged", "readonly": true } }),
+        );
+        let pet = generated_body(schema_file(&files, "pet"));
+        assert!(
+            pet.contains(
+                "export type Pet = (Cat & { readonly kind: \"cat\" }) | (Dog & { readonly kind: \"dog\" });"
+            ),
+            "{pet}"
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
