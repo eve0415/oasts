@@ -1246,6 +1246,22 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             return None;
         }
 
+        if tagged_projection {
+            for position in [
+                TypePosition::Neutral,
+                TypePosition::Request,
+                TypePosition::Response,
+            ] {
+                if let Err(literal) = self
+                    .projected_discriminator_values_by_branch(branches, property, position, tags)
+                {
+                    return Some(format!(
+                        "discriminator tags for property '{property}' collapse to TypeScript literal {literal} after scalar projection, so the tagged union would not discriminate its branches; emitting a structural union"
+                    ));
+                }
+            }
+        }
+
         if facts.iter().any(|facts| {
             !facts.required
                 && facts
@@ -1558,6 +1574,54 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         tags.iter()
             .map(|tag| projected_tag_value(tag, tag_type))
             .collect()
+    }
+
+    fn projected_discriminator_values_by_branch(
+        &self,
+        branches: &[SchemaNode],
+        property: &str,
+        position: TypePosition,
+        tags: &[Vec<String>],
+    ) -> Result<Vec<Option<Vec<Value>>>, String> {
+        debug_assert_eq!(branches.len(), tags.len());
+        let mut owners = BTreeMap::<String, usize>::new();
+        let mut projected = Vec::with_capacity(branches.len());
+        for (index, (branch, tags)) in branches.iter().zip(tags).enumerate() {
+            let fixed = self
+                .merged_object_property_finite_in_position(
+                    branch,
+                    property,
+                    position,
+                    &mut HashSet::new(),
+                )
+                .values
+                .filter(|values| !values.is_empty());
+            let (values, emit_projection) = if let Some(values) = fixed {
+                (values, false)
+            } else {
+                let Some(values) =
+                    self.projected_discriminator_values(branch, property, position, tags)
+                else {
+                    projected.push(None);
+                    continue;
+                };
+                (values, true)
+            };
+            let mut branch_literals = BTreeSet::new();
+            let mut unique = Vec::with_capacity(values.len());
+            for value in values {
+                let literal = render_ts_value(&value);
+                if !branch_literals.insert(literal.clone()) {
+                    continue;
+                }
+                if owners.insert(literal.clone(), index).is_some() {
+                    return Err(literal);
+                }
+                unique.push(value);
+            }
+            projected.push(emit_projection.then_some(unique));
+        }
+        Ok(projected)
     }
 
     fn merged_object_property_tag_type<'a>(
@@ -2246,19 +2310,29 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 if branches.is_empty() {
                     "never".to_owned()
                 } else {
-                    let projection_tags = discriminator.as_deref().and_then(|discriminator| {
+                    let projection_values = discriminator.as_deref().and_then(|discriminator| {
                         self.discriminator_projection_tags(branches, discriminator)
-                            .map(|tags| (discriminator.property_name.as_str(), tags))
+                            .and_then(|tags| {
+                                self.projected_discriminator_values_by_branch(
+                                    branches,
+                                    &discriminator.property_name,
+                                    position,
+                                    &tags,
+                                )
+                                .ok()
+                            })
+                            .map(|values| (discriminator.property_name.as_str(), values))
                     });
                     // Linear membership rather than a hash set: a union carries a handful of
                     // branches, and a set would clone every rendered branch to own its key.
                     let mut rendered_branches = Vec::with_capacity(branches.len());
                     for (index, branch) in branches.iter().enumerate() {
                         let mut rendered = self.render_type(branch, position, axis, indent);
-                        if let Some((property, tags)) = &projection_tags
-                            && let Some(tags) = tags.get(index).filter(|tags| !tags.is_empty())
-                            && let Some(values) = self
-                                .projected_discriminator_values(branch, property, position, tags)
+                        if let Some((property, values)) = &projection_values
+                            && let Some(values) = values
+                                .get(index)
+                                .and_then(Option::as_deref)
+                                .filter(|values| !values.is_empty())
                         {
                             let member = parenthesize_intersection_member(rendered, branch);
                             let literals = values
@@ -8882,6 +8956,62 @@ mod tests {
             "{pet}"
         );
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn tagged_discriminator_falls_back_when_projected_tags_collide() {
+        let document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "number" }
+            } },
+            "Dog": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "number" }
+            } },
+            "FixedCat": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "number", "const": 1 }
+            } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind", "mapping": {
+                         "1": "#/components/schemas/Cat", "1.0": "#/components/schemas/Dog"
+                     } } },
+            "DeduplicatedPet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind", "mapping": {
+                         "1": "#/components/schemas/Cat", "1.0": "#/components/schemas/Cat",
+                         "2": "#/components/schemas/Dog"
+                     } } },
+            "MixedPet": { "oneOf": [{ "$ref": "#/components/schemas/FixedCat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind", "mapping": {
+                         "1": "#/components/schemas/FixedCat", "1.0": "#/components/schemas/Dog"
+                     } } }
+        }));
+        let (files, diagnostics) = compile(
+            document,
+            json!({ "types": { "discriminatedUnions": "tagged" } }),
+        );
+        let pet = generated_body(schema_file(&files, "pet"));
+        assert!(pet.contains("export type Pet = Cat | Dog;"), "{pet}");
+        let deduplicated = generated_body(schema_file(&files, "deduplicatedpet"));
+        assert!(
+            deduplicated.contains(
+                "export type DeduplicatedPet = (Cat & { kind: 1 }) | (Dog & { kind: 2 });"
+            ),
+            "{deduplicated}"
+        );
+        let mixed = generated_body(schema_file(&files, "mixedpet"));
+        assert!(
+            mixed.contains("export type MixedPet = FixedCat | Dog;"),
+            "{mixed}"
+        );
+        let warnings = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2, "{diagnostics:#?}");
+        assert!(warnings.iter().all(|warning| {
+            warning.severity == Severity::Warning
+                && warning.message.contains("TypeScript literal 1")
+                && warning.message.contains("structural union")
+        }));
     }
 
     #[test]
