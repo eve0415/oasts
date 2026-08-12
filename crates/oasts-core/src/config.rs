@@ -612,6 +612,23 @@ pub enum DateRepresentation {
     Temporal,
 }
 
+/// How a `oneOf` carrying a `discriminator` is shaped. `structural` emits `Cat | Dog` and lets the
+/// discriminator drive diagnostics only; `tagged` intersects each branch with the tag it proves,
+/// `(Cat & { petType: "feline" }) | (Dog & { petType: "canine" })`, so TypeScript can narrow it.
+///
+/// Doc comments belong on the enum, not its variants: a variant description makes `schemars` emit a
+/// named `oneOf` rather than a plain `enum`, and the config-surface generator has no alias form for
+/// that — the emitted `config.ts` would reference a type it never declares.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum DiscriminatedUnions {
+    #[default]
+    Structural,
+    Tagged,
+}
+
 /// Type artifact options with schema defaults applied during deserialization.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -627,6 +644,7 @@ pub struct TypesConfig {
     pub enum_extensions: EnumExtensions,
     pub date_time: DateTimeRepresentation,
     pub date: DateRepresentation,
+    pub discriminated_unions: DiscriminatedUnions,
     pub readonly: bool,
 }
 
@@ -3917,6 +3935,24 @@ mod tests {
             value["types"] = json!({ "enumExtensions": extensions });
             load_json(&value).expect("enumExtensions value should parse");
         }
+    }
+
+    #[test]
+    fn discriminated_unions_defaults_to_structural_and_accepts_tagged() {
+        let resolved = load_json(&valid_json_value()).expect("default config should resolve");
+        assert_eq!(
+            resolved.types.discriminated_unions,
+            DiscriminatedUnions::Structural
+        );
+
+        let mut tagged = valid_json_value();
+        tagged["types"] = json!({ "discriminatedUnions": "tagged" });
+        let resolved =
+            load_json(&tagged).expect("tagged discriminated union representation should resolve");
+        assert_eq!(
+            resolved.types.discriminated_unions,
+            DiscriminatedUnions::Tagged
+        );
     }
 
     #[test]
