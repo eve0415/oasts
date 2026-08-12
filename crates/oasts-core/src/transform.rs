@@ -279,7 +279,13 @@ impl<'ir> TransformFacts<'ir> {
     /// Whether this node reaches at least one site of exactly `kind`, following component refs.
     #[must_use]
     pub fn reaches_kind(&self, node: &SchemaNode, kind: TransformKind) -> bool {
-        self.enabled() && self.reaches_kind_inner(node, kind, &mut Vec::new())
+        self.enabled()
+            && self.reaches_kind_inner(
+                node,
+                kind,
+                &mut Vec::new(),
+                &mut vec![None; self.ir.schemas.len()],
+            )
     }
 
     fn reaches_kind_inner(
@@ -287,6 +293,7 @@ impl<'ir> TransformFacts<'ir> {
         node: &SchemaNode,
         kind: TransformKind,
         visiting: &mut Vec<usize>,
+        memo: &mut [Option<bool>],
     ) -> bool {
         if self.site(node) == Some(kind) {
             return true;
@@ -299,13 +306,17 @@ impl<'ir> TransformFacts<'ir> {
                 else {
                     return false;
                 };
+                if let Some(reaches) = memo[index] {
+                    return reaches;
+                }
                 if visiting.contains(&index) {
                     return false;
                 }
                 visiting.push(index);
                 let reaches =
-                    self.reaches_kind_inner(&self.ir.schemas[index].schema, kind, visiting);
+                    self.reaches_kind_inner(&self.ir.schemas[index].schema, kind, visiting, memo);
                 visiting.pop();
+                memo[index] = Some(reaches);
                 reaches
             }
             SchemaNode::Object {
@@ -316,11 +327,11 @@ impl<'ir> TransformFacts<'ir> {
             } => {
                 properties
                     .iter()
-                    .any(|(_, property, _)| self.reaches_kind_inner(property, kind, visiting))
+                    .any(|(_, property, _)| self.reaches_kind_inner(property, kind, visiting, memo))
                     || match additional_properties {
                         AdditionalProperties::Allowed(Some(schema))
                         | AdditionalProperties::Schema(schema) => {
-                            self.reaches_kind_inner(schema, kind, visiting)
+                            self.reaches_kind_inner(schema, kind, visiting, memo)
                         }
                         AdditionalProperties::Allowed(None) | AdditionalProperties::Forbidden => {
                             false
@@ -332,19 +343,19 @@ impl<'ir> TransformFacts<'ir> {
                         .iter()
                         .any(|pattern| {
                             pattern.type_key.is_some()
-                                && self.reaches_kind_inner(&pattern.schema, kind, visiting)
+                                && self.reaches_kind_inner(&pattern.schema, kind, visiting, memo)
                         })
             }
-            SchemaNode::Array { items, .. } => self.reaches_kind_inner(items, kind, visiting),
+            SchemaNode::Array { items, .. } => self.reaches_kind_inner(items, kind, visiting, memo),
             SchemaNode::Tuple {
                 prefix_items, rest, ..
             } => {
                 prefix_items
                     .iter()
-                    .any(|item| self.reaches_kind_inner(item, kind, visiting))
+                    .any(|item| self.reaches_kind_inner(item, kind, visiting, memo))
                     || match rest {
                         TupleRest::Schema(schema) => {
-                            self.reaches_kind_inner(schema, kind, visiting)
+                            self.reaches_kind_inner(schema, kind, visiting, memo)
                         }
                         TupleRest::Allowed | TupleRest::Forbidden => false,
                     }
@@ -353,7 +364,7 @@ impl<'ir> TransformFacts<'ir> {
             | SchemaNode::OneOf { branches, .. }
             | SchemaNode::AnyOf { branches, .. } => branches
                 .iter()
-                .any(|branch| self.reaches_kind_inner(branch, kind, visiting)),
+                .any(|branch| self.reaches_kind_inner(branch, kind, visiting, memo)),
             SchemaNode::Primitive { .. }
             | SchemaNode::Finite { .. }
             | SchemaNode::Any { .. }
@@ -794,8 +805,9 @@ fn finite_kinds(enum_values: Option<&[Value]>, const_value: Option<&Value>) -> J
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::{Duration, Instant};
 
-    use serde_json::{Value, json};
+    use serde_json::{Map, Value, json};
     use tempfile::TempDir;
 
     use super::*;
@@ -1591,6 +1603,33 @@ mod tests {
         assert!(!computed.reaches(&dangling));
         assert!(!computed.reaches_kind(&dangling, TransformKind::DateTimeDate));
         assert!(transforms(&fx.ir, &computed, "Pet"));
+    }
+
+    #[test]
+    fn reaches_kind_memoizes_shared_ref_dags() {
+        let mut schemas = Map::new();
+        schemas.insert("Leaf".to_owned(), json!({ "type": "string" }));
+        let mut previous = "Leaf".to_owned();
+        for depth in 0..22 {
+            let name = format!("Layer{depth}");
+            let reference = format!("#/components/schemas/{previous}");
+            schemas.insert(
+                name.clone(),
+                json!({ "allOf": [{ "$ref": reference }, { "$ref": reference }] }),
+            );
+            previous = name;
+        }
+        let fx = fixture(doc(Value::Object(schemas)), date_mode());
+        let computed = fx.facts();
+
+        let started = Instant::now();
+        assert!(!computed.reaches_kind(fx.root(&previous), TransformKind::DateTimeDate));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "shared-ref reachability took {:?}",
+            elapsed
+        );
     }
 
     #[test]
