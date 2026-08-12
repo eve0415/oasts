@@ -7815,6 +7815,108 @@ mod tests {
         assert!(generated_body(intersection).contains("export type Intersected = Cat & Dog;"));
     }
 
+    #[test]
+    fn all_of_preserves_ref_identity() {
+        // The same probe pair in every composition shape that can carry a `$ref`. `allOf`
+        // used to resolve its members and print the merged property bag, which is the one
+        // place a `$ref` stopped being a name. Structure alone cannot tell the inlined
+        // literal from the component it copied, so this asserts the emitted text — the
+        // fixtures under fixtures/composition-identity-* carry the tsc-verified half.
+        let document = openapi(json!({
+            "WidgetMeta": { "type": "object", "required": ["a"], "properties": { "a": { "type": "string" } } },
+            "OtherMeta": { "type": "object", "required": ["b"], "properties": { "b": { "type": "string" } } },
+            "ViaRef": { "$ref": "#/components/schemas/WidgetMeta" },
+            "ViaOneOf": { "oneOf": [{ "$ref": "#/components/schemas/WidgetMeta" }, { "$ref": "#/components/schemas/OtherMeta" }] },
+            "ViaAnyOf": { "anyOf": [{ "$ref": "#/components/schemas/WidgetMeta" }, { "$ref": "#/components/schemas/OtherMeta" }] },
+            "ViaAnyOfNull": { "anyOf": [{ "$ref": "#/components/schemas/WidgetMeta" }, { "type": "null" }] },
+            "ViaAllOfOne": { "allOf": [{ "$ref": "#/components/schemas/WidgetMeta" }] },
+            "ViaAllOfOneDescribed": { "description": "a quoted ref", "allOf": [{ "$ref": "#/components/schemas/WidgetMeta" }] },
+            "ViaAllOfTwo": { "allOf": [{ "$ref": "#/components/schemas/WidgetMeta" }, { "$ref": "#/components/schemas/OtherMeta" }] },
+            "ViaAllOfMixed": { "allOf": [
+                { "$ref": "#/components/schemas/WidgetMeta" },
+                { "type": "object", "properties": { "c": { "type": "string" } } }
+            ] },
+            "ViaAllOfInline": { "allOf": [
+                { "type": "object", "required": ["a"], "properties": { "a": { "type": "string" } } },
+                { "type": "object", "properties": { "b": { "type": "string" } } }
+            ] }
+        }));
+        let (files, _diagnostics) = compile(document, json!({}));
+        let rendered = |base: &str| generated_body(schema_file(&files, base)).to_owned();
+
+        // The six shapes that already named their members. These must not move.
+        assert!(rendered("viaref").contains("export type ViaRef = WidgetMeta;"));
+        assert!(rendered("viaoneof").contains("export type ViaOneOf = WidgetMeta | OtherMeta;"));
+        assert!(rendered("viaanyof").contains("export type ViaAnyOf = WidgetMeta | OtherMeta;"));
+        assert!(rendered("viaanyofnull").contains("export type ViaAnyOfNull = WidgetMeta | null;"));
+        // An `allOf` of two anonymous objects still folds to one object literal: identity-first
+        // changes what happens to `$ref` branches, not to anonymous ones.
+        let inline = rendered("viaallofinline");
+        assert!(
+            inline.contains("export type ViaAllOfInline = {\n  a: string;\n  b?: string;\n};"),
+            "{inline}"
+        );
+
+        // A single `$ref`, with and without an annotation sibling: the quoting idiom, not
+        // composition. A one-member join is the member.
+        let one = rendered("viaallofone");
+        assert!(
+            one.contains("export type ViaAllOfOne = WidgetMeta;"),
+            "{one}"
+        );
+        let described = rendered("viaallofonedescribed");
+        assert!(
+            described.contains("export type ViaAllOfOneDescribed = WidgetMeta;"),
+            "{described}"
+        );
+        assert!(described.contains("a quoted ref"), "{described}");
+
+        // More than one member: each keeps its identity and they join with `&`.
+        let two = rendered("viaalloftwo");
+        assert!(
+            two.contains("export type ViaAllOfTwo = WidgetMeta & OtherMeta;"),
+            "{two}"
+        );
+        let mixed = rendered("viaallofmixed");
+        assert!(
+            mixed.contains("export type ViaAllOfMixed = WidgetMeta & {")
+                && mixed.contains("c?: string;"),
+            "{mixed}"
+        );
+    }
+
+    #[test]
+    fn nullable_all_of_ref_wraps_the_whole_intersection() {
+        // 3.0's `nullable` beside the `allOf` quoting idiom. `null` is appended to whatever
+        // the node rendered to, outside the intersection — distributing it into the members
+        // would give `(A | null) & (B | null)`, whose object half collapses to `never`.
+        let document = json!({
+            "openapi": "3.0.3",
+            "info": { "title": "test", "version": "1" },
+            "paths": {},
+            "components": { "schemas": {
+                "WidgetMeta": { "type": "object", "required": ["a"], "properties": { "a": { "type": "string" } } },
+                "OtherMeta": { "type": "object", "required": ["b"], "properties": { "b": { "type": "string" } } },
+                "NullableOne": { "nullable": true, "allOf": [{ "$ref": "#/components/schemas/WidgetMeta" }] },
+                "NullableTwo": { "nullable": true, "allOf": [
+                    { "$ref": "#/components/schemas/WidgetMeta" },
+                    { "$ref": "#/components/schemas/OtherMeta" }
+                ] }
+            } }
+        });
+        let (files, _diagnostics) = compile(document, json!({}));
+        let one = generated_body(schema_file(&files, "nullableone")).to_owned();
+        assert!(
+            one.contains("export type NullableOne = WidgetMeta | null;"),
+            "{one}"
+        );
+        let two = generated_body(schema_file(&files, "nullabletwo")).to_owned();
+        assert!(
+            two.contains("export type NullableTwo = (WidgetMeta & OtherMeta) | null;"),
+            "{two}"
+        );
+    }
+
     fn discriminator_diagnostics(diagnostics: &[Diagnostic]) -> Vec<&Diagnostic> {
         diagnostics
             .iter()
