@@ -1163,12 +1163,11 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         finite_values(enum_values.as_deref(), const_value.as_ref())
     }
 
-    /// Diagnoses a discriminated `oneOf`/`anyOf` (one shared path for both, since the discriminator
-    /// contract is identical). Each branch must contribute a distinct tag value for the discriminator
-    /// property; the tag is drawn — first non-empty wins — from the explicit `mapping`, the branch's
-    /// own fixed `const`/`enum` seen through the `$ref`+allOf idiom, or the referenced component name.
-    /// The render is always a plain structural union — proof drives diagnostics only, never the type
-    /// shape — so an unprovable union degrades to that same union plus one warning saying why.
+    /// Diagnoses a discriminated `oneOf`/`anyOf`. Each branch must contribute a distinct tag value
+    /// for the discriminator property; the tag is drawn — first non-empty wins — from the explicit
+    /// `mapping`, the branch's own fixed `const`/`enum` seen through the `$ref`+allOf idiom, or the
+    /// referenced component name. An unprovable union keeps its structural shape and gains one
+    /// warning; a proven tagged `oneOf` may also reuse the tags to project its branch types.
     fn validate_discriminated(
         &self,
         branches: &[SchemaNode],
@@ -1444,6 +1443,26 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 facts.required && facts.values.is_some_and(|values| !values.is_empty())
             }
         })
+    }
+
+    fn discriminator_projection_tags(
+        &self,
+        branches: &[SchemaNode],
+        discriminator: &Discriminator,
+    ) -> Option<Vec<Vec<String>>> {
+        if self.model.config.types.discriminated_unions != DiscriminatedUnions::Tagged
+            || self.discriminator_branches_fix_a_literal(branches, &discriminator.property_name)
+        {
+            return None;
+        }
+        let (mapping_targets, _dangling) = self.mapping_targets(discriminator);
+        self.prove_discriminator_tags(branches, discriminator, &mapping_targets)
+            .ok()
+    }
+
+    fn branch_accepts_discriminator_projection(&self, branch: &SchemaNode, property: &str) -> bool {
+        let facts = self.merged_object_property_finite(branch, property, &mut HashSet::new());
+        facts.values.is_none()
     }
 
     fn merged_object_property_finite<'a>(
@@ -1995,12 +2014,51 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     members.join(" & ")
                 }
             }
-            SchemaNode::OneOf { branches, .. } | SchemaNode::AnyOf { branches, .. } => {
+            SchemaNode::OneOf {
+                branches,
+                discriminator,
+                ..
+            } => {
                 if branches.is_empty() {
                     "never".to_owned()
                 } else {
+                    let projection_tags = discriminator.as_deref().and_then(|discriminator| {
+                        self.discriminator_projection_tags(branches, discriminator)
+                            .map(|tags| (discriminator.property_name.as_str(), tags))
+                    });
                     // Linear membership rather than a hash set: a union carries a handful of
                     // branches, and a set would clone every rendered branch to own its key.
+                    let mut rendered_branches = Vec::with_capacity(branches.len());
+                    for (index, branch) in branches.iter().enumerate() {
+                        let mut rendered = self.render_type(branch, position, axis, indent);
+                        if let Some((property, tags)) = &projection_tags
+                            && let Some(tags) = tags.get(index).filter(|tags| !tags.is_empty())
+                            && self.branch_accepts_discriminator_projection(branch, property)
+                        {
+                            let member = parenthesize_intersection_member(rendered, branch);
+                            let literals = tags
+                                .iter()
+                                .map(|tag| render_ts_string(tag))
+                                .collect::<Vec<_>>()
+                                .join(" | ");
+                            rendered = format!(
+                                "({member} & {{ {}: {literals} }})",
+                                render_property_key(property)
+                            );
+                        }
+                        if !rendered_branches.contains(&rendered) {
+                            rendered_branches.push(rendered);
+                        }
+                    }
+                    rendered_branches.join(" | ")
+                }
+            }
+            SchemaNode::AnyOf { branches, .. } => {
+                if branches.is_empty() {
+                    "never".to_owned()
+                } else {
+                    // `anyOf` never gains discriminator intersections: at-least-one matching branch
+                    // does not make the discriminator a total branch selector.
                     let mut rendered_branches = Vec::with_capacity(branches.len());
                     for branch in branches {
                         let rendered = self.render_type(branch, position, axis, indent);
@@ -8374,6 +8432,158 @@ mod tests {
             diagnostics
                 .iter()
                 .all(|diagnostic| diagnostic.code != "OASTS1316"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn tagged_discriminator_projects_only_sound_oneof_tags() {
+        let mapping_document = openapi(json!({
+            "Cat": { "type": "object", "required": ["petType"], "properties": { "petType": { "type": "string" } } },
+            "Dog": { "type": "object", "required": ["petType"], "properties": { "petType": { "type": "string" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "petType", "mapping": {
+                         "feline": "#/components/schemas/Cat", "kitty": "#/components/schemas/Cat",
+                         "canine": "#/components/schemas/Dog"
+                     } } }
+        }));
+        let (tagged_files, tagged_diagnostics) = compile(
+            mapping_document.clone(),
+            json!({ "types": { "discriminatedUnions": "tagged" } }),
+        );
+        let tagged = generated_body(schema_file(&tagged_files, "pet"));
+        assert!(
+            tagged.contains(
+                "export type Pet = (Cat & { petType: \"feline\" | \"kitty\" }) | (Dog & { petType: \"canine\" });"
+            ),
+            "{tagged}"
+        );
+        assert_eq!(
+            tagged_diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+                .count(),
+            0,
+            "{tagged_diagnostics:?}"
+        );
+
+        let (structural_files, structural_diagnostics) = compile(mapping_document, json!({}));
+        let structural = generated_body(schema_file(&structural_files, "pet"));
+        assert!(
+            structural.contains("export type Pet = Cat | Dog;"),
+            "{structural}"
+        );
+        assert_eq!(
+            structural_diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+                .count(),
+            1,
+            "{structural_diagnostics:?}"
+        );
+
+        let const_document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "cat" } } },
+            "Dog": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "dog" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind" } }
+        }));
+        let (files, diagnostics) = compile(
+            const_document,
+            json!({ "types": { "discriminatedUnions": "tagged" } }),
+        );
+        let pet = generated_body(find_file(&files, "types/components/pet.ts"));
+        assert!(pet.contains("export type Pet = Cat | Dog;"), "{pet}");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != CODE_DISCRIMINATOR_NARROWING),
+            "{diagnostics:?}"
+        );
+
+        let optional_document = openapi(json!({
+            "Cat": { "type": "object", "properties": { "kind": { "type": "string", "const": "cat" } } },
+            "Dog": { "type": "object", "properties": { "kind": { "type": "string", "const": "dog" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind" } }
+        }));
+        let (files, diagnostics) = compile(
+            optional_document,
+            json!({ "types": { "discriminatedUnions": "tagged" } }),
+        );
+        let pet = generated_body(schema_file(&files, "pet"));
+        assert!(pet.contains("export type Pet = Cat | Dog;"), "{pet}");
+        let warnings = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "{diagnostics:?}");
+        assert!(warnings[0].message.contains("optional"));
+
+        let anyof_document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string" } } },
+            "Dog": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string" } } },
+            "Pet": { "anyOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind", "mapping": {
+                         "cat": "#/components/schemas/Cat", "dog": "#/components/schemas/Dog"
+                     } } }
+        }));
+        for config in [
+            json!({}),
+            json!({ "types": { "discriminatedUnions": "tagged" } }),
+        ] {
+            let (files, diagnostics) = compile(anyof_document.clone(), config);
+            let pet = generated_body(schema_file(&files, "pet"));
+            assert!(pet.contains("export type Pet = Cat | Dog;"), "{pet}");
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+                    .count(),
+                1,
+                "{diagnostics:?}"
+            );
+        }
+
+        let wire_document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "servers": [{ "url": "https://api.example.test" }],
+            "paths": {},
+            "components": { "schemas": {
+                "Cat": { "type": "object", "required": ["petType", "at"], "properties": {
+                    "petType": { "type": "string" }, "at": { "type": "string", "format": "date-time" }
+                } },
+                "Dog": { "type": "object", "required": ["petType", "at"], "properties": {
+                    "petType": { "type": "string" }, "at": { "type": "string", "format": "date-time" }
+                } },
+                "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                         "discriminator": { "propertyName": "petType", "mapping": {
+                             "feline": "#/components/schemas/Cat", "canine": "#/components/schemas/Dog"
+                         } } }
+            } }
+        });
+        let (files, diagnostics) = compile_all_artifacts(wire_document, |config| {
+            config.types.date_time = DateTimeRepresentation::Date;
+            config.types.discriminated_unions = DiscriminatedUnions::Tagged;
+        });
+        let pet = generated_body(find_file(&files, "types/components/pet.ts"));
+        assert!(
+            pet.contains(
+                "export type Pet = (Cat & { petType: \"feline\" }) | (Dog & { petType: \"canine\" });"
+            ),
+            "{pet}"
+        );
+        assert!(
+            pet.contains(
+                "export type PetWire = (CatWire & { petType: \"feline\" }) | (DogWire & { petType: \"canine\" });"
+            ),
+            "{pet}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != CODE_DISCRIMINATOR_NARROWING),
             "{diagnostics:?}"
         );
     }
