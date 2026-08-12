@@ -2045,6 +2045,21 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             );
         };
         let mut meta = self.schema_meta(&node, Some(object));
+        let not_admits_everything = meta
+            .validation_applicators()
+            .not
+            .as_deref()
+            .is_some_and(schema_admits_everything);
+        if not_admits_everything {
+            let mut applicators = meta
+                .validation_applicators
+                .take()
+                .map(|applicators| *applicators)
+                .unwrap_or_default();
+            applicators.not = None;
+            meta.validation_applicators = box_if_populated(applicators);
+            return SchemaNode::Never { meta };
+        }
         if object
             .get("enum")
             .and_then(Value::as_array)
@@ -4261,6 +4276,23 @@ fn has_typed_or_constraint_content(object: &Map<String, Value>, version: OasVers
     ];
     BOTH_VERSIONS.iter().any(|key| object.contains_key(*key))
         || (version == OasVersion::V3_1 && V3_1_ONLY.iter().any(|key| object.contains_key(*key)))
+}
+
+/// Whether the lowered schema accepts every JSON instance. Typeless constraint groups and
+/// validation applicators still narrow an `Any` node, while annotations and content encoding do
+/// not. Rejected validation keywords keep the classification conservative because their semantics
+/// are unavailable in the lowered IR.
+fn schema_admits_everything(schema: &SchemaNode) -> bool {
+    matches!(
+        schema,
+        SchemaNode::Any { meta }
+            if meta.numeric_constraints.is_none()
+                && meta.string_constraints.is_none()
+                && meta.array_constraints.is_none()
+                && meta.object_constraints.is_none()
+                && meta.validation_applicators.is_none()
+                && meta.rejected_validation_keywords.is_empty()
+    )
 }
 
 /// Source-only meta for a synthetic conjunction branch (`$ref`/`oneOf`/`anyOf` piece). Docs,
@@ -9132,7 +9164,7 @@ mod tests {
                             "else": {},
                             "minContains": 1,
                             "unevaluatedItems": false,
-                            "not": {},
+                            "not": { "type": "string" },
                             "unevaluatedProperties": false
                         }
                     }
@@ -9326,6 +9358,83 @@ mod tests {
                 meta,
                 ..
             }) if meta.source.json_pointer == "/components/schemas/Thing/not"
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    #[test]
+    fn not_of_empty_schema_lowers_the_outer_node_to_never() {
+        let document = schemas_doc("3.1.0", json!({ "RejectAll": { "not": {} } }));
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "RejectAll"),
+            SchemaNode::Never { meta }
+                if meta.source.json_pointer == "/components/schemas/RejectAll"
+                    && meta.validation_applicators().not.is_none()
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    #[test]
+    fn not_of_true_schema_lowers_the_outer_node_to_never() {
+        let document = schemas_doc("3.1.0", json!({ "RejectAll": { "not": true } }));
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "RejectAll"),
+            SchemaNode::Never { meta }
+                if meta.source.json_pointer == "/components/schemas/RejectAll"
+                    && meta.validation_applicators().not.is_none()
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    #[test]
+    fn annotations_do_not_block_not_of_everything_lowering() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "RejectAll": { "not": { "description": "x" } } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "RejectAll"),
+            SchemaNode::Never { meta }
+                if meta.source.json_pointer == "/components/schemas/RejectAll"
+                    && meta.validation_applicators().not.is_none()
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    #[test]
+    fn not_of_never_schema_leaves_the_outer_node_unchanged() {
+        let document = schemas_doc("3.1.0", json!({ "AcceptAll": { "not": false } }));
+        let (_temp, ir, sink) = parse_value(&document);
+
+        let schema = schema_named(&ir, "AcceptAll");
+        assert!(matches!(schema, SchemaNode::Any { .. }));
+        assert!(matches!(
+            schema.meta().validation_applicators().not.as_deref(),
+            Some(SchemaNode::Never { meta })
+                if meta.source.json_pointer == "/components/schemas/AcceptAll/not"
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    #[test]
+    fn provably_empty_not_with_a_typed_sibling_emits_no_diagnostic() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "RejectAll": { "type": "string", "not": true } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "RejectAll"),
+            SchemaNode::Never { meta }
+                if meta.source.json_pointer == "/components/schemas/RejectAll"
+                    && meta.validation_applicators().not.is_none()
         ));
         assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
     }
