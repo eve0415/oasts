@@ -1,0 +1,87 @@
+openapi: 3.1.0
+info:
+  title: Composition Identity Probe
+  version: 1.0.0
+paths:
+  /holder:
+    get:
+      operationId: getHolder
+      responses:
+        "200":
+          description: the probe holder
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Holder"
+components:
+  schemas:
+    WidgetMeta:
+      type: object
+      required: [a]
+      properties:
+        a:
+          type: string
+    OtherMeta:
+      type: object
+      required: [b]
+      properties:
+        b:
+          type: string
+    # Reached from nowhere but an `allOf` branch. While `allOf` inlined its `$ref`
+    # members, the pruner kept this component and the emitter wrote its file, but no
+    # emitted file imported it — the orphan the identity-first rendering closes.
+    SoloMeta:
+      type: object
+      required: [s]
+      properties:
+        s:
+          type: string
+    Holder:
+      type: object
+      properties:
+        viaRef:
+          $ref: "#/components/schemas/WidgetMeta"
+        viaOneOf:
+          oneOf:
+            - $ref: "#/components/schemas/WidgetMeta"
+            - $ref: "#/components/schemas/OtherMeta"
+        viaAnyOf:
+          anyOf:
+            - $ref: "#/components/schemas/WidgetMeta"
+            - $ref: "#/components/schemas/OtherMeta"
+        viaAnyOfNull:
+          anyOf:
+            - $ref: "#/components/schemas/WidgetMeta"
+            - type: "null"
+        viaAllOfOne:
+          allOf:
+            - $ref: "#/components/schemas/WidgetMeta"
+        viaAllOfOneDescribed:
+          description: a quoted ref
+          allOf:
+            - $ref: "#/components/schemas/WidgetMeta"
+        viaAllOfTwo:
+          allOf:
+            - $ref: "#/components/schemas/WidgetMeta"
+            - $ref: "#/components/schemas/OtherMeta"
+        viaAllOfMixed:
+          allOf:
+            - $ref: "#/components/schemas/WidgetMeta"
+            - type: object
+              properties:
+                c:
+                  type: string
+        viaAllOfSolo:
+          allOf:
+            - $ref: "#/components/schemas/SoloMeta"
+        viaAllOfInline:
+          allOf:
+            - type: object
+              required: [a]
+              properties:
+                a:
+                  type: string
+            - type: object
+              properties:
+                b:
+                  type: string
