@@ -1028,12 +1028,23 @@ export const cases: readonly ConformanceCase[] = [
     expected: { verdict: "pass" },
   },
   {
-    // One past Number.MAX_SAFE_INTEGER; int64Id carries no minimum/maximum, so int64 is the only
-    // failing keyword.
+    // One past Number.MAX_SAFE_INTEGER is still an int64: the safe-integer boundary is about what a
+    // double can represent exactly, which is a different question from what the format admits. This
+    // row exists because an earlier revision of this vector conflated the two and rejected it.
     id: "format:int64/over-safe-boundary",
     matrixRow: "format:int64",
     validator: "numericValidator",
     input: { int64Id: Number.MAX_SAFE_INTEGER + 1 },
+    expected: { verdict: "pass" },
+  },
+  {
+    // 2^63 is the first value past the signed 64-bit maximum, and a power of two, so the double
+    // holds it exactly — the rejection is the range check, not a rounding artefact. int64Id carries
+    // no minimum/maximum, so int64 is the only failing keyword.
+    id: "format:int64/over-range",
+    matrixRow: "format:int64",
+    validator: "numericValidator",
+    input: { int64Id: 2 ** 63 },
     expected: {
       verdict: "fail",
       issues: [{ message: "out of int64 range", path: ["int64Id"] }],
