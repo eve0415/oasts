@@ -10,7 +10,9 @@
 use foldhash::HashMap;
 use serde_json::Value;
 
-use crate::config::{DateRepresentation, DateTimeRepresentation, ResolvedConfig};
+use crate::config::{
+    DateRepresentation, DateTimeRepresentation, IntegerRepresentation, ResolvedConfig,
+};
 use crate::ir::{AdditionalProperties, Ir, PrimitiveType, SchemaNode, TupleRest};
 
 /// The codec a transform site is compiled against.
@@ -22,6 +24,8 @@ pub enum TransformKind {
     DateTimeInstant,
     /// `format: date` under `types.date: temporal` — a `Temporal.PlainDate`.
     DatePlainDate,
+    /// `format: int64` under `types.integer: bigint` — a JavaScript `bigint`.
+    IntegerBigInt,
 }
 
 impl TransformKind {
@@ -32,6 +36,7 @@ impl TransformKind {
             Self::DateTimeDate => "Date",
             Self::DateTimeInstant => "Temporal.Instant",
             Self::DatePlainDate => "Temporal.PlainDate",
+            Self::IntegerBigInt => "bigint",
         }
     }
 }
@@ -169,6 +174,7 @@ pub struct TransformFacts<'ir> {
     by_pointer: HashMap<(&'ir str, &'ir str), usize>,
     date_time: DateTimeRepresentation,
     date: DateRepresentation,
+    integer: IntegerRepresentation,
 }
 
 impl<'ir> TransformFacts<'ir> {
@@ -200,6 +206,7 @@ impl<'ir> TransformFacts<'ir> {
                 .collect(),
             date_time: config.types.date_time,
             date: config.types.date,
+            integer: config.types.integer,
         };
         if !facts.enabled() {
             return facts;
@@ -237,11 +244,13 @@ impl<'ir> TransformFacts<'ir> {
         facts
     }
 
-    /// Whether any representation is non-`string`. False means nothing transforms anywhere, which
-    /// is the default and the byte-for-byte-unchanged path.
+    /// Whether any representation converts. False is the default and the byte-for-byte-unchanged
+    /// path.
     #[must_use]
     pub fn enabled(&self) -> bool {
-        self.date_time != DateTimeRepresentation::String || self.date != DateRepresentation::String
+        self.date_time != DateTimeRepresentation::String
+            || self.date != DateRepresentation::String
+            || self.integer != IntegerRepresentation::Number
     }
 
     /// Whether any schema in the document reaches a transform.
@@ -269,36 +278,46 @@ impl<'ir> TransformFacts<'ir> {
 
     /// The codec this node is a transform site for, or `None` when it is not one.
     ///
-    /// A site is a plain formatted string. A `format: date-time` on `type: integer` is not one: the
-    /// format annotates a value the type says is not a string. Nor is a string carrying an `enum`
-    /// or `const` — that is a literal union, strictly more precise than a `Date`, and collapsing it
-    /// would lose information the caller already has. Note this is the `Primitive` arm, not
-    /// `Finite`: `type: string` with an `enum` parses to `Primitive` carrying `enum_values`, and
-    /// `Finite` is only ever the typeless enum/const node.
+    /// A date site is a plain formatted string; an integer site is specifically `format: int64`.
+    /// A `format: date-time` on `type: integer` is not one: the format annotates a value the type
+    /// says is not a string. Nor is a primitive carrying an `enum` or `const` — that is a literal
+    /// union, strictly more precise than the representation type, and collapsing it would lose
+    /// information the caller already has. Note this is the `Primitive` arm, not `Finite`: a typed
+    /// enum parses to `Primitive` carrying `enum_values`, and `Finite` is only ever the typeless
+    /// enum/const node.
     #[must_use]
     pub fn site(&self, node: &SchemaNode) -> Option<TransformKind> {
-        let SchemaNode::Primitive {
-            ty: PrimitiveType::String,
-            format: Some(format),
-            enum_values: None,
-            const_value: None,
-            ..
-        } = node
-        else {
-            return None;
-        };
-        match format.as_str() {
-            "date-time" => match self.date_time {
-                DateTimeRepresentation::String => None,
-                DateTimeRepresentation::Date => Some(TransformKind::DateTimeDate),
-                DateTimeRepresentation::Temporal => Some(TransformKind::DateTimeInstant),
+        match node {
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                format: Some(format),
+                enum_values: None,
+                const_value: None,
+                ..
+            } => match format.as_str() {
+                "date-time" => match self.date_time {
+                    DateTimeRepresentation::String => None,
+                    DateTimeRepresentation::Date => Some(TransformKind::DateTimeDate),
+                    DateTimeRepresentation::Temporal => Some(TransformKind::DateTimeInstant),
+                },
+                // RFC 3339 full-time carries a mandatory offset that no Temporal.PlainTime or Date
+                // can represent, so format: time is a wire and application string under every
+                // setting.
+                "date" => match self.date {
+                    DateRepresentation::String => None,
+                    DateRepresentation::Temporal => Some(TransformKind::DatePlainDate),
+                },
+                _ => None,
             },
-            // RFC 3339 full-time carries a mandatory offset that no Temporal.PlainTime or Date can
-            // represent, so format: time is a wire and application string under every setting.
-            "date" => match self.date {
-                DateRepresentation::String => None,
-                DateRepresentation::Temporal => Some(TransformKind::DatePlainDate),
-            },
+            SchemaNode::Primitive {
+                ty: PrimitiveType::Integer,
+                format: Some(format),
+                enum_values: None,
+                const_value: None,
+                ..
+            } if format == "int64" && self.integer == IntegerRepresentation::Bigint => {
+                Some(TransformKind::IntegerBigInt)
+            }
             _ => None,
         }
     }
@@ -695,7 +714,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        DateRepresentation, DateTimeRepresentation, ResolvedConfig, TypesConfig, load_config,
+        DateRepresentation, DateTimeRepresentation, IntegerRepresentation, ResolvedConfig,
+        TypesConfig, load_config,
     };
     use crate::diag::DiagnosticSink;
     use crate::ir::Ir;
@@ -759,6 +779,13 @@ mod tests {
     pub(super) fn date_mode() -> TypesConfig {
         TypesConfig {
             date_time: DateTimeRepresentation::Date,
+            ..TypesConfig::default()
+        }
+    }
+
+    pub(super) fn bigint_mode() -> TypesConfig {
+        TypesConfig {
+            integer: IntegerRepresentation::Bigint,
             ..TypesConfig::default()
         }
     }
@@ -830,6 +857,29 @@ mod tests {
         );
         let computed = fx.facts();
         assert!(!transforms(&fx.ir, &computed, "Pet"));
+        assert!(!computed.any());
+    }
+
+    #[test]
+    fn integer_bigint_selects_only_integer_int64_sites() {
+        let document = doc(json!({
+            "Id": { "type": "integer", "format": "int64" },
+            "Small": { "type": "integer", "format": "int32" },
+            "WrongType": { "type": "string", "format": "int64" }
+        }));
+        let fx = fixture(document.clone(), bigint_mode());
+        let computed = fx.facts();
+        assert_eq!(
+            computed.site(fx.root("Id")).map(TransformKind::ts_type),
+            Some("bigint")
+        );
+        assert!(transforms(&fx.ir, &computed, "Id"));
+        assert_eq!(computed.site(fx.root("Small")), None);
+        assert_eq!(computed.site(fx.root("WrongType")), None);
+
+        let fx = fixture(document, string_mode());
+        let computed = fx.facts();
+        assert_eq!(computed.site(fx.root("Id")), None);
         assert!(!computed.any());
     }
 

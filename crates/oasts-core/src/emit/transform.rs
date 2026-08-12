@@ -877,6 +877,7 @@ fn transform_module_imports() -> BTreeMap<String, BTreeSet<String>> {
             TransformKind::DateTimeDate,
             TransformKind::DateTimeInstant,
             TransformKind::DatePlainDate,
+            TransformKind::IntegerBigInt,
         ] {
             kernel.insert(direction.codec(kind).to_owned());
         }
@@ -1736,6 +1737,8 @@ impl Direction {
             (Self::Encode, TransformKind::DateTimeInstant) => "encodeInstant",
             (Self::Decode, TransformKind::DatePlainDate) => "decodePlainDate",
             (Self::Encode, TransformKind::DatePlainDate) => "encodePlainDate",
+            (Self::Decode, TransformKind::IntegerBigInt) => "decodeInt64",
+            (Self::Encode, TransformKind::IntegerBigInt) => "encodeInt64",
         }
     }
 
@@ -2560,6 +2563,7 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                     self.helpers.insert("isPlainDate");
                     format!("isPlainDate({value})")
                 }
+                TransformKind::IntegerBigInt => format!("typeof {value} === \"bigint\""),
             };
         }
         kind_test(kinds, value)
@@ -3560,7 +3564,9 @@ mod pair_tests {
 
     use super::Diagnostic;
     use super::tests::{compile_document, notice_document};
-    use crate::config::{DateRepresentation, DateTimeRepresentation, ResolvedConfig};
+    use crate::config::{
+        DateRepresentation, DateTimeRepresentation, IntegerRepresentation, ResolvedConfig,
+    };
 
     fn date_mode(config: &mut ResolvedConfig) {
         config.types.date_time = DateTimeRepresentation::Date;
@@ -3569,6 +3575,10 @@ mod pair_tests {
     fn temporal_mode(config: &mut ResolvedConfig) {
         config.types.date_time = DateTimeRepresentation::Temporal;
         config.types.date = DateRepresentation::Temporal;
+    }
+
+    fn bigint_mode(config: &mut ResolvedConfig) {
+        config.types.integer = IntegerRepresentation::Bigint;
     }
 
     /// The emitted pair module for one component, or `None` when the component emits none.
@@ -3675,6 +3685,59 @@ mod pair_tests {
             "{content}"
         );
         assert!(content.contains("decodeInstantBody(value.at"), "{content}");
+    }
+
+    #[test]
+    fn integer_bigint_pairs_call_the_int64_kernel_codecs() {
+        let content = pairs(
+            json!({
+                "Notice": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" }
+                    }
+                }
+            }),
+            "notice",
+            bigint_mode,
+        )
+        .expect("a bigint int64 component emits a pair module");
+        assert!(
+            content.contains("decodeInt64, encodeInt64")
+                && content.contains("from \"../runtime.js\";"),
+            "{content}"
+        );
+        assert!(content.contains("decodeInt64(value.id"), "{content}");
+        assert!(content.contains("encodeInt64(value.id"), "{content}");
+    }
+
+    #[test]
+    fn integer_number_default_emits_no_wire_twin_or_pair() {
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" }
+                    }
+                }
+            })),
+            |_| {},
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let notice = files
+            .iter()
+            .find(|file| file.relative_path == "types/components/notice.ts")
+            .expect("notice type module");
+        assert!(notice.content.contains("id: number;"), "{}", notice.content);
+        assert!(!notice.content.contains("NoticeWire"), "{}", notice.content);
+        assert!(
+            files
+                .iter()
+                .all(|file| file.relative_path != "client/transform/components/notice.ts")
+        );
     }
 
     #[test]
