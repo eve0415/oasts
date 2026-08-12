@@ -34,6 +34,7 @@ const { requests, routes, scriptRoute, requiredRequest } = harness;
 
 let baseUrl: string;
 let temporaryRoot: string;
+let generatedRoot: string;
 let createTransport: ExportedFunction;
 let getLatestCounter: ExportedFunction;
 let recordCounter: ExportedFunction;
@@ -48,7 +49,7 @@ before(async () => {
   const fixtureRoot = path.join(temporaryRoot, "int64-transform-3.1");
   await cp(fixtureSource, fixtureRoot, { recursive: true });
   execFileSync(binary, ["generate"], { cwd: fixtureRoot, stdio: "pipe" });
-  const generatedRoot = path.join(fixtureRoot, "generated");
+  generatedRoot = path.join(fixtureRoot, "generated");
 
   register(new URL("./resolve-generated.mjs", import.meta.url), {
     data: { generatedRootUrl: pathToFileURL(generatedRoot).href },
@@ -152,4 +153,22 @@ test("urlencoded and multipart text fields keep exact bigint digits", async () =
   );
   assert.equal(multipartResult.outcome, 204);
   assert.match(requiredRequest(1).body.toString("utf8"), new RegExp(`\\r\\n${EXACT_DIGITS}\\r\\n`));
+});
+
+test("degraded runtime keeps safe int64 and returns transform failures for unsafe values", () => {
+  const childEnvironment: NodeJS.ProcessEnv = {
+    ...process.env,
+    OASTS_INT64_GENERATED_ROOT: generatedRoot,
+  };
+  delete childEnvironment.NODE_TEST_CONTEXT;
+  const output = execFileSync(
+    process.execPath,
+    ["--test", path.join(import.meta.dirname, "int64-degradation.test.ts")],
+    {
+      encoding: "utf8",
+      env: childEnvironment,
+    },
+  );
+  assert.match(output, /ℹ pass 4/u);
+  assert.match(output, /ℹ fail 0/u);
 });
