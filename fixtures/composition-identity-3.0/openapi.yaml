@@ -1,0 +1,49 @@
+openapi: 3.0.3
+info:
+  title: Composition Identity Probe (3.0 nullable)
+  version: 1.0.0
+paths:
+  /holder:
+    get:
+      operationId: getHolder
+      responses:
+        "200":
+          description: the probe holder
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Holder"
+components:
+  schemas:
+    WidgetMeta:
+      type: object
+      required: [a]
+      properties:
+        a:
+          type: string
+    OtherMeta:
+      type: object
+      required: [b]
+      properties:
+        b:
+          type: string
+    Holder:
+      type: object
+      properties:
+        # `nullable` beside a `$ref`. 3.0 says siblings of `$ref` are ignored, which is
+        # why the `allOf` rows below exist at all — they are the idiom authors are forced
+        # into to say the same thing.
+        viaNullableRef:
+          nullable: true
+          $ref: "#/components/schemas/WidgetMeta"
+        viaNullableAllOfOne:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/WidgetMeta"
+        # Null wraps the whole intersection. Distributing it into the members would give
+        # `(WidgetMeta | null) & (OtherMeta | null)`, which collapses the object half away.
+        viaNullableAllOfTwo:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/WidgetMeta"
+            - $ref: "#/components/schemas/OtherMeta"
