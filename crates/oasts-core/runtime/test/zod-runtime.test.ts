@@ -4,8 +4,12 @@ import { describe, test } from "node:test";
 import { z } from "zod";
 
 import {
+  bigintMaximum,
+  bigintMinimum,
+  bigintMultipleOf,
   codePointLength,
   collect,
+  compareBigIntToNumber,
   conditional,
   constValue,
   contains,
@@ -21,6 +25,7 @@ import {
   integer,
   isDate,
   isDateTime,
+  isBigIntMultipleOf,
   isInt32,
   isInt64,
   isMultipleOf,
@@ -100,6 +105,39 @@ describe("isMultipleOf", () => {
     assert.equal(isMultipleOf(-Number.MIN_VALUE, Number.MIN_VALUE), true);
     assert.equal(isMultipleOf(2 ** 1000, 2 ** 971), true);
     assert.equal(isMultipleOf(2 ** 971, 2 ** 1000), false);
+  });
+});
+
+describe("exact bigint constraints", () => {
+  test("compares integers against binary64 rationals without coercion", () => {
+    assert.equal(compareBigIntToNumber(42n, 42), 0);
+    assert.equal(compareBigIntToNumber(9_007_199_254_740_993n, 9_007_199_254_740_992), 1);
+    assert.equal(compareBigIntToNumber(1n, 1.5), -1);
+  });
+
+  test("evaluates integer and fractional divisors as exact rationals", () => {
+    assert.equal(isBigIntMultipleOf(10n, 2), true);
+    assert.equal(isBigIntMultipleOf(9_007_199_254_740_993n, 2), false);
+    assert.equal(isBigIntMultipleOf(1n << 60n, 2 ** 60), true);
+    assert.equal(isBigIntMultipleOf(1n, 0.5), true);
+    assert.equal(isBigIntMultipleOf(1n, 0.1), false);
+    assert.equal(isBigIntMultipleOf(1n, 0), false);
+  });
+
+  test("reports inclusive and exclusive bounds without narrowing to number", () => {
+    const minimum = z.custom<bigint>().check(bigintMinimum(10, false));
+    const exclusiveMinimum = z.custom<bigint>().check(bigintMinimum(10, true));
+    const maximum = z.custom<bigint>().check(bigintMaximum(20, false));
+    const exclusiveMaximum = z.custom<bigint>().check(bigintMaximum(20, true));
+
+    assert.equal(minimum.safeParse(9n).success, false);
+    assert.equal(minimum.safeParse(10n).success, true);
+    assert.equal(exclusiveMinimum.safeParse(10n).success, false);
+    assert.equal(exclusiveMinimum.safeParse(11n).success, true);
+    assert.equal(maximum.safeParse(21n).success, false);
+    assert.equal(maximum.safeParse(20n).success, true);
+    assert.equal(exclusiveMaximum.safeParse(20n).success, false);
+    assert.equal(exclusiveMaximum.safeParse(19n).success, true);
   });
 });
 
@@ -289,12 +327,25 @@ describe("scalar checks", () => {
   });
 
   test("constrained int64Wire relays the numeric schema verdict", () => {
-    const schema = z.unknown().check(int64Wire(z.number().min(10).max(20)));
+    const schema = z
+      .unknown()
+      .check(
+        int64Wire(
+          z.custom<bigint>().check(bigintMinimum(10, false)).check(bigintMaximum(20, false)),
+        ),
+      );
 
     assert.equal(schema.safeParse(10n).success, true);
     assert.equal(schema.safeParse({ rawJSON: "20" }).success, true);
     assert.equal(schema.safeParse(9n).success, false);
     assert.equal(schema.safeParse({ rawJSON: "21" }).success, false);
+  });
+
+  test("int64Wire evaluates multipleOf before binary64 can round the value", () => {
+    const schema = z.unknown().check(int64Wire(z.custom<bigint>().check(bigintMultipleOf(2))));
+
+    assert.equal(schema.safeParse(9_007_199_254_740_992n).success, true);
+    assert.equal(schema.safeParse(9_007_199_254_740_993n).success, false);
   });
 
   test("enumValues and constValue use deep JSON equality", () => {

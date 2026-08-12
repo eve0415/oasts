@@ -103,5 +103,6 @@ components:
         id:
           type: integer
           format: int64
+          multipleOf: 2
         amount:
           type: number

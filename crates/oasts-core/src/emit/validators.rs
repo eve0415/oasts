@@ -2184,9 +2184,32 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             || constraints.exclusive_maximum.is_some()
             || constraints.multiple_of.is_some()
         {
-            let number = format!("number{index}");
-            self.line(&format!("const {number} = Number({integer});"));
-            self.gen_number_constraints_inner(meta, &number, path, iss);
+            self.gen_bound(
+                constraints,
+                BoundDirection::Lower,
+                &integer,
+                path,
+                iss,
+                true,
+            );
+            self.gen_bound(
+                constraints,
+                BoundDirection::Upper,
+                &integer,
+                path,
+                iss,
+                true,
+            );
+            if let Some(multiple) = &constraints.multiple_of {
+                let literal = render_number_value(multiple);
+                self.scope.runtime_values.insert("isBigIntMultipleOf");
+                self.push_issue(
+                    &format!("!isBigIntMultipleOf({integer}, {literal})"),
+                    path,
+                    iss,
+                    &format!("not a multiple of {literal}"),
+                );
+            }
         }
         self.close_type_gate(meta.nullable, val, path, iss, "integer");
     }
@@ -2282,8 +2305,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         iss: &str,
     ) {
         let constraints = meta.numeric_constraints();
-        self.gen_bound(constraints, BoundDirection::Lower, val, path, iss);
-        self.gen_bound(constraints, BoundDirection::Upper, val, path, iss);
+        self.gen_bound(constraints, BoundDirection::Lower, val, path, iss, false);
+        self.gen_bound(constraints, BoundDirection::Upper, val, path, iss, false);
         if let Some(multiple) = &constraints.multiple_of {
             let literal = render_number_value(multiple);
             self.scope.runtime_values.insert("isMultipleOf");
@@ -2307,6 +2330,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         val: &str,
         path: &str,
         iss: &str,
+        exact_bigint: bool,
     ) {
         let bound = direction.resolve(constraints);
         match bound.exclusive {
@@ -2316,8 +2340,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                     bound.exclusive_comparator,
                     bound.exclusive_message,
                     value,
-                    path,
-                    iss,
+                    (path, iss),
+                    exact_bigint,
                 );
                 if let Some(value) = bound.inclusive {
                     self.emit_threshold(
@@ -2325,8 +2349,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                         bound.inclusive_comparator,
                         bound.inclusive_message,
                         value,
-                        path,
-                        iss,
+                        (path, iss),
+                        exact_bigint,
                     );
                 }
             }
@@ -2339,8 +2363,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                         bound.exclusive_comparator,
                         bound.exclusive_message,
                         value,
-                        path,
-                        iss,
+                        (path, iss),
+                        exact_bigint,
                     );
                 }
             }
@@ -2351,8 +2375,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                         bound.inclusive_comparator,
                         bound.inclusive_message,
                         value,
-                        path,
-                        iss,
+                        (path, iss),
+                        exact_bigint,
                     );
                 }
             }
@@ -2368,16 +2392,18 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         comparator: &str,
         message: &str,
         value: &Number,
-        path: &str,
-        iss: &str,
+        location: (&str, &str),
+        exact_bigint: bool,
     ) {
+        let (path, iss) = location;
         let literal = render_number_value(value);
-        self.push_issue(
-            &format!("{val} {comparator} {literal}"),
-            path,
-            iss,
-            &format!("{message} {literal}"),
-        );
+        let condition = if exact_bigint {
+            self.scope.runtime_values.insert("compareBigIntToNumber");
+            format!("compareBigIntToNumber({val}, {literal}) {comparator} 0")
+        } else {
+            format!("{val} {comparator} {literal}")
+        };
+        self.push_issue(&condition, path, iss, &format!("{message} {literal}"));
     }
 
     /// Splits an object/array/tuple's `enum`/`const` box and generates its finite-value guard —
@@ -5878,7 +5904,15 @@ mod tests {
                     "type": "object",
                     "properties": {
                         "id": { "type": "integer", "format": "int64" },
-                        "step": { "type": "integer", "format": "int64", "multipleOf": 2 }
+                        "step": { "type": "integer", "format": "int64", "multipleOf": 2 },
+                        "bounded": {
+                            "type": "integer",
+                            "format": "int64",
+                            "minimum": 0,
+                            "exclusiveMinimum": 1,
+                            "maximum": 10,
+                            "exclusiveMaximum": 9
+                        }
                     }
                 }
             })),
@@ -5898,13 +5932,26 @@ mod tests {
             "{content}"
         );
         assert!(
-            content.contains("const number3 = Number(integer3);"),
+            content.contains("if (!isBigIntMultipleOf(integer3, 2)) {"),
             "{content}"
         );
         assert!(
-            content.contains("if (!isMultipleOf(number3, 2)) {"),
+            content.contains("compareBigIntToNumber(integer5, 1) <= 0"),
             "{content}"
         );
+        assert!(
+            content.contains("compareBigIntToNumber(integer5, 0) < 0"),
+            "{content}"
+        );
+        assert!(
+            content.contains("compareBigIntToNumber(integer5, 9) >= 0"),
+            "{content}"
+        );
+        assert!(
+            content.contains("compareBigIntToNumber(integer5, 10) > 0"),
+            "{content}"
+        );
+        assert!(!content.contains(" = Number("), "{content}");
         assert!(!content.contains("isInt64(value0)"), "{content}");
     }
 

@@ -208,6 +208,27 @@ test("Zod validation preserves the exact int64 response and request", async () =
   assert.equal(requiredRequest(1).body.toString("utf8"), `{"id":${EXACT_DIGITS}}`);
 });
 
+test("both validator engines reject an unsafe odd bigint under multipleOf 2", async () => {
+  const responseBytes = Buffer.from('{"id":9007199254740993}');
+  scriptRoute("GET", "/counters/latest", {
+    status: 200,
+    headers: [["Content-Type", "application/json"]],
+    body: responseBytes,
+  });
+
+  const generated = requiredRecord(
+    await validatedGetLatestCounter(validatedCreateTransport({ baseUrl }), {}),
+    "generated constrained result",
+  );
+  assert.equal(generated.outcome, "response-validation");
+
+  const zod = requiredRecord(
+    await zodGetLatestCounter(zodCreateTransport({ baseUrl }), {}),
+    "Zod constrained result",
+  );
+  assert.equal(zod.outcome, "response-validation");
+});
+
 test("path, query, header, and content-JSON parameters keep exact bigint digits", async () => {
   scriptRoute("GET", `/counters/${EXACT_DIGITS}?cursor=${EXACT_DIGITS}`, { status: 204 });
   scriptRoute("GET", `/content?filter=${EXACT_DIGITS}`, { status: 204 });

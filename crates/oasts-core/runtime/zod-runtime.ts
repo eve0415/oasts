@@ -187,6 +187,31 @@ export function isMultipleOf(value: number, divisor: number): boolean {
   return numerator % denominator === 0n;
 }
 
+// Exact comparison between an integer and the binary64 rational represented by `other`.
+export function compareBigIntToNumber(value: bigint, other: number): number {
+  const scaled = decompose(other);
+  let scaledInteger = value;
+  let rational = scaled.mantissa;
+  if (scaled.exponent >= 0) {
+    rational <<= BigInt(scaled.exponent);
+  } else {
+    scaledInteger <<= BigInt(-scaled.exponent);
+  }
+  return scaledInteger < rational ? -1 : scaledInteger > rational ? 1 : 0;
+}
+
+// Exact divisibility by the binary64 rational represented by `divisor`. A fractional divisor is
+// valid: the quotient must be an integer under the divisor's exact binary64 value.
+export function isBigIntMultipleOf(value: bigint, divisor: number): boolean {
+  const scaled = decompose(divisor);
+  if (scaled.mantissa === 0n) {
+    return false;
+  }
+  return scaled.exponent >= 0
+    ? value % (scaled.mantissa << BigInt(scaled.exponent)) === 0n
+    : (value << BigInt(-scaled.exponent)) % scaled.mantissa === 0n;
+}
+
 // Count Unicode code points, so an astral character counts as 1 rather than its two UTF-16 units.
 export function codePointLength(s: string): number {
   const iterator = s[Symbol.iterator]();
@@ -351,6 +376,38 @@ export function multipleOf(divisor: number): Check<number> {
   };
 }
 
+export function bigintMinimum(bound: number, exclusive: boolean): Check<bigint> {
+  return (payload) => {
+    const comparison = compareBigIntToNumber(payload.value, bound);
+    if (comparison < 0 || (exclusive && comparison === 0)) {
+      report(
+        payload,
+        exclusive ? `not greater than exclusiveMinimum ${bound}` : `less than minimum ${bound}`,
+      );
+    }
+  };
+}
+
+export function bigintMaximum(bound: number, exclusive: boolean): Check<bigint> {
+  return (payload) => {
+    const comparison = compareBigIntToNumber(payload.value, bound);
+    if (comparison > 0 || (exclusive && comparison === 0)) {
+      report(
+        payload,
+        exclusive ? `not less than exclusiveMaximum ${bound}` : `greater than maximum ${bound}`,
+      );
+    }
+  };
+}
+
+export function bigintMultipleOf(divisor: number): Check<bigint> {
+  return (payload) => {
+    if (!isBigIntMultipleOf(payload.value, divisor)) {
+      report(payload, `not a multiple of ${divisor}`);
+    }
+  };
+}
+
 export function stringFormat(predicate: (s: string) => boolean, name: string): Check<string> {
   return (payload) => {
     if (!predicate(payload.value)) {
@@ -381,7 +438,7 @@ export function int64Wire(schema?: Schema): Check<unknown> {
     if (normalized === null) {
       report(payload, "expected type integer");
     } else if (schema !== undefined) {
-      relay(payload, schema.safeParse(Number(normalized)));
+      relay(payload, schema.safeParse(normalized));
     }
   };
 }
