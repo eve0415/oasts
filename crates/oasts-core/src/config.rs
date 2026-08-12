@@ -1388,6 +1388,14 @@ pub fn resolve_config(
             Some("/types"),
         ));
     }
+    if types.integer == IntegerRepresentation::Bigint && artifact_states.tanstack.enabled {
+        sink.push(config_error(
+            CODE_DATE_REPRESENTATION,
+            "types.integer 'bigint' is incompatible with TanStack query keys because their default JSON serialization rejects bigint values",
+            Some(source_path),
+            Some("/types/integer"),
+        ));
+    }
 
     let naming = raw.naming.unwrap_or_default();
     validate_naming(&naming, source_path, &mut sink);
@@ -3764,6 +3772,18 @@ mod tests {
         let mut value = valid_json_value();
         value["types"] = json!({ "integer": "bigint" });
         assert_code(load_json(&value), CODE_DATE_REPRESENTATION);
+    }
+
+    #[test]
+    fn bigint_integer_with_tanstack_is_rule_13() {
+        let mut value = valid_client_json_value();
+        value["artifacts"] = json!({ "types": true, "client": true, "tanstack": true });
+        value["types"] = json!({ "integer": "bigint" });
+        let diagnostics = assert_code(load_json(&value), CODE_DATE_REPRESENTATION);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("TanStack query keys")
+                && diagnostic.json_pointer.as_deref() == Some("/types/integer")
+        }));
     }
 
     #[test]
