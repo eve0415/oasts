@@ -12,6 +12,10 @@ import {
   type ResponsePlan,
 } from "../transport.ts";
 
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function responsePlan(overrides: Partial<ResponsePlan> = {}): ResponsePlan {
   return {
     match: "200",
@@ -143,6 +147,90 @@ describe("response matching and decoding", () => {
     assert.deepEqual(isDocumented(error) && !error.ok ? error.error : undefined, {
       message: "bad",
     });
+  });
+
+  test("decodes unsafe integer tokens losslessly only on a marked JSON body", async () => {
+    const body =
+      '{"id":12345678901234567890,"nested":[-12345678901234567890],"safe":42,"safeDecimal":42.0,"safeExponent":42e0,"float":9007199254740992.5,"fractionalExponent":9007199254740993e-1,"tiny":1e-999,"zeroTiny":0e-999,"tooLarge":1e99999999999999999999,"decimal":9007199254740993.0,"exponent":9007199254740993e0,"positiveExponent":9007199254740993E+2,"negative":-9007199254740993.0,"contracted":900719925474099300e-2,"expanded":900719925474099.3e1,"other":9007199254740993}';
+    const marked = await callWith(
+      new Response(body, { headers: { "Content-Type": "application/json" } }),
+      operation({
+        responses: [
+          responsePlan({
+            media: [
+              ["application/json", { json: "int64", revive: (_value, lossless) => lossless }],
+            ],
+          }),
+        ],
+      }),
+    );
+    const ordinary = await callWith(
+      new Response(body, { headers: { "Content-Type": "application/json" } }),
+    );
+
+    assert.ok(isDocumented(marked) && marked.ok);
+    if (isDocumented(marked) && marked.ok) {
+      assert.deepEqual(marked.data, {
+        id: 12345678901234567890n,
+        nested: [-12345678901234567890n],
+        safe: 42,
+        safeDecimal: 42,
+        safeExponent: 42,
+        float: Number("9007199254740992.5"),
+        fractionalExponent: Number("9007199254740993e-1"),
+        tiny: Number("1e-999"),
+        zeroTiny: 0,
+        tooLarge: Number("1e99999999999999999999"),
+        decimal: 9007199254740993n,
+        exponent: 9007199254740993n,
+        positiveExponent: 900719925474099300n,
+        negative: -9007199254740993n,
+        contracted: 9007199254740993n,
+        expanded: 9007199254740993n,
+        other: 9007199254740993n,
+      });
+    }
+    assert.ok(isDocumented(ordinary) && ordinary.ok);
+    if (isDocumented(ordinary) && ordinary.ok) {
+      const data = ordinary.data;
+      assert.equal(isRecord(data) ? typeof data.id : "missing", "number");
+    }
+  });
+
+  test("keeps unrelated unsafe integer fields on their declared number surface", async () => {
+    const result = await callWith(
+      new Response('{"id":9007199254740993,"amount":9007199254740995}', {
+        headers: { "Content-Type": "application/json" },
+      }),
+      operation({
+        responses: [
+          responsePlan({
+            media: [
+              [
+                "application/json",
+                {
+                  json: "int64",
+                  revive: (value, lossless) => {
+                    if (!isRecord(value) || !isRecord(lossless)) {
+                      return value;
+                    }
+                    return { ...value, id: lossless.id };
+                  },
+                },
+              ],
+            ],
+          }),
+        ],
+      }),
+    );
+
+    assert.ok(isDocumented(result) && result.ok);
+    if (isDocumented(result) && result.ok) {
+      assert.deepEqual(result.data, {
+        id: 9_007_199_254_740_993n,
+        amount: Number("9007199254740995"),
+      });
+    }
   });
 
   test("accepts null and zero-byte bodies on no-payload branches", async () => {

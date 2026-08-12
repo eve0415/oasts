@@ -169,6 +169,21 @@ generate_and_verify builtin-name-shadow-3.0 oasts-client.yaml "$work/client-buil
 # import walk used to leave behind; the 3.0 row exists for `nullable`, which 3.1 does not have.
 generate_and_verify composition-identity-3.1 oasts.yaml "$work/composition-identity-3.1" types "composition-identity-3.1"
 generate_and_verify composition-identity-3.0 oasts.yaml "$work/composition-identity-3.0" types "composition-identity-3.0"
+# Each schema-fidelity compile assertion consumes all three config outputs. The shared helper keeps
+# every config isolated for its own consumer matrix and repeat-generation diff; the two links then
+# assemble those verified trees beside the default one without generating a fourth time.
+for fidelity in schema-fidelity-3.1 schema-fidelity-3.0; do
+  generate_and_verify "$fidelity" oasts.yaml "$work/$fidelity" types "$fidelity (default)"
+  generate_and_verify "$fidelity" oasts-tagged.yaml "$work/$fidelity-tagged" types \
+    "$fidelity (tagged)"
+  generate_and_verify "$fidelity" oasts-bigint.yaml "$work/$fidelity-bigint" client \
+    "$fidelity (bigint)"
+  ln -s "$work/$fidelity-tagged/generated-tagged" "$work/$fidelity/generated-tagged"
+  ln -s "$work/$fidelity-bigint/generated-bigint" "$work/$fidelity/generated-bigint"
+  pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext \
+    --moduleResolution bundler "$work/$fidelity/compile-assert/cases.ts"
+  echo "compile-assert matrix ok: $fidelity"
+done
 generate_and_verify defs-entry-3.1 oasts.yaml "$work/defs-entry-3.1" types "defs-entry-3.1"
 generate_and_verify empty-enum-3.1 oasts.yaml "$work/empty-enum-3.1" types "empty-enum-3.1"
 generate_and_verify document-root-ref-3.1 oasts.yaml "$work/document-root-ref-3.1" types "document-root-ref-3.1"
@@ -217,6 +232,9 @@ for transform_config in oasts-date oasts-date-validated oasts-temporal oasts-pla
   generate_and_verify transform-showcase-3.1 "$transform_config.yaml" \
     "$work/transform-$transform_config" transform "transform-showcase-3.1 ($transform_config)"
 done
+generate_and_verify int64-transform-3.1 oasts.yaml "$work/int64-transform" transform "int64-transform-3.1"
+generate_and_verify int64-transform-3.1 oasts-validated.yaml "$work/int64-transform-validated" transform "int64-transform-3.1 (validated)"
+generate_and_verify int64-transform-3.1 oasts-zod.yaml "$work/int64-transform-zod" transform "int64-transform-3.1 (zod)" link
 
 # The `allOf` merges whose branches name a converting component. Only tsc over the emitted tree
 # decides these: both surfaces of a merged object have to assign, and a merge that writes one key

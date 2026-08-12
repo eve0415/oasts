@@ -5,16 +5,20 @@ import { describe, test } from "node:test";
 import { TransformError } from "../result.ts";
 import {
   decodeDateTimeDate,
+  decodeInt64,
   guarded,
   decodeInstant,
   decodePlainDate,
   encodeDateTimeDate,
+  encodeInt64,
   encodeInstant,
   encodePlainDate,
   isInstant,
   isPlainDate,
+  losslessInt64,
   omit,
   pushPath,
+  withLosslessJson,
 } from "../transform-runtime.ts";
 import {
   CANONICAL_DATE_TIME,
@@ -92,6 +96,45 @@ describe("pushPath", () => {
   });
 });
 
+describe("lossless JSON paths", () => {
+  test("reads exact integer values only from the active schema path", () => {
+    const exact = { pets: [{ bornAt: 9_007_199_254_740_993n }] };
+
+    assert.equal(
+      withLosslessJson(exact, () => losslessInt64(PATH)),
+      9_007_199_254_740_993n,
+    );
+    assert.equal(
+      withLosslessJson(42, () => losslessInt64([])),
+      42,
+    );
+  });
+
+  test("restores an outer exact document after a nested walk", () => {
+    assert.equal(
+      withLosslessJson({ id: 1n }, () => {
+        assert.equal(
+          withLosslessJson({ id: 2n }, () => losslessInt64(["id"])),
+          2n,
+        );
+        return losslessInt64(["id"]);
+      }),
+      1n,
+    );
+  });
+
+  test("rejects paths that do not select an integer", () => {
+    assert.throws(
+      () => withLosslessJson(42n, () => losslessInt64(["missing"])),
+      /path does not exist/u,
+    );
+    assert.throws(
+      () => withLosslessJson({ value: "42" }, () => losslessInt64(["value"])),
+      /path is not an integer/u,
+    );
+  });
+});
+
 describe("omit", () => {
   test("removes one key without mutating the source", () => {
     const source = { a: 1, b: "two", c: true };
@@ -104,6 +147,56 @@ describe("omit", () => {
     const result = omit(source, "b");
     assert.deepEqual(result, { a: 1 });
     assert.equal("b" in result, false);
+  });
+});
+
+describe("integer: bigint", () => {
+  test("decodes every lossless wire shape to bigint", () => {
+    assert.equal(decodeInt64(42, POINTER, PATH), 42n);
+    assert.equal(decodeInt64(12345678901234567890n, POINTER, PATH), 12345678901234567890n);
+  });
+
+  test("decodes the raw JSON token produced by the encoder", () => {
+    for (const value of [42n, 12345678901234567890n]) {
+      assert.equal(decodeInt64(encodeInt64(value, POINTER, PATH), POINTER, PATH), value);
+    }
+  });
+
+  test("rejects malformed raw JSON values", () => {
+    for (const value of [null, {}, { rawJSON: "01" }, { rawJSON: "1.5" }, { rawJSON: "1e3" }]) {
+      assertRejects(
+        () => Reflect.apply(decodeInt64, undefined, [value, POINTER, PATH]),
+        "invalid-wire-value",
+        "response",
+        "malformed raw JSON value",
+      );
+    }
+  });
+
+  test("rejects a rounded wire number", () => {
+    assertRejects(
+      () => decodeInt64(Number.MAX_SAFE_INTEGER + 1, POINTER, PATH),
+      "invalid-wire-value",
+      "response",
+      "rounded int64 wire number",
+    );
+  });
+
+  test("rejects a non-bigint application value at the runtime boundary", () => {
+    assertRejects(
+      () => Reflect.apply(encodeInt64, undefined, [42, POINTER, PATH]),
+      "invalid-application-value",
+      "request",
+      "non-bigint application value",
+    );
+  });
+
+  test("encodes exact unquoted digits at any JSON depth", () => {
+    const encoded = encodeInt64(12345678901234567890n, POINTER, PATH);
+    assert.equal(
+      JSON.stringify({ outer: { list: [encoded, 7] } }),
+      '{"outer":{"list":[12345678901234567890,7]}}',
+    );
   });
 });
 

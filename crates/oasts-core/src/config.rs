@@ -612,6 +612,33 @@ pub enum DateRepresentation {
     Temporal,
 }
 
+/// How a `oneOf` carrying a `discriminator` is shaped. `structural` emits `Cat | Dog` and lets the
+/// discriminator drive diagnostics only; `tagged` intersects each branch with the tag it proves,
+/// `(Cat & { petType: "feline" }) | (Dog & { petType: "canine" })`, so TypeScript can narrow it.
+///
+/// Doc comments belong on the enum, not its variants: a variant description makes `schemars` emit a
+/// named `oneOf` rather than a plain `enum`, and the config-surface generator has no alias form for
+/// that — the emitted `config.ts` would reference a type it never declares.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum IntegerRepresentation {
+    #[default]
+    Number,
+    Bigint,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
+pub enum DiscriminatedUnions {
+    #[default]
+    Structural,
+    Tagged,
+}
+
 /// Type artifact options with schema defaults applied during deserialization.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -627,6 +654,8 @@ pub struct TypesConfig {
     pub enum_extensions: EnumExtensions,
     pub date_time: DateTimeRepresentation,
     pub date: DateRepresentation,
+    pub discriminated_unions: DiscriminatedUnions,
+    pub integer: IntegerRepresentation,
     pub readonly: bool,
 }
 
@@ -1348,14 +1377,23 @@ pub fn resolve_config(
     // The codecs are emitted under the client artifact and only run at client pipeline positions,
     // so a transforming representation without the client artifact has nowhere to bind.
     if (types.date_time != DateTimeRepresentation::String
-        || types.date != DateRepresentation::String)
+        || types.date != DateRepresentation::String
+        || types.integer != IntegerRepresentation::Number)
         && !artifact_states.client.enabled
     {
         sink.push(config_error(
             CODE_DATE_REPRESENTATION,
-            "non-string dateTime/date representations require the client artifact",
+            "non-string dateTime/date and bigint integer representations require the client artifact",
             Some(source_path),
             Some("/types"),
+        ));
+    }
+    if types.integer == IntegerRepresentation::Bigint && artifact_states.tanstack.enabled {
+        sink.push(config_error(
+            CODE_DATE_REPRESENTATION,
+            "types.integer 'bigint' is incompatible with TanStack query keys because their default JSON serialization rejects bigint values",
+            Some(source_path),
+            Some("/types/integer"),
         ));
     }
 
@@ -3730,6 +3768,25 @@ mod tests {
     }
 
     #[test]
+    fn bigint_integer_without_client_is_rule_13() {
+        let mut value = valid_json_value();
+        value["types"] = json!({ "integer": "bigint" });
+        assert_code(load_json(&value), CODE_DATE_REPRESENTATION);
+    }
+
+    #[test]
+    fn bigint_integer_with_tanstack_is_rule_13() {
+        let mut value = valid_client_json_value();
+        value["artifacts"] = json!({ "types": true, "client": true, "tanstack": true });
+        value["types"] = json!({ "integer": "bigint" });
+        let diagnostics = assert_code(load_json(&value), CODE_DATE_REPRESENTATION);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("TanStack query keys")
+                && diagnostic.json_pointer.as_deref() == Some("/types/integer")
+        }));
+    }
+
+    #[test]
     fn non_string_dates_with_client_resolve() {
         for (types, expected_date_time, expected_date) in [
             (
@@ -3917,6 +3974,36 @@ mod tests {
             value["types"] = json!({ "enumExtensions": extensions });
             load_json(&value).expect("enumExtensions value should parse");
         }
+    }
+
+    #[test]
+    fn discriminated_unions_defaults_to_structural_and_accepts_tagged() {
+        let resolved = load_json(&valid_json_value()).expect("default config should resolve");
+        assert_eq!(
+            resolved.types.discriminated_unions,
+            DiscriminatedUnions::Structural
+        );
+
+        let mut tagged = valid_json_value();
+        tagged["types"] = json!({ "discriminatedUnions": "tagged" });
+        let resolved =
+            load_json(&tagged).expect("tagged discriminated union representation should resolve");
+        assert_eq!(
+            resolved.types.discriminated_unions,
+            DiscriminatedUnions::Tagged
+        );
+    }
+
+    #[test]
+    fn integer_defaults_to_number_and_accepts_bigint() {
+        let resolved = load_json(&valid_json_value()).expect("default config should resolve");
+        assert_eq!(resolved.types.integer, IntegerRepresentation::Number);
+
+        let mut value = valid_client_json_value();
+        value["types"] = json!({ "integer": "bigint" });
+        let resolved = load_json(&value)
+            .expect("bigint integer representation should resolve with the client");
+        assert_eq!(resolved.types.integer, IntegerRepresentation::Bigint);
     }
 
     #[test]

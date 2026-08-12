@@ -187,6 +187,31 @@ export function isMultipleOf(value: number, divisor: number): boolean {
   return numerator % denominator === 0n;
 }
 
+// Exact comparison between an integer and the binary64 rational represented by `other`.
+export function compareBigIntToNumber(value: bigint, other: number): number {
+  const scaled = decompose(other);
+  let scaledInteger = value;
+  let rational = scaled.mantissa;
+  if (scaled.exponent >= 0) {
+    rational <<= BigInt(scaled.exponent);
+  } else {
+    scaledInteger <<= BigInt(-scaled.exponent);
+  }
+  return scaledInteger < rational ? -1 : scaledInteger > rational ? 1 : 0;
+}
+
+// Exact divisibility by the binary64 rational represented by `divisor`. A fractional divisor is
+// valid: the quotient must be an integer under the divisor's exact binary64 value.
+export function isBigIntMultipleOf(value: bigint, divisor: number): boolean {
+  const scaled = decompose(divisor);
+  if (scaled.mantissa === 0n) {
+    return false;
+  }
+  return scaled.exponent >= 0
+    ? value % (scaled.mantissa << BigInt(scaled.exponent)) === 0n
+    : (value << BigInt(-scaled.exponent)) % scaled.mantissa === 0n;
+}
+
 // Count Unicode code points, so an astral character counts as 1 rather than its two UTF-16 units.
 export function codePointLength(s: string): number {
   const iterator = s[Symbol.iterator]();
@@ -282,6 +307,25 @@ export function isInt32(v: number): boolean {
   return Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
 }
 
+const INT64_WIRE_INTEGER = /^-?(?:0|[1-9]\d*)$/;
+
+export function int64WireValue(value: unknown): bigint | null {
+  if (typeof value === "bigint") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value)) {
+    return BigInt(value);
+  }
+  if (
+    isRecord(value) &&
+    typeof value.rawJSON === "string" &&
+    INT64_WIRE_INTEGER.test(value.rawJSON)
+  ) {
+    return BigInt(value.rawJSON);
+  }
+  return null;
+}
+
 // --- scalar checks -------------------------------------------------------------------------------
 
 // The contract's integer domain: any finite number that is a whole number. Wider than zod's
@@ -327,6 +371,38 @@ export function multipleOf(divisor: number): Check<number> {
   };
 }
 
+export function bigintMinimum(bound: number, exclusive: boolean): Check<bigint> {
+  return (payload) => {
+    const comparison = compareBigIntToNumber(payload.value, bound);
+    if (comparison < 0 || (exclusive && comparison === 0)) {
+      report(
+        payload,
+        exclusive ? `not greater than exclusiveMinimum ${bound}` : `less than minimum ${bound}`,
+      );
+    }
+  };
+}
+
+export function bigintMaximum(bound: number, exclusive: boolean): Check<bigint> {
+  return (payload) => {
+    const comparison = compareBigIntToNumber(payload.value, bound);
+    if (comparison > 0 || (exclusive && comparison === 0)) {
+      report(
+        payload,
+        exclusive ? `not less than exclusiveMaximum ${bound}` : `greater than maximum ${bound}`,
+      );
+    }
+  };
+}
+
+export function bigintMultipleOf(divisor: number): Check<bigint> {
+  return (payload) => {
+    if (!isBigIntMultipleOf(payload.value, divisor)) {
+      report(payload, `not a multiple of ${divisor}`);
+    }
+  };
+}
+
 export function stringFormat(predicate: (s: string) => boolean, name: string): Check<string> {
   return (payload) => {
     if (!predicate(payload.value)) {
@@ -339,6 +415,19 @@ export function int32(): Check<number> {
   return (payload) => {
     if (!isInt32(payload.value)) {
       report(payload, "out of int32 range");
+    }
+  };
+}
+
+export function int64Wire(schema?: Schema): Check<unknown> {
+  return (payload) => {
+    const normalized = int64WireValue(payload.value);
+    if (normalized === null) {
+      report(payload, "expected type integer");
+    } else if (normalized < -9223372036854775808n || normalized >= 9223372036854775808n) {
+      report(payload, "out of int64 range");
+    } else if (schema !== undefined) {
+      relay(payload, schema.safeParse(normalized));
     }
   };
 }

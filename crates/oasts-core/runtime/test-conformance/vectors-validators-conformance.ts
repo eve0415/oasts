@@ -1017,6 +1017,14 @@ export const cases: readonly ConformanceCase[] = [
     },
   },
 
+  // --- format:int64 (numericValidator) ---
+  {
+    id: "format:int64/max-safe-boundary",
+    matrixRow: "format:int64",
+    validator: "numericValidator",
+    input: { int64Id: Number.MAX_SAFE_INTEGER },
+    expected: { verdict: "pass" },
+  },
   // --- patternProperties (patternBagValidator) ---
   {
     id: "patternProperties/declared-and-pattern-keys-valid",

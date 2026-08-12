@@ -2,7 +2,7 @@
 // the Rust embedding engine preserves this exact order when emitting any helper subset.
 
 //#region oxs:core
-export type ParamPrimitive = string | number | boolean;
+export type ParamPrimitive = string | number | boolean | bigint;
 export type ParamValue =
   | ParamPrimitive
   | readonly ParamPrimitive[]

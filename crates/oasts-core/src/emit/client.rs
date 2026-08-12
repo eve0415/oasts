@@ -19,6 +19,7 @@ use crate::ir::{
 };
 use crate::media::media_essence;
 use crate::response_media::StreamKind;
+use crate::transform::TransformKind;
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 use super::model::EmissionModel;
@@ -314,7 +315,7 @@ fn emit_operation(
     let stem = uppercase_first(allocated_name);
     let transforming = model.transform_facts().enabled();
     let conversions = response_conversions(model, plan, &stem);
-    let response_transforms = response_transform_bindings(plan, &stem, &conversions);
+    let response_transforms = response_transform_bindings(model, plan, &stem, &conversions);
     let request_transforms = request_transform_binding(model, plan);
     // The object the request actually dispatches, named once: the validators read it and `execute`
     // receives it, and two spellings of the same choice would disagree as an undeclared binding in
@@ -362,6 +363,14 @@ fn emit_operation(
                 TypeAxis::Application,
                 &mut component_imports,
             );
+            if request_transforms && parameter_transforms(model, parameter) {
+                renderer.collect_operation_imports(
+                    &parameter.schema,
+                    TypePosition::Request,
+                    TypeAxis::Wire,
+                    &mut component_imports,
+                );
+            }
         }
         if let Some(body) = &plan.body_plan {
             collect_body_imports(
@@ -703,6 +712,11 @@ fn emit_operation(
         .iter()
         .map(|transform| transform.decoder.clone())
         .chain(
+            response_transforms
+                .iter()
+                .filter_map(|transform| transform.reviver.clone()),
+        )
+        .chain(
             event_checks
                 .iter()
                 .filter_map(|check| check.pair.as_ref())
@@ -779,6 +793,7 @@ fn emit_operation(
         plan,
         allocated_name,
         &event_checks,
+        &response_transforms,
     );
     output.push('\n');
 
@@ -903,6 +918,8 @@ struct ResponseTransform {
     content_type: Option<String>,
     /// The emitted codec this branch calls, from the operation's own transform module.
     decoder: String,
+    /// The path-scoped exact-integer revival this JSON entry hands to the transport.
+    reviver: Option<String>,
     /// Which field carries the payload — `default` spans both, so `result.ok` picks at runtime.
     body: ResponseBody,
 }
@@ -1083,9 +1100,41 @@ pub(super) fn request_transform_binding(
     if !model.transform_facts().enabled() {
         return false;
     }
-    plan.param_plans.iter().any(|parameter| {
-        !parameter.caller_serialized && model.transform_facts().reaches(&parameter.schema)
-    }) || request_body_transforms(model, plan.body_plan.as_ref())
+    plan.param_plans
+        .iter()
+        .any(|parameter| parameter_transforms(model, parameter))
+        || request_body_transforms(model, plan.body_plan.as_ref())
+}
+
+pub(super) fn reaches_non_integer_transform(
+    model: &EmissionModel<'_, '_>,
+    schema: &SchemaNode,
+) -> bool {
+    [
+        TransformKind::DateTimeDate,
+        TransformKind::DateTimeInstant,
+        TransformKind::DatePlainDate,
+    ]
+    .into_iter()
+    .any(|kind| model.transform_facts().reaches_kind(schema, kind))
+}
+
+pub(super) fn parameter_transforms(
+    model: &EmissionModel<'_, '_>,
+    parameter: &ParameterPlan,
+) -> bool {
+    if parameter.caller_serialized {
+        return false;
+    }
+    if parameter_encodes_int64(parameter) {
+        model.transform_facts().reaches(&parameter.schema)
+    } else {
+        reaches_non_integer_transform(model, &parameter.schema)
+    }
+}
+
+pub(super) fn parameter_encodes_int64(parameter: &ParameterPlan) -> bool {
+    parameter.resolved.helper.is_content_json()
 }
 
 /// Whether a request body carries an application value the operation encoder converts.
@@ -1112,10 +1161,27 @@ pub(super) fn request_body_transforms(
 
 /// Whether one rendered form field carries its schema value rather than a binary upload handle.
 pub(super) fn form_field_transforms(model: &EmissionModel<'_, '_>, field: &FormFieldPlan) -> bool {
-    !field.is_binary_upload() && model.transform_facts().reaches(&field.schema)
+    if field.is_binary_upload() {
+        return false;
+    }
+    if form_field_encodes_int64(field) {
+        model.transform_facts().reaches(&field.schema)
+    } else {
+        reaches_non_integer_transform(model, &field.schema)
+    }
+}
+
+pub(super) fn form_field_encodes_int64(field: &FormFieldPlan) -> bool {
+    field.serialization.content_media().is_some_and(|media| {
+        media
+            .payloads
+            .iter()
+            .all(|payload| *payload == PayloadKind::Json)
+    })
 }
 
 fn response_transform_bindings(
+    model: &EmissionModel<'_, '_>,
     plan: &OperationPlan,
     stem: &str,
     conversions: &[ResponseConversion],
@@ -1126,10 +1192,14 @@ fn response_transform_bindings(
         let body = response_body_side(response.kind, &response.match_key);
         match conversion {
             ResponseConversion::None => {}
-            ResponseConversion::Whole(_) => bindings.push(ResponseTransform {
+            ResponseConversion::Whole(index) => bindings.push(ResponseTransform {
                 outcome,
                 content_type: None,
                 decoder: format!("decode{}", response_type_name(stem, response)),
+                reviver: model
+                    .transform_facts()
+                    .reaches_kind(&response.media[*index].schema, TransformKind::IntegerBigInt)
+                    .then(|| format!("revive{}", response_type_name(stem, response))),
                 body,
             }),
             ResponseConversion::PerEntry(entries) => {
@@ -1140,6 +1210,13 @@ fn response_transform_bindings(
                         outcome: outcome.clone(),
                         content_type: Some(response.media[entry.index].media.clone()),
                         decoder: format!("decode{}", entry.name),
+                        reviver: model
+                            .transform_facts()
+                            .reaches_kind(
+                                &response.media[entry.index].schema,
+                                TransformKind::IntegerBigInt,
+                            )
+                            .then(|| format!("revive{}", entry.name)),
                         body,
                     });
                 }
@@ -2128,10 +2205,17 @@ fn render_input(
                 // pre-serialized wire string rather than the declared schema (OASTS1443).
                 output.push_str("string");
             } else {
+                let parameter_axis = if axis == TypeAxis::Wire
+                    && !parameter_transforms(renderer.model, parameter_plan)
+                {
+                    TypeAxis::Application
+                } else {
+                    axis
+                };
                 output.push_str(&renderer.render_type(
                     &parameter_plan.schema,
                     TypePosition::Request,
-                    axis,
+                    parameter_axis,
                     4,
                 ));
             }
@@ -2307,12 +2391,17 @@ fn render_form_field_input(
     indent: usize,
     axis: TypeAxis,
 ) -> String {
+    let field_axis = if axis == TypeAxis::Wire && !form_field_transforms(renderer.model, field) {
+        TypeAxis::Application
+    } else {
+        axis
+    };
     let body = match &field.serialization {
         FieldSerializationPlan::Content { media, .. } if media.binary_upload => {
             "Blob | File".to_owned()
         }
         FieldSerializationPlan::Style { .. } | FieldSerializationPlan::Content { .. } => {
-            renderer.render_type(&field.schema, TypePosition::Request, axis, indent)
+            renderer.render_type(&field.schema, TypePosition::Request, field_axis, indent)
         }
     };
     if !field.wrapper.wrapped {
@@ -2830,6 +2919,7 @@ fn write_descriptor(
     plan: &OperationPlan,
     allocated_name: &str,
     event_checks: &[EventCheck],
+    response_transforms: &[ResponseTransform],
 ) {
     output.push_str("const descriptor: OperationDescriptor = {\n  operationId: ");
     output.push_str(&render_ts_string(
@@ -2957,10 +3047,29 @@ fn write_descriptor(
                                 && check.media_index == media_index
                         })
                         .map(|check| check.function.as_str());
+                    let lossless_int64 = !bodyless
+                        && media.decoder == DecoderClass::Json
+                        && model
+                            .transform_facts()
+                            .reaches_kind(&media.schema, TransformKind::IntegerBigInt);
+                    let outcome = outcome_literal(response);
+                    let reviver = lossless_int64.then(|| {
+                        response_transforms
+                            .iter()
+                            .find(|transform| {
+                                transform.outcome == outcome
+                                    && transform
+                                        .content_type
+                                        .as_deref()
+                                        .is_none_or(|content_type| content_type == media.media)
+                            })
+                            .and_then(|transform| transform.reviver.as_deref())
+                            .expect("an int64 JSON response has a path-scoped reviver")
+                    });
                     format!(
                         "[{}, {}]",
                         render_ts_string(&media.media),
-                        render_response_decoder(media, on_event)
+                        render_response_decoder(media, on_event, reviver)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -3700,7 +3809,11 @@ fn style_name(style: ParamStyle) -> &'static str {
 /// and for multipart the decoder function itself alongside its plan. Shipping the function through
 /// the descriptor rather than tagging it is what keeps the parser out of every other client — the
 /// transport never names it, so nothing but a multipart operation module pulls it in.
-fn render_response_decoder(media: &ResponseMediaPlan, on_event: Option<&str>) -> String {
+fn render_response_decoder(
+    media: &ResponseMediaPlan,
+    on_event: Option<&str>,
+    int64_reviver: Option<&str>,
+) -> String {
     // A streaming entry ships its reader the same way, and for the same reason: the transport never
     // names the SSE parser, so only an operation that declares one links it. `onEvent` is the
     // per-event validate-and-convert pipeline; it is null until a later step binds one, and the
@@ -3714,6 +3827,9 @@ fn render_response_decoder(media: &ResponseMediaPlan, on_event: Option<&str>) ->
         }
         DecoderClass::StreamingRaw => return format!("{{ raw: {RAW_STREAM_READER} }}"),
         _ => {}
+    }
+    if let Some(reviver) = int64_reviver {
+        return format!("{{ json: \"int64\", revive: {reviver} }}");
     }
     let Some(plan) = &media.multipart else {
         return render_ts_string(decoder_name(media.decoder));
@@ -3989,6 +4105,14 @@ mod tests {
         document: Value,
         validate: bool,
     ) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
+        emit_files_with_types(document, validate, json!({ "dateTime": "date" }))
+    }
+
+    fn emit_files_with_types(
+        document: Value,
+        validate: bool,
+        types: Value,
+    ) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("openapi.json"),
@@ -4004,7 +4128,7 @@ mod tests {
                 "authEnforcement": "types",
                 "baseUrl": { "source": "literal", "value": "https://api.example.test/v1" }
             },
-            "types": { "dateTime": "date" },
+            "types": types,
             "validation": if validate {
                 json!({ "engine": "generated", "request": true, "response": true, "unchecked": "allow" })
             } else {
@@ -4059,6 +4183,101 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn transforming_int64_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "T", "version": "1.0.0" },
+            "paths": {
+                "/counters": {
+                    "get": {
+                        "operationId": "readCounter",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "required": ["id"],
+                                            "properties": {
+                                                "id": { "type": "integer", "format": "int64" }
+                                            }
+                                        }
+                                    },
+                                    "text/plain": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn only_an_int64_bigint_response_marks_its_json_decoder_lossless() {
+        let (files, diagnostics) = emit_files_with_types(
+            transforming_int64_document(),
+            false,
+            json!({ "integer": "bigint" }),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let bigint = operation_file(&files, "readcounter");
+        assert!(
+            bigint.contains("media: [[\"application/json\", { json: \"int64\", revive: reviveReadCounterResponse200ApplicationJson }], [\"text/plain\", \"text\"]], hasContentTypeDiscriminant: true"),
+            "{bigint}"
+        );
+
+        let (date, diagnostics) =
+            emit_transforming_operation(transforming_response_document(), "readevent");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(
+            date.contains("media: [[\"application/json\", \"json\"]]"),
+            "{date}"
+        );
+    }
+
+    #[test]
+    fn a_bodyless_int64_json_response_does_not_bind_a_reviver() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "T", "version": "1.0.0" },
+            "paths": {
+                "/counters": {
+                    "get": {
+                        "operationId": "readCounter",
+                        "responses": {
+                            "204": {
+                                "description": "empty",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "integer", "format": "int64" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) =
+            emit_files_with_types(document, false, json!({ "integer": "bigint" }));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            ["OASTS1406"]
+        );
+        let operation = operation_file(&files, "readcounter");
+        assert!(
+            operation.contains(
+                "bodyless: true, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false"
+            ),
+            "{operation}"
+        );
     }
 
     #[test]
@@ -6585,6 +6804,7 @@ mod tests {
             &analyzed.ir.operations[0],
             &plan,
             "descriptorProbe",
+            &[],
             &[],
         );
         assert!(output.contains("allowReserved: true"));

@@ -1,0 +1,107 @@
+openapi: 3.1.0
+info:
+  title: Schema fidelity crossings
+  version: 1.0.0
+paths:
+  /events/{eventId}:
+    put:
+      operationId: putEvent
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Event"
+      responses:
+        "200":
+          description: The stored event.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+components:
+  schemas:
+    PlainEmpty:
+      type: object
+      properties: {}
+    ClosedEmpty:
+      type: object
+      additionalProperties: false
+    PatternOnly:
+      type: object
+      patternProperties:
+        "^x-":
+          type: string
+    ReadOnlyOnly:
+      type: object
+      required:
+        - serverId
+      properties:
+        serverId:
+          type: string
+          readOnly: true
+    RefAndAnonymousEmpty:
+      allOf:
+        - $ref: "#/components/schemas/PlainEmpty"
+        - type: object
+          properties: {}
+    MaybePlainEmpty:
+      type:
+        - object
+        - "null"
+      properties: {}
+    EmptyEvent:
+      type: object
+      required:
+        - kind
+        - plain
+        - closed
+        - patterned
+        - combined
+        - server
+        - maybe
+      properties:
+        kind:
+          const: empty
+        plain:
+          $ref: "#/components/schemas/PlainEmpty"
+        closed:
+          $ref: "#/components/schemas/ClosedEmpty"
+        patterned:
+          $ref: "#/components/schemas/PatternOnly"
+        combined:
+          $ref: "#/components/schemas/RefAndAnonymousEmpty"
+        server:
+          $ref: "#/components/schemas/ReadOnlyOnly"
+        maybe:
+          $ref: "#/components/schemas/MaybePlainEmpty"
+    CountEvent:
+      type: object
+      required:
+        - kind
+        - sequence
+        - plain
+      properties:
+        kind:
+          const: count
+        sequence:
+          type: integer
+          format: int64
+        plain:
+          $ref: "#/components/schemas/PlainEmpty"
+    Event:
+      oneOf:
+        - $ref: "#/components/schemas/EmptyEvent"
+        - $ref: "#/components/schemas/CountEvent"
+      discriminator:
+        propertyName: kind
+        mapping:
+          empty: "#/components/schemas/EmptyEvent"
+          count: "#/components/schemas/CountEvent"

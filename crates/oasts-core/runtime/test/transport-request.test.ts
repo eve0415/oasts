@@ -129,6 +129,85 @@ describe("request serialization and fetch contract", () => {
     assert.equal(capturedSidecar.body, "caller body");
   });
 
+  test("serializes bigint parameters and text form fields without precision loss", async () => {
+    const requests: Request[] = [];
+    const transport = createTransport({
+      fetch: async (request) => {
+        requests.push(request);
+        return new Response();
+      },
+    });
+    const id = 12345678901234567890n;
+
+    await execute(
+      transport,
+      operation({
+        method: "POST",
+        path: [
+          [
+            { kind: "literal", text: "/resource/" },
+            { kind: "param", name: "id" },
+          ],
+        ],
+        params: [
+          {
+            name: "id",
+            location: "path",
+            required: true,
+            serialize: serializePathSimple,
+            allowReserved: false,
+          },
+          {
+            name: "after",
+            location: "query",
+            required: true,
+            serialize: serializeQueryFormExplode,
+            allowReserved: false,
+          },
+          {
+            name: "X-Id",
+            location: "header",
+            required: true,
+            serialize: serializeHeaderSimple,
+            allowReserved: false,
+          },
+        ],
+      }),
+      { path: { id }, query: { after: id }, header: { "X-Id": id } },
+    );
+    await execute(
+      transport,
+      operation({
+        method: "POST",
+        body: urlencodedBody("application/x-www-form-urlencoded", [{ name: "id", required: true }]),
+      }),
+      { body: { id } },
+    );
+    await execute(
+      transport,
+      operation({
+        method: "POST",
+        body: multipartBody([
+          {
+            name: "id",
+            required: true,
+            repeated: false,
+            wrapper: false,
+            payload: "text",
+            contentType: { kind: "fixed", value: "text/plain" },
+            filename: false,
+          },
+        ]),
+      }),
+      { body: { id } },
+    );
+
+    assert.equal(requests[0].url, `https://descriptor.example/api/resource/${id}?after=${id}`);
+    assert.equal(requests[0].headers.get("x-id"), String(id));
+    assert.equal(await requests[1].text(), `id=${id}`);
+    assert.match(await requests[2].text(), new RegExp(`\\r\\n\\r\\n${id}\\r\\n`, "u"));
+  });
+
   test("forwards a content JSON parameter's raw object value past the ParamValue guard", async () => {
     let url = "";
     const transport = createTransport({

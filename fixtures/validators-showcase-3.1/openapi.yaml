@@ -160,6 +160,9 @@ components:
         bigId:
           type: integer
           format: int32
+        int64Id:
+          type: integer
+          format: int64
         score:
           type: number
           multipleOf: 0.25

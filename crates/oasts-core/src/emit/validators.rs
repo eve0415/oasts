@@ -132,6 +132,7 @@ const VALIDATOR_RESERVED_NAMES: &[&str] = &[
     "isTime",
     "isUuid",
     "isInt32",
+    "int64WireValue",
     "StandardSchemaV1",
     "SyncStandardSchemaV1",
     "isRecord",
@@ -1148,7 +1149,13 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 const_value,
                 meta,
             } => {
-                self.gen_primitive(*ty, format.as_deref(), meta, val, path, iss);
+                let bigint_int64 = self.model.transform_facts().site(schema)
+                    == Some(crate::transform::TransformKind::IntegerBigInt);
+                if bigint_int64 {
+                    self.gen_bigint_int64(meta, val, path, iss);
+                } else {
+                    self.gen_primitive(*ty, format.as_deref(), meta, val, path, iss);
+                }
                 self.gen_finite(enum_values.as_deref(), const_value.as_ref(), val, path, iss);
             }
             SchemaNode::Finite {
@@ -2163,6 +2170,55 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         self.close_type_gate(widen_null, val, path, iss, type_name);
     }
 
+    fn gen_bigint_int64(&mut self, meta: &SchemaMeta, val: &str, path: &str, iss: &str) {
+        self.scope.runtime_values.insert("int64WireValue");
+        let index = self.fresh();
+        let integer = format!("integer{index}");
+        self.line(&format!("const {integer} = int64WireValue({val});"));
+        self.open(&format!("if ({integer} !== null) {{"));
+        self.push_issue(
+            &format!("{integer} < -9223372036854775808n || {integer} >= 9223372036854775808n"),
+            path,
+            iss,
+            "out of int64 range",
+        );
+        let constraints = meta.numeric_constraints();
+        if constraints.minimum.is_some()
+            || constraints.maximum.is_some()
+            || constraints.exclusive_minimum.is_some()
+            || constraints.exclusive_maximum.is_some()
+            || constraints.multiple_of.is_some()
+        {
+            self.gen_bound(
+                constraints,
+                BoundDirection::Lower,
+                &integer,
+                path,
+                iss,
+                true,
+            );
+            self.gen_bound(
+                constraints,
+                BoundDirection::Upper,
+                &integer,
+                path,
+                iss,
+                true,
+            );
+            if let Some(multiple) = &constraints.multiple_of {
+                let literal = render_number_value(multiple);
+                self.scope.runtime_values.insert("isBigIntMultipleOf");
+                self.push_issue(
+                    &format!("!isBigIntMultipleOf({integer}, {literal})"),
+                    path,
+                    iss,
+                    &format!("not a multiple of {literal}"),
+                );
+            }
+        }
+        self.close_type_gate(meta.nullable, val, path, iss, "integer");
+    }
+
     fn gen_string_constraints(
         &mut self,
         format: Option<&str>,
@@ -2251,8 +2307,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         iss: &str,
     ) {
         let constraints = meta.numeric_constraints();
-        self.gen_bound(constraints, BoundDirection::Lower, val, path, iss);
-        self.gen_bound(constraints, BoundDirection::Upper, val, path, iss);
+        self.gen_bound(constraints, BoundDirection::Lower, val, path, iss, false);
+        self.gen_bound(constraints, BoundDirection::Upper, val, path, iss, false);
         if let Some(multiple) = &constraints.multiple_of {
             let literal = render_number_value(multiple);
             self.scope.runtime_values.insert("isMultipleOf");
@@ -2276,6 +2332,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         val: &str,
         path: &str,
         iss: &str,
+        exact_bigint: bool,
     ) {
         let bound = direction.resolve(constraints);
         match bound.exclusive {
@@ -2285,8 +2342,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                     bound.exclusive_comparator,
                     bound.exclusive_message,
                     value,
-                    path,
-                    iss,
+                    (path, iss),
+                    exact_bigint,
                 );
                 if let Some(value) = bound.inclusive {
                     self.emit_threshold(
@@ -2294,8 +2351,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                         bound.inclusive_comparator,
                         bound.inclusive_message,
                         value,
-                        path,
-                        iss,
+                        (path, iss),
+                        exact_bigint,
                     );
                 }
             }
@@ -2308,8 +2365,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                         bound.exclusive_comparator,
                         bound.exclusive_message,
                         value,
-                        path,
-                        iss,
+                        (path, iss),
+                        exact_bigint,
                     );
                 }
             }
@@ -2320,8 +2377,8 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                         bound.inclusive_comparator,
                         bound.inclusive_message,
                         value,
-                        path,
-                        iss,
+                        (path, iss),
+                        exact_bigint,
                     );
                 }
             }
@@ -2337,16 +2394,18 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         comparator: &str,
         message: &str,
         value: &Number,
-        path: &str,
-        iss: &str,
+        location: (&str, &str),
+        exact_bigint: bool,
     ) {
+        let (path, iss) = location;
         let literal = render_number_value(value);
-        self.push_issue(
-            &format!("{val} {comparator} {literal}"),
-            path,
-            iss,
-            &format!("{message} {literal}"),
-        );
+        let condition = if exact_bigint {
+            self.scope.runtime_values.insert("compareBigIntToNumber");
+            format!("compareBigIntToNumber({val}, {literal}) {comparator} 0")
+        } else {
+            format!("{val} {comparator} {literal}")
+        };
+        self.push_issue(&condition, path, iss, &format!("{message} {literal}"));
     }
 
     /// Splits an object/array/tuple's `enum`/`const` box and generates its finite-value guard —
@@ -5815,13 +5874,80 @@ mod tests {
     }
 
     #[test]
+    fn bigint_int64_validates_each_lossless_wire_representation() {
+        let (files, diagnostics) = compile_with_config(
+            doc_31(json!({
+                "Thing": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "step": { "type": "integer", "format": "int64", "multipleOf": 2 },
+                        "bounded": {
+                            "type": "integer",
+                            "format": "int64",
+                            "minimum": 0,
+                            "exclusiveMinimum": 1,
+                            "maximum": 10,
+                            "exclusiveMaximum": 9
+                        }
+                    }
+                }
+            })),
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "validators": true },
+                "types": { "integer": "bigint" },
+                "validation": { "engine": "generated", "request": true, "unchecked": "allow" }
+            }),
+        );
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(
+            content.contains("const integer1 = int64WireValue(value0);"),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "if (integer1 < -9223372036854775808n || integer1 >= 9223372036854775808n) {"
+            ),
+            "{content}"
+        );
+        assert!(content.contains("\"out of int64 range\""), "{content}");
+        assert!(
+            content.contains("if (!isBigIntMultipleOf(integer3, 2)) {"),
+            "{content}"
+        );
+        assert!(
+            content.contains("compareBigIntToNumber(integer5, 1) <= 0"),
+            "{content}"
+        );
+        assert!(
+            content.contains("compareBigIntToNumber(integer5, 0) < 0"),
+            "{content}"
+        );
+        assert!(
+            content.contains("compareBigIntToNumber(integer5, 9) >= 0"),
+            "{content}"
+        );
+        assert!(
+            content.contains("compareBigIntToNumber(integer5, 10) > 0"),
+            "{content}"
+        );
+        assert!(!content.contains(" = Number("), "{content}");
+        assert!(!content.contains("isInt64(value0)"), "{content}");
+    }
+
+    #[test]
     fn annotation_only_formats_assert_nothing_beyond_type() {
         let (files, diagnostics) = compile(doc_31(json!({
             "Thing": {
                 "type": "object",
                 "properties": {
                     "e": { "type": "string", "format": "email" },
-                    "u": { "type": "string", "format": "uri" }
+                    "u": { "type": "string", "format": "uri" },
+                    "id": { "type": "integer", "format": "int64" }
                 }
             }
         })));
@@ -5829,8 +5955,9 @@ mod tests {
         let content = component(&files, "thing");
         assert!(!content.contains("isEmail"));
         assert!(!content.contains("format"));
-        // Both string properties still type-check but carry no format assertion.
+        // Both string properties and the integer still type-check but carry no format assertion.
         assert_eq!(content.matches("=== \"string\"").count(), 2);
+        assert!(content.contains("Number.isInteger(value2)"), "{content}");
     }
 
     #[test]
@@ -6414,6 +6541,7 @@ mod tests {
         for inner in [
             json!({ "type": "string", "format": "email" }),
             json!({ "type": "number", "format": "float" }),
+            json!({ "type": "integer", "format": "int64" }),
             json!({ "type": "boolean", "format": "custom" }),
             json!({ "type": "string", "$dynamicRef": "#thing" }),
         ] {

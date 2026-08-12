@@ -16,9 +16,48 @@
 
 import { type ApplicationPath, type SourcePointer, TransformError } from "./result.ts";
 
+type RawJson = Readonly<{ rawJSON: string }>;
+
+declare global {
+  interface JSON {
+    rawJSON?: (text: string) => RawJson;
+  }
+}
+
+// Captured once: a missing API is a runtime capability, not a value-by-value decision.
+const rawJson = typeof JSON.rawJSON === "function" ? JSON.rawJSON : null;
+
 /** Extend a path without mutating the parent, so each nested transform forks its own child path. */
 export function pushPath(path: ApplicationPath, key: string | number): ApplicationPath {
   return [...path, key];
+}
+
+let losslessJsonValue: unknown;
+
+/** Runs a synchronous schema walk against the exact parse of the same JSON document. */
+export function withLosslessJson<T>(lossless: unknown, revive: () => T): T {
+  const previous = losslessJsonValue;
+  losslessJsonValue = lossless;
+  try {
+    return revive();
+  } finally {
+    losslessJsonValue = previous;
+  }
+}
+
+/** Reads the exact integer token at one schema-selected path in the active JSON document. */
+export function losslessInt64(path: ApplicationPath): number | bigint {
+  let value = losslessJsonValue;
+  for (const key of path) {
+    if (typeof value !== "object" || value === null) {
+      throw new TypeError("lossless JSON path does not exist");
+    }
+    value = Reflect.get(value, key);
+  }
+  if (typeof value !== "number" && typeof value !== "bigint") {
+    throw new TypeError("lossless JSON path is not an integer");
+  }
+  return value;
 }
 
 /**
@@ -119,6 +158,49 @@ function applicationFailure(
     applicationPath: path,
     cause: value,
   });
+}
+
+const INT64_WIRE_INTEGER = /^-?(?:0|[1-9]\d*)$/;
+
+/** Decodes an int64 wire number without losing a digit. */
+export function decodeInt64(
+  value: number | bigint | RawJson,
+  pointer: SourcePointer,
+  path: ApplicationPath,
+): bigint {
+  if (typeof value === "bigint") {
+    return value;
+  }
+  if (typeof value === "object" && value !== null) {
+    const token = Reflect.get(value, "rawJSON");
+    if (typeof token === "string" && INT64_WIRE_INTEGER.test(token)) {
+      return BigInt(token);
+    }
+    throw wireFailure(value, pointer, path);
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw wireFailure(value, pointer, path);
+  }
+  return BigInt(value);
+}
+
+/** Encodes an int64 bigint as exact unquoted JSON digits where the runtime supports raw JSON. */
+export function encodeInt64(
+  value: bigint,
+  pointer: SourcePointer,
+  path: ApplicationPath,
+): RawJson | number {
+  if (typeof value !== "bigint") {
+    throw applicationFailure(value, pointer, path);
+  }
+  if (rawJson !== null) {
+    return rawJson(String(value));
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number)) {
+    throw applicationFailure(value, pointer, path);
+  }
+  return number;
 }
 
 function temporalFailure(

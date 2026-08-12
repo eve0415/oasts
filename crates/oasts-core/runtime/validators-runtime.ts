@@ -116,6 +116,31 @@ export function isMultipleOf(value: number, divisor: number): boolean {
   return numerator % denominator === 0n;
 }
 
+// Exact comparison between an integer and the binary64 rational represented by `other`.
+export function compareBigIntToNumber(value: bigint, other: number): number {
+  const scaled = decompose(other);
+  let scaledInteger = value;
+  let rational = scaled.mantissa;
+  if (scaled.exponent >= 0) {
+    rational <<= BigInt(scaled.exponent);
+  } else {
+    scaledInteger <<= BigInt(-scaled.exponent);
+  }
+  return scaledInteger < rational ? -1 : scaledInteger > rational ? 1 : 0;
+}
+
+// Exact divisibility by the binary64 rational represented by `divisor`. A fractional divisor is
+// valid: the quotient must be an integer under the divisor's exact binary64 value.
+export function isBigIntMultipleOf(value: bigint, divisor: number): boolean {
+  const scaled = decompose(divisor);
+  if (scaled.mantissa === 0n) {
+    return false;
+  }
+  return scaled.exponent >= 0
+    ? value % (scaled.mantissa << BigInt(scaled.exponent)) === 0n
+    : (value << BigInt(-scaled.exponent)) % scaled.mantissa === 0n;
+}
+
 // Count Unicode code points: the string iterator yields whole code points, so an astral character
 // like "𝒳" counts as 1 rather than its two UTF-16 code units.
 export function codePointLength(s: string): number {
@@ -211,4 +236,26 @@ export function isUuid(s: string): boolean {
 // Whole number within the signed 32-bit range.
 export function isInt32(v: number): boolean {
   return Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
+}
+
+const INT64_WIRE_INTEGER = /^-?(?:0|[1-9]\d*)$/;
+
+// The bigint representation validates the pre-transform wire surface: safe JSON integers remain
+// numbers, unsafe ones are restored as bigints by the transport, and request encoders contribute a
+// raw-JSON token before request validation runs.
+export function int64WireValue(value: unknown): bigint | null {
+  if (typeof value === "bigint") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value)) {
+    return BigInt(value);
+  }
+  if (
+    isRecord(value) &&
+    typeof value.rawJSON === "string" &&
+    INT64_WIRE_INTEGER.test(value.rawJSON)
+  ) {
+    return BigInt(value.rawJSON);
+  }
+  return null;
 }

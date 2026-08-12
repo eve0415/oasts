@@ -4,10 +4,13 @@ import { describe, test } from "node:test";
 import {
   appendKey,
   codePointLength,
+  compareBigIntToNumber,
   deepEqual,
   hasGet,
+  int64WireValue,
   isDate,
   isDateTime,
+  isBigIntMultipleOf,
   isInt32,
   isMultipleOf,
   isTime,
@@ -15,6 +18,38 @@ import {
   issue,
   type Issue,
 } from "../validators-runtime.ts";
+
+describe("exact bigint constraints", () => {
+  test("compares integers against binary64 rationals without coercion", () => {
+    assert.equal(compareBigIntToNumber(42n, 42), 0);
+    assert.equal(compareBigIntToNumber(9_007_199_254_740_993n, 9_007_199_254_740_992), 1);
+    assert.equal(compareBigIntToNumber(1n, 1.5), -1);
+  });
+
+  test("evaluates integer and fractional divisors as exact rationals", () => {
+    assert.equal(isBigIntMultipleOf(10n, 2), true);
+    assert.equal(isBigIntMultipleOf(9_007_199_254_740_993n, 2), false);
+    assert.equal(isBigIntMultipleOf(1n << 60n, 2 ** 60), true);
+    assert.equal(isBigIntMultipleOf(1n, 0.5), true);
+    assert.equal(isBigIntMultipleOf(1n, 0.1), false);
+    assert.equal(isBigIntMultipleOf(1n, 0), false);
+  });
+});
+
+describe("int64WireValue", () => {
+  test("normalizes each lossless int64 wire representation", () => {
+    assert.equal(int64WireValue(42), 42n);
+    assert.equal(int64WireValue(12_345_678_901_234_567_890n), 12_345_678_901_234_567_890n);
+    assert.equal(int64WireValue({ rawJSON: "12345678901234567890" }), 12_345_678_901_234_567_890n);
+  });
+
+  test("rejects rounded numbers and noncanonical raw tokens", () => {
+    assert.equal(int64WireValue(Number.MAX_SAFE_INTEGER + 1), null);
+    assert.equal(int64WireValue({ rawJSON: "01" }), null);
+    assert.equal(int64WireValue({ rawJSON: "1.5" }), null);
+    assert.equal(int64WireValue(null), null);
+  });
+});
 
 describe("hasGet", () => {
   test("recognizes objects with a get method", () => {

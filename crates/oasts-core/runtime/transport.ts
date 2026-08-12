@@ -242,17 +242,37 @@ export type RawResponseDecoder = {
   ) => ReadableStream<Uint8Array>;
 };
 
+// Like an SSE event hook, a generated reviver names the wire type its schema declares while the
+// transport crosses that boundary with a JSON.parse result. The method extraction keeps that
+// schema-specific parameter bivariant without weakening either side to an unchecked cast.
+type LosslessJsonReviverHost = {
+  revive(value: unknown, lossless: unknown): unknown;
+};
+
+type LosslessJsonReviver = LosslessJsonReviverHost['revive'];
+
+export type LosslessJsonResponseDecoder = {
+  readonly json: 'int64';
+  readonly revive: LosslessJsonReviver;
+};
+
 export type ResponseMediaDecoder =
   | 'json'
   | 'text'
   | 'binary'
+  | LosslessJsonResponseDecoder
   | MultipartResponseDecoder
   | SseResponseDecoder
   | RawResponseDecoder;
 
 // The decoders that need the whole body in hand. Naming the complement as its own type is what lets
 // the streaming check narrow in both directions, so the buffered path below stays exactly as it was.
-type BufferedResponseDecoder = 'json' | 'text' | 'binary' | MultipartResponseDecoder;
+type BufferedResponseDecoder =
+  | 'json'
+  | 'text'
+  | 'binary'
+  | LosslessJsonResponseDecoder
+  | MultipartResponseDecoder;
 
 function isStreamingResponseDecoder(
   decoder: ResponseMediaDecoder,
@@ -847,7 +867,10 @@ function serializeSelectedAuth(
 }
 
 function isParamPrimitive(value: unknown): value is ParamPrimitive {
-  return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+  return typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    typeof value === 'bigint';
 }
 
 function isParamValue(value: unknown): value is ParamValue {
@@ -1241,10 +1264,10 @@ async function multipartPayload(kind: MultipartFieldPlan['payload'], value: unkn
     throw new TypeError('binary multipart fields require Uint8Array, Blob, or File');
   }
   if (kind === 'text') {
-    if (typeof value !== 'string') {
-      throw new TypeError('text multipart fields require a string');
+    if (typeof value !== 'string' && typeof value !== 'bigint') {
+      throw new TypeError('text multipart fields require a string or bigint');
     }
-    return UTF8_ENCODER.encode(value);
+    return UTF8_ENCODER.encode(String(value));
   }
   const json = JSON.stringify(value);
   if (json === undefined) {
@@ -1611,6 +1634,70 @@ type SelectedResponseMedia = {
   readonly actual: ParsedMediaType;
 };
 
+type JsonParseContext = { readonly source?: unknown };
+
+let jsonParseProbeContext: unknown;
+JSON.parse('0', (_key: string, value: unknown, context?: JsonParseContext) => {
+  jsonParseProbeContext = context;
+  return value;
+});
+const jsonParseHasSource =
+  isRecord(jsonParseProbeContext) && jsonParseProbeContext.source === '0';
+const NONZERO_DIGIT = /[1-9]/u;
+const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+const MIN_SAFE_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
+
+function jsonIntegerToken(source: string): bigint | null {
+  // `context.source` for a numeric reviver value is always a valid JSON number token.
+  const exponentIndex = source.search(/[eE]/u);
+  const mantissa = exponentIndex === -1 ? source : source.slice(0, exponentIndex);
+  const exponent = exponentIndex === -1 ? '0' : source.slice(exponentIndex + 1);
+  const sign = mantissa.startsWith('-') ? '-' : '';
+  const unsignedMantissa = sign === '' ? mantissa : mantissa.slice(1);
+  const decimalIndex = unsignedMantissa.indexOf('.');
+  const whole = decimalIndex === -1 ? unsignedMantissa : unsignedMantissa.slice(0, decimalIndex);
+  const fraction = decimalIndex === -1 ? '' : unsignedMantissa.slice(decimalIndex + 1);
+  const digits = `${whole}${fraction}`;
+  const scale = BigInt(exponent) - BigInt(fraction.length);
+  let magnitude: bigint;
+  try {
+    if (scale >= 0n) {
+      magnitude = BigInt(digits) * 10n ** scale;
+    } else {
+      const decimalPlaces = -scale;
+      if (decimalPlaces >= BigInt(digits.length)) {
+        return NONZERO_DIGIT.test(digits) ? null : 0n;
+      }
+      const retainedLength = digits.length - Number(decimalPlaces);
+      if (NONZERO_DIGIT.test(digits.slice(retainedLength))) {
+        return null;
+      }
+      magnitude = BigInt(digits.slice(0, retainedLength));
+    }
+  } catch {
+    return null;
+  }
+  return sign === '-' ? -magnitude : magnitude;
+}
+
+function losslessInt64Reviver(
+  _key: string,
+  value: unknown,
+  context?: JsonParseContext,
+): unknown {
+  if (
+    typeof value !== 'number' ||
+    context === undefined ||
+    typeof context.source !== 'string'
+  ) {
+    return value;
+  }
+  const integer = jsonIntegerToken(context.source);
+  return integer !== null && (integer < MIN_SAFE_BIGINT || integer > MAX_SAFE_BIGINT)
+    ? integer
+    : value;
+}
+
 function selectedResponseMedia(
   rawContentType: string | null,
   media: ResponsePlan['media'],
@@ -1632,10 +1719,17 @@ function selectedResponseMedia(
 
 async function decodedBody(
   bytes: ArrayBuffer,
-  decoder: 'json' | 'text' | 'binary',
+  decoder: 'json' | 'text' | 'binary' | LosslessJsonResponseDecoder,
 ): Promise<unknown> {
   if (decoder === 'json') {
     return new Response(bytes).json();
+  }
+  if (typeof decoder !== 'string') {
+    const text = await new Response(bytes).text();
+    const value: unknown = JSON.parse(text);
+    return jsonParseHasSource
+      ? decoder.revive(value, JSON.parse(text, losslessInt64Reviver))
+      : value;
   }
   if (decoder === 'text') {
     return new Response(bytes).text();
@@ -1870,7 +1964,7 @@ async function assembleResponse(
     // response never links it. It takes the received media parameters because the boundary lives
     // there and nowhere else.
     const decoder = buffered.decoder;
-    const payload = typeof decoder === 'string'
+    const payload = typeof decoder === 'string' || 'json' in decoder
       ? await decodedBody(read, decoder)
       : decoder.decode(new Uint8Array(read), buffered.parameters, decoder.plan);
     return matchedResponseResult(

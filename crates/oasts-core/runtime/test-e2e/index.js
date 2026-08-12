@@ -1,5 +1,6 @@
 import "./auth.test.ts";
 import "./client.test.ts";
+import "./int64.test.ts";
 import "./media-classification.test.ts";
 import "./media-validation.test.ts";
 import "./msw.test.ts";

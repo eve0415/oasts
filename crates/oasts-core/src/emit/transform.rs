@@ -22,11 +22,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use foldhash::HashMap;
+use foldhash::{HashMap, HashSet, HashSetExt};
+use serde_json::Value;
 
 use crate::client_model::{
-    BodyPlan, ClientModel, FormFieldPlan, MultipartResponsePayload, OperationPlan,
-    PayloadDisposition, ResponseMediaPlan,
+    BodyPlan, ClientModel, DecoderClass, FormFieldPlan, MultipartResponsePayload, OperationPlan,
+    PayloadDisposition, PayloadKind, ResponseMediaPlan,
 };
 use crate::diag::Diagnostic;
 use crate::ir::{
@@ -43,7 +44,8 @@ use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
     CODE_TRANSFORM_UNION, CODE_UNCONVERTIBLE_TRANSFORM, Emitter, GeneratedFile, SchemaChildMode,
     TypeAxis, TypePosition, import_extension, property_in_position, render_literal_key,
-    render_property_key, render_ts_string, source_diagnostic, uppercase_first,
+    render_property_key, render_ts_string, render_ts_value, source_diagnostic, tag_key,
+    uppercase_first,
 };
 
 /// Emitted as `client/transform/runtime.ts`; the generated-transform call ABI is fixed to it.
@@ -62,7 +64,7 @@ pub(crate) enum ResolvedDispatch {
     /// `i`; a branch proving several literals selects on any of them.
     Discriminator {
         property: String,
-        tags: Vec<Vec<String>>,
+        tags: Vec<Vec<Value>>,
     },
 }
 
@@ -94,6 +96,29 @@ pub(crate) fn resolve_dispatch(
             emitter.prove_discriminator_tags(branches, discriminator, &mapping_targets)
             && emitter.discriminator_branches_fix_a_literal(branches, &discriminator.property_name)
         {
+            let tags = branches
+                .iter()
+                .zip(tags)
+                .map(|(branch, tags)| {
+                    let fixed = emitter
+                        .merged_object_property_finite(
+                            branch,
+                            &discriminator.property_name,
+                            &mut HashSet::new(),
+                        )
+                        .values
+                        .unwrap_or_default();
+                    tags.into_iter()
+                        .map(|tag| {
+                            fixed
+                                .iter()
+                                .find(|value| tag_key(value) == tag)
+                                .cloned()
+                                .unwrap_or(Value::String(tag))
+                        })
+                        .collect()
+                })
+                .collect();
             return Some(Ok(ResolvedDispatch::Discriminator {
                 property: discriminator.property_name.clone(),
                 tags,
@@ -612,12 +637,26 @@ fn unconvertible_transform_diagnostics(
             continue;
         }
         for entry in &response.media {
-            if multipart_response_entry_transforms(model, entry) {
+            if entry.decoder == DecoderClass::StreamingSse
+                && model
+                    .transform_facts()
+                    .reaches_kind(&entry.schema, TransformKind::IntegerBigInt)
+            {
                 diagnostics.push(source_diagnostic(
                     CODE_UNCONVERTIBLE_TRANSFORM,
                     format!(
-                        "response '{}' entry '{}' applies a date/time transform, but its payload is the object its parts decode to rather than the shape its schema renders, and no emitted codec converts that object; set the representation back to string",
+                        "response '{}' entry '{}': the SSE event schema applies an int64 transform, but the SSE frame parser cannot preserve unsafe integer tokens; set the integer representation back to number",
                         response.match_key, entry.media,
+                    ),
+                    &entry.source,
+                ));
+            }
+            if let Some((transforms, advice)) = multipart_response_transform_terms(model, entry) {
+                diagnostics.push(source_diagnostic(
+                    CODE_UNCONVERTIBLE_TRANSFORM,
+                    format!(
+                        "response '{}' entry '{}' applies {transforms}, but its payload is the object its parts decode to rather than the shape its schema renders, and no emitted codec converts that object; {advice}",
+                        response.match_key, entry.media
                     ),
                     &entry.source,
                 ));
@@ -633,22 +672,39 @@ fn unconvertible_transform_diagnostics(
 /// `contentType`. A multipart payload is the object its parts decode to, which is not what any
 /// schema renders, so no pair names it. Binary parts render `Uint8Array` and never reach their
 /// schema, so they cannot put a wire string behind a `Date` either.
-fn multipart_response_entry_transforms(
+fn multipart_response_transform_terms(
     model: &EmissionModel<'_, '_>,
     entry: &ResponseMediaPlan,
-) -> bool {
+) -> Option<(String, String)> {
     let Some(multipart) = &entry.multipart else {
-        return false;
+        return None;
     };
-    multipart
+    let shapes = multipart
         .parts
         .iter()
         .map(|part| &part.shape)
         .chain(multipart.open.then_some(&multipart.additional))
-        .any(|shape| {
-            shape.payload != MultipartResponsePayload::Binary
-                && model.transform_facts().reaches(&shape.schema)
-        })
+        .filter(|shape| shape.payload != MultipartResponsePayload::Binary)
+        .collect::<Vec<_>>();
+    let date_time = shapes
+        .iter()
+        .any(|shape| super::client::reaches_non_integer_transform(model, &shape.schema));
+    let int64 = shapes.iter().any(|shape| {
+        model
+            .transform_facts()
+            .reaches_kind(&shape.schema, TransformKind::IntegerBigInt)
+    });
+    let mut transforms = Vec::new();
+    let mut advice = Vec::new();
+    if date_time {
+        transforms.push("a date/time transform");
+        advice.push("set the representation back to string");
+    }
+    if int64 {
+        transforms.push("an int64 transform");
+        advice.push("set the integer representation back to number");
+    }
+    (!transforms.is_empty()).then(|| (transforms.join(" and "), advice.join(" and ")))
 }
 
 fn body_transform_refusals(
@@ -656,22 +712,51 @@ fn body_transform_refusals(
     plan: Option<&BodyPlan>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if let Some(BodyPlan::ContentTypeDiscriminated { arms, all_concrete }) = plan {
-        if !all_concrete
-            && arms.len() > 1
-            && let Some(arm) = arms
-                .iter()
-                .find(|arm| super::client::request_body_transforms(model, Some(&arm.plan)))
-        {
-            diagnostics.push(source_diagnostic(
-                CODE_UNCONVERTIBLE_TRANSFORM,
-                "a content-type-discriminated request body mixes media ranges with multiple arms, so its string contentType cannot select one date/time conversion; use concrete media types, or set the representation back to string",
-                &arm.source,
-            ));
+    match plan {
+        Some(BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. }) => {
+            for field in fields {
+                let mixes_json_and_non_json =
+                    field.serialization.content_media().is_some_and(|media| {
+                        media.payloads.contains(&PayloadKind::Json)
+                            && media
+                                .payloads
+                                .iter()
+                                .any(|payload| *payload != PayloadKind::Json)
+                    });
+                if mixes_json_and_non_json
+                    && model
+                        .transform_facts()
+                        .reaches_kind(&field.schema, TransformKind::IntegerBigInt)
+                {
+                    diagnostics.push(source_diagnostic(
+                        CODE_UNCONVERTIBLE_TRANSFORM,
+                        format!(
+                            "form field '{}' mixes JSON and non-JSON media while its schema applies an int64 transform, so no single field encoder can preserve both payloads; split the field media, or set the integer representation back to number",
+                            field.name,
+                        ),
+                        &field.source,
+                    ));
+                }
+            }
         }
-        for arm in arms {
-            body_transform_refusals(model, Some(&arm.plan), diagnostics);
+        Some(BodyPlan::ContentTypeDiscriminated { arms, all_concrete }) => {
+            if !all_concrete
+                && arms.len() > 1
+                && let Some(arm) = arms
+                    .iter()
+                    .find(|arm| super::client::request_body_transforms(model, Some(&arm.plan)))
+            {
+                diagnostics.push(source_diagnostic(
+                    CODE_UNCONVERTIBLE_TRANSFORM,
+                    "a content-type-discriminated request body mixes media ranges with multiple arms, so its string contentType cannot select one date/time conversion; use concrete media types, or set the representation back to string",
+                    &arm.source,
+                ));
+            }
+            for arm in arms {
+                body_transform_refusals(model, Some(&arm.plan), diagnostics);
+            }
         }
+        _ => {}
     }
 }
 
@@ -852,10 +937,15 @@ fn transform_module_imports() -> BTreeMap<String, BTreeSet<String>> {
             TransformKind::DateTimeDate,
             TransformKind::DateTimeInstant,
             TransformKind::DatePlainDate,
+            TransformKind::IntegerBigInt,
         ] {
-            kernel.insert(direction.codec(kind).to_owned());
+            if let Some(codec) = direction.codec(kind) {
+                kernel.insert(codec.to_owned());
+            }
         }
     }
+    kernel.insert("losslessInt64".to_owned());
+    kernel.insert("withLosslessJson".to_owned());
     imports.insert("runtime".to_owned(), kernel);
     imports
 }
@@ -938,6 +1028,11 @@ fn render_component_pairs(
             continue;
         };
         let application = target.variant_name(position);
+        let export_name = if position == TypePosition::Neutral {
+            name.to_owned()
+        } else {
+            application.clone()
+        };
         for direction in [Direction::Decode, Direction::Encode] {
             let mut builder = PairBuilder::new(emitter, position, aliases);
             builder.pointers = rendered.pointers;
@@ -945,22 +1040,69 @@ fn render_component_pairs(
             builder.pair_imports = rendered.pair_imports;
             let expression = builder
                 .convert(&schema.schema, direction, "value", "path", Frame::ROOT)
-                .unwrap_or_else(|| "value".to_owned());
+                .unwrap_or("value".to_owned());
             rendered.pointers = builder.pointers;
             rendered.helpers = builder.helpers;
             rendered.pair_imports = builder.pair_imports;
-            let (parameter, returns) = match direction {
-                Direction::Decode => (wire.as_str(), application.as_str()),
-                Direction::Encode => (application.as_str(), wire.as_str()),
+            let (parameter, returns) = if direction == Direction::Decode {
+                (wire.as_str(), application.as_str())
+            } else {
+                (application.as_str(), wire.as_str())
             };
             rendered.bodies.push_str(&format!(
                 "\nexport function {}{}(value: {parameter}, path: {path_type} = []): {returns} {{\n  return {expression};\n}}\n",
                 direction.prefix(),
-                if position == TypePosition::Neutral {
-                    name.to_owned()
-                } else {
-                    application.clone()
-                },
+                export_name,
+            ));
+        }
+        if super::client::reaches_non_integer_transform(emitter.model, &schema.schema) {
+            let mut builder = PairBuilder::new(emitter, position, aliases);
+            builder.pointers = rendered.pointers;
+            builder.helpers = rendered.helpers;
+            builder.pair_imports = rendered.pair_imports;
+            builder.non_json_encode = true;
+            builder.inline_non_json_refs = true;
+            builder.inlining.push(index);
+            let expression = builder
+                .convert(
+                    &schema.schema,
+                    Direction::Encode,
+                    "value",
+                    "path",
+                    Frame::ROOT,
+                )
+                .unwrap_or("value".to_owned());
+            rendered.pointers = builder.pointers;
+            rendered.helpers = builder.helpers;
+            rendered.pair_imports = builder.pair_imports;
+            rendered.bodies.push_str(&format!(
+                "\nexport function encode{export_name}NonJson(value: {application}, path: {path_type} = []): {wire} {{\n  return {expression};\n}}\n"
+            ));
+        }
+        if emitter
+            .model
+            .transform_facts()
+            .reaches_kind(&schema.schema, TransformKind::IntegerBigInt)
+        {
+            let mut builder = PairBuilder::new(emitter, position, aliases);
+            builder.pointers = rendered.pointers;
+            builder.helpers = rendered.helpers;
+            builder.pair_imports = rendered.pair_imports;
+            let expression = builder
+                .convert(
+                    &schema.schema,
+                    Direction::Revive,
+                    "value",
+                    "path",
+                    Frame::ROOT,
+                )
+                .unwrap_or("value".to_owned());
+            rendered.pointers = builder.pointers;
+            rendered.helpers = builder.helpers;
+            rendered.pair_imports = builder.pair_imports;
+            rendered.bodies.push_str(&format!(
+                "\nexport function revive{}(value: {wire}, path: {path_type} = []): {wire} {{\n  return {expression};\n}}\n",
+                export_name,
             ));
         }
     }
@@ -1016,6 +1158,16 @@ fn emit_component_pairs(
         for direction in [Direction::Decode, Direction::Encode] {
             declared.insert(format!("{}{stem}", direction.prefix()));
         }
+        if super::client::reaches_non_integer_transform(emitter.model, &schema.schema) {
+            declared.insert(format!("encode{stem}NonJson"));
+        }
+        if emitter
+            .model
+            .transform_facts()
+            .reaches_kind(&schema.schema, TransformKind::IntegerBigInt)
+        {
+            declared.insert(format!("revive{stem}"));
+        }
     }
     // A sibling pair this module calls is bound here too, and its name is derived from a component
     // the document named — so `decodeInstant` can arrive from a sibling as readily as from the
@@ -1023,7 +1175,7 @@ fn emit_component_pairs(
     // here is what makes the *kernel* import yield, leaving the sibling its own name.
     let module_imports = transform_module_imports();
     for allocated in &emitter.model.analyzed.schema_names {
-        for direction in [Direction::Decode, Direction::Encode] {
+        for direction in [Direction::Decode, Direction::Encode, Direction::Revive] {
             let pair = format!("{}{}", direction.prefix(), allocated.name);
             if module_imports.values().any(|names| names.contains(&pair)) {
                 declared.insert(pair);
@@ -1206,6 +1358,7 @@ fn render_operation_pairs(
         let wire = format!("{application}Wire");
         let schema = operation_input_schema(emitter, operation, plan);
         let mut builder = PairBuilder::new(emitter, TypePosition::Request, aliases);
+        builder.non_json_roots = non_json_request_roots(emitter, plan);
         let converted = builder.convert(&schema, Direction::Encode, "value", "path", Frame::ROOT);
         rendered.pointers = builder.pointers;
         rendered.helpers = builder.helpers;
@@ -1249,6 +1402,40 @@ fn render_operation_pairs(
         rendered.bodies.push_str(&format!(
             "\nexport function decode{application}(value: {wire}, path: {path_type} = []): {application} {{\n  return {body};\n}}\n"
         ));
+        if emitter
+            .model
+            .transform_facts()
+            .reaches_kind(&codec.schema, TransformKind::IntegerBigInt)
+        {
+            let mut builder = PairBuilder::new(emitter, TypePosition::Response, aliases);
+            builder.pointers = rendered.pointers;
+            builder.helpers = rendered.helpers;
+            builder.pair_imports = rendered.pair_imports;
+            let expression = builder
+                .convert(
+                    &codec.schema,
+                    Direction::Revive,
+                    "value",
+                    "path",
+                    Frame::ROOT,
+                )
+                .unwrap_or("value".to_owned());
+            builder.helpers.insert("withLosslessJson");
+            rendered.pointers = builder.pointers;
+            rendered.helpers = builder.helpers;
+            rendered.pair_imports = builder.pair_imports;
+            let with_lossless = local_import_name("withLosslessJson", &aliases.kernel);
+            let body = guarded_body(
+                Some(format!("{with_lossless}(lossless, () => ({expression}))")),
+                Direction::Revive,
+                &mut rendered.pointers,
+                &mut rendered.helpers,
+                &codec.source,
+            );
+            rendered.bodies.push_str(&format!(
+                "\nexport function revive{application}(value: {wire}, lossless: unknown, path: {path_type} = []): {wire} {{\n  return {body};\n}}\n"
+            ));
+        }
     }
     rendered
 }
@@ -1293,11 +1480,18 @@ fn emit_operation_pairs(
         declared.insert(codec.application.clone());
         declared.insert(format!("{}Wire", codec.application));
         declared.insert(format!("decode{}", codec.application));
+        if emitter
+            .model
+            .transform_facts()
+            .reaches_kind(&codec.schema, TransformKind::IntegerBigInt)
+        {
+            declared.insert(format!("revive{}", codec.application));
+        }
     }
     let own_declared = declared.clone();
     let module_imports = transform_module_imports();
     for allocated in &emitter.model.analyzed.schema_names {
-        for direction in [Direction::Decode, Direction::Encode] {
+        for direction in [Direction::Decode, Direction::Encode, Direction::Revive] {
             let pair = format!("{}{}", direction.prefix(), allocated.name);
             if module_imports.values().any(|names| names.contains(&pair)) {
                 declared.insert(pair);
@@ -1462,7 +1656,7 @@ fn operation_input_schema(
         let required = resolved.iter().any(|(_, required)| *required);
         let group_properties = resolved
             .into_iter()
-            .filter(|(parameter, _)| !parameter.caller_serialized)
+            .filter(|(parameter, _)| super::client::parameter_transforms(emitter.model, parameter))
             .map(|(parameter, required)| {
                 (
                     parameter.name.clone(),
@@ -1485,7 +1679,7 @@ fn operation_input_schema(
     {
         properties.push((
             "body".to_owned(),
-            request_body_schema(body_plan, operation.source.clone()),
+            request_body_schema(emitter, body_plan, operation.source.clone()),
             operation_property(
                 operation
                     .request_body
@@ -1497,8 +1691,59 @@ fn operation_input_schema(
     object_schema(properties, operation.source.clone())
 }
 
+/// Schema roots whose request codec converts date leaves for a non-JSON serializer. Integer leaves
+/// below these roots remain bigint primitives: raw-JSON values belong only at JSON boundaries.
+fn non_json_request_roots(emitter: &Emitter<'_, '_, '_>, plan: &OperationPlan) -> Vec<SourceRef> {
+    let mut roots = plan
+        .param_plans
+        .iter()
+        .filter(|parameter| {
+            super::client::parameter_transforms(emitter.model, parameter)
+                && !super::client::parameter_encodes_int64(parameter)
+        })
+        .map(|parameter| parameter.schema.meta().source.clone())
+        .collect::<Vec<_>>();
+    if let Some(body) = &plan.body_plan {
+        collect_non_json_body_roots(emitter, body, &mut roots);
+    }
+    roots
+}
+
+fn collect_non_json_body_roots(
+    emitter: &Emitter<'_, '_, '_>,
+    plan: &BodyPlan,
+    roots: &mut Vec<SourceRef>,
+) {
+    match plan {
+        BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
+            roots.extend(
+                fields
+                    .iter()
+                    .filter(|field| {
+                        super::client::form_field_transforms(emitter.model, field)
+                            && !super::client::form_field_encodes_int64(field)
+                    })
+                    .map(|field| field.schema.meta().source.clone()),
+            );
+        }
+        BodyPlan::ContentTypeDiscriminated { arms, .. } => {
+            for arm in arms {
+                collect_non_json_body_roots(emitter, &arm.plan, roots);
+            }
+        }
+        BodyPlan::Json { .. }
+        | BodyPlan::TopLevelText { .. }
+        | BodyPlan::TopLevelBinary { .. }
+        | BodyPlan::TopLevelStream { .. } => {}
+    }
+}
+
 /// The request body's rendered client shape, restricted to body plans the encoder can bind.
-fn request_body_schema(plan: &BodyPlan, source: SourceRef) -> SchemaNode {
+fn request_body_schema(
+    emitter: &Emitter<'_, '_, '_>,
+    plan: &BodyPlan,
+    source: SourceRef,
+) -> SchemaNode {
     match plan {
         BodyPlan::Json {
             schema: Some(schema),
@@ -1516,6 +1761,7 @@ fn request_body_schema(plan: &BodyPlan, source: SourceRef) -> SchemaNode {
         } => object_schema(
             fields
                 .iter()
+                .filter(|field| super::client::form_field_transforms(emitter.model, field))
                 .map(|field| {
                     (
                         field.name.clone(),
@@ -1550,7 +1796,7 @@ fn request_body_schema(plan: &BodyPlan, source: SourceRef) -> SchemaNode {
                             ),
                             (
                                 "body".to_owned(),
-                                request_body_schema(&arm.plan, arm_source.clone()),
+                                request_body_schema(emitter, &arm.plan, arm_source.clone()),
                                 operation_property(true),
                             ),
                         ],
@@ -1652,7 +1898,7 @@ fn guarded_body(
     let pointer = pointer_constant(pointers, source);
     let label = match direction {
         Direction::Encode => "request",
-        Direction::Decode => "response",
+        Direction::Decode | Direction::Revive => "response",
     };
     format!("guarded(() => ({expression}), \"{label}\", {pointer})")
 }
@@ -1700,17 +1946,21 @@ fn write_pointer_constants(content: &mut String, pointers: &[SourceRef], bodies:
 enum Direction {
     Decode,
     Encode,
+    Revive,
 }
 
 impl Direction {
-    const fn codec(self, kind: TransformKind) -> &'static str {
+    const fn codec(self, kind: TransformKind) -> Option<&'static str> {
         match (self, kind) {
-            (Self::Decode, TransformKind::DateTimeDate) => "decodeDateTimeDate",
-            (Self::Encode, TransformKind::DateTimeDate) => "encodeDateTimeDate",
-            (Self::Decode, TransformKind::DateTimeInstant) => "decodeInstant",
-            (Self::Encode, TransformKind::DateTimeInstant) => "encodeInstant",
-            (Self::Decode, TransformKind::DatePlainDate) => "decodePlainDate",
-            (Self::Encode, TransformKind::DatePlainDate) => "encodePlainDate",
+            (Self::Decode, TransformKind::DateTimeDate) => Some("decodeDateTimeDate"),
+            (Self::Encode, TransformKind::DateTimeDate) => Some("encodeDateTimeDate"),
+            (Self::Decode, TransformKind::DateTimeInstant) => Some("decodeInstant"),
+            (Self::Encode, TransformKind::DateTimeInstant) => Some("encodeInstant"),
+            (Self::Decode, TransformKind::DatePlainDate) => Some("decodePlainDate"),
+            (Self::Encode, TransformKind::DatePlainDate) => Some("encodePlainDate"),
+            (Self::Decode, TransformKind::IntegerBigInt) => Some("decodeInt64"),
+            (Self::Encode, TransformKind::IntegerBigInt) => Some("encodeInt64"),
+            (Self::Revive, _) => None,
         }
     }
 
@@ -1718,6 +1968,7 @@ impl Direction {
         match self {
             Self::Decode => "decode",
             Self::Encode => "encode",
+            Self::Revive => "revive",
         }
     }
 }
@@ -1784,20 +2035,34 @@ impl ObjectParts {
         // Broken across lines rather than joined: a real schema converts several properties, and a
         // single-line object literal runs to hundreds of columns in generated output no formatter is
         // ever allowed to touch.
-        let inner = " ".repeat(frame.indent + 2);
-        let closing = " ".repeat(frame.indent);
         let mut base = value.to_owned();
         for name in &self.omitted {
             base = format!("omit({base}, {})", render_ts_string(name));
         }
         let mut spreads = vec![format!("...{base}")];
         spreads.extend(self.bases.iter().map(|base| format!("...{base}")));
-        spreads.extend(self.passes.iter().map(|pass| format!("...{pass}")));
         spreads.extend(self.parts);
-        Some(format!(
+        let literal_frame = if self.passes.is_empty() {
+            frame
+        } else {
+            frame.inner()
+        };
+        let inner = " ".repeat(literal_frame.indent + 2);
+        let closing = " ".repeat(literal_frame.indent);
+        let literal = format!(
             "{{\n{inner}{},\n{closing}}}",
             spreads.join(&format!(",\n{inner}"))
-        ))
+        );
+        if self.passes.is_empty() {
+            Some(literal)
+        } else {
+            let argument = " ".repeat(frame.indent + 2);
+            let closing = " ".repeat(frame.indent);
+            Some(format!(
+                "Object.assign(\n{argument}{literal},\n{argument}{}\n{closing})",
+                self.passes.join(&format!(",\n{argument}"))
+            ))
+        }
     }
 }
 
@@ -1889,6 +2154,13 @@ struct PairBuilder<'a, 'model, 'input, 'sink> {
     /// walk. A component whose branch points back at an ancestor would inline forever; that branch
     /// falls back to its own codec call, which is where the recursion belongs.
     inlining: Vec<usize>,
+    /// Roots encoded for parameter or form-style serializers. These codecs still convert dates but
+    /// preserve every int64 below the root as the bigint primitive those serializers accept.
+    non_json_roots: Vec<SourceRef>,
+    non_json_encode: bool,
+    /// Component-scoped non-JSON encoders inline references so their date-only semantics propagate
+    /// without creating a parallel recursive codec graph.
+    inline_non_json_refs: bool,
 }
 
 impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
@@ -1905,6 +2177,9 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             pair_imports: BTreeMap::new(),
             helpers: BTreeSet::new(),
             inlining: Vec::new(),
+            non_json_roots: Vec::new(),
+            non_json_encode: false,
+            inline_non_json_refs: false,
         }
     }
 
@@ -1936,7 +2211,20 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
         path: &str,
         frame: Frame,
     ) -> Option<String> {
-        let inner = self.convert_inner(node, direction, value, path, frame)?;
+        let enters_non_json = direction == Direction::Encode
+            && !self.non_json_encode
+            && self
+                .non_json_roots
+                .iter()
+                .any(|source| source == &node.meta().source);
+        if enters_non_json {
+            self.non_json_encode = true;
+        }
+        let inner = self.convert_inner(node, direction, value, path, frame);
+        if enters_non_json {
+            self.non_json_encode = false;
+        }
+        let inner = inner?;
         // A nullable node admits null in both surfaces, and no codec accepts it.
         if node.meta().nullable {
             return Some(format!("{value} === null ? null : {inner}"));
@@ -1953,8 +2241,21 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
         frame: Frame,
     ) -> Option<String> {
         if let Some(kind) = self.facts().site(node) {
+            if self.non_json_encode && kind == TransformKind::IntegerBigInt {
+                return None;
+            }
+            if direction == Direction::Revive {
+                if kind != TransformKind::IntegerBigInt {
+                    return None;
+                }
+                self.helpers.insert("losslessInt64");
+                let helper = local_import_name("losslessInt64", &self.aliases.kernel);
+                return Some(format!("{helper}({path})"));
+            }
             let pointer = self.pointer(&node.meta().source);
-            let codec = direction.codec(kind);
+            let codec = direction
+                .codec(kind)
+                .expect("decode and encode directions always have a transform codec");
             self.helpers.insert(codec);
             let local = local_import_name(codec, &self.aliases.kernel);
             return Some(format!("{local}({value}, {pointer}, {path})"));
@@ -1969,6 +2270,36 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                     .model
                     .schema_target(&target.source_id, &target.json_pointer)
                     .filter(|target| target.transforms)?;
+                if self.non_json_encode {
+                    let node = &self.emitter.model.analyzed.ir.schemas[target.index].schema;
+                    if !super::client::reaches_non_integer_transform(self.emitter.model, node) {
+                        return None;
+                    }
+                    if self.inline_non_json_refs {
+                        if self.inlining.contains(&target.index) {
+                            return None;
+                        }
+                        self.inlining.push(target.index);
+                        let converted = self.convert(node, direction, value, path, frame);
+                        self.inlining.pop();
+                        return converted;
+                    }
+                    let name = format!("encode{}NonJson", target.variant_name(self.position));
+                    self.pair_imports
+                        .entry(target.file_base.clone())
+                        .or_default()
+                        .insert(name.clone());
+                    let local = local_import_name(&name, &self.aliases.siblings);
+                    return Some(format!("{local}({value}, {path})"));
+                }
+                if direction == Direction::Revive
+                    && !self.facts().reaches_kind(
+                        &self.emitter.model.analyzed.ir.schemas[target.index].schema,
+                        TransformKind::IntegerBigInt,
+                    )
+                {
+                    return None;
+                }
                 let name = format!(
                     "{}{}",
                     direction.prefix(),
@@ -2006,7 +2337,10 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                     frame.nested(),
                 )?;
                 self.helpers.insert("pushPath");
-                Some(format!("{value}.map(({item}, {index}) => {element})"))
+                Some(format!(
+                    "{value}.map(({item}, {index}) => {})",
+                    parenthesize_arrow_object(element)
+                ))
             }
             SchemaNode::Tuple {
                 prefix_items, rest, ..
@@ -2384,7 +2718,7 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             format!(".filter(([{key}]) => {})", selections.join(" && "))
         };
         let pass = format!(
-            "Object.fromEntries(Object.entries({value}){selection}.map(([{key}, {entry}]) => [{key}, {converted}]))"
+            "Object.fromEntries(Object.entries({value}){selection}.map(([{key}, {entry}]) => [{key}, {converted}] as const))"
         );
         // A pass that writes every key *is* the whole value and replaces it. Any other pass spreads
         // over the value instead: the keys it leaves alone keep the type the value already gave
@@ -2438,8 +2772,9 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                 self.helpers.insert("pushPath");
                 converted = true;
                 parts.push(format!(
-                    "...{value}.slice({}).map(({item}, {index}) => {element})",
-                    prefix_items.len()
+                    "...{value}.slice({}).map(({item}, {index}) => {})",
+                    prefix_items.len(),
+                    parenthesize_arrow_object(element)
                 ));
             } else {
                 parts.push(format!("...{value}.slice({})", prefix_items.len()));
@@ -2497,7 +2832,7 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                     .filter_map(|(index, literals)| {
                         let test = literals
                             .iter()
-                            .map(|tag| format!("{access} === {}", render_ts_string(tag)))
+                            .map(|tag| format!("{access} === {}", render_ts_value(tag)))
                             .collect::<Vec<_>>()
                             .join(" || ");
                         (!test.is_empty()).then_some((test, index))
@@ -2535,6 +2870,7 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                     self.helpers.insert("isPlainDate");
                     format!("isPlainDate({value})")
                 }
+                TransformKind::IntegerBigInt => format!("typeof {value} === \"bigint\""),
             };
         }
         kind_test(kinds, value)
@@ -2564,6 +2900,14 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
             return None;
         }
         Some(format!("{} : {value}", rendered.join(" : ")))
+    }
+}
+
+fn parenthesize_arrow_object(expression: String) -> String {
+    if expression.starts_with('{') {
+        format!("({expression})")
+    } else {
+        expression
     }
 }
 
@@ -2614,7 +2958,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::client_model::build_client_model;
+    use crate::client_model::{
+        FieldSerializationPlan, FieldWrapperPlan, PartMediaPlan, PayloadKind, build_client_model,
+    };
     use crate::config::{DateRepresentation, DateTimeRepresentation, ResolvedConfig, load_config};
     use crate::diag::DiagnosticSink;
     use crate::emit::emit_artifacts;
@@ -2773,6 +3119,44 @@ mod tests {
                 |config| config.types.date_time = DateTimeRepresentation::Date,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn a_binary_upload_form_field_uses_an_untyped_transform_shape() {
+        let source = SourceRef::default();
+        let schema = form_field_schema(&FormFieldPlan {
+            name: "archive".to_owned(),
+            required: true,
+            schema: SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                format: Some("binary".to_owned()),
+                enum_values: None,
+                const_value: None,
+                meta: SchemaMeta::default(),
+            },
+            serialization: FieldSerializationPlan::Content {
+                media: PartMediaPlan {
+                    values: vec!["application/octet-stream".to_owned()],
+                    payloads: vec![PayloadKind::Binary],
+                    all_concrete: true,
+                    binary_upload: true,
+                    declared: false,
+                },
+                encoding_source: None,
+            },
+            wrapper: FieldWrapperPlan {
+                wrapped: false,
+                content_type_literal: true,
+                filename: true,
+            },
+            source: source.clone(),
+        });
+        assert_eq!(
+            schema,
+            SchemaNode::Any {
+                meta: operation_schema_meta(source)
+            }
         );
     }
 
@@ -3255,6 +3639,57 @@ mod tests {
     }
 
     #[test]
+    fn a_non_string_discriminator_dispatches_on_its_own_literal_type() {
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Scheduled": {
+                    "type": "object",
+                    "required": ["kind", "at"],
+                    "properties": {
+                        "kind": { "type": "integer", "const": 1 },
+                        "at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Cancelled": {
+                    "type": "object",
+                    "required": ["kind", "on"],
+                    "properties": {
+                        "kind": { "type": "integer", "const": 2 },
+                        "on": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Archived": {
+                    "type": "object",
+                    "required": ["kind", "until"],
+                    "properties": {
+                        "kind": { "type": "string", "const": "cat" },
+                        "until": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Notice": {
+                    "oneOf": [
+                        { "$ref": "#/components/schemas/Scheduled" },
+                        { "$ref": "#/components/schemas/Cancelled" },
+                        { "$ref": "#/components/schemas/Archived" }
+                    ],
+                    "discriminator": { "propertyName": "kind" }
+                }
+            })),
+            |config| config.types.date_time = DateTimeRepresentation::Date,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(refusals(&diagnostics).is_empty(), "{diagnostics:#?}");
+        let content = files
+            .into_iter()
+            .find(|file| file.relative_path == "client/transform/components/notice.ts")
+            .expect("notice codec module")
+            .content;
+        assert!(content.contains("value.kind === 1"), "{content}");
+        assert!(!content.contains("value.kind === \"1\""), "{content}");
+        assert!(content.contains("value.kind === \"cat\""), "{content}");
+    }
+
+    #[test]
     fn a_refusable_union_is_not_refused_in_string_mode() {
         let (_files, diagnostics, _has_errors) = compile_document(
             notice_document(json!({
@@ -3440,9 +3875,11 @@ mod tests {
             .remove("runtime")
             .expect("the kernel import entry")
             .into_iter()
+            .filter(|name| name.starts_with("decode") || name.starts_with("encode"))
             .collect();
         aliasable.sort_unstable();
         assert_eq!(declared, aliasable);
+        assert_eq!(Direction::Revive.codec(TransformKind::IntegerBigInt), None);
     }
 
     #[test]
@@ -3484,7 +3921,9 @@ mod pair_tests {
 
     use super::Diagnostic;
     use super::tests::{compile_document, notice_document};
-    use crate::config::{DateRepresentation, DateTimeRepresentation, ResolvedConfig};
+    use crate::config::{
+        DateRepresentation, DateTimeRepresentation, IntegerRepresentation, ResolvedConfig,
+    };
 
     fn date_mode(config: &mut ResolvedConfig) {
         config.types.date_time = DateTimeRepresentation::Date;
@@ -3493,6 +3932,15 @@ mod pair_tests {
     fn temporal_mode(config: &mut ResolvedConfig) {
         config.types.date_time = DateTimeRepresentation::Temporal;
         config.types.date = DateRepresentation::Temporal;
+    }
+
+    fn bigint_mode(config: &mut ResolvedConfig) {
+        config.types.integer = IntegerRepresentation::Bigint;
+    }
+
+    fn date_and_bigint_mode(config: &mut ResolvedConfig) {
+        date_mode(config);
+        bigint_mode(config);
     }
 
     /// The emitted pair module for one component, or `None` when the component emits none.
@@ -3599,6 +4047,147 @@ mod pair_tests {
             "{content}"
         );
         assert!(content.contains("decodeInstantBody(value.at"), "{content}");
+    }
+
+    #[test]
+    fn integer_bigint_pairs_call_the_int64_kernel_codecs() {
+        let content = pairs(
+            json!({
+                "Dated": {
+                    "type": "object",
+                    "required": ["at"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Notice": {
+                    "type": "object",
+                    "required": ["id", "at", "dated", "requestId", "responseId"],
+                    "properties": {
+                        "id": {
+                            "oneOf": [
+                                { "type": "integer", "format": "int64" },
+                                { "type": "string" }
+                            ]
+                        },
+                        "at": { "type": "string", "format": "date-time" },
+                        "dated": { "$ref": "#/components/schemas/Dated" },
+                        "requestId": {
+                            "type": "integer",
+                            "format": "int64",
+                            "writeOnly": true
+                        },
+                        "responseId": {
+                            "type": "integer",
+                            "format": "int64",
+                            "readOnly": true
+                        }
+                    }
+                }
+            }),
+            "notice",
+            date_and_bigint_mode,
+        )
+        .expect("a bigint int64 component emits a pair module");
+        assert!(
+            content.contains("decodeInt64")
+                && content.contains("encodeInt64")
+                && content.contains("from \"../runtime.js\";"),
+            "{content}"
+        );
+        assert!(content.contains("decodeInt64(value.id"), "{content}");
+        assert!(content.contains("encodeInt64(value.id"), "{content}");
+        assert!(
+            content.contains("export function reviveNotice("),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function reviveNoticeRequest("),
+            "{content}"
+        );
+        assert!(
+            content.contains("export function reviveNoticeResponse("),
+            "{content}"
+        );
+        assert!(
+            content.contains("typeof value.id === \"bigint\" ? encodeInt64(value.id"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn non_json_component_encoder_parenthesizes_inlined_object_array_items() {
+        let content = pairs(
+            json!({
+                "Counter": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "Item": {
+                    "type": "object",
+                    "required": ["at", "counter"],
+                    "properties": {
+                        "at": { "type": "string", "format": "date-time" },
+                        "counter": { "$ref": "#/components/schemas/Counter" }
+                    }
+                },
+                "Collection": {
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/Item" }
+                        }
+                    }
+                },
+                "Notice": { "$ref": "#/components/schemas/Collection" }
+            }),
+            "collection",
+            date_and_bigint_mode,
+        )
+        .expect("a converting component emits a pair module");
+        let non_json = content
+            .split_once("export function encodeCollectionNonJson")
+            .map(|(_, body)| body)
+            .expect("non-JSON component encoder");
+        assert!(non_json.contains(".map((item0, index0) => ({"), "{content}");
+        assert!(
+            non_json.contains("encodeDateTimeDate(item0.at"),
+            "{content}"
+        );
+        assert!(!non_json.contains("encodeInt64"), "{content}");
+    }
+
+    #[test]
+    fn integer_number_default_emits_no_wire_twin_or_pair() {
+        let (files, diagnostics, has_errors) = compile_document(
+            notice_document(json!({
+                "Notice": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" }
+                    }
+                }
+            })),
+            |_| {},
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let notice = files
+            .iter()
+            .find(|file| file.relative_path == "types/components/notice.ts")
+            .expect("notice type module");
+        assert!(notice.content.contains("id: number;"), "{}", notice.content);
+        assert!(!notice.content.contains("NoticeWire"), "{}", notice.content);
+        assert!(
+            files
+                .iter()
+                .all(|file| file.relative_path != "client/transform/components/notice.ts")
+        );
     }
 
     #[test]
@@ -3715,7 +4304,7 @@ mod pair_tests {
         // converted twice and none is left a wire string.
         assert!(
             content.contains(
-                "...Object.fromEntries(Object.entries(value).filter(([key0]) => ![\"at\"].includes(key0)).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0,"
+                "Object.fromEntries(Object.entries(value).filter(([key0]) => ![\"at\"].includes(key0)).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0,"
             ),
             "{content}"
         );
@@ -3943,9 +4532,9 @@ mod pair_tests {
             .find("...decodeBase(value, path)")
             .expect("the ref base");
         let pass = content
-            .find("...Object.fromEntries")
+            .find("Object.fromEntries")
             .expect("the key-selected pass");
-        assert!(base < pass, "the pass must spread last: {content}");
+        assert!(base < pass, "the pass must assign last: {content}");
     }
 
     #[test]
@@ -4464,13 +5053,15 @@ mod pair_tests {
             .expect("notice codec module")
             .content;
         // The key test is the template-literal key's own match rule, and a key it rejects is left
-        // out of the pass entirely rather than written back unconverted.
+        // out of the pass entirely rather than written back unconverted. `Object.assign` preserves
+        // the converted entry type beside the source's broad unknown index signature.
         assert!(
             content.contains(
-                "Object.entries(value).filter(([key0]) => key0.startsWith(\"x-\")).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0, P0, pushPath(path, key0))])"
+                "Object.entries(value).filter(([key0]) => key0.startsWith(\"x-\")).map(([key0, entry0]) => [key0, decodeDateTimeDate(entry0, P0, pushPath(path, key0))] as const)"
             ),
             "{content}"
         );
+        assert!(content.contains("return Object.assign("), "{content}");
     }
 
     #[test]
@@ -4777,7 +5368,7 @@ mod pair_tests {
     }
 
     #[test]
-    fn pointer_constants_are_hoisted_in_first_seen_order_and_shared_by_both_directions() {
+    fn pointer_constants_are_hoisted_in_first_seen_order_and_shared_by_every_codec() {
         let content = pairs(
             json!({
                 "Notice": {
@@ -4798,7 +5389,7 @@ mod pair_tests {
         assert!(!content.contains("P2"), "{content}");
         assert_eq!(
             content.matches("P0, pushPath(path, \"a\")").count(),
-            2,
+            3,
             "{content}"
         );
     }
@@ -5201,7 +5792,7 @@ mod pair_tests {
             content.matches("at: decodeDateTimeDate(value.at,").count(),
             1
         );
-        assert_eq!(content.matches("...omit(value, \"at\"),").count(), 2);
+        assert_eq!(content.matches("...omit(value, \"at\"),").count(), 3);
     }
 
     #[test]
@@ -5301,8 +5892,8 @@ mod pair_tests {
         );
         assert_eq!(
             content.matches("...value,").count(),
-            2,
-            "one spread each way: {content}"
+            3,
+            "one spread per codec: {content}"
         );
     }
 
@@ -5623,11 +6214,20 @@ mod operation_pair_tests {
     use serde_json::{Value, json};
 
     use super::tests::compile_document;
-    use crate::config::{DateTimeRepresentation, ResolvedConfig};
+    use crate::config::{DateTimeRepresentation, IntegerRepresentation, ResolvedConfig};
     use crate::emit::GeneratedFile;
 
     fn date_mode(config: &mut ResolvedConfig) {
         config.types.date_time = DateTimeRepresentation::Date;
+    }
+
+    fn bigint_mode(config: &mut ResolvedConfig) {
+        config.types.integer = IntegerRepresentation::Bigint;
+    }
+
+    fn date_and_bigint_mode(config: &mut ResolvedConfig) {
+        date_mode(config);
+        bigint_mode(config);
     }
 
     fn operation_document(operation: Value, schemas: Value) -> Value {
@@ -5731,14 +6331,18 @@ mod operation_pair_tests {
                             "multipart/form-data": {
                                 "schema": {
                                     "type": "object",
-                                    "required": ["happened-at"],
+                                    "required": ["happened-at", "count"],
                                     "properties": {
                                         "happened-at": {
                                             "type": "string",
                                             "format": "date-time"
                                         },
+                                        "count": { "type": "integer", "format": "int64" },
                                         "label": { "type": "string" }
                                     }
+                                },
+                                "encoding": {
+                                    "count": { "contentType": "application/json" }
                                 }
                             }
                         }
@@ -5747,7 +6351,7 @@ mod operation_pair_tests {
                 }),
                 json!({}),
             ),
-            date_mode,
+            date_and_bigint_mode,
         );
 
         assert!(!has_errors, "{diagnostics:#?}");
@@ -5757,7 +6361,91 @@ mod operation_pair_tests {
             content.contains("\"happened-at\": encodeDateTimeDate(value.body[\"happened-at\"]"),
             "{content}"
         );
+        assert!(
+            content.contains("count: encodeInt64(value.body.count"),
+            "{content}"
+        );
         assert!(!content.contains("value.body.label"), "{content}");
+    }
+
+    #[test]
+    fn a_bigint_content_field_mixing_json_and_text_is_refused() {
+        for body_media in ["application/x-www-form-urlencoded", "multipart/form-data"] {
+            let (_files, diagnostics, has_errors) = compile_document(
+                operation_document(
+                    json!({
+                        "operationId": "submitMixedCounter",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                (body_media): {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["id"],
+                                        "properties": {
+                                            "id": { "type": "integer", "format": "int64" }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "id": { "contentType": "application/json, text/plain" }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }),
+                    json!({}),
+                ),
+                date_and_bigint_mode,
+            );
+
+            assert!(has_errors, "{body_media}: {diagnostics:#?}");
+            assert_eq!(
+                refused(&diagnostics).len(),
+                1,
+                "{body_media}: {diagnostics:#?}"
+            );
+            assert!(
+                refused(&diagnostics)[0].contains("mixes JSON and non-JSON media"),
+                "{body_media}: {diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bigint_sse_event_is_refused_before_emitting_a_decoder() {
+        let (_files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "watchCounters",
+                    "responses": {
+                        "200": {
+                            "description": "events",
+                            "content": {
+                                "text/event-stream": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["id"],
+                                        "properties": {
+                                            "id": { "type": "integer", "format": "int64" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+                json!({}),
+            ),
+            bigint_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        assert_eq!(refused(&diagnostics).len(), 1, "{diagnostics:#?}");
+        assert!(
+            refused(&diagnostics)[0].contains("SSE event schema applies an int64 transform"),
+            "{diagnostics:#?}"
+        );
     }
 
     #[test]
@@ -6073,6 +6761,46 @@ mod operation_pair_tests {
     }
 
     #[test]
+    fn a_bigint_multipart_response_refusal_gives_integer_advice() {
+        let (_files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "downloadCounter",
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "counter": {
+                                                "type": "integer",
+                                                "format": "int64"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+                json!({}),
+            ),
+            bigint_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        assert_eq!(
+            refused(&diagnostics),
+            [
+                "response '200' entry 'multipart/form-data' applies an int64 transform, but its payload is the object its parts decode to rather than the shape its schema renders, and no emitted codec converts that object; set the integer representation back to number"
+            ],
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
     fn a_multipart_binary_part_does_not_claim_a_transform() {
         let (_files, diagnostics, has_errors) = compile_document(
             json!({
@@ -6277,6 +7005,42 @@ mod operation_pair_tests {
     }
 
     #[test]
+    fn an_int64_response_reviver_guards_transform_failures() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "readCounter",
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["id"],
+                                        "properties": {
+                                            "id": { "type": "integer", "format": "int64" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+                json!({}),
+            ),
+            bigint_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = operation_module(&files, "readcounter").expect("operation codec");
+        assert!(
+            content.contains("return guarded(() => (withLosslessJson(lossless"),
+            "{content}"
+        );
+        assert!(content.contains("\"response\""), "{content}");
+    }
+
+    #[test]
     fn response_media_shapes_cover_text_binary_and_media_unions() {
         let timed = json!({
             "type": "object",
@@ -6441,6 +7205,140 @@ mod operation_pair_tests {
             "{content}"
         );
         assert!(content.contains("export function encodeReadEventInput(value: ReadEventInput, path: ApplicationPath = []): ReadEventInputWire"), "{content}");
+    }
+
+    #[test]
+    fn integer_bigint_flat_parameters_stay_bigint_while_content_json_encodes() {
+        let (files, diagnostics, has_errors) = compile_document(
+            json!({
+                "openapi": "3.1.0",
+                "info": { "title": "t", "version": "1" },
+                "paths": {
+                    "/counters/{id}": {
+                        "get": {
+                            "operationId": "readCounter",
+                            "parameters": [
+                                {
+                                    "name": "id",
+                                    "in": "path",
+                                    "required": true,
+                                    "schema": { "type": "integer", "format": "int64" }
+                                },
+                                {
+                                    "name": "filter",
+                                    "in": "query",
+                                    "required": true,
+                                    "content": {
+                                        "application/json": {
+                                            "schema": { "type": "integer", "format": "int64" }
+                                        }
+                                    }
+                                }
+                            ],
+                            "responses": { "204": { "description": "done" } }
+                        }
+                    }
+                }
+            }),
+            bigint_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let client = files
+            .iter()
+            .find(|file| file.relative_path == "client/operations/readcounter.ts")
+            .expect("client operation");
+        assert!(client.content.contains("id: bigint;"), "{}", client.content);
+        assert!(
+            client.content.contains("filter: bigint;"),
+            "{}",
+            client.content
+        );
+        let content = operation_module(&files, "readcounter").expect("operation codec");
+        assert!(
+            content.contains("encodeInt64(value.query.filter"),
+            "{content}"
+        );
+        assert!(!content.contains("encodeInt64(value.path.id"), "{content}");
+    }
+
+    #[test]
+    fn non_json_parameters_and_form_fields_encode_dates_without_encoding_int64() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "submitMixedCounter",
+                    "parameters": [{
+                        "name": "filter",
+                        "in": "query",
+                        "required": true,
+                        "style": "deepObject",
+                        "explode": true,
+                        "schema": { "$ref": "#/components/schemas/DatedCounter" }
+                    }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/x-www-form-urlencoded": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["values"],
+                                    "properties": {
+                                        "values": {
+                                            "type": "array",
+                                            "items": {
+                                                "oneOf": [
+                                                    { "type": "string", "format": "date-time" },
+                                                    { "type": "integer", "format": "int64" }
+                                                ]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": { "204": { "description": "done" } }
+                }),
+                json!({
+                    "DatedCounter": {
+                        "type": "object",
+                        "required": ["at", "id"],
+                        "properties": {
+                            "at": { "type": "string", "format": "date-time" },
+                            "id": { "type": "integer", "format": "int64" }
+                        }
+                    }
+                }),
+            ),
+            date_and_bigint_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = operation_module(&files, "submitmixedcounter").expect("operation codec");
+        assert!(
+            content.contains("encodeDatedCounterNonJson(value.query.filter"),
+            "{content}"
+        );
+        assert!(content.contains("encodeDateTimeDate(item0"), "{content}");
+        assert!(!content.contains("encodeInt64"), "{content}");
+        let component = files
+            .iter()
+            .find(|file| file.relative_path == "client/transform/components/datedcounter.ts")
+            .map(|file| file.content.as_str())
+            .expect("component codec");
+        let non_json = component
+            .split_once("export function encodeDatedCounterNonJson")
+            .map(|(_, body)| body)
+            .expect("non-JSON component encoder");
+        assert!(
+            non_json.contains("encodeDateTimeDate(value.at"),
+            "{component}"
+        );
+        assert!(!non_json.contains("encodeInt64"), "{component}");
+        let client = client_operation(&files, "submitmixedcounter");
+        assert!(
+            client.contains("import type { DatedCounter, DatedCounterWire }"),
+            "{client}"
+        );
     }
 
     #[test]

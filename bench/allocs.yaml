@@ -264,9 +264,9 @@ keys:
         deallocs: 30
         allocBytes: 2788
       - stage: "emit"
-        allocs: 1291
+        allocs: 1309
         reallocs: 277
-        deallocs: 1264
+        deallocs: 1282
         allocBytes: 247088
     informational:
       peakBytes: 172674
@@ -294,10 +294,10 @@ keys:
         deallocs: 30
         allocBytes: 2788
       - stage: "emit"
-        allocs: 906
-        reallocs: 305
-        deallocs: 877
-        allocBytes: 100554
+        allocs: 907
+        reallocs: 306
+        deallocs: 878
+        allocBytes: 101763
     informational:
       peakBytes: 93424
   - fixture: "petstore-3.0-client"
@@ -329,9 +329,9 @@ keys:
         deallocs: 24
         allocBytes: 18194
       - stage: "emit"
-        allocs: 1349
+        allocs: 1354
         reallocs: 353
-        deallocs: 1285
+        deallocs: 1290
         allocBytes: 335446
     informational:
       peakBytes: 308618
@@ -364,9 +364,9 @@ keys:
         deallocs: 30
         allocBytes: 18020
       - stage: "emit"
-        allocs: 1851
+        allocs: 1856
         reallocs: 471
-        deallocs: 1812
+        deallocs: 1817
         allocBytes: 470528
     informational:
       peakBytes: 304455
@@ -429,9 +429,9 @@ keys:
         deallocs: 175
         allocBytes: 89003
       - stage: "emit"
-        allocs: 4018
+        allocs: 4027
         reallocs: 1016
-        deallocs: 3947
+        deallocs: 3956
         allocBytes: 705709
     informational:
       peakBytes: 534305
@@ -464,9 +464,9 @@ keys:
         deallocs: 189
         allocBytes: 45476
       - stage: "emit"
-        allocs: 2938
+        allocs: 2949
         reallocs: 843
-        deallocs: 2881
+        deallocs: 2892
         allocBytes: 473887
     informational:
       peakBytes: 405556
