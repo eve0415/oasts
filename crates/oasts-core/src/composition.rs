@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use foldhash::{HashMap, HashSet, HashSetExt};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde_json::Value;
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
@@ -12,6 +12,10 @@ use crate::ir::{
 };
 
 pub(crate) const CODE_COMPOSITION: &str = "OASTS1303";
+/// A property two `allOf` branches declare with intersecting-to-nothing schemas. A warning,
+/// not one of the four emptiness proofs: the node keeps its intersection type and only the
+/// one property is uninhabitable, which TypeScript shows as a silent `never`.
+pub(crate) const CODE_CONFLICTING_PROPERTY: &str = "OASTS1315";
 
 /// Replaces every `allOf` proven empty with `Never`, preserving its source metadata and reporting
 /// each independent proof as a warning. The proof pass is immutable so references can resolve
@@ -125,7 +129,16 @@ impl<'ir> CompositionAnalysis<'ir> {
             diagnostics.extend(
                 messages
                     .into_iter()
-                    .map(|message| warning_diagnostic(message, &meta.source)),
+                    .map(|message| warning_diagnostic(CODE_COMPOSITION, message, &meta.source)),
+            );
+            // Reported beside the emptiness proofs, never lowered with them: one
+            // uninhabitable property does not make the object uninhabitable.
+            diagnostics.extend(
+                self.conflicting_properties(branches)
+                    .into_iter()
+                    .map(|message| {
+                        warning_diagnostic(CODE_CONFLICTING_PROPERTY, message, &meta.source)
+                    }),
             );
         }
         match schema {
@@ -245,6 +258,96 @@ impl<'ir> CompositionAnalysis<'ir> {
             }
         }
         messages
+    }
+
+    /// Properties that more than one branch declares with schemas whose intersection is
+    /// provably empty. `merge_all_of` used to fold such a property away by refusing to merge
+    /// and letting the whole node re-render; identity-first joins the branches with `&`
+    /// instead, so the conflict survives into TypeScript as a property silently typed
+    /// `never`. Inequality alone is not a conflict — narrowing a base's property is what
+    /// `allOf` is for — so this reuses the same three domain proofs `prove_empty` applies to
+    /// whole branches, one property at a time.
+    fn conflicting_properties(&self, branches: &[SchemaNode]) -> Vec<String> {
+        let objects = branches
+            .iter()
+            .filter_map(|branch| {
+                let resolved = self.resolve_ref(branch, &mut HashSet::new())?;
+                match resolved {
+                    SchemaNode::Object { properties, .. } => Some(properties),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        // Group by property name in declaration order, so the message reads in the order the
+        // document declares the branches and the output stays deterministic.
+        let mut names = Vec::new();
+        let mut declarations: HashMap<&str, Vec<&SchemaNode>> = HashMap::new();
+        for properties in &objects {
+            for (name, schema, _) in properties.iter() {
+                let slot = declarations.entry(name.as_str()).or_insert_with(|| {
+                    names.push(name.as_str());
+                    Vec::new()
+                });
+                slot.push(schema);
+            }
+        }
+        let mut messages = Vec::new();
+        for name in names {
+            let declared = &declarations[name];
+            if declared.len() < 2 {
+                continue;
+            }
+            if let Some(reason) = self.empty_intersection_reason(declared) {
+                messages.push(format!(
+                    "allOf branches declare property '{name}' with {reason}; the branches intersect, so the property is uninhabitable"
+                ));
+            }
+        }
+        messages
+    }
+
+    /// The three whole-domain proofs `prove_empty` runs, applied to one property's schemas.
+    /// The closed-object rule is deliberately absent: it is about a branch's own
+    /// `additionalProperties`, which says nothing about a nested property.
+    fn empty_intersection_reason(&self, schemas: &[&SchemaNode]) -> Option<&'static str> {
+        let domains = schemas
+            .iter()
+            .filter_map(|schema| self.primitive_domain(schema, &mut HashSet::new()))
+            .collect::<Vec<_>>();
+        if domains.len() >= 2 {
+            let mut intersection = domains[0].clone();
+            for domain in &domains[1..] {
+                intersection.retain(|atom| domain.contains(atom));
+            }
+            if intersection.is_empty() {
+                return Some("disjoint primitive type sets");
+            }
+        }
+
+        let finite_sets = schemas
+            .iter()
+            .filter_map(|schema| self.finite_constraint(schema, &mut HashSet::new()))
+            .collect::<Vec<_>>();
+        if finite_sets.len() >= 2 {
+            let mut intersection = finite_sets[0].clone();
+            for values in &finite_sets[1..] {
+                intersection.retain(|value| values.iter().any(|other| json_equal(value, other)));
+            }
+            if intersection.is_empty() {
+                return Some("incompatible const or finite-enum constraints");
+            }
+        }
+
+        let bounds = schemas
+            .iter()
+            .filter_map(|schema| self.numeric_bounds(schema, &mut HashSet::new()))
+            .collect::<Vec<_>>();
+        if let Some(combined) = bounds.into_iter().reduce(NumericBounds::intersect)
+            && combined.is_empty()
+        {
+            return Some("an empty numeric interval");
+        }
+        None
     }
 
     fn resolve_ref<'a>(
@@ -471,8 +574,12 @@ fn source_key(source: &SourceRef) -> SchemaRef {
     }
 }
 
-fn warning_diagnostic(message: impl Into<String>, source: &SourceRef) -> Diagnostic {
-    let mut diagnostic = Diagnostic::input(CODE_COMPOSITION, message)
+fn warning_diagnostic(
+    code: &'static str,
+    message: impl Into<String>,
+    source: &SourceRef,
+) -> Diagnostic {
+    let mut diagnostic = Diagnostic::input(code, message)
         .with_source(&source.source_id)
         .with_json_pointer(&source.json_pointer);
     diagnostic.severity = Severity::Warning;
@@ -754,7 +861,7 @@ mod tests {
                 .contains(&PrimitiveAtom::Null)
         );
 
-        let diagnostic = warning_diagnostic("proof", &meta("/proof").source);
+        let diagnostic = warning_diagnostic(CODE_COMPOSITION, "proof", &meta("/proof").source);
         assert_eq!((diagnostic.line, diagnostic.col), (Some(3), Some(5)));
     }
 

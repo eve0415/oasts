@@ -23,7 +23,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::client_model::{BodyPlan, BodyPlanArm, ClientModel, FormFieldPlan};
 #[cfg(test)]
-use crate::composition::CODE_COMPOSITION;
+use crate::composition::{CODE_COMPOSITION, CODE_CONFLICTING_PROPERTY};
 use crate::composition::{finite_values, json_equal};
 use crate::config::{
     DateRepresentation, DateTimeRepresentation, DocumentationConfig, EnumRepresentation, FileCase,
@@ -7795,12 +7795,16 @@ mod tests {
                 .count(),
             1
         );
+        // Two: the discriminator warning above, and OASTS1315 for `Intersected`. `Cat & Dog`
+        // types `kind` as `"cat" & "dog"`, so that one property really is uninhabitable —
+        // the intersection is still what gets emitted, and the warning is the only thing
+        // that says the property inside it collapsed.
         assert_eq!(
             diagnostics
                 .iter()
                 .filter(|diagnostic| diagnostic.severity == Severity::Warning)
                 .count(),
-            1
+            2
         );
         let animal = files
             .iter()
@@ -7820,6 +7824,12 @@ mod tests {
             .find(|file| file.relative_path.ends_with("intersected.ts"))
             .expect("Intersected");
         assert!(generated_body(intersection).contains("export type Intersected = Cat & Dog;"));
+        let conflicting = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
+            .collect::<Vec<_>>();
+        assert_eq!(conflicting.len(), 1, "{diagnostics:?}");
+        assert!(conflicting[0].message.contains("kind"), "{conflicting:?}");
     }
 
     #[test]
@@ -8254,6 +8264,98 @@ mod tests {
             ),
             "workspace/nested/shared.json"
         );
+    }
+
+    #[test]
+    fn conflicting_property_across_all_of_branches_warns_without_lowering() {
+        // Identity-first sends every all-`$ref` `allOf` down the intersection path, so a
+        // property two branches disagree about is no longer folded away by the merge — it
+        // reaches TypeScript as `string & number`, which is silently `never` at exactly one
+        // property. OASTS1315 is the only signal that says so.
+        //
+        // It fires on a provably empty intersection, not on any inequality. Narrowing a
+        // property is what `allOf` is *for* — the discriminator idiom refines a base's
+        // `kind: string` to `const: "cat"` — and warning on that would fire on most real
+        // documents that use `allOf` at all.
+        let (files, diagnostics) = compile(
+            openapi(json!({
+                "Conflict": { "allOf": [
+                    { "type": "object", "properties": { "a": { "type": "string" } } },
+                    { "type": "object", "properties": { "a": { "type": "number" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        let flagged = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
+            .collect::<Vec<_>>();
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        assert_eq!(flagged[0].severity, Severity::Warning);
+        assert!(flagged[0].message.contains('a'), "{:?}", flagged[0]);
+        // A warning, not a proof of emptiness: the node keeps its intersection type.
+        let conflict = schema_file(&files, "conflict");
+        assert!(
+            !conflict.content.contains("export type Conflict = never;"),
+            "{}",
+            conflict.content
+        );
+
+        // Identical declarations merge, so nothing to say.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Same": { "allOf": [
+                    { "type": "object", "properties": { "a": { "type": "string" } } },
+                    { "type": "object", "properties": { "a": { "type": "string" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        // A numeric property whose bounds cannot both hold.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Bounds": { "allOf": [
+                    { "type": "object", "properties": { "n": { "type": "number", "minimum": 5 } } },
+                    { "type": "object", "properties": { "n": { "type": "number", "maximum": 4 } } }
+                ] }
+            })),
+            json!({}),
+        );
+        let flagged = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
+            .collect::<Vec<_>>();
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        let message = &flagged[0].message;
+        assert!(message.contains("empty numeric interval"), "{message}");
+
+        // Overlapping finite sets intersect to `"y"`. Unequal, inhabitable, silent.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Overlap": { "allOf": [
+                    { "type": "object", "properties": { "a": { "type": "string", "enum": ["x", "y"] } } },
+                    { "type": "object", "properties": { "a": { "type": "string", "const": "y" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        // The discriminator idiom: a base's open `kind` refined to one literal. Unequal, and
+        // entirely legitimate — the intersection is `"cat"`, not `never`.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Base": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string" } } },
+                "Cat": { "allOf": [
+                    { "$ref": "#/components/schemas/Base" },
+                    { "type": "object", "properties": { "kind": { "type": "string", "const": "cat" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
