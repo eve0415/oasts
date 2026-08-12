@@ -16,8 +16,7 @@
 //     is validated (and normally fails its type check).
 //   - Type gating. An assertion keyword applies only when the instance is of the keyword's target
 //     JSON type; otherwise it is inert and only the `type` keyword, if present, reports the
-//     mismatch. Asserted formats apply only to strings, while `format:int32` and `format:int64`
-//     apply only to integers.
+//     mismatch. Asserted formats apply only to strings, `format:int32` only to integers.
 //   - Collect-all. No fail-fast. Issue order equals evaluation order equals schema document order:
 //     properties in declaration order, array items ascending, allOf branches in order.
 //   - Compositions. `allOf` aggregates every branch's issues at their own paths. `anyOf` with zero
@@ -60,7 +59,6 @@
 //               invalid time format
 //               invalid uuid format
 //               out of int32 range
-//               out of int64 range
 
 export type ConformanceCase = {
   readonly id: string; // unique, stable, e.g. 'minLength/short-string-rejected'
@@ -1027,30 +1025,6 @@ export const cases: readonly ConformanceCase[] = [
     input: { int64Id: Number.MAX_SAFE_INTEGER },
     expected: { verdict: "pass" },
   },
-  {
-    // One past Number.MAX_SAFE_INTEGER is still an int64: the safe-integer boundary is about what a
-    // double can represent exactly, which is a different question from what the format admits. This
-    // row exists because an earlier revision of this vector conflated the two and rejected it.
-    id: "format:int64/over-safe-boundary",
-    matrixRow: "format:int64",
-    validator: "numericValidator",
-    input: { int64Id: Number.MAX_SAFE_INTEGER + 1 },
-    expected: { verdict: "pass" },
-  },
-  {
-    // 2^63 is the first value past the signed 64-bit maximum, and a power of two, so the double
-    // holds it exactly — the rejection is the range check, not a rounding artefact. int64Id carries
-    // no minimum/maximum, so int64 is the only failing keyword.
-    id: "format:int64/over-range",
-    matrixRow: "format:int64",
-    validator: "numericValidator",
-    input: { int64Id: 2 ** 63 },
-    expected: {
-      verdict: "fail",
-      issues: [{ message: "out of int64 range", path: ["int64Id"] }],
-    },
-  },
-
   // --- patternProperties (patternBagValidator) ---
   {
     id: "patternProperties/declared-and-pattern-keys-valid",

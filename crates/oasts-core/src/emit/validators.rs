@@ -132,7 +132,6 @@ const VALIDATOR_RESERVED_NAMES: &[&str] = &[
     "isTime",
     "isUuid",
     "isInt32",
-    "isInt64",
     "int64WireValue",
     "StandardSchemaV1",
     "SyncStandardSchemaV1",
@@ -460,7 +459,7 @@ fn validation_flow_cost(schema: &SchemaNode, position: TypePosition) -> usize {
                         + meta.numeric_constraints().multiple_of.is_some() as usize
                         + usize::from(
                             matches!(ty, PrimitiveType::Integer)
-                                && matches!(format.as_deref(), Some("int32" | "int64")),
+                                && format.as_deref() == Some("int32"),
                         )
                 }
                 PrimitiveType::Boolean | PrimitiveType::Null => 0,
@@ -2287,14 +2286,11 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         iss: &str,
     ) {
         self.gen_number_constraints_inner(meta, val, path, iss);
-        // The integer-format clauses are type-specific (they need a declared integer), so they live
-        // here rather than in the shared inner body the typeless path reuses.
+        // The int32 clause is type-specific (it needs a declared integer/int32), so it lives here
+        // rather than in the shared inner body the typeless path reuses.
         if matches!(ty, PrimitiveType::Integer) && format == Some("int32") {
             self.scope.runtime_values.insert("isInt32");
             self.push_issue(&format!("!isInt32({val})"), path, iss, "out of int32 range");
-        } else if matches!(ty, PrimitiveType::Integer) && format == Some("int64") {
-            self.scope.runtime_values.insert("isInt64");
-            self.push_issue(&format!("!isInt64({val})"), path, iss, "out of int64 range");
         } else if format.is_some() {
             self.mark_incomplete();
         }
@@ -5878,31 +5874,6 @@ mod tests {
     }
 
     #[test]
-    fn int64_format_emits_safe_integer_range_check() {
-        let (files, diagnostics) = compile(doc_31(json!({
-            "Thing": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "format": "int64" }
-                }
-            },
-            "NotInt64": {
-                "not": { "type": "integer", "format": "int64" }
-            }
-        })));
-        assert_clean(&diagnostics);
-        let content = component(&files, "thing");
-        assert!(content.contains("if (!isInt64(value0)) {"), "{content}");
-        assert!(content.contains("\"out of int64 range\""), "{content}");
-        let negated = component(&files, "notint64");
-        assert!(negated.contains("isInt64"), "{negated}");
-        assert!(
-            negated.contains("\"value matches not schema\""),
-            "{negated}"
-        );
-    }
-
-    #[test]
     fn bigint_int64_validates_each_lossless_wire_representation() {
         let (files, diagnostics) = compile_with_config(
             doc_31(json!({
@@ -5975,7 +5946,8 @@ mod tests {
                 "type": "object",
                 "properties": {
                     "e": { "type": "string", "format": "email" },
-                    "u": { "type": "string", "format": "uri" }
+                    "u": { "type": "string", "format": "uri" },
+                    "id": { "type": "integer", "format": "int64" }
                 }
             }
         })));
@@ -5983,8 +5955,9 @@ mod tests {
         let content = component(&files, "thing");
         assert!(!content.contains("isEmail"));
         assert!(!content.contains("format"));
-        // Both string properties still type-check but carry no format assertion.
+        // Both string properties and the integer still type-check but carry no format assertion.
         assert_eq!(content.matches("=== \"string\"").count(), 2);
+        assert!(content.contains("Number.isInteger(value2)"), "{content}");
     }
 
     #[test]
@@ -6568,6 +6541,7 @@ mod tests {
         for inner in [
             json!({ "type": "string", "format": "email" }),
             json!({ "type": "number", "format": "float" }),
+            json!({ "type": "integer", "format": "int64" }),
             json!({ "type": "boolean", "format": "custom" }),
             json!({ "type": "string", "$dynamicRef": "#thing" }),
         ] {

@@ -55,7 +55,6 @@ const ZOD_RESERVED_NAMES: &[&str] = &[
     "multipleOf",
     "stringFormat",
     "int32",
-    "int64",
     "int64Wire",
     "enumValues",
     "constValue",
@@ -534,9 +533,6 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
                 if format == Some("int32") {
                     self.runtime_values.insert("int32");
                     check(number, "int32()")
-                } else if format == Some("int64") {
-                    self.runtime_values.insert("int64");
-                    check(number, "int64()")
                 } else {
                     number
                 }
@@ -3104,6 +3100,7 @@ mod tests {
                     "time": { "type": "string", "format": "time" },
                     "uuid": { "type": "string", "format": "uuid" },
                     "annotationOnly": { "type": "string", "format": "email" },
+                    "int64Annotation": { "type": "integer", "format": "int64" },
                     "count": {
                         "type": "integer",
                         "format": "int32",
@@ -3145,25 +3142,9 @@ mod tests {
             assert!(content.contains(expected), "missing {expected}: {content}");
         }
         assert!(content.contains("\"annotationOnly\":z.optional(z.string())"));
+        assert!(content.contains("\"int64Annotation\":z.optional(z.number().check(integer()))"));
         assert!(!content.contains("isEmail"));
-    }
-
-    #[test]
-    fn int64_format_emits_safe_integer_range_check() {
-        let (files, diagnostics) = compile(doc(json!({
-            "Thing": {
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "format": "int64" }
-                }
-            }
-        })));
-        assert_clean(&diagnostics);
-        let content = component(&files, "thing");
-        assert!(
-            content.contains("z.number().check(integer()).check(int64())"),
-            "{content}"
-        );
+        assert!(!content.contains("int64()"));
     }
 
     #[test]
@@ -4610,7 +4591,6 @@ mod tests {
             "isTime",
             "isUuid",
             "isInt32",
-            "isInt64",
             "int64WireValue",
         ] {
             assert_eq!(

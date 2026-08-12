@@ -12,7 +12,6 @@ import {
   isDateTime,
   isBigIntMultipleOf,
   isInt32,
-  isInt64,
   isMultipleOf,
   isTime,
   isUuid,
@@ -34,18 +33,6 @@ describe("exact bigint constraints", () => {
     assert.equal(isBigIntMultipleOf(1n, 0.5), true);
     assert.equal(isBigIntMultipleOf(1n, 0.1), false);
     assert.equal(isBigIntMultipleOf(1n, 0), false);
-  });
-});
-
-describe("isInt64", () => {
-  test("recognizes integers in the signed 64-bit range", () => {
-    assert.equal(isInt64(Number.MIN_SAFE_INTEGER), true);
-    assert.equal(isInt64(Number.MAX_SAFE_INTEGER), true);
-    assert.equal(isInt64(2 ** 60), true);
-    assert.equal(isInt64(-(2 ** 63)), true);
-    assert.equal(isInt64(-(2 ** 63) - 2048), false);
-    assert.equal(isInt64(2 ** 63), false);
-    assert.equal(isInt64(1.5), false);
   });
 });
 
