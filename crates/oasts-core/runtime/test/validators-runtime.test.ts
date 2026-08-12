@@ -10,12 +10,22 @@ import {
   isDate,
   isDateTime,
   isInt32,
+  isInt64,
   isMultipleOf,
   isTime,
   isUuid,
   issue,
   type Issue,
 } from "../validators-runtime.ts";
+
+describe("isInt64", () => {
+  test("accepts only safe integers", () => {
+    assert.equal(isInt64(Number.MIN_SAFE_INTEGER), true);
+    assert.equal(isInt64(Number.MAX_SAFE_INTEGER), true);
+    assert.equal(isInt64(Number.MAX_SAFE_INTEGER + 1), false);
+    assert.equal(isInt64(1.5), false);
+  });
+});
 
 describe("int64WireValue", () => {
   test("normalizes each lossless int64 wire representation", () => {

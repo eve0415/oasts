@@ -15,10 +15,14 @@ import {
   enumValues,
   headers,
   int32,
+  int64,
+  int64Wire,
+  int64WireValue,
   integer,
   isDate,
   isDateTime,
   isInt32,
+  isInt64,
   isMultipleOf,
   isTime,
   isUuid,
@@ -184,6 +188,30 @@ describe("isInt32", () => {
   });
 });
 
+describe("isInt64", () => {
+  test("accepts only safe integers", () => {
+    assert.equal(isInt64(Number.MIN_SAFE_INTEGER), true);
+    assert.equal(isInt64(Number.MAX_SAFE_INTEGER), true);
+    assert.equal(isInt64(Number.MAX_SAFE_INTEGER + 1), false);
+    assert.equal(isInt64(1.5), false);
+  });
+});
+
+describe("int64WireValue", () => {
+  test("normalizes each lossless wire representation", () => {
+    assert.equal(int64WireValue(42), 42n);
+    assert.equal(int64WireValue(12_345_678_901_234_567_890n), 12_345_678_901_234_567_890n);
+    assert.equal(int64WireValue({ rawJSON: "12345678901234567890" }), 12_345_678_901_234_567_890n);
+  });
+
+  test("rejects rounded numbers and noncanonical raw tokens", () => {
+    assert.equal(int64WireValue(Number.MAX_SAFE_INTEGER + 1), null);
+    assert.equal(int64WireValue({ rawJSON: "01" }), null);
+    assert.equal(int64WireValue({ rawJSON: "1.5" }), null);
+    assert.equal(int64WireValue(null), null);
+  });
+});
+
 describe("scalar checks", () => {
   test("integer accepts every finite whole number", () => {
     const schema = z.number().check(integer());
@@ -239,6 +267,34 @@ describe("scalar checks", () => {
 
     assert.equal(schema.safeParse(2147483647).success, true);
     assert.equal(schema.safeParse(2147483648).success, false);
+  });
+
+  test("int64 reports values outside the safe-integer domain", () => {
+    const schema = z.number().check(int64());
+
+    assert.equal(schema.safeParse(Number.MAX_SAFE_INTEGER).success, true);
+    assert.equal(schema.safeParse(Number.MAX_SAFE_INTEGER + 1).success, false);
+  });
+
+  test("int64Wire accepts every exact wire shape and rejects the rest", () => {
+    const schema = z.unknown().check(int64Wire());
+
+    assert.equal(schema.safeParse(42).success, true);
+    assert.equal(schema.safeParse(12_345_678_901_234_567_890n).success, true);
+    assert.equal(schema.safeParse({ rawJSON: "12345678901234567890" }).success, true);
+    assert.equal(
+      issues(schema.safeParse(Number.MAX_SAFE_INTEGER + 1))[0]?.message,
+      "expected type integer",
+    );
+  });
+
+  test("constrained int64Wire relays the numeric schema verdict", () => {
+    const schema = z.unknown().check(int64Wire(z.number().min(10).max(20)));
+
+    assert.equal(schema.safeParse(10n).success, true);
+    assert.equal(schema.safeParse({ rawJSON: "20" }).success, true);
+    assert.equal(schema.safeParse(9n).success, false);
+    assert.equal(schema.safeParse({ rawJSON: "21" }).success, false);
   });
 
   test("enumValues and constValue use deep JSON equality", () => {
