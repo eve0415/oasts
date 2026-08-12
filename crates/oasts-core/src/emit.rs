@@ -5862,6 +5862,14 @@ mod tests {
                 "never",
             ),
             (
+                SchemaNode::OneOf {
+                    branches: Vec::new(),
+                    discriminator: None,
+                    meta: meta("/empty-one-of"),
+                },
+                "never",
+            ),
+            (
                 SchemaNode::Never {
                     meta: meta("/never"),
                 },
