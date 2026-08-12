@@ -437,6 +437,8 @@ export function int64Wire(schema?: Schema): Check<unknown> {
     const normalized = int64WireValue(payload.value);
     if (normalized === null) {
       report(payload, "expected type integer");
+    } else if (normalized < -9223372036854775808n || normalized >= 9223372036854775808n) {
+      report(payload, "out of int64 range");
     } else if (schema !== undefined) {
       relay(payload, schema.safeParse(normalized));
     }

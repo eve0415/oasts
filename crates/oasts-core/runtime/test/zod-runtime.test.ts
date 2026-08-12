@@ -321,8 +321,15 @@ describe("scalar checks", () => {
     const schema = z.unknown().check(int64Wire());
 
     assert.equal(schema.safeParse(42).success, true);
-    assert.equal(schema.safeParse(12_345_678_901_234_567_890n).success, true);
-    assert.equal(schema.safeParse({ rawJSON: "12345678901234567890" }).success, true);
+    assert.equal(schema.safeParse(-(2n ** 63n)).success, true);
+    assert.equal(schema.safeParse(-(2n ** 63n) - 1n).success, false);
+    assert.equal(schema.safeParse(2n ** 63n).success, false);
+    assert.equal(schema.safeParse(9_007_199_254_740_993n).success, true);
+    assert.equal(schema.safeParse({ rawJSON: "9007199254740993" }).success, true);
+    assert.equal(
+      issues(schema.safeParse({ rawJSON: "12345678901234567890" }))[0]?.message,
+      "out of int64 range",
+    );
     assert.equal(
       issues(schema.safeParse(Number.MAX_SAFE_INTEGER + 1))[0]?.message,
       "expected type integer",

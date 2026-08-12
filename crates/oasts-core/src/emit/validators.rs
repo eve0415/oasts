@@ -2177,6 +2177,12 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         let integer = format!("integer{index}");
         self.line(&format!("const {integer} = int64WireValue({val});"));
         self.open(&format!("if ({integer} !== null) {{"));
+        self.push_issue(
+            &format!("{integer} < -9223372036854775808n || {integer} >= 9223372036854775808n"),
+            path,
+            iss,
+            "out of int64 range",
+        );
         let constraints = meta.numeric_constraints();
         if constraints.minimum.is_some()
             || constraints.maximum.is_some()
@@ -5931,6 +5937,13 @@ mod tests {
             content.contains("const integer1 = int64WireValue(value0);"),
             "{content}"
         );
+        assert!(
+            content.contains(
+                "if (integer1 < -9223372036854775808n || integer1 >= 9223372036854775808n) {"
+            ),
+            "{content}"
+        );
+        assert!(content.contains("\"out of int64 range\""), "{content}");
         assert!(
             content.contains("if (!isBigIntMultipleOf(integer3, 2)) {"),
             "{content}"

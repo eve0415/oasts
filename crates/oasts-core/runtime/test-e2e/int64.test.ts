@@ -19,8 +19,8 @@ import {
 const repoRoot = path.resolve(import.meta.dirname, "../../../..");
 const binary = path.join(repoRoot, "target/debug/oasts");
 const fixtureSource = path.join(repoRoot, "fixtures/int64-transform-3.1");
-const EXACT_INT64 = 12_345_678_901_234_567_890n;
-const EXACT_DIGITS = "12345678901234567890";
+const EXACT_INT64 = 1_152_921_504_606_846_976n;
+const EXACT_DIGITS = "1152921504606846976";
 const ROUNDED_AMOUNT = Number("9007199254740995");
 
 async function operation(root: string, file: string, name: string): Promise<ExportedFunction> {
@@ -123,7 +123,7 @@ after(async () => {
   await rm(temporaryRoot, { recursive: true, force: true });
 });
 
-test('emitted client scopes exact revival to int64 and sends raw bytes equal {"id":12345678901234567890}', async () => {
+test('emitted client scopes exact revival to int64 and sends raw bytes equal {"id":1152921504606846976}', async () => {
   const responseBytes = Buffer.from(`{"id":${EXACT_DIGITS},"amount":9007199254740995}`);
   scriptRoute("GET", "/counters/latest", {
     status: 200,
