@@ -212,3 +212,8 @@ export function isUuid(s: string): boolean {
 export function isInt32(v: number): boolean {
   return Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
 }
+
+// Whole number within JavaScript's safe-integer range.
+export function isInt64(v: number): boolean {
+  return Number.isSafeInteger(v);
+}

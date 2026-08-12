@@ -132,6 +132,7 @@ const VALIDATOR_RESERVED_NAMES: &[&str] = &[
     "isTime",
     "isUuid",
     "isInt32",
+    "isInt64",
     "StandardSchemaV1",
     "SyncStandardSchemaV1",
     "isRecord",
@@ -458,7 +459,7 @@ fn validation_flow_cost(schema: &SchemaNode, position: TypePosition) -> usize {
                         + meta.numeric_constraints().multiple_of.is_some() as usize
                         + usize::from(
                             matches!(ty, PrimitiveType::Integer)
-                                && format.as_deref() == Some("int32"),
+                                && matches!(format.as_deref(), Some("int32" | "int64")),
                         )
                 }
                 PrimitiveType::Boolean | PrimitiveType::Null => 0,
@@ -2230,11 +2231,14 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         iss: &str,
     ) {
         self.gen_number_constraints_inner(meta, val, path, iss);
-        // The int32 clause is type-specific (it needs a declared integer/int32), so it lives here
-        // rather than in the shared inner body the typeless path reuses.
+        // The integer-format clauses are type-specific (they need a declared integer), so they live
+        // here rather than in the shared inner body the typeless path reuses.
         if matches!(ty, PrimitiveType::Integer) && format == Some("int32") {
             self.scope.runtime_values.insert("isInt32");
             self.push_issue(&format!("!isInt32({val})"), path, iss, "out of int32 range");
+        } else if matches!(ty, PrimitiveType::Integer) && format == Some("int64") {
+            self.scope.runtime_values.insert("isInt64");
+            self.push_issue(&format!("!isInt64({val})"), path, iss, "out of int64 range");
         } else if format.is_some() {
             self.mark_incomplete();
         }
@@ -5812,6 +5816,31 @@ mod tests {
         assert!(content.contains("\"invalid uuid format\""));
         assert!(content.contains("if (!isInt32(value4)) {"));
         assert!(content.contains("\"out of int32 range\""));
+    }
+
+    #[test]
+    fn int64_format_emits_safe_integer_range_check() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "format": "int64" }
+                }
+            },
+            "NotInt64": {
+                "not": { "type": "integer", "format": "int64" }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(content.contains("if (!isInt64(value0)) {"), "{content}");
+        assert!(content.contains("\"out of int64 range\""), "{content}");
+        let negated = component(&files, "notint64");
+        assert!(negated.contains("isInt64"), "{negated}");
+        assert!(
+            negated.contains("\"value matches not schema\""),
+            "{negated}"
+        );
     }
 
     #[test]

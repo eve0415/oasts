@@ -55,6 +55,7 @@ const ZOD_RESERVED_NAMES: &[&str] = &[
     "multipleOf",
     "stringFormat",
     "int32",
+    "int64",
     "enumValues",
     "constValue",
     "uniqueItems",
@@ -524,6 +525,9 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
                 if format == Some("int32") {
                     self.runtime_values.insert("int32");
                     check(number, "int32()")
+                } else if format == Some("int64") {
+                    self.runtime_values.insert("int64");
+                    check(number, "int64()")
                 } else {
                     number
                 }
@@ -3065,6 +3069,24 @@ mod tests {
     }
 
     #[test]
+    fn int64_format_emits_safe_integer_range_check() {
+        let (files, diagnostics) = compile(doc(json!({
+            "Thing": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "format": "int64" }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(
+            content.contains("z.number().check(integer()).check(int64())"),
+            "{content}"
+        );
+    }
+
+    #[test]
     fn openapi_30_nullable_and_boolean_exclusive_bounds_keep_their_dialect_meaning() {
         let (files, diagnostics) = compile(json!({
             "openapi": "3.0.3",
@@ -4441,6 +4463,7 @@ mod tests {
             "isTime",
             "isUuid",
             "isInt32",
+            "isInt64",
         ] {
             assert_eq!(
                 extract_function(ZOD_RUNTIME_TS, name),

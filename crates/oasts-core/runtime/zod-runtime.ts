@@ -282,6 +282,11 @@ export function isInt32(v: number): boolean {
   return Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
 }
 
+// Whole number within JavaScript's safe-integer range.
+export function isInt64(v: number): boolean {
+  return Number.isSafeInteger(v);
+}
+
 // --- scalar checks -------------------------------------------------------------------------------
 
 // The contract's integer domain: any finite number that is a whole number. Wider than zod's
@@ -339,6 +344,14 @@ export function int32(): Check<number> {
   return (payload) => {
     if (!isInt32(payload.value)) {
       report(payload, "out of int32 range");
+    }
+  };
+}
+
+export function int64(): Check<number> {
+  return (payload) => {
+    if (!isInt64(payload.value)) {
+      report(payload, "out of int64 range");
     }
   };
 }
