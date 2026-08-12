@@ -33,8 +33,7 @@ use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
     AdditionalProperties, Body, Discriminator, Ir, MediaType, Operation, Param, ParamLocation,
     PatternProperty, PatternPropertyKey, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader,
-    ResponseStatus, SchemaDocs, SchemaNode, SchemaRef, SourceRef, TupleRest, finite_parts,
-    mapping_schema_ref,
+    ResponseStatus, SchemaDocs, SchemaNode, SourceRef, TupleRest, finite_parts, mapping_schema_ref,
 };
 use crate::media::{is_json, is_xml};
 use crate::num::{first_number_outside_binary64, render_number_value};
@@ -502,12 +501,6 @@ pub(super) struct Emitter<'model, 'input, 'sink> {
     /// `link_targets_by_response` (same fast-reject) so a resolved link's target response type
     /// name can be looked up in O(1) instead of scanning `operation_names` per link.
     operation_stems: Arc<HashMap<usize, String>>,
-    /// Refs whose targets `merge_all_of` is currently inlining, along the active
-    /// render ancestry. A recursive schema whose `allOf` branch points
-    /// back to an ancestor would otherwise inline forever; the branch renders as a
-    /// bare named reference instead. Balanced push/pop keeps this empty between
-    /// top-level declarations, so acyclic output is byte-identical.
-    inlining_refs: RefCell<Vec<SchemaRef>>,
     /// Prewarmed `allOf` merges keyed by `(branch slice address, length)`. Populated
     /// once per distinct IR node by `prewarm_all_of`, then read on every render/import
     /// pass so the merge runs once instead of up to six times per node. Only IR-resident
@@ -575,7 +568,6 @@ impl<'model, 'input, 'sink> EmitterFactory<'model, 'input, 'sink> {
             enum_member_indices: Arc::clone(&self.enum_member_indices),
             link_targets_by_response: Arc::clone(&self.link_targets_by_response),
             operation_stems: Arc::clone(&self.operation_stems),
-            inlining_refs: RefCell::new(Vec::new()),
             merge_cache: Arc::clone(&self.merge_cache),
             import_aliases: RefCell::new(HashMap::new()),
             deferred_diagnostics: RefCell::new(Vec::new()),
@@ -619,7 +611,6 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             enum_member_indices: Arc::new(enum_member_indices),
             link_targets_by_response: Arc::new(link_targets_by_response),
             operation_stems: Arc::new(operation_stems),
-            inlining_refs: RefCell::new(Vec::new()),
             merge_cache: Arc::new(HashMap::new()),
             import_aliases: RefCell::new(HashMap::new()),
             deferred_diagnostics: RefCell::new(Vec::new()),
@@ -1810,11 +1801,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 format!("[{}]", items.join(", "))
             }
             SchemaNode::AllOf { branches, .. } => {
-                // Inlining a branch that resolves back to an ancestor being inlined
-                // would recurse forever on a recursive schema. The guard falls through
-                // to intersection rendering, where the ref becomes a bare named
-                // reference that terminates the cycle.
-                if let Some(rendered) =
+                // Identity first: a `$ref` branch renders as its own bare name, so it never
+                // enters the merge. The anonymous branches merge among themselves into one
+                // object literal that takes the position of the first of them, and the
+                // members join with `&` in declaration order. Rendering a ref as a name is
+                // also what terminates a recursive schema — the cycle that inlining used to
+                // need a guard against cannot start.
+                let merged =
                     self.merge_all_of_guarded(branches, |properties, additional_properties| {
                         self.render_object_parts(
                             properties,
@@ -1824,28 +1817,43 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                             indent,
                             false,
                         )
-                    })
-                {
-                    rendered
-                } else if branches.is_empty() {
+                    });
+                // A named member surviving is what licenses dropping an empty one: an
+                // annotation- or validation-only sibling beside a `$ref` must not print as
+                // `WidgetMeta & {}`. With no named member the drop would change a
+                // wholly-anonymous `allOf` that merges to `{}` into `unknown`.
+                let has_named = branches.iter().any(is_named_branch);
+                let anonymous_merged = merged.is_some();
+                let mut pending_merge = merged;
+                let mut members = Vec::with_capacity(branches.len());
+                for branch in branches {
+                    let from_merge = anonymous_merged && !is_named_branch(branch);
+                    let rendered = if from_merge {
+                        // The merged blob stands in for the whole anonymous half, at the
+                        // position of the first anonymous branch. Taking it is what emits it
+                        // exactly once — every later anonymous branch is already inside it.
+                        match pending_merge.take() {
+                            Some(blob) => blob,
+                            None => continue,
+                        }
+                    } else {
+                        self.render_type(branch, position, axis, indent)
+                    };
+                    // Tested before parenthesizing, or a member needing parentheses would
+                    // survive the drop as `(unknown)`.
+                    if rendered == "unknown" || (has_named && rendered == "{}") {
+                        continue;
+                    }
+                    members.push(if from_merge {
+                        rendered
+                    } else {
+                        parenthesize_intersection_member(rendered, branch)
+                    });
+                }
+                if members.is_empty() {
                     "unknown".to_owned()
                 } else {
-                    let rendered = branches
-                        .iter()
-                        .filter_map(|branch| {
-                            let rendered = self.render_type(branch, position, axis, indent);
-                            if rendered == "unknown" {
-                                None
-                            } else {
-                                Some(parenthesize_intersection_member(rendered, branch))
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    if rendered.is_empty() {
-                        "unknown".to_owned()
-                    } else {
-                        rendered.join(" & ")
-                    }
+                    members.join(" & ")
                 }
             }
             SchemaNode::OneOf { branches, .. } | SchemaNode::AnyOf { branches, .. } => {
@@ -1989,38 +1997,15 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             })
     }
 
-    /// Target keys of the `allOf` branches that are direct `$ref`s — the branches
-    /// `merge_all_of` would inline by resolving. Used to detect a ref that points
-    /// back to an ancestor already being inlined (the recursive-schema cycle).
-    fn inlineable_ref_keys(&self, branches: &[SchemaNode]) -> Vec<SchemaRef> {
-        branches
-            .iter()
-            .filter_map(|branch| match branch {
-                SchemaNode::Ref { target, .. } => Some(target.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Runs `body` over the merged `allOf` shape while the branches' inlineable ref
-    /// targets sit on the cycle-guard stack, then restores the stack. Returns `None`
-    /// without running `body` when a branch resolves back to an ancestor already being
-    /// inlined (the recursive-schema cycle) or when the branches do not merge into a
-    /// single object shape. The stack borrow is released before `body` runs so the body
-    /// can recurse and push its own guards.
+    /// Runs `body` over the merged shape of the branches that have no name of their own.
+    /// Returns `None` without running `body` when those branches do not merge into a single
+    /// object shape, or when there are none — an `allOf` of nothing but `$ref`s has no
+    /// anonymous half to describe.
     fn merge_all_of_guarded<'a, R>(
         &'a self,
         branches: &'a [SchemaNode],
         body: impl FnOnce(&[BorrowedProperty<'a>], &AdditionalProperties) -> R,
     ) -> Option<R> {
-        let inline_keys = self.inlineable_ref_keys(branches);
-        let would_cycle = {
-            let stack = self.inlining_refs.borrow();
-            inline_keys.iter().any(|key| stack.contains(key))
-        };
-        if would_cycle {
-            return None;
-        }
         // The merge is position-independent and depends only on the branch slice, so a
         // prewarmed entry (keyed by the slice's stable IR address) answers every render
         // and import pass for this node. `None` here means the slice was not prewarmed —
@@ -2042,13 +2027,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     (&fresh.0, fresh.1)
                 }
             };
-        let pushed = inline_keys.len();
-        self.inlining_refs.borrow_mut().extend(inline_keys);
-        let result = body(properties, additional_properties);
-        let mut stack = self.inlining_refs.borrow_mut();
-        let kept = stack.len() - pushed;
-        stack.truncate(kept);
-        Some(result)
+        Some(body(properties, additional_properties))
     }
 
     fn merge_all_of<'a>(
@@ -2058,12 +2037,17 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     where
         'input: 'a,
     {
+        // Only the branches with no name of their own. A `$ref` branch renders as its own
+        // bare name, so resolving it here would describe a shape nothing emits — and the
+        // merge is an analysis input, not the emission strategy.
+        //
         // One scratch set reused across branches; clearing before each call keeps
         // today's per-call-fresh cycle-visited semantics without a fresh allocation
         // per branch.
         let mut visited = HashSet::new();
         let shapes = branches
             .iter()
+            .filter(|branch| !is_named_branch(branch))
             .map(|branch| {
                 visited.clear();
                 self.object_shape(branch, &mut visited)
@@ -2311,27 +2295,36 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 }
             }
             SchemaNode::AllOf { branches, .. } => {
-                // Mirror render_type's cycle guard: a branch resolving back to an
-                // ancestor being inlined must not inline again, or this walk recurses
-                // forever on a recursive schema. Fall through to visiting the raw
-                // branches, where a `$ref` branch records its import and terminates.
-                let handled = if let SchemaChildMode::References(position) = mode {
-                    self.merge_all_of_guarded(branches, |properties, additional_properties| {
-                        for &(_, property, meta) in properties {
-                            if property_in_position(meta, position) {
-                                visit(property);
+                // Mirror render_type's partition exactly, or this walk records a different
+                // set of imports than the renderer names — which is how a component reached
+                // only through an `allOf` ended up emitted and imported by nothing. Each
+                // `$ref` branch is visited directly, so it records its import and
+                // terminates; the merged body describes only the anonymous half, and when
+                // that half does not merge its branches are visited one by one.
+                //
+                // Validation mode is untouched: it visits every branch, refs included,
+                // because a validator is emitted for the whole conjunction rather than for
+                // the rendered type.
+                if let SchemaChildMode::References(position) = mode {
+                    let merged =
+                        self.merge_all_of_guarded(branches, |properties, additional_properties| {
+                            for &(_, property, meta) in properties {
+                                if property_in_position(meta, position) {
+                                    visit(property);
+                                }
                             }
+                            if let AdditionalProperties::Allowed(Some(schema))
+                            | AdditionalProperties::Schema(schema) = additional_properties
+                            {
+                                visit(schema);
+                            }
+                        });
+                    for branch in branches {
+                        if is_named_branch(branch) || merged.is_none() {
+                            visit(branch);
                         }
-                        if let AdditionalProperties::Allowed(Some(schema))
-                        | AdditionalProperties::Schema(schema) = additional_properties
-                        {
-                            visit(schema);
-                        }
-                    })
+                    }
                 } else {
-                    None
-                };
-                if handled.is_none() {
                     for branch in branches {
                         visit(branch);
                     }
@@ -3378,6 +3371,17 @@ pub(super) fn render_literal_key(value: &str) -> String {
         return format!("[{}]", render_ts_string(value));
     }
     render_property_key(value)
+}
+
+/// A branch whose identity survives emission: a `$ref` renders as its own bare name, so it
+/// never enters the anonymous merge. Read by the renderer and by the import walk, so the two
+/// cannot drift — a renderer and an import walk that disagreed is what left a component
+/// reachable only through `allOf` emitted but imported by nothing.
+///
+/// Only a direct `$ref` counts. A branch that is itself an `allOf` wrapping a ref is anonymous
+/// here and recurses through the normal path.
+fn is_named_branch(branch: &SchemaNode) -> bool {
+    matches!(branch, SchemaNode::Ref { .. })
 }
 
 fn add_nullable(mut rendered: String, schema: &SchemaNode) -> String {
@@ -7910,9 +7914,12 @@ mod tests {
             one.contains("export type NullableOne = WidgetMeta | null;"),
             "{one}"
         );
+        // `&` binds tighter than `|`, so the unparenthesized tail is `(A & B) | null` — the
+        // whole intersection is nullable, not its last member. The fixture's compile-assert
+        // pins that reading at the type level.
         let two = generated_body(schema_file(&files, "nullabletwo")).to_owned();
         assert!(
-            two.contains("export type NullableTwo = (WidgetMeta & OtherMeta) | null;"),
+            two.contains("export type NullableTwo = WidgetMeta & OtherMeta | null;"),
             "{two}"
         );
     }
