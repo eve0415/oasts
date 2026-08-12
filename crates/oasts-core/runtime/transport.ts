@@ -242,17 +242,27 @@ export type RawResponseDecoder = {
   ) => ReadableStream<Uint8Array>;
 };
 
+export type LosslessJsonResponseDecoder = {
+  readonly json: 'int64';
+};
+
 export type ResponseMediaDecoder =
   | 'json'
   | 'text'
   | 'binary'
+  | LosslessJsonResponseDecoder
   | MultipartResponseDecoder
   | SseResponseDecoder
   | RawResponseDecoder;
 
 // The decoders that need the whole body in hand. Naming the complement as its own type is what lets
 // the streaming check narrow in both directions, so the buffered path below stays exactly as it was.
-type BufferedResponseDecoder = 'json' | 'text' | 'binary' | MultipartResponseDecoder;
+type BufferedResponseDecoder =
+  | 'json'
+  | 'text'
+  | 'binary'
+  | LosslessJsonResponseDecoder
+  | MultipartResponseDecoder;
 
 function isStreamingResponseDecoder(
   decoder: ResponseMediaDecoder,
@@ -1611,6 +1621,31 @@ type SelectedResponseMedia = {
   readonly actual: ParsedMediaType;
 };
 
+type JsonParseContext = { readonly source?: unknown };
+
+let jsonParseProbeContext: unknown;
+JSON.parse('0', (_key: string, value: unknown, context?: JsonParseContext) => {
+  jsonParseProbeContext = context;
+  return value;
+});
+const jsonParseHasSource =
+  isRecord(jsonParseProbeContext) && jsonParseProbeContext.source === '0';
+const INTEGER_TOKEN = /^-?\d+$/u;
+
+function losslessInt64Reviver(
+  _key: string,
+  value: unknown,
+  context?: JsonParseContext,
+): unknown {
+  return typeof value === 'number' &&
+    context !== undefined &&
+    typeof context.source === 'string' &&
+    INTEGER_TOKEN.test(context.source) &&
+    !Number.isSafeInteger(value)
+    ? BigInt(context.source)
+    : value;
+}
+
 function selectedResponseMedia(
   rawContentType: string | null,
   media: ResponsePlan['media'],
@@ -1632,10 +1667,14 @@ function selectedResponseMedia(
 
 async function decodedBody(
   bytes: ArrayBuffer,
-  decoder: 'json' | 'text' | 'binary',
+  decoder: 'json' | 'text' | 'binary' | LosslessJsonResponseDecoder,
 ): Promise<unknown> {
   if (decoder === 'json') {
     return new Response(bytes).json();
+  }
+  if (typeof decoder !== 'string') {
+    const text = await new Response(bytes).text();
+    return jsonParseHasSource ? JSON.parse(text, losslessInt64Reviver) : JSON.parse(text);
   }
   if (decoder === 'text') {
     return new Response(bytes).text();
@@ -1870,7 +1909,7 @@ async function assembleResponse(
     // response never links it. It takes the received media parameters because the boundary lives
     // there and nowhere else.
     const decoder = buffered.decoder;
-    const payload = typeof decoder === 'string'
+    const payload = typeof decoder === 'string' || 'json' in decoder
       ? await decodedBody(read, decoder)
       : decoder.decode(new Uint8Array(read), buffered.parameters, decoder.plan);
     return matchedResponseResult(

@@ -12,6 +12,10 @@ import {
   type ResponsePlan,
 } from "../transport.ts";
 
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function responsePlan(overrides: Partial<ResponsePlan> = {}): ResponsePlan {
   return {
     match: "200",
@@ -143,6 +147,36 @@ describe("response matching and decoding", () => {
     assert.deepEqual(isDocumented(error) && !error.ok ? error.error : undefined, {
       message: "bad",
     });
+  });
+
+  test("decodes unsafe integer tokens losslessly only on a marked JSON body", async () => {
+    const body =
+      '{"id":12345678901234567890,"nested":[-12345678901234567890],"safe":42,"float":9007199254740992.5,"other":9007199254740993}';
+    const marked = await callWith(
+      new Response(body, { headers: { "Content-Type": "application/json" } }),
+      operation({
+        responses: [responsePlan({ media: [["application/json", { json: "int64" }]] })],
+      }),
+    );
+    const ordinary = await callWith(
+      new Response(body, { headers: { "Content-Type": "application/json" } }),
+    );
+
+    assert.ok(isDocumented(marked) && marked.ok);
+    if (isDocumented(marked) && marked.ok) {
+      assert.deepEqual(marked.data, {
+        id: 12345678901234567890n,
+        nested: [-12345678901234567890n],
+        safe: 42,
+        float: Number("9007199254740992.5"),
+        other: 9007199254740993n,
+      });
+    }
+    assert.ok(isDocumented(ordinary) && ordinary.ok);
+    if (isDocumented(ordinary) && ordinary.ok) {
+      const data = ordinary.data;
+      assert.equal(isRecord(data) ? typeof data.id : "missing", "number");
+    }
   });
 
   test("accepts null and zero-byte bodies on no-payload branches", async () => {

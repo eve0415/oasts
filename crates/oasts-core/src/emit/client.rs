@@ -19,6 +19,7 @@ use crate::ir::{
 };
 use crate::media::media_essence;
 use crate::response_media::StreamKind;
+use crate::transform::TransformKind;
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 use super::model::EmissionModel;
@@ -2957,10 +2958,14 @@ fn write_descriptor(
                                 && check.media_index == media_index
                         })
                         .map(|check| check.function.as_str());
+                    let lossless_int64 = media.decoder == DecoderClass::Json
+                        && model
+                            .transform_facts()
+                            .reaches_kind(&media.schema, TransformKind::IntegerBigInt);
                     format!(
                         "[{}, {}]",
                         render_ts_string(&media.media),
-                        render_response_decoder(media, on_event)
+                        render_response_decoder(media, on_event, lossless_int64)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -3700,7 +3705,11 @@ fn style_name(style: ParamStyle) -> &'static str {
 /// and for multipart the decoder function itself alongside its plan. Shipping the function through
 /// the descriptor rather than tagging it is what keeps the parser out of every other client — the
 /// transport never names it, so nothing but a multipart operation module pulls it in.
-fn render_response_decoder(media: &ResponseMediaPlan, on_event: Option<&str>) -> String {
+fn render_response_decoder(
+    media: &ResponseMediaPlan,
+    on_event: Option<&str>,
+    lossless_int64: bool,
+) -> String {
     // A streaming entry ships its reader the same way, and for the same reason: the transport never
     // names the SSE parser, so only an operation that declares one links it. `onEvent` is the
     // per-event validate-and-convert pipeline; it is null until a later step binds one, and the
@@ -3714,6 +3723,9 @@ fn render_response_decoder(media: &ResponseMediaPlan, on_event: Option<&str>) ->
         }
         DecoderClass::StreamingRaw => return format!("{{ raw: {RAW_STREAM_READER} }}"),
         _ => {}
+    }
+    if lossless_int64 {
+        return "{ json: \"int64\" }".to_owned();
     }
     let Some(plan) = &media.multipart else {
         return render_ts_string(decoder_name(media.decoder));
@@ -3989,6 +4001,14 @@ mod tests {
         document: Value,
         validate: bool,
     ) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
+        emit_files_with_types(document, validate, json!({ "dateTime": "date" }))
+    }
+
+    fn emit_files_with_types(
+        document: Value,
+        validate: bool,
+        types: Value,
+    ) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("openapi.json"),
@@ -4004,7 +4024,7 @@ mod tests {
                 "authEnforcement": "types",
                 "baseUrl": { "source": "literal", "value": "https://api.example.test/v1" }
             },
-            "types": { "dateTime": "date" },
+            "types": types,
             "validation": if validate {
                 json!({ "engine": "generated", "request": true, "response": true, "unchecked": "allow" })
             } else {
@@ -4059,6 +4079,59 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn transforming_int64_document() -> Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "T", "version": "1.0.0" },
+            "paths": {
+                "/counters": {
+                    "get": {
+                        "operationId": "readCounter",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "required": ["id"],
+                                            "properties": {
+                                                "id": { "type": "integer", "format": "int64" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn only_an_int64_bigint_response_marks_its_json_decoder_lossless() {
+        let (files, diagnostics) = emit_files_with_types(
+            transforming_int64_document(),
+            false,
+            json!({ "integer": "bigint" }),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let bigint = operation_file(&files, "readcounter");
+        assert!(
+            bigint.contains("media: [[\"application/json\", { json: \"int64\" }]]"),
+            "{bigint}"
+        );
+
+        let (date, diagnostics) =
+            emit_transforming_operation(transforming_response_document(), "readevent");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(
+            date.contains("media: [[\"application/json\", \"json\"]]"),
+            "{date}"
+        );
     }
 
     #[test]

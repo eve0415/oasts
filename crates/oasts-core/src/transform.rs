@@ -276,6 +276,92 @@ impl<'ir> TransformFacts<'ir> {
         scan.direct || scan.deps.iter().any(|&dep| self.components[dep])
     }
 
+    /// Whether this node reaches at least one site of exactly `kind`, following component refs.
+    #[must_use]
+    pub fn reaches_kind(&self, node: &SchemaNode, kind: TransformKind) -> bool {
+        self.enabled() && self.reaches_kind_inner(node, kind, &mut Vec::new())
+    }
+
+    fn reaches_kind_inner(
+        &self,
+        node: &SchemaNode,
+        kind: TransformKind,
+        visiting: &mut Vec<usize>,
+    ) -> bool {
+        if self.site(node) == Some(kind) {
+            return true;
+        }
+        match node {
+            SchemaNode::Ref { target, .. } => {
+                let Some(&index) = self
+                    .by_pointer
+                    .get(&(target.source_id.as_str(), target.json_pointer.as_str()))
+                else {
+                    return false;
+                };
+                if visiting.contains(&index) {
+                    return false;
+                }
+                visiting.push(index);
+                let reaches =
+                    self.reaches_kind_inner(&self.ir.schemas[index].schema, kind, visiting);
+                visiting.pop();
+                reaches
+            }
+            SchemaNode::Object {
+                properties,
+                additional_properties,
+                meta,
+                ..
+            } => {
+                properties
+                    .iter()
+                    .any(|(_, property, _)| self.reaches_kind_inner(property, kind, visiting))
+                    || match additional_properties {
+                        AdditionalProperties::Allowed(Some(schema))
+                        | AdditionalProperties::Schema(schema) => {
+                            self.reaches_kind_inner(schema, kind, visiting)
+                        }
+                        AdditionalProperties::Allowed(None) | AdditionalProperties::Forbidden => {
+                            false
+                        }
+                    }
+                    || meta
+                        .validation_applicators()
+                        .pattern_properties
+                        .iter()
+                        .any(|pattern| {
+                            pattern.type_key.is_some()
+                                && self.reaches_kind_inner(&pattern.schema, kind, visiting)
+                        })
+            }
+            SchemaNode::Array { items, .. } => self.reaches_kind_inner(items, kind, visiting),
+            SchemaNode::Tuple {
+                prefix_items, rest, ..
+            } => {
+                prefix_items
+                    .iter()
+                    .any(|item| self.reaches_kind_inner(item, kind, visiting))
+                    || match rest {
+                        TupleRest::Schema(schema) => {
+                            self.reaches_kind_inner(schema, kind, visiting)
+                        }
+                        TupleRest::Allowed | TupleRest::Forbidden => false,
+                    }
+            }
+            SchemaNode::AllOf { branches, .. }
+            | SchemaNode::OneOf { branches, .. }
+            | SchemaNode::AnyOf { branches, .. } => branches
+                .iter()
+                .any(|branch| self.reaches_kind_inner(branch, kind, visiting)),
+            SchemaNode::Primitive { .. }
+            | SchemaNode::Finite { .. }
+            | SchemaNode::Any { .. }
+            | SchemaNode::Never { .. }
+            | SchemaNode::Unknown { .. } => false,
+        }
+    }
+
     /// The codec this node is a transform site for, or `None` when it is not one.
     ///
     /// A date site is a plain formatted string; an integer site is specifically `format: int64`.
