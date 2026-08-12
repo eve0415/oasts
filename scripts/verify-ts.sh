@@ -56,11 +56,12 @@ strict_flag_matrix() {
 # keeps a component the emitter never references. Reproduced identically at v0.0.3, so none of it
 # comes from `allOf` identity — closing it means deciding how a non-JSON body names its schema,
 # which is its own change.
-#   form-composition-3.1  Forum/NestedLeft*/NestedRight — urlencoded and multipart request bodies
-#                         whose properties the client flattens into field descriptors.
+#   form-composition-3.1  Forum/Text/NestedLeft*/NestedRight — urlencoded and multipart request
+#                         bodies whose properties the client flattens into field descriptors.
 #   tictactoe-3.1         ErrorMessage — a `text/html` response typed `string` by classification.
 #   transform-composition-3.1  the per-component codec modules for a form-composed body.
 #   strict-flags-3.1      Manifest — a multipart response part.
+#   multipart-response-3.0  SnippetFiles — likewise, in both the types and validators trees.
 # The key is fixture plus file basename, not the full tree path, so one entry covers a component
 # orphaned under several of a fixture's configs — and, the cost of that, does not notice the same
 # basename newly orphaned in a tree it was fine in before.
@@ -69,12 +70,14 @@ orphan_debt=(
   "form-composition-3.1/nestedleftbase.ts"
   "form-composition-3.1/nestedleftextra.ts"
   "form-composition-3.1/nestedright.ts"
+  "form-composition-3.1/text.ts"
   "tictactoe-3.1/errormessage.ts"
   "transform-composition-3.1/audited.ts"
   "transform-composition-3.1/left.ts"
   "transform-composition-3.1/required.ts"
   "transform-composition-3.1/right.ts"
   "strict-flags-3.1/manifest.ts"
+  "multipart-response-3.0/snippetfiles.ts"
 )
 
 # Args: work-dir config fixture.
@@ -94,12 +97,21 @@ assert_no_orphan_components() {
     for name in "${names[@]}"; do
       args+=(-e "$name")
     done
+    # Import and re-export bindings only. A bare occurrence anywhere in the tree is too weak:
+    # a property key, a local, or a word in a TSDoc line that happens to match an exported
+    # name would mask a real orphan. Every cross-file reference in emitted output goes through
+    # one of these specifiers, so matching them is both tighter and sufficient — and a file
+    # never imports its own exports, which is why no self-exclusion is needed.
+    #
     # -w, or `Pet` would count `PetRequest` as a reference and every orphan would look used.
     # Collected rather than piped into `grep -q`: an early-exiting reader SIGPIPEs the
-    # recursive grep, and under `pipefail` that reads as "no reference found" — on a big
-    # enough tree to lose the race, which made this report orphans that were not.
-    referencing=$(grep -rlwF --include='*.ts' "${args[@]}" "$d"/generated* 2>/dev/null \
-      | grep -vxF "$file" || true)
+    # producer, and under `pipefail` that reads as "no reference found" — on a big enough
+    # tree to lose the race, which made this report orphans that were not.
+    referencing=$(grep -rh --include='*.ts' '' "$d"/generated* 2>/dev/null \
+      | awk '/^[[:space:]]*(import[[:space:]{*"'"'"']|export[[:space:]]*(type[[:space:]]*)?[*{])/ { inside = 1 }
+             inside { print }
+             /;/ { inside = 0 }' \
+      | grep -wF "${args[@]}" || true)
     if [[ -z "$referencing" ]]; then
       if [[ " ${orphan_debt[*]} " == *" $fixture/$(basename "$file") "* ]]; then
         continue
