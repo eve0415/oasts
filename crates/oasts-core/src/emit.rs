@@ -23,7 +23,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::client_model::{BodyPlan, BodyPlanArm, ClientModel, FormFieldPlan};
 #[cfg(test)]
-use crate::composition::CODE_COMPOSITION;
+use crate::composition::{CODE_COMPOSITION, CODE_CONFLICTING_PROPERTY};
 use crate::composition::{finite_values, json_equal};
 use crate::config::{
     DateRepresentation, DateTimeRepresentation, DocumentationConfig, EnumRepresentation, FileCase,
@@ -33,8 +33,7 @@ use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
     AdditionalProperties, Body, Discriminator, Ir, MediaType, Operation, Param, ParamLocation,
     PatternProperty, PatternPropertyKey, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader,
-    ResponseStatus, SchemaDocs, SchemaNode, SchemaRef, SourceRef, TupleRest, finite_parts,
-    mapping_schema_ref,
+    ResponseStatus, SchemaDocs, SchemaNode, SourceRef, TupleRest, finite_parts, mapping_schema_ref,
 };
 use crate::media::{is_json, is_xml};
 use crate::num::{first_number_outside_binary64, render_number_value};
@@ -502,12 +501,6 @@ pub(super) struct Emitter<'model, 'input, 'sink> {
     /// `link_targets_by_response` (same fast-reject) so a resolved link's target response type
     /// name can be looked up in O(1) instead of scanning `operation_names` per link.
     operation_stems: Arc<HashMap<usize, String>>,
-    /// Refs whose targets `merge_all_of` is currently inlining, along the active
-    /// render ancestry. A recursive schema whose `allOf` branch points
-    /// back to an ancestor would otherwise inline forever; the branch renders as a
-    /// bare named reference instead. Balanced push/pop keeps this empty between
-    /// top-level declarations, so acyclic output is byte-identical.
-    inlining_refs: RefCell<Vec<SchemaRef>>,
     /// Prewarmed `allOf` merges keyed by `(branch slice address, length)`. Populated
     /// once per distinct IR node by `prewarm_all_of`, then read on every render/import
     /// pass so the merge runs once instead of up to six times per node. Only IR-resident
@@ -575,7 +568,6 @@ impl<'model, 'input, 'sink> EmitterFactory<'model, 'input, 'sink> {
             enum_member_indices: Arc::clone(&self.enum_member_indices),
             link_targets_by_response: Arc::clone(&self.link_targets_by_response),
             operation_stems: Arc::clone(&self.operation_stems),
-            inlining_refs: RefCell::new(Vec::new()),
             merge_cache: Arc::clone(&self.merge_cache),
             import_aliases: RefCell::new(HashMap::new()),
             deferred_diagnostics: RefCell::new(Vec::new()),
@@ -619,7 +611,6 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             enum_member_indices: Arc::new(enum_member_indices),
             link_targets_by_response: Arc::new(link_targets_by_response),
             operation_stems: Arc::new(operation_stems),
-            inlining_refs: RefCell::new(Vec::new()),
             merge_cache: Arc::new(HashMap::new()),
             import_aliases: RefCell::new(HashMap::new()),
             deferred_diagnostics: RefCell::new(Vec::new()),
@@ -1810,11 +1801,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 format!("[{}]", items.join(", "))
             }
             SchemaNode::AllOf { branches, .. } => {
-                // Inlining a branch that resolves back to an ancestor being inlined
-                // would recurse forever on a recursive schema. The guard falls through
-                // to intersection rendering, where the ref becomes a bare named
-                // reference that terminates the cycle.
-                if let Some(rendered) =
+                // Identity first: a `$ref` branch renders as its own bare name, so it never
+                // enters the merge. The anonymous branches merge among themselves into one
+                // object literal that takes the position of the first of them, and the
+                // members join with `&` in declaration order. Rendering a ref as a name is
+                // also what terminates a recursive schema — the cycle that inlining used to
+                // need a guard against cannot start.
+                let merged =
                     self.merge_all_of_guarded(branches, |properties, additional_properties| {
                         self.render_object_parts(
                             properties,
@@ -1824,28 +1817,51 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                             indent,
                             false,
                         )
-                    })
-                {
-                    rendered
-                } else if branches.is_empty() {
+                    });
+                // Only `unknown` is dropped, and `{}` deliberately is not. An annotation- or
+                // validation-only sibling beside a `$ref` lowers to a branch carrying just
+                // constraints, which renders `unknown` and disappears here — that is what
+                // keeps `allOf: [$ref], minLength: 3` printing as the bare name. `{}` says
+                // something a member cannot say otherwise: it admits every value except
+                // `null` and `undefined`, so it is what narrows a nullable named branch.
+                let anonymous_merged = merged.is_some();
+                let mut pending_merge = merged;
+                let mut members = Vec::with_capacity(branches.len());
+                for branch in branches {
+                    let from_merge = covered_by_merge(branch, anonymous_merged);
+                    let rendered = if from_merge {
+                        // The merged blob stands in for the whole anonymous half, at the
+                        // position of the first anonymous branch. Taking it is what emits it
+                        // exactly once — every later anonymous branch is already inside it.
+                        match pending_merge.take() {
+                            Some(blob) => blob,
+                            None => continue,
+                        }
+                    } else {
+                        self.render_type(branch, position, axis, indent)
+                    };
+                    // Tested before parenthesizing, or a member needing parentheses would
+                    // survive the drop as `(unknown)`.
+                    if rendered == "unknown" {
+                        continue;
+                    }
+                    let member = if from_merge {
+                        rendered
+                    } else {
+                        parenthesize_intersection_member(rendered, branch)
+                    };
+                    // `A & A` is `A` spelled twice, and the merge used to fold a repeated
+                    // branch away. Linear membership for the same reason the union arm below
+                    // uses it: an intersection carries a handful of members, and a set would
+                    // clone every rendered member to own its key.
+                    if !members.contains(&member) {
+                        members.push(member);
+                    }
+                }
+                if members.is_empty() {
                     "unknown".to_owned()
                 } else {
-                    let rendered = branches
-                        .iter()
-                        .filter_map(|branch| {
-                            let rendered = self.render_type(branch, position, axis, indent);
-                            if rendered == "unknown" {
-                                None
-                            } else {
-                                Some(parenthesize_intersection_member(rendered, branch))
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    if rendered.is_empty() {
-                        "unknown".to_owned()
-                    } else {
-                        rendered.join(" & ")
-                    }
+                    members.join(" & ")
                 }
             }
             SchemaNode::OneOf { branches, .. } | SchemaNode::AnyOf { branches, .. } => {
@@ -1989,38 +2005,15 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             })
     }
 
-    /// Target keys of the `allOf` branches that are direct `$ref`s — the branches
-    /// `merge_all_of` would inline by resolving. Used to detect a ref that points
-    /// back to an ancestor already being inlined (the recursive-schema cycle).
-    fn inlineable_ref_keys(&self, branches: &[SchemaNode]) -> Vec<SchemaRef> {
-        branches
-            .iter()
-            .filter_map(|branch| match branch {
-                SchemaNode::Ref { target, .. } => Some(target.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Runs `body` over the merged `allOf` shape while the branches' inlineable ref
-    /// targets sit on the cycle-guard stack, then restores the stack. Returns `None`
-    /// without running `body` when a branch resolves back to an ancestor already being
-    /// inlined (the recursive-schema cycle) or when the branches do not merge into a
-    /// single object shape. The stack borrow is released before `body` runs so the body
-    /// can recurse and push its own guards.
+    /// Runs `body` over the merged shape of the branches that have no name of their own.
+    /// Returns `None` without running `body` when those branches do not merge into a single
+    /// object shape, or when there are none — an `allOf` of nothing but `$ref`s has no
+    /// anonymous half to describe.
     fn merge_all_of_guarded<'a, R>(
         &'a self,
         branches: &'a [SchemaNode],
         body: impl FnOnce(&[BorrowedProperty<'a>], &AdditionalProperties) -> R,
     ) -> Option<R> {
-        let inline_keys = self.inlineable_ref_keys(branches);
-        let would_cycle = {
-            let stack = self.inlining_refs.borrow();
-            inline_keys.iter().any(|key| stack.contains(key))
-        };
-        if would_cycle {
-            return None;
-        }
         // The merge is position-independent and depends only on the branch slice, so a
         // prewarmed entry (keyed by the slice's stable IR address) answers every render
         // and import pass for this node. `None` here means the slice was not prewarmed —
@@ -2042,13 +2035,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     (&fresh.0, fresh.1)
                 }
             };
-        let pushed = inline_keys.len();
-        self.inlining_refs.borrow_mut().extend(inline_keys);
-        let result = body(properties, additional_properties);
-        let mut stack = self.inlining_refs.borrow_mut();
-        let kept = stack.len() - pushed;
-        stack.truncate(kept);
-        Some(result)
+        Some(body(properties, additional_properties))
     }
 
     fn merge_all_of<'a>(
@@ -2058,12 +2045,17 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     where
         'input: 'a,
     {
+        // Only the branches with no name of their own. A `$ref` branch renders as its own
+        // bare name, so resolving it here would describe a shape nothing emits — and the
+        // merge is an analysis input, not the emission strategy.
+        //
         // One scratch set reused across branches; clearing before each call keeps
         // today's per-call-fresh cycle-visited semantics without a fresh allocation
         // per branch.
         let mut visited = HashSet::new();
         let shapes = branches
             .iter()
+            .filter(|branch| !is_named_branch(branch))
             .map(|branch| {
                 visited.clear();
                 self.object_shape(branch, &mut visited)
@@ -2311,27 +2303,36 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 }
             }
             SchemaNode::AllOf { branches, .. } => {
-                // Mirror render_type's cycle guard: a branch resolving back to an
-                // ancestor being inlined must not inline again, or this walk recurses
-                // forever on a recursive schema. Fall through to visiting the raw
-                // branches, where a `$ref` branch records its import and terminates.
-                let handled = if let SchemaChildMode::References(position) = mode {
-                    self.merge_all_of_guarded(branches, |properties, additional_properties| {
-                        for &(_, property, meta) in properties {
-                            if property_in_position(meta, position) {
-                                visit(property);
+                // Mirror render_type's partition exactly, or this walk records a different
+                // set of imports than the renderer names — which is how a component reached
+                // only through an `allOf` ended up emitted and imported by nothing. Each
+                // `$ref` branch is visited directly, so it records its import and
+                // terminates; the merged body describes only the anonymous half, and when
+                // that half does not merge its branches are visited one by one.
+                //
+                // Validation mode is untouched: it visits every branch, refs included,
+                // because a validator is emitted for the whole conjunction rather than for
+                // the rendered type.
+                if let SchemaChildMode::References(position) = mode {
+                    let merged =
+                        self.merge_all_of_guarded(branches, |properties, additional_properties| {
+                            for &(_, property, meta) in properties {
+                                if property_in_position(meta, position) {
+                                    visit(property);
+                                }
                             }
+                            if let AdditionalProperties::Allowed(Some(schema))
+                            | AdditionalProperties::Schema(schema) = additional_properties
+                            {
+                                visit(schema);
+                            }
+                        });
+                    for branch in branches {
+                        if !covered_by_merge(branch, merged.is_some()) {
+                            visit(branch);
                         }
-                        if let AdditionalProperties::Allowed(Some(schema))
-                        | AdditionalProperties::Schema(schema) = additional_properties
-                        {
-                            visit(schema);
-                        }
-                    })
+                    }
                 } else {
-                    None
-                };
-                if handled.is_none() {
                     for branch in branches {
                         visit(branch);
                     }
@@ -3378,6 +3379,26 @@ pub(super) fn render_literal_key(value: &str) -> String {
         return format!("[{}]", render_ts_string(value));
     }
     render_property_key(value)
+}
+
+/// A branch whose identity survives emission: a `$ref` renders as its own bare name, so it
+/// never enters the anonymous merge. Read by the renderer and by the import walk, so the two
+/// cannot drift — a renderer and an import walk that disagreed is what left a component
+/// reachable only through `allOf` emitted but imported by nothing.
+///
+/// Only a direct `$ref` counts. A branch that is itself an `allOf` wrapping a ref is anonymous
+/// here and recurses through the normal path.
+fn is_named_branch(branch: &SchemaNode) -> bool {
+    matches!(branch, SchemaNode::Ref { .. })
+}
+
+/// Whether the merged anonymous blob already accounts for this branch — true exactly for the
+/// branches the renderer replaces with that blob and the import walk therefore must not visit
+/// itself. Read by both, because a renderer and an import walk that computed this separately
+/// is what emitted a component nothing imported; sharing only `is_named_branch` still left
+/// the combination with the merge written out twice, in mutually inverted forms.
+fn covered_by_merge(branch: &SchemaNode, merged: bool) -> bool {
+    merged && !is_named_branch(branch)
 }
 
 fn add_nullable(mut rendered: String, schema: &SchemaNode) -> String {
@@ -5984,10 +6005,13 @@ mod tests {
     #[test]
     fn recursive_all_of_ref_terminates_as_named_reference() {
         // Regression: a schema whose member is `allOf: [{$ref: self}]` — the Kubernetes
-        // JSONSchemaProps idiom — must not inline forever. merge_all_of inlines the ref
-        // once, then the self-referential branch renders as the bare named type instead
-        // of recursing. Before the render cycle guard this overflowed the stack (
-        // cycles are legal when they form recursive schemas).
+        // JSONSchemaProps idiom — must not inline forever. Cycles are legal when they form
+        // recursive schemas, and this once overflowed the stack.
+        //
+        // The assertion is unchanged but the mechanism behind it is not. The merge used to
+        // inline the ref one level and an explicit cycle-guard stack stopped the second
+        // level; now the ref never enters the merge at all, so it renders as the bare named
+        // type on the first pass and there is no cycle to guard.
         let recursive = SchemaNode::Object {
             properties: vec![(
                 "child".to_owned(),
@@ -7788,12 +7812,16 @@ mod tests {
                 .count(),
             1
         );
+        // Two: the discriminator warning above, and OASTS1315 for `Intersected`. `Cat & Dog`
+        // types `kind` as `"cat" & "dog"`, so that one property really is uninhabitable —
+        // the intersection is still what gets emitted, and the warning is the only thing
+        // that says the property inside it collapsed.
         assert_eq!(
             diagnostics
                 .iter()
                 .filter(|diagnostic| diagnostic.severity == Severity::Warning)
                 .count(),
-            1
+            2
         );
         let animal = files
             .iter()
@@ -7813,6 +7841,234 @@ mod tests {
             .find(|file| file.relative_path.ends_with("intersected.ts"))
             .expect("Intersected");
         assert!(generated_body(intersection).contains("export type Intersected = Cat & Dog;"));
+        let conflicting = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
+            .collect::<Vec<_>>();
+        assert_eq!(conflicting.len(), 1, "{diagnostics:?}");
+        assert!(conflicting[0].message.contains("kind"), "{conflicting:?}");
+    }
+
+    #[test]
+    fn all_of_preserves_ref_identity() {
+        // The same probe pair in every composition shape that can carry a `$ref`. `allOf`
+        // used to resolve its members and print the merged property bag, which is the one
+        // place a `$ref` stopped being a name. Structure alone cannot tell the inlined
+        // literal from the component it copied, so this asserts the emitted text — the
+        // fixtures under fixtures/composition-identity-* carry the tsc-verified half.
+        let document = openapi(json!({
+            "WidgetMeta": { "type": "object", "required": ["a"], "properties": { "a": { "type": "string" } } },
+            "OtherMeta": { "type": "object", "required": ["b"], "properties": { "b": { "type": "string" } } },
+            "ViaRef": { "$ref": "#/components/schemas/WidgetMeta" },
+            "ViaOneOf": { "oneOf": [{ "$ref": "#/components/schemas/WidgetMeta" }, { "$ref": "#/components/schemas/OtherMeta" }] },
+            "ViaAnyOf": { "anyOf": [{ "$ref": "#/components/schemas/WidgetMeta" }, { "$ref": "#/components/schemas/OtherMeta" }] },
+            "ViaAnyOfNull": { "anyOf": [{ "$ref": "#/components/schemas/WidgetMeta" }, { "type": "null" }] },
+            "ViaAllOfOne": { "allOf": [{ "$ref": "#/components/schemas/WidgetMeta" }] },
+            "ViaAllOfOneDescribed": { "description": "a quoted ref", "allOf": [{ "$ref": "#/components/schemas/WidgetMeta" }] },
+            "ViaAllOfTwo": { "allOf": [{ "$ref": "#/components/schemas/WidgetMeta" }, { "$ref": "#/components/schemas/OtherMeta" }] },
+            "ViaAllOfMixed": { "allOf": [
+                { "$ref": "#/components/schemas/WidgetMeta" },
+                { "type": "object", "properties": { "c": { "type": "string" } } }
+            ] },
+            "ViaAllOfInline": { "allOf": [
+                { "type": "object", "required": ["a"], "properties": { "a": { "type": "string" } } },
+                { "type": "object", "properties": { "b": { "type": "string" } } }
+            ] }
+        }));
+        let (files, _diagnostics) = compile(document, json!({}));
+        let rendered = |base: &str| generated_body(schema_file(&files, base)).to_owned();
+
+        // The six shapes that already named their members. These must not move.
+        assert!(rendered("viaref").contains("export type ViaRef = WidgetMeta;"));
+        assert!(rendered("viaoneof").contains("export type ViaOneOf = WidgetMeta | OtherMeta;"));
+        assert!(rendered("viaanyof").contains("export type ViaAnyOf = WidgetMeta | OtherMeta;"));
+        assert!(rendered("viaanyofnull").contains("export type ViaAnyOfNull = WidgetMeta | null;"));
+        // An `allOf` of two anonymous objects still folds to one object literal: identity-first
+        // changes what happens to `$ref` branches, not to anonymous ones.
+        let inline = rendered("viaallofinline");
+        assert!(
+            inline.contains("export type ViaAllOfInline = {\n  a: string;\n  b?: string;\n};"),
+            "{inline}"
+        );
+
+        // A single `$ref`, with and without an annotation sibling: the quoting idiom, not
+        // composition. A one-member join is the member.
+        let one = rendered("viaallofone");
+        assert!(
+            one.contains("export type ViaAllOfOne = WidgetMeta;"),
+            "{one}"
+        );
+        let described = rendered("viaallofonedescribed");
+        assert!(
+            described.contains("export type ViaAllOfOneDescribed = WidgetMeta;"),
+            "{described}"
+        );
+        assert!(described.contains("a quoted ref"), "{described}");
+
+        // More than one member: each keeps its identity and they join with `&`.
+        let two = rendered("viaalloftwo");
+        assert!(
+            two.contains("export type ViaAllOfTwo = WidgetMeta & OtherMeta;"),
+            "{two}"
+        );
+        let mixed = rendered("viaallofmixed");
+        assert!(
+            mixed.contains("export type ViaAllOfMixed = WidgetMeta & {")
+                && mixed.contains("c?: string;"),
+            "{mixed}"
+        );
+    }
+
+    #[test]
+    fn conflicting_property_is_seen_through_a_nested_all_of() {
+        // The discriminator idiom composed twice: a component that is itself an `allOf` is
+        // the shape most likely to reach TypeScript as `X & { … }`, so a conflict introduced
+        // at the second level is exactly the one the warning has to see. Resolving a branch
+        // one `$ref` deep and requiring a plain object misses it.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Base": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string" } } },
+                "Cat": { "allOf": [
+                    { "$ref": "#/components/schemas/Base" },
+                    { "type": "object", "properties": { "kind": { "type": "string", "const": "cat" } } }
+                ] },
+                "Hybrid": { "allOf": [
+                    { "$ref": "#/components/schemas/Cat" },
+                    { "type": "object", "properties": { "kind": { "type": "string", "const": "dog" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        let flagged = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
+            .collect::<Vec<_>>();
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        let message = &flagged[0].message;
+        assert!(message.contains("kind"), "{message}");
+    }
+
+    #[test]
+    fn a_single_self_contradictory_branch_is_not_a_property_conflict() {
+        // One branch declaring `n` with minimum above maximum empties the whole node, which
+        // is OASTS1303's job. Reporting it as branches disagreeing about `n` names a cause
+        // that is not there — there is only one declaration of `n`.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Solo": { "allOf": [
+                    { "type": "object", "properties": { "n": { "type": "number", "minimum": 5, "maximum": 4 } } },
+                    { "type": "object", "properties": { "n": { "description": "no constraints of its own" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        // Asserted on the whole list rather than a filtered one: a closure that filters an
+        // empty iterator never runs, and the coverage gate counts it as an unreached region.
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_node_lowered_to_never_reports_no_property_conflict() {
+        // The node is replaced by `never`, so a warning about a property inside it describes
+        // a type the output does not contain.
+        let (files, diagnostics) = compile(
+            openapi(json!({
+                "Lowered": { "allOf": [
+                    { "type": "object", "additionalProperties": false, "required": ["a"],
+                      "properties": { "a": { "type": "string" } } },
+                    { "type": "object", "required": ["b"],
+                      "properties": { "a": { "type": "number" }, "b": { "type": "string" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        let lowered = &schema_file(&files, "lowered").content;
+        assert!(
+            lowered.contains("export type Lowered = never;"),
+            "{lowered}"
+        );
+        let flagged = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
+            .count();
+        assert_eq!(flagged, 0, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_repeated_all_of_ref_renders_once() {
+        // The merge used to fold a repeated branch into one shape. Joining members without
+        // deduplicating turns that into `Base & Base`, which is the same type spelled twice —
+        // the union arm has always deduplicated its branches for the same reason.
+        let (files, _diagnostics) = compile(
+            openapi(json!({
+                "Base": { "type": "object", "required": ["a"], "properties": { "a": { "type": "string" } } },
+                "Twice": { "allOf": [
+                    { "$ref": "#/components/schemas/Base" },
+                    { "$ref": "#/components/schemas/Base" }
+                ] }
+            })),
+            json!({}),
+        );
+        let twice = generated_body(schema_file(&files, "twice")).to_owned();
+        assert!(twice.contains("export type Twice = Base;"), "{twice}");
+    }
+
+    #[test]
+    fn empty_object_branch_survives_beside_a_named_branch() {
+        // `{}` is not a member that says nothing: in TypeScript it admits every value except
+        // `null` and `undefined`, so intersecting it with a nullable named branch is what
+        // removes the `null`. Dropping it as noise widens the type back.
+        let document = openapi(json!({
+            "MaybeObject": { "anyOf": [
+                { "type": "object", "properties": { "a": { "type": "string" } } },
+                { "type": "null" }
+            ] },
+            "Constrained": { "allOf": [
+                { "$ref": "#/components/schemas/MaybeObject" },
+                { "type": "object" }
+            ] }
+        }));
+        let (files, _diagnostics) = compile(document, json!({}));
+        let constrained = generated_body(schema_file(&files, "constrained")).to_owned();
+        assert!(
+            constrained.contains("export type Constrained = MaybeObject & {};"),
+            "{constrained}"
+        );
+    }
+
+    #[test]
+    fn nullable_all_of_ref_wraps_the_whole_intersection() {
+        // 3.0's `nullable` beside the `allOf` quoting idiom. `null` is appended to whatever
+        // the node rendered to, outside the intersection — distributing it into the members
+        // would give `(A | null) & (B | null)`, whose object half collapses to `never`.
+        let document = json!({
+            "openapi": "3.0.3",
+            "info": { "title": "test", "version": "1" },
+            "paths": {},
+            "components": { "schemas": {
+                "WidgetMeta": { "type": "object", "required": ["a"], "properties": { "a": { "type": "string" } } },
+                "OtherMeta": { "type": "object", "required": ["b"], "properties": { "b": { "type": "string" } } },
+                "NullableOne": { "nullable": true, "allOf": [{ "$ref": "#/components/schemas/WidgetMeta" }] },
+                "NullableTwo": { "nullable": true, "allOf": [
+                    { "$ref": "#/components/schemas/WidgetMeta" },
+                    { "$ref": "#/components/schemas/OtherMeta" }
+                ] }
+            } }
+        });
+        let (files, _diagnostics) = compile(document, json!({}));
+        let one = generated_body(schema_file(&files, "nullableone")).to_owned();
+        assert!(
+            one.contains("export type NullableOne = WidgetMeta | null;"),
+            "{one}"
+        );
+        // `&` binds tighter than `|`, so the unparenthesized tail is `(A & B) | null` — the
+        // whole intersection is nullable, not its last member. The fixture's compile-assert
+        // pins that reading at the type level.
+        let two = generated_body(schema_file(&files, "nullabletwo")).to_owned();
+        assert!(
+            two.contains("export type NullableTwo = WidgetMeta & OtherMeta | null;"),
+            "{two}"
+        );
     }
 
     fn discriminator_diagnostics(diagnostics: &[Diagnostic]) -> Vec<&Diagnostic> {
@@ -8142,6 +8398,98 @@ mod tests {
             ),
             "workspace/nested/shared.json"
         );
+    }
+
+    #[test]
+    fn conflicting_property_across_all_of_branches_warns_without_lowering() {
+        // Identity-first sends every all-`$ref` `allOf` down the intersection path, so a
+        // property two branches disagree about is no longer folded away by the merge — it
+        // reaches TypeScript as `string & number`, which is silently `never` at exactly one
+        // property. OASTS1315 is the only signal that says so.
+        //
+        // It fires on a provably empty intersection, not on any inequality. Narrowing a
+        // property is what `allOf` is *for* — the discriminator idiom refines a base's
+        // `kind: string` to `const: "cat"` — and warning on that would fire on most real
+        // documents that use `allOf` at all.
+        let (files, diagnostics) = compile(
+            openapi(json!({
+                "Conflict": { "allOf": [
+                    { "type": "object", "properties": { "a": { "type": "string" } } },
+                    { "type": "object", "properties": { "a": { "type": "number" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        let flagged = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
+            .collect::<Vec<_>>();
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        assert_eq!(flagged[0].severity, Severity::Warning);
+        assert!(flagged[0].message.contains('a'), "{:?}", flagged[0]);
+        // A warning, not a proof of emptiness: the node keeps its intersection type.
+        let conflict = schema_file(&files, "conflict");
+        assert!(
+            !conflict.content.contains("export type Conflict = never;"),
+            "{}",
+            conflict.content
+        );
+
+        // Identical declarations merge, so nothing to say.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Same": { "allOf": [
+                    { "type": "object", "properties": { "a": { "type": "string" } } },
+                    { "type": "object", "properties": { "a": { "type": "string" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        // A numeric property whose bounds cannot both hold.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Bounds": { "allOf": [
+                    { "type": "object", "properties": { "n": { "type": "number", "minimum": 5 } } },
+                    { "type": "object", "properties": { "n": { "type": "number", "maximum": 4 } } }
+                ] }
+            })),
+            json!({}),
+        );
+        let flagged = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
+            .collect::<Vec<_>>();
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        let message = &flagged[0].message;
+        assert!(message.contains("empty numeric interval"), "{message}");
+
+        // Overlapping finite sets intersect to `"y"`. Unequal, inhabitable, silent.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Overlap": { "allOf": [
+                    { "type": "object", "properties": { "a": { "type": "string", "enum": ["x", "y"] } } },
+                    { "type": "object", "properties": { "a": { "type": "string", "const": "y" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        // The discriminator idiom: a base's open `kind` refined to one literal. Unequal, and
+        // entirely legitimate — the intersection is `"cat"`, not `never`.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Base": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string" } } },
+                "Cat": { "allOf": [
+                    { "$ref": "#/components/schemas/Base" },
+                    { "type": "object", "properties": { "kind": { "type": "string", "const": "cat" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]

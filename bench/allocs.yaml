@@ -482,21 +482,21 @@ keys:
         allocs: 3989
         reallocs: 275
         deallocs: 1739
-        allocBytes: 733676
+        allocBytes: 734188
       - stage: "filter"
         allocs: 102
         reallocs: 2
         deallocs: 102
-        allocBytes: 32424
+        allocBytes: 32552
       - stage: "analyze"
-        allocs: 733
-        reallocs: 110
-        deallocs: 524
-        allocBytes: 53113
+        allocs: 868
+        reallocs: 178
+        deallocs: 659
+        allocBytes: 118893
       - stage: "emit"
-        allocs: 4352
-        reallocs: 1332
-        deallocs: 4243
-        allocBytes: 498725
+        allocs: 4296
+        reallocs: 1334
+        deallocs: 4187
+        allocBytes: 496884
     informational:
-      peakBytes: 957643
+      peakBytes: 957771
