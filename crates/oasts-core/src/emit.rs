@@ -1246,7 +1246,23 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             ));
         }
 
-        if tagged_projection {
+        if tagged_projection
+            && [
+                TypePosition::Neutral,
+                TypePosition::Request,
+                TypePosition::Response,
+            ]
+            .into_iter()
+            .all(|position| {
+                branches.iter().all(|branch| {
+                    self.discriminator_branches_fix_a_literal_in_position(
+                        std::slice::from_ref(branch),
+                        property,
+                        position,
+                    ) || self.branch_accepts_discriminator_projection(branch, property, position)
+                })
+            })
+        {
             return None;
         }
 
@@ -1433,13 +1449,30 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         branches: &[SchemaNode],
         property: &str,
     ) -> bool {
+        self.discriminator_branches_fix_a_literal_in_position(
+            branches,
+            property,
+            TypePosition::Neutral,
+        )
+    }
+
+    fn discriminator_branches_fix_a_literal_in_position(
+        &self,
+        branches: &[SchemaNode],
+        property: &str,
+        position: TypePosition,
+    ) -> bool {
         branches.iter().all(|branch| {
             matches!(
                 self.resolve_ref(branch, &mut HashSet::new()),
                 Some(SchemaNode::Never { .. })
             ) || {
-                let facts =
-                    self.merged_object_property_finite(branch, property, &mut HashSet::new());
+                let facts = self.merged_object_property_finite_in_position(
+                    branch,
+                    property,
+                    position,
+                    &mut HashSet::new(),
+                );
                 facts.required && facts.values.is_some_and(|values| !values.is_empty())
             }
         })
@@ -1460,15 +1493,35 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             .ok()
     }
 
-    fn branch_accepts_discriminator_projection(&self, branch: &SchemaNode, property: &str) -> bool {
-        let facts = self.merged_object_property_finite(branch, property, &mut HashSet::new());
-        facts.values.is_none()
+    fn branch_accepts_discriminator_projection(
+        &self,
+        branch: &SchemaNode,
+        property: &str,
+        position: TypePosition,
+    ) -> bool {
+        let facts = self.merged_object_property_finite_in_position(
+            branch,
+            property,
+            position,
+            &mut HashSet::new(),
+        );
+        facts.required && facts.values.is_none()
     }
 
     fn merged_object_property_finite<'a>(
         &'a self,
         branch: &'a SchemaNode,
         prop: &str,
+        visited: &mut HashSet<(&'a str, &'a str)>,
+    ) -> TagFacts {
+        self.merged_object_property_finite_in_position(branch, prop, TypePosition::Neutral, visited)
+    }
+
+    fn merged_object_property_finite_in_position<'a>(
+        &'a self,
+        branch: &'a SchemaNode,
+        prop: &str,
+        position: TypePosition,
         visited: &mut HashSet<(&'a str, &'a str)>,
     ) -> TagFacts {
         match branch {
@@ -1480,7 +1533,12 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     .schema_target(&target.source_id, &target.json_pointer)
                     .and_then(|target| self.model.analyzed.ir.schemas.get(target.index))
                     .map_or_else(TagFacts::default, |resolved| {
-                        self.merged_object_property_finite(&resolved.schema, prop, visited)
+                        self.merged_object_property_finite_in_position(
+                            &resolved.schema,
+                            prop,
+                            position,
+                            visited,
+                        )
                     })
             }
             // A primitive tag property fixes its value in `const`/`enum` (resolved through a
@@ -1488,7 +1546,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             // added. Consult both so either spelling proves.
             SchemaNode::Object { properties, .. } => properties
                 .iter()
-                .find(|(name, _, _)| name == prop)
+                .find(|(name, _, meta)| name == prop && property_in_position(meta, position))
                 .map_or_else(TagFacts::default, |(_, schema, meta)| TagFacts {
                     values: self
                         .finite_constraint(schema, &mut visited.clone())
@@ -1498,8 +1556,12 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             SchemaNode::AllOf { branches, .. } => {
                 let mut facts = TagFacts::default();
                 for branch in branches {
-                    let constituent =
-                        self.merged_object_property_finite(branch, prop, &mut visited.clone());
+                    let constituent = self.merged_object_property_finite_in_position(
+                        branch,
+                        prop,
+                        position,
+                        &mut visited.clone(),
+                    );
                     facts.required |= constituent.required;
                     let Some(values) = constituent.values else {
                         continue;
@@ -2052,7 +2114,8 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                         let mut rendered = self.render_type(branch, position, axis, indent);
                         if let Some((property, tags)) = &projection_tags
                             && let Some(tags) = tags.get(index).filter(|tags| !tags.is_empty())
-                            && self.branch_accepts_discriminator_projection(branch, property)
+                            && self
+                                .branch_accepts_discriminator_projection(branch, property, position)
                         {
                             let member = parenthesize_intersection_member(rendered, branch);
                             let literals = tags
@@ -8607,6 +8670,98 @@ mod tests {
             diagnostics
                 .iter()
                 .all(|diagnostic| diagnostic.code != CODE_DISCRIMINATOR_NARROWING),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn tagged_projection_does_not_require_optional_or_position_filtered_tags() {
+        let optional_document = openapi(json!({
+            "Cat": { "type": "object", "properties": { "kind": { "type": "string" } } },
+            "Dog": { "type": "object", "properties": { "kind": { "type": "string" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind", "mapping": {
+                         "cat": "#/components/schemas/Cat", "dog": "#/components/schemas/Dog"
+                     } } }
+        }));
+        let (files, diagnostics) = compile(
+            optional_document,
+            json!({ "types": { "discriminatedUnions": "tagged" } }),
+        );
+        let pet = generated_body(schema_file(&files, "pet"));
+        assert!(pet.contains("export type Pet = Cat | Dog;"), "{pet}");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+                .count(),
+            1,
+            "{diagnostics:?}"
+        );
+
+        let filtered_document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "string", "readOnly": true }
+            } },
+            "Dog": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "string", "readOnly": true }
+            } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind", "mapping": {
+                         "cat": "#/components/schemas/Cat", "dog": "#/components/schemas/Dog"
+                     } } }
+        }));
+        let (files, diagnostics) = compile(
+            filtered_document,
+            json!({ "types": { "discriminatedUnions": "tagged" } }),
+        );
+        let pet = generated_body(schema_file(&files, "pet"));
+        assert!(
+            pet.contains("export type PetRequest = CatRequest | DogRequest;"),
+            "{pet}"
+        );
+        assert!(
+            pet.contains(
+                "export type Pet = (Cat & { kind: \"cat\" }) | (Dog & { kind: \"dog\" });"
+            ),
+            "{pet}"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+                .count(),
+            1,
+            "{diagnostics:?}"
+        );
+
+        let filtered_response_document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "string", "writeOnly": true }
+            } },
+            "Dog": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "string", "writeOnly": true }
+            } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind", "mapping": {
+                         "cat": "#/components/schemas/Cat", "dog": "#/components/schemas/Dog"
+                     } } }
+        }));
+        let (files, diagnostics) = compile(
+            filtered_response_document,
+            json!({ "types": { "discriminatedUnions": "tagged" } }),
+        );
+        let pet = generated_body(schema_file(&files, "pet"));
+        assert!(
+            pet.contains("export type PetResponse = CatResponse | DogResponse;"),
+            "{pet}"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+                .count(),
+            1,
             "{diagnostics:?}"
         );
     }
