@@ -5,9 +5,9 @@ files:
   - path: fixtures/validators-keyword-matrix.yaml
     sha256: 015c2cf5316c8b76c8103a92a91d7b0bfa88713b6e5921a6a1c1fda78a0ace18
   - path: crates/oasts-core/runtime/test-conformance/vectors-validators-conformance.ts
-    sha256: 1f6dc0c98121983e773da58d05ede9f8ae5cd4a5cadc195f97ebd933713f27b2
+    sha256: b1e43406a29486276601f54269905df314ae2d5ef40462354ecf4fd33c101e78
   - path: fixtures/validators-showcase-3.1/openapi.yaml
-    sha256: a22cab2669a29940a5b5e533c23388ce7e64e9ea091e1ab5c3e83e61c6b1bc56
+    sha256: a955b5d4628e651a6f75a1f85f3999d82a7537c4f6f12662214e5dc26b371eac
   - path: fixtures/validators-showcase-3.1/oasts.yaml
     sha256: d44d039ae127117092b00765fa8b3450fbded970b4ce4d8ccb954ce730d2bb95
   - path: fixtures/validators-showcase-3.1/oasts-client.yaml
