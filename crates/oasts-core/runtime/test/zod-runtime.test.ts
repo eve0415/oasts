@@ -227,10 +227,13 @@ describe("isInt32", () => {
 });
 
 describe("isInt64", () => {
-  test("accepts only safe integers", () => {
+  test("recognizes integers in the signed 64-bit range", () => {
     assert.equal(isInt64(Number.MIN_SAFE_INTEGER), true);
     assert.equal(isInt64(Number.MAX_SAFE_INTEGER), true);
-    assert.equal(isInt64(Number.MAX_SAFE_INTEGER + 1), false);
+    assert.equal(isInt64(2 ** 60), true);
+    assert.equal(isInt64(-(2 ** 63)), true);
+    assert.equal(isInt64(-(2 ** 63) - 2048), false);
+    assert.equal(isInt64(2 ** 63), false);
     assert.equal(isInt64(1.5), false);
   });
 });
@@ -307,11 +310,11 @@ describe("scalar checks", () => {
     assert.equal(schema.safeParse(2147483648).success, false);
   });
 
-  test("int64 reports values outside the safe-integer domain", () => {
+  test("int64 reports values outside the signed 64-bit domain", () => {
     const schema = z.number().check(int64());
 
-    assert.equal(schema.safeParse(Number.MAX_SAFE_INTEGER).success, true);
-    assert.equal(schema.safeParse(Number.MAX_SAFE_INTEGER + 1).success, false);
+    assert.equal(schema.safeParse(2 ** 60).success, true);
+    assert.equal(schema.safeParse(2 ** 63).success, false);
   });
 
   test("int64Wire accepts every exact wire shape and rejects the rest", () => {

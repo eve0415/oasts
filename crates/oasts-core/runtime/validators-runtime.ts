@@ -238,9 +238,9 @@ export function isInt32(v: number): boolean {
   return Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
 }
 
-// Whole number within JavaScript's safe-integer range.
+// Whole number within the signed 64-bit range.
 export function isInt64(v: number): boolean {
-  return Number.isSafeInteger(v);
+  return Number.isInteger(v) && v >= -(2 ** 63) && v < 2 ** 63;
 }
 
 const INT64_WIRE_INTEGER = /^-?(?:0|[1-9]\d*)$/;

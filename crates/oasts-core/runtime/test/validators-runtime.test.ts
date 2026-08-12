@@ -38,10 +38,13 @@ describe("exact bigint constraints", () => {
 });
 
 describe("isInt64", () => {
-  test("accepts only safe integers", () => {
+  test("recognizes integers in the signed 64-bit range", () => {
     assert.equal(isInt64(Number.MIN_SAFE_INTEGER), true);
     assert.equal(isInt64(Number.MAX_SAFE_INTEGER), true);
-    assert.equal(isInt64(Number.MAX_SAFE_INTEGER + 1), false);
+    assert.equal(isInt64(2 ** 60), true);
+    assert.equal(isInt64(-(2 ** 63)), true);
+    assert.equal(isInt64(-(2 ** 63) - 2048), false);
+    assert.equal(isInt64(2 ** 63), false);
     assert.equal(isInt64(1.5), false);
   });
 });
