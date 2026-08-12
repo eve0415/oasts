@@ -1408,8 +1408,15 @@ fn render_operation_pairs(
             rendered.helpers = builder.helpers;
             rendered.pair_imports = builder.pair_imports;
             let with_lossless = local_import_name("withLosslessJson", &aliases.kernel);
+            let body = guarded_body(
+                Some(format!("{with_lossless}(lossless, () => ({expression}))")),
+                Direction::Revive,
+                &mut rendered.pointers,
+                &mut rendered.helpers,
+                &codec.source,
+            );
             rendered.bodies.push_str(&format!(
-                "\nexport function revive{application}(value: {wire}, lossless: unknown, path: {path_type} = []): {wire} {{\n  return {with_lossless}(lossless, () => ({expression}));\n}}\n"
+                "\nexport function revive{application}(value: {wire}, lossless: unknown, path: {path_type} = []): {wire} {{\n  return {body};\n}}\n"
             ));
         }
     }
@@ -6938,6 +6945,42 @@ mod operation_pair_tests {
             content.contains("acceptedAt: decodeDateTimeDate(value.acceptedAt"),
             "{content}"
         );
+    }
+
+    #[test]
+    fn an_int64_response_reviver_guards_transform_failures() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "readCounter",
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["id"],
+                                        "properties": {
+                                            "id": { "type": "integer", "format": "int64" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+                json!({}),
+            ),
+            bigint_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let content = operation_module(&files, "readcounter").expect("operation codec");
+        assert!(
+            content.contains("return guarded(() => (withLosslessJson(lossless"),
+            "{content}"
+        );
+        assert!(content.contains("\"response\""), "{content}");
     }
 
     #[test]
