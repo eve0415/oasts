@@ -56,6 +56,7 @@ const ZOD_RESERVED_NAMES: &[&str] = &[
     "stringFormat",
     "int32",
     "int64",
+    "int64Wire",
     "enumValues",
     "constValue",
     "uniqueItems",
@@ -355,14 +356,22 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
                 enum_values,
                 const_value,
                 meta,
-            } => self.render_primitive(
-                *ty,
-                format.as_deref(),
-                enum_values.as_deref(),
-                const_value.as_ref(),
-                meta,
-                schema.is_nullable(),
-            ),
+            } => {
+                if self.model.transform_facts().site(schema)
+                    == Some(crate::transform::TransformKind::IntegerBigInt)
+                {
+                    self.render_bigint_int64(schema, meta)
+                } else {
+                    self.render_primitive(
+                        *ty,
+                        format.as_deref(),
+                        enum_values.as_deref(),
+                        const_value.as_ref(),
+                        meta,
+                        schema.is_nullable(),
+                    )
+                }
+            }
             SchemaNode::Finite {
                 enum_values,
                 const_value,
@@ -555,6 +564,25 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
             format!("z.intersection({domain},{finite})")
         };
         self.apply_finite_checks(constrained, enum_values, const_value)
+    }
+
+    fn render_bigint_int64(&mut self, schema: &SchemaNode, meta: &SchemaMeta) -> String {
+        self.runtime_values.insert("int64Wire");
+        let type_expression =
+            Emitter::new(self.model).render_type(schema, self.position, TypeAxis::Wire, 0);
+        let expression = format!("z.custom<{type_expression}>()");
+        let constraints = meta.numeric_constraints();
+        let has_constraints = constraints.minimum.is_some()
+            || constraints.maximum.is_some()
+            || constraints.exclusive_minimum.is_some()
+            || constraints.exclusive_maximum.is_some()
+            || constraints.multiple_of.is_some();
+        if has_constraints {
+            let number = self.apply_number_constraints("z.number()".to_owned(), meta);
+            check(expression, &format!("int64Wire({number})"))
+        } else {
+            check(expression, "int64Wire()")
+        }
     }
 
     fn apply_string_constraints(
@@ -3087,6 +3115,37 @@ mod tests {
     }
 
     #[test]
+    fn bigint_int64_uses_the_lossless_wire_check() {
+        let (files, diagnostics) = compile_with_config(
+            doc(json!({
+                "Thing": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" }
+                    }
+                }
+            })),
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "zod": true },
+                "types": { "integer": "bigint" },
+                "validation": { "engine": "zod", "request": true, "unchecked": "allow" }
+            }),
+        );
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(
+            content.contains(
+                "z.custom<number | bigint | { readonly rawJSON: string }>().check(int64Wire())"
+            ),
+            "{content}"
+        );
+        assert!(!content.contains(".check(int64())"), "{content}");
+    }
+
+    #[test]
     fn openapi_30_nullable_and_boolean_exclusive_bounds_keep_their_dialect_meaning() {
         let (files, diagnostics) = compile(json!({
             "openapi": "3.0.3",
@@ -4464,6 +4523,7 @@ mod tests {
             "isUuid",
             "isInt32",
             "isInt64",
+            "int64WireValue",
         ] {
             assert_eq!(
                 extract_function(ZOD_RUNTIME_TS, name),
@@ -4477,6 +4537,7 @@ mod tests {
             "TIME_PATTERN",
             "DATE_TIME_PATTERN",
             "UUID_PATTERN",
+            "INT64_WIRE_INTEGER",
         ] {
             assert_eq!(
                 extract_const(ZOD_RUNTIME_TS, name),

@@ -287,6 +287,25 @@ export function isInt64(v: number): boolean {
   return Number.isSafeInteger(v);
 }
 
+const INT64_WIRE_INTEGER = /^-?(?:0|[1-9]\d*)$/;
+
+export function int64WireValue(value: unknown): bigint | null {
+  if (typeof value === "bigint") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value)) {
+    return BigInt(value);
+  }
+  if (
+    isRecord(value) &&
+    typeof value.rawJSON === "string" &&
+    INT64_WIRE_INTEGER.test(value.rawJSON)
+  ) {
+    return BigInt(value.rawJSON);
+  }
+  return null;
+}
+
 // --- scalar checks -------------------------------------------------------------------------------
 
 // The contract's integer domain: any finite number that is a whole number. Wider than zod's
@@ -352,6 +371,17 @@ export function int64(): Check<number> {
   return (payload) => {
     if (!isInt64(payload.value)) {
       report(payload, "out of int64 range");
+    }
+  };
+}
+
+export function int64Wire(schema?: Schema): Check<unknown> {
+  return (payload) => {
+    const normalized = int64WireValue(payload.value);
+    if (normalized === null) {
+      report(payload, "expected type integer");
+    } else if (schema !== undefined) {
+      relay(payload, schema.safeParse(Number(normalized)));
     }
   };
 }

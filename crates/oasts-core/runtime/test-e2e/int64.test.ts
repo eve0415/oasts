@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { constants } from "node:fs";
-import { access, cp, mkdtemp, rm } from "node:fs/promises";
+import { access, cp, mkdtemp, rm, symlink } from "node:fs/promises";
 import { register } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -45,13 +45,20 @@ let submitCounterMultipart: ExportedFunction;
 let validatedCreateTransport: ExportedFunction;
 let validatedGetLatestCounter: ExportedFunction;
 let validatedRecordCounter: ExportedFunction;
+let zodCreateTransport: ExportedFunction;
+let zodGetLatestCounter: ExportedFunction;
+let zodRecordCounter: ExportedFunction;
 
 before(async () => {
   await access(binary, constants.X_OK);
   temporaryRoot = await mkdtemp(path.join(tmpdir(), "oasts-int64-e2e-"));
   const fixtureRoot = path.join(temporaryRoot, "int64-transform-3.1");
   await cp(fixtureSource, fixtureRoot, { recursive: true });
-  for (const config of ["oasts.yaml", "oasts-validated.yaml"]) {
+  await symlink(
+    path.join(repoRoot, "crates/oasts-core/runtime/node_modules"),
+    path.join(fixtureRoot, "node_modules"),
+  );
+  for (const config of ["oasts.yaml", "oasts-validated.yaml", "oasts-zod.yaml"]) {
     execFileSync(binary, ["generate", "--config", config], {
       cwd: fixtureRoot,
       stdio: "pipe",
@@ -59,6 +66,7 @@ before(async () => {
   }
   generatedRoot = path.join(fixtureRoot, "generated");
   const validatedRoot = path.join(fixtureRoot, "generated-validated");
+  const zodRoot = path.join(fixtureRoot, "generated-zod");
 
   register(new URL("./resolve-generated.mjs", import.meta.url), {
     data: { generatedRootUrl: pathToFileURL(fixtureRoot).href },
@@ -87,6 +95,12 @@ before(async () => {
     pathToFileURL(path.join(validatedRoot, "runtime/transport.ts")).href
   );
   validatedCreateTransport = requiredFunction(validatedTransportModule, "createTransport");
+  zodGetLatestCounter = await operation(zodRoot, "getlatestcounter", "getLatestCounter");
+  zodRecordCounter = await operation(zodRoot, "recordcounter", "recordCounter");
+  const zodTransportModule: unknown = await import(
+    pathToFileURL(path.join(zodRoot, "runtime/transport.ts")).href
+  );
+  zodCreateTransport = requiredFunction(zodTransportModule, "createTransport");
   baseUrl = await harness.start();
 });
 
@@ -154,6 +168,35 @@ test("generated validation preserves the exact int64 response and request", asyn
   const writeResult = requiredRecord(
     await validatedRecordCounter(transport, { body: { id: EXACT_INT64 } }),
     "validated recordCounter result",
+  );
+  assert.equal(writeResult.outcome, 201);
+  assert.equal(requiredRequest(1).body.toString("utf8"), `{"id":${EXACT_DIGITS}}`);
+});
+
+test("Zod validation preserves the exact int64 response and request", async () => {
+  const responseBytes = Buffer.from(`{"id":${EXACT_DIGITS}}`);
+  scriptRoute("GET", "/counters/latest", {
+    status: 200,
+    headers: [["Content-Type", "application/json"]],
+    body: responseBytes,
+  });
+  scriptRoute("POST", "/counters", {
+    status: 201,
+    headers: [["Content-Type", "application/json"]],
+    body: responseBytes,
+  });
+
+  const transport = zodCreateTransport({ baseUrl });
+  const readResult = requiredRecord(
+    await zodGetLatestCounter(transport, {}),
+    "Zod getLatestCounter result",
+  );
+  assert.equal(readResult.outcome, 200);
+  assert.equal(requiredRecord(readResult.data, "Zod response data").id, EXACT_INT64);
+
+  const writeResult = requiredRecord(
+    await zodRecordCounter(transport, { body: { id: EXACT_INT64 } }),
+    "Zod recordCounter result",
   );
   assert.equal(writeResult.outcome, 201);
   assert.equal(requiredRequest(1).body.toString("utf8"), `{"id":${EXACT_DIGITS}}`);
