@@ -1810,44 +1810,86 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 // members join with `&` in declaration order. Rendering a ref as a name is
                 // also what terminates a recursive schema — the cycle that inlining used to
                 // need a guard against cannot start.
+                let has_named = branches.iter().any(is_named_branch);
                 let merged =
                     self.merge_all_of_guarded(branches, |properties, additional_properties| {
-                        self.render_object_parts(
-                            properties,
-                            additional_properties,
-                            position,
-                            axis,
-                            indent,
-                            false,
+                        let is_empty_object = !properties
+                            .iter()
+                            .any(|&(_, _, meta)| property_in_position(meta, position))
+                            && matches!(
+                                additional_properties,
+                                AdditionalProperties::Allowed(None)
+                                    | AdditionalProperties::Forbidden
+                            );
+                        (
+                            self.render_object_parts(
+                                properties,
+                                additional_properties,
+                                position,
+                                axis,
+                                indent,
+                                false,
+                            ),
+                            is_empty_object,
                         )
                     });
-                // Only `unknown` is dropped, and `{}` deliberately is not. An annotation- or
-                // validation-only sibling beside a `$ref` lowers to a branch carrying just
-                // constraints, which renders `unknown` and disappears here — that is what
-                // keeps `allOf: [$ref], minLength: 3` printing as the bare name. `{}` says
-                // something a member cannot say otherwise: it admits every value except
-                // `null` and `undefined`, so it is what narrows a nullable named branch.
+                // An annotation- or validation-only sibling beside a `$ref` lowers to a branch
+                // carrying just constraints, which renders `unknown` and disappears here — that
+                // is what keeps `allOf: [$ref], minLength: 3` printing as the bare name. Only
+                // `unknown` is dropped; an empty object beside a named branch is kept, and kept
+                // as the bare `{}` an empty object used to render as everywhere.
                 let anonymous_merged = merged.is_some();
                 let mut pending_merge = merged;
                 let mut members = Vec::with_capacity(branches.len());
                 for branch in branches {
                     let from_merge = covered_by_merge(branch, anonymous_merged);
-                    let rendered = if from_merge {
+                    let (rendered, is_empty_object) = if from_merge {
                         // The merged blob stands in for the whole anonymous half, at the
                         // position of the first anonymous branch. Taking it is what emits it
                         // exactly once — every later anonymous branch is already inside it.
                         match pending_merge.take() {
-                            Some(blob) => blob,
+                            Some(merged) => merged,
                             None => continue,
                         }
                     } else {
-                        self.render_type(branch, position, axis, indent)
+                        let is_empty_object =
+                            if is_named_branch(branch) {
+                                false
+                            } else {
+                                let mut visited = HashSet::new();
+                                self.object_shape(branch, &mut visited)
+                                    .is_some_and(|shape| {
+                                        !shape.properties.iter().any(|(_, _, meta)| {
+                                            property_in_position(meta, position)
+                                        }) && matches!(
+                                            shape.additional_properties,
+                                            AdditionalProperties::Allowed(None)
+                                                | AdditionalProperties::Forbidden
+                                        )
+                                    })
+                            };
+                        (
+                            self.render_type(branch, position, axis, indent),
+                            is_empty_object,
+                        )
                     };
                     // Tested before parenthesizing, or a member needing parentheses would
                     // survive the drop as `(unknown)`.
                     if rendered == "unknown" {
                         continue;
                     }
+                    // Beside a named branch an empty object keeps the bare `{}` it renders as
+                    // nowhere else. `{}` is what narrows a nullable named branch — `(X | null) &
+                    // {}` is `X` — and the named branch is what rejects the primitives a lone
+                    // `{}` would admit, so the hole this commit closes cannot open here. The
+                    // index signature would: the open one widens the named type, and the closed
+                    // one makes its declared properties impossible. Decided structurally, before
+                    // rendering, so it does not depend on how an empty object is spelled.
+                    let rendered = if has_named && is_empty_object {
+                        "{}".to_owned()
+                    } else {
+                        rendered
+                    };
                     let member = if from_merge {
                         rendered
                     } else {
@@ -8072,6 +8114,30 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_anonymous_all_of_branch_does_not_widen_a_named_one() {
+        // An empty object renders as an index signature everywhere it stands as a type of its
+        // own. Beside a named branch it must not: `WidgetMeta & { [key: string]: unknown }`
+        // re-opens every key of a closed type, and the closed spelling would make `a` impossible.
+        // It keeps the bare `{}`, which is what this member has always contributed.
+        let (files, _diagnostics) = compile(
+            openapi(json!({
+                "WidgetMeta": { "type": "object", "properties": { "a": { "type": "string" } } },
+                "Wrapped": { "allOf": [
+                    { "$ref": "#/components/schemas/WidgetMeta" },
+                    { "type": "object", "properties": {} }
+                ] }
+            })),
+            json!({}),
+        );
+        let wrapped = generated_body(schema_file(&files, "wrapped"));
+        assert!(
+            wrapped.contains("export type Wrapped = WidgetMeta & {};"),
+            "{wrapped}"
+        );
+        assert!(!wrapped.contains("[key: string]"), "{wrapped}");
+    }
+
+    #[test]
     fn empty_object_branch_survives_beside_a_named_branch() {
         // `{}` is not a member that says nothing: in TypeScript it admits every value except
         // `null` and `undefined`, so intersecting it with a nullable named branch is what
@@ -8092,6 +8158,7 @@ mod tests {
             constrained.contains("export type Constrained = MaybeObject & {};"),
             "{constrained}"
         );
+        assert!(!constrained.contains("[key: string]"), "{constrained}");
     }
 
     #[test]
