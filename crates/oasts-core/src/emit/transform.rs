@@ -2662,7 +2662,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::client_model::build_client_model;
+    use crate::client_model::{
+        FieldSerializationPlan, FieldWrapperPlan, PartMediaPlan, PayloadKind, build_client_model,
+    };
     use crate::config::{DateRepresentation, DateTimeRepresentation, ResolvedConfig, load_config};
     use crate::diag::DiagnosticSink;
     use crate::emit::emit_artifacts;
@@ -2822,6 +2824,42 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_binary_upload_form_field_uses_an_untyped_transform_shape() {
+        let source = SourceRef::default();
+        let schema = form_field_schema(&FormFieldPlan {
+            name: "archive".to_owned(),
+            required: true,
+            schema: SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                format: Some("binary".to_owned()),
+                enum_values: None,
+                const_value: None,
+                meta: SchemaMeta::default(),
+            },
+            serialization: FieldSerializationPlan::Content {
+                media: PartMediaPlan {
+                    values: vec!["application/octet-stream".to_owned()],
+                    payloads: vec![PayloadKind::Binary],
+                    all_concrete: true,
+                    binary_upload: true,
+                    declared: false,
+                },
+                encoding_source: None,
+            },
+            wrapper: FieldWrapperPlan {
+                wrapped: false,
+                content_type_literal: true,
+                filename: true,
+            },
+            source: source.clone(),
+        });
+        let SchemaNode::Any { meta } = schema else {
+            panic!("a binary upload must not expose its declared schema to the transform emitter");
+        };
+        assert_eq!(meta.source, source);
     }
 
     #[test]
@@ -3714,7 +3752,12 @@ mod pair_tests {
                     "type": "object",
                     "required": ["id"],
                     "properties": {
-                        "id": { "type": "integer", "format": "int64" }
+                        "id": {
+                            "oneOf": [
+                                { "type": "integer", "format": "int64" },
+                                { "type": "string" }
+                            ]
+                        }
                     }
                 }
             }),
@@ -3729,6 +3772,10 @@ mod pair_tests {
         );
         assert!(content.contains("decodeInt64(value.id"), "{content}");
         assert!(content.contains("encodeInt64(value.id"), "{content}");
+        assert!(
+            content.contains("typeof value.id === \"bigint\" ? encodeInt64(value.id"),
+            "{content}"
+        );
     }
 
     #[test]
@@ -5794,6 +5841,11 @@ mod operation_pair_tests {
         config.types.integer = IntegerRepresentation::Bigint;
     }
 
+    fn date_and_bigint_mode(config: &mut ResolvedConfig) {
+        date_mode(config);
+        bigint_mode(config);
+    }
+
     fn operation_document(operation: Value, schemas: Value) -> Value {
         json!({
             "openapi": "3.1.0",
@@ -5895,14 +5947,18 @@ mod operation_pair_tests {
                             "multipart/form-data": {
                                 "schema": {
                                     "type": "object",
-                                    "required": ["happened-at"],
+                                    "required": ["happened-at", "count"],
                                     "properties": {
                                         "happened-at": {
                                             "type": "string",
                                             "format": "date-time"
                                         },
+                                        "count": { "type": "integer", "format": "int64" },
                                         "label": { "type": "string" }
                                     }
+                                },
+                                "encoding": {
+                                    "count": { "contentType": "application/json" }
                                 }
                             }
                         }
@@ -5911,7 +5967,7 @@ mod operation_pair_tests {
                 }),
                 json!({}),
             ),
-            date_mode,
+            date_and_bigint_mode,
         );
 
         assert!(!has_errors, "{diagnostics:#?}");
@@ -5919,6 +5975,10 @@ mod operation_pair_tests {
         let content = operation_module(&files, "uploadevent").expect("operation codec");
         assert!(
             content.contains("\"happened-at\": encodeDateTimeDate(value.body[\"happened-at\"]"),
+            "{content}"
+        );
+        assert!(
+            content.contains("count: encodeInt64(value.body.count"),
             "{content}"
         );
         assert!(!content.contains("value.body.label"), "{content}");
