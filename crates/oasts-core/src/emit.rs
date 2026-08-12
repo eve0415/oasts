@@ -1647,6 +1647,9 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 additional_properties,
                 AdditionalProperties::Schema(_) | AdditionalProperties::Allowed(Some(_))
             )
+            && properties
+                .iter()
+                .any(|(_, _, meta)| property_in_position(meta, position))
             && meta.validation_applicators().pattern_properties.is_empty()
             && !schema.is_nullable()
         {
@@ -6783,6 +6786,23 @@ mod tests {
     }
 
     #[test]
+    fn a_top_level_empty_object_is_not_an_empty_interface() {
+        // `interface X {}` has the identical hole `{}` has: 42 is assignable to it.
+        let (files, _diagnostics) = compile(
+            openapi(json!({
+                "Bag": { "type": "object", "additionalProperties": true }
+            })),
+            json!({}),
+        );
+        let bag = generated_body(schema_file(&files, "bag"));
+        assert!(
+            bag.contains("export type Bag = { [key: string]: unknown };"),
+            "{bag}"
+        );
+        assert!(!bag.contains("export interface Bag {}"), "{bag}");
+    }
+
+    #[test]
     fn string_property_and_additional_property_encoders_snapshot() {
         assert_eq!(
             render_ts_string("\"\\\n\u{2028}\u{2029}"),
@@ -9988,7 +10008,8 @@ mod tests {
         );
         let pet = find_file(&files, "types/components/pet.ts");
         assert!(
-            pet.content.contains("export interface PetRequestBody {"),
+            pet.content
+                .contains("export type PetRequestBody = { [key: string]: unknown };"),
             "{}",
             pet.content
         );
@@ -10048,7 +10069,8 @@ mod tests {
         );
         let pet = find_file(&files, "types/components/pet.ts");
         assert!(
-            pet.content.contains("export interface PetResponseBody {"),
+            pet.content
+                .contains("export type PetResponseBody = { [key: string]: unknown };"),
             "{}",
             pet.content
         );
