@@ -5877,7 +5877,8 @@ mod tests {
                 "Thing": {
                     "type": "object",
                     "properties": {
-                        "id": { "type": "integer", "format": "int64", "minimum": 1 }
+                        "id": { "type": "integer", "format": "int64" },
+                        "step": { "type": "integer", "format": "int64", "multipleOf": 2 }
                     }
                 }
             })),
@@ -5897,10 +5898,13 @@ mod tests {
             "{content}"
         );
         assert!(
-            content.contains("const number1 = Number(integer1);"),
+            content.contains("const number3 = Number(integer3);"),
             "{content}"
         );
-        assert!(content.contains("if (number1 < 1) {"), "{content}");
+        assert!(
+            content.contains("if (!isMultipleOf(number3, 2)) {"),
+            "{content}"
+        );
         assert!(!content.contains("isInt64(value0)"), "{content}");
     }
 

@@ -3121,7 +3121,8 @@ mod tests {
                 "Thing": {
                     "type": "object",
                     "properties": {
-                        "id": { "type": "integer", "format": "int64", "minimum": 1 }
+                        "id": { "type": "integer", "format": "int64" },
+                        "step": { "type": "integer", "format": "int64", "multipleOf": 2 }
                     }
                 }
             })),
@@ -3138,7 +3139,13 @@ mod tests {
         let content = component(&files, "thing");
         assert!(
             content.contains(
-                "z.custom<number | bigint | { readonly rawJSON: string }>().check(int64Wire(z.number().check(z.gte(1))))"
+                "z.custom<number | bigint | { readonly rawJSON: string }>().check(int64Wire())"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "z.custom<number | bigint | { readonly rawJSON: string }>().check(int64Wire(z.number().check(multipleOf(2))))"
             ),
             "{content}"
         );
