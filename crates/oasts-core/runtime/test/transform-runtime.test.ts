@@ -115,6 +115,24 @@ describe("integer: bigint", () => {
     assert.equal(decodeInt64(12345678901234567890n, POINTER, PATH), 12345678901234567890n);
   });
 
+  test("rejects a rounded wire number", () => {
+    assertRejects(
+      () => decodeInt64(Number.MAX_SAFE_INTEGER + 1, POINTER, PATH),
+      "invalid-wire-value",
+      "response",
+      "rounded int64 wire number",
+    );
+  });
+
+  test("rejects a non-bigint application value at the runtime boundary", () => {
+    assertRejects(
+      () => Reflect.apply(encodeInt64, undefined, [42, POINTER, PATH]),
+      "invalid-application-value",
+      "request",
+      "non-bigint application value",
+    );
+  });
+
   test("encodes exact unquoted digits at any JSON depth", () => {
     const encoded = encodeInt64(12345678901234567890n, POINTER, PATH);
     assert.equal(
