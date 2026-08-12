@@ -1643,19 +1643,58 @@ JSON.parse('0', (_key: string, value: unknown, context?: JsonParseContext) => {
 });
 const jsonParseHasSource =
   isRecord(jsonParseProbeContext) && jsonParseProbeContext.source === '0';
-const INTEGER_TOKEN = /^-?\d+$/u;
+const NONZERO_DIGIT = /[1-9]/u;
+const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+const MIN_SAFE_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
+
+function jsonIntegerToken(source: string): bigint | null {
+  // `context.source` for a numeric reviver value is always a valid JSON number token.
+  const exponentIndex = source.search(/[eE]/u);
+  const mantissa = exponentIndex === -1 ? source : source.slice(0, exponentIndex);
+  const exponent = exponentIndex === -1 ? '0' : source.slice(exponentIndex + 1);
+  const sign = mantissa.startsWith('-') ? '-' : '';
+  const unsignedMantissa = sign === '' ? mantissa : mantissa.slice(1);
+  const decimalIndex = unsignedMantissa.indexOf('.');
+  const whole = decimalIndex === -1 ? unsignedMantissa : unsignedMantissa.slice(0, decimalIndex);
+  const fraction = decimalIndex === -1 ? '' : unsignedMantissa.slice(decimalIndex + 1);
+  const digits = `${whole}${fraction}`;
+  const scale = BigInt(exponent) - BigInt(fraction.length);
+  let magnitude: bigint;
+  try {
+    if (scale >= 0n) {
+      magnitude = BigInt(digits) * 10n ** scale;
+    } else {
+      const decimalPlaces = -scale;
+      if (decimalPlaces >= BigInt(digits.length)) {
+        return NONZERO_DIGIT.test(digits) ? null : 0n;
+      }
+      const retainedLength = digits.length - Number(decimalPlaces);
+      if (NONZERO_DIGIT.test(digits.slice(retainedLength))) {
+        return null;
+      }
+      magnitude = BigInt(digits.slice(0, retainedLength));
+    }
+  } catch {
+    return null;
+  }
+  return sign === '-' ? -magnitude : magnitude;
+}
 
 function losslessInt64Reviver(
   _key: string,
   value: unknown,
   context?: JsonParseContext,
 ): unknown {
-  return typeof value === 'number' &&
-    context !== undefined &&
-    typeof context.source === 'string' &&
-    INTEGER_TOKEN.test(context.source) &&
-    !Number.isSafeInteger(value)
-    ? BigInt(context.source)
+  if (
+    typeof value !== 'number' ||
+    context === undefined ||
+    typeof context.source !== 'string'
+  ) {
+    return value;
+  }
+  const integer = jsonIntegerToken(context.source);
+  return integer !== null && (integer < MIN_SAFE_BIGINT || integer > MAX_SAFE_BIGINT)
+    ? integer
     : value;
 }
 

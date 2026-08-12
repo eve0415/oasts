@@ -146,6 +146,37 @@ test('emitted client scopes exact revival to int64 and sends raw bytes equal {"i
   assert.equal(requiredRequest(1).body.toString("utf8"), `{"id":${EXACT_DIGITS}}`);
 });
 
+test("emitted client revives decimal and exponent int64 spellings exactly", async () => {
+  const transport = createTransport({ baseUrl });
+  for (const token of ["9007199254740993.0", "9007199254740993e0"]) {
+    scriptRoute("GET", "/counters/latest", {
+      status: 200,
+      headers: [["Content-Type", "application/json"]],
+      body: Buffer.from(`{"id":${token}}`),
+    });
+    const result = requiredRecord(
+      await getLatestCounter(transport, {}),
+      `getLatestCounter ${token} result`,
+    );
+    assert.equal(result.outcome, 200);
+    assert.equal(
+      requiredRecord(result.data, `getLatestCounter ${token} data`).id,
+      9007199254740993n,
+    );
+  }
+
+  scriptRoute("GET", "/counters/latest", {
+    status: 200,
+    headers: [["Content-Type", "application/json"]],
+    body: Buffer.from('{"id":9007199254740993.5}'),
+  });
+  const fractional = requiredRecord(
+    await getLatestCounter(transport, {}),
+    "getLatestCounter fractional result",
+  );
+  assert.equal(fractional.outcome, "response-transform");
+});
+
 test("generated validation preserves the exact int64 response and request", async () => {
   const responseBytes = Buffer.from(`{"id":${EXACT_DIGITS},"amount":9007199254740995}`);
   scriptRoute("GET", "/counters/latest", {

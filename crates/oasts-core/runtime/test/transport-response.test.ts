@@ -151,7 +151,7 @@ describe("response matching and decoding", () => {
 
   test("decodes unsafe integer tokens losslessly only on a marked JSON body", async () => {
     const body =
-      '{"id":12345678901234567890,"nested":[-12345678901234567890],"safe":42,"float":9007199254740992.5,"other":9007199254740993}';
+      '{"id":12345678901234567890,"nested":[-12345678901234567890],"safe":42,"safeDecimal":42.0,"safeExponent":42e0,"float":9007199254740992.5,"fractionalExponent":9007199254740993e-1,"tiny":1e-999,"zeroTiny":0e-999,"tooLarge":1e99999999999999999999,"decimal":9007199254740993.0,"exponent":9007199254740993e0,"positiveExponent":9007199254740993E+2,"negative":-9007199254740993.0,"contracted":900719925474099300e-2,"expanded":900719925474099.3e1,"other":9007199254740993}';
     const marked = await callWith(
       new Response(body, { headers: { "Content-Type": "application/json" } }),
       operation({
@@ -174,7 +174,19 @@ describe("response matching and decoding", () => {
         id: 12345678901234567890n,
         nested: [-12345678901234567890n],
         safe: 42,
+        safeDecimal: 42,
+        safeExponent: 42,
         float: Number("9007199254740992.5"),
+        fractionalExponent: Number("9007199254740993e-1"),
+        tiny: Number("1e-999"),
+        zeroTiny: 0,
+        tooLarge: Number("1e99999999999999999999"),
+        decimal: 9007199254740993n,
+        exponent: 9007199254740993n,
+        positiveExponent: 900719925474099300n,
+        negative: -9007199254740993n,
+        contracted: 9007199254740993n,
+        expanded: 9007199254740993n,
         other: 9007199254740993n,
       });
     }
