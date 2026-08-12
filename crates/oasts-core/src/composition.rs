@@ -191,14 +191,18 @@ impl<'ir> CompositionAnalysis<'ir> {
     /// empty accepts a single self-contradictory branch, while calling two branches'
     /// declarations of one property a disagreement needs two of them to actually say
     /// something, or the message names a cause that is not there.
-    fn empty_domain_reasons(
+    /// `min_contributors` floors at two for the set-based proofs: intersecting one primitive
+    /// domain or one finite set with nothing is that set, so below two there is nothing to
+    /// disagree about and the parameter cannot mean anything smaller. Only the numeric arm
+    /// can fire on a single contributor, which is the case the two callers differ on.
+    fn empty_domain_reasons<'a>(
         &self,
-        schemas: &[&SchemaNode],
+        schemas: impl Iterator<Item = &'a SchemaNode> + Clone,
         min_contributors: usize,
     ) -> Vec<&'static str> {
         let mut reasons = Vec::new();
         let domains = schemas
-            .iter()
+            .clone()
             .filter_map(|schema| self.primitive_domain(schema, &mut HashSet::new()))
             .collect::<Vec<_>>();
         if domains.len() >= min_contributors.max(2) {
@@ -212,7 +216,7 @@ impl<'ir> CompositionAnalysis<'ir> {
         }
 
         let finite_sets = schemas
-            .iter()
+            .clone()
             .filter_map(|schema| self.finite_constraint(schema, &mut HashSet::new()))
             .collect::<Vec<_>>();
         if finite_sets.len() >= min_contributors.max(2) {
@@ -226,7 +230,6 @@ impl<'ir> CompositionAnalysis<'ir> {
         }
 
         let bounds = schemas
-            .iter()
             .filter_map(|schema| self.numeric_bounds(schema, &mut HashSet::new()))
             .collect::<Vec<_>>();
         if bounds.len() >= min_contributors
@@ -239,11 +242,10 @@ impl<'ir> CompositionAnalysis<'ir> {
     }
 
     fn prove_empty(&self, branches: &[SchemaNode]) -> Vec<String> {
-        let schemas = branches.iter().collect::<Vec<_>>();
         // One contributor is enough here: a lone branch whose own bounds cannot hold empties
         // the whole node, and there is no other branch to misattribute it to.
         let mut messages = self
-            .empty_domain_reasons(&schemas, 1)
+            .empty_domain_reasons(branches.iter(), 1)
             .into_iter()
             .map(|reason| format!("allOf has {reason}"))
             .collect::<Vec<_>>();
@@ -313,23 +315,19 @@ impl<'ir> CompositionAnalysis<'ir> {
         // Sorting groups the repeats and fixes the report order by property name. The sort is
         // stable, so declarations of one name stay in branch order for the domain tests.
         declared.sort_by_key(|(name, _)| *name);
-        let mut start = 0;
-        while start < declared.len() {
-            let mut end = start + 1;
-            while end < declared.len() && declared[end].0 == declared[start].0 {
-                end += 1;
+        for group in declared.chunk_by(|left, right| left.0 == right.0) {
+            if group.len() < 2 {
+                continue;
             }
-            let group = &declared[start..end];
-            if group.len() >= 2 {
-                let schemas = group.iter().map(|(_, schema)| *schema).collect::<Vec<_>>();
-                if let Some(reason) = self.empty_domain_reasons(&schemas, 2).first() {
-                    let name = group[0].0;
-                    messages.push(format!(
-                        "allOf branches declare property '{name}' with {reason}; the branches intersect, so the property is uninhabitable"
-                    ));
-                }
+            if let Some(reason) = self
+                .empty_domain_reasons(group.iter().map(|(_, schema)| *schema), 2)
+                .first()
+            {
+                let name = group[0].0;
+                messages.push(format!(
+                    "allOf branches declare property '{name}' with {reason}; the branches intersect, so the property is uninhabitable"
+                ));
             }
-            start = end;
         }
         messages
     }

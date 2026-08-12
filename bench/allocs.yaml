@@ -489,10 +489,10 @@ keys:
         deallocs: 102
         allocBytes: 32552
       - stage: "analyze"
-        allocs: 796
-        reallocs: 110
-        deallocs: 587
-        allocBytes: 60525
+        allocs: 868
+        reallocs: 178
+        deallocs: 659
+        allocBytes: 118893
       - stage: "emit"
         allocs: 4296
         reallocs: 1334

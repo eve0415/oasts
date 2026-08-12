@@ -1828,7 +1828,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 let mut pending_merge = merged;
                 let mut members = Vec::with_capacity(branches.len());
                 for branch in branches {
-                    let from_merge = anonymous_merged && !is_named_branch(branch);
+                    let from_merge = covered_by_merge(branch, anonymous_merged);
                     let rendered = if from_merge {
                         // The merged blob stands in for the whole anonymous half, at the
                         // position of the first anonymous branch. Taking it is what emits it
@@ -2328,7 +2328,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                             }
                         });
                     for branch in branches {
-                        if is_named_branch(branch) || merged.is_none() {
+                        if !covered_by_merge(branch, merged.is_some()) {
                             visit(branch);
                         }
                     }
@@ -3390,6 +3390,15 @@ pub(super) fn render_literal_key(value: &str) -> String {
 /// here and recurses through the normal path.
 fn is_named_branch(branch: &SchemaNode) -> bool {
     matches!(branch, SchemaNode::Ref { .. })
+}
+
+/// Whether the merged anonymous blob already accounts for this branch — true exactly for the
+/// branches the renderer replaces with that blob and the import walk therefore must not visit
+/// itself. Read by both, because a renderer and an import walk that computed this separately
+/// is what emitted a component nothing imported; sharing only `is_named_branch` still left
+/// the combination with the merge written out twice, in mutually inverted forms.
+fn covered_by_merge(branch: &SchemaNode, merged: bool) -> bool {
+    merged && !is_named_branch(branch)
 }
 
 fn add_nullable(mut rendered: String, schema: &SchemaNode) -> String {
@@ -7935,7 +7944,8 @@ mod tests {
             .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
             .collect::<Vec<_>>();
         assert_eq!(flagged.len(), 1, "{diagnostics:?}");
-        assert!(flagged[0].message.contains("kind"), "{:?}", flagged[0]);
+        let message = &flagged[0].message;
+        assert!(message.contains("kind"), "{message}");
     }
 
     #[test]
@@ -7952,11 +7962,9 @@ mod tests {
             })),
             json!({}),
         );
-        let flagged = diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
-            .count();
-        assert_eq!(flagged, 0, "{diagnostics:?}");
+        // Asserted on the whole list rather than a filtered one: a closure that filters an
+        // empty iterator never runs, and the coverage gate counts it as an unreached region.
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
@@ -7974,11 +7982,10 @@ mod tests {
             })),
             json!({}),
         );
-        let lowered = schema_file(&files, "lowered");
+        let lowered = &schema_file(&files, "lowered").content;
         assert!(
-            lowered.content.contains("export type Lowered = never;"),
-            "{}",
-            lowered.content
+            lowered.contains("export type Lowered = never;"),
+            "{lowered}"
         );
         let flagged = diagnostics
             .iter()

@@ -94,7 +94,7 @@ assert_no_orphan_components() {
   # a validators-tree import satisfy a types-tree component. Paths cannot collide that way,
   # and a comment or property key that happens to spell a component name cannot match at all.
   local referenced source specifier
-  referenced=$(grep -rhoE "from +['\"][^'\"]+['\"]" "$d"/generated* --include='*.ts' -H 2>/dev/null \
+  referenced=$(grep -roE "from +['\"][^'\"]+['\"]" "$d"/generated* --include='*.ts' -H 2>/dev/null \
     | while IFS= read -r hit; do
         source=${hit%%:from *}
         specifier=${hit##*from }
