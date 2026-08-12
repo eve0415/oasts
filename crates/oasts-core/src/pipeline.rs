@@ -775,9 +775,10 @@ paths:
 
     #[test]
     fn all_of_self_reference_terminates_and_renders_the_named_type() {
-        // A component whose property `allOf`s a `$ref` back to itself would inline forever
-        // without the walk-side cycle guard; the recursive branch must render as the bare
-        // named type instead. Reaching this test's assertions at all proves no stack overflow.
+        // A component whose property `allOf`s a `$ref` back to itself must render the bare
+        // named type rather than inlining forever. Reaching this test's assertions at all
+        // proves no stack overflow. A `$ref` branch no longer enters the merge, so there is
+        // no inlining to cut off and the walk-side cycle guard it used to need is gone.
         let openapi = r##"openapi: "3.1.0"
 info:
   title: loop

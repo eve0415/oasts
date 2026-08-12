@@ -5988,10 +5988,13 @@ mod tests {
     #[test]
     fn recursive_all_of_ref_terminates_as_named_reference() {
         // Regression: a schema whose member is `allOf: [{$ref: self}]` — the Kubernetes
-        // JSONSchemaProps idiom — must not inline forever. merge_all_of inlines the ref
-        // once, then the self-referential branch renders as the bare named type instead
-        // of recursing. Before the render cycle guard this overflowed the stack (
-        // cycles are legal when they form recursive schemas).
+        // JSONSchemaProps idiom — must not inline forever. Cycles are legal when they form
+        // recursive schemas, and this once overflowed the stack.
+        //
+        // The assertion is unchanged but the mechanism behind it is not. The merge used to
+        // inline the ref one level and an explicit cycle-guard stack stopped the second
+        // level; now the ref never enters the merge at all, so it renders as the bare named
+        // type on the first pass and there is no cycle to guard.
         let recursive = SchemaNode::Object {
             properties: vec![(
                 "child".to_owned(),

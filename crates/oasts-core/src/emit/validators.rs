@@ -6095,7 +6095,12 @@ mod tests {
     }
 
     #[test]
-    fn all_of_wrapped_ref_imports_the_validator_call_the_inlined_type_does_not_name() {
+    fn all_of_wrapped_ref_names_the_component_in_both_the_type_and_the_validator_call() {
+        // 3.0's quoting idiom: `allOf: [$ref]` beside a `description`, because 3.0 ignores a
+        // sibling of `$ref`. The validators artifact always delegated to the component's own
+        // validator; the types artifact used to inline the component's body instead, so the
+        // two named different things for the same node. Both name `Target` now, which is why
+        // the type import and the validator import are one line rather than two.
         let (files, diagnostics) = compile(doc_30(json!({
             "Target": {
                 "type": "object",
@@ -6123,7 +6128,7 @@ mod tests {
             [
                 "import type { SyncStandardSchemaV1 } from \"../standard-schema.js\";",
                 "import { type Issue, appendKey, issue } from \"../runtime.js\";",
-                "import { validateTarget } from \"./target.js\";",
+                "import { type Target, validateTarget } from \"./target.js\";",
             ],
             "{content}"
         );
@@ -6131,6 +6136,7 @@ mod tests {
             content.contains("validateTarget(value0, path0, issues);"),
             "{content}"
         );
+        assert!(content.contains("target?: Target;"), "{content}");
     }
 
     #[test]
