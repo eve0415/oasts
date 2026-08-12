@@ -472,6 +472,16 @@ struct TagFacts {
     required: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectedTagType {
+    String,
+    Number,
+    Integer,
+    Boolean,
+    Null,
+    Incompatible,
+}
+
 impl TypePosition {
     /// A stable slot for per-position state, so one array replaces one field per position.
     pub(super) const fn index(self) -> usize {
@@ -1189,11 +1199,12 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             Err((code, message)) => {
                 diagnostics.push(warning_diagnostic(code, message, &discriminator.source));
             }
-            Ok(_) => {
+            Ok(tags) => {
                 if let Some(message) = self.discriminator_narrowing_warning(
                     branches,
                     discriminator,
                     &mapping_targets,
+                    &tags,
                     tagged_projection,
                 ) {
                     diagnostics.push(warning_diagnostic(
@@ -1211,6 +1222,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         branches: &[SchemaNode],
         discriminator: &Discriminator,
         mapping_targets: &[(&str, usize)],
+        tags: &[Vec<String>],
         tagged_projection: bool,
     ) -> Option<String> {
         let property = discriminator.property_name.as_str();
@@ -1254,16 +1266,39 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             ]
             .into_iter()
             .all(|position| {
-                branches.iter().all(|branch| {
+                branches.iter().zip(tags).all(|(branch, tags)| {
                     self.discriminator_branches_fix_a_literal_in_position(
                         std::slice::from_ref(branch),
                         property,
                         position,
-                    ) || self.branch_accepts_discriminator_projection(branch, property, position)
+                    ) || self
+                        .projected_discriminator_values(branch, property, position, tags)
+                        .is_some()
                 })
             })
         {
             return None;
+        }
+
+        if tagged_projection
+            && [
+                TypePosition::Neutral,
+                TypePosition::Request,
+                TypePosition::Response,
+            ]
+            .into_iter()
+            .any(|position| {
+                branches.iter().zip(tags).any(|(branch, tags)| {
+                    self.branch_accepts_discriminator_projection(branch, property, position)
+                        && self
+                            .projected_discriminator_values(branch, property, position, tags)
+                            .is_none()
+                })
+            })
+        {
+            return Some(format!(
+                "discriminator property '{property}' uses a tag whose JSON kind does not match the branch's declared scalar type, so that branch is emitted without tagged projection"
+            ));
         }
 
         let uses_mapping = branches.iter().any(|branch| {
@@ -1506,6 +1541,114 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             &mut HashSet::new(),
         );
         facts.required && facts.values.is_none()
+    }
+
+    fn projected_discriminator_values(
+        &self,
+        branch: &SchemaNode,
+        property: &str,
+        position: TypePosition,
+        tags: &[String],
+    ) -> Option<Vec<Value>> {
+        if !self.branch_accepts_discriminator_projection(branch, property, position) {
+            return None;
+        }
+        let tag_type =
+            self.merged_object_property_tag_type(branch, property, position, &mut HashSet::new())?;
+        tags.iter()
+            .map(|tag| projected_tag_value(tag, tag_type))
+            .collect()
+    }
+
+    fn merged_object_property_tag_type<'a>(
+        &'a self,
+        branch: &'a SchemaNode,
+        property: &str,
+        position: TypePosition,
+        visited: &mut HashSet<(&'a str, &'a str)>,
+    ) -> Option<ProjectedTagType> {
+        match branch {
+            SchemaNode::Ref { target, .. } => {
+                if !visited.insert((target.source_id.as_str(), target.json_pointer.as_str())) {
+                    return None;
+                }
+                self.model
+                    .schema_target(&target.source_id, &target.json_pointer)
+                    .and_then(|target| self.model.analyzed.ir.schemas.get(target.index))
+                    .and_then(|resolved| {
+                        self.merged_object_property_tag_type(
+                            &resolved.schema,
+                            property,
+                            position,
+                            visited,
+                        )
+                    })
+            }
+            SchemaNode::Object { properties, .. } => properties
+                .iter()
+                .find(|(name, _, meta)| name == property && property_in_position(meta, position))
+                .and_then(|(_, schema, _)| self.projected_tag_type(schema, &mut HashSet::new())),
+            SchemaNode::AllOf { branches, .. } => branches
+                .iter()
+                .filter_map(|branch| {
+                    self.merged_object_property_tag_type(
+                        branch,
+                        property,
+                        position,
+                        &mut visited.clone(),
+                    )
+                })
+                .reduce(intersect_projected_tag_types),
+            _ => None,
+        }
+    }
+
+    fn projected_tag_type<'a>(
+        &'a self,
+        schema: &'a SchemaNode,
+        visited: &mut HashSet<(&'a str, &'a str)>,
+    ) -> Option<ProjectedTagType> {
+        if schema.meta().nullable {
+            return None;
+        }
+        match schema {
+            SchemaNode::Ref { target, .. } => {
+                if !visited.insert((target.source_id.as_str(), target.json_pointer.as_str())) {
+                    return None;
+                }
+                self.model
+                    .schema_target(&target.source_id, &target.json_pointer)
+                    .and_then(|target| self.model.analyzed.ir.schemas.get(target.index))
+                    .and_then(|resolved| self.projected_tag_type(&resolved.schema, visited))
+            }
+            SchemaNode::Primitive { ty, .. } => Some(match ty {
+                PrimitiveType::String => ProjectedTagType::String,
+                PrimitiveType::Number => ProjectedTagType::Number,
+                PrimitiveType::Integer => ProjectedTagType::Integer,
+                PrimitiveType::Boolean => ProjectedTagType::Boolean,
+                PrimitiveType::Null => ProjectedTagType::Null,
+            }),
+            SchemaNode::AllOf { branches, .. } => branches
+                .iter()
+                .filter_map(|branch| self.projected_tag_type(branch, &mut visited.clone()))
+                .reduce(intersect_projected_tag_types),
+            SchemaNode::OneOf { branches, .. } | SchemaNode::AnyOf { branches, .. } => {
+                let mut types = branches
+                    .iter()
+                    .map(|branch| self.projected_tag_type(branch, &mut visited.clone()));
+                let first = types.next()??;
+                types
+                    .all(|tag_type| tag_type == Some(first))
+                    .then_some(first)
+            }
+            SchemaNode::Finite { .. }
+            | SchemaNode::Object { .. }
+            | SchemaNode::Array { .. }
+            | SchemaNode::Tuple { .. }
+            | SchemaNode::Any { .. }
+            | SchemaNode::Never { .. }
+            | SchemaNode::Unknown { .. } => None,
+        }
     }
 
     fn merged_object_property_finite<'a>(
@@ -2114,13 +2257,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                         let mut rendered = self.render_type(branch, position, axis, indent);
                         if let Some((property, tags)) = &projection_tags
                             && let Some(tags) = tags.get(index).filter(|tags| !tags.is_empty())
-                            && self
-                                .branch_accepts_discriminator_projection(branch, property, position)
+                            && let Some(values) = self
+                                .projected_discriminator_values(branch, property, position, tags)
                         {
                             let member = parenthesize_intersection_member(rendered, branch);
-                            let literals = tags
+                            let literals = values
                                 .iter()
-                                .map(|tag| render_ts_string(tag))
+                                .map(render_ts_value)
                                 .collect::<Vec<_>>()
                                 .join(" | ");
                             let readonly = if self.model.config.types.readonly {
@@ -3582,6 +3725,42 @@ fn container_finite_values(schema: &SchemaNode) -> Option<Vec<Value>> {
     };
     let (enum_values, const_value) = finite_parts(finite);
     finite_values(enum_values, const_value)
+}
+
+fn intersect_projected_tag_types(
+    left: ProjectedTagType,
+    right: ProjectedTagType,
+) -> ProjectedTagType {
+    match (left, right) {
+        (ProjectedTagType::Number, ProjectedTagType::Integer)
+        | (ProjectedTagType::Integer, ProjectedTagType::Number) => ProjectedTagType::Integer,
+        (left, right) if left == right => left,
+        _ => ProjectedTagType::Incompatible,
+    }
+}
+
+fn projected_tag_value(tag: &str, tag_type: ProjectedTagType) -> Option<Value> {
+    match tag_type {
+        ProjectedTagType::String => Some(Value::String(tag.to_owned())),
+        ProjectedTagType::Number | ProjectedTagType::Integer => {
+            let Value::Number(number) = serde_json::from_str::<Value>(tag).ok()? else {
+                return None;
+            };
+            if tag_type == ProjectedTagType::Integer
+                && !number.as_f64().is_some_and(|value| value.fract() == 0.0)
+            {
+                return None;
+            }
+            Some(Value::Number(number))
+        }
+        ProjectedTagType::Boolean => match tag {
+            "true" => Some(Value::Bool(true)),
+            "false" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        ProjectedTagType::Null => (tag == "null").then_some(Value::Null),
+        ProjectedTagType::Incompatible => None,
+    }
 }
 
 /// The canonical string form of a discriminator tag value, shared across the mapping/const/implicit
@@ -8676,6 +8855,196 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.code != CODE_DISCRIMINATOR_NARROWING),
             "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn tagged_discriminator_projects_mapping_tags_as_the_declared_scalar_type() {
+        let document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "integer" }
+            } },
+            "Dog": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "integer" }
+            } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind", "mapping": {
+                         "1": "#/components/schemas/Cat", "2": "#/components/schemas/Dog"
+                     } } }
+        }));
+        let (files, diagnostics) = compile(
+            document,
+            json!({ "types": { "discriminatedUnions": "tagged" } }),
+        );
+        let pet = generated_body(schema_file(&files, "pet"));
+        assert!(
+            pet.contains("export type Pet = (Cat & { kind: 1 }) | (Dog & { kind: 2 });"),
+            "{pet}"
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn tagged_discriminator_leaves_a_mismatched_mapping_tag_unprojected() {
+        let document = openapi(json!({
+            "Cat": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "integer" }
+            } },
+            "Dog": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "integer" }
+            } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "kind", "mapping": {
+                         "cat": "#/components/schemas/Cat", "2": "#/components/schemas/Dog"
+                     } } }
+        }));
+        let (files, diagnostics) = compile(
+            document,
+            json!({ "types": { "discriminatedUnions": "tagged" } }),
+        );
+        let pet = generated_body(schema_file(&files, "pet"));
+        assert!(
+            pet.contains("export type Pet = Cat | (Dog & { kind: 2 });"),
+            "{pet}"
+        );
+        let warnings = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "{diagnostics:#?}");
+        assert!(warnings[0].message.contains("JSON kind"));
+    }
+
+    #[test]
+    fn projected_tag_values_follow_scalar_json_kinds() {
+        assert_eq!(
+            projected_tag_value("tag", ProjectedTagType::String),
+            Some(json!("tag"))
+        );
+        assert_eq!(
+            projected_tag_value("1.5", ProjectedTagType::Number),
+            Some(json!(1.5))
+        );
+        assert_eq!(projected_tag_value("1.5", ProjectedTagType::Integer), None);
+        assert_eq!(
+            projected_tag_value("true", ProjectedTagType::Boolean),
+            Some(json!(true))
+        );
+        assert_eq!(
+            projected_tag_value("false", ProjectedTagType::Boolean),
+            Some(json!(false))
+        );
+        assert_eq!(
+            projected_tag_value("other", ProjectedTagType::Boolean),
+            None
+        );
+        assert_eq!(
+            projected_tag_value("null", ProjectedTagType::Null),
+            Some(Value::Null)
+        );
+        assert_eq!(projected_tag_value("other", ProjectedTagType::Null), None);
+        assert_eq!(
+            projected_tag_value("1", ProjectedTagType::Incompatible),
+            None
+        );
+        assert_eq!(
+            intersect_projected_tag_types(ProjectedTagType::Number, ProjectedTagType::Integer),
+            ProjectedTagType::Integer
+        );
+        assert_eq!(
+            intersect_projected_tag_types(ProjectedTagType::String, ProjectedTagType::String),
+            ProjectedTagType::String
+        );
+        assert_eq!(
+            intersect_projected_tag_types(ProjectedTagType::String, ProjectedTagType::Boolean),
+            ProjectedTagType::Incompatible
+        );
+        assert_eq!(
+            projected_tag_value("not-json", ProjectedTagType::Number),
+            None
+        );
+        assert_eq!(projected_tag_value("true", ProjectedTagType::Number), None);
+    }
+
+    #[test]
+    fn tagged_projection_resolves_refs_compositions_and_scalar_kinds() {
+        let document = openapi(json!({
+            "NumberTag": { "type": "number" },
+            "TagA": { "$ref": "#/components/schemas/TagB" },
+            "TagB": { "$ref": "#/components/schemas/TagA" },
+            "NumberArm": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "$ref": "#/components/schemas/NumberTag" }
+            } },
+            "ComposedArm": { "allOf": [
+                {},
+                { "type": "object", "required": ["kind"], "properties": {
+                    "kind": { "allOf": [{ "type": "number" }, { "type": "integer" }] }
+                } }
+            ] },
+            "BooleanArm": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "oneOf": [{ "type": "boolean" }, { "type": "boolean" }] }
+            } },
+            "NullArm": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "null" }
+            } },
+            "NullableArm": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": ["integer", "null"] }
+            } },
+            "ArrayArm": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "type": "array", "items": { "type": "string" } }
+            } },
+            "CyclicPropertyArm": { "type": "object", "required": ["kind"], "properties": {
+                "kind": { "$ref": "#/components/schemas/TagA" }
+            } },
+            "CyclicBranchArm": { "allOf": [
+                { "$ref": "#/components/schemas/CyclicBranchArm" },
+                { "type": "object", "required": ["kind"], "properties": {
+                    "kind": { "type": "integer" }
+                } }
+            ] },
+            "Pet": {
+                "oneOf": [
+                    { "$ref": "#/components/schemas/NumberArm" },
+                    { "$ref": "#/components/schemas/ComposedArm" },
+                    { "$ref": "#/components/schemas/BooleanArm" },
+                    { "$ref": "#/components/schemas/NullArm" },
+                    { "$ref": "#/components/schemas/NullableArm" },
+                    { "$ref": "#/components/schemas/ArrayArm" },
+                    { "$ref": "#/components/schemas/CyclicPropertyArm" },
+                    { "$ref": "#/components/schemas/CyclicBranchArm" }
+                ],
+                "discriminator": { "propertyName": "kind", "mapping": {
+                    "1.5": "#/components/schemas/NumberArm",
+                    "2": "#/components/schemas/ComposedArm",
+                    "true": "#/components/schemas/BooleanArm",
+                    "null": "#/components/schemas/NullArm",
+                    "4": "#/components/schemas/NullableArm",
+                    "array": "#/components/schemas/ArrayArm",
+                    "cycle": "#/components/schemas/CyclicPropertyArm",
+                    "5": "#/components/schemas/CyclicBranchArm"
+                } }
+            }
+        }));
+        let (files, diagnostics) = compile(
+            document,
+            json!({ "types": { "discriminatedUnions": "tagged" } }),
+        );
+        let pet = generated_body(schema_file(&files, "pet"));
+        assert!(pet.contains("NumberArm & { kind: 1.5 }"), "{pet}");
+        assert!(pet.contains("ComposedArm & { kind: 2 }"), "{pet}");
+        assert!(pet.contains("BooleanArm & { kind: true }"), "{pet}");
+        assert!(pet.contains("NullArm & { kind: null }"), "{pet}");
+        assert!(pet.contains("NullableArm"), "{pet}");
+        assert!(pet.contains("ArrayArm"), "{pet}");
+        assert!(pet.contains("CyclicPropertyArm"), "{pet}");
+        assert!(pet.contains("CyclicBranchArm & { kind: 5 }"), "{pet}");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+                .count(),
+            1,
+            "{diagnostics:#?}"
         );
     }
 
