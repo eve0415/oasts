@@ -217,3 +217,25 @@ export function isInt32(v: number): boolean {
 export function isInt64(v: number): boolean {
   return Number.isSafeInteger(v);
 }
+
+const INT64_WIRE_INTEGER = /^-?(?:0|[1-9]\d*)$/;
+
+// The bigint representation validates the pre-transform wire surface: safe JSON integers remain
+// numbers, unsafe ones are restored as bigints by the transport, and request encoders contribute a
+// raw-JSON token before request validation runs.
+export function int64WireValue(value: unknown): bigint | null {
+  if (typeof value === "bigint") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value)) {
+    return BigInt(value);
+  }
+  if (
+    isRecord(value) &&
+    typeof value.rawJSON === "string" &&
+    INT64_WIRE_INTEGER.test(value.rawJSON)
+  ) {
+    return BigInt(value.rawJSON);
+  }
+  return null;
+}

@@ -133,6 +133,7 @@ const VALIDATOR_RESERVED_NAMES: &[&str] = &[
     "isUuid",
     "isInt32",
     "isInt64",
+    "int64WireValue",
     "StandardSchemaV1",
     "SyncStandardSchemaV1",
     "isRecord",
@@ -1149,7 +1150,13 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 const_value,
                 meta,
             } => {
-                self.gen_primitive(*ty, format.as_deref(), meta, val, path, iss);
+                let bigint_int64 = self.model.transform_facts().site(schema)
+                    == Some(crate::transform::TransformKind::IntegerBigInt);
+                if bigint_int64 {
+                    self.gen_bigint_int64(meta, val, path, iss);
+                } else {
+                    self.gen_primitive(*ty, format.as_deref(), meta, val, path, iss);
+                }
                 self.gen_finite(enum_values.as_deref(), const_value.as_ref(), val, path, iss);
             }
             SchemaNode::Finite {
@@ -2162,6 +2169,26 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
             }
         }
         self.close_type_gate(widen_null, val, path, iss, type_name);
+    }
+
+    fn gen_bigint_int64(&mut self, meta: &SchemaMeta, val: &str, path: &str, iss: &str) {
+        self.scope.runtime_values.insert("int64WireValue");
+        let index = self.fresh();
+        let integer = format!("integer{index}");
+        self.line(&format!("const {integer} = int64WireValue({val});"));
+        self.open(&format!("if ({integer} !== null) {{"));
+        let constraints = meta.numeric_constraints();
+        if constraints.minimum.is_some()
+            || constraints.maximum.is_some()
+            || constraints.exclusive_minimum.is_some()
+            || constraints.exclusive_maximum.is_some()
+            || constraints.multiple_of.is_some()
+        {
+            let number = format!("number{index}");
+            self.line(&format!("const {number} = Number({integer});"));
+            self.gen_number_constraints_inner(meta, &number, path, iss);
+        }
+        self.close_type_gate(meta.nullable, val, path, iss, "integer");
     }
 
     fn gen_string_constraints(
@@ -5841,6 +5868,35 @@ mod tests {
             negated.contains("\"value matches not schema\""),
             "{negated}"
         );
+    }
+
+    #[test]
+    fn bigint_int64_validates_each_lossless_wire_representation() {
+        let (files, diagnostics) = compile_with_config(
+            doc_31(json!({
+                "Thing": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" }
+                    }
+                }
+            })),
+            json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.json" },
+                "output": "./generated",
+                "artifacts": { "types": true, "client": true, "validators": true },
+                "types": { "integer": "bigint" },
+                "validation": { "engine": "generated", "request": true, "unchecked": "allow" }
+            }),
+        );
+        assert_clean(&diagnostics);
+        let content = component(&files, "thing");
+        assert!(
+            content.contains("const integer1 = int64WireValue(value0);"),
+            "{content}"
+        );
+        assert!(!content.contains("isInt64(value0)"), "{content}");
     }
 
     #[test]

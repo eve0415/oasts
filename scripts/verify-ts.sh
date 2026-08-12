@@ -218,6 +218,7 @@ for transform_config in oasts-date oasts-date-validated oasts-temporal oasts-pla
     "$work/transform-$transform_config" transform "transform-showcase-3.1 ($transform_config)"
 done
 generate_and_verify int64-transform-3.1 oasts.yaml "$work/int64-transform" transform "int64-transform-3.1"
+generate_and_verify int64-transform-3.1 oasts-validated.yaml "$work/int64-transform-validated" transform "int64-transform-3.1 (validated)"
 
 # The `allOf` merges whose branches name a converting component. Only tsc over the emitted tree
 # decides these: both surfaces of a merged object have to assign, and a merge that writes one key

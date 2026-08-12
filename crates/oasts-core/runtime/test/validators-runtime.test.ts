@@ -6,6 +6,7 @@ import {
   codePointLength,
   deepEqual,
   hasGet,
+  int64WireValue,
   isDate,
   isDateTime,
   isInt32,
@@ -15,6 +16,21 @@ import {
   issue,
   type Issue,
 } from "../validators-runtime.ts";
+
+describe("int64WireValue", () => {
+  test("normalizes each lossless int64 wire representation", () => {
+    assert.equal(int64WireValue(42), 42n);
+    assert.equal(int64WireValue(12_345_678_901_234_567_890n), 12_345_678_901_234_567_890n);
+    assert.equal(int64WireValue({ rawJSON: "12345678901234567890" }), 12_345_678_901_234_567_890n);
+  });
+
+  test("rejects rounded numbers and noncanonical raw tokens", () => {
+    assert.equal(int64WireValue(Number.MAX_SAFE_INTEGER + 1), null);
+    assert.equal(int64WireValue({ rawJSON: "01" }), null);
+    assert.equal(int64WireValue({ rawJSON: "1.5" }), null);
+    assert.equal(int64WireValue(null), null);
+  });
+});
 
 describe("hasGet", () => {
   test("recognizes objects with a get method", () => {

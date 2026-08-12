@@ -42,17 +42,26 @@ let readCounter: ExportedFunction;
 let readContentCounter: ExportedFunction;
 let submitCounterForm: ExportedFunction;
 let submitCounterMultipart: ExportedFunction;
+let validatedCreateTransport: ExportedFunction;
+let validatedGetLatestCounter: ExportedFunction;
+let validatedRecordCounter: ExportedFunction;
 
 before(async () => {
   await access(binary, constants.X_OK);
   temporaryRoot = await mkdtemp(path.join(tmpdir(), "oasts-int64-e2e-"));
   const fixtureRoot = path.join(temporaryRoot, "int64-transform-3.1");
   await cp(fixtureSource, fixtureRoot, { recursive: true });
-  execFileSync(binary, ["generate"], { cwd: fixtureRoot, stdio: "pipe" });
+  for (const config of ["oasts.yaml", "oasts-validated.yaml"]) {
+    execFileSync(binary, ["generate", "--config", config], {
+      cwd: fixtureRoot,
+      stdio: "pipe",
+    });
+  }
   generatedRoot = path.join(fixtureRoot, "generated");
+  const validatedRoot = path.join(fixtureRoot, "generated-validated");
 
   register(new URL("./resolve-generated.mjs", import.meta.url), {
-    data: { generatedRootUrl: pathToFileURL(generatedRoot).href },
+    data: { generatedRootUrl: pathToFileURL(fixtureRoot).href },
   });
   getLatestCounter = await operation(generatedRoot, "getlatestcounter", "getLatestCounter");
   recordCounter = await operation(generatedRoot, "recordcounter", "recordCounter");
@@ -68,6 +77,16 @@ before(async () => {
     pathToFileURL(path.join(generatedRoot, "runtime/transport.ts")).href
   );
   createTransport = requiredFunction(transportModule, "createTransport");
+  validatedGetLatestCounter = await operation(
+    validatedRoot,
+    "getlatestcounter",
+    "getLatestCounter",
+  );
+  validatedRecordCounter = await operation(validatedRoot, "recordcounter", "recordCounter");
+  const validatedTransportModule: unknown = await import(
+    pathToFileURL(path.join(validatedRoot, "runtime/transport.ts")).href
+  );
+  validatedCreateTransport = requiredFunction(validatedTransportModule, "createTransport");
   baseUrl = await harness.start();
 });
 
@@ -106,6 +125,35 @@ test('emitted client decodes 12345678901234567890n and request raw bytes equal {
   const writeResult = requiredRecord(
     await recordCounter(transport, { body: { id: EXACT_INT64 } }),
     "recordCounter result",
+  );
+  assert.equal(writeResult.outcome, 201);
+  assert.equal(requiredRequest(1).body.toString("utf8"), `{"id":${EXACT_DIGITS}}`);
+});
+
+test("generated validation preserves the exact int64 response and request", async () => {
+  const responseBytes = Buffer.from(`{"id":${EXACT_DIGITS}}`);
+  scriptRoute("GET", "/counters/latest", {
+    status: 200,
+    headers: [["Content-Type", "application/json"]],
+    body: responseBytes,
+  });
+  scriptRoute("POST", "/counters", {
+    status: 201,
+    headers: [["Content-Type", "application/json"]],
+    body: responseBytes,
+  });
+
+  const transport = validatedCreateTransport({ baseUrl });
+  const readResult = requiredRecord(
+    await validatedGetLatestCounter(transport, {}),
+    "validated getLatestCounter result",
+  );
+  assert.equal(readResult.outcome, 200);
+  assert.equal(requiredRecord(readResult.data, "validated response data").id, EXACT_INT64);
+
+  const writeResult = requiredRecord(
+    await validatedRecordCounter(transport, { body: { id: EXACT_INT64 } }),
+    "validated recordCounter result",
   );
   assert.equal(writeResult.outcome, 201);
   assert.equal(requiredRequest(1).body.toString("utf8"), `{"id":${EXACT_DIGITS}}`);
