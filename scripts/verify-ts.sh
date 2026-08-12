@@ -40,6 +40,74 @@ strict_flag_matrix() {
   echo "consumer flag matrix ok: $label (exactOptionalPropertyTypes=$exact_optional)"
 }
 
+# Every emitted component file must be named by some other file in the same tree. A component
+# the pruner keeps but nothing imports is a disagreement between two walks: the pruner keeps any
+# component a `$ref` names anywhere, so the emitter's import walk has to name the same set the
+# renderer does. It did not for `allOf`, whose `$ref` members were inlined by body — the file was
+# written, and the field that should have pointed at it restated its shape anonymously instead.
+#
+# Only sound while pruning is on: `filters.orphans: true` means the document deliberately keeps
+# components no operation reaches, so those fixtures opt out.
+#
+# The known-orphan list below is debt, not design, and it is deliberately enumerated rather than
+# skipped by fixture so that a NEW orphan in any of these documents still fails. Every entry is one
+# pre-existing defect of a single family: a form, multipart, or non-JSON body types itself from
+# flattened fields or from its media classification instead of naming its schema, so the pruner
+# keeps a component the emitter never references. Reproduced identically at v0.0.3, so none of it
+# comes from `allOf` identity — closing it means deciding how a non-JSON body names its schema,
+# which is its own change.
+#   form-composition-3.1  Forum/NestedLeft*/NestedRight — urlencoded and multipart request bodies
+#                         whose properties the client flattens into field descriptors.
+#   tictactoe-3.1         ErrorMessage — a `text/html` response typed `string` by classification.
+#   transform-composition-3.1  the per-component codec modules for a form-composed body.
+#   strict-flags-3.1      Manifest — a multipart response part.
+orphan_debt=(
+  "form-composition-3.1/forum.ts"
+  "form-composition-3.1/nestedleftbase.ts"
+  "form-composition-3.1/nestedleftextra.ts"
+  "form-composition-3.1/nestedright.ts"
+  "tictactoe-3.1/errormessage.ts"
+  "transform-composition-3.1/audited.ts"
+  "transform-composition-3.1/left.ts"
+  "transform-composition-3.1/required.ts"
+  "transform-composition-3.1/right.ts"
+  "strict-flags-3.1/manifest.ts"
+)
+
+# Args: work-dir config fixture.
+assert_no_orphan_components() {
+  local d=$1 cfg=$2 fixture=$3
+  if [[ -f "$d/$cfg" ]] && grep -qE '^[[:space:]]*orphans:[[:space:]]*true' "$d/$cfg"; then
+    return 0
+  fi
+  local file names args name referencing found=0
+  while IFS= read -r file; do
+    mapfile -t names < <(grep -oE '^export (interface|type|const|function|declare) [A-Za-z_$][A-Za-z0-9_$]*' \
+      "$file" | awk '{print $3}' | sort -u)
+    if [[ ${#names[@]} -eq 0 ]]; then
+      continue
+    fi
+    args=()
+    for name in "${names[@]}"; do
+      args+=(-e "$name")
+    done
+    # -w, or `Pet` would count `PetRequest` as a reference and every orphan would look used.
+    # Collected rather than piped into `grep -q`: an early-exiting reader SIGPIPEs the
+    # recursive grep, and under `pipefail` that reads as "no reference found" — on a big
+    # enough tree to lose the race, which made this report orphans that were not.
+    referencing=$(grep -rlwF --include='*.ts' "${args[@]}" "$d"/generated* 2>/dev/null \
+      | grep -vxF "$file" || true)
+    if [[ -z "$referencing" ]]; then
+      if [[ " ${orphan_debt[*]} " == *" $fixture/$(basename "$file") "* ]]; then
+        continue
+      fi
+      echo "verify-ts: generated component is import-orphaned: $file (exports: ${names[*]})" >&2
+      found=1
+    fi
+  done < <(find "$d"/generated* -path '*/components/*.ts' 2>/dev/null | sort)
+  return "$found"
+}
+
 # Shared body for the client and validators fixture checks: copy the fixture, strip any prior
 # generated output, generate under one config and typecheck it, then regenerate into a sibling dir
 # and diff to prove generation is byte-stable. The gate label and message differ per caller, so they
@@ -56,6 +124,7 @@ generate_and_verify() {
     ln -s "$PWD/crates/oasts-core/runtime/node_modules" "$d/node_modules"
   fi
   (cd "$d" && "$OLDPWD/$bin" generate --config "$cfg")
+  assert_no_orphan_components "$d" "$cfg" "$f"
   # The consumer flag matrix over every emitted tree, exactOptionalPropertyTypes off and
   # on. `--strict` alone is the bar this gate used to hold, and it is a bar no consumer compiles at:
   # none of these five flags is part of `strict`, so output that only passes `--strict` can still be
@@ -76,6 +145,11 @@ generate_and_verify anchors-3.1 oasts.yaml "$work/anchors-3.1" types "anchors-3.
 # component, the client artifact in the operation module that imports one as a parameter type.
 generate_and_verify builtin-name-shadow-3.0 oasts.yaml "$work/builtin-name-shadow-3.0" types "builtin-name-shadow-3.0"
 generate_and_verify builtin-name-shadow-3.0 oasts-client.yaml "$work/client-builtin-name-shadow-3.0" client "builtin-name-shadow-3.0 (client)"
+# The composition-identity matrix: one probe pair in every shape that can carry a `$ref`. The
+# 3.1 row also carries a component reached only through an `allOf`, which is the orphan the
+# import walk used to leave behind; the 3.0 row exists for `nullable`, which 3.1 does not have.
+generate_and_verify composition-identity-3.1 oasts.yaml "$work/composition-identity-3.1" types "composition-identity-3.1"
+generate_and_verify composition-identity-3.0 oasts.yaml "$work/composition-identity-3.0" types "composition-identity-3.0"
 generate_and_verify defs-entry-3.1 oasts.yaml "$work/defs-entry-3.1" types "defs-entry-3.1"
 generate_and_verify empty-enum-3.1 oasts.yaml "$work/empty-enum-3.1" types "empty-enum-3.1"
 generate_and_verify document-root-ref-3.1 oasts.yaml "$work/document-root-ref-3.1" types "document-root-ref-3.1"
@@ -99,6 +173,10 @@ pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module es
 echo "compile-assert matrix ok: variant-name-shadow-3.0"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/uninhabitable-allof-3.0/compile-assert/cases.ts"
 echo "compile-assert matrix ok: uninhabitable-allof-3.0"
+for identity in composition-identity-3.1 composition-identity-3.0; do
+  pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/$identity/compile-assert/cases.ts"
+  echo "compile-assert matrix ok: $identity"
+done
 
 for f in client-showcase-3.1 petstore-3.0 tictactoe-3.1 auth-showcase-3.1 server-variables-enum-3.1 relative-server-3.1 wire-fidelity-3.1 media-classification-3.1 form-composition-3.1 multipart-response-3.0 streaming-3.1; do
   # A fixture whose client config lives in a separate file says so on disk.
