@@ -7,7 +7,7 @@
 //! artifacts naming the same schema differently. Identifier clashes go through the same file-local
 //! import aliasing the client uses instead.
 //!
-//! That containment is what makes this artifact refuse a position reaching a date/time transform
+//! That containment is what makes this artifact refuse a position reaching a date/time or int64 transform
 //! (`OASTS1508`/`OASTS1509`). The refusal is a deliberate limitation, not an impossibility: the
 //! conversion is perfectly expressible, but the codecs are emitted under the client's output
 //! directory, so importing them would break the one rule above and emit a module that does not
@@ -45,6 +45,7 @@ use crate::ir::{
 use crate::response_media::{
     ResponseMediaKind, classify_response_media, diagnose_operation_response_media,
 };
+use crate::transform::TransformKind;
 
 const MSW_RUNTIME_TS: &str = include_str!("../../runtime/msw-runtime.ts");
 const MSW_PROJECT_TS: &str = include_str!("../../runtime/msw-project.ts");
@@ -825,20 +826,22 @@ fn inspect_body_projection(
             source,
             ..
         } => {
-            if model.transform_facts().reaches(schema) {
+            if let Some(transform) = unsupported_transform(model, schema) {
                 diagnostics.push(body_projection_diagnostic(
                     source,
-                    "the application type applies a date/time transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach",
+                    &format!(
+                        "the application type applies {transform} transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach"
+                    ),
                 ));
             }
         }
         BodyPlan::FormUrlencoded { fields, .. } => {
             for field in fields {
-                if model.transform_facts().reaches(&field.schema) {
+                if let Some(transform) = unsupported_transform(model, &field.schema) {
                     diagnostics.push(body_projection_diagnostic(
                         &field.source,
                         &format!(
-                            "form field '{}' applies a date/time transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach",
+                            "form field '{}' applies {transform} transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach",
                             field.name
                         ),
                     ));
@@ -900,12 +903,12 @@ fn inspect_body_projection(
         BodyPlan::Multipart { fields, .. } => {
             for field in fields {
                 if multipart_field_payload(field) != PayloadKind::Binary
-                    && model.transform_facts().reaches(&field.schema)
+                    && let Some(transform) = unsupported_transform(model, &field.schema)
                 {
                     diagnostics.push(body_projection_diagnostic(
                         &field.source,
                         &format!(
-                            "multipart field '{}' applies a date/time transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach",
+                            "multipart field '{}' applies {transform} transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach",
                             field.name
                         ),
                     ));
@@ -920,6 +923,22 @@ fn inspect_body_projection(
         BodyPlan::Json { schema: None, .. }
         | BodyPlan::TopLevelText { .. }
         | BodyPlan::TopLevelBinary { .. } => {}
+    }
+}
+
+fn unsupported_transform(
+    model: &EmissionModel<'_, '_>,
+    schema: &SchemaNode,
+) -> Option<&'static str> {
+    if model
+        .transform_facts()
+        .reaches_kind(schema, TransformKind::IntegerBigInt)
+    {
+        Some("an int64")
+    } else if model.transform_facts().reaches(schema) {
+        Some("a date/time")
+    } else {
+        None
     }
 }
 
@@ -1405,8 +1424,10 @@ fn plan_projected_parameters(
                 "content media type '{}' is caller-serialized and defines no typed inverse",
                 parameter.content_media_type.as_deref().unwrap_or("unknown")
             ))
-        } else if model.transform_facts().reaches(&parameter.schema) {
-            Some("the application type applies a date/time transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach".to_owned())
+        } else if let Some(transform) = unsupported_transform(model, &parameter.schema) {
+            Some(format!(
+                "the application type applies {transform} transform this artifact does not reproduce: MSW handlers import only the types artifact and their own kernel, so the client's codecs are out of reach"
+            ))
         } else if plan.resolved.style == ParamStyle::Label
             && plan.resolved.explode
             && projector.admits_collection(&parameter.schema)
@@ -2249,7 +2270,9 @@ fn embedded_assets(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DateTimeRepresentation, ResolvedConfig, load_config};
+    use crate::config::{
+        DateTimeRepresentation, IntegerRepresentation, ResolvedConfig, load_config,
+    };
     use crate::diag::{DiagnosticSink, Severity};
     use crate::emit::emit_artifacts;
     use crate::ir::{PropMeta, SchemaMeta, SchemaRef};
@@ -3047,6 +3070,61 @@ paths:
     }
 
     #[test]
+    fn int64_request_bodies_name_the_int64_transform_in_diagnostics() {
+        let document = r#"
+openapi: 3.1.0
+info: { title: Int64 bodies, version: 1.0.0 }
+paths:
+  /json:
+    post:
+      operationId: sendJsonInt64
+      requestBody:
+        content:
+          application/json: { schema: { type: integer, format: int64 } }
+      responses: { "204": { description: ok } }
+  /form:
+    post:
+      operationId: sendFormInt64
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties: { id: { type: integer, format: int64 } }
+      responses: { "204": { description: ok } }
+  /multipart:
+    post:
+      operationId: sendMultipartInt64
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties: { id: { type: integer, format: int64 } }
+      responses: { "204": { description: ok } }
+"#;
+        let (files, diagnostics) = generate_with_config(document, |config| {
+            config.types.integer = IntegerRepresentation::Bigint;
+        });
+        let projection = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_BODY_PROJECTION)
+            .collect::<Vec<_>>();
+        assert_eq!(projection.len(), 3, "{projection:#?}");
+        assert!(
+            projection
+                .iter()
+                .all(|diagnostic| diagnostic.message.contains("int64 transform")),
+            "{projection:#?}"
+        );
+        assert!(
+            files
+                .iter()
+                .all(|file| { !file.relative_path.starts_with("msw/handlers/send") })
+        );
+    }
+
+    #[test]
     fn invalid_internal_body_plans_fail_with_diagnostics() {
         let temp = TempDir::new().expect("temp dir");
         fs::write(temp.path().join("openapi.yaml"), MINIMAL).expect("write document");
@@ -3719,6 +3797,39 @@ components:
             diagnostic.code == CODE_PARAMETER_PROJECTION
                 && diagnostic.message.contains("patternProperties")
         }));
+    }
+
+    #[test]
+    fn int64_parameters_name_the_int64_transform_in_diagnostics() {
+        let document = r#"
+openapi: 3.1.0
+info: { title: Int64 parameter, version: 1.0.0 }
+paths:
+  /value:
+    get:
+      operationId: getValue
+      parameters:
+        - name: id
+          in: query
+          schema: { type: integer, format: int64 }
+      responses: { "204": { description: ok } }
+"#;
+        let (files, diagnostics) = generate_with_config(document, |config| {
+            config.types.integer = IntegerRepresentation::Bigint;
+        });
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_PARAMETER_PROJECTION)
+            .expect("int64 parameter projection diagnostic");
+        assert!(
+            diagnostic.message.contains("int64 transform"),
+            "{diagnostic:#?}"
+        );
+        assert!(
+            files
+                .iter()
+                .all(|file| file.relative_path != "msw/handlers/getvalue.ts")
+        );
     }
 
     #[test]
