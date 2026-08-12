@@ -26,7 +26,7 @@ use foldhash::{HashMap, HashSet, HashSetExt};
 use serde_json::Value;
 
 use crate::client_model::{
-    BodyPlan, ClientModel, FormFieldPlan, MultipartResponsePayload, OperationPlan,
+    BodyPlan, ClientModel, DecoderClass, FormFieldPlan, MultipartResponsePayload, OperationPlan,
     PayloadDisposition, PayloadKind, ResponseMediaPlan,
 };
 use crate::diag::Diagnostic;
@@ -637,6 +637,20 @@ fn unconvertible_transform_diagnostics(
             continue;
         }
         for entry in &response.media {
+            if entry.decoder == DecoderClass::StreamingSse
+                && model
+                    .transform_facts()
+                    .reaches_kind(&entry.schema, TransformKind::IntegerBigInt)
+            {
+                diagnostics.push(source_diagnostic(
+                    CODE_UNCONVERTIBLE_TRANSFORM,
+                    format!(
+                        "response '{}' entry '{}': the SSE event schema applies an int64 transform, but the SSE frame parser cannot preserve unsafe integer tokens; set the integer representation back to number",
+                        response.match_key, entry.media,
+                    ),
+                    &entry.source,
+                ));
+            }
             if multipart_response_entry_transforms(model, entry) {
                 diagnostics.push(source_diagnostic(
                     CODE_UNCONVERTIBLE_TRANSFORM,
@@ -6190,6 +6204,42 @@ mod operation_pair_tests {
                 "{body_media}: {diagnostics:#?}"
             );
         }
+    }
+
+    #[test]
+    fn a_bigint_sse_event_is_refused_before_emitting_a_decoder() {
+        let (_files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "watchCounters",
+                    "responses": {
+                        "200": {
+                            "description": "events",
+                            "content": {
+                                "text/event-stream": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["id"],
+                                        "properties": {
+                                            "id": { "type": "integer", "format": "int64" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+                json!({}),
+            ),
+            bigint_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        assert_eq!(refused(&diagnostics).len(), 1, "{diagnostics:#?}");
+        assert!(
+            refused(&diagnostics)[0].contains("SSE event schema applies an int64 transform"),
+            "{diagnostics:#?}"
+        );
     }
 
     #[test]
