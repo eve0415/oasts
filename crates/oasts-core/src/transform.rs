@@ -1561,7 +1561,9 @@ mod tests {
             extra_required: Vec::new(),
             meta: crate::ir::SchemaMeta::default(),
         };
-        assert!(computed.reaches(&open_with_schema(dated)));
+        let dated_map = open_with_schema(dated);
+        assert!(computed.reaches(&dated_map));
+        assert!(computed.reaches_kind(&dated_map, TransformKind::DateTimeDate));
         assert!(!computed.reaches(&open_with_schema(SchemaNode::Any {
             meta: crate::ir::SchemaMeta::default(),
         })));
@@ -1587,6 +1589,7 @@ mod tests {
             meta: crate::ir::SchemaMeta::default(),
         };
         assert!(!computed.reaches(&dangling));
+        assert!(!computed.reaches_kind(&dangling, TransformKind::DateTimeDate));
         assert!(transforms(&fx.ir, &computed, "Pet"));
     }
 
