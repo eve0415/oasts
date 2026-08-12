@@ -2856,10 +2856,12 @@ mod tests {
             },
             source: source.clone(),
         });
-        let SchemaNode::Any { meta } = schema else {
-            panic!("a binary upload must not expose its declared schema to the transform emitter");
-        };
-        assert_eq!(meta.source, source);
+        assert_eq!(
+            schema,
+            SchemaNode::Any {
+                meta: operation_schema_meta(source)
+            }
+        );
     }
 
     #[test]
