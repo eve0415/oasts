@@ -8468,12 +8468,7 @@ mod tests {
                      "discriminator": { "propertyName": "petType" } }
         }));
         let (_files, diagnostics) = compile(document, json!({}));
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.code != "OASTS1316"),
-            "{diagnostics:?}"
-        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
@@ -8498,14 +8493,7 @@ mod tests {
             ),
             "{tagged}"
         );
-        assert_eq!(
-            tagged_diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
-                .count(),
-            0,
-            "{tagged_diagnostics:?}"
-        );
+        assert!(tagged_diagnostics.is_empty(), "{tagged_diagnostics:?}");
 
         let (structural_files, structural_diagnostics) = compile(mapping_document, json!({}));
         let structural = generated_body(schema_file(&structural_files, "pet"));
@@ -8534,12 +8522,7 @@ mod tests {
         );
         let pet = generated_body(find_file(&files, "types/components/pet.ts"));
         assert!(pet.contains("export type Pet = Cat | Dog;"), "{pet}");
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.code != CODE_DISCRIMINATOR_NARROWING),
-            "{diagnostics:?}"
-        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
         let optional_document = openapi(json!({
             "Cat": { "type": "object", "properties": { "kind": { "type": "string", "const": "cat" } } },
