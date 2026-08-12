@@ -1872,8 +1872,21 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     indent,
                     false,
                 );
+                // An object with no property visible here renders as its own index signature,
+                // which is the whole point of that spelling — but a pattern signature says the
+                // same thing more precisely, so the base yields to it rather than intersecting.
+                // Decided structurally, before rendering, so it does not depend on how an empty
+                // object happens to be spelled.
+                let literal_is_empty_object = !borrowed
+                    .iter()
+                    .any(|&(_, _, meta)| property_in_position(meta, position))
+                    && matches!(
+                        additional_properties,
+                        AdditionalProperties::Allowed(None) | AdditionalProperties::Forbidden
+                    );
                 self.render_pattern_properties(
                     literal,
+                    literal_is_empty_object,
                     &meta.validation_applicators().pattern_properties,
                     position,
                     axis,
@@ -2169,6 +2182,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     fn render_pattern_properties(
         &self,
         literal: String,
+        literal_is_empty_object: bool,
         pattern_properties: &[PatternProperty],
         position: TypePosition,
         axis: TypeAxis,
@@ -2192,8 +2206,11 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 };
                 Some(signature)
             })
-            .fold(literal, |rendered, signature| {
-                if rendered == "{}" {
+            .enumerate()
+            .fold(literal, |rendered, (index, signature)| {
+                // Only the first signature may replace the base — the rest intersect onto it, or
+                // a second pattern would discard the first.
+                if literal_is_empty_object && index == 0 {
                     signature
                 } else {
                     format!("{rendered} & {signature}")
@@ -7082,10 +7099,19 @@ mod tests {
             .iter()
             .find(|file| file.relative_path.ends_with("onlypattern.ts"))
             .expect("OnlyPattern file");
+        // The pattern signature stands alone: it already says which keys exist and what they
+        // hold. Intersecting the empty object's own index signature onto it would widen the
+        // value type back to `unknown`, and anything reading the result through
+        // `Object.entries` would see `unknown` instead of the pattern's type.
+        let only_pattern_body = generated_body(only_pattern);
         assert!(
-            generated_body(only_pattern).contains(
-                "export type OnlyPattern = { [key: string]: unknown } & { [key: `x-${string}`]: number };"
-            )
+            only_pattern_body
+                .contains("export type OnlyPattern = { [key: `x-${string}`]: number };"),
+            "{only_pattern_body}"
+        );
+        assert!(
+            !only_pattern_body.contains("[key: string]: unknown"),
+            "{only_pattern_body}"
         );
         let patterned_all_of = files
             .iter()
