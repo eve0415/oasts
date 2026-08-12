@@ -26,8 +26,8 @@ use crate::client_model::{BodyPlan, BodyPlanArm, ClientModel, FormFieldPlan};
 use crate::composition::{CODE_COMPOSITION, CODE_CONFLICTING_PROPERTY};
 use crate::composition::{finite_values, json_equal};
 use crate::config::{
-    DateRepresentation, DateTimeRepresentation, DocumentationConfig, EnumRepresentation, FileCase,
-    ResolvedConfig, TypesConfig,
+    DateRepresentation, DateTimeRepresentation, DiscriminatedUnions, DocumentationConfig,
+    EnumRepresentation, FileCase, ResolvedConfig, TypesConfig,
 };
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::ir::{
@@ -88,6 +88,9 @@ const CODE_TRANSFORM_UNION: &str = "OASTS1313";
 /// a shape no single codec is keyed on, and emitting nothing for one would leave a wire string
 /// behind a type promising an application value.
 pub(super) const CODE_UNCONVERTIBLE_TRANSFORM: &str = "OASTS1314";
+/// A discriminator whose proof can select branches but whose emitted TypeScript union does not
+/// carry required unit-literal tags on every branch, so consumers cannot narrow it exhaustively.
+const CODE_DISCRIMINATOR_NARROWING: &str = "OASTS1316";
 
 /// A wire twin whose derived `{Name}Wire` is already a declared component's name. The document owns
 /// its name; the compiler invented the other, so the twin yields to `{Name}WireValue` and generation
@@ -1062,13 +1065,20 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 branches,
                 discriminator: Some(discriminator),
                 ..
+            } => {
+                self.validate_discriminated(
+                    branches,
+                    discriminator,
+                    self.model.config.types.discriminated_unions == DiscriminatedUnions::Tagged,
+                    diagnostics,
+                );
             }
-            | SchemaNode::AnyOf {
+            SchemaNode::AnyOf {
                 branches,
                 discriminator: Some(discriminator),
                 ..
             } => {
-                self.validate_discriminated(branches, discriminator, diagnostics);
+                self.validate_discriminated(branches, discriminator, false, diagnostics);
             }
             _ => {}
         }
@@ -1163,6 +1173,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         &self,
         branches: &[SchemaNode],
         discriminator: &Discriminator,
+        tagged_projection: bool,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
         let (mapping_targets, dangling) = self.mapping_targets(discriminator);
@@ -1175,10 +1186,85 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 &discriminator.source,
             ));
         }
-        if let Err((code, message)) =
-            self.prove_discriminator_tags(branches, discriminator, &mapping_targets)
-        {
-            diagnostics.push(warning_diagnostic(code, message, &discriminator.source));
+        match self.prove_discriminator_tags(branches, discriminator, &mapping_targets) {
+            Err((code, message)) => {
+                diagnostics.push(warning_diagnostic(code, message, &discriminator.source));
+            }
+            Ok(_) => {
+                if let Some(message) = self.discriminator_narrowing_warning(
+                    branches,
+                    discriminator,
+                    &mapping_targets,
+                    tagged_projection,
+                ) {
+                    diagnostics.push(warning_diagnostic(
+                        CODE_DISCRIMINATOR_NARROWING,
+                        message,
+                        &discriminator.source,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn discriminator_narrowing_warning(
+        &self,
+        branches: &[SchemaNode],
+        discriminator: &Discriminator,
+        mapping_targets: &[(&str, usize)],
+        tagged_projection: bool,
+    ) -> Option<String> {
+        let property = discriminator.property_name.as_str();
+        let facts = branches
+            .iter()
+            .map(|branch| self.merged_object_property_finite(branch, property, &mut HashSet::new()))
+            .collect::<Vec<_>>();
+
+        if facts.iter().any(|facts| {
+            facts
+                .values
+                .as_deref()
+                .is_some_and(|values| values.iter().any(Value::is_object))
+        }) {
+            return Some(format!(
+                "discriminator property '{property}' uses object const tags, which render as object types rather than unit types and cannot make the emitted union exhaustive"
+            ));
+        }
+
+        if self.discriminator_branches_fix_a_literal(branches, property) {
+            return None;
+        }
+
+        if facts.iter().any(|facts| {
+            !facts.required
+                && facts
+                    .values
+                    .as_deref()
+                    .is_some_and(|values| !values.is_empty())
+        }) {
+            return Some(format!(
+                "discriminator property '{property}' is optional in at least one branch, so a payload that omits it falls through every equality arm and prevents exhaustive narrowing"
+            ));
+        }
+
+        if tagged_projection {
+            return None;
+        }
+
+        let uses_mapping = branches.iter().any(|branch| {
+            let branch_index = self.branch_target_index(branch);
+            mapping_targets
+                .iter()
+                .any(|(_, index)| branch_index == Some(*index))
+        });
+        if uses_mapping {
+            Some(format!(
+                "discriminator property '{property}' uses mapping literals that the structural branch types do not declare, so the emitted union cannot narrow on those tags"
+            ))
+        } else {
+            Some(format!(
+                "discriminator property '{property}' uses implicit component-name tags that the document does not declare on the wire, so the emitted union cannot narrow on those tags"
+            ))
         }
     }
 
@@ -1340,9 +1426,9 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     /// `value.<property> === "<tag>"`, and TypeScript narrows on that only where the branch's type
     /// declares the literal. Under a mapping-only proof every arm still declares `<property>` as
     /// `string`, and the emitted ternary compiles to a type error rather than a dispatch.
-    /// A branch also has to *require* the property. An optional tag declares `<property>?: "alpha"`,
-    /// which the emitted `value.<property> === "alpha"` does not narrow — the arm is a type error,
-    /// and a payload that omits the tag falls through every arm unconverted.
+    /// A branch also has to *require* the property. TypeScript does narrow an optional literal on an
+    /// equality check, but a payload that omits the tag falls through every arm, so the dispatch is
+    /// not exhaustive and its fallback cannot be `never`.
     pub(super) fn discriminator_branches_fix_a_literal(
         &self,
         branches: &[SchemaNode],
@@ -5583,7 +5669,12 @@ mod tests {
         };
         let before = diagnostics.len();
         emitter.validate_schema(&unique, &mut diagnostics);
-        assert_eq!(diagnostics.len(), before);
+        let added = &diagnostics[before..];
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0].code, CODE_DISCRIMINATOR_NARROWING);
+        assert_eq!(added[0].severity, Severity::Warning);
+        assert!(added[0].message.contains("optional"), "{added:?}");
+        assert!(added[0].message.contains("exhaustive"), "{added:?}");
         emitter.validate_schema(
             &SchemaNode::OneOf {
                 branches: Vec::new(),
@@ -8202,10 +8293,89 @@ mod tests {
             .filter(|diagnostic| {
                 matches!(
                     diagnostic.code,
-                    CODE_DISCRIMINATOR | CODE_DISCRIMINATOR_PROOF | CODE_MAPPING_TARGET
+                    CODE_DISCRIMINATOR
+                        | CODE_DISCRIMINATOR_PROOF
+                        | CODE_DISCRIMINATOR_NARROWING
+                        | CODE_MAPPING_TARGET
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn proven_discriminator_that_cannot_narrow_warns() {
+        let cases = [
+            (
+                openapi(json!({
+                    "Cat": { "type": "object", "required": ["petType"], "properties": { "petType": { "type": "string" } } },
+                    "Dog": { "type": "object", "required": ["petType"], "properties": { "petType": { "type": "string" } } },
+                    "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                             "discriminator": { "propertyName": "petType", "mapping": {
+                                 "feline": "#/components/schemas/Cat", "canine": "#/components/schemas/Dog"
+                             } } }
+                })),
+                "mapping literals",
+            ),
+            (
+                openapi(json!({
+                    "Cat": { "type": "object", "required": ["petType"], "properties": { "petType": { "type": "string" } } },
+                    "Dog": { "type": "object", "required": ["petType"], "properties": { "petType": { "type": "string" } } },
+                    "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                             "discriminator": { "propertyName": "petType" } }
+                })),
+                "component-name tags",
+            ),
+            (
+                openapi(json!({
+                    "Cat": { "type": "object", "properties": { "petType": { "type": "string", "const": "cat" } } },
+                    "Dog": { "type": "object", "properties": { "petType": { "type": "string", "const": "dog" } } },
+                    "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                             "discriminator": { "propertyName": "petType" } }
+                })),
+                "optional",
+            ),
+            (
+                openapi(json!({
+                    "Cat": { "type": "object", "required": ["petType"], "properties": { "petType": { "type": "object", "const": { "k": 1 } } } },
+                    "Dog": { "type": "object", "required": ["petType"], "properties": { "petType": { "type": "object", "const": { "k": 2 } } } },
+                    "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                             "discriminator": { "propertyName": "petType" } }
+                })),
+                "object",
+            ),
+        ];
+
+        for (document, reason) in cases {
+            let (_files, diagnostics) = compile(document, json!({}));
+            let warnings = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS1316")
+                .collect::<Vec<_>>();
+            assert_eq!(warnings.len(), 1, "{reason}: {diagnostics:?}");
+            assert_eq!(warnings[0].severity, Severity::Warning);
+            assert!(
+                warnings[0].message.contains("petType"),
+                "{reason}: {warnings:?}"
+            );
+            assert!(
+                warnings[0].message.contains(reason),
+                "{reason}: {warnings:?}"
+            );
+        }
+
+        let document = openapi(json!({
+            "Cat": { "type": "object", "required": ["petType"], "properties": { "petType": { "type": "string", "const": "cat" } } },
+            "Dog": { "type": "object", "required": ["petType"], "properties": { "petType": { "type": "string", "const": "dog" } } },
+            "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }],
+                     "discriminator": { "propertyName": "petType" } }
+        }));
+        let (_files, diagnostics) = compile(document, json!({}));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "OASTS1316"),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
@@ -8273,10 +8443,11 @@ mod tests {
                        "mapping": { "cat": "#/components/schemas/Cat", "dog": "#/components/schemas/Dog" } } }
         }));
         let (_files, diagnostics) = compile(document, json!({}));
-        assert!(
-            discriminator_diagnostics(&diagnostics).is_empty(),
-            "{diagnostics:?}"
-        );
+        let flagged = discriminator_diagnostics(&diagnostics);
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        assert_eq!(flagged[0].code, CODE_DISCRIMINATOR_NARROWING);
+        assert_eq!(flagged[0].severity, Severity::Warning);
+        assert!(flagged[0].message.contains("mapping literals"));
     }
 
     #[test]
@@ -8341,8 +8512,8 @@ mod tests {
         );
     }
 
-    /// Every mapping entry dangling still emits the same structural union, now with one warning per
-    /// dead entry — proof falls all the way back to the referenced component names.
+    /// Every mapping entry dangling still emits the same structural union, with one warning per dead
+    /// entry and one narrowing warning after proof falls back to referenced component names.
     #[test]
     fn an_entirely_dangling_mapping_still_emits_the_union() {
         let document = openapi(json!({
@@ -8355,12 +8526,20 @@ mod tests {
         }));
         let (files, diagnostics) = compile(document, json!({}));
         let flagged = discriminator_diagnostics(&diagnostics);
-        assert_eq!(flagged.len(), 2, "{diagnostics:?}");
+        assert_eq!(flagged.len(), 3, "{diagnostics:?}");
         assert!(
             flagged
                 .iter()
-                .all(|diagnostic| diagnostic.code == CODE_MAPPING_TARGET
-                    && diagnostic.severity == Severity::Warning),
+                .filter(|diagnostic| diagnostic.code == CODE_MAPPING_TARGET)
+                .count()
+                == 2,
+            "{diagnostics:?}"
+        );
+        assert!(
+            flagged.iter().any(|diagnostic| {
+                diagnostic.code == CODE_DISCRIMINATOR_NARROWING
+                    && diagnostic.severity == Severity::Warning
+            }),
             "{diagnostics:?}"
         );
         let pet = find_file(&files, "types/components/pet.ts");
@@ -8401,12 +8580,13 @@ mod tests {
             "Pet": { "oneOf": [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }], "discriminator": { "propertyName": "kind" } }
         }));
         let (_files, diagnostics) = compile(document, json!({}));
-        // No mapping and no const: the component names Cat/Dog are the distinct tags, so the union
-        // proves where the pre-implicit path would have warned.
-        assert!(
-            discriminator_diagnostics(&diagnostics).is_empty(),
-            "{diagnostics:?}"
-        );
+        // The component names still prove distinct tags, but the document does not declare those
+        // strings on the wire, so the structural output cannot narrow on them.
+        let flagged = discriminator_diagnostics(&diagnostics);
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        assert_eq!(flagged[0].code, CODE_DISCRIMINATOR_NARROWING);
+        assert_eq!(flagged[0].severity, Severity::Warning);
+        assert!(flagged[0].message.contains("component-name tags"));
     }
 
     #[test]
@@ -8437,20 +8617,20 @@ mod tests {
 
     #[test]
     fn discriminator_container_finite_tag_proves() {
-        // Branch A's tag property is itself an object with a `const`, so its fixed value lives in the
-        // object `finite` field b9e3b24 added rather than a primitive `const`; the proof must consult
-        // it. Branch B's tag property is a non-finite array, which proves nothing and falls back to
-        // the implicit component name — so the two branches still carry distinct tags.
+        // Branch A's tag property is itself an object with a `const`, so proof finds its fixed value
+        // in the object `finite` field. That still is not a unit type TypeScript can discriminate;
+        // branch B's non-finite array falls back to its implicit component name.
         let document = openapi(json!({
             "A": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "object", "const": { "k": 1 } } } },
             "B": { "type": "object", "properties": { "kind": { "type": "array", "items": { "type": "string" } } } },
             "Pet": { "oneOf": [{ "$ref": "#/components/schemas/A" }, { "$ref": "#/components/schemas/B" }], "discriminator": { "propertyName": "kind" } }
         }));
         let (_files, diagnostics) = compile(document, json!({}));
-        assert!(
-            discriminator_diagnostics(&diagnostics).is_empty(),
-            "{diagnostics:?}"
-        );
+        let flagged = discriminator_diagnostics(&diagnostics);
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        assert_eq!(flagged[0].code, CODE_DISCRIMINATOR_NARROWING);
+        assert_eq!(flagged[0].severity, Severity::Warning);
+        assert!(flagged[0].message.contains("object const tags"));
     }
 
     #[test]
