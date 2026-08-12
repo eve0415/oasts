@@ -61,6 +61,9 @@ strict_flag_matrix() {
 #   tictactoe-3.1         ErrorMessage — a `text/html` response typed `string` by classification.
 #   transform-composition-3.1  the per-component codec modules for a form-composed body.
 #   strict-flags-3.1      Manifest — a multipart response part.
+# The key is fixture plus file basename, not the full tree path, so one entry covers a component
+# orphaned under several of a fixture's configs — and, the cost of that, does not notice the same
+# basename newly orphaned in a tree it was fine in before.
 orphan_debt=(
   "form-composition-3.1/forum.ts"
   "form-composition-3.1/nestedleftbase.ts"

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use foldhash::{HashMap, HashSet, HashSetExt};
 use serde_json::Value;
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
@@ -268,40 +268,47 @@ impl<'ir> CompositionAnalysis<'ir> {
     /// `allOf` is for — so this reuses the same three domain proofs `prove_empty` applies to
     /// whole branches, one property at a time.
     fn conflicting_properties(&self, branches: &[SchemaNode]) -> Vec<String> {
-        let objects = branches
-            .iter()
-            .filter_map(|branch| {
-                let resolved = self.resolve_ref(branch, &mut HashSet::new())?;
-                match resolved {
-                    SchemaNode::Object { properties, .. } => Some(properties),
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>();
-        // Group by property name in declaration order, so the message reads in the order the
-        // document declares the branches and the output stays deterministic.
-        let mut names = Vec::new();
-        let mut declarations: HashMap<&str, Vec<&SchemaNode>> = HashMap::new();
-        for properties in &objects {
-            for (name, schema, _) in properties.iter() {
-                let slot = declarations.entry(name.as_str()).or_insert_with(|| {
-                    names.push(name.as_str());
-                    Vec::new()
-                });
-                slot.push(schema);
+        let mut messages = Vec::new();
+        // Two branches are the minimum that can declare one property twice. Checked before
+        // anything is built, so the single-`$ref` quoting idiom — the most common `allOf` in
+        // any 3.0 document — costs one comparison and no allocation.
+        if branches.len() < 2 {
+            return messages;
+        }
+        // One flat buffer of every declaration rather than a map of per-name vectors: this
+        // runs on every `allOf` node in the document, and a container per property name is
+        // the allocation that shows up when a document has thousands of them. `Vec::new`
+        // does not allocate, so branches that resolve to no object stay free.
+        let mut declared: Vec<(&str, &SchemaNode)> = Vec::new();
+        for branch in branches {
+            let Some(SchemaNode::Object { properties, .. }) =
+                self.resolve_ref(branch, &mut HashSet::new())
+            else {
+                continue;
+            };
+            for (name, schema, _) in properties {
+                declared.push((name.as_str(), schema));
             }
         }
-        let mut messages = Vec::new();
-        for name in names {
-            let declared = &declarations[name];
-            if declared.len() < 2 {
-                continue;
+        // Sorting groups the repeats and fixes the report order by property name. The sort is
+        // stable, so declarations of one name stay in branch order for the domain tests.
+        declared.sort_by_key(|(name, _)| *name);
+        let mut start = 0;
+        while start < declared.len() {
+            let mut end = start + 1;
+            while end < declared.len() && declared[end].0 == declared[start].0 {
+                end += 1;
             }
-            if let Some(reason) = self.empty_intersection_reason(declared) {
+            let group = &declared[start..end];
+            if group.len() >= 2
+                && let Some(reason) = self.empty_intersection_reason(group)
+            {
+                let name = group[0].0;
                 messages.push(format!(
                     "allOf branches declare property '{name}' with {reason}; the branches intersect, so the property is uninhabitable"
                 ));
             }
+            start = end;
         }
         messages
     }
@@ -309,10 +316,10 @@ impl<'ir> CompositionAnalysis<'ir> {
     /// The three whole-domain proofs `prove_empty` runs, applied to one property's schemas.
     /// The closed-object rule is deliberately absent: it is about a branch's own
     /// `additionalProperties`, which says nothing about a nested property.
-    fn empty_intersection_reason(&self, schemas: &[&SchemaNode]) -> Option<&'static str> {
+    fn empty_intersection_reason(&self, schemas: &[(&str, &SchemaNode)]) -> Option<&'static str> {
         let domains = schemas
             .iter()
-            .filter_map(|schema| self.primitive_domain(schema, &mut HashSet::new()))
+            .filter_map(|(_, schema)| self.primitive_domain(schema, &mut HashSet::new()))
             .collect::<Vec<_>>();
         if domains.len() >= 2 {
             let mut intersection = domains[0].clone();
@@ -326,7 +333,7 @@ impl<'ir> CompositionAnalysis<'ir> {
 
         let finite_sets = schemas
             .iter()
-            .filter_map(|schema| self.finite_constraint(schema, &mut HashSet::new()))
+            .filter_map(|(_, schema)| self.finite_constraint(schema, &mut HashSet::new()))
             .collect::<Vec<_>>();
         if finite_sets.len() >= 2 {
             let mut intersection = finite_sets[0].clone();
@@ -340,7 +347,7 @@ impl<'ir> CompositionAnalysis<'ir> {
 
         let bounds = schemas
             .iter()
-            .filter_map(|schema| self.numeric_bounds(schema, &mut HashSet::new()))
+            .filter_map(|(_, schema)| self.numeric_bounds(schema, &mut HashSet::new()))
             .collect::<Vec<_>>();
         if let Some(combined) = bounds.into_iter().reduce(NumericBounds::intersect)
             && combined.is_empty()
