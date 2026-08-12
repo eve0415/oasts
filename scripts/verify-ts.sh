@@ -86,39 +86,43 @@ assert_no_orphan_components() {
   if [[ -f "$d/$cfg" ]] && grep -qE '^[[:space:]]*orphans:[[:space:]]*true' "$d/$cfg"; then
     return 0
   fi
-  local file names args name referencing found=0
+  # One pass over the tree collecting the file every relative import/re-export specifier
+  # actually names, resolved against the importing file's own directory. Matching the
+  # resolved path rather than the exported name is what makes this exact: a sibling artifact
+  # declares and imports the SAME component names independently — the validators tree writes
+  # its own `export interface Pet` and its operations import it — so a name-based search let
+  # a validators-tree import satisfy a types-tree component. Paths cannot collide that way,
+  # and a comment or property key that happens to spell a component name cannot match at all.
+  local referenced source specifier
+  referenced=$(grep -rhoE "from +['\"][^'\"]+['\"]" "$d"/generated* --include='*.ts' -H 2>/dev/null \
+    | while IFS= read -r hit; do
+        source=${hit%%:from *}
+        specifier=${hit##*from }
+        specifier=${specifier#[\'\"]}
+        specifier=${specifier%[\'\"]}
+        [[ $specifier == .* ]] || continue
+        printf '%s\n' "$(cd "$(dirname "$source")" 2>/dev/null && realpath -m "${specifier%.js}.ts")"
+      done | sort -u || true)
+  local file names found=0
   while IFS= read -r file; do
     mapfile -t names < <(grep -oE '^export (interface|type|const|function|declare) [A-Za-z_$][A-Za-z0-9_$]*' \
       "$file" | awk '{print $3}' | sort -u)
+    # Fail loud rather than skip. A component file with no export this recognizes means the
+    # emitter grew a declaration form the extractor does not know, and silently skipping it
+    # would retire the check for that shape without anyone noticing.
     if [[ ${#names[@]} -eq 0 ]]; then
+      echo "verify-ts: no exported name found in $file; the orphan check cannot read it" >&2
+      found=1
       continue
     fi
-    args=()
-    for name in "${names[@]}"; do
-      args+=(-e "$name")
-    done
-    # Import and re-export bindings only. A bare occurrence anywhere in the tree is too weak:
-    # a property key, a local, or a word in a TSDoc line that happens to match an exported
-    # name would mask a real orphan. Every cross-file reference in emitted output goes through
-    # one of these specifiers, so matching them is both tighter and sufficient — and a file
-    # never imports its own exports, which is why no self-exclusion is needed.
-    #
-    # -w, or `Pet` would count `PetRequest` as a reference and every orphan would look used.
-    # Collected rather than piped into `grep -q`: an early-exiting reader SIGPIPEs the
-    # producer, and under `pipefail` that reads as "no reference found" — on a big enough
-    # tree to lose the race, which made this report orphans that were not.
-    referencing=$(grep -rh --include='*.ts' '' "$d"/generated* 2>/dev/null \
-      | awk '/^[[:space:]]*(import[[:space:]{*"'"'"']|export[[:space:]]*(type[[:space:]]*)?[*{])/ { inside = 1 }
-             inside { print }
-             /;/ { inside = 0 }' \
-      | grep -wF "${args[@]}" || true)
-    if [[ -z "$referencing" ]]; then
-      if [[ " ${orphan_debt[*]} " == *" $fixture/$(basename "$file") "* ]]; then
-        continue
-      fi
-      echo "verify-ts: generated component is import-orphaned: $file (exports: ${names[*]})" >&2
-      found=1
+    if grep -qxF "$file" <<<"$referenced"; then
+      continue
     fi
+    if [[ " ${orphan_debt[*]} " == *" $fixture/$(basename "$file") "* ]]; then
+      continue
+    fi
+    echo "verify-ts: generated component is import-orphaned: $file (exports: ${names[*]})" >&2
+    found=1
   done < <(find "$d"/generated* -path '*/components/*.ts' 2>/dev/null | sort)
   return "$found"
 }

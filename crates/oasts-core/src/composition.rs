@@ -123,7 +123,8 @@ impl<'ir> CompositionAnalysis<'ir> {
     ) {
         if let SchemaNode::AllOf { branches, meta } = schema {
             let messages = self.prove_empty(branches);
-            if !messages.is_empty() {
+            let lowered = !messages.is_empty();
+            if lowered {
                 lowerings.insert(source_key(&meta.source));
             }
             diagnostics.extend(
@@ -132,14 +133,14 @@ impl<'ir> CompositionAnalysis<'ir> {
                     .map(|message| warning_diagnostic(CODE_COMPOSITION, message, &meta.source)),
             );
             // Reported beside the emptiness proofs, never lowered with them: one
-            // uninhabitable property does not make the object uninhabitable.
-            diagnostics.extend(
-                self.conflicting_properties(branches)
-                    .into_iter()
-                    .map(|message| {
-                        warning_diagnostic(CODE_CONFLICTING_PROPERTY, message, &meta.source)
-                    }),
-            );
+            // uninhabitable property does not make the object uninhabitable. Skipped
+            // entirely once the node is being replaced by `never`, where a warning about a
+            // property would describe a type the output no longer contains.
+            if !lowered {
+                diagnostics.extend(self.conflicting_properties(branches).into_iter().map(
+                    |message| warning_diagnostic(CODE_CONFLICTING_PROPERTY, message, &meta.source),
+                ));
+            }
         }
         match schema {
             SchemaNode::Object {
@@ -185,45 +186,67 @@ impl<'ir> CompositionAnalysis<'ir> {
         }
     }
 
-    fn prove_empty(&self, branches: &[SchemaNode]) -> Vec<String> {
-        let mut messages = Vec::new();
-        let domains = branches
+    /// The three domain proofs shared by the whole-branch emptiness check and the
+    /// per-property conflict check. They differ only in `min_contributors`: proving a node
+    /// empty accepts a single self-contradictory branch, while calling two branches'
+    /// declarations of one property a disagreement needs two of them to actually say
+    /// something, or the message names a cause that is not there.
+    fn empty_domain_reasons(
+        &self,
+        schemas: &[&SchemaNode],
+        min_contributors: usize,
+    ) -> Vec<&'static str> {
+        let mut reasons = Vec::new();
+        let domains = schemas
             .iter()
-            .filter_map(|branch| self.primitive_domain(branch, &mut HashSet::new()))
+            .filter_map(|schema| self.primitive_domain(schema, &mut HashSet::new()))
             .collect::<Vec<_>>();
-        if domains.len() >= 2 {
+        if domains.len() >= min_contributors.max(2) {
             let mut intersection = domains[0].clone();
             for domain in &domains[1..] {
                 intersection.retain(|atom| domain.contains(atom));
             }
             if intersection.is_empty() {
-                messages.push("allOf has disjoint primitive type sets".to_owned());
+                reasons.push("disjoint primitive type sets");
             }
         }
 
-        let finite_sets = branches
+        let finite_sets = schemas
             .iter()
-            .filter_map(|branch| self.finite_constraint(branch, &mut HashSet::new()))
+            .filter_map(|schema| self.finite_constraint(schema, &mut HashSet::new()))
             .collect::<Vec<_>>();
-        if finite_sets.len() >= 2 {
+        if finite_sets.len() >= min_contributors.max(2) {
             let mut intersection = finite_sets[0].clone();
             for values in &finite_sets[1..] {
                 intersection.retain(|value| values.iter().any(|other| json_equal(value, other)));
             }
             if intersection.is_empty() {
-                messages.push("allOf has incompatible const or finite-enum constraints".to_owned());
+                reasons.push("incompatible const or finite-enum constraints");
             }
         }
 
-        let bounds = branches
+        let bounds = schemas
             .iter()
-            .filter_map(|branch| self.numeric_bounds(branch, &mut HashSet::new()))
+            .filter_map(|schema| self.numeric_bounds(schema, &mut HashSet::new()))
             .collect::<Vec<_>>();
-        if let Some(combined) = bounds.into_iter().reduce(NumericBounds::intersect)
+        if bounds.len() >= min_contributors
+            && let Some(combined) = bounds.into_iter().reduce(NumericBounds::intersect)
             && combined.is_empty()
         {
-            messages.push("allOf has an empty numeric interval".to_owned());
+            reasons.push("an empty numeric interval");
         }
+        reasons
+    }
+
+    fn prove_empty(&self, branches: &[SchemaNode]) -> Vec<String> {
+        let schemas = branches.iter().collect::<Vec<_>>();
+        // One contributor is enough here: a lone branch whose own bounds cannot hold empties
+        // the whole node, and there is no other branch to misattribute it to.
+        let mut messages = self
+            .empty_domain_reasons(&schemas, 1)
+            .into_iter()
+            .map(|reason| format!("allOf has {reason}"))
+            .collect::<Vec<_>>();
 
         let objects = branches
             .iter()
@@ -265,8 +288,8 @@ impl<'ir> CompositionAnalysis<'ir> {
     /// and letting the whole node re-render; identity-first joins the branches with `&`
     /// instead, so the conflict survives into TypeScript as a property silently typed
     /// `never`. Inequality alone is not a conflict — narrowing a base's property is what
-    /// `allOf` is for — so this reuses the same three domain proofs `prove_empty` applies to
-    /// whole branches, one property at a time.
+    /// `allOf` is for — so this reuses the domain proofs `prove_empty` applies to whole
+    /// branches, one property at a time.
     fn conflicting_properties(&self, branches: &[SchemaNode]) -> Vec<String> {
         let mut messages = Vec::new();
         // Two branches are the minimum that can declare one property twice. Checked before
@@ -278,17 +301,14 @@ impl<'ir> CompositionAnalysis<'ir> {
         // One flat buffer of every declaration rather than a map of per-name vectors: this
         // runs on every `allOf` node in the document, and a container per property name is
         // the allocation that shows up when a document has thousands of them. `Vec::new`
-        // does not allocate, so branches that resolve to no object stay free.
+        // does not allocate, so branches that contribute no object stay free.
         let mut declared: Vec<(&str, &SchemaNode)> = Vec::new();
+        // Shared across the whole collection so a `$ref` is followed once: it stops
+        // `A: allOf[$ref A]` from recursing, and a component reached twice contributes the
+        // same declarations both times anyway.
+        let mut visited = HashSet::new();
         for branch in branches {
-            let Some(SchemaNode::Object { properties, .. }) =
-                self.resolve_ref(branch, &mut HashSet::new())
-            else {
-                continue;
-            };
-            for (name, schema, _) in properties {
-                declared.push((name.as_str(), schema));
-            }
+            self.collect_declarations(branch, &mut visited, &mut declared);
         }
         // Sorting groups the repeats and fixes the report order by property name. The sort is
         // stable, so declarations of one name stay in branch order for the domain tests.
@@ -300,61 +320,47 @@ impl<'ir> CompositionAnalysis<'ir> {
                 end += 1;
             }
             let group = &declared[start..end];
-            if group.len() >= 2
-                && let Some(reason) = self.empty_intersection_reason(group)
-            {
-                let name = group[0].0;
-                messages.push(format!(
-                    "allOf branches declare property '{name}' with {reason}; the branches intersect, so the property is uninhabitable"
-                ));
+            if group.len() >= 2 {
+                let schemas = group.iter().map(|(_, schema)| *schema).collect::<Vec<_>>();
+                if let Some(reason) = self.empty_domain_reasons(&schemas, 2).first() {
+                    let name = group[0].0;
+                    messages.push(format!(
+                        "allOf branches declare property '{name}' with {reason}; the branches intersect, so the property is uninhabitable"
+                    ));
+                }
             }
             start = end;
         }
         messages
     }
 
-    /// The three whole-domain proofs `prove_empty` runs, applied to one property's schemas.
-    /// The closed-object rule is deliberately absent: it is about a branch's own
-    /// `additionalProperties`, which says nothing about a nested property.
-    fn empty_intersection_reason(&self, schemas: &[(&str, &SchemaNode)]) -> Option<&'static str> {
-        let domains = schemas
-            .iter()
-            .filter_map(|(_, schema)| self.primitive_domain(schema, &mut HashSet::new()))
-            .collect::<Vec<_>>();
-        if domains.len() >= 2 {
-            let mut intersection = domains[0].clone();
-            for domain in &domains[1..] {
-                intersection.retain(|atom| domain.contains(atom));
+    /// Every property one branch contributes, seen through `$ref`s and through a nested
+    /// `allOf`. The nesting matters: a component that is itself an `allOf` — a base extended
+    /// once, then extended again — is the shape that most often reaches emission as
+    /// `Name & { … }`, so a branch that resolved to one could not be skipped as "not an
+    /// object" without blinding the check to its most common case.
+    fn collect_declarations<'a>(
+        &'a self,
+        branch: &'a SchemaNode,
+        visited: &mut HashSet<(&'a str, &'a str)>,
+        declared: &mut Vec<(&'a str, &'a SchemaNode)>,
+    ) {
+        let Some(resolved) = self.resolve_ref(branch, visited) else {
+            return;
+        };
+        match resolved {
+            SchemaNode::Object { properties, .. } => {
+                for (name, schema, _) in properties {
+                    declared.push((name.as_str(), schema));
+                }
             }
-            if intersection.is_empty() {
-                return Some("disjoint primitive type sets");
+            SchemaNode::AllOf { branches, .. } => {
+                for nested in branches {
+                    self.collect_declarations(nested, visited, declared);
+                }
             }
+            _ => {}
         }
-
-        let finite_sets = schemas
-            .iter()
-            .filter_map(|(_, schema)| self.finite_constraint(schema, &mut HashSet::new()))
-            .collect::<Vec<_>>();
-        if finite_sets.len() >= 2 {
-            let mut intersection = finite_sets[0].clone();
-            for values in &finite_sets[1..] {
-                intersection.retain(|value| values.iter().any(|other| json_equal(value, other)));
-            }
-            if intersection.is_empty() {
-                return Some("incompatible const or finite-enum constraints");
-            }
-        }
-
-        let bounds = schemas
-            .iter()
-            .filter_map(|(_, schema)| self.numeric_bounds(schema, &mut HashSet::new()))
-            .collect::<Vec<_>>();
-        if let Some(combined) = bounds.into_iter().reduce(NumericBounds::intersect)
-            && combined.is_empty()
-        {
-            return Some("an empty numeric interval");
-        }
-        None
     }
 
     fn resolve_ref<'a>(

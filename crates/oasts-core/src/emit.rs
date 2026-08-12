@@ -1845,11 +1845,18 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     if rendered == "unknown" {
                         continue;
                     }
-                    members.push(if from_merge {
+                    let member = if from_merge {
                         rendered
                     } else {
                         parenthesize_intersection_member(rendered, branch)
-                    });
+                    };
+                    // `A & A` is `A` spelled twice, and the merge used to fold a repeated
+                    // branch away. Linear membership for the same reason the union arm below
+                    // uses it: an intersection carries a handful of members, and a set would
+                    // clone every rendered member to own its key.
+                    if !members.contains(&member) {
+                        members.push(member);
+                    }
                 }
                 if members.is_empty() {
                     "unknown".to_owned()
@@ -7901,6 +7908,102 @@ mod tests {
                 && mixed.contains("c?: string;"),
             "{mixed}"
         );
+    }
+
+    #[test]
+    fn conflicting_property_is_seen_through_a_nested_all_of() {
+        // The discriminator idiom composed twice: a component that is itself an `allOf` is
+        // the shape most likely to reach TypeScript as `X & { … }`, so a conflict introduced
+        // at the second level is exactly the one the warning has to see. Resolving a branch
+        // one `$ref` deep and requiring a plain object misses it.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Base": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string" } } },
+                "Cat": { "allOf": [
+                    { "$ref": "#/components/schemas/Base" },
+                    { "type": "object", "properties": { "kind": { "type": "string", "const": "cat" } } }
+                ] },
+                "Hybrid": { "allOf": [
+                    { "$ref": "#/components/schemas/Cat" },
+                    { "type": "object", "properties": { "kind": { "type": "string", "const": "dog" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        let flagged = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
+            .collect::<Vec<_>>();
+        assert_eq!(flagged.len(), 1, "{diagnostics:?}");
+        assert!(flagged[0].message.contains("kind"), "{:?}", flagged[0]);
+    }
+
+    #[test]
+    fn a_single_self_contradictory_branch_is_not_a_property_conflict() {
+        // One branch declaring `n` with minimum above maximum empties the whole node, which
+        // is OASTS1303's job. Reporting it as branches disagreeing about `n` names a cause
+        // that is not there — there is only one declaration of `n`.
+        let (_files, diagnostics) = compile(
+            openapi(json!({
+                "Solo": { "allOf": [
+                    { "type": "object", "properties": { "n": { "type": "number", "minimum": 5, "maximum": 4 } } },
+                    { "type": "object", "properties": { "n": { "description": "no constraints of its own" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        let flagged = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
+            .count();
+        assert_eq!(flagged, 0, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_node_lowered_to_never_reports_no_property_conflict() {
+        // The node is replaced by `never`, so a warning about a property inside it describes
+        // a type the output does not contain.
+        let (files, diagnostics) = compile(
+            openapi(json!({
+                "Lowered": { "allOf": [
+                    { "type": "object", "additionalProperties": false, "required": ["a"],
+                      "properties": { "a": { "type": "string" } } },
+                    { "type": "object", "required": ["b"],
+                      "properties": { "a": { "type": "number" }, "b": { "type": "string" } } }
+                ] }
+            })),
+            json!({}),
+        );
+        let lowered = schema_file(&files, "lowered");
+        assert!(
+            lowered.content.contains("export type Lowered = never;"),
+            "{}",
+            lowered.content
+        );
+        let flagged = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_CONFLICTING_PROPERTY)
+            .count();
+        assert_eq!(flagged, 0, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn a_repeated_all_of_ref_renders_once() {
+        // The merge used to fold a repeated branch into one shape. Joining members without
+        // deduplicating turns that into `Base & Base`, which is the same type spelled twice —
+        // the union arm has always deduplicated its branches for the same reason.
+        let (files, _diagnostics) = compile(
+            openapi(json!({
+                "Base": { "type": "object", "required": ["a"], "properties": { "a": { "type": "string" } } },
+                "Twice": { "allOf": [
+                    { "$ref": "#/components/schemas/Base" },
+                    { "$ref": "#/components/schemas/Base" }
+                ] }
+            })),
+            json!({}),
+        );
+        let twice = generated_body(schema_file(&files, "twice")).to_owned();
+        assert!(twice.contains("export type Twice = Base;"), "{twice}");
     }
 
     #[test]
