@@ -1488,7 +1488,7 @@ fn operation_input_schema(
         let required = resolved.iter().any(|(_, required)| *required);
         let group_properties = resolved
             .into_iter()
-            .filter(|(parameter, _)| !parameter.caller_serialized)
+            .filter(|(parameter, _)| super::client::parameter_transforms(emitter.model, parameter))
             .map(|(parameter, required)| {
                 (
                     parameter.name.clone(),
@@ -1511,7 +1511,7 @@ fn operation_input_schema(
     {
         properties.push((
             "body".to_owned(),
-            request_body_schema(body_plan, operation.source.clone()),
+            request_body_schema(emitter, body_plan, operation.source.clone()),
             operation_property(
                 operation
                     .request_body
@@ -1524,7 +1524,11 @@ fn operation_input_schema(
 }
 
 /// The request body's rendered client shape, restricted to body plans the encoder can bind.
-fn request_body_schema(plan: &BodyPlan, source: SourceRef) -> SchemaNode {
+fn request_body_schema(
+    emitter: &Emitter<'_, '_, '_>,
+    plan: &BodyPlan,
+    source: SourceRef,
+) -> SchemaNode {
     match plan {
         BodyPlan::Json {
             schema: Some(schema),
@@ -1542,6 +1546,7 @@ fn request_body_schema(plan: &BodyPlan, source: SourceRef) -> SchemaNode {
         } => object_schema(
             fields
                 .iter()
+                .filter(|field| super::client::form_field_transforms(emitter.model, field))
                 .map(|field| {
                     (
                         field.name.clone(),
@@ -1576,7 +1581,7 @@ fn request_body_schema(plan: &BodyPlan, source: SourceRef) -> SchemaNode {
                             ),
                             (
                                 "body".to_owned(),
-                                request_body_schema(&arm.plan, arm_source.clone()),
+                                request_body_schema(emitter, &arm.plan, arm_source.clone()),
                                 operation_property(true),
                             ),
                         ],
@@ -5762,11 +5767,15 @@ mod operation_pair_tests {
     use serde_json::{Value, json};
 
     use super::tests::compile_document;
-    use crate::config::{DateTimeRepresentation, ResolvedConfig};
+    use crate::config::{DateTimeRepresentation, IntegerRepresentation, ResolvedConfig};
     use crate::emit::GeneratedFile;
 
     fn date_mode(config: &mut ResolvedConfig) {
         config.types.date_time = DateTimeRepresentation::Date;
+    }
+
+    fn bigint_mode(config: &mut ResolvedConfig) {
+        config.types.integer = IntegerRepresentation::Bigint;
     }
 
     fn operation_document(operation: Value, schemas: Value) -> Value {
@@ -6580,6 +6589,60 @@ mod operation_pair_tests {
             "{content}"
         );
         assert!(content.contains("export function encodeReadEventInput(value: ReadEventInput, path: ApplicationPath = []): ReadEventInputWire"), "{content}");
+    }
+
+    #[test]
+    fn integer_bigint_flat_parameters_stay_bigint_while_content_json_encodes() {
+        let (files, diagnostics, has_errors) = compile_document(
+            json!({
+                "openapi": "3.1.0",
+                "info": { "title": "t", "version": "1" },
+                "paths": {
+                    "/counters/{id}": {
+                        "get": {
+                            "operationId": "readCounter",
+                            "parameters": [
+                                {
+                                    "name": "id",
+                                    "in": "path",
+                                    "required": true,
+                                    "schema": { "type": "integer", "format": "int64" }
+                                },
+                                {
+                                    "name": "filter",
+                                    "in": "query",
+                                    "required": true,
+                                    "content": {
+                                        "application/json": {
+                                            "schema": { "type": "integer", "format": "int64" }
+                                        }
+                                    }
+                                }
+                            ],
+                            "responses": { "204": { "description": "done" } }
+                        }
+                    }
+                }
+            }),
+            bigint_mode,
+        );
+        assert!(!has_errors, "{diagnostics:#?}");
+        let client = files
+            .iter()
+            .find(|file| file.relative_path == "client/operations/readcounter.ts")
+            .expect("client operation");
+        assert!(client.content.contains("id: bigint;"), "{}", client.content);
+        assert!(
+            client.content.contains("filter: bigint;"),
+            "{}",
+            client.content
+        );
+        let content = operation_module(&files, "readcounter").expect("operation codec");
+        assert!(
+            content.contains("encodeInt64(value.query.filter"),
+            "{content}"
+        );
+        assert!(!content.contains("encodeInt64(value.path.id"), "{content}");
     }
 
     #[test]

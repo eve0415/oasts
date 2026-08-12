@@ -26,6 +26,7 @@ import {
   serializeQuerySpaceDelimited,
   serializeQuerySpaceDelimitedObject,
 } from "../serialize.ts";
+import { encodeInt64 } from "../transform-runtime.ts";
 import { MEDIA_VECTORS } from "./vectors-media.ts";
 import {
   STYLE_VECTORS,
@@ -113,6 +114,15 @@ describe("content JSON serialization", () => {
     assert.equal(
       serializeContentJsonQuery("filter", { tags: ["a", "b"] }, false),
       "filter=%7B%22tags%22%3A%5B%22a%22%2C%22b%22%5D%7D",
+    );
+  });
+
+  test("carries a transformed int64 as exact JSON digits", () => {
+    const pointer = { logicalSourceId: "openapi.yaml", jsonPointer: "/parameters/filter" };
+    const id = encodeInt64(12345678901234567890n, pointer, ["query", "filter"]);
+    assert.equal(
+      serializeContentJsonQuery("filter", { id }, false),
+      "filter=%7B%22id%22%3A12345678901234567890%7D",
     );
   });
 

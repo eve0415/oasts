@@ -857,7 +857,10 @@ function serializeSelectedAuth(
 }
 
 function isParamPrimitive(value: unknown): value is ParamPrimitive {
-  return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+  return typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    typeof value === 'bigint';
 }
 
 function isParamValue(value: unknown): value is ParamValue {
@@ -1251,10 +1254,10 @@ async function multipartPayload(kind: MultipartFieldPlan['payload'], value: unkn
     throw new TypeError('binary multipart fields require Uint8Array, Blob, or File');
   }
   if (kind === 'text') {
-    if (typeof value !== 'string') {
-      throw new TypeError('text multipart fields require a string');
+    if (typeof value !== 'string' && typeof value !== 'bigint') {
+      throw new TypeError('text multipart fields require a string or bigint');
     }
-    return UTF8_ENCODER.encode(value);
+    return UTF8_ENCODER.encode(String(value));
   }
   const json = JSON.stringify(value);
   if (json === undefined) {

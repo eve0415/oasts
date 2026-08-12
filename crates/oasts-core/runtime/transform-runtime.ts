@@ -134,14 +134,14 @@ function applicationFailure(
 
 /** Decodes an int64 wire number without losing a digit. */
 export function decodeInt64(
-  value: number | bigint,
+  value: number | bigint | RawJson,
   pointer: SourcePointer,
   path: ApplicationPath,
 ): bigint {
   if (typeof value === "bigint") {
     return value;
   }
-  if (!Number.isSafeInteger(value)) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
     throw wireFailure(value, pointer, path);
   }
   return BigInt(value);

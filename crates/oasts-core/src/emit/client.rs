@@ -1084,9 +1084,34 @@ pub(super) fn request_transform_binding(
     if !model.transform_facts().enabled() {
         return false;
     }
-    plan.param_plans.iter().any(|parameter| {
-        !parameter.caller_serialized && model.transform_facts().reaches(&parameter.schema)
-    }) || request_body_transforms(model, plan.body_plan.as_ref())
+    plan.param_plans
+        .iter()
+        .any(|parameter| parameter_transforms(model, parameter))
+        || request_body_transforms(model, plan.body_plan.as_ref())
+}
+
+fn reaches_non_integer_transform(model: &EmissionModel<'_, '_>, schema: &SchemaNode) -> bool {
+    [
+        TransformKind::DateTimeDate,
+        TransformKind::DateTimeInstant,
+        TransformKind::DatePlainDate,
+    ]
+    .into_iter()
+    .any(|kind| model.transform_facts().reaches_kind(schema, kind))
+}
+
+pub(super) fn parameter_transforms(
+    model: &EmissionModel<'_, '_>,
+    parameter: &ParameterPlan,
+) -> bool {
+    if parameter.caller_serialized {
+        return false;
+    }
+    if parameter.resolved.helper.is_content_json() {
+        model.transform_facts().reaches(&parameter.schema)
+    } else {
+        reaches_non_integer_transform(model, &parameter.schema)
+    }
 }
 
 /// Whether a request body carries an application value the operation encoder converts.
@@ -1113,7 +1138,20 @@ pub(super) fn request_body_transforms(
 
 /// Whether one rendered form field carries its schema value rather than a binary upload handle.
 pub(super) fn form_field_transforms(model: &EmissionModel<'_, '_>, field: &FormFieldPlan) -> bool {
-    !field.is_binary_upload() && model.transform_facts().reaches(&field.schema)
+    if field.is_binary_upload() {
+        return false;
+    }
+    let int64_needs_raw_json = field.serialization.content_media().is_some_and(|media| {
+        media
+            .payloads
+            .iter()
+            .all(|payload| *payload == PayloadKind::Json)
+    });
+    if int64_needs_raw_json {
+        model.transform_facts().reaches(&field.schema)
+    } else {
+        reaches_non_integer_transform(model, &field.schema)
+    }
 }
 
 fn response_transform_bindings(
@@ -2129,10 +2167,17 @@ fn render_input(
                 // pre-serialized wire string rather than the declared schema (OASTS1443).
                 output.push_str("string");
             } else {
+                let parameter_axis = if axis == TypeAxis::Wire
+                    && !parameter_transforms(renderer.model, parameter_plan)
+                {
+                    TypeAxis::Application
+                } else {
+                    axis
+                };
                 output.push_str(&renderer.render_type(
                     &parameter_plan.schema,
                     TypePosition::Request,
-                    axis,
+                    parameter_axis,
                     4,
                 ));
             }
@@ -2308,12 +2353,17 @@ fn render_form_field_input(
     indent: usize,
     axis: TypeAxis,
 ) -> String {
+    let field_axis = if axis == TypeAxis::Wire && !form_field_transforms(renderer.model, field) {
+        TypeAxis::Application
+    } else {
+        axis
+    };
     let body = match &field.serialization {
         FieldSerializationPlan::Content { media, .. } if media.binary_upload => {
             "Blob | File".to_owned()
         }
         FieldSerializationPlan::Style { .. } | FieldSerializationPlan::Content { .. } => {
-            renderer.render_type(&field.schema, TypePosition::Request, axis, indent)
+            renderer.render_type(&field.schema, TypePosition::Request, field_axis, indent)
         }
     };
     if !field.wrapper.wrapped {

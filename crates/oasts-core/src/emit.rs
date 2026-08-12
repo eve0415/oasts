@@ -1813,10 +1813,16 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         // the runtime type, the wire surface keeps the `string` the JSON actually carries. The site
         // predicate already excludes a formatted string carrying an `enum`/`const`, so a literal
         // union stays the literal union it is.
-        if axis == TypeAxis::Application
-            && let Some(kind) = self.model.transform_facts().site(schema)
-        {
-            return add_nullable(kind.ts_type().to_owned(), schema);
+        if let Some(kind) = self.model.transform_facts().site(schema) {
+            if axis == TypeAxis::Application {
+                return add_nullable(kind.ts_type().to_owned(), schema);
+            }
+            if kind == crate::transform::TransformKind::IntegerBigInt {
+                return add_nullable(
+                    "number | bigint | { readonly rawJSON: string }".to_owned(),
+                    schema,
+                );
+            }
         }
         let rendered = match schema {
             SchemaNode::Ref { target, .. } => self
