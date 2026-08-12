@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use crate::client_model::{
     BodyPlan, ClientModel, FormFieldPlan, MultipartResponsePayload, OperationPlan,
-    PayloadDisposition, ResponseMediaPlan,
+    PayloadDisposition, PayloadKind, ResponseMediaPlan,
 };
 use crate::diag::Diagnostic;
 use crate::ir::{
@@ -681,22 +681,51 @@ fn body_transform_refusals(
     plan: Option<&BodyPlan>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if let Some(BodyPlan::ContentTypeDiscriminated { arms, all_concrete }) = plan {
-        if !all_concrete
-            && arms.len() > 1
-            && let Some(arm) = arms
-                .iter()
-                .find(|arm| super::client::request_body_transforms(model, Some(&arm.plan)))
-        {
-            diagnostics.push(source_diagnostic(
-                CODE_UNCONVERTIBLE_TRANSFORM,
-                "a content-type-discriminated request body mixes media ranges with multiple arms, so its string contentType cannot select one date/time conversion; use concrete media types, or set the representation back to string",
-                &arm.source,
-            ));
+    match plan {
+        Some(BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. }) => {
+            for field in fields {
+                let mixes_json_and_non_json =
+                    field.serialization.content_media().is_some_and(|media| {
+                        media.payloads.contains(&PayloadKind::Json)
+                            && media
+                                .payloads
+                                .iter()
+                                .any(|payload| *payload != PayloadKind::Json)
+                    });
+                if mixes_json_and_non_json
+                    && model
+                        .transform_facts()
+                        .reaches_kind(&field.schema, TransformKind::IntegerBigInt)
+                {
+                    diagnostics.push(source_diagnostic(
+                        CODE_UNCONVERTIBLE_TRANSFORM,
+                        format!(
+                            "form field '{}' mixes JSON and non-JSON media while its schema applies an int64 transform, so no single field encoder can preserve both payloads; split the field media, or set the integer representation back to number",
+                            field.name,
+                        ),
+                        &field.source,
+                    ));
+                }
+            }
         }
-        for arm in arms {
-            body_transform_refusals(model, Some(&arm.plan), diagnostics);
+        Some(BodyPlan::ContentTypeDiscriminated { arms, all_concrete }) => {
+            if !all_concrete
+                && arms.len() > 1
+                && let Some(arm) = arms
+                    .iter()
+                    .find(|arm| super::client::request_body_transforms(model, Some(&arm.plan)))
+            {
+                diagnostics.push(source_diagnostic(
+                    CODE_UNCONVERTIBLE_TRANSFORM,
+                    "a content-type-discriminated request body mixes media ranges with multiple arms, so its string contentType cannot select one date/time conversion; use concrete media types, or set the representation back to string",
+                    &arm.source,
+                ));
+            }
+            for arm in arms {
+                body_transform_refusals(model, Some(&arm.plan), diagnostics);
+            }
         }
+        _ => {}
     }
 }
 
@@ -6117,6 +6146,50 @@ mod operation_pair_tests {
             "{content}"
         );
         assert!(!content.contains("value.body.label"), "{content}");
+    }
+
+    #[test]
+    fn a_bigint_content_field_mixing_json_and_text_is_refused() {
+        for body_media in ["application/x-www-form-urlencoded", "multipart/form-data"] {
+            let (_files, diagnostics, has_errors) = compile_document(
+                operation_document(
+                    json!({
+                        "operationId": "submitMixedCounter",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                (body_media): {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["id"],
+                                        "properties": {
+                                            "id": { "type": "integer", "format": "int64" }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "id": { "contentType": "application/json, text/plain" }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }),
+                    json!({}),
+                ),
+                date_and_bigint_mode,
+            );
+
+            assert!(has_errors, "{body_media}: {diagnostics:#?}");
+            assert_eq!(
+                refused(&diagnostics).len(),
+                1,
+                "{body_media}: {diagnostics:#?}"
+            );
+            assert!(
+                refused(&diagnostics)[0].contains("mixes JSON and non-JSON media"),
+                "{body_media}: {diagnostics:#?}"
+            );
+        }
     }
 
     #[test]
