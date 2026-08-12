@@ -156,6 +156,23 @@ describe("integer: bigint", () => {
     assert.equal(decodeInt64(12345678901234567890n, POINTER, PATH), 12345678901234567890n);
   });
 
+  test("decodes the raw JSON token produced by the encoder", () => {
+    for (const value of [42n, 12345678901234567890n]) {
+      assert.equal(decodeInt64(encodeInt64(value, POINTER, PATH), POINTER, PATH), value);
+    }
+  });
+
+  test("rejects malformed raw JSON values", () => {
+    for (const value of [null, {}, { rawJSON: "01" }, { rawJSON: "1.5" }, { rawJSON: "1e3" }]) {
+      assertRejects(
+        () => Reflect.apply(decodeInt64, undefined, [value, POINTER, PATH]),
+        "invalid-wire-value",
+        "response",
+        "malformed raw JSON value",
+      );
+    }
+  });
+
   test("rejects a rounded wire number", () => {
     assertRejects(
       () => decodeInt64(Number.MAX_SAFE_INTEGER + 1, POINTER, PATH),

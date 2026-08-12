@@ -160,6 +160,8 @@ function applicationFailure(
   });
 }
 
+const INT64_WIRE_INTEGER = /^-?(?:0|[1-9]\d*)$/;
+
 /** Decodes an int64 wire number without losing a digit. */
 export function decodeInt64(
   value: number | bigint | RawJson,
@@ -168,6 +170,13 @@ export function decodeInt64(
 ): bigint {
   if (typeof value === "bigint") {
     return value;
+  }
+  if (typeof value === "object" && value !== null) {
+    const token = Reflect.get(value, "rawJSON");
+    if (typeof token === "string" && INT64_WIRE_INTEGER.test(token)) {
+      return BigInt(token);
+    }
+    throw wireFailure(value, pointer, path);
   }
   if (typeof value !== "number" || !Number.isSafeInteger(value)) {
     throw wireFailure(value, pointer, path);
