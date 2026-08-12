@@ -651,12 +651,12 @@ fn unconvertible_transform_diagnostics(
                     &entry.source,
                 ));
             }
-            if multipart_response_entry_transforms(model, entry) {
+            if let Some((transforms, advice)) = multipart_response_transform_terms(model, entry) {
                 diagnostics.push(source_diagnostic(
                     CODE_UNCONVERTIBLE_TRANSFORM,
                     format!(
-                        "response '{}' entry '{}' applies a date/time transform, but its payload is the object its parts decode to rather than the shape its schema renders, and no emitted codec converts that object; set the representation back to string",
-                        response.match_key, entry.media,
+                        "response '{}' entry '{}' applies {transforms}, but its payload is the object its parts decode to rather than the shape its schema renders, and no emitted codec converts that object; {advice}",
+                        response.match_key, entry.media
                     ),
                     &entry.source,
                 ));
@@ -672,22 +672,39 @@ fn unconvertible_transform_diagnostics(
 /// `contentType`. A multipart payload is the object its parts decode to, which is not what any
 /// schema renders, so no pair names it. Binary parts render `Uint8Array` and never reach their
 /// schema, so they cannot put a wire string behind a `Date` either.
-fn multipart_response_entry_transforms(
+fn multipart_response_transform_terms(
     model: &EmissionModel<'_, '_>,
     entry: &ResponseMediaPlan,
-) -> bool {
+) -> Option<(String, String)> {
     let Some(multipart) = &entry.multipart else {
-        return false;
+        return None;
     };
-    multipart
+    let shapes = multipart
         .parts
         .iter()
         .map(|part| &part.shape)
         .chain(multipart.open.then_some(&multipart.additional))
-        .any(|shape| {
-            shape.payload != MultipartResponsePayload::Binary
-                && model.transform_facts().reaches(&shape.schema)
-        })
+        .filter(|shape| shape.payload != MultipartResponsePayload::Binary)
+        .collect::<Vec<_>>();
+    let date_time = shapes
+        .iter()
+        .any(|shape| super::client::reaches_non_integer_transform(model, &shape.schema));
+    let int64 = shapes.iter().any(|shape| {
+        model
+            .transform_facts()
+            .reaches_kind(&shape.schema, TransformKind::IntegerBigInt)
+    });
+    let mut transforms = Vec::new();
+    let mut advice = Vec::new();
+    if date_time {
+        transforms.push("a date/time transform");
+        advice.push("set the representation back to string");
+    }
+    if int64 {
+        transforms.push("an int64 transform");
+        advice.push("set the integer representation back to number");
+    }
+    (!transforms.is_empty()).then(|| (transforms.join(" and "), advice.join(" and ")))
 }
 
 fn body_transform_refusals(
@@ -6738,6 +6755,46 @@ mod operation_pair_tests {
             refused(&diagnostics),
             [
                 "response '200' entry 'multipart/form-data' applies a date/time transform, but its payload is the object its parts decode to rather than the shape its schema renders, and no emitted codec converts that object; set the representation back to string"
+            ],
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn a_bigint_multipart_response_refusal_gives_integer_advice() {
+        let (_files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "downloadCounter",
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "counter": {
+                                                "type": "integer",
+                                                "format": "int64"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+                json!({}),
+            ),
+            bigint_mode,
+        );
+
+        assert!(has_errors, "{diagnostics:#?}");
+        assert_eq!(
+            refused(&diagnostics),
+            [
+                "response '200' entry 'multipart/form-data' applies an int64 transform, but its payload is the object its parts decode to rather than the shape its schema renders, and no emitted codec converts that object; set the integer representation back to number"
             ],
             "{diagnostics:#?}"
         );
