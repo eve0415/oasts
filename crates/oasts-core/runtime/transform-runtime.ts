@@ -16,6 +16,17 @@
 
 import { type ApplicationPath, type SourcePointer, TransformError } from "./result.ts";
 
+type RawJson = Readonly<{ rawJSON: string }>;
+
+declare global {
+  interface JSON {
+    rawJSON?: (text: string) => RawJson;
+  }
+}
+
+// Captured once: a missing API is a runtime capability, not a value-by-value decision.
+const rawJson = typeof JSON.rawJSON === "function" ? JSON.rawJSON : null;
+
 /** Extend a path without mutating the parent, so each nested transform forks its own child path. */
 export function pushPath(path: ApplicationPath, key: string | number): ApplicationPath {
   return [...path, key];
@@ -119,6 +130,40 @@ function applicationFailure(
     applicationPath: path,
     cause: value,
   });
+}
+
+/** Decodes an int64 wire number without losing a digit. */
+export function decodeInt64(
+  value: number | bigint,
+  pointer: SourcePointer,
+  path: ApplicationPath,
+): bigint {
+  if (typeof value === "bigint") {
+    return value;
+  }
+  if (!Number.isSafeInteger(value)) {
+    throw wireFailure(value, pointer, path);
+  }
+  return BigInt(value);
+}
+
+/** Encodes an int64 bigint as exact unquoted JSON digits where the runtime supports raw JSON. */
+export function encodeInt64(
+  value: bigint,
+  pointer: SourcePointer,
+  path: ApplicationPath,
+): RawJson | number {
+  if (typeof value !== "bigint") {
+    throw applicationFailure(value, pointer, path);
+  }
+  if (rawJson !== null) {
+    return rawJson(String(value));
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number)) {
+    throw applicationFailure(value, pointer, path);
+  }
+  return number;
 }
 
 function temporalFailure(

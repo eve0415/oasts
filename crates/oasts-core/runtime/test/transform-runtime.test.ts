@@ -5,10 +5,12 @@ import { describe, test } from "node:test";
 import { TransformError } from "../result.ts";
 import {
   decodeDateTimeDate,
+  decodeInt64,
   guarded,
   decodeInstant,
   decodePlainDate,
   encodeDateTimeDate,
+  encodeInt64,
   encodeInstant,
   encodePlainDate,
   isInstant,
@@ -104,6 +106,21 @@ describe("omit", () => {
     const result = omit(source, "b");
     assert.deepEqual(result, { a: 1 });
     assert.equal("b" in result, false);
+  });
+});
+
+describe("integer: bigint", () => {
+  test("decodes every lossless wire shape to bigint", () => {
+    assert.equal(decodeInt64(42, POINTER, PATH), 42n);
+    assert.equal(decodeInt64(12345678901234567890n, POINTER, PATH), 12345678901234567890n);
+  });
+
+  test("encodes exact unquoted digits at any JSON depth", () => {
+    const encoded = encodeInt64(12345678901234567890n, POINTER, PATH);
+    assert.equal(
+      JSON.stringify({ outer: { list: [encoded, 7] } }),
+      '{"outer":{"list":[12345678901234567890,7]}}',
+    );
   });
 });
 
