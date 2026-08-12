@@ -3047,7 +3047,8 @@ fn write_descriptor(
                                 && check.media_index == media_index
                         })
                         .map(|check| check.function.as_str());
-                    let lossless_int64 = media.decoder == DecoderClass::Json
+                    let lossless_int64 = !bodyless
+                        && media.decoder == DecoderClass::Json
                         && model
                             .transform_facts()
                             .reaches_kind(&media.schema, TransformKind::IntegerBigInt);
@@ -4235,6 +4236,47 @@ mod tests {
         assert!(
             date.contains("media: [[\"application/json\", \"json\"]]"),
             "{date}"
+        );
+    }
+
+    #[test]
+    fn a_bodyless_int64_json_response_does_not_bind_a_reviver() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "T", "version": "1.0.0" },
+            "paths": {
+                "/counters": {
+                    "get": {
+                        "operationId": "readCounter",
+                        "responses": {
+                            "204": {
+                                "description": "empty",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "integer", "format": "int64" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) =
+            emit_files_with_types(document, false, json!({ "integer": "bigint" }));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            ["OASTS1406"]
+        );
+        let operation = operation_file(&files, "readcounter");
+        assert!(
+            operation.contains(
+                "bodyless: true, media: [[\"application/json\", \"json\"]], hasContentTypeDiscriminant: false"
+            ),
+            "{operation}"
         );
     }
 
