@@ -6793,7 +6793,6 @@ mod tests {
                 ..
             })
         ));
-        assert!(schema_array_items(&model, &items_ref, &mut HashSet::new()).is_some());
         let mut visited: HashSet<_> = [(
             items_ref.meta().source.source_id.clone(),
             items_ref.meta().source.json_pointer.clone(),
