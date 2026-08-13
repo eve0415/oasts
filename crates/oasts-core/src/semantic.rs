@@ -2634,6 +2634,15 @@ mod tests {
         SourceRef::new("openapi.yaml", pointer)
     }
 
+    /// Collected eagerly so an assertion carries a static message: a format argument evaluated
+    /// only on failure is a line the 100% line gate counts and no passing run ever reaches.
+    fn diagnostic_codes(sink: &DiagnosticSink) -> Vec<&str> {
+        sink.as_slice()
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect()
+    }
+
     fn any_schema(pointer: &str) -> SchemaNode {
         SchemaNode::Any {
             meta: SchemaMeta {
@@ -4386,13 +4395,10 @@ mod tests {
         };
         let mut sink = DiagnosticSink::new();
         analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+        let codes = diagnostic_codes(&sink);
         assert!(
-            !sink
-                .as_slice()
-                .iter()
-                .any(|diagnostic| diagnostic.code == CODE_OVERRIDE_UNMATCHED),
-            "{:?}",
-            sink.as_slice()
+            !codes.contains(&CODE_OVERRIDE_UNMATCHED),
+            "a pruned target must not be reported as unmatched"
         );
     }
 
@@ -4418,12 +4424,10 @@ mod tests {
         };
         let mut sink = DiagnosticSink::new();
         analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+        let codes = diagnostic_codes(&sink);
         assert!(
-            sink.as_slice()
-                .iter()
-                .any(|diagnostic| diagnostic.code == CODE_OVERRIDE_UNMATCHED),
-            "{:?}",
-            sink.as_slice()
+            codes.contains(&CODE_OVERRIDE_UNMATCHED),
+            "a key naming nothing must stay a configuration error"
         );
     }
 
