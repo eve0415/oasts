@@ -1918,12 +1918,27 @@ mod wire_declaration_tests {
             "info": { "title": "t", "version": "1" },
             "paths": {
                 "/read": { "get": { "operationId": "read", "responses": {
-                    "200": { "description": "ok", "content": { "application/json": {
-                        "schema": { "$ref": "#/components/schemas/Read" }
-                    } } }
+                    "200": {
+                        "description": "ok",
+                        "content": { "application/json": {
+                            "schema": { "$ref": "#/components/schemas/Read" }
+                        } },
+                        // A response header is a response-position root of its own, reached
+                        // through no media type.
+                        "headers": { "X-Read": {
+                            "schema": { "$ref": "#/components/schemas/ReadHeader" }
+                        } }
+                    }
                 } } },
                 "/write": { "post": {
                     "operationId": "write",
+                    // A parameter is a request-position root, and the only one `github-3.0`'s
+                    // single live variant is reached through.
+                    "parameters": [ {
+                        "name": "trace",
+                        "in": "query",
+                        "schema": { "$ref": "#/components/schemas/WriteParam" }
+                    } ],
                     "requestBody": json_body("Write"),
                     "responses": { "204": { "description": "done" } }
                 } },
@@ -1932,16 +1947,50 @@ mod wire_declaration_tests {
                     "requestBody": json_body("Both"),
                     "responses": { "200": { "description": "ok", "content": { "application/json": {
                         "schema": { "$ref": "#/components/schemas/Both" }
+                    } } } },
+                    // A callback operation is an operation like any other, and its own request
+                    // body is a request-position root.
+                    "callbacks": { "onDone": { "{$request.body#/url}": { "post": {
+                        "operationId": "onDone",
+                        "requestBody": json_body("CallbackBody"),
+                        "responses": { "204": { "description": "done" } }
                     } } } }
+                } },
+                // A multipart request body carries per-part encoding headers, which are request
+                // -position roots reached through neither the body schema nor a parameter.
+                "/parts": { "post": {
+                    "operationId": "parts",
+                    "requestBody": { "content": { "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": { "file": { "type": "string" } }
+                        },
+                        "encoding": { "file": { "headers": { "X-Part": {
+                            "schema": { "$ref": "#/components/schemas/PartHeader" }
+                        } } } }
+                    } } },
+                    "responses": { "204": { "description": "done" } }
                 } }
             },
+            // A webhook operation is a sibling of `paths`, not part of it, and the document sends
+            // its body — so its request body is a request-position root like any other.
+            "webhooks": { "ping": { "post": {
+                "operationId": "ping",
+                "requestBody": json_body("WebhookBody"),
+                "responses": { "204": { "description": "done" } }
+            } } },
             "components": { "schemas": {
                 "Read": split("ReadLeaf"),
                 "Write": split("WriteLeaf"),
                 "Both": split("BothLeaf"),
                 "ReadLeaf": leaf,
                 "WriteLeaf": leaf,
-                "BothLeaf": leaf
+                "BothLeaf": leaf,
+                "ReadHeader": leaf,
+                "WriteParam": leaf,
+                "CallbackBody": leaf,
+                "PartHeader": leaf,
+                "WebhookBody": leaf
             } }
         })
     }
@@ -1983,6 +2032,29 @@ mod wire_declaration_tests {
         let content = positioned_component("both");
         for name in ["Both", "BothRequest", "BothResponse"] {
             assert!(declares(&content, name), "{name}: {content}");
+        }
+    }
+
+    /// The seed roots that are not a body schema: a response header, a query parameter, a callback
+    /// operation's own request body, and a multipart part's encoding header. Each is the only route
+    /// to its component, so each twin below exists only if that root is walked — `github-3.0`'s one
+    /// live derived variant is reached through a parameter, not a body.
+    #[test]
+    fn every_operation_position_root_seeds_the_component_it_names() {
+        for (base, present, absent) in [
+            ("readheader", "ReadHeaderResponse", "ReadHeaderRequest"),
+            ("writeparam", "WriteParamRequest", "WriteParamResponse"),
+            (
+                "callbackbody",
+                "CallbackBodyRequest",
+                "CallbackBodyResponse",
+            ),
+            ("partheader", "PartHeaderRequest", "PartHeaderResponse"),
+            ("webhookbody", "WebhookBodyRequest", "WebhookBodyResponse"),
+        ] {
+            let content = positioned_component(base);
+            assert!(declares(&content, present), "{present}: {content}");
+            assert!(!declares(&content, absent), "{absent}: {content}");
         }
     }
 

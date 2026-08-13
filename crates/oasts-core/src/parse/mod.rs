@@ -9525,6 +9525,28 @@ mod tests {
         assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
     }
 
+    /// `Unknown` is the parser's record that it could not represent something, and the validators
+    /// artifact refuses on it rather than emitting a check. Rewriting one to `Never` because a `not`
+    /// beside it proves emptiness would turn that refusal into a generated validator, so the
+    /// unrepresentable node wins and the lowering stands aside.
+    #[test]
+    fn an_unrepresentable_node_is_not_rewritten_by_an_empty_not() {
+        let document = schemas_doc("3.0.3", json!({ "UnknownNot": { "if": {}, "not": {} } }));
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "UnknownNot"),
+            SchemaNode::Unknown { .. }
+        ));
+        let reported = format!("{:?}", sink.as_slice());
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_UNSUPPORTED),
+            "{reported}"
+        );
+    }
+
     /// The same rule as `an_empty_not_does_not_excuse_a_malformed_sibling`, for the other keyword
     /// that proves a schema empty. Both lowerings return, so both had to stop returning from inside
     /// the dispatch: emptiness is a statement about the instances a schema admits, not a licence to
@@ -9538,13 +9560,13 @@ mod tests {
         let (_temp, ir, sink) = parse_value(&document);
 
         assert!(matches!(schema_named(&ir, "Bad"), SchemaNode::Never { .. }));
+        let reported = format!("{:?}", sink.as_slice());
         assert!(
             sink.as_slice()
                 .iter()
                 .any(|diagnostic| diagnostic.code == CODE_SHAPE
                     && diagnostic.json_pointer.as_deref() == Some("/components/schemas/Bad/oneOf")),
-            "{:?}",
-            sink.as_slice()
+            "{reported}"
         );
         assert!(sink.has_errors(), "{:?}", sink.as_slice());
     }
@@ -9574,10 +9596,10 @@ mod tests {
         let (_temp, ir, sink) = parse_value(&document);
 
         for name in ["TypedRefNot", "RefAndTypedNot"] {
+            let lowered = format!("{:?}", schema_named(&ir, name));
             assert!(
                 matches!(schema_named(&ir, name), SchemaNode::Never { .. }),
-                "{name}: {:?}",
-                schema_named(&ir, name)
+                "{name}: {lowered}"
             );
         }
         assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
@@ -9613,13 +9635,13 @@ mod tests {
         );
         let (_temp, _ir, sink) = parse_value(&document);
 
+        let reported = format!("{:?}", sink.as_slice());
         assert!(
             sink.as_slice()
                 .iter()
                 .any(|diagnostic| diagnostic.code == CODE_SHAPE
                     && diagnostic.json_pointer.as_deref() == Some("/components/schemas/Bad/oneOf")),
-            "{:?}",
-            sink.as_slice()
+            "{reported}"
         );
         assert!(sink.has_errors(), "{:?}", sink.as_slice());
     }

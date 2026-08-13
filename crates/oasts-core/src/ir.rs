@@ -982,6 +982,86 @@ mod tests {
 
     use super::*;
 
+    /// `into_meta` is the owned counterpart of `meta()`, and its arms are what a lowering relies on
+    /// to carry a node's source location and annotations onto the node that replaces it. Every
+    /// variant is listed here because a variant that silently stopped yielding its meta would drop
+    /// the `// Source:` provenance of whatever replaced it, with nothing else to notice.
+    #[test]
+    fn into_meta_yields_the_meta_of_every_variant() {
+        let tagged = |nullable: bool| SchemaMeta {
+            nullable,
+            ..SchemaMeta::default()
+        };
+        let reference = SchemaRef {
+            source_id: "doc".to_owned(),
+            json_pointer: "/components/schemas/Thing".to_owned(),
+        };
+        let nodes = [
+            SchemaNode::Ref {
+                target: reference,
+                meta: tagged(true),
+            },
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                format: None,
+                enum_values: None,
+                const_value: None,
+                meta: tagged(true),
+            },
+            SchemaNode::Finite {
+                enum_values: None,
+                const_value: None,
+                meta: tagged(true),
+            },
+            SchemaNode::Object {
+                properties: Vec::new(),
+                additional_properties: AdditionalProperties::Allowed(None),
+                dependent_required: Vec::new(),
+                finite: None,
+                extra_required: Vec::new(),
+                meta: tagged(true),
+            },
+            SchemaNode::Array {
+                items: Box::new(SchemaNode::Any {
+                    meta: SchemaMeta::default(),
+                }),
+                finite: None,
+                meta: tagged(true),
+            },
+            SchemaNode::Tuple {
+                prefix_items: Vec::new(),
+                rest: TupleRest::Allowed,
+                finite: None,
+                meta: tagged(true),
+            },
+            SchemaNode::AllOf {
+                branches: Vec::new(),
+                meta: tagged(true),
+            },
+            SchemaNode::OneOf {
+                branches: Vec::new(),
+                discriminator: None,
+                meta: tagged(true),
+            },
+            SchemaNode::AnyOf {
+                branches: Vec::new(),
+                discriminator: None,
+                meta: tagged(true),
+            },
+            SchemaNode::Any { meta: tagged(true) },
+            SchemaNode::Never { meta: tagged(true) },
+            SchemaNode::Unknown {
+                reason: "probe".to_owned(),
+                meta: tagged(true),
+            },
+        ];
+        for node in nodes {
+            let borrowed = node.meta().nullable;
+            assert!(borrowed);
+            assert!(node.into_meta().nullable);
+        }
+    }
+
     #[test]
     fn schema_node_and_meta_stay_small() {
         // Guards the T3.9 layout win: boxing the six sparse constraint/extension groups (and
