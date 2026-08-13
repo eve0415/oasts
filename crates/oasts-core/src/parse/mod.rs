@@ -25,6 +25,9 @@ use crate::media::canonical_content_key;
 const CODE_VERSION: &str = "OASTS1101";
 const CODE_SHAPE: &str = "OASTS1102";
 const CODE_UNSUPPORTED: &str = "OASTS1103";
+/// A narrowing schema keyword the emitted TypeScript cannot apply. Reporting it upholds the
+/// no-silent-widening contract in `docs/spec.md` §5.1 while validators retain the exact check.
+const CODE_UNAPPLIED_NARROWING: &str = "OASTS1122";
 const CODE_RESPONSE_STATUS: &str = "OASTS1104";
 /// A status range written in lowercase. OpenAPI specifies the uppercase wildcard, but real
 /// documents ship `4xx`, so it is canonicalized and reported rather than rejected.
@@ -2045,6 +2048,16 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             );
         };
         let mut meta = self.schema_meta(&node, Some(object));
+        if self.version == OasVersion::V3_1
+            && meta.validation_applicators().property_names.is_some()
+        {
+            self.sink.push(self.warning_diagnostic(
+                CODE_UNAPPLIED_NARROWING,
+                node.doc_id,
+                &append_pointer(&node.pointer, "propertyNames"),
+                "schema keyword 'propertyNames' narrows validation but its constraint is not applied to the emitted type; the validators artifact enforces it instead",
+            ));
+        }
         let not_admits_everything = meta
             .validation_applicators()
             .not
@@ -2059,6 +2072,19 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             applicators.not = None;
             meta.validation_applicators = box_if_populated(applicators);
             return SchemaNode::Never { meta };
+        }
+        if meta
+            .validation_applicators()
+            .not
+            .as_deref()
+            .is_some_and(|schema| !matches!(schema, SchemaNode::Never { .. }))
+        {
+            self.sink.push(self.warning_diagnostic(
+                CODE_UNAPPLIED_NARROWING,
+                node.doc_id,
+                &append_pointer(&node.pointer, "not"),
+                "schema keyword 'not' narrows validation but its constraint is not applied to the emitted type; the validators artifact enforces it instead",
+            ));
         }
         if object
             .get("enum")
@@ -6030,6 +6056,13 @@ mod tests {
             .collect()
     }
 
+    fn unapplied_narrowing_warnings(sink: &DiagnosticSink) -> Vec<&Diagnostic> {
+        sink.as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_UNAPPLIED_NARROWING)
+            .collect()
+    }
+
     #[test]
     fn dynamic_reference_errors_name_the_keyword_and_retain_unknown_ir() {
         let document = schemas_doc(
@@ -9330,7 +9363,7 @@ mod tests {
                 if properties.iter().map(|(name, _, _)| name.as_str()).collect::<Vec<_>>()
                     == ["a", "b"]
         ));
-        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+        assert_eq!(unapplied_narrowing_warnings(&sink).len(), 1);
         assert!(matches!(
             schema_named(&ir, "Thing")
                 .meta()
@@ -9359,7 +9392,7 @@ mod tests {
                 ..
             }) if meta.source.json_pointer == "/components/schemas/Thing/not"
         ));
-        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+        assert_eq!(unapplied_narrowing_warnings(&sink).len(), 1);
     }
 
     #[test]
@@ -9437,6 +9470,88 @@ mod tests {
                     && meta.validation_applicators().not.is_none()
         ));
         assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    #[test]
+    fn constrained_not_warns_without_changing_the_outer_type() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "Thing": { "type": "string", "not": { "const": "blocked" } } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            }
+        ));
+        let warnings = unapplied_narrowing_warnings(&sink);
+        assert_eq!(warnings.len(), 1, "{:?}", sink.as_slice());
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(
+            warnings[0].json_pointer.as_deref(),
+            Some("/components/schemas/Thing/not")
+        );
+        assert_eq!(
+            warnings[0].message,
+            "schema keyword 'not' narrows validation but its constraint is not applied to the emitted type; the validators artifact enforces it instead"
+        );
+    }
+
+    #[test]
+    fn constrained_not_warns_under_openapi_30() {
+        let document = schemas_doc(
+            "3.0.3",
+            json!({ "Thing": { "type": "string", "not": { "const": "blocked" } } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            }
+        ));
+        let warnings = unapplied_narrowing_warnings(&sink);
+        assert_eq!(warnings.len(), 1, "{:?}", sink.as_slice());
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(
+            warnings[0].json_pointer.as_deref(),
+            Some("/components/schemas/Thing/not")
+        );
+    }
+
+    #[test]
+    fn property_names_warns_without_changing_the_outer_type() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Thing": {
+                    "type": "object",
+                    "propertyNames": { "pattern": "^x" }
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::Object { .. }
+        ));
+        let warnings = unapplied_narrowing_warnings(&sink);
+        assert_eq!(warnings.len(), 1, "{:?}", sink.as_slice());
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(
+            warnings[0].json_pointer.as_deref(),
+            Some("/components/schemas/Thing/propertyNames")
+        );
+        assert_eq!(
+            warnings[0].message,
+            "schema keyword 'propertyNames' narrows validation but its constraint is not applied to the emitted type; the validators artifact enforces it instead"
+        );
     }
 
     #[test]
