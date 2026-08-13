@@ -1,5 +1,6 @@
 //! Semantic analysis, identifier normalization, and stable name allocation.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -1339,16 +1340,29 @@ fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut Diagnos
             sink.push(unmatched_override_diagnostic("schema", "schemas", key));
         }
     }
-    for key in naming.overrides.schemas_by_source.keys() {
-        let declared = ir.schemas.iter().any(|schema| {
-            is_overrideable_schema(&schema.source) && schema.source.display() == *key
-        });
-        if !declared && !ir.removed.schema_sources.contains(key) {
-            sink.push(unmatched_override_diagnostic(
-                "schema",
-                "schemasBySource",
-                key,
-            ));
+    if !naming.overrides.schemas_by_source.is_empty() {
+        let mut declared_sources: HashSet<Cow<'_, str>> =
+            HashSet::with_capacity(ir.schemas.len() + ir.removed.schema_sources.len());
+        declared_sources.extend(
+            ir.schemas
+                .iter()
+                .filter(|schema| is_overrideable_schema(&schema.source))
+                .map(|schema| Cow::Owned(schema.source.display())),
+        );
+        declared_sources.extend(
+            ir.removed
+                .schema_sources
+                .iter()
+                .map(|source| Cow::Borrowed(source.as_str())),
+        );
+        for key in naming.overrides.schemas_by_source.keys() {
+            if !declared_sources.contains(key.as_str()) {
+                sink.push(unmatched_override_diagnostic(
+                    "schema",
+                    "schemasBySource",
+                    key,
+                ));
+            }
         }
     }
     for key in naming.overrides.operations.keys() {
