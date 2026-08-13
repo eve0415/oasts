@@ -48,8 +48,11 @@ strict_flag_matrix() {
 # and `??` do not remove `void` when the flag is off, so they narrow under our settings and not under
 # theirs.
 #
-# Scoped to the emitted runtime tree because that is the surface this was found on. The types and
-# client trees are not claimed to compile here.
+# Scoped to the emitted runtime tree, which is the surface this was found on and the one every
+# consumer compiles whatever artifacts they enabled. Widening it to the whole emitted tree was
+# tried and does not hold yet: a client operation module narrows a result union on its `ok`
+# discriminant, which stops discriminating once the flag is off. That is a separate defect from
+# the guards this axis was added for, so the axis stays where it can be held.
 #
 # Args: label dir...
 strict_null_checks_off() {
