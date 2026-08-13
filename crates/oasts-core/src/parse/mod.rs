@@ -2038,13 +2038,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
     /// A keyword that says "no instance is valid" says nothing about whether the document is valid.
     fn parse_schema(&mut self, node: NodeView<'graph>) -> SchemaNode {
         let lowered = self.parse_schema_dispatch(node);
-        if !lowered
-            .meta()
-            .validation_applicators()
-            .not
-            .as_deref()
-            .is_some_and(schema_admits_everything)
-        {
+        if !node_negates_everything(&lowered) {
             return lowered;
         }
         // `Unknown` is the parser's record that it could not represent something, and the validators
@@ -4342,6 +4336,33 @@ fn has_typed_or_constraint_content(object: &Map<String, Value>, version: OasVers
     ];
     BOTH_VERSIONS.iter().any(|key| object.contains_key(*key))
         || (version == OasVersion::V3_1 && V3_1_ONLY.iter().any(|key| object.contains_key(*key)))
+}
+
+/// Whether the lowered node carries a `not` that admits every instance, and so admits nothing
+/// itself.
+///
+/// Two places have to be looked at, because a schema object carrying more than one independent
+/// piece is lowered to a conjunction and `split_for_conjunction` hands the `not` to the **typed**
+/// branch rather than the wrapper. Reading only the wrapper silently stopped lowering exactly the
+/// shapes that carry a sibling — `{$ref: …, minProperties: 1, not: {}}` rendered as its reference
+/// while the validator beside it rejected every value, which is the divergence this rule exists to
+/// close. One conjunct admitting nothing is enough: a conjunction is satisfied only by a value that
+/// satisfies all of it.
+fn node_negates_everything(node: &SchemaNode) -> bool {
+    fn negates(node: &SchemaNode) -> bool {
+        node.meta()
+            .validation_applicators()
+            .not
+            .as_deref()
+            .is_some_and(schema_admits_everything)
+    }
+    if negates(node) {
+        return true;
+    }
+    match node {
+        SchemaNode::AllOf { branches, .. } => branches.iter().any(negates),
+        _ => false,
+    }
 }
 
 /// Whether the lowered schema accepts every JSON instance. Typeless constraint groups and
@@ -9492,6 +9513,40 @@ mod tests {
             Some(SchemaNode::Never { meta })
                 if meta.source.json_pointer == "/components/schemas/AcceptAll/not"
         ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    /// A schema object carrying a second independent piece is lowered to a conjunction, and the
+    /// conjunction split hands the `not` to the typed branch rather than the wrapper. Reading only
+    /// the wrapper left exactly these shapes rendering their reference while the validator beside
+    /// them rejected every value — the divergence the whole rule exists to close, one shape over.
+    #[test]
+    fn an_empty_not_beside_another_piece_still_lowers_to_never() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Base": { "type": "object", "properties": { "id": { "type": "string" } } },
+                "TypedRefNot": {
+                    "$ref": "#/components/schemas/Base",
+                    "minProperties": 1,
+                    "not": {}
+                },
+                "RefAndTypedNot": {
+                    "$ref": "#/components/schemas/Base",
+                    "type": "object",
+                    "not": {}
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        for name in ["TypedRefNot", "RefAndTypedNot"] {
+            assert!(
+                matches!(schema_named(&ir, name), SchemaNode::Never { .. }),
+                "{name}: {:?}",
+                schema_named(&ir, name)
+            );
+        }
         assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
     }
 

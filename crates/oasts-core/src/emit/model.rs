@@ -273,15 +273,11 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         // operations. Suppress the flag itself rather than the export: `variant_name` reads the flag
         // when it renders a reference, so a flag left standing beside a withheld declaration is the
         // one shape that emits a name nothing declares.
+        // A component no operation reaches is reported as used at both positions rather than
+        // neither, so nothing is suppressed on the strength of a walk that found nothing — and its
+        // referents inherit that through the same fixpoint.
         let (used_in_request, used_in_response) = self.resolve_positions_used(count);
         for index in 0..count {
-            // Used at neither position means the traversal found no operation reaching this
-            // component at all — a `filters.orphans` retention, or a root this walk does not know.
-            // Both flags stand: withholding a declaration on the strength of a walk that found
-            // nothing would trade a dead declaration for a reference to a name nobody emitted.
-            if !used_in_request[index] && !used_in_response[index] {
-                continue;
-            }
             request[index] &= used_in_request[index];
             response[index] &= used_in_response[index];
         }
@@ -473,35 +469,57 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             }
         }
 
-        for (slot, position) in [TypePosition::Request, TypePosition::Response]
-            .into_iter()
-            .enumerate()
-        {
-            let mut edges: Vec<Vec<usize>> = vec![Vec::new(); count];
-            for allocated in &self.analyzed.schema_names {
-                let index = allocated.schema_index;
-                let mut referenced = Vec::new();
-                self.collect_ref_edges_in_position(
-                    &self.analyzed.ir.schemas[index].schema,
-                    position,
-                    &mut referenced,
-                );
-                referenced.sort_unstable();
-                referenced.dedup();
-                edges[index] = referenced;
-            }
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for source in 0..count {
-                    for &referent in &edges[source] {
-                        if used[slot][source] && !used[slot][referent] {
-                            used[slot][referent] = true;
-                            changed = true;
+        let edges: [Vec<Vec<usize>>; 2] =
+            [TypePosition::Request, TypePosition::Response].map(|position| {
+                let mut edges: Vec<Vec<usize>> = vec![Vec::new(); count];
+                for allocated in &self.analyzed.schema_names {
+                    let index = allocated.schema_index;
+                    let mut referenced = Vec::new();
+                    self.collect_ref_edges_in_position(
+                        &self.analyzed.ir.schemas[index].schema,
+                        position,
+                        &mut referenced,
+                    );
+                    referenced.sort_unstable();
+                    referenced.dedup();
+                    edges[index] = referenced;
+                }
+                edges
+            });
+        fn propagate(used: &mut [Vec<bool>; 2], edges: &[Vec<Vec<usize>>; 2], count: usize) {
+            for slot in 0..2 {
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for source in 0..count {
+                        for &referent in &edges[slot][source] {
+                            if used[slot][source] && !used[slot][referent] {
+                                used[slot][referent] = true;
+                                changed = true;
+                            }
                         }
                     }
                 }
             }
+        }
+        propagate(&mut used, &edges, count);
+
+        // A component no operation reaches counts as used at *both* positions, and that has to
+        // propagate like any other use rather than be handled at the suppression site. Under
+        // `filters.orphans` such a component is still emitted and still renders directional
+        // declarations, so it names its referents' twins — and if the referent's flag were left
+        // suppressed, the referrer's response declaration would fall back to the referent's neutral
+        // name and publish a `writeOnly` field as part of a response. Seeding it here and running
+        // the fixpoint again is what carries "used at both" across the reference graph.
+        let unreached: Vec<usize> = (0..count)
+            .filter(|&index| !used[0][index] && !used[1][index])
+            .collect();
+        if !unreached.is_empty() {
+            for index in unreached {
+                used[0][index] = true;
+                used[1][index] = true;
+            }
+            propagate(&mut used, &edges, count);
         }
         let [request, response] = used;
         (request, response)
@@ -2003,6 +2021,67 @@ mod wire_declaration_tests {
         for name in ["Pet", "PetRequest", "PetResponse"] {
             assert!(declares(&content, name), "{name}: {content}");
         }
+    }
+
+    /// An orphan-retaining document keeps a component no operation reaches, and that component
+    /// still renders directional declarations naming its referents' twins. If the referent's flag
+    /// were suppressed because operations only reach it in the other position, the orphan's response
+    /// declaration would fall back to the referent's neutral name — publishing a `writeOnly` field
+    /// as part of a response, which compiles and is wrong. "Used at neither" therefore means "used
+    /// at both", and has to propagate as such.
+    #[test]
+    fn an_orphan_referrer_still_names_its_referents_twin() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/x": { "post": {
+                "operationId": "sendX",
+                "requestBody": { "content": { "application/json": {
+                    "schema": { "$ref": "#/components/schemas/X" }
+                } } },
+                "responses": { "204": { "description": "done" } }
+            } } },
+            "components": { "schemas": {
+                "X": {
+                    "type": "object",
+                    "required": ["own", "secret"],
+                    "properties": {
+                        "own": { "type": "string" },
+                        "secret": { "type": "string", "writeOnly": true }
+                    }
+                },
+                "Y": {
+                    "type": "object",
+                    "required": ["own", "nested"],
+                    "properties": {
+                        "own": { "type": "string" },
+                        "nested": { "$ref": "#/components/schemas/X" },
+                        "hidden": { "type": "string", "readOnly": true }
+                    }
+                }
+            } }
+        });
+        let (_temp, resolved, analyzed, digest) =
+            build_model_inputs_from_document(document, |_| {});
+        let mut sink = DiagnosticSink::new();
+        let mut model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        let files = emit_types_from_model(&mut model);
+        let content = |base: &str| {
+            files
+                .iter()
+                .find(|file| file.relative_path == format!("types/components/{base}.ts"))
+                .expect("component file")
+                .content
+                .clone()
+        };
+
+        let x = content("x");
+        assert!(declares(&x, "XResponse"), "{x}");
+        let y = content("y");
+        assert!(
+            y.contains("nested: XResponse;"),
+            "the orphan's response declaration must name the response twin, not the neutral name: {y}"
+        );
     }
 
     #[test]

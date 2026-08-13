@@ -166,25 +166,40 @@ declaration_debt=()
 # Args: work-dir fixture.
 assert_no_orphan_declarations() {
   local d=$1 fixture=$2
-  # Every (resolved target file, imported name) pair in the tree. Generated imports are always one
-  # line, which this relies on; a wrapped clause would silently read as no import at all, so the
-  # extractor fails loud below if it ever meets an import line it cannot resolve to a specifier.
+  # Every (resolved target file, imported name) pair in the tree. A named-import clause this cannot
+  # read becomes "nobody imports that name", which would report a live declaration as orphaned, so
+  # the forms are read rather than assumed. The awk pass joins a clause that wraps across lines —
+  # the emitted runtime carries those — and both quote styles are accepted, because the emitted
+  # runtime uses single quotes where the generated trees use double. `|| true` keeps a tree with no
+  # relative named imports from aborting the gate under `set -o pipefail`: no match is an answer.
   local pairs
   pairs=$(
-    grep -rHoE '^import (type )?\{[^}]*\} from "[^"]+"' "$d"/generated* --include='*.ts' 2>/dev/null \
+    find "$d"/generated* -name '*.ts' -print0 2>/dev/null \
+      | xargs -0 -r awk '
+          FNR == 1 { buf = "" }
+          buf != "" { buf = buf " " $0 }
+          buf == "" && /^import / { buf = $0 }
+          buf != "" && buf ~ /from[ ]*[\047\042][^\047\042]*[\047\042]/ {
+            print FILENAME ":" buf; buf = ""
+          }
+        ' \
       | while IFS= read -r hit; do
           local src=${hit%%:import *} clause=${hit#*:} spec names target
-          spec=${clause##*from \"}; spec=${spec%\"}
+          [[ $clause == *"{"* ]] || continue
+          # The joined clause carries whatever followed the specifier — a trailing `;` at least — so
+          # the closing quote is what ends it, not the end of the string.
+          spec=${clause##*from }; spec=${spec#[\'\"]}; spec=${spec%%[\'\"]*}
           [[ $spec == .* ]] || continue
           names=${clause#*\{}; names=${names%%\}*}
           target=$(cd "$(dirname "$src")" 2>/dev/null && realpath -m "${spec%.js}.ts")
-          # `A as B` imports A from the target; B is only this module's local name for it.
+          # `A as B` imports A from the target — B is only this module's local name for it — and an
+          # inline `type` modifier is a modifier, not part of the name.
           tr ',' '\n' <<<"$names" \
-            | sed -E 's/[[:space:]]+as[[:space:]]+.*//; s/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | sed -E 's/[[:space:]]+as[[:space:]]+.*//; s/^[[:space:]]*(type[[:space:]]+)?//; s/[[:space:]]*$//' \
             | while IFS= read -r n; do
                 [[ -n $n ]] && printf '%s\t%s\n' "$target" "$n"
               done
-        done | sort -u
+        done | sort -u || true
   )
   local raw file base lower name found=0
   while IFS= read -r raw; do
