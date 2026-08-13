@@ -953,6 +953,27 @@ impl SchemaNode {
     pub const fn is_nullable(&self) -> bool {
         self.meta().nullable
     }
+
+    /// Consumes the node for its metadata. Used where a lowering replaces a node with a different
+    /// one at the same source location and must carry that location, its docs, and its annotations
+    /// across rather than rebuild them.
+    #[must_use]
+    pub fn into_meta(self) -> SchemaMeta {
+        match self {
+            Self::Ref { meta, .. }
+            | Self::Primitive { meta, .. }
+            | Self::Finite { meta, .. }
+            | Self::Object { meta, .. }
+            | Self::Array { meta, .. }
+            | Self::Tuple { meta, .. }
+            | Self::AllOf { meta, .. }
+            | Self::OneOf { meta, .. }
+            | Self::AnyOf { meta, .. }
+            | Self::Any { meta }
+            | Self::Never { meta }
+            | Self::Unknown { meta, .. } => meta,
+        }
+    }
 }
 
 #[cfg(test)]

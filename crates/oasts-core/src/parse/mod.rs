@@ -2027,7 +2027,50 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         })
     }
 
+    /// Lowers one schema, then applies the one rewrite that has to see the finished node: a `not`
+    /// whose subschema admits every instance says that no instance is valid, exactly as the boolean
+    /// schema `false` does, and lowers the same way.
+    ///
+    /// It runs *after* the whole dispatch rather than as an early return inside it. Returning early
+    /// skipped every sibling keyword the dispatch would have parsed — not only their unsupported-
+    /// keyword warnings but their shape validation — so `{ not: {}, oneOf: "invalid" }` generated
+    /// successfully and exit 0 where the same document without the `not` is a fatal `OASTS1102`.
+    /// A keyword that says "no instance is valid" says nothing about whether the document is valid.
     fn parse_schema(&mut self, node: NodeView<'graph>) -> SchemaNode {
+        let lowered = self.parse_schema_dispatch(node);
+        if !lowered
+            .meta()
+            .validation_applicators()
+            .not
+            .as_deref()
+            .is_some_and(schema_admits_everything)
+        {
+            return lowered;
+        }
+        // `Unknown` is the parser's record that it could not represent something, and the validators
+        // artifact refuses rather than emitting a check for it. Rewriting that to `Never` would turn
+        // a refusal into a generated validator, which is a wider change than this rule.
+        if matches!(lowered, SchemaNode::Unknown { .. }) {
+            return lowered;
+        }
+        let mut meta = lowered.into_meta();
+        let mut applicators = meta
+            .validation_applicators
+            .take()
+            .map(|applicators| *applicators)
+            .unwrap_or_default();
+        // The node already admits nothing, so restating the negation would only reject a second
+        // time what the node rejects on its own.
+        applicators.not = None;
+        meta.validation_applicators = box_if_populated(applicators);
+        // Nullability widens, and there is nothing left to widen: `never | null` would admit the one
+        // value the schema is most explicit about rejecting. The empty-enum lowering clears it for
+        // the same reason.
+        meta.nullable = false;
+        SchemaNode::Never { meta }
+    }
+
+    fn parse_schema_dispatch(&mut self, node: NodeView<'graph>) -> SchemaNode {
         if let Some(boolean) = node.value.as_bool() {
             let meta = self.schema_meta(&node, None);
             if self.version == OasVersion::V3_1 {
@@ -2232,23 +2275,6 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     meta,
                 };
             }
-        }
-        // A `not` whose subschema admits every instance says exactly what the boolean schema `false`
-        // says — no instance satisfies this — so it lowers the same way, and silently, for the same
-        // reason. The applicator goes with it: the node already admits nothing, so re-stating the
-        // negation would only emit a second rejection of a value the first one rejected.
-        //
-        // Deferred to here so a sibling keyword's diagnostic is reported before the return: an
-        // unrepresentable `contains` beside a `not: {}` is still an unrepresentable `contains`.
-        if not_admits_everything {
-            let mut applicators = meta
-                .validation_applicators
-                .take()
-                .map(|applicators| *applicators)
-                .unwrap_or_default();
-            applicators.not = None;
-            meta.validation_applicators = box_if_populated(applicators);
-            return SchemaNode::Never { meta };
         }
         // JSON Schema (both dialects) applies every keyword on one schema object conjunctively.
         // Detect how many independent "pieces" the object carries; the historical dispatch below
@@ -9467,6 +9493,47 @@ mod tests {
                 if meta.source.json_pointer == "/components/schemas/AcceptAll/not"
         ));
         assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    /// Nullability widens, and a schema that rejects every instance has nothing left to widen.
+    /// Carried onto the lowered node it produced `never | null` on the types surface and
+    /// `z.union([z.never(),z.null()])` in zod — both admitting the one value the schema is most
+    /// explicit about rejecting.
+    #[test]
+    fn a_nullable_schema_with_an_empty_not_admits_nothing_at_all() {
+        let document = schemas_doc(
+            "3.0.3",
+            json!({ "NullableReject": { "type": "string", "nullable": true, "not": {} } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "NullableReject"),
+            SchemaNode::Never { meta } if !meta.nullable
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    /// The lowering runs after the whole dispatch, so a sibling keyword is still parsed and still
+    /// validated. As an early return it swallowed the sibling's shape check too: this document
+    /// generated successfully at exit 0, while the same document without the `not` is fatal.
+    #[test]
+    fn an_empty_not_does_not_excuse_a_malformed_sibling() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "Bad": { "not": {}, "oneOf": "not-an-array" } }),
+        );
+        let (_temp, _ir, sink) = parse_value(&document);
+
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_SHAPE
+                    && diagnostic.json_pointer.as_deref() == Some("/components/schemas/Bad/oneOf")),
+            "{:?}",
+            sink.as_slice()
+        );
+        assert!(sink.has_errors(), "{:?}", sink.as_slice());
     }
 
     #[test]
