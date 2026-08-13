@@ -40,6 +40,26 @@ strict_flag_matrix() {
   echo "consumer flag matrix ok: $label (exactOptionalPropertyTypes=$exact_optional)"
 }
 
+# The one axis that runs BELOW the floor rather than above it. Every flag in the matrix above is an
+# addition on top of `strict`; this one takes something away. `strictNullChecks` is the only setting
+# that changes assignability wholesale, and a consumer with it off is still a consumer — the emitted
+# runtime lands in their project and has to compile there. Nothing else in this gate ever toggles it,
+# which is exactly how three guards written in a form the compiler cannot use survived: `!== undefined`
+# and `??` do not remove `void` when the flag is off, so they narrow under our settings and not under
+# theirs.
+#
+# Scoped to the emitted runtime tree because that is the surface this was found on. The types and
+# client trees are not claimed to compile here.
+#
+# Args: label dir...
+strict_null_checks_off() {
+  local label=$1
+  shift
+  pnpm exec tsc --strict --strictNullChecks false --noEmit --skipLibCheck false --target es2022 \
+    --module esnext --moduleResolution bundler "$@"
+  echo "strictNullChecks=false ok: $label"
+}
+
 # Every emitted component file must be named by some other file in the same tree. A component
 # the pruner keeps but nothing imports is a disagreement between two walks: the pruner keeps any
 # component a `$ref` names anywhere, so the emitter's import walk has to name the same set the
@@ -281,6 +301,11 @@ generate_and_verify() {
   # uncompilable in the project it was generated into.
   for exact_optional in false true; do
     strict_flag_matrix "$message" "$exact_optional" "$d"/generated*/**/*.ts
+  done
+  local runtime_dir
+  for runtime_dir in "$d"/generated*/runtime; do
+    [[ -d $runtime_dir ]] || continue
+    strict_null_checks_off "$message" "$runtime_dir"/*.ts
   done
   cp -r "fixtures/$f" "$d-repeat"
   rm -rf "$d-repeat"/generated*
