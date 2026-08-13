@@ -2278,12 +2278,37 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     // index signature would: the open one widens the named type, and the closed
                     // one makes its declared properties impossible. Decided structurally, before
                     // rendering, so it does not depend on how an empty object is spelled.
-                    let rendered = if has_named && is_empty_object {
-                        "{}".to_owned()
+                    //
+                    // The one case that reasoning does not cover is a conjunction every member of
+                    // which admits null — a nullable empty object beside a nullable named branch.
+                    // Null then satisfies the whole intersection, the validators and the zod
+                    // schemas both accept it, and a bare `{}` is the only artifact claiming
+                    // otherwise. Carrying the `| null` through lets TypeScript distribute to the
+                    // same verdict: `(X | null) & ({} | null)` is `X | null`.
+                    let substituted = has_named && is_empty_object;
+                    let rendered = if substituted {
+                        // Resolved rather than read off the branch node, because a `$ref` member
+                        // carries its target's nullability, not its own. Computed here rather than
+                        // per branch: an empty object beside a named branch is the rare shape.
+                        let admits_null = branches.iter().all(|branch| {
+                            let mut visited = HashSet::new();
+                            self.resolve_ref(branch, &mut visited)
+                                .is_some_and(SchemaNode::is_nullable)
+                        });
+                        // Parenthesized rather than left to precedence: with a third member in the
+                        // intersection, a bare `A & B & {} | null` binds as `(A & B & {}) | null`
+                        // and admits a null that A rejects.
+                        if admits_null {
+                            "({} | null)".to_owned()
+                        } else {
+                            "{}".to_owned()
+                        }
                     } else {
                         rendered
                     };
-                    let member = if from_merge {
+                    // Neither substituted spelling needs the parenthesizer, and the merged blob
+                    // never did.
+                    let member = if from_merge || substituted {
                         rendered
                     } else {
                         parenthesize_intersection_member(rendered, branch)
@@ -8650,6 +8675,49 @@ mod tests {
             "{wrapped}"
         );
         assert!(!wrapped.contains("[key: string]"), "{wrapped}");
+    }
+
+    #[test]
+    fn an_all_nullable_intersection_keeps_the_null_its_validators_accept() {
+        // `{}` removes the null of a nullable named branch, which is the point of keeping it. It
+        // may not remove a null that nothing else rejects: when the empty branch is ITSELF
+        // nullable and so is the named one, null satisfies every member, and the validators and
+        // zod schemas both accept it. `(X | null) & ({} | null)` distributes to `X | null`, so the
+        // emitted type reaches the same verdict instead of contradicting them.
+        let (files, _diagnostics) = compile(
+            openapi(json!({
+                "WidgetMaybe": {
+                    "type": ["object", "null"],
+                    "properties": { "a": { "type": "string" } }
+                },
+                "BothNullable": {
+                    "type": ["object", "null"],
+                    "allOf": [{ "$ref": "#/components/schemas/WidgetMaybe" }]
+                },
+                // The control: the named branch rejects null on its own, so the conjunction does
+                // too and the bare `{}` stays.
+                "WidgetMeta": {
+                    "type": "object",
+                    "required": ["a"],
+                    "properties": { "a": { "type": "string" } }
+                },
+                "OneNullable": {
+                    "type": ["object", "null"],
+                    "allOf": [{ "$ref": "#/components/schemas/WidgetMeta" }]
+                }
+            })),
+            json!({}),
+        );
+        let both = generated_body(schema_file(&files, "bothnullable"));
+        assert!(
+            both.contains("export type BothNullable = WidgetMaybe & ({} | null);"),
+            "{both}"
+        );
+        let one = generated_body(schema_file(&files, "onenullable"));
+        assert!(
+            one.contains("export type OneNullable = WidgetMeta & {};"),
+            "{one}"
+        );
     }
 
     #[test]
