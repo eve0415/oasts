@@ -2142,12 +2142,14 @@ fn collect_body_imports(
     match plan {
         BodyPlan::FormUrlencoded { fields, .. } | BodyPlan::Multipart { fields, .. } => {
             for field in fields {
-                renderer.collect_operation_imports(
-                    &field.schema,
-                    TypePosition::Request,
-                    axis,
-                    imports,
-                );
+                if let Some(schema) = form_field_render_schema(renderer.model, field).schema {
+                    renderer.collect_operation_imports(
+                        schema,
+                        TypePosition::Request,
+                        axis,
+                        imports,
+                    );
+                }
             }
         }
         BodyPlan::ContentTypeDiscriminated { arms, .. } => {
@@ -4856,6 +4858,64 @@ mod tests {
     }
 
     #[test]
+    fn repeated_wrapped_multipart_field_imports_its_rendered_item() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/upload": {
+                    "post": {
+                        "operationId": "upload",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["metas"],
+                                        "properties": {
+                                            "metas": { "$ref": "#/components/schemas/Metas" }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "metas": {
+                                            "contentType": "application/json, application/cbor"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Meta": {
+                        "type": "object",
+                        "properties": { "tag": { "type": "string" } }
+                    },
+                    "Metas": {
+                        "type": "array",
+                        "items": { "$ref": "#/components/schemas/Meta" }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "upload");
+
+        assert!(
+            actual.contains("import type { Meta } from \"../../types/components/meta.js\";"),
+            "rendered item import mismatch:\n{actual}"
+        );
+        assert!(
+            !actual.contains("import type { Metas }"),
+            "outer array import should be absent:\n{actual}"
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
     fn multipart_content_encoding_operation_module_snapshot() {
         let document = json!({
             "openapi": "3.1.0",
@@ -6820,6 +6880,7 @@ mod tests {
             assert!(input.contains("filename?: string"));
             assert!(input.contains("Blob | File"));
             assert!(input.contains("encoded: string"));
+            assert!(!input.contains("Items"));
             let mut imports = BTreeMap::new();
             collect_body_imports(&renderer, &body, TypeAxis::Application, &mut imports);
             let mut import_text = String::new();
@@ -6831,7 +6892,7 @@ mod tests {
                 "client/operations/getpet.ts",
                 "types",
             );
-            assert!(import_text.contains("types/components"));
+            assert!(import_text.is_empty(), "{import_text}");
         }
         let mut descriptor = String::new();
         write_body_descriptor(&mut descriptor, &model, &body, 2);
