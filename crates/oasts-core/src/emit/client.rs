@@ -2398,16 +2398,31 @@ fn render_form_field_input(
     } else {
         axis
     };
-    let body = match &field.serialization {
-        FieldSerializationPlan::Content { media, .. } if media.binary_upload => {
-            "Blob | File".to_owned()
-        }
-        FieldSerializationPlan::Style { .. } | FieldSerializationPlan::Content { .. } => {
-            renderer.render_type(&field.schema, TypePosition::Request, field_axis, indent)
+    // A binary upload does not render its schema — the byte container replaces it — so the one
+    // fact the schema still carries, whether the field repeats, is lost unless it is read
+    // separately. The descriptor reads it (`repeated:`) and the runtime enforces it, which is how
+    // the emitted type came to promise a single Blob for a field the runtime rejects unless it is
+    // given an array. Every other field renders its schema, so an array one is already an array.
+    let binary_upload = matches!(
+        &field.serialization,
+        FieldSerializationPlan::Content { media, .. } if media.binary_upload
+    );
+    let body = if binary_upload {
+        "Blob | File".to_owned()
+    } else {
+        renderer.render_type(&field.schema, TypePosition::Request, field_axis, indent)
+    };
+    // The array wraps the whole per-part input rather than the body alone: the runtime iterates a
+    // repeated field and hands each ITEM to the part serializer, wrapper and all.
+    let repeat = |rendered: String| {
+        if binary_upload && schema_is_array(renderer.model, &field.schema, &mut HashSet::new()) {
+            format!("({rendered})[]")
+        } else {
+            rendered
         }
     };
     if !field.wrapper.wrapped {
-        return body;
+        return repeat(body);
     }
     let mut output = format!("{{ body: {body}; contentType: ");
     if field.wrapper.content_type_literal {
@@ -2430,7 +2445,7 @@ fn render_form_field_input(
         output.push_str("; filename?: string");
     }
     output.push_str(" }");
-    output
+    repeat(output)
 }
 
 /// One emitted HTTP arm of a per-operation result union. The result type, the `orThrow` envelope
@@ -4796,6 +4811,57 @@ mod tests {
         // a binary upload would demand.
         assert!(actual.contains("note: unknown;"));
         assert!(!actual.contains("Blob | File"));
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    /// A repeated binary upload is an array in the descriptor and in the runtime, which rejects a
+    /// lone Blob with `repeated multipart field files must be an array`. The input type used to
+    /// promise exactly that lone Blob, so following it produced a call that never left the process.
+    #[test]
+    fn a_repeated_binary_upload_takes_an_array() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/uploads": {
+                    "post": {
+                        "operationId": "uploadFiles",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["files", "cover"],
+                                        "properties": {
+                                            "files": {
+                                                "type": "array",
+                                                "items": { "type": "string", "format": "binary" }
+                                            },
+                                            "cover": { "type": "string", "format": "binary" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "uploadfiles");
+
+        assert!(actual.contains("files: (Blob | File)[];"), "{actual}");
+        assert!(
+            actual.contains("\"files\", required: true, repeated: true"),
+            "{actual}"
+        );
+        // The singular field is the control: it keeps the bare union and its `repeated: false`.
+        assert!(actual.contains("cover: Blob | File;"), "{actual}");
+        assert!(
+            actual.contains("\"cover\", required: true, repeated: false"),
+            "{actual}"
+        );
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
