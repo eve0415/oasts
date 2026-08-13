@@ -124,6 +124,76 @@ assert_no_orphan_components() {
     echo "verify-ts: generated component is import-orphaned: $file (exports: ${names[*]})" >&2
     found=1
   done < <(find "$d"/generated* -path '*/components/*.ts' 2>/dev/null | sort)
+  assert_no_orphan_declarations "$d" "$fixture" || found=1
+  return "$found"
+}
+
+# A file is "referenced" as soon as ONE of its exports is imported, so the check above sees nothing
+# when a component file is imported for its own declaration while a second declaration beside it is
+# named by nobody. That is what a request/response twin for an unused position looked like: a live
+# file with a dead export inside it.
+#
+# Scoped to the derived names in the types tree, and deliberately not wider:
+#   * the component's own declaration is contractual — every named component is exported as a public
+#     declaration — and is unreferenced by construction whenever an operation reaches the component
+#     through a variant instead, so requiring an importer for it would fire on nearly every root;
+#   * the validators, zod, client and transform trees export their component modules as the public
+#     API a consumer calls (`petValidator`, `petSchema`, `decodePet`). An export nothing else in the
+#     tree imports is the normal shape of a public entry point there, not a dead declaration.
+# What is left is exactly the compiler's own invention: `{Name}Request`, `{Name}Response`, and the
+# wire twins composed onto them. Nothing outside the emitted tree is promised those names, so each
+# one has to be named by some other file in the same tree or it is not API, it is debt.
+# Empty, and worth keeping that way. Two known survivors exist in the pinned corpus rather than in
+# any fixture this gate generates — `workers_multipart-script` and
+# `workers_script-and-version-settings-item` in cloudflare-3.0, whose request variants no site names
+# because a multipart body flattens to per-field descriptors. That is the same cause as the
+# `form-composition-3.1` entries in the file-level list above, reached through
+# `components/requestBodies`; entries for them here could never fire, and a debt list that cannot
+# fire reads as coverage this gate does not have.
+declaration_debt=()
+
+# Args: work-dir fixture.
+assert_no_orphan_declarations() {
+  local d=$1 fixture=$2
+  # Every (resolved target file, imported name) pair in the tree. Generated imports are always one
+  # line, which this relies on; a wrapped clause would silently read as no import at all, so the
+  # extractor fails loud below if it ever meets an import line it cannot resolve to a specifier.
+  local pairs
+  pairs=$(
+    grep -rHoE '^import (type )?\{[^}]*\} from "[^"]+"' "$d"/generated* --include='*.ts' 2>/dev/null \
+      | while IFS= read -r hit; do
+          local src=${hit%%:import *} clause=${hit#*:} spec names target
+          spec=${clause##*from \"}; spec=${spec%\"}
+          [[ $spec == .* ]] || continue
+          names=${clause#*\{}; names=${names%%\}*}
+          target=$(cd "$(dirname "$src")" 2>/dev/null && realpath -m "${spec%.js}.ts")
+          # `A as B` imports A from the target; B is only this module's local name for it.
+          tr ',' '\n' <<<"$names" \
+            | sed -E 's/[[:space:]]+as[[:space:]]+.*//; s/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | while IFS= read -r n; do
+                [[ -n $n ]] && printf '%s\t%s\n' "$target" "$n"
+              done
+        done | sort -u
+  )
+  local raw file base lower name found=0
+  while IFS= read -r raw; do
+    [[ -n $raw ]] || continue
+    # `find` over a directory argument can yield `//`, which realpath normalizes away on the import
+    # side. Compare normalized paths or nothing ever matches and the check silently passes.
+    file=$(realpath -m "$raw")
+    base=$(basename "$file" .ts | tr -cd 'a-zA-Z0-9' | tr '[:upper:]' '[:lower:]')
+    while IFS= read -r name; do
+      [[ -n $name ]] || continue
+      lower=$(tr -cd 'a-zA-Z0-9' <<<"$name" | tr '[:upper:]' '[:lower:]')
+      [[ $lower == "$base" ]] && continue
+      grep -qxF "$file	$name" <<<"$pairs" && continue
+      if [[ " ${declaration_debt[*]} " == *" $fixture/$(basename "$file"):$name "* ]]; then
+        continue
+      fi
+      echo "verify-ts: generated declaration is import-orphaned: $name in $file" >&2
+      found=1
+    done < <(grep -oE '^export (interface|type) [A-Za-z_$][A-Za-z0-9_$]*' "$file" | awk '{print $3}' | sort -u)
+  done < <(find "$d"/generated* -path '*/types/components/*.ts' 2>/dev/null | sort)
   return "$found"
 }
 
