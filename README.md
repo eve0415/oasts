@@ -103,7 +103,7 @@ switch (result.outcome) {
 
 An exact declared status is a number literal, a range or `default` key and every failure tag a string literal — the two never overlap, so `case 200:` can never also match `"4XX"`.
 
-Every operation also gets a `getPetShowcaseOrThrow` companion for the call sites where a failure is not worth branching on: it resolves to the matched success arm's `{ data, meta }` and throws `ApiError` otherwise, with the whole failed result preserved on `error.result`. Both forms are re-exported from `generated/client/api.ts` if you would rather import one object than one module per operation.
+Every operation also gets a `getPetShowcaseOrThrow` companion for the call sites where a failure is not worth branching on: it resolves to the matched success arm's `{ data, meta }` and throws `ApiError` otherwise, with the whole failed result preserved on `error.result`. Set `client.aggregate: true` and both forms are also re-exported from `generated/client/api.ts`, if you would rather import one object than one module per operation. It is off by default, because the aggregate names every operation and a bundler cannot drop the ones you never call.
 
 In CI, fail on drift instead of writing files:
 
@@ -343,6 +343,26 @@ emit:
 ```
 
 Two enabled artifacts may not share a directory, or nest one inside another — that's an `OASTS0102` at config time rather than a collision at write time.
+
+### Narrowing and integer width
+
+Two type-shape knobs are off by default, because each buys precision at a cost worth opting into.
+
+`types.discriminatedUnions: tagged` intersects each branch of a `discriminator` union with its own mapping literal, so TypeScript can narrow on the tag:
+
+```ts
+// structural (default)
+export type Pet = Cat | Dog;
+// tagged
+export type Pet = (Cat & { petType: "feline" }) | (Dog & { petType: "canine" });
+```
+
+`types.integer: bigint` maps `format: int64` to `bigint` instead of `number`, so values past 2^53 survive the round trip. It converts at the client boundary, so it needs the client artifact:
+
+```ts
+// number (default)      cents: number;
+// bigint                cents: bigint;
+```
 
 ### Date and time representations
 
