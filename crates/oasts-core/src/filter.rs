@@ -660,6 +660,7 @@ fn prune_unreachable_schemas(ir: &mut Ir) {
         if reached[position] {
             survivors.push(schema);
         } else {
+            removed.schema_sources.push(schema.source.display());
             removed.schemas.push(schema.name);
         }
     }

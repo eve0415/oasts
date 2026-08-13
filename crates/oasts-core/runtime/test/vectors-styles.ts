@@ -97,6 +97,10 @@ export type StyleVector = {
 const PRIMITIVE: StyleValue = "blue";
 const ARRAY: StyleValue = ["blue", "black"];
 const OBJECT: StyleValue = { R: 100, G: 200 };
+const EMPTY_PRIMITIVE: StyleValue = "";
+const ARRAY_WITH_EMPTY: StyleValue = ["", "b"];
+const EMPTY_ARRAY_ITEMS: StyleValue = ["", ""];
+const OBJECT_WITH_EMPTY: StyleValue = { a: "" };
 
 export const STYLE_VECTORS: readonly StyleVector[] = [
   // --- path / simple (RFC 6570 §3.2.2 simple string expansion) ---
@@ -196,6 +200,38 @@ export const STYLE_VECTORS: readonly StyleVector[] = [
     value: OBJECT,
     expected: ".R,100,G,200",
   },
+  // A defined empty scalar keeps the label's dot-prefix.
+  {
+    cite: "RFC 6570 §3.2.5",
+    location: "path",
+    style: "label",
+    explode: false,
+    allowReserved: false,
+    paramName: "color",
+    value: EMPTY_PRIMITIVE,
+    expected: ".",
+  },
+  // Non-explode joins empty list items and object values with commas.
+  {
+    cite: "RFC 6570 §3.2.5",
+    location: "path",
+    style: "label",
+    explode: false,
+    allowReserved: false,
+    paramName: "color",
+    value: ARRAY_WITH_EMPTY,
+    expected: ".,b",
+  },
+  {
+    cite: "RFC 6570 §3.2.5",
+    location: "path",
+    style: "label",
+    explode: false,
+    allowReserved: false,
+    paramName: "color",
+    value: OBJECT_WITH_EMPTY,
+    expected: ".a,",
+  },
   {
     cite: "RFC 6570 §3.2.5",
     location: "path",
@@ -227,7 +263,27 @@ export const STYLE_VECTORS: readonly StyleVector[] = [
     value: OBJECT,
     expected: ".R=100.G=200",
   },
-
+  // Explode repeats the dot-prefix for each empty list item.
+  {
+    cite: "RFC 6570 §3.2.5",
+    location: "path",
+    style: "label",
+    explode: true,
+    allowReserved: false,
+    paramName: "color",
+    value: EMPTY_PRIMITIVE,
+    expected: ".",
+  },
+  {
+    cite: "RFC 6570 §3.2.5",
+    location: "path",
+    style: "label",
+    explode: true,
+    allowReserved: false,
+    paramName: "color",
+    value: EMPTY_ARRAY_ITEMS,
+    expected: "..",
+  },
   // --- path / matrix (RFC 6570 §3.2.7 path-style parameter expansion; OpenAPI calls it "matrix") ---
   {
     cite: "RFC 6570 §3.2.7",
@@ -258,6 +314,37 @@ export const STYLE_VECTORS: readonly StyleVector[] = [
     paramName: "color",
     value: OBJECT,
     expected: ";color=R,100,G,200",
+  },
+  // A defined empty scalar drops "=", while non-explode composites keep it when their joined value is non-empty.
+  {
+    cite: "RFC 6570 §3.2.7",
+    location: "path",
+    style: "matrix",
+    explode: false,
+    allowReserved: false,
+    paramName: "color",
+    value: EMPTY_PRIMITIVE,
+    expected: ";color",
+  },
+  {
+    cite: "RFC 6570 §3.2.7",
+    location: "path",
+    style: "matrix",
+    explode: false,
+    allowReserved: false,
+    paramName: "color",
+    value: ARRAY_WITH_EMPTY,
+    expected: ";color=,b",
+  },
+  {
+    cite: "RFC 6570 §3.2.7",
+    location: "path",
+    style: "matrix",
+    explode: false,
+    allowReserved: false,
+    paramName: "color",
+    value: OBJECT_WITH_EMPTY,
+    expected: ";color=a,",
   },
   {
     cite: "RFC 6570 §3.2.7",
@@ -290,6 +377,37 @@ export const STYLE_VECTORS: readonly StyleVector[] = [
     paramName: "color",
     value: OBJECT,
     expected: ";R=100;G=200",
+  },
+  // Explode drops "=" independently for each empty scalar, list item, or object value.
+  {
+    cite: "RFC 6570 §3.2.7",
+    location: "path",
+    style: "matrix",
+    explode: true,
+    allowReserved: false,
+    paramName: "color",
+    value: EMPTY_PRIMITIVE,
+    expected: ";color",
+  },
+  {
+    cite: "RFC 6570 §3.2.7",
+    location: "path",
+    style: "matrix",
+    explode: true,
+    allowReserved: false,
+    paramName: "color",
+    value: ARRAY_WITH_EMPTY,
+    expected: ";color;color=b",
+  },
+  {
+    cite: "RFC 6570 §3.2.7",
+    location: "path",
+    style: "matrix",
+    explode: true,
+    allowReserved: false,
+    paramName: "color",
+    value: OBJECT_WITH_EMPTY,
+    expected: ";a",
   },
 
   // --- query / form (RFC 6570 §3.2.9 form-style query continuation; default query style) ---

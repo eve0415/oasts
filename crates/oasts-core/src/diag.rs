@@ -44,6 +44,7 @@ pub struct NamingOverrideSuggestion {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum NamingOverrideNamespace {
     Schemas,
+    SchemasBySource,
     Operations,
     Webhooks,
     Callbacks,
@@ -53,6 +54,7 @@ impl NamingOverrideNamespace {
     const fn key(self) -> &'static str {
         match self {
             Self::Schemas => "schemas",
+            Self::SchemasBySource => "schemasBySource",
             Self::Operations => "operations",
             Self::Webhooks => "webhooks",
             Self::Callbacks => "callbacks",

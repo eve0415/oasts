@@ -638,7 +638,6 @@ impl KeyFactory {
     /// Renders `tanstack/keys.ts`.
     pub(crate) fn render(&self, model: &EmissionModel<'_, '_>) -> String {
         let mut output = model.header();
-        output.push('\n');
         output.push_str(
             "// One binding per path node. An operation module imports the single leaf binding it needs,\n\
              // never the composed `keys` object below: a bundler cannot drop unused properties of an\n\
@@ -828,7 +827,7 @@ fn is_query_eligible(plan: &OperationPlan) -> Result<(), &'static str> {
         success_branches += 1;
         if !matches!(response.payload, PayloadDisposition::Payload) {
             return Err(
-                "every successful response is bodyless, and a query function may not resolve undefined",
+                "at least one successful response is bodyless, and a query function may not resolve undefined",
             );
         }
     }
@@ -1067,7 +1066,6 @@ fn emit_operation(
     let extension = import_extension(model);
     let relative_path = format!("{}/operations/{file_base}.ts", model.dirs.tanstack);
     let mut output = model.header();
-    output.push('\n');
     // Every descriptor names at least its own path node's binding, so this import is unconditional.
     output.push_str(&format!(
         "import {{ {} }} from {};\n",
@@ -1324,6 +1322,34 @@ mod tests {
             .find(|file| file.relative_path == path)
             .expect("the emitter produced this module")
             .content
+    }
+
+    #[test]
+    fn tanstack_files_start_their_first_declaration_after_one_blank_line() {
+        let (files, diagnostics) = emit(DOCUMENT, TANSTACK_CONFIG);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != Severity::Error)
+        );
+
+        for (path, first_declaration) in [
+            (
+                "tanstack/keys.ts",
+                "// One binding per path node. An operation module imports the single leaf binding it needs,",
+            ),
+            ("tanstack/operations/listpets.ts", "import { "),
+        ] {
+            let content = emitted(&files, path);
+            let (_, after_digest) = content
+                .split_once("// Source digest: ")
+                .expect("source digest header");
+            let (_, after_header) = after_digest.split_once('\n').expect("digest line ending");
+            assert!(
+                after_header.starts_with(&format!("\n{first_declaration}")),
+                "unexpected first bytes for {path}: {content:?}"
+            );
+        }
     }
 
     fn literal(text: &str) -> SegmentPart {
@@ -2450,7 +2476,7 @@ paths:
     }
 
     #[test]
-    fn every_way_a_read_can_be_bodyless_suppresses_its_descriptor_and_warns() {
+    fn any_bodyless_success_suppresses_its_descriptor_and_warns() {
         let (files, diagnostics) = emit(DOCUMENT, TANSTACK_CONFIG);
         for file in [
             "tanstack/operations/headpet.ts",
@@ -2484,6 +2510,14 @@ paths:
                 .iter()
                 .any(|warning| warning.message.contains("getPartial")),
             "{warnings:#?}"
+        );
+        let mixed_response_warning = warnings
+            .iter()
+            .find(|warning| warning.message.contains("getPartial"))
+            .expect("mixed response warning");
+        assert_eq!(
+            mixed_response_warning.message,
+            "operation 'getPartial' emits no query descriptor: at least one successful response is bodyless, and a query function may not resolve undefined"
         );
     }
 

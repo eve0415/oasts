@@ -1274,24 +1274,24 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             ));
         }
 
-        if tagged_projection
-            && [
-                TypePosition::Neutral,
-                TypePosition::Request,
-                TypePosition::Response,
-            ]
-            .into_iter()
-            .all(|position| {
-                branches.iter().zip(tags).all(|(branch, tags)| {
-                    self.discriminator_branches_fix_a_literal_in_position(
-                        std::slice::from_ref(branch),
-                        property,
-                        position,
-                    ) || self
-                        .projected_discriminator_values(branch, property, position, tags)
-                        .is_some()
-                })
+        let projects_in = |position: TypePosition| {
+            branches.iter().zip(tags).all(|(branch, tags)| {
+                self.discriminator_branches_fix_a_literal_in_position(
+                    std::slice::from_ref(branch),
+                    property,
+                    position,
+                ) || self
+                    .projected_discriminator_values(branch, property, position, tags)
+                    .is_some()
             })
+        };
+        let neutral = projects_in(TypePosition::Neutral);
+
+        if tagged_projection
+            && neutral
+            && [TypePosition::Request, TypePosition::Response]
+                .into_iter()
+                .all(&projects_in)
         {
             return None;
         }
@@ -1314,6 +1314,26 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         {
             return Some(format!(
                 "discriminator property '{property}' uses a tag whose JSON kind does not match the branch's declared scalar type, so that branch is emitted without tagged projection"
+            ));
+        }
+
+        // A directional variant can fail to project for a reason the neutral declaration does not
+        // share: a `readOnly` discriminator is absent from the request shape and a `writeOnly` one
+        // from the response shape, so that variant has no property to carry the tag. The union
+        // still narrows everywhere the property exists, which is why the messages below — which
+        // say the union cannot narrow — would be false here.
+        if tagged_projection && neutral {
+            let directional = [
+                (TypePosition::Request, "request"),
+                (TypePosition::Response, "response"),
+            ]
+            .into_iter()
+            .filter(|&(position, _)| !projects_in(position))
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>()
+            .join(" and ");
+            return Some(format!(
+                "discriminator property '{property}' is absent from the {directional} shape, so that variant is emitted without tagged projection while the neutral declaration still narrows"
             ));
         }
 
@@ -1864,13 +1884,23 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             .borrow_mut()
             .extend(alias_diagnostics);
         self.write_imports(&mut content, imports, "./");
-        self.write_schema_declaration(
+        let neutral_variants = match (&request_variant, &response_variant) {
+            (Some(request), Some(response)) => Some(NeutralSchemaVariants { request, response }),
+            _ => None,
+        };
+        self.write_schema_declaration_with_docs(
             &mut content,
             &allocated.name,
             &schema.schema,
             TypePosition::Neutral,
             TypeAxis::Application,
-            &schema.source,
+            SchemaDeclarationContext {
+                source: &schema.source,
+                docs: SchemaDocView {
+                    neutral_variants,
+                    ..SchemaDocView::from(&schema.schema.meta().docs)
+                },
+            },
         );
         if let Some(export) = &request_variant {
             self.write_schema_declaration(
@@ -1932,6 +1962,29 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         axis: TypeAxis,
         source: &SourceRef,
     ) {
+        self.write_schema_declaration_with_docs(
+            output,
+            name,
+            schema,
+            position,
+            axis,
+            SchemaDeclarationContext {
+                source,
+                docs: SchemaDocView::from(&schema.meta().docs),
+            },
+        );
+    }
+
+    fn write_schema_declaration_with_docs(
+        &self,
+        output: &mut String,
+        name: &str,
+        schema: &SchemaNode,
+        position: TypePosition,
+        axis: TypeAxis,
+        context: SchemaDeclarationContext<'_>,
+    ) {
+        let SchemaDeclarationContext { source, docs } = context;
         if let Some(values) = schema_finite_values(schema)
             && self.model.config.types.enum_representation == EnumRepresentation::Const
         {
@@ -1953,7 +2006,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             write_source_metadata(output, source, 0);
             write_schema_tsdoc(
                 output,
-                SchemaDocView::from(&schema.meta().docs),
+                docs,
                 DocKind::Schema,
                 &self.model.config.documentation,
                 0,
@@ -1986,7 +2039,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             write_source_metadata(output, source, 0);
             write_schema_tsdoc(
                 output,
-                SchemaDocView::from(&schema.meta().docs),
+                docs,
                 DocKind::Schema,
                 &self.model.config.documentation,
                 0,
@@ -2005,7 +2058,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         write_source_metadata(output, source, 0);
         write_schema_tsdoc(
             output,
-            SchemaDocView::from(&schema.meta().docs),
+            docs,
             DocKind::Schema,
             &self.model.config.documentation,
             0,
@@ -2278,12 +2331,37 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     // index signature would: the open one widens the named type, and the closed
                     // one makes its declared properties impossible. Decided structurally, before
                     // rendering, so it does not depend on how an empty object is spelled.
-                    let rendered = if has_named && is_empty_object {
-                        "{}".to_owned()
+                    //
+                    // The one case that reasoning does not cover is a conjunction every member of
+                    // which admits null — a nullable empty object beside a nullable named branch.
+                    // Null then satisfies the whole intersection, the validators and the zod
+                    // schemas both accept it, and a bare `{}` is the only artifact claiming
+                    // otherwise. Carrying the `| null` through lets TypeScript distribute to the
+                    // same verdict: `(X | null) & ({} | null)` is `X | null`.
+                    let substituted = has_named && is_empty_object;
+                    let rendered = if substituted {
+                        // Resolved rather than read off the branch node, because a `$ref` member
+                        // carries its target's nullability, not its own. Computed here rather than
+                        // per branch: an empty object beside a named branch is the rare shape.
+                        let admits_null = branches.iter().all(|branch| {
+                            let mut visited = HashSet::new();
+                            self.resolve_ref(branch, &mut visited)
+                                .is_some_and(SchemaNode::is_nullable)
+                        });
+                        // Parenthesized rather than left to precedence: with a third member in the
+                        // intersection, a bare `A & B & {} | null` binds as `(A & B & {}) | null`
+                        // and admits a null that A rejects.
+                        if admits_null {
+                            "({} | null)".to_owned()
+                        } else {
+                            "{}".to_owned()
+                        }
                     } else {
                         rendered
                     };
-                    let member = if from_merge {
+                    // Neither substituted spelling needs the parenthesizer, and the merged blob
+                    // never did.
+                    let member = if from_merge || substituted {
                         rendered
                     } else {
                         parenthesize_intersection_member(rendered, branch)
@@ -3390,11 +3468,12 @@ impl Emitter<'_, '_, '_> {
 
     fn render_request(&self, operation: &Operation, axis: TypeAxis, indent: usize) -> String {
         let groups = [
-            (ParamLocation::Path, "path"),
-            (ParamLocation::Query, "query"),
-            (ParamLocation::Header, "headers"),
-            (ParamLocation::Cookie, "cookies"),
-        ];
+            ParamLocation::Path,
+            ParamLocation::Query,
+            ParamLocation::Header,
+            ParamLocation::Cookie,
+        ]
+        .map(|location| (location, parameter_group_name(location)));
         let mut output = String::from("{\n");
         let mut has_members = false;
         for (location, group_name) in groups {
@@ -3431,6 +3510,7 @@ impl Emitter<'_, '_, '_> {
                 media_stream_kind(&media_type.essence, media_type.streaming_marked),
                 TypePosition::Request,
                 axis,
+                indent + 2,
             );
             if let Some(description) = &body.description {
                 write_schema_tsdoc(
@@ -3543,6 +3623,7 @@ impl Emitter<'_, '_, '_> {
                 media_stream_kind(&media_type.essence, media_type.streaming_marked),
                 TypePosition::Response,
                 TypeAxis::Wire,
+                0,
             );
             if !types.contains(&rendered) {
                 types.push(rendered);
@@ -3563,6 +3644,7 @@ impl Emitter<'_, '_, '_> {
                 media_stream_kind(&media_type.essence, media_type.streaming_marked),
                 TypePosition::Response,
                 TypeAxis::Application,
+                0,
             );
             if !types.contains(&rendered) {
                 types.push(rendered);
@@ -3582,6 +3664,7 @@ impl Emitter<'_, '_, '_> {
         stream: Option<StreamKind>,
         position: TypePosition,
         axis: TypeAxis,
+        indent: usize,
     ) -> String {
         // The two directions deliberately disagree, and this is the one place that says so. A
         // response stream is the thing the client hands back, so SSE arrives as typed events; a
@@ -3603,7 +3686,7 @@ impl Emitter<'_, '_, '_> {
                 // emitted module unable to compile against its own declared result.
                 return format!(
                     "AsyncIterable<SseEvent<{}>>",
-                    self.render_type(schema, position, TypeAxis::Application, 0)
+                    self.render_type(schema, position, TypeAxis::Application, indent)
                 );
             }
             (Some(StreamKind::Raw), TypePosition::Response | TypePosition::Neutral) => {
@@ -3612,7 +3695,7 @@ impl Emitter<'_, '_, '_> {
             (None, _) => {}
         }
         if is_json(essence) {
-            self.render_type(schema, position, axis, 0)
+            self.render_type(schema, position, axis, indent)
         } else if essence.starts_with("text/") && !is_xml(essence) {
             "string".to_owned()
         } else {
@@ -3734,16 +3817,7 @@ pub(super) fn property_in_position(meta: &PropMeta, position: TypePosition) -> b
 }
 
 fn property_docs(schema: &SchemaNode) -> SchemaDocView<'_> {
-    let docs = &schema.meta().docs;
-    SchemaDocView {
-        title: docs.title.as_deref(),
-        description: docs.description.as_deref(),
-        deprecated: docs.deprecated,
-        default: docs.default.as_ref(),
-        examples: &docs.examples,
-        comment: docs.comment.as_deref(),
-        constraints: &docs.constraints,
-    }
+    SchemaDocView::from(&schema.meta().docs)
 }
 
 /// `SchemaDocs` for a Parameter or Header Object: its own `description`/`deprecated`, never a
@@ -3760,9 +3834,7 @@ fn schema_field_docs<'a>(
         description,
         deprecated,
         default: None,
-        examples: &schema.meta().docs.examples,
-        comment: schema.meta().docs.comment.as_deref(),
-        constraints: &schema.meta().docs.constraints,
+        ..SchemaDocView::from(&schema.meta().docs)
     }
 }
 
@@ -3942,6 +4014,33 @@ fn covered_by_merge(branch: &SchemaNode, merged: bool) -> bool {
     merged && !is_named_branch(branch)
 }
 
+/// The property name the emitted input gives one parameter location's group.
+///
+/// One producer for both the types artifact's `Request` and the client artifact's `Input`, because
+/// the two describe the same operation input: a `Request` value has to be assignable to the
+/// parameter an `Input` declares, and two independent spellings made that false wherever an
+/// operation carried a header or a cookie. Singular throughout, matching the document's own `in:`
+/// values.
+///
+/// The descriptor's own `location` string is this same name, and must stay so: the runtime reads a
+/// parameter as `input[plan.location]`, so the literal a descriptor carries is the key it looks up
+/// on the value the caller passed. The emitted input-member access and a validator's issue path
+/// name that same property. One producer for all four, because they are one name — a second
+/// spelling anywhere makes every parameter read `undefined` at request time, which throws for a
+/// required parameter and silently drops an optional one.
+///
+/// The msw artifact deliberately keeps its own spelling: its resolver argument is a handler's
+/// destructured context mirroring MSW's vocabulary, where `params` and `cookies` are MSW's own
+/// property names. Nothing assigns a `Request` into it, and it could not align if it tried.
+pub(crate) const fn parameter_group_name(location: ParamLocation) -> &'static str {
+    match location {
+        ParamLocation::Path => "path",
+        ParamLocation::Query => "query",
+        ParamLocation::Header => "header",
+        ParamLocation::Cookie => "cookie",
+    }
+}
+
 fn add_nullable(mut rendered: String, schema: &SchemaNode) -> String {
     if !schema.is_nullable()
         || rendered.split(" | ").any(|member| member == "null")
@@ -4041,6 +4140,18 @@ struct SchemaDocView<'a> {
     examples: &'a [Value],
     comment: Option<&'a str>,
     constraints: &'a [String],
+    neutral_variants: Option<NeutralSchemaVariants<'a>>,
+}
+
+struct SchemaDeclarationContext<'a> {
+    source: &'a SourceRef,
+    docs: SchemaDocView<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct NeutralSchemaVariants<'a> {
+    request: &'a str,
+    response: &'a str,
 }
 
 impl<'a> From<&'a SchemaDocs> for SchemaDocView<'a> {
@@ -4053,6 +4164,7 @@ impl<'a> From<&'a SchemaDocs> for SchemaDocView<'a> {
             examples: &docs.examples,
             comment: docs.comment.as_deref(),
             constraints: &docs.constraints,
+            neutral_variants: None,
         }
     }
 }
@@ -4068,6 +4180,7 @@ struct TsDoc<'a> {
     examples: Vec<DocExample<'a>>,
     private_remarks: Option<Cow<'a, str>>,
     see: Vec<(Cow<'a, str>, Option<Cow<'a, str>>)>,
+    neutral_variants: Option<NeutralSchemaVariants<'a>>,
 }
 
 struct DocExample<'a> {
@@ -4157,6 +4270,7 @@ fn write_schema_tsdoc(
             .collect();
     }
     tsdoc.private_remarks = docs.comment.map(Cow::Borrowed);
+    tsdoc.neutral_variants = docs.neutral_variants;
     write_tsdoc(output, &tsdoc, indent);
 }
 
@@ -4462,6 +4576,7 @@ fn write_tsdoc(output: &mut String, docs: &TsDoc<'_>, indent: usize) {
         && docs.examples.is_empty()
         && docs.private_remarks.is_none()
         && docs.see.is_empty()
+        && docs.neutral_variants.is_none()
     {
         return;
     }
@@ -4476,17 +4591,31 @@ fn write_tsdoc(output: &mut String, docs: &TsDoc<'_>, indent: usize) {
         writer.begin_section();
         writer.encoded_lines(summary);
     }
-    if !docs.remarks.is_empty() {
+    if !docs.remarks.is_empty() || docs.neutral_variants.is_some() {
         writer.begin_section();
         writer.plain_line("@remarks");
-        let (first, rest) = docs
-            .remarks
-            .split_first()
-            .expect("non-empty remarks have a first entry");
-        writer.encoded_lines(first);
-        for remark in rest {
-            writer.plain_line("");
-            writer.encoded_lines(remark);
+        if let Some((first, rest)) = docs.remarks.split_first() {
+            writer.encoded_lines(first);
+            for remark in rest {
+                writer.plain_line("");
+                writer.encoded_lines(remark);
+            }
+        }
+        if let Some(variants) = docs.neutral_variants {
+            if !docs.remarks.is_empty() {
+                writer.plain_line("");
+            }
+            writer.start_line();
+            writer.output.push_str(
+                "This is the shape declared by the document, not a wire shape for any single message. Use {@link ",
+            );
+            write_link_part(writer.output, variants.request);
+            writer
+                .output
+                .push_str("} for what a caller sends and {@link ");
+            write_link_part(writer.output, variants.response);
+            writer.output.push_str("} for what the server returns.");
+            writer.finish_line();
         }
     }
     if let Some(deprecated) = docs.deprecated {
@@ -7545,6 +7674,8 @@ mod tests {
                 " * \n",
                 " * @remarks\n",
                 " * A pet.\n",
+                " * \n",
+                " * This is the shape declared by the document, not a wire shape for any single message. Use {@link PetRequest} for what a caller sends and {@link PetResponse} for what the server returns.\n",
                 " */\n",
                 "export interface Pet {\n",
                 "  readonly id: number | null;\n",
@@ -7598,6 +7729,57 @@ mod tests {
             .find(|file| file.relative_path.ends_with("pair.ts"))
             .expect("Pair file");
         assert!(generated_body(pair).ends_with("export type Pair = [string, number];\n"));
+    }
+
+    #[test]
+    fn neutral_variant_tsdoc_names_both_wire_shapes_and_preserves_description() {
+        let document = openapi(json!({
+            "Widget": {
+                "description": "A catalog widget.",
+                "type": "object",
+                "required": ["id", "name"],
+                "properties": {
+                    "id": { "type": "string", "readOnly": true },
+                    "secret": { "type": "string", "writeOnly": true },
+                    "name": { "type": "string" }
+                }
+            },
+            "ReadOnlyWidget": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "readOnly": true },
+                    "name": { "type": "string" }
+                }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let widget = generated_body(schema_file(&files, "widget"));
+        let guidance = "This is the shape declared by the document, not a wire shape for any single message. Use {@link WidgetRequest} for what a caller sends and {@link WidgetResponse} for what the server returns.";
+        assert_eq!(widget.matches(guidance).count(), 1, "{widget}");
+        assert!(
+            widget.contains(&format!(
+                concat!(
+                    "/**\n",
+                    " * A catalog widget.\n",
+                    " * \n",
+                    " * @remarks\n",
+                    " * {}\n",
+                    " */\n",
+                    "export interface Widget {{"
+                ),
+                guidance
+            )),
+            "{widget}"
+        );
+
+        let read_only = generated_body(schema_file(&files, "readonlywidget"));
+        assert!(
+            read_only.contains("export interface ReadOnlyWidgetRequest {")
+                && !read_only.contains("ReadOnlyWidgetResponse")
+                && !read_only.contains("shape declared by the document"),
+            "{read_only}"
+        );
     }
 
     /// The variant-need decision reaches read/write-only markers buried in an inline nested object,
@@ -8649,6 +8831,99 @@ mod tests {
     }
 
     #[test]
+    fn a_request_names_its_parameter_slots_the_way_the_client_input_does() {
+        // The two artifacts describe the same operation input, so a value of one has to be
+        // assignable to the other. Plural group names made that false for every operation with a
+        // header or a cookie, and TypeScript only caught it where no other slot matched.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/pets/{petId}": {
+                    "get": {
+                        "operationId": "readPet",
+                        "parameters": [
+                            { "name": "petId", "in": "path", "required": true,
+                              "schema": { "type": "string" } },
+                            { "name": "X-Trace", "in": "header",
+                              "schema": { "type": "string" } },
+                            { "name": "session", "in": "cookie",
+                              "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let operation = find_file(&files, "types/operations/readpet.ts");
+        assert!(
+            operation.content.contains("  header?: {\n"),
+            "{}",
+            operation.content
+        );
+        assert!(
+            operation.content.contains("  cookie?: {\n"),
+            "{}",
+            operation.content
+        );
+        assert!(
+            !operation.content.contains("headers?:"),
+            "{}",
+            operation.content
+        );
+        assert!(
+            !operation.content.contains("cookies?:"),
+            "{}",
+            operation.content
+        );
+    }
+
+    #[test]
+    fn an_all_nullable_intersection_keeps_the_null_its_validators_accept() {
+        // `{}` removes the null of a nullable named branch, which is the point of keeping it. It
+        // may not remove a null that nothing else rejects: when the empty branch is ITSELF
+        // nullable and so is the named one, null satisfies every member, and the validators and
+        // zod schemas both accept it. `(X | null) & ({} | null)` distributes to `X | null`, so the
+        // emitted type reaches the same verdict instead of contradicting them.
+        let (files, _diagnostics) = compile(
+            openapi(json!({
+                "WidgetMaybe": {
+                    "type": ["object", "null"],
+                    "properties": { "a": { "type": "string" } }
+                },
+                "BothNullable": {
+                    "type": ["object", "null"],
+                    "allOf": [{ "$ref": "#/components/schemas/WidgetMaybe" }]
+                },
+                // The control: the named branch rejects null on its own, so the conjunction does
+                // too and the bare `{}` stays.
+                "WidgetMeta": {
+                    "type": "object",
+                    "required": ["a"],
+                    "properties": { "a": { "type": "string" } }
+                },
+                "OneNullable": {
+                    "type": ["object", "null"],
+                    "allOf": [{ "$ref": "#/components/schemas/WidgetMeta" }]
+                }
+            })),
+            json!({}),
+        );
+        let both = generated_body(schema_file(&files, "bothnullable"));
+        assert!(
+            both.contains("export type BothNullable = WidgetMaybe & ({} | null);"),
+            "{both}"
+        );
+        let one = generated_body(schema_file(&files, "onenullable"));
+        assert!(
+            one.contains("export type OneNullable = WidgetMeta & {};"),
+            "{one}"
+        );
+    }
+
+    #[test]
     fn empty_object_branch_survives_beside_a_named_branch() {
         // `{}` is not a member that says nothing: in TypeScript it admits every value except
         // `null` and `undefined`, so intersecting it with a nullable named branch is what
@@ -9239,6 +9514,18 @@ mod tests {
             1,
             "{diagnostics:?}"
         );
+        // Names the shape that cannot carry the tag. The neutral declaration above demonstrably
+        // narrows, so a message claiming the union cannot narrow would be false of this document.
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+                .map(|diagnostic| diagnostic.message.as_str()),
+            Some(
+                "discriminator property 'kind' is absent from the request shape, so that variant is emitted without tagged projection while the neutral declaration still narrows"
+            ),
+            "{diagnostics:?}"
+        );
 
         let filtered_response_document = openapi(json!({
             "Cat": { "type": "object", "required": ["kind"], "properties": {
@@ -9267,6 +9554,17 @@ mod tests {
                 .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
                 .count(),
             1,
+            "{diagnostics:?}"
+        );
+        // The mirror image, and the reason one axis-blind sentence could not serve both.
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+                .map(|diagnostic| diagnostic.message.as_str()),
+            Some(
+                "discriminator property 'kind' is absent from the response shape, so that variant is emitted without tagged projection while the neutral declaration still narrows"
+            ),
             "{diagnostics:?}"
         );
     }
@@ -9969,6 +10267,7 @@ mod tests {
                 Cow::Owned("u{v}|<x>\r\n*/sourceMappingURL=".to_owned()),
                 Some(Cow::Owned("L{a}\r\nB".to_owned())),
             )],
+            neutral_variants: None,
         };
         let mut output = String::new();
 
@@ -10098,6 +10397,67 @@ mod tests {
         assert!(!body.contains("@default "));
         assert!(!body.contains("@summary"));
         assert!(!body.contains("@description"));
+    }
+
+    #[test]
+    fn inline_request_body_is_indented_to_its_member_column() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/labels": {
+                    "post": {
+                        "operationId": "submitLabels",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["labels", "metadata"],
+                                        "properties": {
+                                            "labels": {
+                                                "description": "The labels to submit.",
+                                                "type": "array",
+                                                "items": { "type": "string" }
+                                            },
+                                            "metadata": {
+                                                "type": "object",
+                                                "required": ["source"],
+                                                "properties": {
+                                                    "source": { "type": "string" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "Accepted" } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let operation = find_file(&files, "types/operations/submitlabels.ts");
+        assert!(
+            operation.content.contains(concat!(
+                "export type SubmitLabelsRequest = {\n",
+                "  body: {\n",
+                "    /**\n",
+                "     * The labels to submit.\n",
+                "     */\n",
+                "    labels: string[];\n",
+                "    metadata: {\n",
+                "      source: string;\n",
+                "    };\n",
+                "  };\n",
+                "};\n",
+            )),
+            "{}",
+            operation.content
+        );
     }
 
     #[test]
