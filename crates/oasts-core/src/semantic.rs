@@ -1047,18 +1047,42 @@ fn is_overrideable_schema(source: &SourceRef) -> bool {
     source.json_pointer.is_empty() || is_root_component_pointer(&source.json_pointer)
 }
 
-/// The override entry that renames `schema`, if its raw name is user-addressable.
+#[derive(Clone, Copy)]
+struct ResolvedSchemaOverride<'naming> {
+    name: &'naming str,
+    source_specific: bool,
+}
+
+/// The override entry that renames `schema`, if its declaration is user-addressable.
 fn schema_override<'naming>(
     naming: &'naming NamingConfig,
     schema: &NamedSchema,
-) -> Option<&'naming String> {
-    is_overrideable_schema(&schema.source)
-        .then(|| naming.overrides.schemas.get(&schema.name))
-        .flatten()
+) -> Option<ResolvedSchemaOverride<'naming>> {
+    if !is_overrideable_schema(&schema.source) {
+        return None;
+    }
+    if !naming.overrides.schemas_by_source.is_empty() {
+        let source_key = schema.source.display();
+        if let Some(name) = naming.overrides.schemas_by_source.get(&source_key) {
+            return Some(ResolvedSchemaOverride {
+                name,
+                source_specific: true,
+            });
+        }
+    }
+    naming
+        .overrides
+        .schemas
+        .get(&schema.name)
+        .map(|name| ResolvedSchemaOverride {
+            name,
+            source_specific: false,
+        })
 }
 
-struct PendingSchemaName {
+struct PendingSchemaName<'ir> {
     allocated: AllocatedSchemaName,
+    raw_name: &'ir str,
     overridden: bool,
 }
 
@@ -1071,13 +1095,14 @@ fn allocate_schema_names(
     for (schema_index, schema) in ir.schemas.iter().enumerate() {
         // An override supplies the complete identifier: typePrefix/typeSuffix are not applied on
         // top, but the value must still validate and collide like any generated name.
-        let allocation = match schema_override(naming, schema) {
-            Some(name) => validate_final_identifier(name)
+        let schema_override = schema_override(naming, schema);
+        let allocation = match schema_override {
+            Some(schema_override) => validate_final_identifier(schema_override.name)
                 .map(|()| NameAllocation {
-                    name: name.clone(),
+                    name: schema_override.name.to_owned(),
                     escaped_reserved_word: None,
                 })
-                .map_err(|error| (name.clone(), error)),
+                .map_err(|error| (schema_override.name.to_owned(), error)),
             None => normalize_identifier(&schema.name, TargetCase::Pascal)
                 .and_then(|base| {
                     let candidate = format!("{}{}{}", naming.type_prefix, base, naming.type_suffix);
@@ -1091,14 +1116,22 @@ fn allocate_schema_names(
         };
         match allocation {
             Ok(allocation) => {
+                // Path allocation otherwise falls back to the raw wire name when no bare-name
+                // override owns it, so a source-specific override carries its final name here.
+                let wire_name = if schema_override.is_some_and(|value| value.source_specific) {
+                    allocation.name.clone()
+                } else {
+                    schema.name.clone()
+                };
                 pending.push(PendingSchemaName {
                     allocated: AllocatedSchemaName {
                         schema_index,
-                        wire_name: schema.name.clone(),
+                        wire_name,
                         name: allocation.name,
                         source: schema.source.clone(),
                     },
-                    overridden: schema_override(naming, schema).is_some(),
+                    raw_name: &schema.name,
+                    overridden: schema_override.is_some(),
                 });
             }
             Err((input, error)) => push_name_error(
@@ -1144,7 +1177,7 @@ fn allocate_schema_names(
             let source_name = if schema.overridden {
                 schema.allocated.name.as_str()
             } else {
-                &schema.allocated.wire_name
+                schema.raw_name
             };
             crate::emit::file_base_name(source_name, naming.file_case).ok()
         });
@@ -1184,7 +1217,7 @@ fn allocate_schema_names(
 /// identifier collisions themselves and the latent file-path collisions a pasted override would
 /// otherwise uncover on the next run.
 fn collect_schema_override_suggestions(
-    pending: &[PendingSchemaName],
+    pending: &[PendingSchemaName<'_>],
     naming: &NamingConfig,
     groups: &BTreeMap<&str, Vec<usize>>,
     suggester: &mut OverrideSuggester,
@@ -1201,7 +1234,7 @@ fn collect_schema_override_suggestions(
         }
         let raw_names = indices
             .iter()
-            .map(|index| pending[*index].allocated.wire_name.as_str())
+            .map(|index| pending[*index].raw_name)
             .collect::<Vec<_>>();
         let unique = raw_names.iter().copied().collect::<HashSet<_>>();
         if unique.len() == indices.len() {
@@ -1212,6 +1245,25 @@ fn collect_schema_override_suggestions(
                     .map(|suggestion| suggestion.source_name.clone()),
             );
             all_suggestions.extend(suggestions);
+        } else {
+            let source_names = indices
+                .iter()
+                .map(|index| pending[*index].allocated.source.display())
+                .collect::<Vec<_>>();
+            let unique_sources = source_names.iter().collect::<HashSet<_>>();
+            if unique_sources.len() == indices.len() {
+                let suggestions = suggester.allocate(
+                    NamingOverrideNamespace::SchemasBySource,
+                    name,
+                    source_names.iter().map(String::as_str).collect(),
+                );
+                suggested_sources.extend(
+                    suggestions
+                        .iter()
+                        .map(|suggestion| suggestion.source_name.clone()),
+                );
+                all_suggestions.extend(suggestions);
+            }
         }
     }
 
@@ -1226,7 +1278,7 @@ fn collect_schema_override_suggestions(
         let source_name = if schema.overridden {
             schema.allocated.name.as_str()
         } else {
-            &schema.allocated.wire_name
+            schema.raw_name
         };
         if let Ok(file_base) = crate::emit::file_base_name(source_name, naming.file_case) {
             file_groups
@@ -1238,7 +1290,7 @@ fn collect_schema_override_suggestions(
     for indices in file_groups.values().filter(|indices| indices.len() > 1) {
         let raw_names = indices
             .iter()
-            .map(|index| pending[*index].allocated.wire_name.as_str())
+            .map(|index| pending[*index].raw_name)
             .collect::<Vec<_>>();
         let unique = raw_names.iter().copied().collect::<HashSet<_>>();
         if unique.len() != indices.len()
@@ -1254,7 +1306,7 @@ fn collect_schema_override_suggestions(
                 .iter()
                 .map(|index| {
                     (
-                        pending[*index].allocated.wire_name.as_str(),
+                        pending[*index].raw_name,
                         pending[*index].allocated.name.as_str(),
                     )
                 })
@@ -1285,6 +1337,18 @@ fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut Diagnos
             .any(|schema| &schema.name == key && is_overrideable_schema(&schema.source));
         if !declared && !ir.removed.schemas.contains(key) {
             sink.push(unmatched_override_diagnostic("schema", "schemas", key));
+        }
+    }
+    for key in naming.overrides.schemas_by_source.keys() {
+        let declared = ir.schemas.iter().any(|schema| {
+            is_overrideable_schema(&schema.source) && schema.source.display() == *key
+        });
+        if !declared {
+            sink.push(unmatched_override_diagnostic(
+                "schema",
+                "schemasBySource",
+                key,
+            ));
         }
     }
     for key in naming.overrides.operations.keys() {
@@ -2501,6 +2565,12 @@ mod tests {
             schema: any_schema(&pointer),
             source: source(&pointer),
         }
+    }
+
+    fn named_schema_in(source_id: &str, name: &str) -> NamedSchema {
+        let mut schema = named_schema(name);
+        schema.source = SourceRef::new(source_id, format!("/components/schemas/{name}"));
+        schema
     }
 
     /// A schema materialized at an inline pointer — the shape a `$ref` into a media type's
@@ -4261,13 +4331,21 @@ mod tests {
         assert!(!sink.has_errors(), "{rendered}");
         let files = files.expect("fixture emits");
         for (path, declaration) in [
-            ("types/components/thing-a.ts", "export interface ThingA"),
-            ("types/components/thing-b.ts", "export interface ThingB"),
+            ("types/components/thinga.ts", "export interface ThingA"),
+            ("types/components/thingb.ts", "export interface ThingB"),
         ] {
             let file = files
                 .iter()
                 .find(|file| file.relative_path == path)
-                .unwrap_or_else(|| panic!("missing {path}"));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing {path}: {:?}",
+                        files
+                            .iter()
+                            .map(|file| file.relative_path.as_str())
+                            .collect::<Vec<_>>()
+                    )
+                });
             assert!(file.content.contains(declaration), "{path}");
         }
     }
@@ -4408,6 +4486,55 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_raw_schema_names_suggest_source_specific_overrides() {
+        let ir = Ir {
+            schemas: vec![
+                named_schema_in("workspace/a/models.yaml", "Thing"),
+                named_schema_in("workspace/b/models.yaml", "Thing"),
+            ],
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            ir,
+            &NamingConfig::default(),
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        let collision = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_TYPE_NAME)
+            .expect("schema collision");
+        assert_eq!(
+            collision.naming_override_suggestions.as_deref(),
+            Some(&vec![
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::SchemasBySource,
+                    source_name: "workspace/a/models.yaml#/components/schemas/Thing".to_owned(),
+                    identifier: "Thing_1".to_owned(),
+                },
+                NamingOverrideSuggestion {
+                    namespace: NamingOverrideNamespace::SchemasBySource,
+                    source_name: "workspace/b/models.yaml#/components/schemas/Thing".to_owned(),
+                    identifier: "Thing_2".to_owned(),
+                },
+            ])
+        );
+        let rendered = crate::diag::render_to_string(sink.into_sorted_vec());
+        assert!(rendered.contains("    schemasBySource:\n"));
+        assert!(
+            rendered
+                .contains("      'workspace/a/models.yaml#/components/schemas/Thing': 'Thing_1'\n")
+        );
+        assert!(
+            rendered
+                .contains("      'workspace/b/models.yaml#/components/schemas/Thing': 'Thing_2'\n")
+        );
+    }
+
+    #[test]
     fn a_schema_override_renames_a_declared_component() {
         let ir = Ir {
             schemas: vec![named_schema("widget")],
@@ -4422,6 +4549,52 @@ mod tests {
         );
         assert_eq!(analyzed.schema_names[0].name, "Gadget");
         assert!(sink.as_slice().is_empty());
+    }
+
+    #[test]
+    fn a_bare_schema_override_still_applies_to_every_matching_source() {
+        let ir = Ir {
+            schemas: vec![
+                named_schema_in("workspace/a/models.yaml", "Thing"),
+                named_schema_in("workspace/b/models.yaml", "Thing"),
+            ],
+            ..Ir::default()
+        };
+        let naming = schema_overrides(&[("Thing", "SharedThing")]);
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+
+        assert_eq!(schema_names(&analyzed), ["SharedThing", "SharedThing"]);
+        assert!(sink.as_slice().iter().any(|diagnostic| {
+            diagnostic.code == CODE_TYPE_NAME && diagnostic.message.contains("'SharedThing'")
+        }));
+    }
+
+    #[test]
+    fn a_source_schema_override_wins_over_a_bare_override() {
+        let ir = Ir {
+            schemas: vec![
+                named_schema_in("workspace/a/models.yaml", "Thing"),
+                named_schema_in("workspace/b/models.yaml", "Thing"),
+            ],
+            ..Ir::default()
+        };
+        let naming = NamingConfig {
+            overrides: NameOverrides {
+                schemas: BTreeMap::from([("Thing".to_owned(), "SharedThing".to_owned())]),
+                schemas_by_source: BTreeMap::from([(
+                    "workspace/a/models.yaml#/components/schemas/Thing".to_owned(),
+                    "ThingA".to_owned(),
+                )]),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+
+        assert_eq!(schema_names(&analyzed), ["ThingA", "SharedThing"]);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
     }
 
     #[test]
@@ -4611,6 +4784,43 @@ mod tests {
         assert_eq!(
             callback_diagnostic.json_pointer.as_deref(),
             Some("/naming/overrides/callbacks/phantom~0callback")
+        );
+    }
+
+    #[test]
+    fn an_unmatched_source_schema_override_is_an_exit_two_config_error() {
+        let source_key = "workspace/ghost.yaml#/components/schemas/Ghost";
+        let naming = NamingConfig {
+            overrides: NameOverrides {
+                schemas_by_source: BTreeMap::from([(source_key.to_owned(), "Ghost".to_owned())]),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(
+            Ir {
+                schemas: vec![named_schema("widget")],
+                ..Ir::default()
+            },
+            &naming,
+            &TypesConfig::default(),
+            &mut sink,
+        );
+
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_OVERRIDE_UNMATCHED)
+            .expect("unmatched source schema override");
+        assert_eq!(diagnostic.category, Category::Config);
+        assert_eq!(diagnostic.category.exit_code(), 2);
+        assert!(diagnostic.message.contains(source_key));
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some(
+                "/naming/overrides/schemasBySource/workspace~1ghost.yaml#~1components~1schemas~1Ghost"
+            )
         );
     }
 

@@ -789,6 +789,12 @@ pub struct NameOverrides {
     /// Keyed by a `components/schemas` key or a document-root schema's file stem; the value is the
     /// final type identifier.
     pub schemas: BTreeMap<String, String>,
+    /// Keyed by `SourceRef::display()` (`<source_id>#<json_pointer>`); the value is the final type
+    /// identifier. A local `source_id` is `workspace/<path>` when the workspace root contains the
+    /// target, or `allow/<n>/<path>` for the most specific matching `local.allowPaths` root, where
+    /// `<n>` is that root's zero-based config order. Reordering `local.allowPaths` can therefore
+    /// change these keys.
+    pub schemas_by_source: BTreeMap<String, String>,
     /// Keyed by the `operationId`; the value is the final operation identifier.
     pub operations: BTreeMap<String, String>,
     /// Keyed by a raw document `webhooks` map key; the value replaces its normalized identifier
@@ -3847,6 +3853,9 @@ mod tests {
         value["naming"] = json!({
             "overrides": {
                 "schemas": { "stream_liveInput": "StreamLiveInputId" },
+                "schemasBySource": {
+                    "workspace/models.yaml#/components/schemas/Thing": "SourceThing"
+                },
                 "operations": { "deleteWebhook": "DeleteRealtimeKitWebhook" },
                 "webhooks": { "pet-created": "PetCreatedEvent" },
                 "callbacks": { "delivery-status": "DeliveryStatusEvent" }
@@ -3861,6 +3870,15 @@ mod tests {
                 .get("stream_liveInput")
                 .map(String::as_str),
             Some("StreamLiveInputId")
+        );
+        assert_eq!(
+            resolved
+                .naming
+                .overrides
+                .schemas_by_source
+                .get("workspace/models.yaml#/components/schemas/Thing")
+                .map(String::as_str),
+            Some("SourceThing")
         );
         assert_eq!(
             resolved

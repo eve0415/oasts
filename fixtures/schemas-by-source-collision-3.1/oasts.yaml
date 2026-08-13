@@ -4,6 +4,6 @@ input:
 output: ./generated
 naming:
   overrides:
-    schemas:
+    schemasBySource:
       'workspace/a/models.yaml#/components/schemas/Thing': ThingA
       'workspace/b/models.yaml#/components/schemas/Thing': ThingB
