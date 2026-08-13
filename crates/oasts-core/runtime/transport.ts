@@ -988,8 +988,10 @@ function serializedParam(plan: ParamPlan, input: Readonly<Record<string, unknown
 }
 
 // The WHATWG URL parser's own definitions: a single-dot segment is "." or a case-insensitive
-// "%2e", and a double-dot segment is any two of those in sequence.
-const DOT_SEGMENT = /^(?:\.|%2e){1,2}$/i;
+// "%2e", and a double-dot segment is any two of those in sequence. The optional leading slash is
+// the separator a group carries, matched in place rather than sliced off — this runs per segment
+// per request, and the slice existed only to drop one character before an anchored test.
+const DOT_SEGMENT = /^\/?(?:\.|%2e){1,2}$/i;
 
 function operationUrl(
   transport: Transport,
@@ -1021,7 +1023,7 @@ function operationUrl(
     //
     // Exact match only. Label output like ".3,4,5" or ".x" is not a dot segment and must stay
     // byte-identical.
-    if (DOT_SEGMENT.test(segment.startsWith('/') ? segment.slice(1) : segment)) {
+    if (DOT_SEGMENT.test(segment)) {
       throw new TypeError(
         `operation ${descriptor.operationId} produced the path segment "${segment}", which a URL removes rather than requests`,
       );
