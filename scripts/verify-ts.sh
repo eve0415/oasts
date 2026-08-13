@@ -184,6 +184,14 @@ for fidelity in schema-fidelity-3.1 schema-fidelity-3.0; do
     --moduleResolution bundler "$work/$fidelity/compile-assert/cases.ts"
   echo "compile-assert matrix ok: $fidelity"
 done
+# `not` splits three ways on the types surface: provably empty renders `never` (agreeing with the
+# validator that rejects every value), a `not` of nothing is a no-op, and everything in between
+# keeps its sibling type and reports the narrowing it could not apply. The compile assertions are
+# what pin the first case — it used to render `unknown`, which accepts every value the shipped
+# validator rejects.
+generate_and_verify negation-3.1 oasts.yaml "$work/negation-3.1" types "negation-3.1"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/negation-3.1/compile-assert/cases.ts"
+echo "compile-assert matrix ok: negation-3.1"
 generate_and_verify defs-entry-3.1 oasts.yaml "$work/defs-entry-3.1" types "defs-entry-3.1"
 generate_and_verify empty-enum-3.1 oasts.yaml "$work/empty-enum-3.1" types "empty-enum-3.1"
 generate_and_verify document-root-ref-3.1 oasts.yaml "$work/document-root-ref-3.1" types "document-root-ref-3.1"
