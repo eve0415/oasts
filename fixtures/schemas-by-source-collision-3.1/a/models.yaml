@@ -1,0 +1,9 @@
+components:
+  schemas:
+    Thing:
+      type: object
+      required:
+        - fromA
+      properties:
+        fromA:
+          type: string

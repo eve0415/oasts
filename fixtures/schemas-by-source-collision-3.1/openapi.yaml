@@ -1,0 +1,25 @@
+openapi: 3.1.0
+info:
+  title: Schema collision across source documents
+  version: 1.0.0
+paths:
+  /a:
+    get:
+      operationId: getThingA
+      responses:
+        '200':
+          description: Thing from source A
+          content:
+            application/json:
+              schema:
+                $ref: './a/models.yaml#/components/schemas/Thing'
+  /b:
+    get:
+      operationId: getThingB
+      responses:
+        '200':
+          description: Thing from source B
+          content:
+            application/json:
+              schema:
+                $ref: './b/models.yaml#/components/schemas/Thing'

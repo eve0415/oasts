@@ -4249,6 +4249,30 @@ mod tests {
     }
 
     #[test]
+    fn schema_overrides_can_address_duplicate_names_by_source() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/schemas-by-source-collision-3.1");
+        let config = crate::config::load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+            .expect("resolved fixture config");
+        let mut sink = DiagnosticSink::new();
+        let files = crate::pipeline::compile(&config, true, &mut sink);
+        let rendered = crate::diag::render_to_string(sink.as_slice().to_vec());
+
+        assert!(!sink.has_errors(), "{rendered}");
+        let files = files.expect("fixture emits");
+        for (path, declaration) in [
+            ("types/components/thing-a.ts", "export interface ThingA"),
+            ("types/components/thing-b.ts", "export interface ThingB"),
+        ] {
+            let file = files
+                .iter()
+                .find(|file| file.relative_path == path)
+                .unwrap_or_else(|| panic!("missing {path}"));
+            assert!(file.content.contains(declaration), "{path}");
+        }
+    }
+
+    #[test]
     fn schema_override_value_is_validated_like_any_generated_name() {
         let ir = Ir {
             schemas: vec![named_schema("widget")],

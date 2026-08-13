@@ -1,0 +1,9 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+naming:
+  overrides:
+    schemas:
+      'workspace/a/models.yaml#/components/schemas/Thing': ThingA
+      'workspace/b/models.yaml#/components/schemas/Thing': ThingB
