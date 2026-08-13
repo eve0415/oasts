@@ -1285,15 +1285,13 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     .is_some()
             })
         };
+        let neutral = projects_in(TypePosition::Neutral);
 
         if tagged_projection
-            && [
-                TypePosition::Neutral,
-                TypePosition::Request,
-                TypePosition::Response,
-            ]
-            .into_iter()
-            .all(&projects_in)
+            && neutral
+            && [TypePosition::Request, TypePosition::Response]
+                .into_iter()
+                .all(&projects_in)
         {
             return None;
         }
@@ -1324,7 +1322,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         // from the response shape, so that variant has no property to carry the tag. The union
         // still narrows everywhere the property exists, which is why the messages below — which
         // say the union cannot narrow — would be false here.
-        if tagged_projection && projects_in(TypePosition::Neutral) {
+        if tagged_projection && neutral {
             let directional = [
                 (TypePosition::Request, "request"),
                 (TypePosition::Response, "response"),
