@@ -184,6 +184,14 @@ for fidelity in schema-fidelity-3.1 schema-fidelity-3.0; do
     --moduleResolution bundler "$work/$fidelity/compile-assert/cases.ts"
   echo "compile-assert matrix ok: $fidelity"
 done
+# A request/response twin is emitted for a position the document uses the component at, not for
+# every position its shape would split at. Every component in this fixture carries both markers, so
+# shape alone would give each of them both twins. The compile assertions import the twins that
+# should not exist under `@ts-expect-error`: a resurrected dead twin is not a type error by itself,
+# so requiring the import to fail is the only way to assert it stayed dead.
+generate_and_verify variant-position-3.1 oasts.yaml "$work/variant-position-3.1" types "variant-position-3.1"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/variant-position-3.1/compile-assert/cases.ts"
+echo "compile-assert matrix ok: variant-position-3.1"
 # `not` splits three ways on the types surface: provably empty renders `never` (agreeing with the
 # validator that rejects every value), a `not` of nothing is a no-op, and everything in between
 # keeps its sibling type and reports the narrowing it could not apply. The compile assertions are

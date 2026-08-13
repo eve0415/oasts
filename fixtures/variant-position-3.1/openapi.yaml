@@ -1,0 +1,89 @@
+openapi: 3.1.0
+info:
+  title: Variant Position Probe
+  version: 1.0.0
+paths:
+  /read:
+    get:
+      operationId: readOnly
+      responses:
+        "200":
+          description: a component this document only ever reads back
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadBack"
+  /write:
+    post:
+      operationId: writeOnly
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendOnly"
+      responses:
+        "204":
+          description: accepted
+  /both:
+    put:
+      operationId: roundTrip
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoundTrip"
+      responses:
+        "200":
+          description: the same component in both directions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoundTrip"
+components:
+  schemas:
+    # Every component here carries both markers, so shape alone would split each of them at both
+    # positions. What decides the twins is which positions the operations above actually use.
+    ReadBack:
+      type: object
+      required: [id, secret, nested]
+      properties:
+        id:
+          type: string
+          readOnly: true
+        secret:
+          type: string
+          writeOnly: true
+        nested:
+          $ref: "#/components/schemas/ReadBackLeaf"
+    SendOnly:
+      type: object
+      required: [id, secret]
+      properties:
+        id:
+          type: string
+          readOnly: true
+        secret:
+          type: string
+          writeOnly: true
+    RoundTrip:
+      type: object
+      required: [id, secret]
+      properties:
+        id:
+          type: string
+          readOnly: true
+        secret:
+          type: string
+          writeOnly: true
+    # Named by nothing but a response-only component, so it inherits response-only through the
+    # reference graph rather than from an operation of its own.
+    ReadBackLeaf:
+      type: object
+      required: [id, secret]
+      properties:
+        id:
+          type: string
+          readOnly: true
+        secret:
+          type: string
+          writeOnly: true
