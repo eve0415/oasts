@@ -1886,13 +1886,23 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             .borrow_mut()
             .extend(alias_diagnostics);
         self.write_imports(&mut content, imports, "./");
-        self.write_schema_declaration(
+        let neutral_variants = match (&request_variant, &response_variant) {
+            (Some(request), Some(response)) => Some(NeutralSchemaVariants { request, response }),
+            _ => None,
+        };
+        self.write_schema_declaration_with_docs(
             &mut content,
             &allocated.name,
             &schema.schema,
             TypePosition::Neutral,
             TypeAxis::Application,
-            &schema.source,
+            SchemaDeclarationContext {
+                source: &schema.source,
+                docs: SchemaDocView {
+                    neutral_variants,
+                    ..SchemaDocView::from(&schema.schema.meta().docs)
+                },
+            },
         );
         if let Some(export) = &request_variant {
             self.write_schema_declaration(
@@ -1954,6 +1964,29 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         axis: TypeAxis,
         source: &SourceRef,
     ) {
+        self.write_schema_declaration_with_docs(
+            output,
+            name,
+            schema,
+            position,
+            axis,
+            SchemaDeclarationContext {
+                source,
+                docs: SchemaDocView::from(&schema.meta().docs),
+            },
+        );
+    }
+
+    fn write_schema_declaration_with_docs(
+        &self,
+        output: &mut String,
+        name: &str,
+        schema: &SchemaNode,
+        position: TypePosition,
+        axis: TypeAxis,
+        context: SchemaDeclarationContext<'_>,
+    ) {
+        let SchemaDeclarationContext { source, docs } = context;
         if let Some(values) = schema_finite_values(schema)
             && self.model.config.types.enum_representation == EnumRepresentation::Const
         {
@@ -1975,7 +2008,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             write_source_metadata(output, source, 0);
             write_schema_tsdoc(
                 output,
-                SchemaDocView::from(&schema.meta().docs),
+                docs,
                 DocKind::Schema,
                 &self.model.config.documentation,
                 0,
@@ -2008,7 +2041,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             write_source_metadata(output, source, 0);
             write_schema_tsdoc(
                 output,
-                SchemaDocView::from(&schema.meta().docs),
+                docs,
                 DocKind::Schema,
                 &self.model.config.documentation,
                 0,
@@ -2027,7 +2060,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         write_source_metadata(output, source, 0);
         write_schema_tsdoc(
             output,
-            SchemaDocView::from(&schema.meta().docs),
+            docs,
             DocKind::Schema,
             &self.model.config.documentation,
             0,
@@ -3795,6 +3828,7 @@ fn property_docs(schema: &SchemaNode) -> SchemaDocView<'_> {
         examples: &docs.examples,
         comment: docs.comment.as_deref(),
         constraints: &docs.constraints,
+        neutral_variants: None,
     }
 }
 
@@ -3815,6 +3849,7 @@ fn schema_field_docs<'a>(
         examples: &schema.meta().docs.examples,
         comment: schema.meta().docs.comment.as_deref(),
         constraints: &schema.meta().docs.constraints,
+        neutral_variants: None,
     }
 }
 
@@ -4116,6 +4151,18 @@ struct SchemaDocView<'a> {
     examples: &'a [Value],
     comment: Option<&'a str>,
     constraints: &'a [String],
+    neutral_variants: Option<NeutralSchemaVariants<'a>>,
+}
+
+struct SchemaDeclarationContext<'a> {
+    source: &'a SourceRef,
+    docs: SchemaDocView<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct NeutralSchemaVariants<'a> {
+    request: &'a str,
+    response: &'a str,
 }
 
 impl<'a> From<&'a SchemaDocs> for SchemaDocView<'a> {
@@ -4128,6 +4175,7 @@ impl<'a> From<&'a SchemaDocs> for SchemaDocView<'a> {
             examples: &docs.examples,
             comment: docs.comment.as_deref(),
             constraints: &docs.constraints,
+            neutral_variants: None,
         }
     }
 }
@@ -4143,6 +4191,7 @@ struct TsDoc<'a> {
     examples: Vec<DocExample<'a>>,
     private_remarks: Option<Cow<'a, str>>,
     see: Vec<(Cow<'a, str>, Option<Cow<'a, str>>)>,
+    neutral_variants: Option<NeutralSchemaVariants<'a>>,
 }
 
 struct DocExample<'a> {
@@ -4232,6 +4281,7 @@ fn write_schema_tsdoc(
             .collect();
     }
     tsdoc.private_remarks = docs.comment.map(Cow::Borrowed);
+    tsdoc.neutral_variants = docs.neutral_variants;
     write_tsdoc(output, &tsdoc, indent);
 }
 
@@ -4537,6 +4587,7 @@ fn write_tsdoc(output: &mut String, docs: &TsDoc<'_>, indent: usize) {
         && docs.examples.is_empty()
         && docs.private_remarks.is_none()
         && docs.see.is_empty()
+        && docs.neutral_variants.is_none()
     {
         return;
     }
@@ -4551,17 +4602,31 @@ fn write_tsdoc(output: &mut String, docs: &TsDoc<'_>, indent: usize) {
         writer.begin_section();
         writer.encoded_lines(summary);
     }
-    if !docs.remarks.is_empty() {
+    if !docs.remarks.is_empty() || docs.neutral_variants.is_some() {
         writer.begin_section();
         writer.plain_line("@remarks");
-        let (first, rest) = docs
-            .remarks
-            .split_first()
-            .expect("non-empty remarks have a first entry");
-        writer.encoded_lines(first);
-        for remark in rest {
-            writer.plain_line("");
-            writer.encoded_lines(remark);
+        if let Some((first, rest)) = docs.remarks.split_first() {
+            writer.encoded_lines(first);
+            for remark in rest {
+                writer.plain_line("");
+                writer.encoded_lines(remark);
+            }
+        }
+        if let Some(variants) = docs.neutral_variants {
+            if !docs.remarks.is_empty() {
+                writer.plain_line("");
+            }
+            writer.start_line();
+            writer.output.push_str(
+                "This is the shape declared by the document, not a wire shape for any single message. Use {@link ",
+            );
+            write_link_part(writer.output, variants.request);
+            writer
+                .output
+                .push_str("} for what a caller sends and {@link ");
+            write_link_part(writer.output, variants.response);
+            writer.output.push_str("} for what the server returns.");
+            writer.finish_line();
         }
     }
     if let Some(deprecated) = docs.deprecated {
@@ -7620,6 +7685,8 @@ mod tests {
                 " * \n",
                 " * @remarks\n",
                 " * A pet.\n",
+                " * \n",
+                " * This is the shape declared by the document, not a wire shape for any single message. Use {@link PetRequest} for what a caller sends and {@link PetResponse} for what the server returns.\n",
                 " */\n",
                 "export interface Pet {\n",
                 "  readonly id: number | null;\n",
@@ -7673,6 +7740,57 @@ mod tests {
             .find(|file| file.relative_path.ends_with("pair.ts"))
             .expect("Pair file");
         assert!(generated_body(pair).ends_with("export type Pair = [string, number];\n"));
+    }
+
+    #[test]
+    fn neutral_variant_tsdoc_names_both_wire_shapes_and_preserves_description() {
+        let document = openapi(json!({
+            "Widget": {
+                "description": "A catalog widget.",
+                "type": "object",
+                "required": ["id", "name"],
+                "properties": {
+                    "id": { "type": "string", "readOnly": true },
+                    "secret": { "type": "string", "writeOnly": true },
+                    "name": { "type": "string" }
+                }
+            },
+            "ReadOnlyWidget": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "readOnly": true },
+                    "name": { "type": "string" }
+                }
+            }
+        }));
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let widget = generated_body(schema_file(&files, "widget"));
+        let guidance = "This is the shape declared by the document, not a wire shape for any single message. Use {@link WidgetRequest} for what a caller sends and {@link WidgetResponse} for what the server returns.";
+        assert_eq!(widget.matches(guidance).count(), 1, "{widget}");
+        assert!(
+            widget.contains(&format!(
+                concat!(
+                    "/**\n",
+                    " * A catalog widget.\n",
+                    " * \n",
+                    " * @remarks\n",
+                    " * {}\n",
+                    " */\n",
+                    "export interface Widget {{"
+                ),
+                guidance
+            )),
+            "{widget}"
+        );
+
+        let read_only = generated_body(schema_file(&files, "readonlywidget"));
+        assert!(
+            read_only.contains("export interface ReadOnlyWidgetRequest {")
+                && !read_only.contains("ReadOnlyWidgetResponse")
+                && !read_only.contains("shape declared by the document"),
+            "{read_only}"
+        );
     }
 
     /// The variant-need decision reaches read/write-only markers buried in an inline nested object,
@@ -10160,6 +10278,7 @@ mod tests {
                 Cow::Owned("u{v}|<x>\r\n*/sourceMappingURL=".to_owned()),
                 Some(Cow::Owned("L{a}\r\nB".to_owned())),
             )],
+            neutral_variants: None,
         };
         let mut output = String::new();
 
