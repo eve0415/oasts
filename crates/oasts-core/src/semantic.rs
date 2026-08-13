@@ -4337,15 +4337,7 @@ mod tests {
             let file = files
                 .iter()
                 .find(|file| file.relative_path == path)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing {path}: {:?}",
-                        files
-                            .iter()
-                            .map(|file| file.relative_path.as_str())
-                            .collect::<Vec<_>>()
-                    )
-                });
+                .expect("a per-source override names one component file per document");
             assert!(file.content.contains(declaration), "{path}");
         }
     }
