@@ -2058,26 +2058,20 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 "schema keyword 'propertyNames' narrows validation but its constraint is not applied to the emitted type; the validators artifact enforces it instead",
             ));
         }
+        // Classified here but acted on below, after every keyword diagnostic has had its say: the
+        // classification decides whether the `not` warning fires, while lowering to `Never` is a
+        // `return` and would carry every sibling keyword's diagnostic out with it.
         let not_admits_everything = meta
             .validation_applicators()
             .not
             .as_deref()
             .is_some_and(schema_admits_everything);
-        if not_admits_everything {
-            let mut applicators = meta
-                .validation_applicators
-                .take()
-                .map(|applicators| *applicators)
-                .unwrap_or_default();
-            applicators.not = None;
-            meta.validation_applicators = box_if_populated(applicators);
-            return SchemaNode::Never { meta };
-        }
-        if meta
-            .validation_applicators()
-            .not
-            .as_deref()
-            .is_some_and(|schema| !matches!(schema, SchemaNode::Never { .. }))
+        if !not_admits_everything
+            && meta
+                .validation_applicators()
+                .not
+                .as_deref()
+                .is_some_and(|schema| !matches!(schema, SchemaNode::Never { .. }))
         {
             self.sink.push(self.warning_diagnostic(
                 CODE_UNAPPLIED_NARROWING,
@@ -2235,6 +2229,23 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     meta,
                 };
             }
+        }
+        // A `not` whose subschema admits every instance says exactly what the boolean schema `false`
+        // says — no instance satisfies this — so it lowers the same way, and silently, for the same
+        // reason. The applicator goes with it: the node already admits nothing, so re-stating the
+        // negation would only emit a second rejection of a value the first one rejected.
+        //
+        // Deferred to here so a sibling keyword's diagnostic is reported before the return: an
+        // unrepresentable `contains` beside a `not: {}` is still an unrepresentable `contains`.
+        if not_admits_everything {
+            let mut applicators = meta
+                .validation_applicators
+                .take()
+                .map(|applicators| *applicators)
+                .unwrap_or_default();
+            applicators.not = None;
+            meta.validation_applicators = box_if_populated(applicators);
+            return SchemaNode::Never { meta };
         }
         // JSON Schema (both dialects) applies every keyword on one schema object conjunctively.
         // Detect how many independent "pieces" the object carries; the historical dispatch below
@@ -9470,6 +9481,46 @@ mod tests {
                     && meta.validation_applicators().not.is_none()
         ));
         assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    /// Lowering to `Never` is a `return`, so it has to happen after every sibling keyword has been
+    /// diagnosed. Placed before them, it carried their diagnostics out of the function with it: a
+    /// document whose `contains` the types surface cannot represent stopped reporting it at all.
+    #[test]
+    fn a_provably_empty_not_still_reports_its_sibling_keywords() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "RejectAll": { "not": {}, "contains": { "type": "string" }, "if": { "type": "string" } } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "RejectAll"),
+            SchemaNode::Never { .. }
+        ));
+        let reported: Vec<_> = sink
+            .as_slice()
+            .iter()
+            .map(|diagnostic| (diagnostic.code, diagnostic.json_pointer.as_deref()))
+            .collect();
+        assert!(
+            reported.contains(&(
+                CODE_UNSUPPORTED,
+                Some("/components/schemas/RejectAll/contains")
+            )),
+            "{reported:?}"
+        );
+        assert!(
+            reported.contains(&(CODE_UNSUPPORTED, Some("/components/schemas/RejectAll/if"))),
+            "{reported:?}"
+        );
+        // The `not` itself stays silent: it is proven empty, not unrepresentable.
+        assert!(
+            !reported
+                .iter()
+                .any(|(code, _)| *code == CODE_UNAPPLIED_NARROWING),
+            "{reported:?}"
+        );
     }
 
     #[test]
