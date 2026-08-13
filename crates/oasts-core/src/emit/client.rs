@@ -2398,24 +2398,26 @@ fn render_form_field_input(
     } else {
         axis
     };
-    // A binary upload does not render its schema — the byte container replaces it — so the one
-    // fact the schema still carries, whether the field repeats, is lost unless it is read
-    // separately. The descriptor reads it (`repeated:`) and the runtime enforces it, which is how
-    // the emitted type came to promise a single Blob for a field the runtime rejects unless it is
-    // given an array. Every other field renders its schema, so an array one is already an array.
     let binary_upload = matches!(
         &field.serialization,
         FieldSerializationPlan::Content { media, .. } if media.binary_upload
     );
+    let array_items = schema_array_items(renderer.model, &field.schema, &mut HashSet::new());
+    // The runtime iterates a repeated field before it applies the wrapper, so a wrapped field's
+    // body is one array element. An unwrapped non-binary field still renders its array schema
+    // directly because its serializer receives each element after the runtime performs the split.
+    let body_schema = if field.wrapper.wrapped {
+        array_items.unwrap_or(&field.schema)
+    } else {
+        &field.schema
+    };
     let body = if binary_upload {
         "Blob | File".to_owned()
     } else {
-        renderer.render_type(&field.schema, TypePosition::Request, field_axis, indent)
+        renderer.render_type(body_schema, TypePosition::Request, field_axis, indent)
     };
-    // The array wraps the whole per-part input rather than the body alone: the runtime iterates a
-    // repeated field and hands each ITEM to the part serializer, wrapper and all.
     let repeat = |rendered: String| {
-        if binary_upload && schema_is_array(renderer.model, &field.schema, &mut HashSet::new()) {
+        if array_items.is_some() && (binary_upload || field.wrapper.wrapped) {
             format!("({rendered})[]")
         } else {
             rendered
@@ -3632,17 +3634,25 @@ fn schema_is_array(
     schema: &SchemaNode,
     visited: &mut HashSet<(String, String)>,
 ) -> bool {
+    schema_array_items(model, schema, visited).is_some()
+}
+
+fn schema_array_items<'a>(
+    model: &'a EmissionModel<'_, '_>,
+    schema: &'a SchemaNode,
+    visited: &mut HashSet<(String, String)>,
+) -> Option<&'a SchemaNode> {
     match schema {
-        SchemaNode::Array { .. } => true,
+        SchemaNode::Array { items, .. } => Some(items),
         SchemaNode::Ref { target, .. } => {
             let key = (target.source_id.clone(), target.json_pointer.clone());
             if !visited.insert(key) {
-                return false;
+                return None;
             }
             model
                 .schema_target(&target.source_id, &target.json_pointer)
                 .and_then(|target| model.analyzed.ir.schemas.get(target.index))
-                .is_some_and(|target| schema_is_array(model, &target.schema, visited))
+                .and_then(|target| schema_array_items(model, &target.schema, visited))
         }
         SchemaNode::Primitive { .. }
         | SchemaNode::Finite { .. }
@@ -3653,7 +3663,7 @@ fn schema_is_array(
         | SchemaNode::AnyOf { .. }
         | SchemaNode::Any { .. }
         | SchemaNode::Never { .. }
-        | SchemaNode::Unknown { .. } => false,
+        | SchemaNode::Unknown { .. } => None,
     }
 }
 
@@ -4730,6 +4740,68 @@ mod tests {
         );
         let (actual, diagnostics) = emit_operation(document, "uploadasset");
         assert_eq!(actual, expected);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn repeated_wrapped_multipart_field_takes_an_array_of_wrappers() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/uploads": {
+                    "post": {
+                        "operationId": "uploadFields",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["metas", "tags", "meta", "files", "cover"],
+                                        "properties": {
+                                            "metas": {
+                                                "type": "array",
+                                                "items": { "type": "object", "properties": { "tag": { "type": "string" } } }
+                                            },
+                                            "tags": { "type": "array", "items": { "type": "string" } },
+                                            "meta": { "type": "object", "properties": { "tag": { "type": "string" } } },
+                                            "files": {
+                                                "type": "array",
+                                                "items": { "type": "string", "format": "binary" }
+                                            },
+                                            "cover": { "type": "string", "format": "binary" }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "metas": { "contentType": "application/json, application/cbor" },
+                                        "meta": { "contentType": "application/json, application/cbor" }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (actual, diagnostics) = emit_operation(document, "uploadfields");
+
+        assert!(
+            actual.contains(
+                "metas: ({ body: {\n      tag?: string;\n    }; contentType: \"application/json\" | \"application/cbor\" })[];"
+            ),
+            "{actual}"
+        );
+        assert!(actual.contains("tags: string[];"), "{actual}");
+        assert!(
+            actual.contains(
+                "meta: { body: {\n      tag?: string;\n    }; contentType: \"application/json\" | \"application/cbor\" };"
+            ),
+            "{actual}"
+        );
+        assert!(actual.contains("files: (Blob | File)[];"), "{actual}");
+        assert!(actual.contains("cover: Blob | File;"), "{actual}");
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
@@ -6550,6 +6622,13 @@ mod tests {
 
         let mut sink = DiagnosticSink::new();
         let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        assert!(matches!(
+            schema_array_items(&model, &items_ref, &mut HashSet::new()),
+            Some(SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            })
+        ));
         assert!(schema_is_array(&model, &items_ref, &mut HashSet::new()));
         let mut visited: HashSet<_> = [(
             items_ref.meta().source.source_id.clone(),
@@ -6561,6 +6640,7 @@ mod tests {
             visited.clear();
             visited.insert((target.source_id.clone(), target.json_pointer.clone()));
         }
+        assert!(schema_array_items(&model, &items_ref, &mut visited).is_none());
         assert!(!schema_is_array(&model, &items_ref, &mut visited));
         assert!(schema_is_array(
             &model,
