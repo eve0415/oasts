@@ -1274,6 +1274,18 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             ));
         }
 
+        let projects_in = |position: TypePosition| {
+            branches.iter().zip(tags).all(|(branch, tags)| {
+                self.discriminator_branches_fix_a_literal_in_position(
+                    std::slice::from_ref(branch),
+                    property,
+                    position,
+                ) || self
+                    .projected_discriminator_values(branch, property, position, tags)
+                    .is_some()
+            })
+        };
+
         if tagged_projection
             && [
                 TypePosition::Neutral,
@@ -1281,17 +1293,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                 TypePosition::Response,
             ]
             .into_iter()
-            .all(|position| {
-                branches.iter().zip(tags).all(|(branch, tags)| {
-                    self.discriminator_branches_fix_a_literal_in_position(
-                        std::slice::from_ref(branch),
-                        property,
-                        position,
-                    ) || self
-                        .projected_discriminator_values(branch, property, position, tags)
-                        .is_some()
-                })
-            })
+            .all(&projects_in)
         {
             return None;
         }
@@ -1314,6 +1316,26 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         {
             return Some(format!(
                 "discriminator property '{property}' uses a tag whose JSON kind does not match the branch's declared scalar type, so that branch is emitted without tagged projection"
+            ));
+        }
+
+        // A directional variant can fail to project for a reason the neutral declaration does not
+        // share: a `readOnly` discriminator is absent from the request shape and a `writeOnly` one
+        // from the response shape, so that variant has no property to carry the tag. The union
+        // still narrows everywhere the property exists, which is why the messages below — which
+        // say the union cannot narrow — would be false here.
+        if tagged_projection && projects_in(TypePosition::Neutral) {
+            let directional = [
+                (TypePosition::Request, "request"),
+                (TypePosition::Response, "response"),
+            ]
+            .into_iter()
+            .filter(|&(position, _)| !projects_in(position))
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>()
+            .join(" and ");
+            return Some(format!(
+                "discriminator property '{property}' is absent from the {directional} shape, so that variant is emitted without tagged projection while the neutral declaration still narrows"
             ));
         }
 
@@ -9311,6 +9333,18 @@ mod tests {
             1,
             "{diagnostics:?}"
         );
+        // Names the shape that cannot carry the tag. The neutral declaration above demonstrably
+        // narrows, so a message claiming the union cannot narrow would be false of this document.
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+                .map(|diagnostic| diagnostic.message.as_str()),
+            Some(
+                "discriminator property 'kind' is absent from the request shape, so that variant is emitted without tagged projection while the neutral declaration still narrows"
+            ),
+            "{diagnostics:?}"
+        );
 
         let filtered_response_document = openapi(json!({
             "Cat": { "type": "object", "required": ["kind"], "properties": {
@@ -9339,6 +9373,17 @@ mod tests {
                 .filter(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
                 .count(),
             1,
+            "{diagnostics:?}"
+        );
+        // The mirror image, and the reason one axis-blind sentence could not serve both.
+        assert_eq!(
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == CODE_DISCRIMINATOR_NARROWING)
+                .map(|diagnostic| diagnostic.message.as_str()),
+            Some(
+                "discriminator property 'kind' is absent from the response shape, so that variant is emitted without tagged projection while the neutral declaration still narrows"
+            ),
             "{diagnostics:?}"
         );
     }
