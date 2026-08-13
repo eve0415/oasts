@@ -49,19 +49,30 @@ strict_flag_matrix() {
 # Only sound while pruning is on: `filters.orphans: true` means the document deliberately keeps
 # components no operation reaches, so those fixtures opt out.
 #
-# The known-orphan list below is debt, not design, and it is deliberately enumerated rather than
-# skipped by fixture so that a NEW orphan in any of these documents still fails. Every entry is one
-# pre-existing defect of a single family: a form, multipart, or non-JSON body types itself from
-# flattened fields or from its media classification instead of naming its schema, so the pruner
-# keeps a component the emitter never references. Reproduced identically at v0.0.3, so none of it
-# comes from `allOf` identity — closing it means deciding how a non-JSON body names its schema,
-# which is its own change.
+# The known-orphan list below is enumerated rather than skipped by fixture so that a NEW orphan in
+# any of these documents still fails. All of it is the same disagreement — pruning is
+# artifact-agnostic while emission is per-artifact, so the pruner keeps a component this artifact
+# never names — but the entries are five causes, not one, and two of them are consequences of
+# decisions this repo made on purpose rather than defects waiting to be fixed:
 #   form-composition-3.1  Forum/Text/NestedLeft*/NestedRight — urlencoded and multipart request
-#                         bodies whose properties the client flattens into field descriptors.
+#                         bodies whose properties the client flattens into per-field descriptors.
+#                         No value of the named type ever exists to bind an import to: the body is
+#                         serialized field by field, so there is no reference site to name it at.
 #   tictactoe-3.1         ErrorMessage — a `text/html` response typed `string` by classification.
-#   transform-composition-3.1  the per-component codec modules for a form-composed body.
-#   strict-flags-3.1      Manifest — a multipart response part.
-#   multipart-response-3.0  SnippetFiles — likewise, in both the types and validators trees.
+#                         Naming it would assert a contract the classification does not provide.
+#   multipart-response-3.0  SnippetFiles — types an unnamed `additionalProperties` catch-all, not a
+#                         declared part. An index signature has no field to attach the name to, and
+#                         the emitted element type is a different shape from the component's.
+#   strict-flags-3.1      Manifest — a declared multipart response part. The types artifact
+#                         represents a multipart response as `unknown` and says so in the emitted
+#                         remark, so the part's schema is unnamed there by design; the client
+#                         artifact models the parts and does name it. Not a wiring gap.
+#   transform-composition-3.1  Left/Right/Required/Audited — NOT a form body; this fixture has none.
+#                         A composing schema's codec inlines its `allOf` branches' conversions
+#                         instead of calling the branch codecs, which orphans the branch codec
+#                         modules. Deliberate: a branch codec spreads every key back, so two
+#                         whole-value calls over one value revert each other. The fixture's own
+#                         document says so, and exists to pin it.
 # The key is fixture plus file basename, not the full tree path, so one entry covers a component
 # orphaned under several of a fixture's configs — and, the cost of that, does not notice the same
 # basename newly orphaned in a tree it was fine in before.
