@@ -1315,10 +1315,15 @@ async function multipartPart(plan: MultipartFieldPlan, value: unknown): Promise<
   if (body === null || body === undefined) {
     throw new TypeError(`multipart field ${plan.name} has no body`);
   }
-  const selectedFilename = wrapper?.filename;
-  if (selectedFilename !== undefined && typeof selectedFilename !== 'string') {
+  const rawFilename = wrapper?.filename;
+  if (rawFilename !== undefined && typeof rawFilename !== 'string') {
     throw new TypeError(`multipart field ${plan.name} filename must be a string`);
   }
+  // Restated as a typed binding rather than reused from the guard above: `!== undefined` narrows
+  // nothing when a consumer compiles with `strictNullChecks` off, so the guard's own narrowing is
+  // not available to every project this lands in. A `typeof` test is.
+  const selectedFilename: string | undefined =
+    typeof rawFilename === 'string' ? rawFilename : undefined;
   const media = multipartMedia(plan, wrapper?.contentType);
   const payload = await multipartPayload(media.payload, body);
   const filename = plan.filename ? selectedFilename ?? blobFilename(body) : undefined;
@@ -2199,7 +2204,10 @@ export async function execute<S extends string = never>(
         continue;
       }
       const replacement = await middleware.onRequest(finalRequest, context);
-      if (replacement !== undefined) {
+      // Truthiness, not `!== undefined`: neither that test nor `??` removes `void` when the
+      // consumer has `strictNullChecks` off. A Request is never falsy, so no in-contract value
+      // changes hands differently.
+      if (replacement) {
         finalRequest = replacement;
       }
       assertAllowedHeaders(finalRequest.headers, 'request middleware produced a forbidden header');
@@ -2250,7 +2258,8 @@ export async function execute<S extends string = never>(
         continue;
       }
       const replacement = await middleware.onResponse(finalResponse, context);
-      if (replacement !== undefined) {
+      // Truthiness for the same reason as the request loop above.
+      if (replacement) {
         finalResponse = replacement;
       }
       if (finalResponse.bodyUsed) {
