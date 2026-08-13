@@ -2423,7 +2423,7 @@ fn diagnose_multipart_headers(
             _ => sink.push(source_diagnostic(
                 "OASTS1417",
                 format!(
-                    "multipart field '{field_name}' declares header '{header_name}', but it is never emitted because multipart/form-data forbids senders including it"
+                    "multipart field '{field_name}' declares header '{header_name}', but it is never emitted because RFC 7578 §4.8 permits only Content-Disposition, Content-Type, and Content-Transfer-Encoding part headers"
                 ),
                 &header.source,
                 Severity::Warning,
@@ -7519,6 +7519,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Severity::Warning);
+        assert_eq!(
+            diagnostics[0].message,
+            "multipart field 'field' declares header 'X-Custom', but it is never emitted because RFC 7578 §4.8 permits only Content-Disposition, Content-Type, and Content-Transfer-Encoding part headers"
+        );
     }
 
     #[test]
