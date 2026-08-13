@@ -2652,6 +2652,7 @@ fn response_entry_payload_type(
             },
             TypePosition::Response,
             axis,
+            0,
         ),
     }
 }

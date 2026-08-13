@@ -3431,6 +3431,7 @@ impl Emitter<'_, '_, '_> {
                 media_stream_kind(&media_type.essence, media_type.streaming_marked),
                 TypePosition::Request,
                 axis,
+                indent + 2,
             );
             if let Some(description) = &body.description {
                 write_schema_tsdoc(
@@ -3543,6 +3544,7 @@ impl Emitter<'_, '_, '_> {
                 media_stream_kind(&media_type.essence, media_type.streaming_marked),
                 TypePosition::Response,
                 TypeAxis::Wire,
+                0,
             );
             if !types.contains(&rendered) {
                 types.push(rendered);
@@ -3563,6 +3565,7 @@ impl Emitter<'_, '_, '_> {
                 media_stream_kind(&media_type.essence, media_type.streaming_marked),
                 TypePosition::Response,
                 TypeAxis::Application,
+                0,
             );
             if !types.contains(&rendered) {
                 types.push(rendered);
@@ -3582,6 +3585,7 @@ impl Emitter<'_, '_, '_> {
         stream: Option<StreamKind>,
         position: TypePosition,
         axis: TypeAxis,
+        indent: usize,
     ) -> String {
         // The two directions deliberately disagree, and this is the one place that says so. A
         // response stream is the thing the client hands back, so SSE arrives as typed events; a
@@ -3603,7 +3607,7 @@ impl Emitter<'_, '_, '_> {
                 // emitted module unable to compile against its own declared result.
                 return format!(
                     "AsyncIterable<SseEvent<{}>>",
-                    self.render_type(schema, position, TypeAxis::Application, 0)
+                    self.render_type(schema, position, TypeAxis::Application, indent)
                 );
             }
             (Some(StreamKind::Raw), TypePosition::Response | TypePosition::Neutral) => {
@@ -3612,7 +3616,7 @@ impl Emitter<'_, '_, '_> {
             (None, _) => {}
         }
         if is_json(essence) {
-            self.render_type(schema, position, axis, 0)
+            self.render_type(schema, position, axis, indent)
         } else if essence.starts_with("text/") && !is_xml(essence) {
             "string".to_owned()
         } else {
@@ -10098,6 +10102,67 @@ mod tests {
         assert!(!body.contains("@default "));
         assert!(!body.contains("@summary"));
         assert!(!body.contains("@description"));
+    }
+
+    #[test]
+    fn inline_request_body_is_indented_to_its_member_column() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/labels": {
+                    "post": {
+                        "operationId": "submitLabels",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["labels", "metadata"],
+                                        "properties": {
+                                            "labels": {
+                                                "description": "The labels to submit.",
+                                                "type": "array",
+                                                "items": { "type": "string" }
+                                            },
+                                            "metadata": {
+                                                "type": "object",
+                                                "required": ["source"],
+                                                "properties": {
+                                                    "source": { "type": "string" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "Accepted" } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let operation = find_file(&files, "types/operations/submitlabels.ts");
+        assert!(
+            operation.content.contains(concat!(
+                "export type SubmitLabelsRequest = {\n",
+                "  body: {\n",
+                "    /**\n",
+                "     * The labels to submit.\n",
+                "     */\n",
+                "    labels: string[];\n",
+                "    metadata: {\n",
+                "      source: string;\n",
+                "    };\n",
+                "  };\n",
+                "};\n",
+            )),
+            "{}",
+            operation.content
+        );
     }
 
     #[test]
