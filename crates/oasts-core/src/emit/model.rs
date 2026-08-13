@@ -10,8 +10,8 @@ use crate::transform::TransformFacts;
 use super::paths::ArtifactDirs;
 use super::{
     CODE_FILE_NAME, CODE_PATH_COLLISION, CODE_VARIANT_ALIAS, CODE_VARIANT_COLLISION,
-    CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, TypePosition, file_base_name, shape_variants,
-    source_diagnostic, warning_diagnostic,
+    CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, TypePosition, file_base_name, property_in_position,
+    shape_variants, source_diagnostic, warning_diagnostic,
 };
 
 #[derive(Clone, Debug)]
@@ -273,7 +273,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         // operations. Suppress the flag itself rather than the export: `variant_name` reads the flag
         // when it renders a reference, so a flag left standing beside a withheld declaration is the
         // one shape that emits a name nothing declares.
-        let (used_in_request, used_in_response) = self.resolve_positions_used(&edges);
+        let (used_in_request, used_in_response) = self.resolve_positions_used(count);
         for index in 0..count {
             // Used at neither position means the traversal found no operation reaching this
             // component at all — a `filters.orphans` retention, or a root this walk does not know.
@@ -429,75 +429,98 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
     /// per-index flags.
     ///
     /// Seeded from every operation the document declares — path items, webhooks, and callbacks
-    /// nested to any depth — and then propagated along the *same* edges the variance fixpoint uses,
-    /// in the opposite direction: variance flows referent to referrer, because a referrer renders
-    /// its referent's variant; position-of-use flows referrer to referent, because a component used
-    /// in a response uses everything it references there too. Monotone false-to-true, so the
-    /// fixpoint is order-independent exactly as the variance one is.
+    /// nested to any depth — and then propagated referrer to referent, the opposite direction from
+    /// variance: a referrer renders its referent's variant, so variance flows inward, while a
+    /// component used in a response uses everything it reaches there, so use flows outward.
+    /// Monotone false-to-true, so the fixpoint is order-independent exactly as the variance one is.
     ///
-    /// Sharing `collect_ref_edges` with the variance pass is the load-bearing part, not an economy.
-    /// The suppression below is sound only while the edges usage traverses are a superset of the
-    /// edges variance traverses: a component whose variance is justified by a referent must be
-    /// reached by usage through that same referent, or its flag is cleared while its rendering still
-    /// diverges. One walker cannot disagree with itself.
+    /// Both the seeds and the propagation walk the graph *at* the position they are establishing,
+    /// because that is the graph the renderer walks. A `readOnly` property is absent from the
+    /// request shape, so a request-position rendering never reaches through it, and a component
+    /// named only beyond such a property is never named in request position no matter how many
+    /// request bodies lead to its referrer.
+    ///
+    /// The suppression this feeds is sound because a component's variant is justified only where
+    /// some rendering *names* it, and a name appears exactly where this walk goes. The referrer
+    /// keeps its own twin either way: dropping a property is itself a divergence from the neutral
+    /// shape, so a referrer that hides a component still differs at that position on its own terms.
     ///
     /// Only the seed roots are this function's own, and a missed root is safe rather than silent:
     /// it leaves a component used at neither position, which the caller reads as "do not suppress".
-    fn resolve_positions_used(&self, edges: &[Vec<usize>]) -> (Vec<bool>, Vec<bool>) {
-        let count = edges.len();
-        let mut request = vec![false; count];
-        let mut response = vec![false; count];
+    fn resolve_positions_used(&self, count: usize) -> (Vec<bool>, Vec<bool>) {
+        let mut used = [vec![false; count], vec![false; count]];
         for operation in self.every_operation() {
             for parameter in &operation.parameters {
-                self.seed_position(&parameter.schema, &mut request);
+                self.seed_position(&parameter.schema, TypePosition::Request, &mut used);
             }
             if let Some(body) = &operation.request_body {
                 for media in &body.media_types {
-                    self.seed_position(&media.schema, &mut request);
+                    self.seed_position(&media.schema, TypePosition::Request, &mut used);
                     for (_, encoding) in &media.encodings {
                         for (_, header) in &encoding.headers {
-                            self.seed_position(&header.schema, &mut request);
+                            self.seed_position(&header.schema, TypePosition::Request, &mut used);
                         }
                     }
                 }
             }
             for entry in &operation.responses {
                 for media in &entry.media_types {
-                    self.seed_position(&media.schema, &mut response);
+                    self.seed_position(&media.schema, TypePosition::Response, &mut used);
                 }
                 for (_, header) in &entry.headers {
-                    self.seed_position(&header.schema, &mut response);
+                    self.seed_position(&header.schema, TypePosition::Response, &mut used);
                 }
             }
         }
 
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for source in 0..count {
-                for &referent in &edges[source] {
-                    if request[source] && !request[referent] {
-                        request[referent] = true;
-                        changed = true;
-                    }
-                    if response[source] && !response[referent] {
-                        response[referent] = true;
-                        changed = true;
+        for (slot, position) in [TypePosition::Request, TypePosition::Response]
+            .into_iter()
+            .enumerate()
+        {
+            let mut edges: Vec<Vec<usize>> = vec![Vec::new(); count];
+            for allocated in &self.analyzed.schema_names {
+                let index = allocated.schema_index;
+                let mut referenced = Vec::new();
+                self.collect_ref_edges_in_position(
+                    &self.analyzed.ir.schemas[index].schema,
+                    position,
+                    &mut referenced,
+                );
+                referenced.sort_unstable();
+                referenced.dedup();
+                edges[index] = referenced;
+            }
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for source in 0..count {
+                    for &referent in &edges[source] {
+                        if used[slot][source] && !used[slot][referent] {
+                            used[slot][referent] = true;
+                            changed = true;
+                        }
                     }
                 }
             }
         }
+        let [request, response] = used;
         (request, response)
     }
 
-    /// Marks every component an operation-position schema names. The schema is inline — a `$ref` to
-    /// a component, or a structure containing them — so the component edges out of it are exactly
-    /// this position's seeds.
-    fn seed_position(&self, schema: &SchemaNode, used: &mut [bool]) {
+    /// Marks every component an operation-position schema names at that position. The schema is
+    /// inline — a `$ref` to a component, or a structure containing them — so the component edges
+    /// out of it are exactly this position's seeds.
+    fn seed_position(
+        &self,
+        schema: &SchemaNode,
+        position: TypePosition,
+        used: &mut [Vec<bool>; 2],
+    ) {
         let mut referenced = Vec::new();
-        self.collect_ref_edges(schema, &mut referenced);
+        self.collect_ref_edges_in_position(schema, position, &mut referenced);
+        let slot = usize::from(position == TypePosition::Response);
         for index in referenced {
-            used[index] = true;
+            used[slot][index] = true;
         }
     }
 
@@ -531,6 +554,20 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
     /// inline structure `shape_variants` walks. A `$ref` is terminal here — it records the edge and
     /// stops; the referent's own edges are collected when it is visited as a source. Stack-only.
     fn collect_ref_edges(&self, schema: &SchemaNode, edges: &mut Vec<usize>) {
+        self.collect_ref_edges_in_position(schema, TypePosition::Neutral, edges);
+    }
+
+    /// The same walk, restricted to what survives at one position. A `readOnly` property is not
+    /// part of the request shape at all, so a rendering in request position never reaches through
+    /// it — and a component named only through such a property is not used in request position,
+    /// however many request bodies lead to its referrer. `TypePosition::Neutral` keeps everything
+    /// and is what the variance pass walks.
+    fn collect_ref_edges_in_position(
+        &self,
+        schema: &SchemaNode,
+        position: TypePosition,
+        edges: &mut Vec<usize>,
+    ) {
         match schema {
             SchemaNode::Ref { target, .. } => {
                 if let Some(target) = self.schema_target(&target.source_id, &target.json_pointer) {
@@ -542,31 +579,36 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                 additional_properties,
                 ..
             } => {
-                for (_, property, _) in properties {
-                    self.collect_ref_edges(property, edges);
+                for (_, property, meta) in properties {
+                    if !property_in_position(meta, position) {
+                        continue;
+                    }
+                    self.collect_ref_edges_in_position(property, position, edges);
                 }
                 if let AdditionalProperties::Allowed(Some(schema))
                 | AdditionalProperties::Schema(schema) = additional_properties
                 {
-                    self.collect_ref_edges(schema, edges);
+                    self.collect_ref_edges_in_position(schema, position, edges);
                 }
             }
-            SchemaNode::Array { items, .. } => self.collect_ref_edges(items, edges),
+            SchemaNode::Array { items, .. } => {
+                self.collect_ref_edges_in_position(items, position, edges)
+            }
             SchemaNode::Tuple {
                 prefix_items, rest, ..
             } => {
                 for item in prefix_items {
-                    self.collect_ref_edges(item, edges);
+                    self.collect_ref_edges_in_position(item, position, edges);
                 }
                 if let TupleRest::Schema(schema) = rest {
-                    self.collect_ref_edges(schema, edges);
+                    self.collect_ref_edges_in_position(schema, position, edges);
                 }
             }
             SchemaNode::AllOf { branches, .. }
             | SchemaNode::AnyOf { branches, .. }
             | SchemaNode::OneOf { branches, .. } => {
                 for branch in branches {
-                    self.collect_ref_edges(branch, edges);
+                    self.collect_ref_edges_in_position(branch, position, edges);
                 }
             }
             SchemaNode::Primitive { .. }
@@ -577,34 +619,34 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         }
         let applicators = schema.meta().validation_applicators();
         if let Some(schema) = &applicators.not {
-            self.collect_ref_edges(schema, edges);
+            self.collect_ref_edges_in_position(schema, position, edges);
         }
         if let Some(schema) = &applicators.property_names {
-            self.collect_ref_edges(schema, edges);
+            self.collect_ref_edges_in_position(schema, position, edges);
         }
         for pattern in &applicators.pattern_properties {
-            self.collect_ref_edges(&pattern.schema, edges);
+            self.collect_ref_edges_in_position(&pattern.schema, position, edges);
         }
         if let Some(contains) = &applicators.contains {
-            self.collect_ref_edges(&contains.schema, edges);
+            self.collect_ref_edges_in_position(&contains.schema, position, edges);
         }
         for (_, schema) in &applicators.dependent_schemas {
-            self.collect_ref_edges(schema, edges);
+            self.collect_ref_edges_in_position(schema, position, edges);
         }
         if let Some(conditional) = &applicators.conditional {
-            self.collect_ref_edges(&conditional.condition, edges);
+            self.collect_ref_edges_in_position(&conditional.condition, position, edges);
             if let Some(schema) = &conditional.then_schema {
-                self.collect_ref_edges(schema, edges);
+                self.collect_ref_edges_in_position(schema, position, edges);
             }
             if let Some(schema) = &conditional.else_schema {
-                self.collect_ref_edges(schema, edges);
+                self.collect_ref_edges_in_position(schema, position, edges);
             }
         }
         if let Some(schema) = &applicators.unevaluated_properties {
-            self.collect_ref_edges(schema, edges);
+            self.collect_ref_edges_in_position(schema, position, edges);
         }
         if let Some(schema) = &applicators.unevaluated_items {
-            self.collect_ref_edges(schema, edges);
+            self.collect_ref_edges_in_position(schema, position, edges);
         }
     }
 
