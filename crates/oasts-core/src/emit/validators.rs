@@ -2879,8 +2879,14 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         }
 
         let name = self.helper_name("Additional", None);
+        // Position-filtered for the same reason the inline guard is: a property absent from the
+        // shape being validated is not a known key there. Left unfiltered, an object over the
+        // control-flow budget took this split path and kept exempting `readOnly`/`writeOnly` keys
+        // that the inline form rejects — and where `unevaluatedProperties` also applied, its
+        // now-filtered record condition and this list disagreed, so neither gate rejected the key.
         let known = properties
             .iter()
+            .filter(|(_, _, meta)| property_in_position(meta, self.position))
             .map(|(property, _, _)| render_ts_string(property))
             .collect::<Vec<_>>()
             .join(", ");
@@ -5098,6 +5104,25 @@ mod tests {
             evaluated.contains("(value, path, issues, recordProperty0, evaluatedItem);"),
             "{evaluated}"
         );
+        // `field000` is readOnly, so it is not part of the request shape and is not a known key
+        // there. The split helper's `known` list is filtered by position for the same reason the
+        // inline guard is — otherwise an object large enough to take this path keeps exempting a
+        // key the small-object form rejects, and where `unevaluatedProperties` also applies the
+        // two gates disagree and neither rejects it.
+        let request_known = first_files
+            .iter()
+            .find(|file| file.relative_path == "validators/components/wide.ts")
+            .expect("the wide component emits a validators module")
+            .content
+            .split("function validateWideRequestAdditional")
+            .nth(1)
+            .expect("a request-position additional-properties helper")
+            .split("\n}\n")
+            .next()
+            .expect("the helper body")
+            .to_owned();
+        assert!(!request_known.contains("\"field000\""), "{request_known}");
+        assert!(request_known.contains("\"field001\""), "{request_known}");
     }
 
     #[test]
