@@ -3018,6 +3018,10 @@ mod tests {
     }
 
     /// A document whose one operation returns `Notice`, plus whatever schemas it is given.
+    /// A document that reads `Notice` back and also sends it. Both positions are occupied on
+    /// purpose: a request/response twin is emitted only for a position the document actually uses,
+    /// so a response-only document would leave every request-position assertion below with nothing
+    /// to find — and would be asserting the absence of a twin rather than the shape of one.
     pub(super) fn notice_document(schemas: Value) -> Value {
         json!({
             "openapi": "3.1.0",
@@ -3036,6 +3040,17 @@ mod tests {
                                 }
                             }
                         }
+                    },
+                    "post": {
+                        "operationId": "createNotice",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/Notice" }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "created" } }
                     }
                 }
             },

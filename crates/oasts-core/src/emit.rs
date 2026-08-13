@@ -2994,7 +2994,8 @@ impl SchemaTarget {
     }
 
     /// The name this component's request-position variant declares under, or `None` when the
-    /// position does not diverge from the neutral shape and so declares nothing of its own.
+    /// position declares nothing of its own — either because the shape does not diverge from the
+    /// neutral one, or because no operation uses the component in request position at all.
     /// Every artifact that emits a component reads this rather than pairing the `differs` flag
     /// with its own `variant_name` call, so the flag and the name cannot drift apart.
     pub(super) fn request_export(&self) -> Option<String> {
