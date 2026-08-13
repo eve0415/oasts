@@ -1092,6 +1092,10 @@ export function serializePathMatrixExplode(
 //#endregion
 
 //#region oxs:helper:path-matrix-value
+function serializeMatrixParameter(name: string, value: string): string {
+  return value === "" ? `;${name}` : `;${name}=${value}`;
+}
+
 function serializeMatrixValue(
   name: string,
   value: ParamValue,
@@ -1100,22 +1104,29 @@ function serializeMatrixValue(
 ): string {
   const encodedName = renderName(name);
   if (!explode) {
-    return `;${encodedName}=${serializeSimpleValue(value, false, policy)}`;
+    return serializeMatrixParameter(
+      encodedName,
+      serializeSimpleValue(value, false, policy),
+    );
   }
   if (isParamArray(value)) {
     return value
-      .map((item) => `;${encodedName}=${renderPrimitive(item, policy)}`)
+      .map((item) =>
+        serializeMatrixParameter(encodedName, renderPrimitive(item, policy)),
+      )
       .join("");
   }
   if (isParamObject(value)) {
     return Object.entries(value)
-      .map(
-        ([key, item]) =>
-          `;${renderComponent(key, policy)}=${renderPrimitive(item, policy)}`,
+      .map(([key, item]) =>
+        serializeMatrixParameter(
+          renderComponent(key, policy),
+          renderPrimitive(item, policy),
+        ),
       )
       .join("");
   }
-  return `;${encodedName}=${renderPrimitive(value, policy)}`;
+  return serializeMatrixParameter(encodedName, renderPrimitive(value, policy));
 }
 //#endregion
 
