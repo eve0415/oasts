@@ -2185,7 +2185,9 @@ fn render_input(
             continue;
         }
         output.push_str("  ");
-        output.push_str(location_name(location));
+        // The group name, not the wire location string `location_name` produces — shared with the
+        // types artifact's `Request` so the two cannot drift apart again.
+        output.push_str(super::parameter_group_name(location));
         if !group.iter().any(|(_, parameter, _)| parameter.required) {
             output.push('?');
         }

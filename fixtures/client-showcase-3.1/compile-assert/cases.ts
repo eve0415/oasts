@@ -8,9 +8,11 @@
 
 import type { SuccessEnvelope } from "../generated/runtime/result.js";
 import type {
+  GetPetShowcaseInput,
   GetPetShowcaseResult,
   getPetShowcaseOrThrow,
 } from "../generated/client/operations/getpetshowcase.js";
+import type { GetPetShowcaseRequest } from "../generated/types/operations/getpetshowcase.js";
 import type { SelectMediaShowcaseResult } from "../generated/client/operations/selectmediashowcase.js";
 import type { Pet } from "../generated/types/components/pet.js";
 
@@ -105,7 +107,25 @@ export function exhaustive(result: GetPetShowcaseResult): string {
   }
 }
 
+// 8. The types artifact's `Request` and the client artifact's `Input` describe the same operation
+//    input, so every slot the first declares must be a slot the second declares. Assignability
+//    alone does not check this: TypeScript's weak-type detection switches off as soon as ONE
+//    property matches, so an operation carrying `path` as well as a header stayed silent while the
+//    two artifacts spelled the header slot differently. Comparing the key sets is what notices.
+//    `getPetShowcase` is the right witness precisely because it has other slots to hide behind.
+type RequestSlots = keyof GetPetShowcaseRequest;
+type InputSlots = keyof GetPetShowcaseInput;
+type AssertRequestSlotsExistOnInput = Expect<
+  Equal<Extract<RequestSlots, InputSlots>, RequestSlots>
+>;
+
+// And the value itself goes where the client expects one.
+declare const requestValue: GetPetShowcaseRequest;
+const inputValue: GetPetShowcaseInput = requestValue;
+void inputValue;
+
 export type {
+  AssertRequestSlotsExistOnInput,
   AssertStringKeyMatchesNothing,
   AssertJsonArmIsPet,
   AssertTextArmIsString,

@@ -3437,11 +3437,12 @@ impl Emitter<'_, '_, '_> {
 
     fn render_request(&self, operation: &Operation, axis: TypeAxis, indent: usize) -> String {
         let groups = [
-            (ParamLocation::Path, "path"),
-            (ParamLocation::Query, "query"),
-            (ParamLocation::Header, "headers"),
-            (ParamLocation::Cookie, "cookies"),
-        ];
+            ParamLocation::Path,
+            ParamLocation::Query,
+            ParamLocation::Header,
+            ParamLocation::Cookie,
+        ]
+        .map(|location| (location, parameter_group_name(location)));
         let mut output = String::from("{\n");
         let mut has_members = false;
         for (location, group_name) in groups {
@@ -3991,6 +3992,29 @@ fn is_named_branch(branch: &SchemaNode) -> bool {
 /// the combination with the merge written out twice, in mutually inverted forms.
 fn covered_by_merge(branch: &SchemaNode, merged: bool) -> bool {
     merged && !is_named_branch(branch)
+}
+
+/// The property name the emitted input gives one parameter location's group.
+///
+/// One producer for both the types artifact's `Request` and the client artifact's `Input`, because
+/// the two describe the same operation input: a `Request` value has to be assignable to the
+/// parameter an `Input` declares, and two independent spellings made that false wherever an
+/// operation carried a header or a cookie. Singular throughout, matching the document's own `in:`
+/// values.
+///
+/// Not the same thing as the client's `location_name`, which produces the wire location string a
+/// descriptor carries. They coincide today; a change to one is not a change to the other.
+///
+/// The msw artifact deliberately keeps its own spelling: its resolver argument is a handler's
+/// destructured context mirroring MSW's vocabulary, where `params` and `cookies` are MSW's own
+/// property names. Nothing assigns a `Request` into it, and it could not align if it tried.
+pub(crate) const fn parameter_group_name(location: ParamLocation) -> &'static str {
+    match location {
+        ParamLocation::Path => "path",
+        ParamLocation::Query => "query",
+        ParamLocation::Header => "header",
+        ParamLocation::Cookie => "cookie",
+    }
 }
 
 fn add_nullable(mut rendered: String, schema: &SchemaNode) -> String {
@@ -8697,6 +8721,56 @@ mod tests {
             "{wrapped}"
         );
         assert!(!wrapped.contains("[key: string]"), "{wrapped}");
+    }
+
+    #[test]
+    fn a_request_names_its_parameter_slots_the_way_the_client_input_does() {
+        // The two artifacts describe the same operation input, so a value of one has to be
+        // assignable to the other. Plural group names made that false for every operation with a
+        // header or a cookie, and TypeScript only caught it where no other slot matched.
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "test", "version": "1" },
+            "paths": {
+                "/pets/{petId}": {
+                    "get": {
+                        "operationId": "readPet",
+                        "parameters": [
+                            { "name": "petId", "in": "path", "required": true,
+                              "schema": { "type": "string" } },
+                            { "name": "X-Trace", "in": "header",
+                              "schema": { "type": "string" } },
+                            { "name": "session", "in": "cookie",
+                              "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let (files, diagnostics) = compile(document, json!({}));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let operation = find_file(&files, "types/operations/readpet.ts");
+        assert!(
+            operation.content.contains("  header?: {\n"),
+            "{}",
+            operation.content
+        );
+        assert!(
+            operation.content.contains("  cookie?: {\n"),
+            "{}",
+            operation.content
+        );
+        assert!(
+            !operation.content.contains("headers?:"),
+            "{}",
+            operation.content
+        );
+        assert!(
+            !operation.content.contains("cookies?:"),
+            "{}",
+            operation.content
+        );
     }
 
     #[test]
