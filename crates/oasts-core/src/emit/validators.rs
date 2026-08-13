@@ -2984,7 +2984,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         properties: &[(String, SchemaNode, PropMeta)],
         pattern_properties: &[PatternProperty],
     ) -> String {
-        let declared = unknown_key_condition(properties);
+        let declared = unknown_key_condition(properties, self.position);
         let patterns = self.pattern_key_condition(pattern_properties, "key");
         format!("{declared}{patterns}")
     }
@@ -2994,7 +2994,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         properties: &[(String, SchemaNode, PropMeta)],
         pattern_properties: &[PatternProperty],
     ) -> String {
-        let mut conditions = vec![unknown_key_condition(properties)];
+        let mut conditions = vec![unknown_key_condition(properties, self.position)];
         conditions.extend(pattern_properties.iter().map(|pattern_property| {
             let slot = self.scope.pattern_slot(&pattern_property.pattern, true);
             format!("!pattern{slot}Regex().test(key)")
@@ -3611,15 +3611,27 @@ fn has_typeless_constraints(meta: &SchemaMeta) -> bool {
         || meta.object_constraints.is_some()
 }
 
-fn unknown_key_condition(properties: &[(String, SchemaNode, PropMeta)]) -> String {
-    if properties.is_empty() {
+/// The guard that decides whether a key is undeclared, for the position being emitted.
+///
+/// Position-filtered for the same reason the `declaredProperties` list in the same emitted function
+/// is: a `readOnly` property is not part of the request shape and a `writeOnly` one is not part of
+/// the response shape, so exempting it from the unknown-key rejection admits a key the emitted type
+/// does not declare. Under `additionalProperties: false` that made the validator wider than the
+/// type it checks.
+fn unknown_key_condition(
+    properties: &[(String, SchemaNode, PropMeta)],
+    position: TypePosition,
+) -> String {
+    let conditions = properties
+        .iter()
+        .filter(|(_, _, meta)| property_in_position(meta, position))
+        .map(|(name, _, _)| format!("key !== {}", render_ts_string(name)))
+        .collect::<Vec<_>>();
+    if conditions.is_empty() {
+        // Nothing is declared here, so every key is an undeclared one.
         return "true".to_owned();
     }
-    properties
-        .iter()
-        .map(|(name, _, _)| format!("key !== {}", render_ts_string(name)))
-        .collect::<Vec<_>>()
-        .join(" && ")
+    conditions.join(" && ")
 }
 
 fn string_format_predicate(format: &str) -> Option<(&'static str, &'static str)> {
@@ -6090,6 +6102,45 @@ mod tests {
         assert!(bag.contains("if (evaluatedProperty !== undefined) {"));
         assert!(
             bag.contains("issues.push(issue(path, \"more properties than maxProperties 3\"));")
+        );
+    }
+
+    /// A closed object's unknown-key guard has to name the properties THIS position declares. A
+    /// `readOnly` property is absent from the request shape and a `writeOnly` one from the
+    /// response shape, so exempting either from the rejection lets the validator accept a key the
+    /// emitted type does not declare — the validator wider than the type it checks. The
+    /// `declaredProperties` list in the same emitted function was already filtered; this is the
+    /// sibling that was not.
+    #[test]
+    fn a_closed_object_rejects_keys_absent_from_its_own_position() {
+        let (files, diagnostics) = compile(doc_31(json!({
+            "Widget": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name"],
+                "properties": {
+                    "id": { "type": "string", "readOnly": true },
+                    "secret": { "type": "string", "writeOnly": true },
+                    "name": { "type": "string" }
+                }
+            }
+        })));
+        assert_clean(&diagnostics);
+        let widget = component(&files, "widget");
+        // The neutral declaration keeps every declared property, so its guard names all three.
+        assert!(
+            widget.contains("if (key !== \"id\" && key !== \"secret\" && key !== \"name\") {"),
+            "{widget}"
+        );
+        // The request shape has no `id`, so `id` is an unexpected key there — and the response
+        // shape has no `secret`.
+        assert!(
+            widget.contains("if (key !== \"secret\" && key !== \"name\") {"),
+            "{widget}"
+        );
+        assert!(
+            widget.contains("if (key !== \"id\" && key !== \"name\") {"),
+            "{widget}"
         );
     }
 
