@@ -10,8 +10,8 @@ use crate::transform::TransformFacts;
 use super::paths::ArtifactDirs;
 use super::{
     CODE_FILE_NAME, CODE_PATH_COLLISION, CODE_VARIANT_ALIAS, CODE_VARIANT_COLLISION,
-    CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, TypePosition, file_base_name, property_in_position,
-    shape_variants, source_diagnostic, warning_diagnostic,
+    CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, TypePosition, callback_operation, file_base_name,
+    property_in_position, shape_variants, source_diagnostic, warning_diagnostic,
 };
 
 #[derive(Clone, Debug)]
@@ -444,65 +444,50 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
     /// Only the seed roots are this function's own, and a missed root is safe rather than silent:
     /// it leaves a component used at neither position, which the caller reads as "do not suppress".
     fn resolve_positions_used(&self, count: usize) -> (Vec<bool>, Vec<bool>) {
-        let mut used = [vec![false; count], vec![false; count]];
+        let mut request = vec![false; count];
+        let mut response = vec![false; count];
         for operation in self.every_operation() {
             for parameter in &operation.parameters {
-                self.seed_position(&parameter.schema, TypePosition::Request, &mut used);
+                self.seed_position(&parameter.schema, TypePosition::Request, &mut request);
             }
             if let Some(body) = &operation.request_body {
                 for media in &body.media_types {
-                    self.seed_position(&media.schema, TypePosition::Request, &mut used);
+                    self.seed_position(&media.schema, TypePosition::Request, &mut request);
                     for (_, encoding) in &media.encodings {
                         for (_, header) in &encoding.headers {
-                            self.seed_position(&header.schema, TypePosition::Request, &mut used);
+                            self.seed_position(&header.schema, TypePosition::Request, &mut request);
                         }
                     }
                 }
             }
             for entry in &operation.responses {
                 for media in &entry.media_types {
-                    self.seed_position(&media.schema, TypePosition::Response, &mut used);
+                    self.seed_position(&media.schema, TypePosition::Response, &mut response);
                 }
                 for (_, header) in &entry.headers {
-                    self.seed_position(&header.schema, TypePosition::Response, &mut used);
+                    self.seed_position(&header.schema, TypePosition::Response, &mut response);
                 }
             }
         }
 
-        let edges: [Vec<Vec<usize>>; 2] =
-            [TypePosition::Request, TypePosition::Response].map(|position| {
-                let mut edges: Vec<Vec<usize>> = vec![Vec::new(); count];
-                for allocated in &self.analyzed.schema_names {
-                    let index = allocated.schema_index;
-                    let mut referenced = Vec::new();
-                    self.collect_ref_edges_in_position(
-                        &self.analyzed.ir.schemas[index].schema,
-                        position,
-                        &mut referenced,
-                    );
-                    referenced.sort_unstable();
-                    referenced.dedup();
-                    edges[index] = referenced;
-                }
-                edges
-            });
-        fn propagate(used: &mut [Vec<bool>; 2], edges: &[Vec<Vec<usize>>; 2], count: usize) {
-            for slot in 0..2 {
-                let mut changed = true;
-                while changed {
-                    changed = false;
-                    for source in 0..count {
-                        for &referent in &edges[slot][source] {
-                            if used[slot][source] && !used[slot][referent] {
-                                used[slot][referent] = true;
-                                changed = true;
-                            }
+        let request_edges = self.position_edges(TypePosition::Request, count);
+        let response_edges = self.position_edges(TypePosition::Response, count);
+        fn propagate(used: &mut [bool], edges: &[Vec<usize>]) {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for source in 0..used.len() {
+                    for &referent in &edges[source] {
+                        if used[source] && !used[referent] {
+                            used[referent] = true;
+                            changed = true;
                         }
                     }
                 }
             }
         }
-        propagate(&mut used, &edges, count);
+        propagate(&mut request, &request_edges);
+        propagate(&mut response, &response_edges);
 
         // A component no operation reaches counts as used at *both* positions, and that has to
         // propagate like any other use rather than be handled at the suppression site. Under
@@ -511,61 +496,76 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         // suppressed, the referrer's response declaration would fall back to the referent's neutral
         // name and publish a `writeOnly` field as part of a response. Seeding it here and running
         // the fixpoint again is what carries "used at both" across the reference graph.
-        let unreached: Vec<usize> = (0..count)
-            .filter(|&index| !used[0][index] && !used[1][index])
-            .collect();
-        if !unreached.is_empty() {
-            for index in unreached {
-                used[0][index] = true;
-                used[1][index] = true;
+        let mut any_unreached = false;
+        for index in 0..count {
+            if !request[index] && !response[index] {
+                request[index] = true;
+                response[index] = true;
+                any_unreached = true;
             }
-            propagate(&mut used, &edges, count);
         }
-        let [request, response] = used;
+        if any_unreached {
+            propagate(&mut request, &request_edges);
+            propagate(&mut response, &response_edges);
+        }
         (request, response)
+    }
+
+    /// The reference graph as it stands at one position: every component `$ref` a rendering at that
+    /// position actually reaches, per component index.
+    fn position_edges(&self, position: TypePosition, count: usize) -> Vec<Vec<usize>> {
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for allocated in &self.analyzed.schema_names {
+            let index = allocated.schema_index;
+            let mut referenced = Vec::new();
+            self.collect_ref_edges_in_position(
+                &self.analyzed.ir.schemas[index].schema,
+                position,
+                &mut referenced,
+            );
+            referenced.sort_unstable();
+            referenced.dedup();
+            edges[index] = referenced;
+        }
+        edges
     }
 
     /// Marks every component an operation-position schema names at that position. The schema is
     /// inline — a `$ref` to a component, or a structure containing them — so the component edges
     /// out of it are exactly this position's seeds.
-    fn seed_position(
-        &self,
-        schema: &SchemaNode,
-        position: TypePosition,
-        used: &mut [Vec<bool>; 2],
-    ) {
+    fn seed_position(&self, schema: &SchemaNode, position: TypePosition, used: &mut [bool]) {
         let mut referenced = Vec::new();
         self.collect_ref_edges_in_position(schema, position, &mut referenced);
-        let slot = usize::from(position == TypePosition::Response);
         for index in referenced {
-            used[slot][index] = true;
+            used[index] = true;
         }
     }
 
-    /// Every operation the document declares, in a flat walk: path-item operations, webhook
-    /// operations (a sibling vector, not part of `operations`), and callback operations, which nest
-    /// inside an operation and may themselves declare callbacks.
+    /// Every operation the document declares: path-item operations, webhook operations (a sibling
+    /// vector, not part of `operations`), and callback operations, which nest inside an operation
+    /// and may themselves declare callbacks.
+    ///
+    /// Callbacks are read through `callback_names`, which semantic analysis already flattened to
+    /// any depth, rather than re-recursed here — the same walk `emit/validators.rs` and
+    /// `emit/zod.rs` do. A second hand-rolled recursion would be a second place for the flattening
+    /// rules to be wrong, and would not inherit a fix made to the first.
     fn every_operation(&self) -> Vec<&'input Operation> {
-        fn push_with_callbacks<'a>(operation: &'a Operation, out: &mut Vec<&'a Operation>) {
-            out.push(operation);
-            for callback in &operation.callbacks {
-                for expression in &callback.expressions {
-                    for nested in &expression.operations {
-                        push_with_callbacks(nested, out);
-                    }
-                }
-            }
-        }
-        let mut out = Vec::new();
-        for operation in &self.analyzed.ir.operations {
-            push_with_callbacks(operation, &mut out);
-        }
-        for webhook in &self.analyzed.ir.webhooks {
-            for operation in &webhook.operations {
-                push_with_callbacks(operation, &mut out);
-            }
-        }
-        out
+        let analyzed = self.analyzed;
+        analyzed
+            .ir
+            .operations
+            .iter()
+            .chain(
+                analyzed
+                    .ir
+                    .webhooks
+                    .iter()
+                    .flat_map(|webhook| webhook.operations.iter()),
+            )
+            .chain(analyzed.callback_names.iter().map(|allocated| {
+                callback_operation(&analyzed.ir, &analyzed.callback_names, allocated)
+            }))
+            .collect()
     }
 
     /// Records the target index of every component `$ref` reachable from `schema` through the same

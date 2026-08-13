@@ -133,6 +133,13 @@ struct Parser<'graph, 'sink> {
     version: OasVersion,
     sink: &'sink mut DiagnosticSink,
     entry_defs_referenced: bool,
+    /// Set by a dispatch branch that has proven the schema it is parsing admits no instance, and
+    /// read by `parse_schema` once the dispatch returns. It is a one-schema channel: `parse_schema`
+    /// saves and restores it around the call, so a nested subschema's emptiness cannot escape into
+    /// its parent. Lowering has to wait for the dispatch to finish, because the dispatch is also
+    /// what validates the rest of the object, and a schema that admits nothing can still be written
+    /// in a document that is malformed elsewhere.
+    admits_no_instance: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -323,6 +330,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             version,
             sink,
             entry_defs_referenced: false,
+            admits_no_instance: false,
         }
     }
 
@@ -2037,8 +2045,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
     /// successfully and exit 0 where the same document without the `not` is a fatal `OASTS1102`.
     /// A keyword that says "no instance is valid" says nothing about whether the document is valid.
     fn parse_schema(&mut self, node: NodeView<'graph>) -> SchemaNode {
+        let outer = std::mem::replace(&mut self.admits_no_instance, false);
         let lowered = self.parse_schema_dispatch(node);
-        if !node_negates_everything(&lowered) {
+        let admits_no_instance = std::mem::replace(&mut self.admits_no_instance, outer);
+        if !admits_no_instance && !node_negates_everything(&lowered) {
             return lowered;
         }
         // `Unknown` is the parser's record that it could not represent something, and the validators
@@ -2098,21 +2108,16 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 "schema keyword 'propertyNames' narrows validation but its constraint is not applied to the emitted type; the validators artifact enforces it instead",
             ));
         }
-        // Classified here but acted on below, after every keyword diagnostic has had its say: the
-        // classification decides whether the `not` warning fires, while lowering to `Never` is a
+        // One three-way classification of the `not` subschema: it admits everything (the caller
+        // lowers the whole node to `Never`, silently), it admits nothing (a no-op that narrows
+        // nothing and is equally silent), or it narrows in a way TypeScript cannot express, which is
+        // the only case that warns. The lowering itself waits for the caller, because it is a
         // `return` and would carry every sibling keyword's diagnostic out with it.
-        let not_admits_everything = meta
-            .validation_applicators()
-            .not
-            .as_deref()
-            .is_some_and(schema_admits_everything);
-        if !not_admits_everything
-            && meta
-                .validation_applicators()
-                .not
-                .as_deref()
-                .is_some_and(|schema| !matches!(schema, SchemaNode::Never { .. }))
-        {
+        let negation = meta.validation_applicators().not.as_deref();
+        let not_admits_everything = negation.is_some_and(schema_admits_everything);
+        if negation.is_some_and(|schema| {
+            !not_admits_everything && !matches!(schema, SchemaNode::Never { .. })
+        }) {
             self.sink.push(self.warning_diagnostic(
                 CODE_UNAPPLIED_NARROWING,
                 node.doc_id,
@@ -2143,8 +2148,12 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 }
             };
             self.sink.push(diagnostic);
-            meta.nullable = false;
-            return SchemaNode::Never { meta };
+            // Reported here so it keeps its place in the sink, but lowered by the caller once the
+            // dispatch has parsed the rest of the object. Returning `Never` from inside the dispatch
+            // is what let `{ enum: [], oneOf: "invalid" }` generate at exit 0: the malformed sibling
+            // was never reached, so it was never diagnosed. Emptiness is a statement about the
+            // instances a schema admits, not a licence to stop reading the document.
+            self.admits_no_instance = true;
         }
         let dialect_unsupported = if self.version == OasVersion::V3_0 {
             [
@@ -9514,6 +9523,30 @@ mod tests {
                 if meta.source.json_pointer == "/components/schemas/AcceptAll/not"
         ));
         assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    /// The same rule as `an_empty_not_does_not_excuse_a_malformed_sibling`, for the other keyword
+    /// that proves a schema empty. Both lowerings return, so both had to stop returning from inside
+    /// the dispatch: emptiness is a statement about the instances a schema admits, not a licence to
+    /// stop reading the document around it.
+    #[test]
+    fn an_empty_enum_does_not_excuse_a_malformed_sibling() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "Bad": { "enum": [], "oneOf": "not-an-array" } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(schema_named(&ir, "Bad"), SchemaNode::Never { .. }));
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_SHAPE
+                    && diagnostic.json_pointer.as_deref() == Some("/components/schemas/Bad/oneOf")),
+            "{:?}",
+            sink.as_slice()
+        );
+        assert!(sink.has_errors(), "{:?}", sink.as_slice());
     }
 
     /// A schema object carrying a second independent piece is lowered to a conjunction, and the

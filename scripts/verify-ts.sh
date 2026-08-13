@@ -172,54 +172,89 @@ assert_no_orphan_declarations() {
   # the emitted runtime carries those — and both quote styles are accepted, because the emitted
   # runtime uses single quotes where the generated trees use double. `|| true` keeps a tree with no
   # relative named imports from aborting the gate under `set -o pipefail`: no match is an answer.
-  local pairs
-  pairs=$(
+  # One awk pass emits both halves of the comparison: an `I` row per (resolved target, imported
+  # name) and an `E` row per exported declaration in a types component file. Resolving the specifier
+  # inside awk keeps the two halves in one traversal and one set of rules, rather than a second
+  # extraction pipeline that has to agree with the first about what an import looks like. Cost is
+  # not the reason: measured against a stubbed-out check, the whole pass is ~0.5s of this gate's
+  # ~84s, which is dominated by tsc.
+  local -A imported=()
+  local -a exports=()
+  local kind target name
+  while IFS=$'\t' read -r kind target name; do
+    case $kind in
+      I) imported["$target"$'\t'"$name"]=1 ;;
+      E) exports+=("$target"$'\t'"$name") ;;
+    esac
+  done < <(
     find "$d"/generated* -name '*.ts' -print0 2>/dev/null \
       | xargs -0 -r awk '
+          # Lexical resolution: collapse repeated separators, drop "." and resolve ".." segments.
+          # `find` over a directory argument yields "//", which the import side never has, so the
+          # two spellings have to be normalized or nothing ever matches.
+          function normalize(p,   parts, n, i, out, k, joined) {
+            gsub(/\/+/, "/", p)
+            n = split(p, parts, "/")
+            k = 0
+            for (i = 1; i <= n; i++) {
+              if (parts[i] == "" && i > 1) continue
+              if (parts[i] == ".") continue
+              if (parts[i] == "..") { if (k > 1) k--; continue }
+              out[++k] = parts[i]
+            }
+            joined = out[1]
+            for (i = 2; i <= k; i++) joined = joined "/" out[i]
+            return joined
+          }
+          function dirname(p) { sub(/\/[^\/]*$/, "", p); return p }
           FNR == 1 { buf = "" }
           buf != "" { buf = buf " " $0 }
           buf == "" && /^import / { buf = $0 }
           buf != "" && buf ~ /from[ ]*[\047\042][^\047\042]*[\047\042]/ {
-            print FILENAME ":" buf; buf = ""
+            clause = buf
+            buf = ""
+            if (clause !~ /\{/) next
+            spec = clause
+            sub(/^.*from[ ]*[\047\042]/, "", spec)
+            sub(/[\047\042].*$/, "", spec)
+            if (spec !~ /^\./) next
+            sub(/\.js$/, ".ts", spec)
+            names = clause
+            sub(/^[^{]*\{/, "", names)
+            sub(/\}.*$/, "", names)
+            target = normalize(dirname(FILENAME) "/" spec)
+            count = split(names, parts, ",")
+            for (i = 1; i <= count; i++) {
+              one = parts[i]
+              # `A as B` imports A from the target — B is only the importing module local name for
+              # it — and an inline `type` modifier is a modifier, not part of the name.
+              sub(/[ \t]+as[ \t]+.*$/, "", one)
+              gsub(/^[ \t]+|[ \t]+$/, "", one)
+              sub(/^type[ \t]+/, "", one)
+              if (one != "") print "I\t" target "\t" one
+            }
           }
-        ' \
-      | while IFS= read -r hit; do
-          local src=${hit%%:import *} clause=${hit#*:} spec names target
-          [[ $clause == *"{"* ]] || continue
-          # The joined clause carries whatever followed the specifier — a trailing `;` at least — so
-          # the closing quote is what ends it, not the end of the string.
-          spec=${clause##*from }; spec=${spec#[\'\"]}; spec=${spec%%[\'\"]*}
-          [[ $spec == .* ]] || continue
-          names=${clause#*\{}; names=${names%%\}*}
-          target=$(cd "$(dirname "$src")" 2>/dev/null && realpath -m "${spec%.js}.ts")
-          # `A as B` imports A from the target — B is only this module's local name for it — and an
-          # inline `type` modifier is a modifier, not part of the name.
-          tr ',' '\n' <<<"$names" \
-            | sed -E 's/[[:space:]]+as[[:space:]]+.*//; s/^[[:space:]]*(type[[:space:]]+)?//; s/[[:space:]]*$//' \
-            | while IFS= read -r n; do
-                [[ -n $n ]] && printf '%s\t%s\n' "$target" "$n"
-              done
-        done | sort -u || true
+          FILENAME ~ /\/types\/components\/[^\/]*\.ts$/ &&
+          /^export (interface|type) [A-Za-z_$][A-Za-z0-9_$]*/ {
+            split($0, field, " ")
+            print "E\t" normalize(FILENAME) "\t" field[3]
+          }
+        '
   )
-  local raw file base lower name found=0
-  while IFS= read -r raw; do
-    [[ -n $raw ]] || continue
-    # `find` over a directory argument can yield `//`, which realpath normalizes away on the import
-    # side. Compare normalized paths or nothing ever matches and the check silently passes.
-    file=$(realpath -m "$raw")
-    base=$(basename "$file" .ts | tr -cd 'a-zA-Z0-9' | tr '[:upper:]' '[:lower:]')
-    while IFS= read -r name; do
-      [[ -n $name ]] || continue
-      lower=$(tr -cd 'a-zA-Z0-9' <<<"$name" | tr '[:upper:]' '[:lower:]')
-      [[ $lower == "$base" ]] && continue
-      grep -qxF "$file	$name" <<<"$pairs" && continue
-      if [[ " ${declaration_debt[*]} " == *" $fixture/$(basename "$file"):$name "* ]]; then
-        continue
-      fi
-      echo "verify-ts: generated declaration is import-orphaned: $name in $file" >&2
-      found=1
-    done < <(grep -oE '^export (interface|type) [A-Za-z_$][A-Za-z0-9_$]*' "$file" | awk '{print $3}' | sort -u)
-  done < <(find "$d"/generated* -path '*/types/components/*.ts' 2>/dev/null | sort)
+  local entry file base lower found=0
+  for entry in "${exports[@]}"; do
+    file=${entry%%$'\t'*}
+    name=${entry#*$'\t'}
+    base=${file##*/}; base=${base%.ts}; base=${base//[^a-zA-Z0-9]/}
+    lower=${name//[^a-zA-Z0-9]/}
+    [[ ${lower,,} == "${base,,}" ]] && continue
+    [[ -n ${imported["$file"$'\t'"$name"]:-} ]] && continue
+    if [[ " ${declaration_debt[*]} " == *" $fixture/${file##*/}:$name "* ]]; then
+      continue
+    fi
+    echo "verify-ts: generated declaration is import-orphaned: $name in $file" >&2
+    found=1
+  done
   return "$found"
 }
 
