@@ -25,8 +25,11 @@ use crate::media::canonical_content_key;
 const CODE_VERSION: &str = "OASTS1101";
 const CODE_SHAPE: &str = "OASTS1102";
 const CODE_UNSUPPORTED: &str = "OASTS1103";
-/// A narrowing schema keyword the emitted TypeScript cannot apply. Reporting it upholds the
-/// no-silent-widening contract in `docs/spec.md` §5.1 while validators retain the exact check.
+/// A narrowing schema keyword the emitted TypeScript cannot apply. Unlike `CODE_UNSUPPORTED`, the
+/// leaf does not widen to `unknown` — the sibling type survives exactly as declared and only the
+/// narrowing is lost, so the emitted type is wider than the document. Reported rather than dropped
+/// because a keyword is never silently ignored when doing so widens a public type; the validators
+/// artifact still enforces it exactly.
 const CODE_UNAPPLIED_NARROWING: &str = "OASTS1122";
 const CODE_RESPONSE_STATUS: &str = "OASTS1104";
 /// A status range written in lowercase. OpenAPI specifies the uppercase wildcard, but real
