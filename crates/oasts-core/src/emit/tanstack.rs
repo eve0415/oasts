@@ -828,7 +828,7 @@ fn is_query_eligible(plan: &OperationPlan) -> Result<(), &'static str> {
         success_branches += 1;
         if !matches!(response.payload, PayloadDisposition::Payload) {
             return Err(
-                "every successful response is bodyless, and a query function may not resolve undefined",
+                "at least one successful response is bodyless, and a query function may not resolve undefined",
             );
         }
     }
@@ -2450,7 +2450,7 @@ paths:
     }
 
     #[test]
-    fn every_way_a_read_can_be_bodyless_suppresses_its_descriptor_and_warns() {
+    fn any_bodyless_success_suppresses_its_descriptor_and_warns() {
         let (files, diagnostics) = emit(DOCUMENT, TANSTACK_CONFIG);
         for file in [
             "tanstack/operations/headpet.ts",
@@ -2484,6 +2484,14 @@ paths:
                 .iter()
                 .any(|warning| warning.message.contains("getPartial")),
             "{warnings:#?}"
+        );
+        let mixed_response_warning = warnings
+            .iter()
+            .find(|warning| warning.message.contains("getPartial"))
+            .expect("mixed response warning");
+        assert_eq!(
+            mixed_response_warning.message,
+            "operation 'getPartial' emits no query descriptor: at least one successful response is bodyless, and a query function may not resolve undefined"
         );
     }
 
