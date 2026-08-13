@@ -2560,7 +2560,7 @@ fn render_entry_payload_pairs(
                 output.push_str(&if conversion.per_event {
                     renderer.render_type(&entry.schema, TypePosition::Response, axis, 0)
                 } else {
-                    response_entry_payload_type(renderer, entry, axis)
+                    response_entry_payload_type(renderer, entry, axis, 0)
                 });
                 output.push_str(";\n\n");
             }
@@ -2640,7 +2640,7 @@ fn push_response_result_arms(
                         match entry_payload_alias(conversion, index) {
                             Some(alias) if wire => format!("{alias}Wire"),
                             Some(alias) => alias.to_owned(),
-                            None => response_entry_payload_type(renderer, entry, axis),
+                            None => response_entry_payload_type(renderer, entry, axis, 2),
                         },
                     )
                 })
@@ -2720,9 +2720,10 @@ fn response_entry_payload_type(
     renderer: &TypesEmitter<'_, '_, '_>,
     entry: &ResponseMediaPlan,
     axis: TypeAxis,
+    indent: usize,
 ) -> String {
     match &entry.multipart {
-        Some(multipart) => render_multipart_response_type(renderer, multipart, axis, 0),
+        Some(multipart) => render_multipart_response_type(renderer, multipart, axis, indent),
         None => renderer.media_payload_type(
             media_essence(&entry.media),
             &entry.schema,
@@ -2733,7 +2734,7 @@ fn response_entry_payload_type(
             },
             TypePosition::Response,
             axis,
-            0,
+            indent,
         ),
     }
 }
@@ -5639,7 +5640,7 @@ mod tests {
         // schema's own type.
         assert!(
             actual.contains(
-                "data: {\n  manifest: {\n    name?: string;\n  };\n  readme?: string;\n  archive: Uint8Array;\n  thumbnails?: Uint8Array[];\n  labels?: string[];\n  encoded?: string;\n  extra?: unknown;\n}; meta: ResponseMeta"
+                "data: {\n    manifest: {\n      name?: string;\n    };\n    readme?: string;\n    archive: Uint8Array;\n    thumbnails?: Uint8Array[];\n    labels?: string[];\n    encoded?: string;\n    extra?: unknown;\n  }; meta: ResponseMeta"
             ),
             "{actual}"
         );
@@ -5677,7 +5678,7 @@ mod tests {
         // A declared property must be assignable to the index type, and `Uint8Array` is not a
         // `string`, so the index signature unions both.
         assert!(
-            actual.contains("archive?: Uint8Array;\n  [key: string]: string | Uint8Array;\n}"),
+            actual.contains("archive?: Uint8Array;\n    [key: string]: string | Uint8Array;\n  }"),
             "{actual}"
         );
         assert!(
@@ -5693,7 +5694,7 @@ mod tests {
         let actual = operation_file(&files, "getbundle");
 
         assert!(
-            actual.contains("data: {\n  [key: string]: unknown;\n}"),
+            actual.contains("data: {\n    [key: string]: unknown;\n  }"),
             "{actual}"
         );
         assert!(
@@ -5779,7 +5780,7 @@ mod tests {
             "{actual}"
         );
         assert!(
-            actual.contains("manifest?: Manifest;\n  archive?: Uint8Array;\n}"),
+            actual.contains("manifest?: Manifest;\n    archive?: Uint8Array;\n  }"),
             "{actual}"
         );
         // The binary part never names its schema, so only the JSON-rendered part imports a
@@ -6519,6 +6520,68 @@ mod tests {
     }
 
     #[test]
+    fn a_result_arm_indents_its_inline_payload_to_the_arm_column() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/thing": {
+                    "get": {
+                        "operationId": "getThing",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "required": ["id"],
+                                            "properties": {
+                                                "id": { "type": "string" },
+                                                "nested": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "deep": { "type": "string" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "text/plain": { "schema": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (content, diagnostics) = emit_operation(document, "getthing");
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let start = content
+            .find("export type GetThingResult =")
+            .expect("result declaration");
+        let end = content[start..]
+            .find("\n\nexport type GetThingCallArgs")
+            .expect("call args declaration");
+        assert_eq!(
+            &content[start..start + end],
+            concat!(
+                "export type GetThingResult =\n",
+                "  | { outcome: 200; ok: true; status: 200; data: {\n",
+                "    id: string;\n",
+                "    nested?: {\n",
+                "      deep?: string;\n",
+                "    };\n",
+                "  }; contentType: \"application/json\"; meta: ResponseMeta }\n",
+                "  | { outcome: 200; ok: true; status: 200; data: string; contentType: \"text/plain\"; meta: ResponseMeta }\n",
+                "  | { outcome: \"unmatched\"; ok: false; status: number; error: UnknownHttpError; meta: ResponseMeta }\n",
+                "  | ResponsePhaseFailure<200>\n",
+                "  | RequestPhaseFailure;",
+            )
+        );
+    }
+
+    #[test]
     fn a_discriminated_default_branch_emits_four_arms() {
         // `default` spans both outcomes and this one declares two media entries, so it is 2 x 2 —
         // not the two arms a status-keyed branch would produce.
@@ -6546,7 +6609,7 @@ mod tests {
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
         assert!(
             content.contains(
-                "export type ReadthingResult =\n  | { outcome: \"default\"; ok: true; status: number; data: {\n  code?: number;\n}; contentType: \"application/json\"; meta: ResponseMeta }\n  | { outcome: \"default\"; ok: false; status: number; error: {\n  code?: number;\n}; contentType: \"application/json\"; meta: ResponseMeta }\n  | { outcome: \"default\"; ok: true; status: number; data: string; contentType: \"text/plain\"; meta: ResponseMeta }\n  | { outcome: \"default\"; ok: false; status: number; error: string; contentType: \"text/plain\"; meta: ResponseMeta }\n"
+                "export type ReadthingResult =\n  | { outcome: \"default\"; ok: true; status: number; data: {\n    code?: number;\n  }; contentType: \"application/json\"; meta: ResponseMeta }\n  | { outcome: \"default\"; ok: false; status: number; error: {\n    code?: number;\n  }; contentType: \"application/json\"; meta: ResponseMeta }\n  | { outcome: \"default\"; ok: true; status: number; data: string; contentType: \"text/plain\"; meta: ResponseMeta }\n  | { outcome: \"default\"; ok: false; status: number; error: string; contentType: \"text/plain\"; meta: ResponseMeta }\n"
             ),
             "{content}"
         );
