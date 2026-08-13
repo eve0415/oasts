@@ -1343,7 +1343,7 @@ fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut Diagnos
         let declared = ir.schemas.iter().any(|schema| {
             is_overrideable_schema(&schema.source) && schema.source.display() == *key
         });
-        if !declared {
+        if !declared && !ir.removed.schema_sources.contains(key) {
             sink.push(unmatched_override_diagnostic(
                 "schema",
                 "schemasBySource",
@@ -4359,6 +4359,72 @@ mod tests {
             .expect("override value rejection");
         assert!(diagnostic.message.contains("2Bad"));
         assert!(diagnostic.message.contains("begins with a digit"));
+    }
+
+    /// Pruning removing an override's target is not a typo — the same rule the bare `schemas`
+    /// namespace already follows. Without it, turning an operation off would break a config that
+    /// was valid, and default-on pruning would make a per-source override unusable on any document
+    /// whose schema is not reachable from an operation.
+    #[test]
+    fn a_per_source_override_survives_its_target_being_pruned() {
+        let pruned = source("/components/schemas/Thing").display();
+        let ir = Ir {
+            schemas: vec![named_schema("kept")],
+            removed: crate::ir::RemovedDeclarations {
+                schemas: vec!["Thing".to_owned()],
+                schema_sources: vec![pruned.clone()],
+                ..crate::ir::RemovedDeclarations::default()
+            },
+            ..Ir::default()
+        };
+        let naming = NamingConfig {
+            overrides: NameOverrides {
+                schemas_by_source: [(pruned, "RenamedThing".to_owned())].into_iter().collect(),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+        assert!(
+            !sink
+                .as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_OVERRIDE_UNMATCHED),
+            "{:?}",
+            sink.as_slice()
+        );
+    }
+
+    /// The other side: a key naming nothing at all stays a configuration error, so a typo in a
+    /// per-source key still surfaces immediately rather than silently doing nothing.
+    #[test]
+    fn a_per_source_override_naming_nothing_is_still_an_error() {
+        let ir = Ir {
+            schemas: vec![named_schema("kept")],
+            ..Ir::default()
+        };
+        let naming = NamingConfig {
+            overrides: NameOverrides {
+                schemas_by_source: [(
+                    source("/components/schemas/Typo").display(),
+                    "RenamedThing".to_owned(),
+                )]
+                .into_iter()
+                .collect(),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_OVERRIDE_UNMATCHED),
+            "{:?}",
+            sink.as_slice()
+        );
     }
 
     #[test]

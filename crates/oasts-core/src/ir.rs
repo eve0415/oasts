@@ -113,6 +113,10 @@ pub struct Ir {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RemovedDeclarations {
     pub schemas: Vec<String>,
+    /// The same removed schemas addressed the way a per-source override names them —
+    /// `SourceRef::display()`. Kept alongside the bare names because two documents can declare the
+    /// same name, so a name alone cannot tell a per-source key that its target was pruned.
+    pub schema_sources: Vec<String>,
     /// Operation ids; an operation without one contributes nothing, because an override cannot
     /// have named it either.
     pub operations: Vec<String>,
