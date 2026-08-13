@@ -37,7 +37,7 @@ use crate::ir::{
 };
 use crate::transform::{JsonKinds, KindBranch, TransformFacts, TransformKind, UnionDispatch};
 
-use super::client::ResponseConversion;
+use super::client::{FormFieldRenderSchema, ResponseConversion, form_field_render_schema};
 use super::model::EmissionModel;
 use super::paths::{TRANSFORM_SUBDIR, relative_import};
 use super::runtime_assets::rewrite_relative_ts_imports;
@@ -1763,9 +1763,10 @@ fn request_body_schema(
                 .iter()
                 .filter(|field| super::client::form_field_transforms(emitter.model, field))
                 .map(|field| {
+                    let rendered = form_field_render_schema(emitter.model, field);
                     (
                         field.name.clone(),
-                        form_field_schema(field),
+                        form_field_schema(field, rendered),
                         operation_property(field.required),
                     )
                 })
@@ -1818,19 +1819,19 @@ fn request_body_schema(
 
 /// One form field's actual input shape. Content-selected values wrap their schema payload under
 /// `body`, while binary uploads render as `Blob | File` and carry no date/time value to convert.
-fn form_field_schema(field: &FormFieldPlan) -> SchemaNode {
-    if field.is_binary_upload() {
+fn form_field_schema(field: &FormFieldPlan, rendered: FormFieldRenderSchema<'_>) -> SchemaNode {
+    let Some(body_schema) = rendered.schema else {
         return SchemaNode::Any {
             meta: operation_schema_meta(field.source.clone()),
         };
-    }
+    };
     if !field.wrapper.wrapped {
-        return field.schema.clone();
+        return body_schema.clone();
     }
     let properties = vec![
         (
             "body".to_owned(),
-            field.schema.clone(),
+            body_schema.clone(),
             operation_property(true),
         ),
         (
@@ -1839,7 +1840,16 @@ fn form_field_schema(field: &FormFieldPlan) -> SchemaNode {
             operation_property(true),
         ),
     ];
-    object_schema(properties, field.source.clone())
+    let wrapper = object_schema(properties, field.source.clone());
+    if rendered.repeated {
+        SchemaNode::Array {
+            items: Box::new(wrapper),
+            finite: None,
+            meta: operation_schema_meta(field.source.clone()),
+        }
+    } else {
+        wrapper
+    }
 }
 
 fn string_schema(source: SourceRef, const_value: Option<serde_json::Value>) -> SchemaNode {
@@ -3140,33 +3150,39 @@ mod tests {
     #[test]
     fn a_binary_upload_form_field_uses_an_untyped_transform_shape() {
         let source = SourceRef::default();
-        let schema = form_field_schema(&FormFieldPlan {
-            name: "archive".to_owned(),
-            required: true,
-            schema: SchemaNode::Primitive {
-                ty: PrimitiveType::String,
-                format: Some("binary".to_owned()),
-                enum_values: None,
-                const_value: None,
-                meta: SchemaMeta::default(),
-            },
-            serialization: FieldSerializationPlan::Content {
-                media: PartMediaPlan {
-                    values: vec!["application/octet-stream".to_owned()],
-                    payloads: vec![PayloadKind::Binary],
-                    all_concrete: true,
-                    binary_upload: true,
-                    declared: false,
+        let schema = form_field_schema(
+            &FormFieldPlan {
+                name: "archive".to_owned(),
+                required: true,
+                schema: SchemaNode::Primitive {
+                    ty: PrimitiveType::String,
+                    format: Some("binary".to_owned()),
+                    enum_values: None,
+                    const_value: None,
+                    meta: SchemaMeta::default(),
                 },
-                encoding_source: None,
+                serialization: FieldSerializationPlan::Content {
+                    media: PartMediaPlan {
+                        values: vec!["application/octet-stream".to_owned()],
+                        payloads: vec![PayloadKind::Binary],
+                        all_concrete: true,
+                        binary_upload: true,
+                        declared: false,
+                    },
+                    encoding_source: None,
+                },
+                wrapper: FieldWrapperPlan {
+                    wrapped: false,
+                    content_type_literal: true,
+                    filename: true,
+                },
+                source: source.clone(),
             },
-            wrapper: FieldWrapperPlan {
-                wrapped: false,
-                content_type_literal: true,
-                filename: true,
+            FormFieldRenderSchema {
+                schema: None,
+                repeated: false,
             },
-            source: source.clone(),
-        });
+        );
         assert_eq!(
             schema,
             SchemaNode::Any {
@@ -6381,6 +6397,57 @@ mod operation_pair_tests {
             "{content}"
         );
         assert!(!content.contains("value.body.label"), "{content}");
+    }
+
+    #[test]
+    fn a_repeated_wrapped_multipart_field_transforms_each_wrapper_body() {
+        let (files, diagnostics, has_errors) = compile_document(
+            operation_document(
+                json!({
+                    "operationId": "uploadDates",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["dates"],
+                                    "properties": {
+                                        "dates": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "string",
+                                                "format": "date-time"
+                                            }
+                                        }
+                                    }
+                                },
+                                "encoding": {
+                                    "dates": {
+                                        "contentType": "application/json, application/cbor"
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": { "204": { "description": "ok" } }
+                }),
+                json!({}),
+            ),
+            date_mode,
+        );
+
+        assert!(!has_errors, "{diagnostics:#?}");
+        assert!(refused(&diagnostics).is_empty(), "{diagnostics:#?}");
+        let content = operation_module(&files, "uploaddates").expect("operation codec");
+        assert!(
+            content.contains("dates: value.body.dates.map((item0, index0) => ({"),
+            "{content}"
+        );
+        assert!(
+            content.contains("body: encodeDateTimeDate(item0.body"),
+            "{content}"
+        );
     }
 
     #[test]

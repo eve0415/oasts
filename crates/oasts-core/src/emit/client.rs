@@ -540,8 +540,14 @@ fn emit_operation(
     });
     let decoding_notes = multipart_decoding_notes(plan);
     let (validate_request, validate_response) = validation_flags(model);
-    let request_checks =
-        request_validation_checks(operation, plan, &stem, validate_request, dispatch_root);
+    let request_checks = request_validation_checks(
+        model,
+        operation,
+        plan,
+        &stem,
+        validate_request,
+        dispatch_root,
+    );
     let response_checks = response_validation_checks(plan, &stem, validate_response);
     let event_checks = event_pipelines(plan, &stem, validate_response, &conversions);
     // Only the checks that name a validator: a per-event pipeline that converts without validating
@@ -1256,6 +1262,7 @@ fn validation_artifact_dir<'model>(model: &'model EmissionModel<'_, '_>) -> &'mo
 /// The request-side checks: every parameter in declared order, then the JSON request body. Empty
 /// unless request validation is enabled.
 fn request_validation_checks(
+    model: &EmissionModel<'_, '_>,
     operation: &Operation,
     plan: &OperationPlan,
     stem: &str,
@@ -1294,6 +1301,23 @@ fn request_validation_checks(
     if let Some(body) = &operation.request_body {
         for position in request_body_validator_positions(body, plan.body_plan.as_ref(), stem) {
             let access = position.access;
+            let (repeated_wrapper, optional_repeated_wrapper) =
+                match (&access, plan.body_plan.as_ref()) {
+                    (
+                        RequestBodyAccess::Field { key, wrapped: true },
+                        Some(
+                            BodyPlan::FormUrlencoded { fields, .. }
+                            | BodyPlan::Multipart { fields, .. },
+                        ),
+                    ) => fields
+                        .iter()
+                        .find(|field| field.name == key.as_str())
+                        .map_or((false, false), |field| {
+                            let repeated = form_field_render_schema(model, field).repeated;
+                            (repeated, repeated && !field.required)
+                        }),
+                    _ => (false, false),
+                };
             let content_type = match &access {
                 RequestBodyAccess::Arm { media } => {
                     let chain = if body.required { "." } else { "?." };
@@ -1306,8 +1330,14 @@ fn request_validation_checks(
                 RequestBodyAccess::Whole | RequestBodyAccess::Field { .. } => None,
             };
             checks.push(RequestCheck {
-                access: body_member_access(&access, root, body.required),
-                base_path: body_member_path(&access),
+                access: body_member_access(
+                    &access,
+                    root,
+                    body.required,
+                    repeated_wrapper,
+                    optional_repeated_wrapper,
+                ),
+                base_path: body_member_path(&access, repeated_wrapper),
                 validator: format!("validate{}", position.name),
                 guarded: position.guarded,
                 content_type,
@@ -1322,7 +1352,13 @@ fn request_validation_checks(
 /// Every hop that can be absent is optional-chained: the body itself when it is not required, and a
 /// wrapper object when its field is optional. A guarded check then tests the whole expression, so an
 /// absent hop short-circuits to `undefined` and the call is skipped rather than throwing.
-fn body_member_access(access: &RequestBodyAccess, root: &str, body_required: bool) -> String {
+fn body_member_access(
+    access: &RequestBodyAccess,
+    root: &str,
+    body_required: bool,
+    repeated_wrapper: bool,
+    optional_repeated_wrapper: bool,
+) -> String {
     let base = input_member(InputMember::Body, root);
     let chain = if body_required { "." } else { "?." };
     match access {
@@ -1338,7 +1374,13 @@ fn body_member_access(access: &RequestBodyAccess, root: &str, body_required: boo
             } else {
                 format!("{base}?.[{property}]")
             };
-            if *wrapped {
+            if *wrapped && repeated_wrapper {
+                access.push_str(if optional_repeated_wrapper {
+                    "?.map((item) => item.body)"
+                } else {
+                    ".map((item) => item.body)"
+                });
+            } else if *wrapped {
                 access.push_str("?.body");
             }
             access
@@ -1348,12 +1390,12 @@ fn body_member_access(access: &RequestBodyAccess, root: &str, body_required: boo
 }
 
 /// The issue path for one request-body validator position, mirroring the accessor hop for hop.
-fn body_member_path(access: &RequestBodyAccess) -> String {
+fn body_member_path(access: &RequestBodyAccess, repeated_wrapper: bool) -> String {
     match access {
         RequestBodyAccess::Whole => "[\"body\"]".to_owned(),
         RequestBodyAccess::Field { key, wrapped } => {
             let key = render_ts_string(key);
-            if *wrapped {
+            if *wrapped && !repeated_wrapper {
                 format!("[\"body\", {key}, \"body\"]")
             } else {
                 format!("[\"body\", {key}]")
@@ -2387,6 +2429,34 @@ fn render_form_input(
     output
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct FormFieldRenderSchema<'a> {
+    pub schema: Option<&'a SchemaNode>,
+    pub repeated: bool,
+}
+
+/// The schema a form field's input declaration renders, plus whether the runtime iterates it.
+///
+/// A wrapper belongs to each repeated item, so its `body` renders from the array item rather than
+/// the array itself. Binary uploads render an opaque handle and therefore select no schema.
+pub(super) fn form_field_render_schema<'a>(
+    model: &'a EmissionModel<'_, '_>,
+    field: &'a FormFieldPlan,
+) -> FormFieldRenderSchema<'a> {
+    let array_items = schema_array_items(model, &field.schema, &mut HashSet::new());
+    let schema = if field.is_binary_upload() {
+        None
+    } else if field.wrapper.wrapped {
+        Some(array_items.unwrap_or(&field.schema))
+    } else {
+        Some(&field.schema)
+    };
+    FormFieldRenderSchema {
+        schema,
+        repeated: array_items.is_some(),
+    }
+}
+
 fn render_form_field_input(
     renderer: &TypesEmitter<'_, '_, '_>,
     field: &FormFieldPlan,
@@ -2398,29 +2468,19 @@ fn render_form_field_input(
     } else {
         axis
     };
-    let binary_upload = matches!(
-        &field.serialization,
-        FieldSerializationPlan::Content { media, .. } if media.binary_upload
-    );
-    let array_items = schema_array_items(renderer.model, &field.schema, &mut HashSet::new());
+    let rendered = form_field_render_schema(renderer.model, field);
     // The runtime iterates a repeated field before it applies the wrapper, so a wrapped field's
     // body is one array element. An unwrapped non-binary field still renders its array schema
     // directly because its serializer receives each element after the runtime performs the split.
-    let body_schema = if field.wrapper.wrapped {
-        array_items.unwrap_or(&field.schema)
-    } else {
-        &field.schema
+    let body = match rendered.schema {
+        Some(schema) => renderer.render_type(schema, TypePosition::Request, field_axis, indent),
+        None => "Blob | File".to_owned(),
     };
-    let body = if binary_upload {
-        "Blob | File".to_owned()
-    } else {
-        renderer.render_type(body_schema, TypePosition::Request, field_axis, indent)
-    };
-    let repeat = |rendered: String| {
-        if array_items.is_some() && (binary_upload || field.wrapper.wrapped) {
-            format!("({rendered})[]")
+    let repeat = |body: String| {
+        if rendered.repeated && (rendered.schema.is_none() || field.wrapper.wrapped) {
+            format!("({body})[]")
         } else {
-            rendered
+            body
         }
     };
     if !field.wrapper.wrapped {
@@ -3582,13 +3642,11 @@ fn write_multipart_field(
     output.push_str(", required: ");
     output.push_str(if field.required { "true" } else { "false" });
     output.push_str(", repeated: ");
-    output.push_str(
-        if schema_is_array(model, &field.schema, &mut HashSet::new()) {
-            "true"
-        } else {
-            "false"
-        },
-    );
+    output.push_str(if form_field_render_schema(model, field).repeated {
+        "true"
+    } else {
+        "false"
+    });
     output.push_str(", wrapper: ");
     output.push_str(if field.wrapper.wrapped {
         "true"
@@ -3627,14 +3685,6 @@ fn write_multipart_field(
         "false"
     });
     output.push_str(" },\n");
-}
-
-fn schema_is_array(
-    model: &EmissionModel<'_, '_>,
-    schema: &SchemaNode,
-    visited: &mut HashSet<(String, String)>,
-) -> bool {
-    schema_array_items(model, schema, visited).is_some()
 }
 
 fn schema_array_items<'a>(
@@ -6629,7 +6679,7 @@ mod tests {
                 ..
             })
         ));
-        assert!(schema_is_array(&model, &items_ref, &mut HashSet::new()));
+        assert!(schema_array_items(&model, &items_ref, &mut HashSet::new()).is_some());
         let mut visited: HashSet<_> = [(
             items_ref.meta().source.source_id.clone(),
             items_ref.meta().source.json_pointer.clone(),
@@ -6641,21 +6691,19 @@ mod tests {
             visited.insert((target.source_id.clone(), target.json_pointer.clone()));
         }
         assert!(schema_array_items(&model, &items_ref, &mut visited).is_none());
-        assert!(!schema_is_array(&model, &items_ref, &mut visited));
-        assert!(schema_is_array(
-            &model,
-            &SchemaNode::Array {
-                items: Box::new(string_schema(None)),
-                finite: None,
-                meta: SchemaMeta::default(),
-            },
-            &mut HashSet::new()
-        ));
-        assert!(!schema_is_array(
-            &model,
-            &string_schema(None),
-            &mut HashSet::new()
-        ));
+        assert!(
+            schema_array_items(
+                &model,
+                &SchemaNode::Array {
+                    items: Box::new(string_schema(None)),
+                    finite: None,
+                    meta: SchemaMeta::default(),
+                },
+                &mut HashSet::new()
+            )
+            .is_some()
+        );
+        assert!(schema_array_items(&model, &string_schema(None), &mut HashSet::new()).is_none());
 
         let arm = |media: String, plan| crate::client_model::BodyPlanArm {
             media,
@@ -8054,6 +8102,103 @@ mod tests {
   }"#
             ),
             "optional bracket access mismatch:\n{content}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_wrapped_multipart_field_validates_the_wrapper_bodies() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/upload": {
+                    "post": {
+                        "operationId": "upload",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["metas"],
+                                        "properties": {
+                                            "metas": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": { "tag": { "type": "string" } }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "metas": {
+                                            "contentType": "application/json, application/cbor"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let content = emit_validated_operation(document, "upload", true, false);
+
+        assert!(
+            content.contains(
+                "validateUploadRequestBodyMetas(input.body.metas.map((item) => item.body), [\"body\", \"metas\"], requestIssues);"
+            ),
+            "repeated wrapper validation mismatch:\n{content}"
+        );
+    }
+
+    #[test]
+    fn an_optional_repeated_wrapped_form_field_validates_when_present() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/submit": {
+                    "post": {
+                        "operationId": "submit",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/x-www-form-urlencoded": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "dates": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "string",
+                                                    "format": "date-time"
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "encoding": {
+                                        "dates": {
+                                            "contentType": "application/json, application/cbor"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "ok" } }
+                    }
+                }
+            }
+        });
+        let content = emit_validated_operation(document, "submit", true, false);
+
+        assert!(
+            content.contains(
+                "input.body.dates?.map((item) => item.body), [\"body\", \"dates\"], requestIssues);"
+            ),
+            "optional repeated wrapper validation mismatch:\n{content}"
         );
     }
 
