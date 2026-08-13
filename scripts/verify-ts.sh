@@ -49,19 +49,30 @@ strict_flag_matrix() {
 # Only sound while pruning is on: `filters.orphans: true` means the document deliberately keeps
 # components no operation reaches, so those fixtures opt out.
 #
-# The known-orphan list below is debt, not design, and it is deliberately enumerated rather than
-# skipped by fixture so that a NEW orphan in any of these documents still fails. Every entry is one
-# pre-existing defect of a single family: a form, multipart, or non-JSON body types itself from
-# flattened fields or from its media classification instead of naming its schema, so the pruner
-# keeps a component the emitter never references. Reproduced identically at v0.0.3, so none of it
-# comes from `allOf` identity — closing it means deciding how a non-JSON body names its schema,
-# which is its own change.
+# The known-orphan list below is enumerated rather than skipped by fixture so that a NEW orphan in
+# any of these documents still fails. All of it is the same disagreement — pruning is
+# artifact-agnostic while emission is per-artifact, so the pruner keeps a component this artifact
+# never names — but the entries are five causes, not one, and two of them are consequences of
+# decisions this repo made on purpose rather than defects waiting to be fixed:
 #   form-composition-3.1  Forum/Text/NestedLeft*/NestedRight — urlencoded and multipart request
-#                         bodies whose properties the client flattens into field descriptors.
+#                         bodies whose properties the client flattens into per-field descriptors.
+#                         No value of the named type ever exists to bind an import to: the body is
+#                         serialized field by field, so there is no reference site to name it at.
 #   tictactoe-3.1         ErrorMessage — a `text/html` response typed `string` by classification.
-#   transform-composition-3.1  the per-component codec modules for a form-composed body.
-#   strict-flags-3.1      Manifest — a multipart response part.
-#   multipart-response-3.0  SnippetFiles — likewise, in both the types and validators trees.
+#                         Naming it would assert a contract the classification does not provide.
+#   multipart-response-3.0  SnippetFiles — types an unnamed `additionalProperties` catch-all, not a
+#                         declared part. An index signature has no field to attach the name to, and
+#                         the emitted element type is a different shape from the component's.
+#   strict-flags-3.1      Manifest — a declared multipart response part. The types artifact
+#                         represents a multipart response as `unknown` and says so in the emitted
+#                         remark, so the part's schema is unnamed there by design; the client
+#                         artifact models the parts and does name it. Not a wiring gap.
+#   transform-composition-3.1  Left/Right/Required/Audited — NOT a form body; this fixture has none.
+#                         A composing schema's codec inlines its `allOf` branches' conversions
+#                         instead of calling the branch codecs, which orphans the branch codec
+#                         modules. Deliberate: a branch codec spreads every key back, so two
+#                         whole-value calls over one value revert each other. The fixture's own
+#                         document says so, and exists to pin it.
 # The key is fixture plus file basename, not the full tree path, so one entry covers a component
 # orphaned under several of a fixture's configs — and, the cost of that, does not notice the same
 # basename newly orphaned in a tree it was fine in before.
@@ -124,6 +135,126 @@ assert_no_orphan_components() {
     echo "verify-ts: generated component is import-orphaned: $file (exports: ${names[*]})" >&2
     found=1
   done < <(find "$d"/generated* -path '*/components/*.ts' 2>/dev/null | sort)
+  assert_no_orphan_declarations "$d" "$fixture" || found=1
+  return "$found"
+}
+
+# A file is "referenced" as soon as ONE of its exports is imported, so the check above sees nothing
+# when a component file is imported for its own declaration while a second declaration beside it is
+# named by nobody. That is what a request/response twin for an unused position looked like: a live
+# file with a dead export inside it.
+#
+# Scoped to the derived names in the types tree, and deliberately not wider:
+#   * the component's own declaration is contractual — every named component is exported as a public
+#     declaration — and is unreferenced by construction whenever an operation reaches the component
+#     through a variant instead, so requiring an importer for it would fire on nearly every root;
+#   * the validators, zod, client and transform trees export their component modules as the public
+#     API a consumer calls (`petValidator`, `petSchema`, `decodePet`). An export nothing else in the
+#     tree imports is the normal shape of a public entry point there, not a dead declaration.
+# What is left is exactly the compiler's own invention: `{Name}Request`, `{Name}Response`, and the
+# wire twins composed onto them. Nothing outside the emitted tree is promised those names, so each
+# one has to be named by some other file in the same tree or it is not API, it is debt.
+# Empty, and worth keeping that way. Two known survivors exist in the pinned corpus rather than in
+# any fixture this gate generates — `workers_multipart-script` and
+# `workers_script-and-version-settings-item` in cloudflare-3.0, whose request variants no site names
+# because a multipart body flattens to per-field descriptors. That is the same cause as the
+# `form-composition-3.1` entries in the file-level list above, reached through
+# `components/requestBodies`; entries for them here could never fire, and a debt list that cannot
+# fire reads as coverage this gate does not have.
+declaration_debt=()
+
+# Args: work-dir fixture.
+assert_no_orphan_declarations() {
+  local d=$1 fixture=$2
+  # Every (resolved target file, imported name) pair in the tree. A named-import clause this cannot
+  # read becomes "nobody imports that name", which would report a live declaration as orphaned, so
+  # the forms are read rather than assumed. The awk pass joins a clause that wraps across lines —
+  # the emitted runtime carries those — and both quote styles are accepted, because the emitted
+  # runtime uses single quotes where the generated trees use double. `|| true` keeps a tree with no
+  # relative named imports from aborting the gate under `set -o pipefail`: no match is an answer.
+  # One awk pass emits both halves of the comparison: an `I` row per (resolved target, imported
+  # name) and an `E` row per exported declaration in a types component file. Resolving the specifier
+  # inside awk keeps the two halves in one traversal and one set of rules, rather than a second
+  # extraction pipeline that has to agree with the first about what an import looks like. Cost is
+  # not the reason: measured against a stubbed-out check, the whole pass is ~0.5s of this gate's
+  # ~84s, which is dominated by tsc.
+  local -A imported=()
+  local -a exports=()
+  local kind target name
+  while IFS=$'\t' read -r kind target name; do
+    case $kind in
+      I) imported["$target"$'\t'"$name"]=1 ;;
+      E) exports+=("$target"$'\t'"$name") ;;
+    esac
+  done < <(
+    find "$d"/generated* -name '*.ts' -print0 2>/dev/null \
+      | xargs -0 -r awk '
+          # Lexical resolution: collapse repeated separators, drop "." and resolve ".." segments.
+          # `find` over a directory argument yields "//", which the import side never has, so the
+          # two spellings have to be normalized or nothing ever matches.
+          function normalize(p,   parts, n, i, out, k, joined) {
+            gsub(/\/+/, "/", p)
+            n = split(p, parts, "/")
+            k = 0
+            for (i = 1; i <= n; i++) {
+              if (parts[i] == "" && i > 1) continue
+              if (parts[i] == ".") continue
+              if (parts[i] == "..") { if (k > 1) k--; continue }
+              out[++k] = parts[i]
+            }
+            joined = out[1]
+            for (i = 2; i <= k; i++) joined = joined "/" out[i]
+            return joined
+          }
+          function dirname(p) { sub(/\/[^\/]*$/, "", p); return p }
+          FNR == 1 { buf = "" }
+          buf != "" { buf = buf " " $0 }
+          buf == "" && /^import / { buf = $0 }
+          buf != "" && buf ~ /from[ ]*[\047\042][^\047\042]*[\047\042]/ {
+            clause = buf
+            buf = ""
+            if (clause !~ /\{/) next
+            spec = clause
+            sub(/^.*from[ ]*[\047\042]/, "", spec)
+            sub(/[\047\042].*$/, "", spec)
+            if (spec !~ /^\./) next
+            sub(/\.js$/, ".ts", spec)
+            names = clause
+            sub(/^[^{]*\{/, "", names)
+            sub(/\}.*$/, "", names)
+            target = normalize(dirname(FILENAME) "/" spec)
+            count = split(names, parts, ",")
+            for (i = 1; i <= count; i++) {
+              one = parts[i]
+              # `A as B` imports A from the target — B is only the importing module local name for
+              # it — and an inline `type` modifier is a modifier, not part of the name.
+              sub(/[ \t]+as[ \t]+.*$/, "", one)
+              gsub(/^[ \t]+|[ \t]+$/, "", one)
+              sub(/^type[ \t]+/, "", one)
+              if (one != "") print "I\t" target "\t" one
+            }
+          }
+          FILENAME ~ /\/types\/components\/[^\/]*\.ts$/ &&
+          /^export (interface|type) [A-Za-z_$][A-Za-z0-9_$]*/ {
+            split($0, field, " ")
+            print "E\t" normalize(FILENAME) "\t" field[3]
+          }
+        '
+  )
+  local entry file base lower found=0
+  for entry in "${exports[@]}"; do
+    file=${entry%%$'\t'*}
+    name=${entry#*$'\t'}
+    base=${file##*/}; base=${base%.ts}; base=${base//[^a-zA-Z0-9]/}
+    lower=${name//[^a-zA-Z0-9]/}
+    [[ ${lower,,} == "${base,,}" ]] && continue
+    [[ -n ${imported["$file"$'\t'"$name"]:-} ]] && continue
+    if [[ " ${declaration_debt[*]} " == *" $fixture/${file##*/}:$name "* ]]; then
+      continue
+    fi
+    echo "verify-ts: generated declaration is import-orphaned: $name in $file" >&2
+    found=1
+  done
   return "$found"
 }
 
@@ -184,6 +315,22 @@ for fidelity in schema-fidelity-3.1 schema-fidelity-3.0; do
     --moduleResolution bundler "$work/$fidelity/compile-assert/cases.ts"
   echo "compile-assert matrix ok: $fidelity"
 done
+# A request/response twin is emitted for a position the document uses the component at, not for
+# every position its shape would split at. Every component in this fixture carries both markers, so
+# shape alone would give each of them both twins. The compile assertions import the twins that
+# should not exist under `@ts-expect-error`: a resurrected dead twin is not a type error by itself,
+# so requiring the import to fail is the only way to assert it stayed dead.
+generate_and_verify variant-position-3.1 oasts.yaml "$work/variant-position-3.1" types "variant-position-3.1"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/variant-position-3.1/compile-assert/cases.ts"
+echo "compile-assert matrix ok: variant-position-3.1"
+# `not` splits three ways on the types surface: provably empty renders `never` (agreeing with the
+# validator that rejects every value), a `not` of nothing is a no-op, and everything in between
+# keeps its sibling type and reports the narrowing it could not apply. The compile assertions are
+# what pin the first case — it used to render `unknown`, which accepts every value the shipped
+# validator rejects.
+generate_and_verify negation-3.1 oasts.yaml "$work/negation-3.1" types "negation-3.1"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/negation-3.1/compile-assert/cases.ts"
+echo "compile-assert matrix ok: negation-3.1"
 generate_and_verify defs-entry-3.1 oasts.yaml "$work/defs-entry-3.1" types "defs-entry-3.1"
 generate_and_verify empty-enum-3.1 oasts.yaml "$work/empty-enum-3.1" types "empty-enum-3.1"
 generate_and_verify document-root-ref-3.1 oasts.yaml "$work/document-root-ref-3.1" types "document-root-ref-3.1"

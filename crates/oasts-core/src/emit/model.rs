@@ -2,7 +2,7 @@ use foldhash::{HashMap, HashMapExt, HashSet};
 
 use crate::config::ResolvedConfig;
 use crate::diag::DiagnosticSink;
-use crate::ir::{AdditionalProperties, SchemaNode, SourceRef, TupleRest};
+use crate::ir::{AdditionalProperties, Operation, SchemaNode, SourceRef, TupleRest};
 use crate::semantic::Analyzed;
 
 use crate::transform::TransformFacts;
@@ -10,8 +10,8 @@ use crate::transform::TransformFacts;
 use super::paths::ArtifactDirs;
 use super::{
     CODE_FILE_NAME, CODE_PATH_COLLISION, CODE_VARIANT_ALIAS, CODE_VARIANT_COLLISION,
-    CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, TypePosition, file_base_name, shape_variants,
-    source_diagnostic, warning_diagnostic,
+    CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, TypePosition, callback_operation, file_base_name,
+    property_in_position, shape_variants, source_diagnostic, warning_diagnostic,
 };
 
 #[derive(Clone, Debug)]
@@ -19,6 +19,10 @@ pub(crate) struct SchemaTarget {
     pub(crate) index: usize,
     pub(crate) name: String,
     pub(crate) file_base: String,
+    /// Whether this component declares a twin of its own at that position: the shape differs there
+    /// *and* some operation uses the component there. Shape alone is not enough — a component the
+    /// document only ever reads back has no request position to declare one for, and a twin emitted
+    /// for it is a name no emitted file can reach.
     pub(crate) request_differs: bool,
     pub(crate) response_differs: bool,
     /// The name this component's request-position variant exports under when the derived
@@ -199,7 +203,9 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         self.sink.extend(diagnostics);
     }
 
-    /// Propagates request/response variance across the component reference graph to a fixpoint.
+    /// Decides which request/response twins each component declares, from two fixpoints over the
+    /// same reference graph: variance says the shape *would* differ at a position, position-of-use
+    /// says the document ever puts the component there, and a twin needs both.
     ///
     /// `shape_variants` decides variance from each component's own inline structure but stops at a
     /// `$ref` — a graph edge, not crossed there. A component with no local read/write-only marker
@@ -209,9 +215,10 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
     /// referent's flags into every referrer until nothing changes. Monotone false->true, so the
     /// fixpoint is order-independent and deterministic regardless of graph shape or cycles.
     ///
-    /// Fast-reject: with no marker set anywhere, no variance can propagate, so the pass returns
-    /// before allocating any working buffer — the common marker-free input stays zero-heap, matching
-    /// the pre-pass allocation profile the drift gate pins.
+    /// Fast-reject: with no marker set anywhere, no variance can propagate and there is no twin for
+    /// position-of-use to suppress, so the pass returns before allocating any working buffer — the
+    /// common marker-free input stays zero-heap, matching the pre-pass allocation profile the drift
+    /// gate pins. The operation walk sits behind that return for exactly this reason.
     fn resolve_variant_shapes(&mut self) {
         let any_variance = self.schema_targets.values().any(|by_pointer| {
             by_pointer
@@ -258,6 +265,21 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                     }
                 }
             }
+        }
+
+        // Variance says the shape *would* differ at a position; it does not say the document ever
+        // uses the component there. A component reached only from a response still declared a
+        // `{Name}Request` that no emitted file could name, because this pass never consulted the
+        // operations. Suppress the flag itself rather than the export: `variant_name` reads the flag
+        // when it renders a reference, so a flag left standing beside a withheld declaration is the
+        // one shape that emits a name nothing declares.
+        // A component no operation reaches is reported as used at both positions rather than
+        // neither, so nothing is suppressed on the strength of a walk that found nothing — and its
+        // referents inherit that through the same fixpoint.
+        let (used_in_request, used_in_response) = self.resolve_positions_used(count);
+        for index in 0..count {
+            request[index] &= used_in_request[index];
+            response[index] &= used_in_response[index];
         }
 
         // `self.analyzed` is a Copy `&'input` reference, so writing back through it borrows the
@@ -399,10 +421,171 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         }
     }
 
+    /// Which positions each component is actually used at, as a `(request, response)` pair of
+    /// per-index flags.
+    ///
+    /// Seeded from every operation the document declares — path items, webhooks, and callbacks
+    /// nested to any depth — and then propagated referrer to referent, the opposite direction from
+    /// variance: a referrer renders its referent's variant, so variance flows inward, while a
+    /// component used in a response uses everything it reaches there, so use flows outward.
+    /// Monotone false-to-true, so the fixpoint is order-independent exactly as the variance one is.
+    ///
+    /// Both the seeds and the propagation walk the graph *at* the position they are establishing,
+    /// because that is the graph the renderer walks. A `readOnly` property is absent from the
+    /// request shape, so a request-position rendering never reaches through it, and a component
+    /// named only beyond such a property is never named in request position no matter how many
+    /// request bodies lead to its referrer.
+    ///
+    /// The suppression this feeds is sound because a component's variant is justified only where
+    /// some rendering *names* it, and a name appears exactly where this walk goes. The referrer
+    /// keeps its own twin either way: dropping a property is itself a divergence from the neutral
+    /// shape, so a referrer that hides a component still differs at that position on its own terms.
+    ///
+    /// Only the seed roots are this function's own, and a missed root is safe rather than silent:
+    /// it leaves a component used at neither position, which the caller reads as "do not suppress".
+    fn resolve_positions_used(&self, count: usize) -> (Vec<bool>, Vec<bool>) {
+        let mut request = vec![false; count];
+        let mut response = vec![false; count];
+        for operation in self.every_operation() {
+            for parameter in &operation.parameters {
+                self.seed_position(&parameter.schema, TypePosition::Request, &mut request);
+            }
+            if let Some(body) = &operation.request_body {
+                for media in &body.media_types {
+                    self.seed_position(&media.schema, TypePosition::Request, &mut request);
+                    for (_, encoding) in &media.encodings {
+                        for (_, header) in &encoding.headers {
+                            self.seed_position(&header.schema, TypePosition::Request, &mut request);
+                        }
+                    }
+                }
+            }
+            for entry in &operation.responses {
+                for media in &entry.media_types {
+                    self.seed_position(&media.schema, TypePosition::Response, &mut response);
+                }
+                for (_, header) in &entry.headers {
+                    self.seed_position(&header.schema, TypePosition::Response, &mut response);
+                }
+            }
+        }
+
+        let request_edges = self.position_edges(TypePosition::Request, count);
+        let response_edges = self.position_edges(TypePosition::Response, count);
+        fn propagate(used: &mut [bool], edges: &[Vec<usize>]) {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for source in 0..used.len() {
+                    for &referent in &edges[source] {
+                        if used[source] && !used[referent] {
+                            used[referent] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        propagate(&mut request, &request_edges);
+        propagate(&mut response, &response_edges);
+
+        // A component no operation reaches counts as used at *both* positions, and that has to
+        // propagate like any other use rather than be handled at the suppression site. Under
+        // `filters.orphans` such a component is still emitted and still renders directional
+        // declarations, so it names its referents' twins — and if the referent's flag were left
+        // suppressed, the referrer's response declaration would fall back to the referent's neutral
+        // name and publish a `writeOnly` field as part of a response. Seeding it here and running
+        // the fixpoint again is what carries "used at both" across the reference graph.
+        let mut any_unreached = false;
+        for index in 0..count {
+            if !request[index] && !response[index] {
+                request[index] = true;
+                response[index] = true;
+                any_unreached = true;
+            }
+        }
+        if any_unreached {
+            propagate(&mut request, &request_edges);
+            propagate(&mut response, &response_edges);
+        }
+        (request, response)
+    }
+
+    /// The reference graph as it stands at one position: every component `$ref` a rendering at that
+    /// position actually reaches, per component index.
+    fn position_edges(&self, position: TypePosition, count: usize) -> Vec<Vec<usize>> {
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for allocated in &self.analyzed.schema_names {
+            let index = allocated.schema_index;
+            let mut referenced = Vec::new();
+            self.collect_ref_edges_in_position(
+                &self.analyzed.ir.schemas[index].schema,
+                position,
+                &mut referenced,
+            );
+            referenced.sort_unstable();
+            referenced.dedup();
+            edges[index] = referenced;
+        }
+        edges
+    }
+
+    /// Marks every component an operation-position schema names at that position. The schema is
+    /// inline — a `$ref` to a component, or a structure containing them — so the component edges
+    /// out of it are exactly this position's seeds.
+    fn seed_position(&self, schema: &SchemaNode, position: TypePosition, used: &mut [bool]) {
+        let mut referenced = Vec::new();
+        self.collect_ref_edges_in_position(schema, position, &mut referenced);
+        for index in referenced {
+            used[index] = true;
+        }
+    }
+
+    /// Every operation the document declares: path-item operations, webhook operations (a sibling
+    /// vector, not part of `operations`), and callback operations, which nest inside an operation
+    /// and may themselves declare callbacks.
+    ///
+    /// Callbacks are read through `callback_names`, which semantic analysis already flattened to
+    /// any depth, rather than re-recursed here — the same walk `emit/validators.rs` and
+    /// `emit/zod.rs` do. A second hand-rolled recursion would be a second place for the flattening
+    /// rules to be wrong, and would not inherit a fix made to the first.
+    fn every_operation(&self) -> Vec<&'input Operation> {
+        let analyzed = self.analyzed;
+        analyzed
+            .ir
+            .operations
+            .iter()
+            .chain(
+                analyzed
+                    .ir
+                    .webhooks
+                    .iter()
+                    .flat_map(|webhook| webhook.operations.iter()),
+            )
+            .chain(analyzed.callback_names.iter().map(|allocated| {
+                callback_operation(&analyzed.ir, &analyzed.callback_names, allocated)
+            }))
+            .collect()
+    }
+
     /// Records the target index of every component `$ref` reachable from `schema` through the same
     /// inline structure `shape_variants` walks. A `$ref` is terminal here — it records the edge and
     /// stops; the referent's own edges are collected when it is visited as a source. Stack-only.
     fn collect_ref_edges(&self, schema: &SchemaNode, edges: &mut Vec<usize>) {
+        self.collect_ref_edges_in_position(schema, TypePosition::Neutral, edges);
+    }
+
+    /// The same walk, restricted to what survives at one position. A `readOnly` property is not
+    /// part of the request shape at all, so a rendering in request position never reaches through
+    /// it — and a component named only through such a property is not used in request position,
+    /// however many request bodies lead to its referrer. `TypePosition::Neutral` keeps everything
+    /// and is what the variance pass walks.
+    fn collect_ref_edges_in_position(
+        &self,
+        schema: &SchemaNode,
+        position: TypePosition,
+        edges: &mut Vec<usize>,
+    ) {
         match schema {
             SchemaNode::Ref { target, .. } => {
                 if let Some(target) = self.schema_target(&target.source_id, &target.json_pointer) {
@@ -414,31 +597,36 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                 additional_properties,
                 ..
             } => {
-                for (_, property, _) in properties {
-                    self.collect_ref_edges(property, edges);
+                for (_, property, meta) in properties {
+                    if !property_in_position(meta, position) {
+                        continue;
+                    }
+                    self.collect_ref_edges_in_position(property, position, edges);
                 }
                 if let AdditionalProperties::Allowed(Some(schema))
                 | AdditionalProperties::Schema(schema) = additional_properties
                 {
-                    self.collect_ref_edges(schema, edges);
+                    self.collect_ref_edges_in_position(schema, position, edges);
                 }
             }
-            SchemaNode::Array { items, .. } => self.collect_ref_edges(items, edges),
+            SchemaNode::Array { items, .. } => {
+                self.collect_ref_edges_in_position(items, position, edges)
+            }
             SchemaNode::Tuple {
                 prefix_items, rest, ..
             } => {
                 for item in prefix_items {
-                    self.collect_ref_edges(item, edges);
+                    self.collect_ref_edges_in_position(item, position, edges);
                 }
                 if let TupleRest::Schema(schema) = rest {
-                    self.collect_ref_edges(schema, edges);
+                    self.collect_ref_edges_in_position(schema, position, edges);
                 }
             }
             SchemaNode::AllOf { branches, .. }
             | SchemaNode::AnyOf { branches, .. }
             | SchemaNode::OneOf { branches, .. } => {
                 for branch in branches {
-                    self.collect_ref_edges(branch, edges);
+                    self.collect_ref_edges_in_position(branch, position, edges);
                 }
             }
             SchemaNode::Primitive { .. }
@@ -449,34 +637,34 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         }
         let applicators = schema.meta().validation_applicators();
         if let Some(schema) = &applicators.not {
-            self.collect_ref_edges(schema, edges);
+            self.collect_ref_edges_in_position(schema, position, edges);
         }
         if let Some(schema) = &applicators.property_names {
-            self.collect_ref_edges(schema, edges);
+            self.collect_ref_edges_in_position(schema, position, edges);
         }
         for pattern in &applicators.pattern_properties {
-            self.collect_ref_edges(&pattern.schema, edges);
+            self.collect_ref_edges_in_position(&pattern.schema, position, edges);
         }
         if let Some(contains) = &applicators.contains {
-            self.collect_ref_edges(&contains.schema, edges);
+            self.collect_ref_edges_in_position(&contains.schema, position, edges);
         }
         for (_, schema) in &applicators.dependent_schemas {
-            self.collect_ref_edges(schema, edges);
+            self.collect_ref_edges_in_position(schema, position, edges);
         }
         if let Some(conditional) = &applicators.conditional {
-            self.collect_ref_edges(&conditional.condition, edges);
+            self.collect_ref_edges_in_position(&conditional.condition, position, edges);
             if let Some(schema) = &conditional.then_schema {
-                self.collect_ref_edges(schema, edges);
+                self.collect_ref_edges_in_position(schema, position, edges);
             }
             if let Some(schema) = &conditional.else_schema {
-                self.collect_ref_edges(schema, edges);
+                self.collect_ref_edges_in_position(schema, position, edges);
             }
         }
         if let Some(schema) = &applicators.unevaluated_properties {
-            self.collect_ref_edges(schema, edges);
+            self.collect_ref_edges_in_position(schema, position, edges);
         }
         if let Some(schema) = &applicators.unevaluated_items {
-            self.collect_ref_edges(schema, edges);
+            self.collect_ref_edges_in_position(schema, position, edges);
         }
     }
 
@@ -716,15 +904,28 @@ mod tests {
         schemas: Value,
         patch: fn(&mut ResolvedConfig),
     ) -> (TempDir, ResolvedConfig, Analyzed, String) {
+        build_model_inputs_from_document(
+            json!({
+                "openapi": "3.1.0",
+                "info": { "title": "t", "version": "1" },
+                "paths": {},
+                "components": { "schemas": schemas }
+            }),
+            patch,
+        )
+    }
+
+    /// The same inputs from a caller-supplied document. A component's request/response twin is
+    /// emitted only for a position some operation uses it at, so a test about twins has to declare
+    /// the operations it means — the `paths: {}` document above puts every component in the
+    /// used-nowhere case, where both twins stand by default and the suppression cannot be observed.
+    pub(super) fn build_model_inputs_from_document(
+        document: Value,
+        patch: fn(&mut ResolvedConfig),
+    ) -> (TempDir, ResolvedConfig, Analyzed, String) {
         let temp = TempDir::new().expect("temp directory");
         let input = temp.path().join("openapi.json");
         let config_path = temp.path().join("oasts.json");
-        let document = json!({
-            "openapi": "3.1.0",
-            "info": { "title": "t", "version": "1" },
-            "paths": {},
-            "components": { "schemas": schemas }
-        });
         fs::write(
             &input,
             serde_json::to_vec(&document).expect("document JSON"),
@@ -1490,7 +1691,7 @@ mod wire_variant_tests {
 mod wire_declaration_tests {
     use serde_json::{Value, json};
 
-    use super::tests::build_model_inputs_with;
+    use super::tests::{build_model_inputs_from_document, build_model_inputs_with};
     use super::*;
     use crate::config::{DateRepresentation, DateTimeRepresentation};
     use crate::emit::emit_types_from_model;
@@ -1679,6 +1880,280 @@ mod wire_declaration_tests {
                 "{name}: {content}"
             );
         }
+    }
+
+    /// A component carrying both markers, and a second one it reaches only by `$ref`. Whatever
+    /// positions the caller wires them into is what the twins should follow.
+    fn split(reference: &str) -> Value {
+        json!({
+            "type": "object",
+            "required": ["id", "secret"],
+            "properties": {
+                "id": { "type": "string", "readOnly": true },
+                "secret": { "type": "string", "writeOnly": true },
+                "nested": { "$ref": format!("#/components/schemas/{reference}") }
+            }
+        })
+    }
+
+    /// `Read` is named by a response only, `Write` by a request body only, `Both` by one of each.
+    /// Each reaches its own `*Leaf`, so the same document pins the transitive case in all three
+    /// directions.
+    fn positioned_document() -> Value {
+        let leaf = json!({
+            "type": "object",
+            "required": ["id", "secret"],
+            "properties": {
+                "id": { "type": "string", "readOnly": true },
+                "secret": { "type": "string", "writeOnly": true }
+            }
+        });
+        let json_body = |name: &str| {
+            json!({ "content": { "application/json": {
+                "schema": { "$ref": format!("#/components/schemas/{name}") }
+            } } })
+        };
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": {
+                "/read": { "get": { "operationId": "read", "responses": {
+                    "200": {
+                        "description": "ok",
+                        "content": { "application/json": {
+                            "schema": { "$ref": "#/components/schemas/Read" }
+                        } },
+                        // A response header is a response-position root of its own, reached
+                        // through no media type.
+                        "headers": { "X-Read": {
+                            "schema": { "$ref": "#/components/schemas/ReadHeader" }
+                        } }
+                    }
+                } } },
+                "/write": { "post": {
+                    "operationId": "write",
+                    // A parameter is a request-position root, and the only one `github-3.0`'s
+                    // single live variant is reached through.
+                    "parameters": [ {
+                        "name": "trace",
+                        "in": "query",
+                        "schema": { "$ref": "#/components/schemas/WriteParam" }
+                    } ],
+                    "requestBody": json_body("Write"),
+                    "responses": { "204": { "description": "done" } }
+                } },
+                "/both": { "put": {
+                    "operationId": "both",
+                    "requestBody": json_body("Both"),
+                    "responses": { "200": { "description": "ok", "content": { "application/json": {
+                        "schema": { "$ref": "#/components/schemas/Both" }
+                    } } } },
+                    // A callback operation is an operation like any other, and its own request
+                    // body is a request-position root.
+                    "callbacks": { "onDone": { "{$request.body#/url}": { "post": {
+                        "operationId": "onDone",
+                        "requestBody": json_body("CallbackBody"),
+                        "responses": { "204": { "description": "done" } }
+                    } } } }
+                } },
+                // A multipart request body carries per-part encoding headers, which are request
+                // -position roots reached through neither the body schema nor a parameter.
+                "/parts": { "post": {
+                    "operationId": "parts",
+                    "requestBody": { "content": { "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": { "file": { "type": "string" } }
+                        },
+                        "encoding": { "file": { "headers": { "X-Part": {
+                            "schema": { "$ref": "#/components/schemas/PartHeader" }
+                        } } } }
+                    } } },
+                    "responses": { "204": { "description": "done" } }
+                } }
+            },
+            // A webhook operation is a sibling of `paths`, not part of it, and the document sends
+            // its body — so its request body is a request-position root like any other.
+            "webhooks": { "ping": { "post": {
+                "operationId": "ping",
+                "requestBody": json_body("WebhookBody"),
+                "responses": { "204": { "description": "done" } }
+            } } },
+            "components": { "schemas": {
+                "Read": split("ReadLeaf"),
+                "Write": split("WriteLeaf"),
+                "Both": split("BothLeaf"),
+                "ReadLeaf": leaf,
+                "WriteLeaf": leaf,
+                "BothLeaf": leaf,
+                "ReadHeader": leaf,
+                "WriteParam": leaf,
+                "CallbackBody": leaf,
+                "PartHeader": leaf,
+                "WebhookBody": leaf
+            } }
+        })
+    }
+
+    fn positioned_component(base: &str) -> String {
+        let (_temp, resolved, analyzed, digest) =
+            build_model_inputs_from_document(positioned_document(), |_| {});
+        let mut sink = DiagnosticSink::new();
+        let mut model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        emit_types_from_model(&mut model)
+            .into_iter()
+            .find(|file| file.relative_path == format!("types/components/{base}.ts"))
+            .expect("component file")
+            .content
+    }
+
+    fn declares(content: &str, name: &str) -> bool {
+        content.contains(&format!("export interface {name} "))
+    }
+
+    #[test]
+    fn a_response_only_component_declares_no_request_twin() {
+        let content = positioned_component("read");
+        assert!(declares(&content, "Read"), "{content}");
+        assert!(declares(&content, "ReadResponse"), "{content}");
+        assert!(!declares(&content, "ReadRequest"), "{content}");
+    }
+
+    #[test]
+    fn a_request_only_component_declares_no_response_twin() {
+        let content = positioned_component("write");
+        assert!(declares(&content, "Write"), "{content}");
+        assert!(declares(&content, "WriteRequest"), "{content}");
+        assert!(!declares(&content, "WriteResponse"), "{content}");
+    }
+
+    #[test]
+    fn a_component_used_at_both_positions_declares_both_twins() {
+        let content = positioned_component("both");
+        for name in ["Both", "BothRequest", "BothResponse"] {
+            assert!(declares(&content, name), "{name}: {content}");
+        }
+    }
+
+    /// The seed roots that are not a body schema: a response header, a query parameter, a callback
+    /// operation's own request body, and a multipart part's encoding header. Each is the only route
+    /// to its component, so each twin below exists only if that root is walked — `github-3.0`'s one
+    /// live derived variant is reached through a parameter, not a body.
+    #[test]
+    fn every_operation_position_root_seeds_the_component_it_names() {
+        for (base, present, absent) in [
+            ("readheader", "ReadHeaderResponse", "ReadHeaderRequest"),
+            ("writeparam", "WriteParamRequest", "WriteParamResponse"),
+            (
+                "callbackbody",
+                "CallbackBodyRequest",
+                "CallbackBodyResponse",
+            ),
+            ("partheader", "PartHeaderRequest", "PartHeaderResponse"),
+            ("webhookbody", "WebhookBodyRequest", "WebhookBodyResponse"),
+        ] {
+            let content = positioned_component(base);
+            assert!(declares(&content, present), "{present}: {content}");
+            assert!(!declares(&content, absent), "{absent}: {content}");
+        }
+    }
+
+    /// Position of use flows the way references point: a component reached only through a
+    /// response-only component is itself response-only, however deep the chain.
+    #[test]
+    fn position_of_use_reaches_a_transitively_referenced_component() {
+        let read = positioned_component("readleaf");
+        assert!(declares(&read, "ReadLeafResponse"), "{read}");
+        assert!(!declares(&read, "ReadLeafRequest"), "{read}");
+
+        let write = positioned_component("writeleaf");
+        assert!(declares(&write, "WriteLeafRequest"), "{write}");
+        assert!(!declares(&write, "WriteLeafResponse"), "{write}");
+    }
+
+    /// A schema-library document declares no operation, so no component is used at any position.
+    /// Suppressing on the strength of a walk that found nothing would delete both twins from every
+    /// component in the document; the pass leaves them exactly as variance decided.
+    #[test]
+    fn a_component_no_operation_reaches_keeps_both_twins() {
+        let content = component_file(
+            json!({
+                "Pet": {
+                    "type": "object",
+                    "required": ["id", "secret"],
+                    "properties": {
+                        "id": { "type": "string", "readOnly": true },
+                        "secret": { "type": "string", "writeOnly": true }
+                    }
+                }
+            }),
+            "pet",
+            |_| {},
+        );
+        for name in ["Pet", "PetRequest", "PetResponse"] {
+            assert!(declares(&content, name), "{name}: {content}");
+        }
+    }
+
+    /// An orphan-retaining document keeps a component no operation reaches, and that component
+    /// still renders directional declarations naming its referents' twins. If the referent's flag
+    /// were suppressed because operations only reach it in the other position, the orphan's response
+    /// declaration would fall back to the referent's neutral name — publishing a `writeOnly` field
+    /// as part of a response, which compiles and is wrong. "Used at neither" therefore means "used
+    /// at both", and has to propagate as such.
+    #[test]
+    fn an_orphan_referrer_still_names_its_referents_twin() {
+        let document = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/x": { "post": {
+                "operationId": "sendX",
+                "requestBody": { "content": { "application/json": {
+                    "schema": { "$ref": "#/components/schemas/X" }
+                } } },
+                "responses": { "204": { "description": "done" } }
+            } } },
+            "components": { "schemas": {
+                "X": {
+                    "type": "object",
+                    "required": ["own", "secret"],
+                    "properties": {
+                        "own": { "type": "string" },
+                        "secret": { "type": "string", "writeOnly": true }
+                    }
+                },
+                "Y": {
+                    "type": "object",
+                    "required": ["own", "nested"],
+                    "properties": {
+                        "own": { "type": "string" },
+                        "nested": { "$ref": "#/components/schemas/X" },
+                        "hidden": { "type": "string", "readOnly": true }
+                    }
+                }
+            } }
+        });
+        let (_temp, resolved, analyzed, digest) =
+            build_model_inputs_from_document(document, |_| {});
+        let mut sink = DiagnosticSink::new();
+        let mut model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        let files = emit_types_from_model(&mut model);
+        let content = |base: &str| {
+            files
+                .iter()
+                .find(|file| file.relative_path == format!("types/components/{base}.ts"))
+                .expect("component file")
+                .content
+                .clone()
+        };
+
+        let x = content("x");
+        assert!(declares(&x, "XResponse"), "{x}");
+        let y = content("y");
+        assert!(
+            y.contains("nested: XResponse;"),
+            "the orphan's response declaration must name the response twin, not the neutral name: {y}"
+        );
     }
 
     #[test]

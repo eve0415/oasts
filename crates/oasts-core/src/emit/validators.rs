@@ -6524,6 +6524,10 @@ mod tests {
         }
     }
 
+    /// A `not` of a schema that admits everything admits nothing, so the parser lowers it to the
+    /// same `Never` node the boolean schema `false` produces, and the negation machinery never
+    /// reaches this emitter. What the rejection is spelled as changed; that every value is rejected,
+    /// and that the component stays complete, did not.
     #[test]
     fn not_of_an_empty_schema_is_complete_and_rejects_every_value() {
         let (files, diagnostics) = compile(doc_31(json!({
@@ -6531,9 +6535,9 @@ mod tests {
         })));
         assert_clean(&diagnostics);
         let content = component(&files, "rejectall");
-        assert!(content.contains("const issues0: Issue[] = [];"));
-        assert!(content.contains("if (issues0.length === 0) {"));
-        assert!(content.contains("\"value matches not schema\""));
+        assert!(content.contains("issues.push(issue(path, \"value not allowed\"));"));
+        // Unconditional: no branch guards the rejection, so no value reaches an accepting path.
+        assert!(!content.contains("if ("));
     }
 
     #[test]

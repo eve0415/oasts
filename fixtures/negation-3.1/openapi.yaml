@@ -1,0 +1,85 @@
+openapi: 3.1.0
+info:
+  title: Negation Probe
+  version: 1.0.0
+paths:
+  /negation:
+    get:
+      operationId: getNegation
+      responses:
+        "200":
+          description: the probe holder
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Holder"
+components:
+  schemas:
+    # A `not` whose subschema admits every instance states "no instance", exactly as the
+    # boolean schema `false` does. Three spellings of the same statement, all silent: the
+    # types surface renders `never`, which is what the validators artifact already enforces.
+    RejectAll:
+      not: {}
+    RejectAllTrue:
+      not: true
+    RejectAllAnnotated:
+      not:
+        description: an annotation narrows nothing
+    # The mirror. The complement of "no instance" is every instance, so the keyword is a
+    # no-op and the sibling type stands unchanged — nothing is widened, nothing is said.
+    RejectNothing:
+      type: string
+      not: false
+    # A `not` TypeScript has no complement type for. The string survives; the narrowing is
+    # dropped, and dropping it silently is what the diagnostic exists to prevent.
+    RejectSome:
+      type: string
+      not:
+        const: blocked
+    # The same case reached through a `$ref`. `Excluded` is named by `Holder` as well, so
+    # this row probes the diagnostic without also probing reference reachability.
+    NamedNot:
+      type: object
+      properties:
+        payload:
+          type: string
+      not:
+        $ref: "#/components/schemas/Excluded"
+    Excluded:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          const: excluded
+    # The only other narrowing applicator the types surface drops without a word.
+    KeyedNames:
+      type: object
+      propertyNames:
+        pattern: "^x-"
+      additionalProperties:
+        type: string
+    Holder:
+      type: object
+      required:
+        - rejectNothing
+        - rejectSome
+        - namedNot
+        - excluded
+        - keyedNames
+      properties:
+        rejectAll:
+          $ref: "#/components/schemas/RejectAll"
+        rejectAllTrue:
+          $ref: "#/components/schemas/RejectAllTrue"
+        rejectAllAnnotated:
+          $ref: "#/components/schemas/RejectAllAnnotated"
+        rejectNothing:
+          $ref: "#/components/schemas/RejectNothing"
+        rejectSome:
+          $ref: "#/components/schemas/RejectSome"
+        namedNot:
+          $ref: "#/components/schemas/NamedNot"
+        excluded:
+          $ref: "#/components/schemas/Excluded"
+        keyedNames:
+          $ref: "#/components/schemas/KeyedNames"

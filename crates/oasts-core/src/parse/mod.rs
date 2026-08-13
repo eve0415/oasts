@@ -25,6 +25,12 @@ use crate::media::canonical_content_key;
 const CODE_VERSION: &str = "OASTS1101";
 const CODE_SHAPE: &str = "OASTS1102";
 const CODE_UNSUPPORTED: &str = "OASTS1103";
+/// A narrowing schema keyword the emitted TypeScript cannot apply. Unlike `CODE_UNSUPPORTED`, the
+/// leaf does not widen to `unknown` — the sibling type survives exactly as declared and only the
+/// narrowing is lost, so the emitted type is wider than the document. Reported rather than dropped
+/// because a keyword is never silently ignored when doing so widens a public type; the validators
+/// artifact still enforces it exactly.
+const CODE_UNAPPLIED_NARROWING: &str = "OASTS1122";
 const CODE_RESPONSE_STATUS: &str = "OASTS1104";
 /// A status range written in lowercase. OpenAPI specifies the uppercase wildcard, but real
 /// documents ship `4xx`, so it is canonicalized and reported rather than rejected.
@@ -127,6 +133,13 @@ struct Parser<'graph, 'sink> {
     version: OasVersion,
     sink: &'sink mut DiagnosticSink,
     entry_defs_referenced: bool,
+    /// Set by a dispatch branch that has proven the schema it is parsing admits no instance, and
+    /// read by `parse_schema` once the dispatch returns. It is a one-schema channel: `parse_schema`
+    /// saves and restores it around the call, so a nested subschema's emptiness cannot escape into
+    /// its parent. Lowering has to wait for the dispatch to finish, because the dispatch is also
+    /// what validates the rest of the object, and a schema that admits nothing can still be written
+    /// in a document that is malformed elsewhere.
+    admits_no_instance: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -317,6 +330,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             version,
             sink,
             entry_defs_referenced: false,
+            admits_no_instance: false,
         }
     }
 
@@ -2021,7 +2035,46 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         })
     }
 
+    /// Lowers one schema, then applies the one rewrite that has to see the finished node: a `not`
+    /// whose subschema admits every instance says that no instance is valid, exactly as the boolean
+    /// schema `false` does, and lowers the same way.
+    ///
+    /// It runs *after* the whole dispatch rather than as an early return inside it. Returning early
+    /// skipped every sibling keyword the dispatch would have parsed — not only their unsupported-
+    /// keyword warnings but their shape validation — so `{ not: {}, oneOf: "invalid" }` generated
+    /// successfully and exit 0 where the same document without the `not` is a fatal `OASTS1102`.
+    /// A keyword that says "no instance is valid" says nothing about whether the document is valid.
     fn parse_schema(&mut self, node: NodeView<'graph>) -> SchemaNode {
+        let outer = std::mem::replace(&mut self.admits_no_instance, false);
+        let lowered = self.parse_schema_dispatch(node);
+        let admits_no_instance = std::mem::replace(&mut self.admits_no_instance, outer);
+        if !admits_no_instance && !node_negates_everything(&lowered) {
+            return lowered;
+        }
+        // `Unknown` is the parser's record that it could not represent something, and the validators
+        // artifact refuses rather than emitting a check for it. Rewriting that to `Never` would turn
+        // a refusal into a generated validator, which is a wider change than this rule.
+        if matches!(lowered, SchemaNode::Unknown { .. }) {
+            return lowered;
+        }
+        let mut meta = lowered.into_meta();
+        let mut applicators = meta
+            .validation_applicators
+            .take()
+            .map(|applicators| *applicators)
+            .unwrap_or_default();
+        // The node already admits nothing, so restating the negation would only reject a second
+        // time what the node rejects on its own.
+        applicators.not = None;
+        meta.validation_applicators = box_if_populated(applicators);
+        // Nullability widens, and there is nothing left to widen: `never | null` would admit the one
+        // value the schema is most explicit about rejecting. The empty-enum lowering clears it for
+        // the same reason.
+        meta.nullable = false;
+        SchemaNode::Never { meta }
+    }
+
+    fn parse_schema_dispatch(&mut self, node: NodeView<'graph>) -> SchemaNode {
         if let Some(boolean) = node.value.as_bool() {
             let meta = self.schema_meta(&node, None);
             if self.version == OasVersion::V3_1 {
@@ -2045,6 +2098,33 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             );
         };
         let mut meta = self.schema_meta(&node, Some(object));
+        if self.version == OasVersion::V3_1
+            && meta.validation_applicators().property_names.is_some()
+        {
+            self.sink.push(self.warning_diagnostic(
+                CODE_UNAPPLIED_NARROWING,
+                node.doc_id,
+                &append_pointer(&node.pointer, "propertyNames"),
+                "schema keyword 'propertyNames' narrows validation but its constraint is not applied to the emitted type; the validators artifact enforces it instead",
+            ));
+        }
+        // One three-way classification of the `not` subschema: it admits everything (the caller
+        // lowers the whole node to `Never`, silently), it admits nothing (a no-op that narrows
+        // nothing and is equally silent), or it narrows in a way TypeScript cannot express, which is
+        // the only case that warns. The lowering itself waits for the caller, because it is a
+        // `return` and would carry every sibling keyword's diagnostic out with it.
+        let negation = meta.validation_applicators().not.as_deref();
+        let not_admits_everything = negation.is_some_and(schema_admits_everything);
+        if negation.is_some_and(|schema| {
+            !not_admits_everything && !matches!(schema, SchemaNode::Never { .. })
+        }) {
+            self.sink.push(self.warning_diagnostic(
+                CODE_UNAPPLIED_NARROWING,
+                node.doc_id,
+                &append_pointer(&node.pointer, "not"),
+                "schema keyword 'not' narrows validation but its constraint is not applied to the emitted type; the validators artifact enforces it instead",
+            ));
+        }
         if object
             .get("enum")
             .and_then(Value::as_array)
@@ -2068,8 +2148,12 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 }
             };
             self.sink.push(diagnostic);
-            meta.nullable = false;
-            return SchemaNode::Never { meta };
+            // Reported here so it keeps its place in the sink, but lowered by the caller once the
+            // dispatch has parsed the rest of the object. Returning `Never` from inside the dispatch
+            // is what let `{ enum: [], oneOf: "invalid" }` generate at exit 0: the malformed sibling
+            // was never reached, so it was never diagnosed. Emptiness is a statement about the
+            // instances a schema admits, not a licence to stop reading the document.
+            self.admits_no_instance = true;
         }
         let dialect_unsupported = if self.version == OasVersion::V3_0 {
             [
@@ -4263,6 +4347,50 @@ fn has_typed_or_constraint_content(object: &Map<String, Value>, version: OasVers
         || (version == OasVersion::V3_1 && V3_1_ONLY.iter().any(|key| object.contains_key(*key)))
 }
 
+/// Whether the lowered node carries a `not` that admits every instance, and so admits nothing
+/// itself.
+///
+/// Two places have to be looked at, because a schema object carrying more than one independent
+/// piece is lowered to a conjunction and `split_for_conjunction` hands the `not` to the **typed**
+/// branch rather than the wrapper. Reading only the wrapper silently stopped lowering exactly the
+/// shapes that carry a sibling — `{$ref: …, minProperties: 1, not: {}}` rendered as its reference
+/// while the validator beside it rejected every value, which is the divergence this rule exists to
+/// close. One conjunct admitting nothing is enough: a conjunction is satisfied only by a value that
+/// satisfies all of it.
+fn node_negates_everything(node: &SchemaNode) -> bool {
+    fn negates(node: &SchemaNode) -> bool {
+        node.meta()
+            .validation_applicators()
+            .not
+            .as_deref()
+            .is_some_and(schema_admits_everything)
+    }
+    if negates(node) {
+        return true;
+    }
+    match node {
+        SchemaNode::AllOf { branches, .. } => branches.iter().any(negates),
+        _ => false,
+    }
+}
+
+/// Whether the lowered schema accepts every JSON instance. Typeless constraint groups and
+/// validation applicators still narrow an `Any` node, while annotations and content encoding do
+/// not. Rejected validation keywords keep the classification conservative because their semantics
+/// are unavailable in the lowered IR.
+fn schema_admits_everything(schema: &SchemaNode) -> bool {
+    matches!(
+        schema,
+        SchemaNode::Any { meta }
+            if meta.numeric_constraints.is_none()
+                && meta.string_constraints.is_none()
+                && meta.array_constraints.is_none()
+                && meta.object_constraints.is_none()
+                && meta.validation_applicators.is_none()
+                && meta.rejected_validation_keywords.is_empty()
+    )
+}
+
 /// Source-only meta for a synthetic conjunction branch (`$ref`/`oneOf`/`anyOf` piece). Docs,
 /// nullability, and constraints live on the wrapper or the typed branch, never on these pieces.
 fn minimal_conjunction_meta(source: &SourceRef) -> SchemaMeta {
@@ -5995,6 +6123,13 @@ mod tests {
         sink.as_slice()
             .iter()
             .filter(|diagnostic| diagnostic.code == CODE_REF_SIBLINGS)
+            .collect()
+    }
+
+    fn unapplied_narrowing_warnings(sink: &DiagnosticSink) -> Vec<&Diagnostic> {
+        sink.as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_UNAPPLIED_NARROWING)
             .collect()
     }
 
@@ -9132,7 +9267,7 @@ mod tests {
                             "else": {},
                             "minContains": 1,
                             "unevaluatedItems": false,
-                            "not": {},
+                            "not": { "type": "string" },
                             "unevaluatedProperties": false
                         }
                     }
@@ -9298,7 +9433,7 @@ mod tests {
                 if properties.iter().map(|(name, _, _)| name.as_str()).collect::<Vec<_>>()
                     == ["a", "b"]
         ));
-        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+        assert_eq!(unapplied_narrowing_warnings(&sink).len(), 1);
         assert!(matches!(
             schema_named(&ir, "Thing")
                 .meta()
@@ -9327,7 +9462,327 @@ mod tests {
                 ..
             }) if meta.source.json_pointer == "/components/schemas/Thing/not"
         ));
+        assert_eq!(unapplied_narrowing_warnings(&sink).len(), 1);
+    }
+
+    #[test]
+    fn not_of_empty_schema_lowers_the_outer_node_to_never() {
+        let document = schemas_doc("3.1.0", json!({ "RejectAll": { "not": {} } }));
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "RejectAll"),
+            SchemaNode::Never { meta }
+                if meta.source.json_pointer == "/components/schemas/RejectAll"
+                    && meta.validation_applicators().not.is_none()
+        ));
         assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    #[test]
+    fn not_of_true_schema_lowers_the_outer_node_to_never() {
+        let document = schemas_doc("3.1.0", json!({ "RejectAll": { "not": true } }));
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "RejectAll"),
+            SchemaNode::Never { meta }
+                if meta.source.json_pointer == "/components/schemas/RejectAll"
+                    && meta.validation_applicators().not.is_none()
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    #[test]
+    fn annotations_do_not_block_not_of_everything_lowering() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "RejectAll": { "not": { "description": "x" } } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "RejectAll"),
+            SchemaNode::Never { meta }
+                if meta.source.json_pointer == "/components/schemas/RejectAll"
+                    && meta.validation_applicators().not.is_none()
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    #[test]
+    fn not_of_never_schema_leaves_the_outer_node_unchanged() {
+        let document = schemas_doc("3.1.0", json!({ "AcceptAll": { "not": false } }));
+        let (_temp, ir, sink) = parse_value(&document);
+
+        let schema = schema_named(&ir, "AcceptAll");
+        assert!(matches!(schema, SchemaNode::Any { .. }));
+        assert!(matches!(
+            schema.meta().validation_applicators().not.as_deref(),
+            Some(SchemaNode::Never { meta })
+                if meta.source.json_pointer == "/components/schemas/AcceptAll/not"
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    /// `Unknown` is the parser's record that it could not represent something, and the validators
+    /// artifact refuses on it rather than emitting a check. Rewriting one to `Never` because a `not`
+    /// beside it proves emptiness would turn that refusal into a generated validator, so the
+    /// unrepresentable node wins and the lowering stands aside.
+    #[test]
+    fn an_unrepresentable_node_is_not_rewritten_by_an_empty_not() {
+        let document = schemas_doc("3.0.3", json!({ "UnknownNot": { "if": {}, "not": {} } }));
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "UnknownNot"),
+            SchemaNode::Unknown { .. }
+        ));
+        let reported = format!("{:?}", sink.as_slice());
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_UNSUPPORTED),
+            "{reported}"
+        );
+    }
+
+    /// The same rule as `an_empty_not_does_not_excuse_a_malformed_sibling`, for the other keyword
+    /// that proves a schema empty. Both lowerings return, so both had to stop returning from inside
+    /// the dispatch: emptiness is a statement about the instances a schema admits, not a licence to
+    /// stop reading the document around it.
+    #[test]
+    fn an_empty_enum_does_not_excuse_a_malformed_sibling() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "Bad": { "enum": [], "oneOf": "not-an-array" } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(schema_named(&ir, "Bad"), SchemaNode::Never { .. }));
+        let reported = format!("{:?}", sink.as_slice());
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_SHAPE
+                    && diagnostic.json_pointer.as_deref() == Some("/components/schemas/Bad/oneOf")),
+            "{reported}"
+        );
+        assert!(sink.has_errors(), "{:?}", sink.as_slice());
+    }
+
+    /// A schema object carrying a second independent piece is lowered to a conjunction, and the
+    /// conjunction split hands the `not` to the typed branch rather than the wrapper. Reading only
+    /// the wrapper left exactly these shapes rendering their reference while the validator beside
+    /// them rejected every value — the divergence the whole rule exists to close, one shape over.
+    #[test]
+    fn an_empty_not_beside_another_piece_still_lowers_to_never() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Base": { "type": "object", "properties": { "id": { "type": "string" } } },
+                "TypedRefNot": {
+                    "$ref": "#/components/schemas/Base",
+                    "minProperties": 1,
+                    "not": {}
+                },
+                "RefAndTypedNot": {
+                    "$ref": "#/components/schemas/Base",
+                    "type": "object",
+                    "not": {}
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        for name in ["TypedRefNot", "RefAndTypedNot"] {
+            let lowered = format!("{:?}", schema_named(&ir, name));
+            assert!(
+                matches!(schema_named(&ir, name), SchemaNode::Never { .. }),
+                "{name}: {lowered}"
+            );
+        }
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    /// Nullability widens, and a schema that rejects every instance has nothing left to widen.
+    /// Carried onto the lowered node it produced `never | null` on the types surface and
+    /// `z.union([z.never(),z.null()])` in zod — both admitting the one value the schema is most
+    /// explicit about rejecting.
+    #[test]
+    fn a_nullable_schema_with_an_empty_not_admits_nothing_at_all() {
+        let document = schemas_doc(
+            "3.0.3",
+            json!({ "NullableReject": { "type": "string", "nullable": true, "not": {} } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "NullableReject"),
+            SchemaNode::Never { meta } if !meta.nullable
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    /// The lowering runs after the whole dispatch, so a sibling keyword is still parsed and still
+    /// validated. As an early return it swallowed the sibling's shape check too: this document
+    /// generated successfully at exit 0, while the same document without the `not` is fatal.
+    #[test]
+    fn an_empty_not_does_not_excuse_a_malformed_sibling() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "Bad": { "not": {}, "oneOf": "not-an-array" } }),
+        );
+        let (_temp, _ir, sink) = parse_value(&document);
+
+        let reported = format!("{:?}", sink.as_slice());
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_SHAPE
+                    && diagnostic.json_pointer.as_deref() == Some("/components/schemas/Bad/oneOf")),
+            "{reported}"
+        );
+        assert!(sink.has_errors(), "{:?}", sink.as_slice());
+    }
+
+    #[test]
+    fn provably_empty_not_with_a_typed_sibling_emits_no_diagnostic() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "RejectAll": { "type": "string", "not": true } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "RejectAll"),
+            SchemaNode::Never { meta }
+                if meta.source.json_pointer == "/components/schemas/RejectAll"
+                    && meta.validation_applicators().not.is_none()
+        ));
+        assert!(sink.as_slice().is_empty(), "{:?}", sink.as_slice());
+    }
+
+    /// Lowering to `Never` is a `return`, so it has to happen after every sibling keyword has been
+    /// diagnosed. Placed before them, it carried their diagnostics out of the function with it: a
+    /// document whose `contains` the types surface cannot represent stopped reporting it at all.
+    #[test]
+    fn a_provably_empty_not_still_reports_its_sibling_keywords() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "RejectAll": { "not": {}, "contains": { "type": "string" }, "if": { "type": "string" } } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "RejectAll"),
+            SchemaNode::Never { .. }
+        ));
+        let reported: Vec<_> = sink
+            .as_slice()
+            .iter()
+            .map(|diagnostic| (diagnostic.code, diagnostic.json_pointer.as_deref()))
+            .collect();
+        assert!(
+            reported.contains(&(
+                CODE_UNSUPPORTED,
+                Some("/components/schemas/RejectAll/contains")
+            )),
+            "{reported:?}"
+        );
+        assert!(
+            reported.contains(&(CODE_UNSUPPORTED, Some("/components/schemas/RejectAll/if"))),
+            "{reported:?}"
+        );
+        // The `not` itself stays silent: it is proven empty, not unrepresentable.
+        assert!(
+            !reported
+                .iter()
+                .any(|(code, _)| *code == CODE_UNAPPLIED_NARROWING),
+            "{reported:?}"
+        );
+    }
+
+    #[test]
+    fn constrained_not_warns_without_changing_the_outer_type() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({ "Thing": { "type": "string", "not": { "const": "blocked" } } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            }
+        ));
+        let warnings = unapplied_narrowing_warnings(&sink);
+        assert_eq!(warnings.len(), 1, "{:?}", sink.as_slice());
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(
+            warnings[0].json_pointer.as_deref(),
+            Some("/components/schemas/Thing/not")
+        );
+        assert_eq!(
+            warnings[0].message,
+            "schema keyword 'not' narrows validation but its constraint is not applied to the emitted type; the validators artifact enforces it instead"
+        );
+    }
+
+    #[test]
+    fn constrained_not_warns_under_openapi_30() {
+        let document = schemas_doc(
+            "3.0.3",
+            json!({ "Thing": { "type": "string", "not": { "const": "blocked" } } }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            }
+        ));
+        let warnings = unapplied_narrowing_warnings(&sink);
+        assert_eq!(warnings.len(), 1, "{:?}", sink.as_slice());
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(
+            warnings[0].json_pointer.as_deref(),
+            Some("/components/schemas/Thing/not")
+        );
+    }
+
+    #[test]
+    fn property_names_warns_without_changing_the_outer_type() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Thing": {
+                    "type": "object",
+                    "propertyNames": { "pattern": "^x" }
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        assert!(matches!(
+            schema_named(&ir, "Thing"),
+            SchemaNode::Object { .. }
+        ));
+        let warnings = unapplied_narrowing_warnings(&sink);
+        assert_eq!(warnings.len(), 1, "{:?}", sink.as_slice());
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(
+            warnings[0].json_pointer.as_deref(),
+            Some("/components/schemas/Thing/propertyNames")
+        );
+        assert_eq!(
+            warnings[0].message,
+            "schema keyword 'propertyNames' narrows validation but its constraint is not applied to the emitted type; the validators artifact enforces it instead"
+        );
     }
 
     #[test]
