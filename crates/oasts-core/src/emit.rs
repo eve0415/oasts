@@ -3819,17 +3819,7 @@ pub(super) fn property_in_position(meta: &PropMeta, position: TypePosition) -> b
 }
 
 fn property_docs(schema: &SchemaNode) -> SchemaDocView<'_> {
-    let docs = &schema.meta().docs;
-    SchemaDocView {
-        title: docs.title.as_deref(),
-        description: docs.description.as_deref(),
-        deprecated: docs.deprecated,
-        default: docs.default.as_ref(),
-        examples: &docs.examples,
-        comment: docs.comment.as_deref(),
-        constraints: &docs.constraints,
-        neutral_variants: None,
-    }
+    SchemaDocView::from(&schema.meta().docs)
 }
 
 /// `SchemaDocs` for a Parameter or Header Object: its own `description`/`deprecated`, never a
@@ -3846,10 +3836,7 @@ fn schema_field_docs<'a>(
         description,
         deprecated,
         default: None,
-        examples: &schema.meta().docs.examples,
-        comment: schema.meta().docs.comment.as_deref(),
-        constraints: &schema.meta().docs.constraints,
-        neutral_variants: None,
+        ..SchemaDocView::from(&schema.meta().docs)
     }
 }
 
