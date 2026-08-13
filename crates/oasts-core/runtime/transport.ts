@@ -987,6 +987,10 @@ function serializedParam(plan: ParamPlan, input: Readonly<Record<string, unknown
   return plan.serialize(plan.name, value, plan.allowReserved);
 }
 
+// The WHATWG URL parser's own definitions: a single-dot segment is "." or a case-insensitive
+// "%2e", and a double-dot segment is any two of those in sequence.
+const DOT_SEGMENT = /^(?:\.|%2e){1,2}$/i;
+
 function operationUrl(
   transport: Transport,
   descriptor: OperationDescriptor,
@@ -994,18 +998,35 @@ function operationUrl(
 ): URL {
   let path = '';
   for (const group of descriptor.path) {
+    let segment = '';
     for (const part of group) {
       if (part.kind === 'literal') {
-        path += part.text;
+        segment += part.text;
       } else {
         const plan = findParamPlan(descriptor, 'path', part.name);
         const value = serializedParam(plan, input);
         if (value === null) {
           throw new TypeError(`path parameter ${part.name} is missing`);
         }
-        path += value;
+        segment += value;
       }
     }
+    // A segment that *is* a dot segment never reaches the wire: RFC 3986 §5.2.4 removes "." and
+    // pops the parent for "..", and every WHATWG entry point applies it — the URL constructor, the
+    // pathname setter and the Request constructor alike, to the %2e spellings as well as the bare
+    // ones. So there is no encoding that survives, and the only choice is between failing here and
+    // sending the request to a different URL than the caller asked for. An empty label parameter
+    // serializes to "." and an exploded label over two empty members to "..", which is how a
+    // caller's own data reaches this.
+    //
+    // Exact match only. Label output like ".3,4,5" or ".x" is not a dot segment and must stay
+    // byte-identical.
+    if (DOT_SEGMENT.test(segment.startsWith('/') ? segment.slice(1) : segment)) {
+      throw new TypeError(
+        `operation ${descriptor.operationId} produced the path segment "${segment}", which a URL removes rather than requests`,
+      );
+    }
+    path += segment;
   }
 
   const base = absoluteBaseUrl(transport, descriptor);

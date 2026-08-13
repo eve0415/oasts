@@ -14,10 +14,13 @@ import {
   urlencodedBody,
   type ExecutionResult,
   type OperationDescriptor,
+  type ParamPlan,
 } from "../transport.ts";
 import {
   serializeContentJsonQuery,
   serializeHeaderSimple,
+  serializePathLabel,
+  serializePathLabelExplode,
   serializePathSimple,
   serializeQueryFormExplode,
 } from "../serialize.ts";
@@ -641,6 +644,129 @@ describe("request serialization and fetch contract", () => {
 });
 
 describe("request failures", () => {
+  // A path segment that IS a dot segment is removed by every WHATWG entry point — the URL
+  // constructor, the pathname setter and the Request constructor — for the %2e spellings as well
+  // as the bare ones. Nothing can be sent, so the choice is between failing and requesting a
+  // different URL than the caller asked for. An empty label parameter serializes to "." and an
+  // exploded label over two empty members to "..", which pops a whole segment.
+  test("refuses a path segment a URL would resolve away", async () => {
+    for (const [label, serialize, value] of [
+      ["empty label scalar", serializePathLabel, ""],
+      ["empty exploded label scalar", serializePathLabelExplode, ""],
+      ["exploded label over empty members", serializePathLabelExplode, ["", ""]],
+      ["a literal dot-dot value", serializePathSimple, ".."],
+    ] satisfies readonly (readonly [string, ParamPlan["serialize"], unknown])[]) {
+      let fetched = false;
+      const transport = createTransport({
+        fetch: async () => {
+          fetched = true;
+          return new Response(null, { status: 204 });
+        },
+      });
+      const result = requestFailure(
+        await execute(
+          transport,
+          operation({
+            path: [
+              [{ kind: "literal", text: "/labelNo" }],
+              [
+                { kind: "literal", text: "/" },
+                { kind: "param", name: "p" },
+              ],
+            ],
+            params: [
+              { name: "p", location: "path", required: true, serialize, allowReserved: false },
+            ],
+          }),
+          { path: { p: value } },
+        ),
+      );
+
+      assert.equal(result.outcome, "request-encode", label);
+      assert.match(
+        result.outcome === "request-encode" ? result.message : "",
+        /path segment/u,
+        label,
+      );
+      assert.equal(fetched, false, label);
+    }
+  });
+
+  // The other side of the same check: label output that merely starts with a dot is not a dot
+  // segment and must reach the wire byte-identical.
+  test("keeps a non-empty label parameter's dot", async () => {
+    let requested = "";
+    const transport = createTransport({
+      fetch: async (request) => {
+        requested = request.url;
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    await execute(
+      transport,
+      operation({
+        path: [
+          [{ kind: "literal", text: "/labelNo" }],
+          [
+            { kind: "literal", text: "/" },
+            { kind: "param", name: "p" },
+          ],
+        ],
+        params: [
+          {
+            name: "p",
+            location: "path",
+            required: true,
+            serialize: serializePathLabel,
+            allowReserved: false,
+          },
+        ],
+      }),
+      { path: { p: ["3", "4", "5"] } },
+    );
+
+    assert.equal(requested, "https://descriptor.example/api/labelNo/.3,4,5");
+  });
+
+  // The %2e spellings are dot segments to the URL parser, but a caller cannot produce one through
+  // a serializer: the percent is itself encoded, so "%2E" arrives as "%252E" and addresses a real
+  // segment. Asserted so the guard above is never widened into rejecting it.
+  test("sends a literal percent-encoded dot as an ordinary segment", async () => {
+    let requested = "";
+    const transport = createTransport({
+      fetch: async (request) => {
+        requested = request.url;
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    await execute(
+      transport,
+      operation({
+        path: [
+          [{ kind: "literal", text: "/simpleNo" }],
+          [
+            { kind: "literal", text: "/" },
+            { kind: "param", name: "p" },
+          ],
+        ],
+        params: [
+          {
+            name: "p",
+            location: "path",
+            required: true,
+            serialize: serializePathSimple,
+            allowReserved: false,
+          },
+        ],
+      }),
+      { path: { p: "%2E" } },
+    );
+
+    assert.equal(requested, "https://descriptor.example/api/simpleNo/%252E");
+  });
+
   test("returns request-encode when no absolute base URL resolves", async () => {
     const transport = createTransport({});
     const result = requestFailure(
