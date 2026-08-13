@@ -4037,8 +4037,12 @@ fn covered_by_merge(branch: &SchemaNode, merged: bool) -> bool {
 /// operation carried a header or a cookie. Singular throughout, matching the document's own `in:`
 /// values.
 ///
-/// Not the same thing as the client's `location_name`, which produces the wire location string a
-/// descriptor carries. They coincide today; a change to one is not a change to the other.
+/// The descriptor's own `location` string is this same name, and must stay so: the runtime reads a
+/// parameter as `input[plan.location]`, so the literal a descriptor carries is the key it looks up
+/// on the value the caller passed. The emitted input-member access and a validator's issue path
+/// name that same property. One producer for all four, because they are one name — a second
+/// spelling anywhere makes every parameter read `undefined` at request time, which throws for a
+/// required parameter and silently drops an optional one.
 ///
 /// The msw artifact deliberately keeps its own spelling: its resolver argument is a handler's
 /// destructured context mirroring MSW's vocabulary, where `params` and `cookies` are MSW's own

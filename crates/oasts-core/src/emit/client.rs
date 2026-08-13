@@ -1287,7 +1287,7 @@ fn request_validation_checks(
             validator: format!("validate{type_name}"),
             base_path: format!(
                 "[{}, {}]",
-                render_ts_string(location_name(parameter.location)),
+                render_ts_string(super::parameter_group_name(parameter.location)),
                 render_ts_string(&parameter.name)
             ),
             guarded: true,
@@ -1597,7 +1597,7 @@ fn input_member(member: InputMember<'_>, root: &str) -> String {
         InputMember::Parameter { location, name } => {
             // `location` is always one of the four fixed identifiers (path/query/header/cookie), so
             // it is always dot-accessed; only a non-identifier parameter name needs a bracket key.
-            let location = location_name(location);
+            let location = super::parameter_group_name(location);
             let key = render_property_key(name);
             if key == name {
                 format!("{root}.{location}?.{name}")
@@ -2229,8 +2229,8 @@ fn render_input(
             continue;
         }
         output.push_str("  ");
-        // The group name, not the wire location string `location_name` produces — shared with the
-        // types artifact's `Request` so the two cannot drift apart again.
+        // Shared with the types artifact's `Request`, with the descriptor's `location` literal,
+        // and with the input-member access, because all four name the same property.
         output.push_str(super::parameter_group_name(location));
         if !group.iter().any(|(_, parameter, _)| parameter.required) {
             output.push('?');
@@ -3039,7 +3039,7 @@ fn write_descriptor(
             output.push_str("    { name: ");
             output.push_str(&render_ts_string(&parameter_plan.name));
             output.push_str(", location: ");
-            output.push_str(&render_ts_string(location_name(
+            output.push_str(&render_ts_string(super::parameter_group_name(
                 parameter_plan.resolved.location,
             )));
             output.push_str(", required: ");
@@ -3862,15 +3862,6 @@ fn write_fetch_defaults(output: &mut String, defaults: &FetchDefaults) {
         output.push_str("{ ");
         output.push_str(&fields.join(", "));
         output.push_str(" }");
-    }
-}
-
-fn location_name(location: ParamLocation) -> &'static str {
-    match location {
-        ParamLocation::Path => "path",
-        ParamLocation::Query => "query",
-        ParamLocation::Header => "header",
-        ParamLocation::Cookie => "cookie",
     }
 }
 
@@ -5940,7 +5931,7 @@ mod tests {
             (ParamLocation::Header, "header"),
             (ParamLocation::Cookie, "cookie"),
         ] {
-            assert_eq!(location_name(location), expected);
+            assert_eq!(crate::emit::parameter_group_name(location), expected);
         }
         for (style, expected) in [
             (ParamStyle::Form, "form"),
