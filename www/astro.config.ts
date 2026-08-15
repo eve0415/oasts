@@ -4,7 +4,7 @@ import nimbus, { defineConfig as defineNimbusConfig } from "@cloudflare/nimbus-d
 import { tableScroll } from "@cloudflare/nimbus-docs/markdown";
 
 const nimbusConfig = defineNimbusConfig({
-  site: "https://oasts.eve0415.net",
+  site: "https://oasts.eve0415.workers.dev",
   title: "oasts",
   description:
     "Compile OpenAPI 3.0/3.1 into TypeScript types and a zero-dependency typed client.",
