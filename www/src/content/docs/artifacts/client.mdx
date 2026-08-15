@@ -58,6 +58,9 @@ string literals. The two can never overlap, so `case 200:` can never also match 
 the union is exhaustiveness checking — add a response to the document and the compiler shows you
 every `switch` that no longer covers it.
 
+The union above is abbreviated. Every branch, including the six response-phase failures and the
+nine request-phase ones, is catalogued in [Results](/concepts/results).
+
 <Aside type="tip">
   For call sites where branching is not worth it, every operation also gets an
   `{operation}OrThrow` companion. It resolves to the matched success arm's `{ data, meta }` and

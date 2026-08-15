@@ -77,11 +77,15 @@ from the path template, never a claim about what your API means — compose it w
 
 ## What does not get a query descriptor
 
-A read gets one only when **every** documented success response carries a body. A `HEAD`, a 204-only
-`GET`, and a `GET` returning 200 *or* 204 all fail that — the last one is the easy one to miss,
-because it only resolves `undefined` on the days the server picks the 204. TanStack rejects a
-`queryFn` that resolves `undefined`, so each of these emits no descriptor and a warning naming the
-operation, rather than a descriptor that fails at runtime.
+A read gets one only when **every** documented success response carries a buffered body. Two things
+disqualify an operation, and each emits an `OASTS1511` warning naming it rather than a descriptor
+that fails at runtime:
+
+- **A success branch with no payload.** A `HEAD`, a 204-only `GET`, and a `GET` returning 200 *or*
+  204 all fail this — the last one is the easy one to miss, because it only resolves `undefined` on
+  the days the server picks the 204, and TanStack rejects a `queryFn` that resolves `undefined`.
+- **A [streaming](/guides/streaming) response.** A stream is consumable once and cannot be handed to
+  two cache readers.
 
 Non-reads are unaffected: a 204 `DELETE` gets a mutation descriptor, because mutations may resolve
 `undefined`.

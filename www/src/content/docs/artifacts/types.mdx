@@ -30,6 +30,46 @@ Supported keywords are the ones TypeScript can represent soundly: primitive and 
 numeric ranges, string patterns, length bounds — do not change the TypeScript output; they compile
 into the [Zod and validators artifacts](/artifacts/validation) instead.
 
+## Constraints the type cannot hold go in the doc comment
+
+`minLength`, `pattern`, `minimum` and the rest do not change a TypeScript type — but they are the
+part of the schema you most want at your cursor. oasts carries them into TSDoc, along with the
+description, deprecation and examples:
+
+```ts title="generated/types/components/thing.ts"
+export interface Thing {
+  /**
+   * The name.
+   *
+   * @remarks
+   * Constraints
+   *
+   * - minLength: 3
+   * - maxLength: 20
+   * - pattern: "^[a-z]+$"
+   */
+  name: string;
+  /**
+   * @remarks
+   * Constraints
+   *
+   * - minimum: 1
+   * - maximum: 99
+   *
+   * @deprecated This property is deprecated.
+   *
+   * @example
+   * ```json
+   * 7
+   * ```
+   */
+  count?: number;
+}
+```
+
+Every switch is on by default and individually disableable — see
+[`documentation`](/reference/configuration#documentation).
+
 ## A type is never wider than the document
 
 oasts refuses to emit a type the validators shipped beside it would contradict. A keyword that
@@ -85,4 +125,4 @@ They have their own page — [Dates and times](/guides/dates).
 
 Two schemas that normalize to the same TypeScript name are refused at generation with both named,
 never resolved by an invented suffix. `naming.overrides` is the way out — see
-[Configuration](/configuration#naming).
+[Configuration](/reference/configuration#naming).
