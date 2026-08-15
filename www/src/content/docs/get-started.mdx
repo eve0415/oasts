@@ -1,0 +1,106 @@
+---
+title: Get started
+description: Install oasts, point it at a document, and make your first typed call.
+sidebar:
+  order: 1
+---
+
+## Install
+
+<Render file="install" />
+
+## Configure
+
+Drop an `oasts.yaml` next to your spec:
+
+```yaml title="oasts.yaml"
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+```
+
+`input` takes exactly one of `path` (a local file) or `url` (an HTTP(S) document). `output` is the
+directory every artifact is written under. With no `artifacts` block you get types.
+
+<Aside type="tip">
+  `oasts.json` and a typed `oasts.config.ts` work too. The YAML and JSON forms are validated against
+  a published JSON Schema, so a typo fails loudly with a rule ID instead of silently doing nothing.
+</Aside>
+
+## Generate
+
+<PackageManagers pkg="oasts" type="exec" args="generate" />
+
+Every schema becomes a plain, readable interface:
+
+```ts title="generated/types/components/pet.ts"
+export interface Pet {
+  id: number;
+  name: string;
+  tag?: string;
+}
+```
+
+## Add the client
+
+Turn on the client artifact and every operation becomes a typed call:
+
+```yaml title="oasts.yaml" {4-6}
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+artifacts:
+  types: true
+  client: true
+```
+
+```ts
+import { createTransport } from "./generated/runtime/transport.js";
+import { getPet } from "./generated/client/operations/getpet.js";
+
+const transport = createTransport({ baseUrl: "https://api.example.com/v1" });
+
+const result = await getPet(transport, { path: { petId: "42" } });
+
+switch (result.outcome) {
+  case 200:
+    console.log(result.data.name);
+    break;
+  case "4XX":
+    console.error(result.status, result.error.message);
+    break;
+  case "unmatched":
+    console.error("undocumented status", result.status);
+    break;
+  case "network":
+    console.error(result.cause.message);
+    break;
+}
+```
+
+The union covers documented responses *and* the ways a call fails, so handling them is
+exhaustiveness checking rather than guesswork. [Results in full](/artifacts/client).
+
+## Commit the output, then gate it
+
+Generated code is a build artifact you can review in a pull request. Because output is
+byte-identical for the same input, config, and version, CI can fail on drift instead of writing
+files:
+
+<PackageManagers pkg="oasts" type="exec" args="generate --check" />
+
+There is also `oasts check`, which validates your configuration and input document without
+emitting anything.
+
+## Next steps
+
+<CardGrid>
+  <Card title="Artifacts" icon="ph:stack">
+    Six things oasts can emit, and what each one is for. [Browse them](/artifacts).
+  </Card>
+  <Card title="Configuration" icon="ph:sliders">
+    Output layout, type shape, validation engine, naming. [Read the reference](/configuration).
+  </Card>
+</CardGrid>

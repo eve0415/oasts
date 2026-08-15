@@ -1,0 +1,44 @@
+---
+title: Determinism and CI
+description: Generated output is byte-identical, so you can commit it and let CI fail on drift.
+sidebar:
+  order: 1
+---
+
+Given the same input document, the same config, and the same oasts version, output is
+**byte-identical** across machines and operating systems. That is a contract, not an aspiration —
+the repo's own gates generate everything twice and diff the bytes.
+
+## Commit the output
+
+Generated code is a build artifact you can review in a pull request. When output is stable, a diff
+means something changed in your API, and reviewers can read it. Nothing regenerates behind you at
+install time, and nothing depends on a generator being present at build time.
+
+## Gate the output
+
+In CI, fail on drift instead of writing files:
+
+<PackageManagers pkg="oasts" type="exec" args="generate --check" />
+
+`--check` compares what would be written against what is committed and exits non-zero on any
+difference. Pair it with `oasts check`, which validates your configuration and input document
+without emitting anything:
+
+<PackageManagers pkg="oasts" type="exec" args="check" />
+
+```yaml title=".github/workflows/ci.yaml"
+- run: pnpm install --frozen-lockfile
+- run: pnpm exec oasts generate --check
+```
+
+## No formatter, ever
+
+Emitted code has one canonical shape. oasts never reformats your project, and you should never run
+a formatter over its output — doing so guarantees a diff on the next `--check`.
+
+<Aside type="tip">
+  If your formatter runs over the whole repo, add the output directory to its ignore file. The
+  point of byte-identical output is that a diff carries information; a formatter pass destroys
+  that.
+</Aside>

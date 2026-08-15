@@ -1,0 +1,197 @@
+---
+title: Configuration
+description: The oasts.yaml surface — input, artifacts, output layout, type shape, validation, and naming.
+sidebar:
+  order: 2
+---
+
+Configuration lives in `oasts.yaml`, `oasts.json`, or a typed `oasts.config.ts`. The YAML and JSON
+forms are validated against a published JSON Schema, so a typo fails with a rule ID rather than
+silently doing nothing.
+
+```yaml title="oasts.yaml"
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+artifacts:
+  types: true
+  client: true
+client:
+  authEnforcement: types
+  baseUrl:
+    source: server
+    index: 0
+validation:
+  engine: off
+  unchecked: allow
+```
+
+## Input and output
+
+`input` takes exactly one of:
+
+```yaml
+input:
+  path: ./openapi.yaml     # a local document
+```
+
+```yaml
+input:
+  url: https://api.example.com/openapi.json
+```
+
+`output` is the directory everything is written under. `namespace` prefixes the emitted module
+namespace when you generate more than one API into one tree.
+
+## Artifacts
+
+Each artifact is `true`/`false`, or an option block:
+
+```yaml
+artifacts:
+  types: true
+  client: true
+  zod: false
+  validators: false
+  tanstack: false
+  msw: false
+```
+
+```yaml
+artifacts:
+  types:
+    enabled: true
+    directory: shared/model
+  client:
+    directory: sdk/fetch
+emit:
+  runtimeDirectory: shared/kernel
+```
+
+Each artifact gets its own directory under `output`, named after the artifact by default. Rename or
+nest any of them and the imports between artifacts follow. Two enabled artifacts may not share a
+directory, or nest one inside another — that is an `OASTS0102` at config time rather than a
+collision at write time.
+
+## Type shape
+
+```yaml
+types:
+  enum: literal          # literal | const
+  dateTime: string       # string | date | temporal
+  date: string           # string | temporal
+  discriminatedUnions: structural   # structural | tagged
+  integer: number        # number | bigint
+  readonly: false
+```
+
+Two knobs are off by default because each buys precision at a cost worth opting into.
+
+`discriminatedUnions: tagged` intersects each branch of a `discriminator` union with its own mapping
+literal, so TypeScript can narrow on the tag:
+
+```ts
+// structural (default)
+export type Pet = Cat | Dog;
+// tagged
+export type Pet = (Cat & { petType: "feline" }) | (Dog & { petType: "canine" });
+```
+
+It stays opt-in because the validators deliberately never consult the discriminator — under a
+renamed mapping, `tagged` would make a compile-time claim nothing checks at runtime.
+
+`types.integer: bigint` maps `format: int64` to `bigint` instead of `number`, so values past 2^53
+survive the round trip. It converts at the client boundary, so it needs the client artifact.
+
+`types.dateTime` and `types.date` are covered in [Dates and times](/guides/dates).
+
+## Client
+
+```yaml
+client:
+  transport: fetch
+  authEnforcement: types    # types | runtime
+  aggregate: false
+  baseUrl:
+    source: server          # runtime | server | literal
+    index: 0
+```
+
+- **`baseUrl.source: runtime`** — the caller supplies it when constructing the transport.
+- **`baseUrl.source: server`** — take the document's `servers[index]`.
+- **`baseUrl.source: literal`** — a `value` you write in the config.
+- **`authEnforcement`** — `types` puts an operation's security requirements in its call signature;
+  `runtime` moves the check to call time, where an unsatisfied requirement comes back as an `auth`
+  result. See [Auth](/artifacts/client#auth).
+- **`aggregate`** — also re-export every operation from `generated/client/api.ts`. Off by default,
+  because the aggregate names every operation and a bundler cannot drop the ones you never call.
+
+## Validation
+
+```yaml
+validation:
+  engine: off        # off | zod | generated
+  request: true
+  response: true
+  unchecked: allow   # warn | error | allow
+```
+
+`engine` picks which implementation the client calls: `zod` uses the emitted Zod schemas,
+`generated` uses the dependency-free validators. `unchecked` is the policy for successful response
+data the document gives no schema for. See [Validation](/artifacts/validation).
+
+## Filters
+
+A `filters` block narrows what gets generated. Each axis takes `include` and `exclude` pattern
+lists, where a pattern is exact string equality or a slash-delimited regex with an optional trailing
+`i` flag; exclude beats include.
+
+```yaml
+filters:
+  tags:
+    include: [pets]
+  methods:
+    exclude: ["/^(trace|options)$/i"]
+  deprecated: true    # keep deprecated operations
+  orphans: false      # drop component schemas nothing reaches
+```
+
+See [Generating a slice](/guides/filters).
+
+## Naming
+
+```yaml
+naming:
+  fileCase: kebab          # kebab | snake | camel | pascal | preserve
+  typeCase: pascal
+  propertyCase: preserve
+  operationCase: camel     # camel | preserve
+  typePrefix: ""
+  typeSuffix: ""
+  overrides:
+    pathSegments:
+      foo_bar: fooBarUnderscore
+```
+
+oasts never resolves a name collision with a compiler-invented suffix — a suffix would shift under
+you the next time the document changes. Collisions are refused at generation with both offenders
+named, and `naming.overrides` is the way out.
+
+## Emit
+
+```yaml
+emit:
+  runtimeDirectory: runtime
+  importExtension: ".js"
+  banner: []
+  format: deterministic
+```
+
+`banner` prepends lines to every emitted file. `importExtension` is what emitted imports end in —
+`.js` suits Node's ESM resolution and bundlers that follow it.
+
+<Aside type="note">
+  The blocks above are the ones most projects touch. The published JSON Schema is the complete
+  surface, and `oasts check` validates your file against it without emitting anything.
+</Aside>

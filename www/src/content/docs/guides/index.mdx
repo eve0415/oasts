@@ -1,0 +1,23 @@
+---
+title: Guides
+description: Working practices — committing generated output, narrowing what you generate, and moving dates off the wire.
+sidebar:
+  order: 4
+  group:
+    label: Guides
+---
+
+<CardGrid>
+  <Card title="Determinism and CI" icon="ph:fingerprint">
+    Why generated output is meant to be committed, and how `--check` turns drift into a failed
+    build. [Read more](/guides/determinism).
+  </Card>
+  <Card title="Generating a slice" icon="ph:funnel">
+    Narrow a large document by tag, operation, path, or method — and why a filter that stops
+    matching fails the build. [Read more](/guides/filters).
+  </Card>
+  <Card title="Dates and times" icon="ph:calendar-blank">
+    Make a `date-time` schema a `Date` or a `Temporal` value in your code while the wire keeps its
+    string. [Read more](/guides/dates).
+  </Card>
+</CardGrid>

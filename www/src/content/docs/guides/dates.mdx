@@ -1,0 +1,60 @@
+---
+title: Dates and times
+description: Make a date-time schema a Date or a Temporal value in your code while the wire keeps its string.
+sidebar:
+  order: 3
+---
+
+`date-time` and `date` schemas are strings on the wire and, by default, strings in your code too.
+Set a representation and the client converts at the boundary instead:
+
+```yaml title="oasts.yaml"
+artifacts:
+  types: true
+  client: true
+types:
+  dateTime: date      # string | date | temporal
+  date: temporal      # string | temporal
+```
+
+| setting | your code sees |
+| --- | --- |
+| `dateTime: date` | `Date` |
+| `dateTime: temporal` | `Temporal.Instant` |
+| `date: temporal` | `Temporal.PlainDate` |
+
+The wire grammar is RFC 3339, and it is checked field by field rather than handed to `new Date` or
+`Temporal.Instant.from` — both of which accept more than the contract does.
+
+## Where conversion happens
+
+Conversion is unconditional and ordered:
+
+- A **request** is converted *before* validation and *before* serialization.
+- A **response** is converted *after* decoding.
+
+So validators only ever observe wire values. A schema never sees a `Date` or a `Temporal` object,
+which is what keeps the [validation artifacts](/artifacts/validation) checking the document rather
+than your runtime representation.
+
+## Failures are results, not throws
+
+A value the wire cannot represent comes back as a `request-transform` result with nothing sent. One
+the application cannot represent comes back as a `response-transform` result. Both are branches of
+the same union as every other outcome — see [Client](/artifacts/client#failure-complete-results):
+
+```ts
+switch (result.outcome) {
+  case 200:
+    result.data.createdAt; // Date
+    break;
+  case "response-transform":
+    console.error("a timestamp the client could not represent");
+    break;
+}
+```
+
+<Aside type="caution">
+  The representations need the client artifact. The codecs are emitted under it and only run at its
+  pipeline positions — types alone will keep the wire strings.
+</Aside>

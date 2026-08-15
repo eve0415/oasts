@@ -1,0 +1,98 @@
+---
+title: Validation
+description: Zod schemas, dependency-free validators, and wiring either one into the client.
+sidebar:
+  order: 3
+---
+
+oasts emits two validation artifacts. They are standalone — you can generate either without a
+client — and the client can call whichever one you pick.
+
+<CardGrid>
+  <Card title="validators" icon="ph:shield-check">
+    Dependency-free generated validators implementing Standard Schema v1. Nothing to install.
+  </Card>
+  <Card title="zod" icon="ph:package">
+    Zod v4 schemas you can hand to anything that speaks Zod. Needs `zod` ^4.4.0 in your project.
+  </Card>
+</CardGrid>
+
+```yaml title="oasts.yaml"
+artifacts:
+  types: true
+  validators: true
+  zod: true
+```
+
+Both are compiled from the same model and held to the same conformance vectors, so for any value
+they return the same verdict and the same parsed result. Validation-only keywords that the
+[types artifact](/artifacts/types) cannot express — numeric ranges, string patterns, length bounds —
+are exactly what these two carry.
+
+## Wiring one into the client
+
+```yaml title="oasts.yaml"
+artifacts:
+  types: true
+  client: true
+  validators: true
+validation:
+  engine: generated    # off | zod | generated
+  request: true
+  response: true
+  unchecked: allow     # warn | error | allow
+```
+
+`engine` selects the implementation the client calls: `generated` uses the validators artifact,
+`zod` uses the Zod schemas, `off` (the default) does no runtime checking. `request` and `response`
+choose the positions.
+
+A failed check comes back as a result, not a throw — a `request-validation` or
+`response-validation` outcome carrying its issues, branched in the same `switch` as everything
+else. See [Client](/artifacts/client#failure-complete-results).
+
+`unchecked` is the policy for successful response data the document declares no schema for:
+`allow` passes it through, `warn` reports it at generation, `error` refuses.
+
+<Aside type="note">
+  Validators only ever observe wire values. When a [date representation](/guides/dates) is
+  configured, conversion happens after response validation and before request validation, so a
+  `Date` or `Temporal` value never reaches a schema.
+</Aside>
+
+## Zod flavor
+
+The zod artifact imports classic `zod` by default. Set `zod.flavor: mini` to import `zod/mini`
+instead — the tree-shakable entry point, same package, same `^4.4.0` peer range, no extra
+dependency:
+
+```yaml title="oasts.yaml"
+artifacts:
+  types: true
+  zod: true
+zod:
+  flavor: mini
+```
+
+Both flavors share one parsing core, so verdicts and parsed values are identical. What changes is
+what your bundler can drop. Each row below is one esbuild bundle over the named entry points from
+the GitHub spec's generated artifact, minified and gzipped:
+
+| bundle | `zod` | `zod/mini` |
+| --- | --- | --- |
+| `meta-get-octocat` (smallest operation) | 15.9 kB | 2.8 kB |
+| `dependabot-list-alerts-for-repo` (largest operation) | 22.3 kB | 8.1 kB |
+| the first thirty operations together | 25.5 kB | 11.4 kB |
+
+Zod itself dominates a small bundle and amortizes across a large one, which is why the smallest
+operation gains the most proportionally.
+
+Pick `classic` if you hand the emitted schemas to something that expects a classic `ZodType` — under
+`mini` they are `ZodMiniType`.
+
+## Discriminators are annotations
+
+Neither engine consults a `discriminator` to reach a verdict. It is an annotation, and letting it
+decide would mean rejecting payloads the underlying schemas accept. This is also why
+[`types.discriminatedUnions: tagged`](/artifacts/types#discriminated-unions) is opt-in rather than
+the default.
