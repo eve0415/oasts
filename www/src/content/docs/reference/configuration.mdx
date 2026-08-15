@@ -1,0 +1,290 @@
+---
+title: Configuration
+description: Every block of oasts.yaml — input, artifacts, output layout, type shape, client, validation, filters, naming, docs, limits.
+sidebar:
+  order: 1
+  group:
+    label: Reference
+---
+
+Configuration lives in `oasts.yaml`, `oasts.json`, or a typed `oasts.config.ts`. The YAML and JSON
+forms are validated against a published JSON Schema, so a typo fails with a rule ID rather than
+silently doing nothing. Unknown keys are rejected.
+
+Paths inside the file resolve relative to the **config file's** directory, not your working
+directory. See [CLI](/reference/cli#config-discovery) for how the file is found.
+
+```yaml title="oasts.yaml"
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+artifacts:
+  types: true
+  client: true
+client:
+  authEnforcement: types
+  baseUrl:
+    source: server
+    index: 0
+validation:
+  engine: off
+  unchecked: allow
+```
+
+Three keys are required: `schemaVersion` (always `1`), `input`, and `output`.
+
+## `input`
+
+Exactly one of a local path or an HTTP(S) URL.
+
+```yaml
+input:
+  path: ./openapi.yaml
+```
+
+```yaml
+input:
+  url: https://api.example.com/openapi.json
+```
+
+## `output`, `namespace`
+
+`output` is the directory everything is written under. `namespace` prefixes the emitted module
+namespace when more than one API is generated into one tree.
+
+## `artifacts`
+
+Each artifact is a boolean, or a block:
+
+```yaml
+artifacts:
+  types: true
+  client: true
+  zod: false
+  validators: false
+  tanstack: false
+  msw: false
+```
+
+```yaml
+artifacts:
+  types:
+    enabled: true
+    directory: shared/model
+  client:
+    directory: sdk/fetch
+emit:
+  runtimeDirectory: shared/kernel
+```
+
+Each artifact lands in its own directory under `output`, named after the artifact by default.
+Rename or nest any of them and the imports between artifacts follow. Two enabled artifacts may not
+share a directory, or nest one inside another — that is an `OASTS0102` at config time rather than a
+collision at write time.
+
+With no `artifacts` block you get types.
+
+## `types`
+
+```yaml
+types:
+  enum: literal          # literal | const
+  dateTime: string       # string | date | temporal
+  date: string           # string | temporal
+  discriminatedUnions: structural   # structural | tagged
+  integer: number        # number | bigint
+  readonly: false
+```
+
+`discriminatedUnions: tagged` intersects each branch of a `discriminator` union with its own mapping
+literal so TypeScript can narrow on the tag; `integer: bigint` maps `format: int64` to `bigint`.
+Both are covered in [Types](/artifacts/types#shape-knobs). `dateTime` and `date` have their own
+page — [Dates and times](/guides/dates).
+
+## `client`
+
+```yaml
+client:
+  transport: fetch
+  authEnforcement: types    # types | runtime
+  aggregate: false
+  baseUrl:
+    source: server          # runtime | server | literal
+    index: 0
+  fetchOptions:
+    credentials: same-origin
+    cache: no-store
+    redirect: follow
+    referrerPolicy: no-referrer
+    mode: cors
+    keepalive: false
+```
+
+- **`baseUrl.source: runtime`** — the caller supplies it when constructing the transport, and the
+  generated `TransportConfig` requires it.
+- **`baseUrl.source: server`** — take the document's `servers[index]`.
+- **`baseUrl.source: literal`** — a `value` you write here.
+- **`authEnforcement`** — `types` puts security requirements in the call signature; `runtime` moves
+  the check to call time. See [Auth](/guides/auth#compile-time-or-call-time).
+- **`aggregate`** — also re-export every operation from `generated/client/api.ts`. Off by default,
+  because the aggregate names every operation and a bundler cannot drop the ones you never call.
+- **`fetchOptions`** — static defaults baked into every operation descriptor. See
+  [Transport](/guides/transport#static-fetch-defaults).
+
+## `validation`
+
+```yaml
+validation:
+  engine: off        # off | zod | generated
+  request: true
+  response: true
+  unchecked: allow   # warn | error | allow
+```
+
+`unchecked` is the policy for successful response data the document declares no schema for. See
+[Validation](/artifacts/validation).
+
+## `zod`
+
+```yaml
+zod:
+  flavor: classic    # classic | mini
+```
+
+## `filters`
+
+Narrows what gets generated. Each axis takes `include` and `exclude` pattern lists; a pattern is
+exact string equality or a slash-delimited regex that must match the **whole** subject, with an
+optional trailing `i` flag. Exclude beats include.
+
+```yaml
+filters:
+  tags:
+    include: [pets]
+  operations:
+    exclude: [deletePet]
+  paths:
+    include: ["/^\\/pets\\/.*/"]
+  methods:
+    exclude: ["/^(trace|options)$/i"]
+  deprecated: true    # keep deprecated operations
+  orphans: false      # drop component schemas nothing reaches
+```
+
+A pattern that matches nothing fails the build with an `OASTS0262` rather than quietly shrinking
+your client. See [Generating a slice](/guides/filters).
+
+## `naming`
+
+```yaml
+naming:
+  fileCase: kebab          # kebab | snake | camel | pascal | preserve
+  typeCase: pascal         # pinned
+  propertyCase: preserve   # pinned
+  operationCase: camel     # camel | preserve
+  enumMemberCase: pascal   # pascal | camel | screamingSnake | preserve
+  typePrefix: ""
+  typeSuffix: ""
+  overrides:
+    schemas: {}
+    schemasBySource: {}
+    operations: {}
+    webhooks: {}
+    callbacks: {}
+    pathSegments: {}
+```
+
+`typeCase` accepts only `pascal` and `propertyCase` only `preserve` — property names are wire names.
+See [Naming](/guides/naming).
+
+## `documentation`
+
+TSDoc derived from the document. All on by default:
+
+```yaml
+documentation:
+  enabled: true
+  summary: true
+  description: true
+  deprecated: true
+  examples: true
+  constraints: true
+```
+
+`constraints` is the one worth knowing about: validation-only keywords that cannot appear in the
+TypeScript type — ranges, patterns, length bounds — are carried into the doc comment instead, so the
+information is at your cursor even where the type cannot express it.
+
+## `emit`
+
+```yaml
+emit:
+  runtimeDirectory: runtime
+  importExtension: ".js"
+  banner: []
+  format: deterministic
+```
+
+`banner` prepends lines to every emitted file. `importExtension` is what emitted imports end in —
+`.js` suits Node's ESM resolution and the bundlers that follow it.
+
+## `typescript`
+
+```yaml
+typescript:
+  tsconfig: auto     # auto | off | a path relative to the config file
+```
+
+## `limits`
+
+Bounds on the document graph, as a guard against a pathological or hostile input:
+
+```yaml
+limits:
+  maxDocumentBytes: 33554432     # 32 MiB
+  maxTotalBytes: 268435456       # 256 MiB
+  maxDocuments: 256
+  maxRefDepth: 64
+```
+
+## `local`
+
+The trust boundary for local documents and their `$ref` targets. Each entry widens the set of
+directories a local reference may be read from:
+
+```yaml
+local:
+  allowPaths:
+    - ../shared-schemas
+```
+
+Entries are resolved relative to the config file and **must be relative** — an absolute path is an
+`OASTS0221`. The default is empty, so a document only reaches what the workspace root already
+covers.
+
+## `compat`
+
+Opt-in departures from strict OpenAPI conformance, for documents describing a server that is itself
+non-conformant:
+
+```yaml
+compat:
+  deepObjectEncoding: strict    # strict | extended
+```
+
+`strict` admits `deepObject` only where OpenAPI defines it — an `object`-projecting schema.
+`extended` admits every schema shape, lowering each with the bracket-path encoding `qs` uses, which
+is what real documents that declare `deepObject` on arrays are usually describing.
+
+<Aside type="note">
+  Add nothing here speculatively. Each key exists because a real server disagrees with the
+  specification, and turning one on means the generated client stops matching what your document
+  literally says.
+</Aside>
+
+## Reserved keys
+
+`specs`, `shared`, `remote`, `watch` and `ci` are accepted by the schema but not implemented in this
+build — using one produces an `OASTS0222`. They are reserved so a config written today does not have
+to change shape when they land.
