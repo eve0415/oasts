@@ -330,7 +330,7 @@ mod tests {
         with_spec.specs = vec!["petstore".to_owned()];
         let spec_failure = run(with_spec);
         assert_eq!(spec_failure.exit_code, 2);
-        assert_eq!(spec_failure.diagnostics[0].code, "OASTS0062");
+        assert_eq!(spec_failure.diagnostics[0].code, "OASTS9002");
 
         let compile_failure = copy_fixture("petstore-3.0");
         fs::write(
@@ -377,7 +377,7 @@ mod tests {
 
         let refusal = command_refusal("watch".to_owned()).expect("watch is unimplemented");
         assert_eq!(refusal.exit_code, 2);
-        assert_eq!(refusal.diagnostics[0].code, "OASTS0222");
+        assert_eq!(refusal.diagnostics[0].code, "OASTS9003");
         assert!(
             refusal
                 .rendered_stderr

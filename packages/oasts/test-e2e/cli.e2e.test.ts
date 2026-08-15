@@ -95,10 +95,10 @@ test("invalid script config exits 2 through the spawned bin", () => {
   assert.match(result.stderr, /error\[OASTS0013\]: config default export is a promise/);
 });
 
-test("the standalone Rust binary still rejects script configs with OASTS0012", () => {
+test("the standalone Rust binary still rejects script configs with OASTS9001", () => {
   const directory = mkdtempSync(join(tmpdir(), "oasts-e2e-rust-script-"));
   writeFileSync(join(directory, "oasts.config.ts"), "export default {};\n");
   const result = spawnSync(RUST_BIN, ["generate"], { cwd: directory, encoding: "utf8" });
   assert.equal(result.status, 2);
-  assert.match(result.stderr, /error\[OASTS0012\]/);
+  assert.match(result.stderr, /error\[OASTS9001\]/);
 });

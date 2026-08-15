@@ -21,7 +21,7 @@ use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::syntax::parse_yaml_document_value;
 
 const CODE_IO: &str = "OASTS1001";
-const CODE_REMOTE_UNSUPPORTED: &str = "OASTS1002";
+const CODE_REMOTE_UNSUPPORTED: &str = "OASTS9101";
 const CODE_REF_ESCAPE: &str = "OASTS1003";
 const CODE_NON_UNICODE_PATH: &str = "OASTS1004";
 const CODE_PARSE: &str = "OASTS1005";
@@ -1863,7 +1863,7 @@ fn encode_relative_path(path: &Path) -> Result<String, String> {
 /// `$id` names a schema resource; it is not a request to fetch one. A bundled document that
 /// identifies its resources with `https://` URIs resolves entirely in memory, so the scheme check
 /// belongs at the point something is actually read — `local_path_from_url`, which every path that
-/// reaches the filesystem goes through, and which is where OASTS1002 now comes from.
+/// reaches the filesystem goes through, and which is where OASTS9101 now comes from.
 fn resolve_identity_uri(
     base: &Url,
     reference: &str,

@@ -3,6 +3,13 @@
 //! Configuration diagnostics use `OASTS0rrs`, where `rr` is the two-digit
 //! config rejection-rule number and `s` is a per-rule sequence digit.
 //! Input and semantic diagnostics use the reserved `OASTS1xxx` range.
+//!
+//! `OASTS9xxx` is the provisional band: capabilities this build gates off
+//! rather than refuses on the merits. A provisional code retires when its
+//! capability lands, so the band is expected to develop holes and nothing may
+//! renumber to close them. The second digit mirrors the category the code
+//! keeps — `90xx` config, `91xx` input — so a provisional code's exit code
+//! still reads off its number. `99xx` is reserved for test sentinels.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
