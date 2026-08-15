@@ -15,13 +15,17 @@ filters:
   operations:
     exclude: [deletePet]
   paths:
-    include: ["/^\\/pets/"]
-  methods:
-    exclude: ["/^(trace|options)$/i"]
+    include: ["/^\\/pets\\/.*/"]
 ```
 
 Each axis takes `include` and `exclude` lists. A pattern is either **exact string equality** or a
 **slash-delimited regex** with an optional trailing `i` flag. Exclude beats include.
+
+<Aside type="caution" title="A regex matches the whole subject">
+  `"/^\\/pets/"` matches the path `/pets` and nothing else — not `/pets/{petId}`. Add `.*` when you
+  mean a prefix. A pattern that matches nothing is an `OASTS0262`, so this shows up as a failed
+  build rather than a smaller client.
+</Aside>
 
 ## Unreachable schemas are dropped
 
@@ -37,8 +41,8 @@ Deprecated operations are kept by default — set `deprecated: false` to drop th
 
 ## A filter that stops matching fails the build
 
-A pattern that matches nothing is an error, not a silent no-op. So is a filter combination that
-would leave nothing to generate.
+A pattern that matches nothing is an error, not a silent no-op — in either direction, `include` and
+`exclude` alike. So is a filter combination that would leave nothing to generate.
 
 This is the point of the feature. The failure mode of every filter system is that the upstream
 document renames a tag, your pattern quietly matches zero operations, and your client shrinks

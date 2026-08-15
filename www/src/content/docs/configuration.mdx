@@ -144,18 +144,21 @@ data the document gives no schema for. See [Validation](/artifacts/validation).
 ## Filters
 
 A `filters` block narrows what gets generated. Each axis takes `include` and `exclude` pattern
-lists, where a pattern is exact string equality or a slash-delimited regex with an optional trailing
-`i` flag; exclude beats include.
+lists, where a pattern is exact string equality or a slash-delimited regex that must match the
+**whole** subject, with an optional trailing `i` flag; exclude beats include.
 
 ```yaml
 filters:
   tags:
     include: [pets]
-  methods:
-    exclude: ["/^(trace|options)$/i"]
+  paths:
+    include: ["/^\\/pets\\/.*/"]
   deprecated: true    # keep deprecated operations
   orphans: false      # drop component schemas nothing reaches
 ```
+
+A pattern that matches nothing fails the build with an `OASTS0262` rather than quietly shrinking
+your client.
 
 See [Generating a slice](/guides/filters).
 
