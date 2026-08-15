@@ -4,17 +4,16 @@ import nimbus, { defineConfig as defineNimbusConfig } from "@cloudflare/nimbus-d
 import { tableScroll } from "@cloudflare/nimbus-docs/markdown";
 
 const nimbusConfig = defineNimbusConfig({
-  // CHANGE_ME: your site's canonical origin (no trailing slash). Drives
-  // canonical URLs, absolute OG image URLs, robots.txt, sitemap, and the
-  // links in /llms.txt — leaving the placeholder breaks all of them.
-  site: "https://example.com",
-  // CHANGE_ME: your project's name — used for <title>, the home H1, and OG.
-  title: "Nimbus",
-  // CHANGE_ME: a one-line description of your docs — used for meta + OG.
-  description: "Minimal starter consuming nimbus-docs.",
+  site: "https://oasts.eve0415.net",
+  title: "oasts",
+  description:
+    "Compile OpenAPI 3.0/3.1 into TypeScript types and a zero-dependency typed client.",
   locale: "en",
-  github: null,
-  socialImageAlt: "Nimbus documentation preview",
+  github: "https://github.com/eve0415/oasts",
+  // `{path}` arrives relative to the Astro root, and this site is a
+  // subdirectory of the repo.
+  editPattern: "https://github.com/eve0415/oasts/edit/main/www/{path}",
+  socialImageAlt: "oasts documentation",
 });
 
 export default defineConfig({
