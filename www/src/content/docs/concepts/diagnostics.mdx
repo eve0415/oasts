@@ -1,0 +1,117 @@
+---
+title: Diagnostics
+description: How to read an OASTS code, what the families mean, and the refusals you are most likely to meet.
+sidebar:
+  order: 3
+---
+
+Every message oasts prints carries a stable code, a severity, and a pointer into the thing it is
+talking about:
+
+```text
+error[OASTS0262]: filters.paths.include pattern '/^\/pets/' matches no operation; a regex pattern
+must match the whole subject, so add `.*` to match a prefix or a substring
+  --> ./oasts.yaml:1:1 /filters/paths/include/0
+```
+
+```text
+warning[OASTS1406]: response key '200' is statically bodyless but declares media 'text/event-stream'
+  --> ./openapi.yaml:1:1 /paths/~1probe/head/responses/200/content/text~1event-stream
+```
+
+The pointer's trailing path is a **JSON Pointer** into the document or config file — the exact node
+the diagnostic is about, with `/` in a key escaped as `~1`.
+
+## Severity
+
+- **`error`** — nothing is written. The build fails.
+- **`warning`** — generation continues, and the warning names what was skipped or adjusted. A
+  warning always means one operation, one component, or one artifact projection did *not* come out
+  the way an unqualified reading of the document would suggest.
+
+Warnings matter more here than in most tools, because oasts never resolves an ambiguity silently.
+If an operation vanished from an artifact, a warning says so and names it.
+
+## Code families
+
+The number tells you which stage refused:
+
+| Range | Stage | Typical cause |
+| --- | --- | --- |
+| `OASTS00xx` | CLI and config loading | The config file is missing, unreadable, or not valid against the schema |
+| `OASTS01xx` | Config validation | A key holds a value the schema does not allow |
+| `OASTS02xx` | Config semantics | Two settings contradict each other, a filter pattern is unusable, a peer dependency is missing |
+| `OASTS10xx` | Document loading | A `$ref` target cannot be resolved, or a limit was exceeded |
+| `OASTS11xx` | Schema model | A keyword cannot be represented, or filtering left nothing |
+| `OASTS12xx` | Naming | Two things in the document want the same identifier |
+| `OASTS13xx` | Composition and emit | A compiler-invented name collides with one the document owns |
+| `OASTS14xx` | Client model | A request or response cannot be projected into the client pipeline |
+| `OASTS15xx` | Artifact projections | The zod, validators, MSW or TanStack view cannot express something |
+
+## Refusals you are most likely to meet
+
+### Configuration
+
+| Code | Meaning |
+| --- | --- |
+| `OASTS0102` | Two enabled artifacts share a directory, or one nests inside another |
+| `OASTS0261` | A filter pattern is a regex literal whose body does not compile |
+| `OASTS0262` | A filter pattern matches no operation in the document |
+| `OASTS0263` | Filters selected operations but left none of them, and no webhooks either |
+
+### Document and schema
+
+| Code | Meaning |
+| --- | --- |
+| `OASTS1115` | A discriminator `mapping` value that is not a JSON string, so it cannot name a schema |
+| `OASTS1117` | A `$recursiveRef` written with a value other than `"#"` |
+| `OASTS1118` | A dynamic reference whose target genuinely depends on the path evaluation took to reach it |
+| `OASTS1119` | Pruning removed every component schema and there was nothing else to emit |
+| `OASTS1120` | A lowercase status range (`4xx`) — canonicalized and reported, not rejected |
+| `OASTS1121` | Two keys in one responses object naming the same status once canonicalized |
+| `OASTS1122` | A narrowing keyword the emitted TypeScript cannot apply, where the leaf does *not* widen to `unknown` |
+
+### Names the compiler will not invent
+
+These are the [naming](/guides/naming) refusals. Each has a remedy in `naming.overrides`.
+
+| Code | Meaning |
+| --- | --- |
+| `OASTS1307` | A renamed component import collides with another operation-module rename |
+| `OASTS1308` | A discriminator `mapping` value resolving to no allocated component schema |
+| `OASTS1309` | A discriminator whose `mapping`/`const` proof is internally incoherent |
+| `OASTS1310` | A request/response variant's replacement name is itself declared, or another variant's replacement |
+| `OASTS1311` | A wire twin's derived `{Name}Wire` is already a declared component's name |
+| `OASTS1312` | `{Name}WireValue` is itself declared — nothing compiler-invented remains, so the document is refused |
+| `OASTS1313` | A union whose branches convert date/time values differently, with nothing to tell them apart |
+| `OASTS1315` | A property two `allOf` branches declare with schemas that intersect to nothing (warning) |
+| `OASTS1316` | A discriminator that can select branches, but whose union lacks unit-literal tags on every branch |
+| `OASTS1400` | A JSON response media entry renamed because its validator-name fragment collided |
+
+### Artifact projections
+
+An artifact that cannot express one thing skips that thing and warns; the rest still generates.
+
+| Code | Artifact | Meaning |
+| --- | --- | --- |
+| `OASTS1501` | validators | A validation keyword the validators artifact does not implement |
+| `OASTS1502` | validators | A schema degraded to an unknown leaf, so no faithful validator exists |
+| `OASTS1503` | validators | An applicator's subschema is not fully checkable, so the outer check would be unsound |
+| `OASTS1504` | zod | A validation keyword the Zod artifact does not implement |
+| `OASTS1505` | zod | A schema degraded to an unknown leaf, so no faithful Zod schema exists |
+| `OASTS1506` | msw | A path literal carrying a character the MSW matcher cannot match |
+| `OASTS1507` | msw | An HTTP method for which MSW exposes no handler factory |
+| `OASTS1508` | msw | A parameter's wire form cannot be inverted into its TypeScript type |
+| `OASTS1509` | msw | A body cannot be projected between wire form and TypeScript type |
+| `OASTS1510` | msw | A parameter serialization loses boundaries before the handler can project it |
+| `OASTS1511` | tanstack | A read carries no payload on at least one success branch, so it emits no query descriptor |
+| `OASTS1512` | tanstack | Two path nodes normalize to the same key-factory name |
+| `OASTS1513` | tanstack | A `naming.overrides.pathSegments` entry matched no path segment |
+| `OASTS1514` | msw | A streaming body has no buffered value to project in either direction |
+| `OASTS1515` | msw | A form body whose schema declares no properties — the handler is emitted with no body fields |
+
+<Aside type="note">
+  This is the set you are most likely to hit, not the complete allocation. Run
+  [`oasts check`](/reference/cli) to see every diagnostic your own document and config produce,
+  without writing any files.
+</Aside>

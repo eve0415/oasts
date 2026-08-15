@@ -1,0 +1,105 @@
+---
+title: CLI
+description: Commands, flags, config discovery, and exit codes.
+sidebar:
+  order: 2
+---
+
+The package is `@oasts/cli`; the command it installs is `oasts`.
+
+```text
+Usage: oasts <command> [options]
+
+Commands:
+  generate           Generate configured artifacts
+  check              Validate configuration and input without emitting
+
+Options:
+  --config <path>    Use an explicit configuration file
+  --check            With generate: check committed output without writing
+```
+
+## `oasts generate`
+
+Reads your document and writes every enabled artifact under `output`.
+
+<PackageManagers pkg="oasts" type="exec" args="generate" />
+
+### `--check`
+
+Does everything `generate` does except writing. Any difference between what would be written and
+what is committed exits non-zero and reports the drift. This is the CI form:
+
+<PackageManagers pkg="oasts" type="exec" args="generate --check" />
+
+Because output is [byte-identical](/concepts/determinism) for the same inputs, `--check` is a real
+gate, not a heuristic — see [Determinism](/concepts/determinism).
+
+## `oasts check`
+
+Validates the configuration and the input document, and reports every diagnostic, without writing
+anything.
+
+<PackageManagers pkg="oasts" type="exec" args="check" />
+
+Use it to see what your document produces — including every warning about an operation an artifact
+had to skip — before committing to a run.
+
+## `--config`
+
+Points at an explicit configuration file:
+
+<PackageManagers pkg="oasts" type="exec" args="generate --config ./config/oasts.yaml" />
+
+Paths inside the config (`input.path`, `output`, and the rest) resolve relative to the **config
+file's** directory, not to your working directory. Moving the config moves everything with it.
+
+## Config discovery
+
+With no `--config`, oasts looks in the current directory for exactly these names:
+
+```text
+oasts.config.ts   oasts.config.mts   oasts.config.cts
+oasts.config.js   oasts.config.mjs   oasts.config.cjs
+oasts.yaml        oasts.json
+```
+
+<Aside type="caution" title="Exactly one, or it is an error">
+  Discovery does not apply a precedence order. Finding two candidates — say `oasts.yaml` next to
+  `oasts.config.ts` — fails, and so does finding none. Note also that `oasts.yml` is **not** in the
+  list; the spelling is `oasts.yaml`.
+</Aside>
+
+A `oasts.config.ts` is evaluated as a module. Import `defineConfig` from the package for editor
+completion and a compile-time check of the whole config:
+
+```ts title="oasts.config.ts"
+import { defineConfig } from "@oasts/cli";
+
+export default defineConfig({
+  schemaVersion: 1,
+  input: { path: "./openapi.yaml" },
+  output: "./generated",
+  artifacts: { types: true, client: true },
+});
+```
+
+The `.yaml` and `.json` forms are validated against the published JSON Schema instead — see
+[Configuration](/reference/configuration).
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. Warnings may still have been printed. |
+| `2` | A usage error — unknown command, unexpected argument, `--check` on the wrong command. |
+| non-zero | A diagnostic that stops the run: an invalid config, an unresolvable document, a refusal, or drift under `--check`. |
+
+Warnings never change the exit code. If you want a warning to fail your build, grep the output or
+gate on `oasts check` in a step of its own.
+
+## What the package exports
+
+`@oasts/cli`'s public entry is the config surface — `defineConfig` and the `UserConfig` types, both
+generated from the same schema the YAML form is validated against. The compiler itself is a native
+module loaded through napi, so there is no JavaScript reimplementation that could drift from it.

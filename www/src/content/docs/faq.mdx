@@ -1,0 +1,142 @@
+---
+title: FAQ
+description: The questions people actually ask of an OpenAPI-to-TypeScript generator, answered for oasts.
+sidebar:
+  order: 7
+---
+
+## Which TypeScript version does the output need?
+
+oasts is built and gated against **TypeScript 7.0.2**, and the generated output is typechecked on
+every change under `--target es2022 --module esnext --moduleResolution bundler`.
+
+The gate is not just `--strict`. Because your project is probably stricter than that, generated
+output is compiled under the five consumer flags that are *not* part of `strict` —
+`noUncheckedIndexedAccess`, `noUnusedLocals`, `noUnusedParameters`, `noImplicitOverride` and
+`exactOptionalPropertyTypes` — with `exactOptionalPropertyTypes` both off and on.
+
+The point is that the output has to compile in your project, not in ours.
+
+## Which OpenAPI versions?
+
+**3.0 and 3.1.** A 3.0 document using a 3.1-only keyword (`const`, `type: "null"`) is refused with a
+diagnostic naming the keyword, rather than silently reinterpreted.
+
+3.2 is not supported.
+
+## What ends up in my dependency tree?
+
+Nothing at runtime.
+
+- `@oasts/cli` has **no runtime dependencies**. `msw` and `zod` are optional peers, needed only if
+  you enable those artifacts.
+- The **generated client is zero-dependency**: no oasts package to import, nothing to version-match,
+  no code path in production that differs from the code you read in review.
+
+The compiler ships as a native binary through napi, for eight targets — macOS (arm64, x64), Linux
+gnu and musl (arm64, x64), Windows (arm64, x64). Node 24 or newer.
+
+## An error status came back with no body. What do I get?
+
+A branch you can match on:
+
+```ts
+case "unmatched":
+  if (result.error.kind === "empty") { /* status only */ }
+```
+
+Undocumented responses are classified by what actually arrived — `empty`, `json`, `text`, `binary` —
+so "the server returned a 502 with nothing in it" is a case in the type system rather than an
+`error` field that exists but is `undefined`. See [Results](/concepts/results#unmatched--an-undocumented-status).
+
+## Does it handle `style: deepObject` / `spaceDelimited` / multipart properly?
+
+Yes — the whole matrix, to the letter of the spec: `form`, `spaceDelimited`, `pipeDelimited`,
+`deepObject`, `label`, `matrix` and `simple`, across path, query and header parameters, plus
+multipart encoding with per-part content types. The [MSW artifact](/artifacts/msw) runs the same
+rules backwards to decode request values, which is the strongest test there is that the two agree.
+
+## Can I use my own `fetch`, or add interceptors?
+
+Both. `transport.fetch` takes the final `Request` and returns a `Response`, and `middleware` gives
+you `onRequest`/`onResponse` hooks. A middleware that throws surfaces as a result branch, not an
+exception. See [Transport](/guides/transport).
+
+## Can the client validate responses at runtime?
+
+Yes, and you choose the engine:
+
+```yaml
+validation:
+  engine: generated   # or zod
+  request: true
+  response: true
+```
+
+`generated` is dependency-free; `zod` uses the emitted Zod schemas. Both are compiled from the same
+model and return the same verdicts. A failed check is a `request-validation` /
+`response-validation` result, not a throw. See [Validation](/artifacts/validation).
+
+## Can I rename properties to camelCase?
+
+No, and this is deliberate. Property names are **wire names** — re-casing them makes the emitted type
+describe a payload your API does not send, and every consumer then has to remember which side of the
+boundary it is on. `naming.propertyCase` exists in the schema but accepts only `preserve`.
+
+Type names, operation names, enum members and filenames are all configurable. See
+[Naming](/guides/naming).
+
+## Can I get kebab-case filenames?
+
+`naming.fileCase: kebab` is the default. Note that word boundaries come from `-`/`_` separators in
+the source name, not from case transitions — `getPet` becomes `getpet.ts`, not `get-pet.ts`. The
+table in [Naming](/guides/naming#file-names) shows every case.
+
+## Does it generate mock data?
+
+No. The [MSW artifact](/artifacts/msw) emits typed handlers with a slot you fill; there is no faker
+and no seeded generator.
+
+That is a trade, not an omission: synthesized bodies overflow the stack on recursive schemas, and
+seeding does not make values stable across a faker upgrade. A typed slot you fill is worth more than
+a plausible body nobody reviewed.
+
+## Server-sent events? Streaming?
+
+Both directions, no flag needed — the document's media types decide. An SSE response is
+`AsyncIterable<SseEvent<T>>` with per-event validation; a raw body is a `ReadableStream<Uint8Array>`.
+See [Streaming](/guides/streaming).
+
+## Infinite queries / pagination?
+
+Not generated. OpenAPI has no pagination vocabulary, so any such support would be a guess about your
+API that fails silently at runtime. Write `infiniteQueryOptions` by hand over the same call — the
+[descriptors](/artifacts/tanstack) compose with it.
+
+## Are TanStack query keys usable for invalidation?
+
+They are hierarchical, derived from the URL path template, so a prefix invalidates everything
+beneath it. Literal segments contribute strings and parameters contribute single-key objects, so
+`/pets/mine` and `/pets/{petId}` with `petId = "mine"` are different entries at every depth. Each
+mutation also exports a companion listing the keys it structurally affects. See
+[TanStack Query](/artifacts/tanstack#keys-are-hierarchical).
+
+## Should I commit the generated output?
+
+Yes. It is byte-identical for the same document, config and version, so a diff means your API
+changed, and `oasts generate --check` turns drift into a failed build. See
+[Determinism](/concepts/determinism).
+
+## Why does it refuse to build instead of renaming something?
+
+Because a compiler-invented name is assigned by whatever order the document happened to be walked,
+and it silently moves the next time the document changes. A refusal you resolve once in
+`naming.overrides` cannot move. The same reasoning applies to filters that stop matching and to
+types that would widen past what the document says. See [Diagnostics](/concepts/diagnostics).
+
+## How fast is it?
+
+The in-repo benchmark compiles GitHub's full OpenAPI spec to types in about 80 ms — warm p50 of
+end-to-end `oasts generate` runs on the reference container, with every run gated on repeatability.
+The harness and its recorded baseline live in the repository, so the number is reproducible rather
+than quoted.

@@ -1,0 +1,186 @@
+---
+title: Transport
+description: Base URLs, headers, middleware, a custom fetch, and the options every call accepts.
+sidebar:
+  order: 1
+---
+
+The transport is the one object every generated call takes. You build it once and pass it around:
+
+```ts
+import { createTransport } from "./generated/runtime/transport.js";
+
+const transport = createTransport({
+  baseUrl: "https://api.example.com/v1",
+  headers: { "user-agent": "acme/1.0" },
+});
+```
+
+It is frozen on construction and holds no mutable state, so it is safe to share across concurrent
+calls, share between modules, or create per request on a server.
+
+## The full shape
+
+```ts
+type TransportConfig<S extends string = never> = {
+  baseUrl?: string;
+  serverVariables?: Readonly<Record<string, string>>;
+  auth?: AuthProviders<S>;
+  headers?: HeadersInit;
+  fetch?: (request: Request, extensions?: Readonly<Record<string, unknown>>) => Promise<Response>;
+  middleware?: readonly Middleware[];
+  credentials?: RequestCredentials;
+};
+```
+
+Whether `baseUrl` is optional or **required** depends on your config: with
+`client.baseUrl.source: runtime` the generated type demands it, and with `server` or `literal` the
+URL comes from the document or your config and `baseUrl` becomes an override. See
+[Configuration](/reference/configuration#client).
+
+`baseUrl` must be an absolute URL — `createTransport` throws a `TypeError` otherwise, at construction
+rather than at the first call.
+
+## Server variables
+
+An OpenAPI server URL with `{variable}` placeholders is filled from `serverVariables`, and the
+generated type is narrowed to what your document actually declares — one member per server, with
+enums as literal unions:
+
+```ts title="generated/runtime/transport.ts"
+serverVariables?: Record<string, never> | { version: "v1" | "v2" } | { region: string };
+```
+
+```ts
+const transport = createTransport({ serverVariables: { version: "v2" } });
+```
+
+A variable you leave out falls back to the default the document declares for it, resolved per call.
+
+## Middleware
+
+`onRequest` sees the final `Request` — after URL resolution, serialization and auth — and `onResponse`
+sees the `Response` before it is decoded. Return a replacement, or return nothing to keep the one you
+were given:
+
+```ts
+const logging: Middleware = {
+  onRequest(request, context) {
+    console.debug(context.operationId, request.method, request.url);
+  },
+  onResponse(response, context) {
+    if (response.status >= 500) alert(context.operationId, response.status);
+  },
+};
+
+const withTraceHeader: Middleware = {
+  onRequest(request) {
+    const next = new Request(request);
+    next.headers.set("x-trace-id", crypto.randomUUID());
+    return next;
+  },
+};
+
+const transport = createTransport({
+  baseUrl,
+  middleware: [logging, withTraceHeader],   // registration order
+});
+```
+
+The `context` is the operation, not the payload:
+
+```ts
+type OperationContext = {
+  readonly operationId: string;
+  readonly method: string;
+  readonly url: URL;
+  readonly selectedAuth: readonly string[] | null;  // scheme names, never credential values
+};
+```
+
+<Aside type="caution">
+  A middleware that throws does not throw out of the call. It comes back as a
+  `request-middleware` or `response-middleware` [result](/concepts/results) carrying your error as
+  `cause` — so a broken interceptor is a branch you handle, not an exception from a call site that
+  documents itself as never throwing.
+</Aside>
+
+## A custom `fetch`
+
+Supply your own and oasts hands it the final `Request`:
+
+```ts
+const transport = createTransport({
+  baseUrl,
+  fetch: (request) => fetchWithRetry(request, { attempts: 3 }),
+});
+```
+
+This is the seam for anything the Fetch API cannot express portably — an undici dispatcher, a proxy
+agent, mTLS client certificates, an instrumented client, or a stub in tests. The second parameter
+carries platform extensions when the runtime supplies them.
+
+## Per-call options
+
+Every generated call takes an optional final argument:
+
+```ts
+type CallOptions = {
+  auth?: AuthOverrides;
+  headers?: HeadersInit;
+  signal?: AbortSignal;
+  fetchOptions?: Omit<RequestInit, "method" | "body" | "headers" | "signal"> & Record<string, unknown>;
+};
+```
+
+```ts
+const result = await getPet(
+  transport,
+  { path: { petId } },
+  { signal: AbortSignal.timeout(5_000), headers: { "x-request-id": id } },
+);
+```
+
+`method`, `body`, `headers` and `signal` are excluded from `fetchOptions` because oasts owns them —
+they come from the document and from the options above. Everything else on `RequestInit` passes
+through, including runtime-specific keys such as Cloudflare Workers' `cf` or Next.js's `next`.
+
+Cancelling through `signal` produces an `aborted` or `response-aborted` result, distinct from
+`timeout`, so retry logic can tell "the caller changed their mind" from "the server was slow".
+
+## Static fetch defaults
+
+Settings that are the same for every call belong in the config rather than at each call site:
+
+```yaml title="oasts.yaml"
+client:
+  fetchOptions:
+    credentials: same-origin
+    cache: no-store
+    redirect: follow
+    referrerPolicy: no-referrer
+    mode: cors
+    keepalive: false
+```
+
+These are baked into the generated operation descriptors.
+
+## Headers, in the order they are applied
+
+Each layer overwrites the one above it:
+
+1. Transport `headers`.
+2. Per-call `headers`.
+3. Header **parameters** the document declares, from your call input.
+4. `Content-Type`, from the request body's media type.
+5. `Accept`, from the responses the operation declares.
+6. Auth credentials, applied to the header the scheme declares.
+7. Whatever `onRequest` middleware sets last.
+
+<Aside type="caution" title="Operation-owned headers are refused">
+  Setting `content-type`, `accept`, or a header an operation uses for credentials — through either
+  transport or per-call `headers` — throws a `TypeError` rather than being silently overwritten at
+  step 4, 5 or 6. Set the body's media type by choosing the request variant, and set credentials
+  through [auth](/guides/auth). Forbidden request headers (`proxy-*`, `sec-*`, and the rest the
+  Fetch standard reserves) are refused the same way, including when middleware adds them.
+</Aside>

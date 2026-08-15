@@ -1,0 +1,108 @@
+---
+title: Naming
+description: How identifiers and filenames are derived, and what to do when two things in your document want the same name.
+sidebar:
+  order: 4
+---
+
+## File names
+
+`naming.fileCase` controls the filename derived from an `operationId` or schema name. Word
+boundaries come from `-` and `_` **separators in the source name — not from case transitions**:
+
+| `fileCase` | `get_pet_by_id` | `getPet` |
+| --- | --- | --- |
+| `kebab` *(default)* | `get-pet-by-id.ts` | `getpet.ts` |
+| `snake` | `get_pet_by_id.ts` | `getpet.ts` |
+| `camel` | `getPetById.ts` | `getPet.ts` |
+| `pascal` | `GetPetById.ts` | `GetPet.ts` |
+| `preserve` | `get-pet-by-id.ts` | `getPet.ts` |
+
+```yaml title="oasts.yaml"
+naming:
+  fileCase: kebab
+```
+
+`kebab` and `snake` lowercase the token; `camel` and `pascal` join the tokens and capitalize. So an
+already-camelCase `operationId` looks unchanged under `camel`/`preserve` and runs together under
+`kebab`/`snake` — `getPet` becomes `getpet.ts`, not `get-pet.ts`, because there is no separator to
+split on.
+
+<Aside type="caution">
+  Renaming the operation to introduce a separator moves the filename *and* the type names with it —
+  `operations: { getPet: get_pet }` gives you `get-pet.ts` and `Get_petRequest`. The override sets
+  one identifier and everything derives from it; it is not a filename-only knob.
+</Aside>
+
+## Identifiers
+
+| Setting | Values | Default |
+| --- | --- | --- |
+| `operationCase` | `camel`, `preserve` | `camel` |
+| `enumMemberCase` | `pascal`, `camel`, `screamingSnake`, `preserve` | `pascal` |
+| `typePrefix`, `typeSuffix` | any string | empty |
+
+```yaml title="oasts.yaml"
+naming:
+  operationCase: camel
+  enumMemberCase: screamingSnake
+  typePrefix: Api
+```
+
+<Aside type="note" title="Two settings are pinned">
+  `typeCase` accepts only `pascal` and `propertyCase` only `preserve`. Type names are TypeScript
+  identifiers, where PascalCase is the universal convention; **property names are wire names**, and
+  re-casing them would make the emitted type describe a payload your API does not send. They exist
+  in the schema so the surface can grow, and any other value is a config error today.
+</Aside>
+
+## Collisions are refused, never renamed
+
+Two things that normalize to the same identifier stop the build, with both offenders named. oasts
+never appends a compiler-invented suffix.
+
+The reason is stability. A suffix like `Pet2` is assigned by whatever order the compiler happened to
+walk the document; add an unrelated schema next month and `Pet2` silently becomes a different type,
+with no diff at any call site to tell you. A refusal you resolve once, in config, cannot move.
+
+## Overrides
+
+`naming.overrides` is the remedy, keyed by the **raw wire name** rather than the derived one:
+
+```yaml title="oasts.yaml"
+naming:
+  overrides:
+    schemas:
+      Pet: PetModel                    # a components/schemas key
+    operations:
+      getPet: fetchPet                 # an operationId
+    pathSegments:
+      foo_bar: fooBarUnderscore        # raw URL path segment text
+    webhooks:
+      "pet.created": PetCreatedHook    # a document webhooks key
+    callbacks:
+      onData: OnDataCallback           # an operation callbacks key
+    schemasBySource:
+      "spec#/components/schemas/Pet": VendorPet
+```
+
+`schemasBySource` is keyed by `<source_id>#<json_pointer>` and exists for the case two documents
+contribute a schema with the same name — the plain `schemas` key cannot tell them apart.
+
+<Aside type="caution">
+  An override that matches nothing is an error too. A `pathSegments` entry that stops matching is an
+  `OASTS1513`; the same rule that makes filters fail loudly applies here, and for the same reason —
+  a stale override is a rename you think is happening and is not.
+</Aside>
+
+## Which collisions you might meet
+
+| Code | Collision |
+| --- | --- |
+| `OASTS1307` | An operation module renamed a component import, and the replacement collides with another |
+| `OASTS1310` | A request/response variant's replacement is a declared component or another variant's replacement |
+| `OASTS1311` | A `{Name}Wire` twin collides with a declared component — the document owns its name, so the twin yields |
+| `OASTS1312` | `{Name}WireValue` is also declared, so nothing compiler-invented is left to move |
+| `OASTS1512` | Two path nodes normalize to the same TanStack key-factory name |
+
+The full list is in [Diagnostics](/concepts/diagnostics#names-the-compiler-will-not-invent).
