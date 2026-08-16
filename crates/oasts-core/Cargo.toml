@@ -30,6 +30,7 @@ json-strip-comments = "=3.1.2"
 
 [dev-dependencies]
 divan = "=0.1.21"
+syn = { version = "=2.0.119", features = ["full", "visit"] }
 tempfile = "=3.27.0"
 
 [[bench]]

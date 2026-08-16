@@ -452,7 +452,7 @@ mod tests {
         };
         let input_error = Diagnostic {
             category: Category::Input,
-            ..diagnostic(None, None, None, "OASTS1003", "input")
+            ..diagnostic(None, None, None, "OASTS9907", "input")
         };
         let mut sink = DiagnosticSink::new();
         sink.push(warning);
@@ -471,7 +471,7 @@ mod tests {
             .with_source("config.yaml")
             .with_location(3, 7)
             .with_json_pointer("/input");
-        let input = Diagnostic::input("OASTS1003", "input");
+        let input = Diagnostic::input("OASTS9907", "input");
 
         assert_eq!(configured.source_id.as_deref(), Some("config.yaml"));
         assert_eq!((configured.line, configured.col), (Some(3), Some(7)));
