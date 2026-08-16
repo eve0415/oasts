@@ -3094,6 +3094,18 @@ mod tests {
     }
 
     #[test]
+    fn tanstack_artifact_cannot_bypass_the_client_types_prerequisite() {
+        let mut value = valid_client_json_value();
+        value["artifacts"]["types"] = json!(false);
+        value["artifacts"]["tanstack"] = json!(true);
+        let diagnostics = assert_code(load_json(&value), CODE_CLIENT_REQUIRES_TYPES);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CODE_CLIENT_REQUIRES_TYPES
+                && diagnostic.json_pointer.as_deref() == Some("/artifacts/client")
+        }));
+    }
+
+    #[test]
     fn msw_artifact_resolves_alongside_types() {
         let mut value = valid_json_value();
         value["artifacts"] = json!({ "types": true, "msw": true });

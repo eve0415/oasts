@@ -381,6 +381,7 @@ pub fn emit_types(
     sink: &mut DiagnosticSink,
 ) -> Vec<GeneratedFile> {
     let mut model = EmissionModel::new(analyzed, config, source_digest(source_tuples), sink);
+    validate_emission_model(&mut model);
     emit_types_from_model(&mut model)
 }
 
@@ -390,6 +391,11 @@ pub(crate) fn emit_types_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Ge
     let (files, diagnostics) = Emitter::new(model).emit();
     model.sink.extend(diagnostics);
     files
+}
+
+fn validate_emission_model(model: &mut EmissionModel<'_, '_>) {
+    let diagnostics = Emitter::new(model).validate_model();
+    model.sink.extend(diagnostics);
 }
 
 /// Emits every enabled artifact (types, client, validators, zod, msw) for one compile.
@@ -412,7 +418,12 @@ pub fn emit_artifacts(
     sink.extend(tsconfig_diagnostics);
     let mut model = EmissionModel::new(analyzed, config, source_digest(source_tuples), sink);
     model.consumer_provides_temporal = consumer_provides_temporal;
-    let mut files = emit_types_from_model(&mut model);
+    validate_emission_model(&mut model);
+    let mut files = if config.artifacts.types.enabled {
+        emit_types_from_model(&mut model)
+    } else {
+        Vec::new()
+    };
     if let Some(client_model) = client_model {
         files.extend(client::emit_client_from_model(&mut model, client_model));
         // The transform artifact lives under the client's tree and only ever runs at the client's
@@ -631,7 +642,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
     }
 
     fn emit(mut self) -> (Vec<GeneratedFile>, Vec<Diagnostic>) {
-        let mut diagnostics = self.validate_model();
+        let mut diagnostics = Vec::new();
         // Compute every component's `allOf` merges once up front. Each component is
         // rendered for up to three positions and walked for imports for each, so a node's
         // position-independent merge would otherwise run up to six times; the cache turns
