@@ -287,7 +287,9 @@ emit:
   format: deterministic
 ```
 
-`banner` prepends lines to every emitted file. `importExtension` is what emitted imports end in —
+`banner` prepends lines to every emitted file. Each entry has to stay one line and stay out of the
+compiler's way, so a NUL, a line break of any kind, a `sourceMappingURL=`, or the generated-header
+text itself is an `OASTS0211`. `importExtension` is what emitted imports end in —
 `.js` suits Node's ESM resolution and the bundlers that follow it; `none` emits extensionless
 imports for resolvers that want those instead.
 
