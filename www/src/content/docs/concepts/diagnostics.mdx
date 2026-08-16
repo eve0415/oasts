@@ -9,18 +9,25 @@ Every message oasts prints carries a stable code, a severity, and a pointer into
 talking about:
 
 ```text
-error[OASTS0262]: filters.paths.include pattern '/^\/pets/' matches no operation; a regex pattern
-must match the whole subject, so add `.*` to match a prefix or a substring
-  --> ./oasts.yaml:1:1 /filters/paths/include/0
+error[OASTS0262]: filters.paths.include pattern '/^\/pets/' matches no operation; a regex pattern must match the whole subject, so add `.*` to match a prefix or a substring
+  --> /home/you/project/oasts.yaml:1:1 /filters/paths/include/0
 ```
 
 ```text
-warning[OASTS1406]: response key '200' is statically bodyless but declares media 'text/event-stream'
-  --> ./openapi.yaml:1:1 /paths/~1probe/head/responses/200/content/text~1event-stream
+warning[OASTS5204]: response key '200' is statically bodyless but declares media 'text/event-stream'
+  --> workspace/openapi.yaml:1:1 /paths/~1probe/head/responses/200/content/text~1event-stream
 ```
 
-The pointer's trailing path is a **JSON Pointer** into the document or config file — the exact node
-the diagnostic is about, with `/` in a key escaped as `~1`.
+The message is one line however long it runs — nothing wraps it. The trailing path is a **JSON
+Pointer** into the document or config file: the exact node the diagnostic is about, with `/` in a
+key escaped as `~1`.
+
+The two source names are not the same kind of thing. A config diagnostic names the config file by
+its absolute path, because that is what oasts resolved it to before reading it. A document
+diagnostic names a **logical source ID** instead — `workspace/<path>` for anything under the
+workspace root, `allow/<n>/<path>` for a document reached through the *n*th `local.allowPaths` root.
+Those are stable across machines, which is what makes diagnostics comparable between a laptop and
+CI.
 
 ## Severity
 
