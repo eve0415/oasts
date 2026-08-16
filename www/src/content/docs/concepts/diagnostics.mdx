@@ -23,7 +23,8 @@ Pointer** into the document or config file: the exact node the diagnostic is abo
 key escaped as `~1`.
 
 The two source names are not the same kind of thing. A config diagnostic names the config file by
-its absolute path, because that is what oasts resolved it to before reading it. A document
+its absolute path, because that is what oasts resolved it to before reading it — or plain `<config>`
+where the pointer alone is enough to place it. A document
 diagnostic names a **logical source ID** instead — `workspace/<path>` for anything under the
 workspace root, `allow/<n>/<path>` for a document reached through the *n*th `local.allowPaths` root.
 Those are stable across machines, which is what makes diagnostics comparable between a laptop and
@@ -72,8 +73,8 @@ stage is a bug. See [exit codes](/reference/cli) for what `1` and `2` mean at th
 
 `0xxx` has a finer address: `0rrs`, where `rr` is a config rule and `s` is a sequence within it.
 `OASTS0262` is rule 26 — filters — sequence 2. Codes sharing an `rr` are different ways of failing
-the same rule, so `0261`, `0262` and `0263` are all about filters, widening from one pattern to one
-axis to the whole block.
+the same rule, so `0261`, `0262` and `0263` are all about filters: two ways one pattern can be wrong,
+then the whole block leaving nothing behind.
 
 ### The provisional band
 
