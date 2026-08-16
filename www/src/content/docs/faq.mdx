@@ -134,9 +134,10 @@ mutation also exports a companion listing the keys it structurally affects. See
 
 ## Should I commit the generated output?
 
-Yes. It is byte-identical for the same document, config and version, so a diff means your API
-changed, and `oasts generate --check` turns drift into a failed build. See
-[Determinism](/concepts/determinism).
+Yes. It is byte-identical for the same document *bytes*, config, version and consumer
+`tsconfig.json`, so a diff means one of those changed, and `oasts generate --check` turns drift into
+a failed build. Note the first one: reformatting your spec without changing what it says still moves
+the output. See [Determinism](/concepts/determinism).
 
 ## Why does it refuse to build instead of renaming something?
 
