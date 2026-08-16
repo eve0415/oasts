@@ -36,6 +36,7 @@ const CODE_WEBHOOK_NAME: &str = "OASTS3003";
 pub(crate) const CODE_ENUM_RULE_14: &str = "OASTS3101";
 const CODE_NUMERIC_BOUND_DOMAIN: &str = "OASTS3102";
 const CODE_ANNOTATION_DOMAIN: &str = "OASTS3103";
+const CODE_NUMERIC_MEMBER_DOMAIN: &str = "OASTS3104";
 const CODE_LINK_OPERATION_ID: &str = "OASTS3201";
 const CODE_LINK_OPERATION_REF: &str = "OASTS3202";
 const CODE_LINK_PARAMETER: &str = "OASTS3203";
@@ -2216,8 +2217,16 @@ fn validate_numeric_value(
                 );
                 return;
             };
-            let original =
-                Decimal::parse(&raw).expect("serde_json number rendering is valid decimal");
+            let Some(original) = Decimal::parse(&raw) else {
+                sink.push(source_diagnostic(
+                    CODE_NUMERIC_MEMBER_DOMAIN,
+                    format!(
+                        "numeric member {raw} has an exponent outside the supported decimal domain"
+                    ),
+                    &meta.source,
+                ));
+                return;
+            };
             if original.negative_zero {
                 enum_error(meta, "numeric enum member -0 is not representable", sink);
                 return;
@@ -2739,6 +2748,25 @@ mod tests {
         assert_bound_domain_diagnostic(
             r#"{"type":"number","exclusiveMaximum":1e999}"#,
             "exclusiveMaximum",
+        );
+    }
+
+    #[test]
+    fn numeric_member_with_oversized_exponent_errors() {
+        let diagnostics =
+            diagnostics_for_schema(r#"{"type":"number","enum":[1e-99999999999999999999]}"#);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_NUMERIC_MEMBER_DOMAIN)
+            .expect("numeric member domain diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(
+            diagnostic.message,
+            "numeric member 1e-99999999999999999999 has an exponent outside the supported decimal domain"
+        );
+        assert_eq!(
+            diagnostic.json_pointer.as_deref(),
+            Some("/components/schemas/Value")
         );
     }
 
