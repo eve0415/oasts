@@ -116,7 +116,7 @@ test("usage, watch, discovery, spec, and config failures exit 2", async () => {
 
   const watch = await invoke(["watch"], empty);
   assert.equal(watch.code, 2);
-  assert.match(watch.stderr, /error\[OASTS9003\]: the watch command is not supported/);
+  assert.match(watch.stderr, /error\[OASTS9004\]: the watch command is not supported/);
 
   const undiscovered = await invoke(["check"], empty);
   assert.equal(undiscovered.code, 2);

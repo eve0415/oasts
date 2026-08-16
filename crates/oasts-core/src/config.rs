@@ -49,6 +49,7 @@ const CODE_CONFIG_READ: &str = "OASTS1001";
 const CODE_SCRIPT_CONFIG_UNSUPPORTED: &str = "OASTS9001";
 pub(crate) const CODE_WORKSPACE_UNSUPPORTED: &str = "OASTS9002";
 pub(crate) const CODE_BLOCK_UNSUPPORTED: &str = "OASTS9003";
+pub(crate) const CODE_COMMAND_UNSUPPORTED: &str = "OASTS9004";
 
 const DISCOVERY_NAMES: [&str; 8] = [
     "oasts.config.ts",

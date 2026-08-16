@@ -377,7 +377,7 @@ mod tests {
 
         let refusal = command_refusal("watch".to_owned()).expect("watch is unimplemented");
         assert_eq!(refusal.exit_code, 2);
-        assert_eq!(refusal.diagnostics[0].code, "OASTS9003");
+        assert_eq!(refusal.diagnostics[0].code, "OASTS9004");
         assert!(
             refusal
                 .rendered_stderr
