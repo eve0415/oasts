@@ -27,8 +27,10 @@ The client artifact requires an explicit `validation` block; `engine: "off"` opt
 checking. See [Validation](/artifacts/validation) for the other engines.
 
 <Aside type="note">
-  This build always emits the types artifact. `types: false` is accepted by the config and then
-  ignored, so the `types/` directory is written either way.
+  Types default on. Set `types: false` to omit the artifact; oasts does not write `types/` or
+  silently turn it back on. Zod and validators can stand alone. Client and MSW each require types
+  (`OASTS0111` and `OASTS0112`), and TanStack requires client (`OASTS0113`), so it requires types
+  transitively. At least one artifact must remain enabled.
 </Aside>
 
 <CardGrid>
