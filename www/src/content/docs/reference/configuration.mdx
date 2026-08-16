@@ -71,8 +71,16 @@ input:
   than a refusal on the merits.
 </Aside>
 
-Note that an `https://` `$id` inside the document is fine: `$id` names a schema resource, it is not
-a request to fetch one. Only something that actually has to be *read* over the network is refused.
+An `https://` `$id` inside the document is not itself a problem: `$id` names a schema resource, it is
+not a request to fetch one. Only something that actually has to be *read* over the network is
+refused.
+
+It is not inert, though. `$id` re-bases every relative `$ref` beneath it, so a sibling
+`$ref: "./tag.yaml"` that resolves to a local file today resolves to
+`https://…/tag.yaml` once you add an `https://` `$id` above it — and then it does have to be read,
+and it is an `OASTS9101`. Same for a `#/components/…` pointer written inside an `$id`'d schema: it
+resolves against that resource, not the document root. If adding an `$id` broke a `$ref` that worked
+before, this is why.
 
 ## `output`, `namespace`
 
