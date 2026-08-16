@@ -1192,7 +1192,7 @@ fn emit_component_pairs(
     // once. The two ways one could collide are both closed upstream: name allocation renames this
     // component's own position variant when another component already carries that name, and a
     // document declaring both `Instant` and `InstantBody` — the only pair that could reach a
-    // kernel import's replacement name — is already fatal at OASTS1307.
+    // kernel import's replacement name — is already fatal at OASTS4102.
     let aliases = ModuleAliases {
         kernel,
         siblings: HashMap::default(),
@@ -3071,7 +3071,7 @@ mod tests {
     fn refusals(diagnostics: &[Diagnostic]) -> Vec<&Diagnostic> {
         diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1313")
+            .filter(|diagnostic| diagnostic.code == "OASTS4301")
             .collect()
     }
 
@@ -4350,7 +4350,7 @@ mod pair_tests {
     fn unconvertible_messages(diagnostics: &[Diagnostic]) -> Vec<&str> {
         let mut messages = Vec::new();
         for diagnostic in diagnostics {
-            if diagnostic.code == "OASTS1314" {
+            if diagnostic.code == "OASTS4302" {
                 messages.push(diagnostic.message.as_str());
             }
         }
@@ -6171,14 +6171,14 @@ mod pair_tests {
     #[test]
     fn an_unallocatable_component_emits_no_pair_module() {
         // "CON" is a Windows reserved device name, so no file base is allocated for it and the run
-        // already carries the OASTS1301 refusal — the pair emitter must skip it rather than panic.
+        // already carries the OASTS4001 refusal — the pair emitter must skip it rather than panic.
         let (files, diagnostics, has_errors) = compile_document(
             notice_document(json!({ "CON": timed(), "Notice": timed() })),
             date_mode,
         );
         assert!(has_errors, "{diagnostics:#?}");
         assert!(
-            diagnostics.iter().any(|d| d.code == "OASTS1301"),
+            diagnostics.iter().any(|d| d.code == "OASTS4001"),
             "{diagnostics:#?}"
         );
         assert!(!files.iter().any(|file| {
@@ -6297,7 +6297,7 @@ mod operation_pair_tests {
     fn refused(diagnostics: &[crate::diag::Diagnostic]) -> Vec<&str> {
         diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1314")
+            .filter(|diagnostic| diagnostic.code == "OASTS4302")
             .map(|diagnostic| diagnostic.message.as_str())
             .collect()
     }
@@ -6995,7 +6995,7 @@ mod operation_pair_tests {
             date_mode,
         );
         assert!(has_errors, "{diagnostics:#?}");
-        for code in ["OASTS1201", "OASTS1301"] {
+        for code in ["OASTS1201", "OASTS4001"] {
             assert!(
                 diagnostics.iter().any(|diagnostic| diagnostic.code == code),
                 "missing {code}: {diagnostics:#?}"

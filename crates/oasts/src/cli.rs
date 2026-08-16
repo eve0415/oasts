@@ -381,7 +381,7 @@ mod tests {
 
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(stdout, "check ok\n");
-        assert!(stderr.contains("warning[OASTS1303]"), "{stderr}");
+        assert!(stderr.contains("warning[OASTS4201]"), "{stderr}");
         assert!(stderr.contains("disjoint primitive type sets"), "{stderr}");
         assert!(!temp.path().join("generated").exists());
 
@@ -393,7 +393,7 @@ mod tests {
             reserved.path(),
         );
         assert_eq!(code, 1, "{stderr}");
-        assert!(stderr.contains("error[OASTS1301]"), "{stderr}");
+        assert!(stderr.contains("error[OASTS4001]"), "{stderr}");
         assert!(stderr.contains("Windows reserved device"), "{stderr}");
         assert!(!reserved.path().join("generated").exists());
     }
@@ -492,7 +492,7 @@ mod tests {
 
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(stdout, "generated 1 files\n");
-        assert!(stderr.contains("warning[OASTS1304]"), "{stderr}");
+        assert!(stderr.contains("warning[OASTS4202]"), "{stderr}");
         assert!(
             stderr.contains("emitting a structural union because"),
             "{stderr}"

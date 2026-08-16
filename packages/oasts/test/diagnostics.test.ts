@@ -6,11 +6,11 @@ import { CliFailure, configFailure, fromNativeError, render } from "../src/diagn
 test("render matches the core stderr dialect", () => {
   const rendered = render([
     { code: "OASTS0013", severity: "error", message: "boom", sourceId: "oasts.config.ts" },
-    { code: "OASTS1304", severity: "warning", message: "structural" },
+    { code: "OASTS4202", severity: "warning", message: "structural" },
   ]);
   assert.equal(
     rendered,
-    "error[OASTS0013]: boom\n  --> oasts.config.ts:1:1\nwarning[OASTS1304]: structural\n",
+    "error[OASTS0013]: boom\n  --> oasts.config.ts:1:1\nwarning[OASTS4202]: structural\n",
   );
 });
 

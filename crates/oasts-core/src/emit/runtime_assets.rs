@@ -894,7 +894,7 @@ mod tests {
         assert!(
             sink.as_slice()
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1302")
+                .any(|diagnostic| diagnostic.code == "OASTS4002")
         );
     }
 

@@ -547,7 +547,7 @@ components:
         // `custom-hostname` -> `CustomHostname` and `custom-hostName` -> `CustomHostName`
         // are distinct identifiers, so the identifier layer allocates both (no OASTS1202).
         // Their kebab file bases both fold to `custom-hostname.ts`, so filesystem safety is
-        // still enforced — at the path layer, via OASTS1302.
+        // still enforced — at the path layer, via OASTS4002.
         let openapi = r##"openapi: "3.1.0"
 info: { title: pathcollide, version: "1" }
 paths:
@@ -586,7 +586,7 @@ components:
         assert!(files.is_none(), "path collision must be fatal");
         let has_code = |code: &str| sink.as_slice().iter().any(|d| d.code == code);
         assert!(!has_code("OASTS1202"), "case-only diff must not be fatal");
-        assert!(has_code("OASTS1302"), "path layer must still collide");
+        assert!(has_code("OASTS4002"), "path layer must still collide");
     }
 
     #[test]

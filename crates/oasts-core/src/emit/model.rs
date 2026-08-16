@@ -888,7 +888,7 @@ mod tests {
     /// Runs the pipeline through analysis (config load, graph load, parse, semantic analyze) for
     /// an inline `components.schemas` document, stopping short of `EmissionModel::new` so each
     /// caller can construct its own model against its own `DiagnosticSink` — the model-affecting
-    /// diagnostics (e.g. OASTS1306 variant collisions) only exist after that call, so a shared sink
+    /// diagnostics (e.g. OASTS4101 variant collisions) only exist after that call, so a shared sink
     /// here would either hide them from `variant_collisions` or leak unrelated pipeline warnings
     /// into it. Returns the owned outputs a caller needs for that call: the `TempDir` (kept alive
     /// so the config's relative `input.path` still resolves), the resolved config, the analyzed
@@ -1259,14 +1259,14 @@ mod tests {
             .collect()
     }
 
-    /// The OASTS1306 rename warnings for `schemas`.
+    /// The OASTS4101 rename warnings for `schemas`.
     fn variant_collisions(schemas: Value) -> Vec<crate::diag::Diagnostic> {
-        model_diagnostics(schemas, "OASTS1306")
+        model_diagnostics(schemas, "OASTS4101")
     }
 
-    /// The OASTS1310 residual-collision errors for `schemas` — the replacement name was taken too.
+    /// The OASTS4103 residual-collision errors for `schemas` — the replacement name was taken too.
     fn variant_alias_collisions(schemas: Value) -> Vec<crate::diag::Diagnostic> {
-        model_diagnostics(schemas, "OASTS1310")
+        model_diagnostics(schemas, "OASTS4103")
     }
 
     /// A component literally named `PetRequest` shadows the synthetic `PetRequest` that `Pet`'s
@@ -1580,11 +1580,11 @@ mod wire_variant_tests {
             "Pet",
         );
         assert_eq!(exports[0].as_deref(), Some("PetWireValue"));
-        let warnings = codes(&diagnostics, "OASTS1311");
+        let warnings = codes(&diagnostics, "OASTS4104");
         assert_eq!(warnings.len(), 1, "{diagnostics:#?}");
         assert!(warnings[0].contains("'PetWire'"));
         assert!(warnings[0].contains("'PetWireValue'"));
-        assert!(codes(&diagnostics, "OASTS1312").is_empty());
+        assert!(codes(&diagnostics, "OASTS4105").is_empty());
     }
 
     #[test]
@@ -1602,11 +1602,11 @@ mod wire_variant_tests {
         );
         assert_eq!(exports[0].as_deref(), Some("IssueWire"));
         assert!(
-            codes(&diagnostics, "OASTS1311").is_empty(),
+            codes(&diagnostics, "OASTS4104").is_empty(),
             "{diagnostics:#?}"
         );
         assert!(
-            codes(&diagnostics, "OASTS1312").is_empty(),
+            codes(&diagnostics, "OASTS4105").is_empty(),
             "{diagnostics:#?}"
         );
     }
@@ -1621,17 +1621,17 @@ mod wire_variant_tests {
             }),
             "Pet",
         );
-        let errors = codes(&diagnostics, "OASTS1312");
+        let errors = codes(&diagnostics, "OASTS4105");
         assert_eq!(errors.len(), 1, "{diagnostics:#?}");
         assert!(errors[0].contains("'PetWire'"));
         assert!(errors[0].contains("'PetWireValue'"));
         assert!(errors[0].contains("naming.overrides"));
-        assert!(codes(&diagnostics, "OASTS1311").is_empty());
+        assert!(codes(&diagnostics, "OASTS4104").is_empty());
     }
 
     #[test]
     fn the_suffix_composes_onto_the_aliased_request_variant() {
-        // `Pet` needs a request variant, but `PetRequest` is declared, so OASTS1306 aliases the
+        // `Pet` needs a request variant, but `PetRequest` is declared, so OASTS4101 aliases the
         // variant to `PetRequestBody`. The wire suffix must compose onto that alias — composing onto
         // the derived name would have two modules exporting `PetRequestWire` with no diagnostic.
         let (exports, diagnostics) = wire_exports(
@@ -1649,12 +1649,12 @@ mod wire_variant_tests {
         );
         assert_eq!(exports[1].as_deref(), Some("PetRequestBodyWire"));
         assert_eq!(
-            codes(&diagnostics, "OASTS1306").len(),
+            codes(&diagnostics, "OASTS4101").len(),
             1,
             "{diagnostics:#?}"
         );
-        assert!(codes(&diagnostics, "OASTS1311").is_empty());
-        assert!(codes(&diagnostics, "OASTS1312").is_empty());
+        assert!(codes(&diagnostics, "OASTS4104").is_empty());
+        assert!(codes(&diagnostics, "OASTS4105").is_empty());
     }
 
     /// A component whose generated file name is invalid (a Windows reserved device name) never gets
@@ -1672,7 +1672,7 @@ mod wire_variant_tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.code != "OASTS1311" && diagnostic.code != "OASTS1312"),
+                .all(|diagnostic| diagnostic.code != "OASTS4104" && diagnostic.code != "OASTS4105"),
             "{diagnostics:#?}"
         );
     }

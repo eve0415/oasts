@@ -1270,7 +1270,7 @@ fn collect_schema_override_suggestions(
 
     // A pasted identifier override also becomes that declaration's file-base source. Include
     // latent raw-name path collisions in the same block so resolving OASTS1202 cannot merely
-    // uncover OASTS1302 on the next run.
+    // uncover OASTS4002 on the next run.
     let mut file_groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, schema) in pending.iter().enumerate() {
         if !is_overrideable_schema(&schema.allocated.source) {
@@ -1622,7 +1622,7 @@ fn name_collision_diagnostic(
     // Exact match over case-folded match at the identifier layer, because TypeScript
     // identifiers are case-sensitive: two names differing only in case are two distinct,
     // legal types. Filesystem safety on case-insensitive volumes is enforced separately
-    // by the path-collision check (`register_path` / OASTS1302 in `emit/model.rs`), so this
+    // by the path-collision check (`register_path` / OASTS4002 in `emit/model.rs`), so this
     // layer must not also reject case-only differences.
     let message = format!(
         "{kind} name collision: '{name}' allocated at {} and {}",

@@ -313,7 +313,7 @@ mod tests {
         );
         let result = run(options);
         assert_eq!(result.exit_code, 0, "{}", result.rendered_stderr);
-        assert!(result.rendered_stderr.contains("warning[OASTS1304]"));
+        assert!(result.rendered_stderr.contains("warning[OASTS4202]"));
         assert_eq!(result.diagnostics[0].severity, "warning");
         assert!(temp.path().join("generated").is_dir());
     }

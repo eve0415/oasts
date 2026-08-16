@@ -105,7 +105,7 @@ test("warnings reach stderr on successful runs", async () => {
   );
   const generated = await invoke(["generate"], directory);
   assert.equal(generated.code, 0);
-  assert.match(generated.stderr, /warning\[OASTS1304\]/);
+  assert.match(generated.stderr, /warning\[OASTS4202\]/);
 });
 
 test("usage, watch, discovery, spec, and config failures exit 2", async () => {

@@ -6454,7 +6454,7 @@ mod tests {
         let (_, diagnostics) = emit_operation(document, "readpet");
         let flagged = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1307")
+            .find(|diagnostic| diagnostic.code == "OASTS4102")
             .expect("alias collision diagnostic");
         assert_eq!(flagged.severity, Severity::Error);
         assert!(flagged.message.contains("ReadpetInputBody"));

@@ -468,7 +468,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             let Some(node) = node else {
                 // A mapping value is not a `$ref`, so nothing validated it upstream and a document
                 // is free to point one at a pointer that resolves to nothing. Emission reports the
-                // dangling entry (OASTS1308) and drops its tag, so there is nothing to materialize
+                // dangling entry (OASTS4204) and drops its tag, so there is nothing to materialize
                 // here and nothing to say twice. A `$ref` reaching this arm would mean the loader
                 // let an unresolved target through, which is why the assert stays.
                 debug_assert_eq!(
@@ -2655,7 +2655,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 match value.as_str() {
                     Some(value) => mapping.push((key.clone(), value.to_owned())),
                     // Dropped either way; the discriminator never shapes the union. Diagnosing it
-                    // keeps a malformed value from being quieter than a dangling one (OASTS1308).
+                    // keeps a malformed value from being quieter than a dangling one (OASTS4204).
                     None => self.sink.push(self.warning_diagnostic(
                         CODE_MAPPING_VALUE_SHAPE,
                         parent.doc_id,
@@ -6426,7 +6426,7 @@ mod tests {
     fn oneof_and_anyof_conjunction_carries_single_discriminator() {
         // When oneOf, anyOf, and a discriminator coexist, the lowered conjunction attaches the
         // discriminator to the oneOf branch only (the conventional carrier). Attaching it to both
-        // synthetic branches would run the downstream proof — and its OASTS1304 diagnostic — twice.
+        // synthetic branches would run the downstream proof — and its OASTS4202 diagnostic — twice.
         let document = schemas_doc(
             "3.1.0",
             json!({

@@ -1140,7 +1140,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 } else {
                     self.mark_incomplete();
                 }
-                // An unresolved reference is already reported as OASTS1305 by the types pass.
+                // An unresolved reference is already reported as OASTS4203 by the types pass.
             }
             SchemaNode::Primitive {
                 ty,
@@ -4893,7 +4893,7 @@ mod tests {
         );
         let mut warned = false;
         for diagnostic in &diagnostics {
-            if diagnostic.code == "OASTS1311" {
+            if diagnostic.code == "OASTS4104" {
                 warned = true;
             }
         }
@@ -4940,7 +4940,7 @@ mod tests {
 
         let mut fatal = Vec::new();
         for diagnostic in &diagnostics {
-            if diagnostic.code == "OASTS1312" {
+            if diagnostic.code == "OASTS4105" {
                 fatal.push(diagnostic.message.as_str());
             }
         }
