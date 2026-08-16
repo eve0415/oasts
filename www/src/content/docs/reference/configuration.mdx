@@ -139,7 +139,15 @@ types:
 `discriminatedUnions: tagged` intersects each branch of a `discriminator` union with its own mapping
 literal so TypeScript can narrow on the tag; `integer: bigint` maps `format: int64` to `bigint`.
 Both are covered in [Types](/artifacts/types#shape-knobs). `dateTime` and `date` have their own
-page — [Dates and times](/guides/dates). `enumExtensions: reject` turns the vendor extensions
+page — [Dates and times](/guides/dates).
+
+Every value in that block other than the defaults shown needs the **client** artifact: the conversion
+between the wire form and the TypeScript type lives in the client runtime, so `dateTime: date`,
+`dateTime: temporal`, `date: temporal` and `integer: bigint` are an `OASTS0131` on a types-only build.
+`integer: bigint` additionally rules out the tanstack artifact, whose query keys are JSON-serialized
+and cannot carry a `bigint`.
+
+`enumExtensions: reject` turns the vendor extensions
 `x-enum-varnames`, `x-enumNames`, `x-enum-descriptions` and `x-enumDescriptions` into a build error
 instead of honoring them; `accept` (the default) uses them to name and describe enum members.
 
