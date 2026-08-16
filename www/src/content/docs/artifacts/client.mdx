@@ -9,7 +9,13 @@ sidebar:
 artifacts:
   types: true
   client: true
+validation:
+  engine: "off"
+  unchecked: allow
 ```
+
+The client artifact requires an explicit `validation` block — `engine: "off"` opts out of boundary
+checking.
 
 The client is emitted next to your types. It imports nothing — no runtime package to version-match,
 nothing added to your dependency tree.
@@ -25,6 +31,9 @@ const result = await getPetShowcase(transport, {
   query: { tags: ["indoor"] },
 });
 ```
+
+A third, optional argument carries per-call `CallOptions` — `auth`, `headers`, `signal`,
+`fetchOptions`.
 
 ## Failure-complete results
 
@@ -97,15 +106,17 @@ client:
 ## Parameter serialization
 
 The full OpenAPI matrix is implemented to the letter, not approximated: `style`/`explode` for path,
-query and header parameters (`form`, `spaceDelimited`, `pipeDelimited`, `deepObject`, `label`,
-`matrix`, `simple`), and multipart encoding with per-part content types. The
+query, header and cookie parameters (`form`, `spaceDelimited`, `pipeDelimited`, `deepObject`,
+`label`, `matrix`, `simple`), and multipart encoding with per-part content types. Combinations
+OpenAPI leaves undefined are refused rather than guessed — `deepObject` over an array or a scalar is
+one, and `compat.deepObjectEncoding: extended` opts into a bracket-path encoding for it. The
 [MSW artifact](/artifacts/msw) runs the same matrix backwards to decode request values.
 
 ## One module per operation, or one object
 
 Each operation is its own module, so a bundler drops the ones you never import. Set
-`client.aggregate: true` and both call forms are also re-exported from `generated/client/api.ts` if
-you would rather import one object:
+`client.aggregate: true` and both call forms are also collected into a single `api` object exported
+from `generated/client/api.ts`:
 
 ```yaml title="oasts.yaml"
 client:
@@ -117,10 +128,14 @@ ones you never call.
 
 ## Validation at the boundary
 
-The client can check payloads against the document as they pass through. Pick an engine and the
-positions:
+The client can check payloads against the document as they pass through. Swap the `engine: "off"`
+above for a real engine and the artifact backing it, then pick the positions:
 
 ```yaml title="oasts.yaml"
+artifacts:
+  types: true
+  client: true
+  validators: true
 validation:
   engine: generated
   request: true
