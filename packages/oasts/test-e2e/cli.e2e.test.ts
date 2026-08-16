@@ -95,6 +95,23 @@ test("invalid script config exits 2 through the spawned bin", () => {
   assert.match(result.stderr, /error\[OASTS0012\]: config default export is a promise/);
 });
 
+test("native module load failure exits 2 through the spawned bin", () => {
+  const directory = mkdtempSync(join(tmpdir(), "oasts-e2e-native-load-"));
+  const result = spawnSync(process.execPath, [BIN, "check"], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      NAPI_RS_NATIVE_LIBRARY_PATH: join(directory, "missing.node"),
+    },
+  });
+
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 2);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /error\[OASTS1023\]: native module load failed:/);
+});
+
 test("the standalone Rust binary still rejects script configs with OASTS9001", () => {
   const directory = mkdtempSync(join(tmpdir(), "oasts-e2e-rust-script-"));
   writeFileSync(join(directory, "oasts.config.ts"), "export default {};\n");
