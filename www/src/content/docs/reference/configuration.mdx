@@ -67,11 +67,11 @@ input:
 
 <Aside type="caution" title="`url` is accepted by the schema but refused at load">
   This build does not fetch documents. `input.url` — and any `$ref` that resolves to an `http(s)`
-  target — fails with `error[OASTS9101]: remote loading is not supported in this build`. The key is
+  target — fails with `error[OASTS9201]: remote loading is not supported in this build`. The key is
   in the schema so configs stay forward-compatible; today, bundle or vendor the document and point
   `input.path` at it.
 
-  `OASTS9101` is in the [provisional band](/concepts/diagnostics) — a capability gated off rather
+  `OASTS9201` is in the [provisional band](/concepts/diagnostics) — a capability gated off rather
   than a refusal on the merits.
 </Aside>
 
@@ -82,7 +82,7 @@ refused.
 It is not inert, though. `$id` re-bases every relative `$ref` beneath it, so a sibling
 `$ref: "./tag.yaml"` that resolves to a local file today resolves to
 `https://…/tag.yaml` once you add an `https://` `$id` above it — and then it does have to be read,
-and it is an `OASTS9101`. Same for a `#/components/…` pointer written inside an `$id`'d schema: it
+and it is an `OASTS9201`. Same for a `#/components/…` pointer written inside an `$id`'d schema: it
 resolves against that resource, not the document root. If adding an `$id` broke a `$ref` that worked
 before, this is why.
 

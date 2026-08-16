@@ -60,7 +60,7 @@ The **thousands** digit is the stage that refused, and every code in a stage sha
 | `4xxx` | **Type emission.** Turning the model into TypeScript. | `1` | `OASTS4105` a compiler-invented name has nowhere left to move · `OASTS4201` an `allOf` proven empty, lowered to `never` |
 | `5xxx` | **Client model.** Projecting operations into the request and response pipeline. | `1` | `OASTS5201` an XML response media · `OASTS5403` an OAuth2 scheme declaring no flows |
 | `6xxx` | **Artifacts.** One sub-band per artifact. | `1` | `OASTS6002` validators cannot check a keyword · `OASTS6201` a path literal MSW's matcher cannot match |
-| `9xxx` | **Provisional.** A capability this build gates off rather than refuses. | varies | `OASTS9003` a reserved config block · `OASTS9101` a remote `$ref` |
+| `9xxx` | **Provisional.** A capability this build gates off rather than refuses. | varies | `OASTS9003` a reserved config block · `OASTS9201` a remote `$ref` |
 
 The **hundreds** digit sub-divides a stage: `62xx` is MSW's corner of the artifact stage, `22xx` is
 the schema-keyword corner of document loading. Sub-bands are kept sparse deliberately, so a new code
@@ -79,7 +79,7 @@ then the whole block leaving nothing behind.
 ### The provisional band
 
 `9xxx` is not a stage. It holds capabilities this build gates off rather than refuses on the merits
-— `OASTS9101` for a remote `$ref`, `OASTS9003` for a config block that is accepted by the schema but
+— `OASTS9201` for a remote `$ref`, `OASTS9003` for a config block that is accepted by the schema but
 not implemented. A provisional code **retires when its capability lands**, so the band is expected to
 develop holes, and nothing is renumbered to close them.
 
