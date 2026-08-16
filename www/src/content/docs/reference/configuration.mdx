@@ -116,6 +116,7 @@ With no `artifacts` block you get types.
 ```yaml
 types:
   enum: literal          # literal | const
+  enumExtensions: accept # accept | reject
   dateTime: string       # string | date | temporal
   date: string           # string | temporal
   discriminatedUnions: structural   # structural | tagged
@@ -126,7 +127,9 @@ types:
 `discriminatedUnions: tagged` intersects each branch of a `discriminator` union with its own mapping
 literal so TypeScript can narrow on the tag; `integer: bigint` maps `format: int64` to `bigint`.
 Both are covered in [Types](/artifacts/types#shape-knobs). `dateTime` and `date` have their own
-page — [Dates and times](/guides/dates).
+page — [Dates and times](/guides/dates). `enumExtensions: reject` turns the vendor extensions
+`x-enum-varnames`, `x-enumNames`, `x-enum-descriptions` and `x-enumDescriptions` into a build error
+instead of honoring them; `accept` (the default) uses them to name and describe enum members.
 
 ## `client`
 
@@ -247,13 +250,14 @@ information is at your cursor even where the type cannot express it.
 ```yaml
 emit:
   runtimeDirectory: runtime
-  importExtension: ".js"
+  importExtension: ".js"   # ".js" | "none"
   banner: []
   format: deterministic
 ```
 
 `banner` prepends lines to every emitted file. `importExtension` is what emitted imports end in —
-`.js` suits Node's ESM resolution and the bundlers that follow it.
+`.js` suits Node's ESM resolution and the bundlers that follow it; `none` emits extensionless
+imports for resolvers that want those instead.
 
 ## `typescript`
 
