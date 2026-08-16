@@ -412,7 +412,11 @@ pub fn emit_artifacts(
     sink.extend(tsconfig_diagnostics);
     let mut model = EmissionModel::new(analyzed, config, source_digest(source_tuples), sink);
     model.consumer_provides_temporal = consumer_provides_temporal;
-    let mut files = emit_types_from_model(&mut model);
+    let mut files = if config.artifacts.types.enabled {
+        emit_types_from_model(&mut model)
+    } else {
+        Vec::new()
+    };
     if let Some(client_model) = client_model {
         files.extend(client::emit_client_from_model(&mut model, client_model));
         // The transform artifact lives under the client's tree and only ever runs at the client's
