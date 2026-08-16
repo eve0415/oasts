@@ -1254,6 +1254,8 @@ pub fn resolve_config(
 ) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     let mut sink = DiagnosticSink::new();
     let source_path = config_path.as_path();
+    // Config resolution is entered with a selected file path; even a relative file has an empty
+    // parent path rather than no parent.
     let config_parent = config_path
         .parent()
         .expect("resolved config paths always have a parent");
@@ -1447,6 +1449,7 @@ pub fn resolve_config(
         return Err(diagnostics);
     }
 
+    // Both resolvers emit an error whenever they return `None`, and that path returned above.
     let input = input.expect("an unresolved input always emits a diagnostic");
     let output = output.expect("an unresolved output always emits a diagnostic");
     let client = resolve_client_config(raw.client.as_ref(), artifact_states.client.enabled);
@@ -2281,6 +2284,8 @@ fn resolve_below(base: &Path, relative: &Path, allow_equal: bool) -> Result<Path
 
     if base.exists() {
         let canonical_base = canonicalize_result(fs::canonicalize(base), "allowed root")?;
+        // `candidate` was lexically joined below the existing `base`, so the ancestor walk must
+        // reach at least `base`.
         let existing_ancestor = nearest_existing_ancestor(&candidate)
             .expect("an existing base is always an ancestor of its lexical child");
         let canonical_ancestor =

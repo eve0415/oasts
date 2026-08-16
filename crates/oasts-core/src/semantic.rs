@@ -1465,6 +1465,8 @@ impl OverrideSuggester {
                 loop {
                     let identifier = format!("{base}_{suffix}");
                     suffix += 1;
+                    // Appending an ASCII suffix to a validated identifier preserves the file-name
+                    // validator's accepted domain.
                     let file_base = crate::emit::file_base_name(&identifier, self.file_case)
                         .expect("a valid TypeScript identifier always produces a safe file base")
                         .to_ascii_lowercase();
@@ -1503,6 +1505,8 @@ impl OverrideSuggester {
                         .iter()
                         .map(|(prefix, tail)| {
                             let identifier = format!("{prefix}{fragment}{tail}");
+                            // All three fragments are validated identifier parts assembled without
+                            // introducing punctuation.
                             let file_base = crate::emit::file_base_name(
                                 &identifier,
                                 self.file_case,
@@ -2359,6 +2363,7 @@ fn numeric_name_tokens(number: &Number) -> Result<Vec<String>, NormalizeError> {
             'e' => {
                 push_digits(&mut tokens, &mut digits);
                 tokens.push("Exponent".to_owned());
+                // `render_number` is the sole producer and always writes `e+` or `e-`.
                 if chars
                     .next()
                     .expect("rendered exponents include an explicit sign")
@@ -2485,6 +2490,7 @@ fn change_first_alphabetic(token: &str, transform: fn(&u8) -> u8) -> String {
     if let Some(character) = bytes.iter_mut().find(|byte| byte.is_ascii_alphabetic()) {
         *character = transform(character);
     }
+    // The only mutation replaces one ASCII byte with another, preserving the input's UTF-8.
     String::from_utf8(bytes).expect("ASCII case conversion preserves UTF-8")
 }
 

@@ -591,6 +591,7 @@ impl<'a> GraphBuilder<'a> {
         let entry_path = configured_entry_path(&self.config.input)?;
         let entry_id = self.load_document(&entry_path)?;
         let entry_path = self.documents[entry_id.0].canonical_path.clone();
+        // `load_document` stores a canonical absolute filesystem path, which `file_url` accepts.
         let entry_base = file_url(&entry_path)
             .expect("a canonical filesystem path is representable as a file URI");
         let mut state = TraversalState::default();
@@ -608,6 +609,8 @@ impl<'a> GraphBuilder<'a> {
             .documents
             .into_iter()
             .map(|document| {
+                // Traversal keeps document handles only in stack-local borrows and returns before
+                // graph construction takes ownership here.
                 Rc::try_unwrap(document).expect("document handles do not escape graph traversal")
             })
             .collect();
@@ -700,6 +703,7 @@ impl<'a> GraphBuilder<'a> {
         drop(raw);
         let id = DocId(self.documents.len());
         if contains_anchor {
+            // `canonical_path` came from `fs::canonicalize`, so it is an absolute file path.
             let base = file_url(&canonical_path)
                 .expect("a canonical filesystem path is representable as a file URI");
             collect_anchors(&value, id, base, &source_id, &mut self.identifiers)?;
@@ -744,6 +748,7 @@ impl<'a> GraphBuilder<'a> {
             })?;
         let doc_id = location.doc_id;
         let mut json_pointer = location.json_pointer;
+        // `value` could only have been produced through the same `document.as_ref()` above.
         self.walk_resolved_node(
             ResolvedWalkNode {
                 document: document.as_ref().expect("resolved document exists"),
@@ -1818,6 +1823,7 @@ fn authorize_path<'a>(
         }
     }
     if let Some((index, root)) = selected {
+        // `selected` is assigned only by the `starts_with` branch above.
         let suffix = canonical_path
             .strip_prefix(&root.canonical_path)
             .expect("the selected allow root is a prefix of the canonical path");

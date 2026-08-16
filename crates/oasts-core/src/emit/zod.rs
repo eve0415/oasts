@@ -114,6 +114,7 @@ pub(crate) fn emit_zod_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Gene
             continue;
         }
         let schema = &analyzed.ir.schemas[allocated.schema_index];
+        // A component file and its target are registered together during path allocation.
         let name = model
             .schema_target(&schema.source.source_id, &schema.source.json_pointer)
             .map(|target| target.name.clone())
@@ -1683,6 +1684,7 @@ fn emit_component(
     let file_base = model.component_files[schema_index].clone()?;
     let schema = &analyzed.ir.schemas[schema_index];
     let (request_variant, response_variant, neutral_wire, request_wire, response_wire) = {
+        // Reaching this emitter with a file base proves path allocation registered the target too.
         let target = model
             .schema_target(&schema.source.source_id, &schema.source.json_pointer)
             .expect("a component with an allocated file has a registered target");

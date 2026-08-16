@@ -137,6 +137,8 @@ pub fn run(command: Command, source: ConfigSource<'_>) -> Outcome {
     let Command::Generate { check } = command else {
         return Outcome::succeeded("check ok", warnings);
     };
+    // A successful emitting compile returns `Some`; `None` either means check-only or an error,
+    // and both cases returned above.
     let files = files.expect("successful emitting compilation returns generated files");
 
     if check {

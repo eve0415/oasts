@@ -839,6 +839,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
     }
 
     fn finish_completeness(&mut self) -> bool {
+        // Every schema generation entry pushes one completeness scope before it can finish.
         let complete = self
             .completeness
             .pop()
@@ -1349,6 +1350,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
         if let Some(conditional) = &applicators.conditional {
             self.gen_conditional(conditional, val, path, iss, evaluation);
         }
+        // Applicators are generated only from inside `gen_schema`, after it pushed this scope.
         let annotation_sources_complete = self
             .completeness
             .last()
@@ -3810,6 +3812,7 @@ fn emit_component(
     // was resolved across the whole reference graph at model construction; `Some` is exactly the
     // positions that diverge, and carries the name each one declares under.
     let (request_variant, response_variant, neutral_wire, request_wire, response_wire) = {
+        // A component file and its target are registered together during path allocation.
         let target = model
             .schema_target(&schema.source.source_id, &schema.source.json_pointer)
             .expect("a component with an allocated file has a registered target");

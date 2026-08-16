@@ -1047,6 +1047,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             );
             return ContentSchema::Invalid;
         }
+        // The empty and multi-entry cases returned above, leaving exactly one entry.
         let (raw_name, value) = content.iter().next().expect("one content entry");
         let media_pointer = append_pointer(&pointer, raw_name);
         let Some(canonical) = self.parse_content_key(node.doc_id, &media_pointer, raw_name) else {
@@ -3657,6 +3658,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
     }
 
     fn source_id(&self, doc_id: DocId) -> &str {
+        // Every parser node carries a `DocId` allocated by this immutable document graph.
         self.graph
             .document(doc_id)
             .expect("parser node IDs originate from the document graph")
@@ -4446,6 +4448,7 @@ fn is_consumed_format(ty: &str, format: &str) -> bool {
 }
 
 fn compact_json(value: &Value) -> String {
+    // `serde_json::Value` has no map keys or values that its serializer can reject.
     serde_json::to_string(value).expect("serializing a JSON value cannot fail")
 }
 

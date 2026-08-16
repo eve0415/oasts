@@ -119,6 +119,7 @@ pub(crate) fn emit_client_from_model(
         model.register_path(&auth_file.relative_path, &source);
         files.push(auth_file);
     }
+    // This emitter receives a client model only after resolved config enabled the client artifact.
     let base_url = model
         .config
         .client
@@ -512,6 +513,7 @@ fn emit_operation(
     }
 
     let extension = import_extension(model);
+    // Operation client emission is reachable only from the enabled client artifact pipeline.
     let auth_enforcement = model
         .config
         .client
@@ -1495,6 +1497,8 @@ fn body_validation_checks(response: &ResponsePlan, stem: &str) -> Vec<BodyCheck>
     }
     let body = response_body_side(response.kind, &response.match_key);
     if !response.content_type_discriminated {
+        // The planner sets this flag false only for a single concrete media entry; the non-empty
+        // JSON subset checked above is therefore exactly one entry.
         return vec![BodyCheck {
             content_type: None,
             validator: json.into_iter().next().expect("one JSON media entry").2,
@@ -2300,6 +2304,8 @@ fn planned_parameters<'operation>(
     plan.param_plans
         .iter()
         .map(|parameter_plan| {
+            // Parameter plans are constructed by iterating this operation's parameter list and
+            // preserve each source identity unchanged.
             operation
                 .parameters
                 .iter()
@@ -2490,6 +2496,7 @@ fn render_form_field_input(
     }
     let mut output = format!("{{ body: {body}; contentType: ");
     if field.wrapper.content_type_literal {
+        // Planning enables a wrapped literal content type only for content-based serialization.
         let media = field
             .serialization
             .content_media()
@@ -3137,6 +3144,8 @@ fn write_descriptor(
                             .reaches_kind(&media.schema, TransformKind::IntegerBigInt);
                     let outcome = outcome_literal(response);
                     let reviver = lossless_int64.then(|| {
+                        // The transform planner creates a reviver on this response/media entry
+                        // whenever `lossless_int64` is true.
                         response_transforms
                             .iter()
                             .find(|transform| {
@@ -3169,6 +3178,7 @@ fn write_descriptor(
     output.push_str("  ],\n  baseUrl: ");
     write_base_url(output, &plan.base_url);
     output.push_str(",\n  fetchDefaults: ");
+    // Operation client emission is reachable only from the enabled client artifact pipeline.
     write_fetch_defaults(
         output,
         &model
@@ -3480,6 +3490,8 @@ const TRANSPORT_VALUE_IMPORTS: [&str; 17] = [
 /// The name's slot in `TRANSPORT_VALUE_IMPORTS`. Looked up rather than hand-numbered so adding an
 /// import cannot silently renumber the others.
 fn transport_import_index(name: &str) -> usize {
+    // Callers pass either a literal from this table or `body_encoder_name`, whose match arms are
+    // entries in the same table.
     TRANSPORT_VALUE_IMPORTS
         .iter()
         .position(|candidate| *candidate == name)
@@ -3672,6 +3684,7 @@ fn write_multipart_field(
         }
         FieldSerializationPlan::Content { media, .. } => {
             output.push_str("{ kind: \"fixed\", value: ");
+            // Content planning rejects an empty media selection before emission.
             output.push_str(&render_ts_string(
                 media
                     .values
