@@ -30,6 +30,8 @@ use crate::response_media::{
 };
 use crate::semantic::Analyzed;
 
+const CODE_DEEP_OBJECT_FALSE_EXPLODE: &str = "OASTS5005";
+const CODE_CONTENT_CALLER_SERIALIZED: &str = "OASTS5006";
 const CODE_FORM_SCHEMA_PROPERTIES: &str = "OASTS5106";
 const CODE_URLENCODED_CONTENT_TYPE_IGNORED: &str = "OASTS5109";
 const CODE_MULTIPART_30_STYLE_IGNORED: &str = "OASTS5111";
@@ -1613,9 +1615,6 @@ fn response_table(
         })
         .collect()
 }
-
-const CODE_DEEP_OBJECT_FALSE_EXPLODE: &str = "OASTS5005";
-const CODE_CONTENT_CALLER_SERIALIZED: &str = "OASTS5006";
 
 fn plan_parameters(
     operation: &Operation,

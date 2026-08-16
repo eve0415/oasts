@@ -66,6 +66,13 @@ const CODE_IMPORT_ALIAS: &str = "OASTS4102";
 /// component or another variant's replacement. No local remedy exists, so the document is refused
 /// rather than emitted with two declarations fighting over one identifier.
 const CODE_VARIANT_ALIAS: &str = "OASTS4103";
+/// A wire twin whose derived `{Name}Wire` is already a declared component's name. The document owns
+/// its name; the compiler invented the other, so the twin yields to `{Name}WireValue` and generation
+/// continues — the same rule OASTS4101 applies to a colliding request/response variant.
+const CODE_WIRE_ALIAS: &str = "OASTS4104";
+/// The residual: `{Name}WireValue` is itself declared. Nothing compiler-invented remains, so the
+/// document is refused rather than emitted with two declarations fighting over one identifier.
+const CODE_WIRE_COLLISION: &str = "OASTS4105";
 const CODE_DISCRIMINATOR: &str = "OASTS4202";
 const CODE_UNALLOCATED_REFERENCE: &str = "OASTS4203";
 /// A discriminator `mapping` value that resolves to no allocated component schema. A mapping target
@@ -91,14 +98,6 @@ const CODE_TRANSFORM_UNION: &str = "OASTS4301";
 /// a shape no single codec is keyed on, and emitting nothing for one would leave a wire string
 /// behind a type promising an application value.
 pub(super) const CODE_UNCONVERTIBLE_TRANSFORM: &str = "OASTS4302";
-
-/// A wire twin whose derived `{Name}Wire` is already a declared component's name. The document owns
-/// its name; the compiler invented the other, so the twin yields to `{Name}WireValue` and generation
-/// continues — the same rule OASTS4101 applies to a colliding request/response variant.
-const CODE_WIRE_ALIAS: &str = "OASTS4104";
-/// The residual: `{Name}WireValue` is itself declared. Nothing compiler-invented remains, so the
-/// document is refused rather than emitted with two declarations fighting over one identifier.
-const CODE_WIRE_COLLISION: &str = "OASTS4105";
 
 const INDENT_CHUNK: &str = "                                ";
 
