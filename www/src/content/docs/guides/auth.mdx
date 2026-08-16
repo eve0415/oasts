@@ -108,21 +108,40 @@ await andBasicHeader(transport, {}, { auth: { headerKey: "k-123" } });
   </TabItem>
 </Tabs>
 
-An operation whose `security` includes the empty requirement `{}` can always be called anonymously,
-and one with `security: []` needs nothing at all.
+An operation whose `security` includes the empty requirement `{}` never asks for credentials in its
+signature — but at runtime a configured alternative still wins, and the anonymous path is taken only
+when nothing was configured for it or the caller opts in. One with `security: []` needs nothing at
+all, at either level.
 
 ## Per-call overrides
 
-`CallOptions.auth` overrides the transport for that call. It also accepts the literal
-`"anonymous"`, which sends no credentials:
+`CallOptions.auth` overrides the transport for that call:
 
 ```ts
-await getPet(transport, input, { auth: "anonymous" });
 await getPet(transport, input, { auth: { bearerAuth: otherUsersToken } });
 ```
 
-This is the shape for impersonation, for a health check that must not carry credentials, and for
-tests.
+That is the shape for impersonation and for tests.
+
+### `"anonymous"` is permission, not a way to strip credentials
+
+`CallOptions.auth` also accepts the literal `"anonymous"`. It does **not** send the request without
+credentials. Credentialed alternatives are still evaluated first and their providers still run; if
+one succeeds, the call goes out authenticated:
+
+```ts
+await getPet(transport, input, { auth: "anonymous" }); // still sends bearerAuth if configured
+```
+
+The opt-in only changes the outcome for an operation whose `security` includes the empty requirement
+`{}`, where without it a provider returning `null` is an `auth` failure rather than a silent
+downgrade to anonymous.
+
+<Aside type="caution">
+  There is no way to force a secured call out with no credentials. For a health check that must not
+  carry them, use a transport with no providers configured, or a per-call
+  [custom `fetch`](/guides/transport#a-custom-fetch).
+</Aside>
 
 ## Compile time or call time
 
