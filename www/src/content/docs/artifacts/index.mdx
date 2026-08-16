@@ -18,7 +18,18 @@ artifacts:
   validators: false
   tanstack: false
   msw: false
+validation:
+  engine: "off"
+  unchecked: allow
 ```
+
+The client artifact requires an explicit `validation` block; `engine: "off"` opts out of boundary
+checking. See [Validation](/artifacts/validation) for the other engines.
+
+<Aside type="note">
+  This build always emits the types artifact. `types: false` is accepted by the config and then
+  ignored, so the `types/` directory is written either way.
+</Aside>
 
 <CardGrid>
   <Card title="Types" icon="ph:brackets-curly">
