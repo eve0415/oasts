@@ -414,9 +414,23 @@ fn write_transaction(
             return Err(failure.diagnostics);
         }
     };
-    require_clean_staging(staging.close())?;
-    prune_emptied_directories(&canonical_output, emptied);
-    Ok(report)
+    Ok(finish_successful_commit(
+        report,
+        emptied,
+        &canonical_output,
+        staging,
+    ))
+}
+
+fn finish_successful_commit(
+    report: WriteReport,
+    emptied: Vec<PathBuf>,
+    output_dir: &Path,
+    staging: StagingDirectories,
+) -> WriteReport {
+    let _ = staging.close();
+    prune_emptied_directories(output_dir, emptied);
+    report
 }
 
 fn stage_changes(
@@ -692,14 +706,6 @@ fn finish_created_directories(
         }
     }
     Err(diagnostics)
-}
-
-fn require_clean_staging(diagnostics: Vec<Diagnostic>) -> Result<(), Vec<Diagnostic>> {
-    if diagnostics.is_empty() {
-        Ok(())
-    } else {
-        Err(diagnostics)
-    }
 }
 
 fn change_error<'a>(
@@ -1799,12 +1805,6 @@ mod tests {
         assert_eq!(restore_error.diagnostics[0].code, CODE_WRITE_IO);
         assert!(restore_error.retain_staging);
         fs::remove_file(backup).expect("backup cleanup");
-
-        require_clean_staging(Vec::new()).expect("empty cleanup result");
-        let cleanup_error =
-            require_clean_staging(vec![io_diagnostic("cleanup".to_owned(), Some(temp.path()))])
-                .expect_err("cleanup diagnostic");
-        assert_eq!(cleanup_error[0].code, CODE_WRITE_IO);
     }
 
     #[cfg(unix)]
@@ -1865,6 +1865,34 @@ mod tests {
         let staging_root = nested.parent().expect("staging root").to_path_buf();
         let cleanup_error = staging.close();
         assert_eq!(cleanup_error.len(), 1);
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
+            .expect("unlock staging directory");
+        fs::remove_dir_all(staging_root).expect("staging cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_cleanup_failure_after_commit_preserves_success() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut staging = StagingDirectories::default();
+        let (nested, _) = staging.paths(temp.path()).expect("staging paths");
+        fs::create_dir(&nested).expect("nested staging directory");
+        fs::write(nested.join("file"), "x").expect("nested staging file");
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o000))
+            .expect("lock staging directory");
+        let staging_root = nested.parent().expect("staging root").to_path_buf();
+        let report = WriteReport {
+            files_written: 1,
+            files_deleted: 2,
+        };
+
+        assert_eq!(
+            finish_successful_commit(report, Vec::new(), temp.path(), staging),
+            report
+        );
+
         fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
             .expect("unlock staging directory");
         fs::remove_dir_all(staging_root).expect("staging cleanup");
