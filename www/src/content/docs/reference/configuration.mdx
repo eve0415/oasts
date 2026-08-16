@@ -43,10 +43,18 @@ input:
   path: ./openapi.yaml
 ```
 
-```yaml
-input:
-  url: https://api.example.com/openapi.json
-```
+<Aside type="caution" title="`url` is accepted by the schema but refused at load">
+  This build does not fetch documents. `input.url` — and any `$ref` that resolves to an `http(s)`
+  target — fails with `error[OASTS9101]: remote loading is not supported in this build`. The key is
+  in the schema so configs stay forward-compatible; today, bundle or vendor the document and point
+  `input.path` at it.
+
+  `OASTS9101` is in the [provisional band](/concepts/diagnostics) — a capability gated off rather
+  than a refusal on the merits.
+</Aside>
+
+Note that an `https://` `$id` inside the document is fine: `$id` names a schema resource, it is not
+a request to fetch one. Only something that actually has to be *read* over the network is refused.
 
 ## `output`, `namespace`
 
