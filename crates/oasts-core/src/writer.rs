@@ -526,15 +526,14 @@ fn commit_changes(
             ChangeKind::Manifest => MANIFEST_NAME,
         };
         let target = validate_target(output_dir, relative_path)?;
-        let backup =
-            if target_metadata(&change.kind, &target, fs::symlink_metadata(&target))?.is_some() {
-                renamer
-                    .rename(&target, &change.backup)
-                    .map_err(change_error(&change.kind, &target))?;
-                Some(change.backup.clone())
-            } else {
-                None
-            };
+        let backup = if target_metadata(&change.kind, &target, fs::symlink_metadata(&target))?
+            .is_some()
+        {
+            fs::hard_link(&target, &change.backup).map_err(change_error(&change.kind, &target))?;
+            Some(change.backup.clone())
+        } else {
+            None
+        };
         applied.push(AppliedChange {
             target: target.clone(),
             backup,
@@ -559,6 +558,11 @@ fn commit_changes(
             .backup
             .is_some()
         {
+            fs::remove_file(&target).map_err(change_error(&change.kind, &target))?;
+            applied
+                .last_mut()
+                .expect("the current change was recorded before deletion")
+                .installed = true;
             report.files_deleted += 1;
             emptied.push(
                 target
@@ -581,22 +585,23 @@ fn finish_changes(
     };
     for change in applied.into_iter().rev() {
         if change.installed {
-            match fs::remove_file(&change.target) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => diagnostics.push(io_diagnostic(
-                    format!("failed to remove a committed file during rollback: {error}"),
-                    Some(&change.target),
-                )),
+            if let Some(backup) = change.backup {
+                if let Err(error) = renamer.rename(&backup, &change.target) {
+                    diagnostics.push(io_diagnostic(
+                        format!("failed to restore a generated file during rollback: {error}"),
+                        Some(&change.target),
+                    ));
+                }
+            } else {
+                match fs::remove_file(&change.target) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => diagnostics.push(io_diagnostic(
+                        format!("failed to remove a committed file during rollback: {error}"),
+                        Some(&change.target),
+                    )),
+                }
             }
-        }
-        if let Some(backup) = change.backup
-            && let Err(error) = renamer.rename(&backup, &change.target)
-        {
-            diagnostics.push(io_diagnostic(
-                format!("failed to restore a generated file during rollback: {error}"),
-                Some(&change.target),
-            ));
         }
     }
     Err(diagnostics)
@@ -1086,6 +1091,28 @@ mod tests {
         }
     }
 
+    struct InterruptBeforeInstallRenamer {
+        observed_old_target: Cell<Option<bool>>,
+    }
+
+    impl Renamer for InterruptBeforeInstallRenamer {
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            if from
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("new-"))
+            {
+                self.observed_old_target
+                    .set(Some(fs::read(to).is_ok_and(|content| content == b"old")));
+                Err(io::Error::new(
+                    ErrorKind::Interrupted,
+                    "forced interruption before installation",
+                ))
+            } else {
+                fs::rename(from, to)
+            }
+        }
+    }
+
     fn generated(path: &str, content: &str) -> GeneratedFile {
         GeneratedFile {
             relative_path: path.to_owned(),
@@ -1566,7 +1593,7 @@ mod tests {
         let before = tree_snapshot(&output);
         let renamer = FailOnceRenamer {
             calls: Cell::new(0),
-            fail_at: 4,
+            fail_at: 2,
         };
 
         let diagnostics = write_with_renamer(
@@ -1581,7 +1608,28 @@ mod tests {
 
         assert_eq!(diagnostics[0].code, CODE_WRITE_IO);
         assert_eq!(tree_snapshot(&output), before);
-        assert_eq!(renamer.calls.get(), 6, "rollback must restore both files");
+        assert_eq!(
+            renamer.calls.get(),
+            3,
+            "rollback must restore the changed file"
+        );
+    }
+
+    #[test]
+    fn the_old_target_remains_visible_until_its_replacement_is_installed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        write(&output, vec![generated("a.ts", "old")]).expect("initial write");
+        let renamer = InterruptBeforeInstallRenamer {
+            observed_old_target: Cell::new(None),
+        };
+
+        let diagnostics = write_with_renamer(&output, vec![generated("a.ts", "new")], &renamer)
+            .expect_err("installation interruption");
+
+        assert_eq!(diagnostics[0].code, CODE_WRITE_IO);
+        assert_eq!(renamer.observed_old_target.get(), Some(true));
+        assert_eq!(fs::read(output.join("a.ts")).expect("old target"), b"old");
     }
 
     #[test]
@@ -1654,7 +1702,7 @@ mod tests {
             vec![AppliedChange {
                 target,
                 backup: Some(backup.clone()),
-                installed: false,
+                installed: true,
             }],
         )
         .expect_err("rollback restore error");
