@@ -158,6 +158,45 @@ mod tests {
     }
 
     #[test]
+    fn compiler_checked_string_literals_are_constrained() {
+        let schema = config_schema();
+        let naming = &schema["$defs"]["NamingConfig"]["properties"];
+        assert_eq!(
+            naming["typeCase"],
+            json!({ "type": "string", "const": "pascal", "default": "pascal" })
+        );
+        assert_eq!(
+            naming["propertyCase"],
+            json!({ "type": "string", "const": "preserve", "default": "preserve" })
+        );
+
+        let emit = &schema["$defs"]["EmitConfig"]["properties"];
+        assert_eq!(
+            emit["importExtension"],
+            json!({ "type": "string", "enum": [".js", "none"], "default": ".js" })
+        );
+        assert_eq!(
+            emit["format"],
+            json!({ "type": "string", "const": "deterministic", "default": "deterministic" })
+        );
+    }
+
+    #[test]
+    fn compiler_checked_limits_are_constrained_inclusively() {
+        let schema = config_schema();
+        let limits = &schema["$defs"]["LimitsConfig"]["properties"];
+        for (name, minimum, maximum) in [
+            ("maxDocumentBytes", 1_024_u64, 1_073_741_824_u64),
+            ("maxTotalBytes", 1_024, 4_294_967_296),
+            ("maxDocuments", 1, 4_096),
+            ("maxRefDepth", 1, 1_024),
+        ] {
+            assert_eq!(limits[name]["minimum"], json!(minimum), "{name} minimum");
+            assert_eq!(limits[name]["maximum"], json!(maximum), "{name} maximum");
+        }
+    }
+
+    #[test]
     fn input_one_of_is_preserved() {
         let schema = config_schema();
         let input = &schema["$defs"]["Input"];

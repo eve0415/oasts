@@ -736,7 +736,15 @@ pub enum EnumMemberCase {
 )]
 pub struct NamingConfig {
     pub file_case: FileCase,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(schema_with = "pascal_literal_schema")
+    )]
     pub type_case: String,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(schema_with = "preserve_literal_schema")
+    )]
     pub property_case: String,
     pub operation_case: OperationCase,
     pub enum_member_case: EnumMemberCase,
@@ -849,9 +857,49 @@ impl Default for DocumentationConfig {
 )]
 pub struct EmitConfig {
     pub runtime_directory: String,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(schema_with = "import_extension_schema")
+    )]
     pub import_extension: String,
     pub banner: Vec<String>,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(schema_with = "deterministic_literal_schema")
+    )]
     pub format: String,
+}
+
+#[cfg(feature = "json-schema")]
+fn pascal_literal_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "pascal"
+    })
+}
+
+#[cfg(feature = "json-schema")]
+fn preserve_literal_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "preserve"
+    })
+}
+
+#[cfg(feature = "json-schema")]
+fn import_extension_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": [".js", "none"]
+    })
+}
+
+#[cfg(feature = "json-schema")]
+fn deterministic_literal_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "deterministic"
+    })
 }
 
 impl Default for EmitConfig {
@@ -918,9 +966,19 @@ pub struct LocalTrustConfig {
     )
 )]
 pub struct LimitsConfig {
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 1_024, max = 1_073_741_824))
+    )]
     pub max_document_bytes: u64,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 1_024_u64, max = 4_294_967_296_u64))
+    )]
     pub max_total_bytes: u64,
+    #[cfg_attr(feature = "json-schema", schemars(range(min = 1, max = 4_096)))]
     pub max_documents: u64,
+    #[cfg_attr(feature = "json-schema", schemars(range(min = 1, max = 1_024)))]
     pub max_ref_depth: u64,
 }
 
