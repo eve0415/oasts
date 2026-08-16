@@ -322,5 +322,14 @@ is what real documents that declare `deepObject` on arrays are usually describin
 ## Reserved keys
 
 `specs`, `shared`, `remote`, `watch` and `ci` are accepted by the schema but not implemented in this
-build — using one produces an `OASTS0222`. They are reserved so a config written today does not have
-to change shape when they land.
+build. They are reserved so a config written today does not have to change shape when they land, and
+they refuse in the [provisional band](/concepts/diagnostics) rather than as ordinary config errors:
+
+| Key | Code |
+| --- | --- |
+| `specs`, `shared` | `OASTS9002` — workspace configs |
+| `remote`, `watch`, `ci` | `OASTS9003` — the surrounding capability |
+
+The CLI has the same arrangement: `oasts watch` parses and then refuses with `OASTS9004`, and
+`--spec` refuses with the same `OASTS9002` the `specs` key does. Both exit `2`.
+See [CLI](/reference/cli).
