@@ -13,11 +13,20 @@ Usage: oasts <command> [options]
 Commands:
   generate           Generate configured artifacts
   check              Validate configuration and input without emitting
+  watch              (unsupported in this build)
 
 Options:
   --config <path>    Use an explicit configuration file
   --check            With generate: check committed output without writing
+  --spec <name>      Select a workspace spec (workspace configs are
+                     unsupported in this build; selecting one fails)
 ```
+
+`watch` and `--spec` are parsed but not implemented in this build. They are in the help text because
+the argument surface is fixed; using either exits `2` — `oasts watch` with `OASTS9004` ("the watch
+command is not supported in this build"), `--spec` with the `OASTS9002` that workspace configs
+refuse under. Both are [provisional](/concepts/diagnostics) codes, so they retire when the
+capability lands.
 
 ## `oasts generate`
 
