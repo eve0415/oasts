@@ -39,7 +39,7 @@ const CODE_RESPONSE_STATUS_CASE: &str = "OASTS2105";
 /// Two keys in one responses object that name the same status once canonicalized.
 const CODE_RESPONSE_STATUS_DUPLICATE: &str = "OASTS2106";
 const CODE_PATH_PARAMETER: &str = "OASTS2202";
-const CODE_REFERENCE: &str = "OASTS2211";
+const CODE_RECURSIVE_REF_TARGET: &str = "OASTS2211";
 const CODE_MEDIA_TYPE: &str = "OASTS2111";
 const CODE_DUPLICATE_MEDIA_TYPE: &str = "OASTS2112";
 const CODE_RESERVED_HEADER_PARAMETER: &str = "OASTS2113";
@@ -2501,7 +2501,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 Some(pointer) => self.schema_ref_node(node.doc_id, pointer, meta),
                 None => {
                     self.sink.push(self.input_diagnostic(
-                        CODE_REFERENCE,
+                        CODE_RECURSIVE_REF_TARGET,
                         node.doc_id,
                         &keyword_pointer,
                         "$recursiveRef resolves to the OpenAPI Object, which is not a schema, \
@@ -2537,7 +2537,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             Err(diagnostic) => {
                 self.sink.push(diagnostic);
                 self.sink.push(self.input_diagnostic(
-                    CODE_REFERENCE,
+                    CODE_RECURSIVE_REF_TARGET,
                     node.doc_id,
                     &keyword_pointer,
                     format!("schema reference '{reference}' could not be resolved"),
@@ -2601,7 +2601,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 self.sink.push(diagnostic);
                 self.sink.push(
                     Diagnostic::input(
-                        CODE_REFERENCE,
+                        CODE_RECURSIVE_REF_TARGET,
                         format!("schema reference '{reference}' could not be resolved"),
                     )
                     .with_source(self.source_id(node.doc_id))
@@ -6166,7 +6166,7 @@ mod tests {
                 "/components/schemas/BadRecursiveValue/$recursiveRef",
             ),
             (
-                CODE_REFERENCE,
+                CODE_RECURSIVE_REF_TARGET,
                 "/components/schemas/MissingRecursiveAnchor/$recursiveRef",
             ),
             (
@@ -6178,7 +6178,7 @@ mod tests {
                 "/components/schemas/BadRecursiveShape/$recursiveRef",
             ),
             (
-                CODE_REFERENCE,
+                CODE_RECURSIVE_REF_TARGET,
                 "/components/schemas/BrokenDynamicUri/$dynamicRef",
             ),
         ] {
@@ -10242,7 +10242,7 @@ mod tests {
         assert!(
             sink.as_slice()
                 .iter()
-                .any(|diagnostic| diagnostic.code == CODE_REFERENCE)
+                .any(|diagnostic| diagnostic.code == CODE_RECURSIVE_REF_TARGET)
         );
     }
 

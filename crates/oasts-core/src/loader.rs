@@ -20,11 +20,11 @@ use crate::config::ResolvedConfig;
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::syntax::parse_yaml_document_value;
 
-const CODE_IO: &str = "OASTS1003";
+const CODE_DOCUMENT_IO: &str = "OASTS1003";
 const CODE_REMOTE_UNSUPPORTED: &str = "OASTS9101";
 const CODE_REF_ESCAPE: &str = "OASTS2001";
 const CODE_NON_UNICODE_PATH: &str = "OASTS2002";
-const CODE_PARSE: &str = "OASTS2003";
+const CODE_DOCUMENT_PARSE: &str = "OASTS2003";
 const CODE_MAX_DOCUMENT_BYTES: &str = "OASTS2011";
 const CODE_MAX_TOTAL_BYTES: &str = "OASTS2012";
 const CODE_MAX_DOCUMENTS: &str = "OASTS2013";
@@ -251,7 +251,7 @@ impl DocumentGraph {
                 local_path_from_url(&target_url, Some(&base_document.source_id), None)?;
             let canonical = fs::canonicalize(&target_path).map_err(|error| {
                 io_error(
-                    CODE_IO,
+                    CODE_DOCUMENT_IO,
                     format!("failed to canonicalize referenced document: {error}"),
                     Some(&base_document.source_id),
                     None,
@@ -269,7 +269,7 @@ impl DocumentGraph {
             )?;
             let Some(target_id) = self.path_to_id.get(&canonical).copied() else {
                 return Err(io_error(
-                    CODE_IO,
+                    CODE_DOCUMENT_IO,
                     format!(
                         "referenced document '{}' is not part of the loaded graph",
                         canonical.display()
@@ -552,7 +552,7 @@ impl<'a> GraphBuilder<'a> {
     fn new(config: &'a ResolvedConfig) -> Result<Self, Diagnostic> {
         let workspace_root = fs::canonicalize(&config.workspace_root).map_err(|error| {
             io_error(
-                CODE_IO,
+                CODE_DOCUMENT_IO,
                 format!("failed to canonicalize workspaceRoot: {error}"),
                 Some(&config.config_path.to_string_lossy()),
                 Some("/workspaceRoot"),
@@ -562,7 +562,7 @@ impl<'a> GraphBuilder<'a> {
         for (config_index, path) in config.local_allow_paths.iter().enumerate() {
             let canonical_path = fs::canonicalize(path).map_err(|error| {
                 io_error(
-                    CODE_IO,
+                    CODE_DOCUMENT_IO,
                     format!(
                         "failed to canonicalize local.allowPaths entry {config_index} '{}': {error}",
                         path.display()
@@ -634,7 +634,7 @@ impl<'a> GraphBuilder<'a> {
         }
         let canonical_path = fs::canonicalize(requested_path).map_err(|error| {
             io_error(
-                CODE_IO,
+                CODE_DOCUMENT_IO,
                 format!(
                     "failed to canonicalize document '{}': {error}",
                     requested_path.display()
@@ -685,7 +685,7 @@ impl<'a> GraphBuilder<'a> {
 
         let raw = fs::read(&canonical_path).map_err(|error| {
             io_error(
-                CODE_IO,
+                CODE_DOCUMENT_IO,
                 format!("failed to read document: {error}"),
                 Some(&source_id),
                 None,
@@ -1424,7 +1424,7 @@ fn document_byte_len(path: &Path, source_id: &str) -> Result<u64, Diagnostic> {
         .map(|metadata| metadata.len())
         .map_err(|error| {
             io_error(
-                CODE_IO,
+                CODE_DOCUMENT_IO,
                 format!("failed to read document metadata: {error}"),
                 Some(source_id),
                 None,
@@ -1516,7 +1516,7 @@ fn combined_parse_error(
     yaml_error: Diagnostic,
 ) -> Diagnostic {
     let mut diagnostic = input_error(
-        CODE_PARSE,
+        CODE_DOCUMENT_PARSE,
         format!(
             "document is neither valid JSON nor YAML: {}; {}",
             json_error.message, yaml_error.message
@@ -1624,7 +1624,7 @@ fn parse_json(raw: &[u8], source_id: &str) -> Result<Value, Diagnostic> {
         .map(|value| value.0)
         .map_err(|error| {
             input_error(
-                CODE_PARSE,
+                CODE_DOCUMENT_PARSE,
                 format!("invalid JSON document: {error}"),
                 Some(source_id),
                 None,
@@ -1767,7 +1767,7 @@ where
 fn parse_yaml(raw: &[u8], source_id: &str) -> Result<Value, Diagnostic> {
     let source = std::str::from_utf8(raw).map_err(|error| {
         input_error(
-            CODE_PARSE,
+            CODE_DOCUMENT_PARSE,
             format!("YAML document is not UTF-8: {error}"),
             Some(source_id),
             None,
@@ -1776,7 +1776,7 @@ fn parse_yaml(raw: &[u8], source_id: &str) -> Result<Value, Diagnostic> {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     parse_yaml_document_value(source).map_err(|error| {
         input_error(
-            CODE_PARSE,
+            CODE_DOCUMENT_PARSE,
             format!("invalid YAML document: {}", error.message),
             Some(source_id),
             None,
@@ -2427,7 +2427,7 @@ mod tests {
         assert!(load_graph(&config, &mut sink).is_none());
         assert_eq!(sink.as_slice().len(), 1);
         let diagnostic = &sink.as_slice()[0];
-        assert_eq!(diagnostic.code, CODE_PARSE);
+        assert_eq!(diagnostic.code, CODE_DOCUMENT_PARSE);
         assert_eq!(diagnostic.severity, Severity::Error);
         assert!(diagnostic.message.contains("invalid JSON document"));
         assert!(diagnostic.message.contains("duplicate object key 'a'"));
@@ -2445,7 +2445,7 @@ mod tests {
         );
         let config = resolved_json_config(directory.path());
 
-        let diagnostic = assert_load_code(&config, CODE_PARSE);
+        let diagnostic = assert_load_code(&config, CODE_DOCUMENT_PARSE);
 
         assert!(diagnostic.message.contains("invalid JSON document"));
         assert!(diagnostic.message.contains("duplicate object key 'a'"));
@@ -2631,7 +2631,7 @@ mod tests {
         write(directory.path(), "workspace/entry.yaml", &document);
         let config = resolved_config(directory.path(), "");
 
-        let diagnostic = assert_load_code(&config, CODE_PARSE);
+        let diagnostic = assert_load_code(&config, CODE_DOCUMENT_PARSE);
 
         assert!(diagnostic.message.contains("alias expansion"));
         assert!(diagnostic.message.contains("1000000"));
@@ -3570,7 +3570,7 @@ mod tests {
                 .resolve(graph.entry().id, "missing.yaml")
                 .expect_err("missing file")
                 .code,
-            CODE_IO
+            CODE_DOCUMENT_IO
         );
 
         write(directory.path(), "workspace/unloaded.yaml", "value: true\n");
@@ -3579,7 +3579,7 @@ mod tests {
                 .resolve(graph.entry().id, "unloaded.yaml")
                 .expect_err("unloaded file")
                 .code,
-            CODE_IO
+            CODE_DOCUMENT_IO
         );
         write(directory.path(), "outside.yaml", "value: true\n");
         assert_eq!(
@@ -3617,19 +3617,19 @@ mod tests {
         config.workspace_root = directory.path().join("missing-workspace");
         let mut sink = DiagnosticSink::new();
         assert!(load_graph(&config, &mut sink).is_none());
-        assert_eq!(sink.as_slice()[0].code, CODE_IO);
+        assert_eq!(sink.as_slice()[0].code, CODE_DOCUMENT_IO);
 
         config = resolved_config(directory.path(), "");
         config.local_allow_paths = vec![directory.path().join("missing-allow-root")];
         let mut sink = DiagnosticSink::new();
         assert!(load_graph(&config, &mut sink).is_none());
-        assert_eq!(sink.as_slice()[0].code, CODE_IO);
+        assert_eq!(sink.as_slice()[0].code, CODE_DOCUMENT_IO);
 
         config = resolved_config(directory.path(), "");
         config.input = directory.path().join("workspace/missing.yaml");
         let mut sink = DiagnosticSink::new();
         assert!(load_graph(&config, &mut sink).is_none());
-        assert_eq!(sink.as_slice()[0].code, CODE_IO);
+        assert_eq!(sink.as_slice()[0].code, CODE_DOCUMENT_IO);
 
         for (name, contents) in [
             ("bad.json", "{"),
@@ -3638,7 +3638,7 @@ mod tests {
         ] {
             config = resolved_config(directory.path(), "");
             config.input = write(directory.path(), &format!("workspace/{name}"), contents);
-            assert_load_code(&config, CODE_PARSE);
+            assert_load_code(&config, CODE_DOCUMENT_PARSE);
         }
 
         let error = document_byte_len(
@@ -3646,7 +3646,7 @@ mod tests {
             "workspace/missing-metadata.yaml",
         )
         .expect_err("missing metadata should be an I/O diagnostic");
-        assert_eq!(error.code, CODE_IO);
+        assert_eq!(error.code, CODE_DOCUMENT_IO);
         assert!(error.message.contains("failed to read document metadata"));
         assert_eq!(
             error.source_id.as_deref(),
@@ -3668,7 +3668,7 @@ mod tests {
         assert!(load_graph(&config, &mut sink).is_none());
         fs::set_permissions(&entry, fs::Permissions::from_mode(0o600))
             .expect("permissions should be restored");
-        assert_eq!(sink.as_slice()[0].code, CODE_IO);
+        assert_eq!(sink.as_slice()[0].code, CODE_DOCUMENT_IO);
     }
 
     #[test]
@@ -3728,7 +3728,7 @@ mod tests {
         let mut sink = DiagnosticSink::new();
         assert!(load_graph(&config, &mut sink).is_none());
         let diagnostic = &sink.as_slice()[0];
-        assert_eq!(diagnostic.code, CODE_IO);
+        assert_eq!(diagnostic.code, CODE_DOCUMENT_IO);
         assert_eq!(
             diagnostic.source_id.as_deref(),
             Some("workspace/entry.yaml")
@@ -3920,7 +3920,7 @@ mod tests {
         );
         assert_eq!(
             parse_yaml(&[0xff], "bad-utf8").expect_err("UTF-8").code,
-            CODE_PARSE
+            CODE_DOCUMENT_PARSE
         );
         let yaml_error = parse_yaml(b"value: [", "bad-yaml").expect_err("syntax");
         assert!(yaml_error.line.is_some());
@@ -4022,7 +4022,7 @@ mod tests {
         let config = resolved_json_config(temp.path());
         write(&config.workspace_root, "entry.json", "value: [\n");
 
-        let diagnostic = assert_load_code(&config, CODE_PARSE);
+        let diagnostic = assert_load_code(&config, CODE_DOCUMENT_PARSE);
 
         assert!(
             diagnostic
@@ -4226,10 +4226,10 @@ mod tests {
             WalkContext::Skip
         );
 
-        let input = input_error(CODE_PARSE, "bad", Some("source"), Some("/pointer"));
+        let input = input_error(CODE_DOCUMENT_PARSE, "bad", Some("source"), Some("/pointer"));
         assert_eq!(input.source_id.as_deref(), Some("source"));
         assert_eq!(input.json_pointer.as_deref(), Some("/pointer"));
-        let io = io_error(CODE_IO, "bad", Some("source"), Some("/pointer"));
+        let io = io_error(CODE_DOCUMENT_IO, "bad", Some("source"), Some("/pointer"));
         assert_eq!(io.source_id.as_deref(), Some("source"));
         assert_eq!(io.json_pointer.as_deref(), Some("/pointer"));
         assert_eq!(to_u32(usize::MAX), u32::MAX);

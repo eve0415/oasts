@@ -13,10 +13,10 @@ use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::filter::Filters;
 use crate::syntax::parse_yaml_value;
 
-const CODE_IO: &str = "OASTS1001";
+const CODE_CONFIG_READ: &str = "OASTS1001";
 const CODE_DISCOVERY: &str = "OASTS0011";
 const CODE_SCRIPT_CONFIG_UNSUPPORTED: &str = "OASTS9001";
-const CODE_PARSE: &str = "OASTS0031";
+const CODE_CONFIG_PARSE: &str = "OASTS0031";
 const CODE_SCHEMA_VERSION: &str = "OASTS0041";
 const CODE_SCHEMA_URI: &str = "OASTS0042";
 const CODE_WORKSPACE_ROOT: &str = "OASTS0051";
@@ -1161,7 +1161,7 @@ pub fn load_config(explicit: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig
     };
     let source = fs::read_to_string(&config_path).map_err(|error| {
         vec![config_error(
-            CODE_IO,
+            CODE_CONFIG_READ,
             format!("failed to read config: {error}"),
             Some(&config_path),
             None,
@@ -1194,7 +1194,7 @@ pub fn load_config_from_json(
 pub fn parse_config_json(config_path: &Path, json: &[u8]) -> Result<RawConfig, Diagnostic> {
     serde_json::from_slice(json).map_err(|error| {
         config_error(
-            CODE_PARSE,
+            CODE_CONFIG_PARSE,
             format!("invalid JSON config: {error}"),
             Some(config_path),
             None,
@@ -1211,7 +1211,7 @@ fn absolutize_config_path(
         .map(|current| current.join(discovered))
         .map_err(|error| {
             vec![config_error(
-                CODE_IO,
+                CODE_CONFIG_READ,
                 format!("failed to resolve current directory: {error}"),
                 None,
                 None,
@@ -1223,7 +1223,7 @@ fn parse_config(path: &Path, source: &str) -> Result<RawConfig, Diagnostic> {
     if path.extension() == Some(OsStr::new("json")) {
         serde_json::from_str(source).map_err(|error| {
             config_error(
-                CODE_PARSE,
+                CODE_CONFIG_PARSE,
                 format!("invalid JSON config: {error}"),
                 Some(path),
                 None,
@@ -1232,12 +1232,12 @@ fn parse_config(path: &Path, source: &str) -> Result<RawConfig, Diagnostic> {
         })
     } else {
         let value = parse_yaml_value(source).map_err(|error| {
-            config_error(CODE_PARSE, error.message, Some(path), None)
+            config_error(CODE_CONFIG_PARSE, error.message, Some(path), None)
                 .with_location(error.line, error.col)
         })?;
         serde_json::from_value(value).map_err(|error| {
             config_error(
-                CODE_PARSE,
+                CODE_CONFIG_PARSE,
                 format!("invalid YAML config value: {error}"),
                 Some(path),
                 None,
@@ -1260,7 +1260,7 @@ pub fn resolve_config(
         Ok(path) => path,
         Err(error) => {
             sink.push(config_error(
-                CODE_IO,
+                CODE_CONFIG_READ,
                 format!("failed to resolve config directory: {error}"),
                 Some(source_path),
                 None,
@@ -2506,10 +2506,10 @@ mod tests {
         );
 
         value["compat"] = json!({ "deepObjectEncodings": "extended" });
-        assert_code(load_json(&value), CODE_PARSE);
+        assert_code(load_json(&value), CODE_CONFIG_PARSE);
 
         value["compat"] = json!({ "deepObjectEncoding": "loose" });
-        assert_code(load_json(&value), CODE_PARSE);
+        assert_code(load_json(&value), CODE_CONFIG_PARSE);
     }
 
     #[test]
@@ -2565,7 +2565,7 @@ mod tests {
 
         let malformed = load_config_from_json(&file, b"{").expect_err("malformed JSON");
         assert_eq!(malformed.len(), 1);
-        assert_eq!(malformed[0].code, CODE_PARSE);
+        assert_eq!(malformed[0].code, CODE_CONFIG_PARSE);
         assert!(malformed[0].line.is_some());
         assert!(malformed[0].col.is_some());
     }
@@ -2674,7 +2674,7 @@ mod tests {
             Err(io::Error::other("current directory unavailable")),
         )
         .expect_err("current directory failure should be reported");
-        assert_eq!(error[0].code, CODE_IO);
+        assert_eq!(error[0].code, CODE_CONFIG_READ);
         assert!(error[0].message.contains("current directory unavailable"));
     }
 
@@ -2690,7 +2690,7 @@ mod tests {
         let result = load_config(Some(&path), directory.path());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
             .expect("config permissions should be restored");
-        assert_code(result, CODE_IO);
+        assert_code(result, CODE_CONFIG_READ);
     }
 
     #[test]
@@ -2713,11 +2713,11 @@ mod tests {
             load_yaml(
                 "schemaVersion: 1\nschemaVersion: 1\ninput: { path: openapi.yaml }\noutput: generated\n",
             ),
-            CODE_PARSE,
+            CODE_CONFIG_PARSE,
         );
         let diagnostic = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == CODE_PARSE)
+            .find(|diagnostic| diagnostic.code == CODE_CONFIG_PARSE)
             .expect("parse diagnostic should exist");
         assert!(diagnostic.line.is_some());
         assert!(diagnostic.col.is_some());
@@ -2729,7 +2729,7 @@ mod tests {
             load_yaml(
                 "schemaVersion: 1\ninput: { path: openapi.yaml }\noutput: generated\ntypes:\n  readonly: true\n  readonly: false\n",
             ),
-            CODE_PARSE,
+            CODE_CONFIG_PARSE,
         );
     }
 
@@ -2770,14 +2770,14 @@ mod tests {
     fn yaml_unknown_key_is_rejected() {
         assert_code(
             load_yaml(&format!("{}unknown: true\n", valid_yaml())),
-            CODE_PARSE,
+            CODE_CONFIG_PARSE,
         );
 
         assert_code(
             load_yaml(
                 "schemaVersion: 1\ninput: { path: openapi.yaml, unknown: true }\noutput: generated\n",
             ),
-            CODE_PARSE,
+            CODE_CONFIG_PARSE,
         );
     }
 
@@ -2785,7 +2785,7 @@ mod tests {
     fn yaml_string_is_not_coerced_to_boolean() {
         assert_code(
             load_yaml(&format!("{}types:\n  readonly: \"false\"\n", valid_yaml())),
-            CODE_PARSE,
+            CODE_CONFIG_PARSE,
         );
     }
 
@@ -2793,16 +2793,16 @@ mod tests {
     fn yaml_plain_off_is_not_coerced_to_boolean() {
         assert_code(
             load_yaml(&format!("{}types:\n  readonly: off\n", valid_yaml())),
-            CODE_PARSE,
+            CODE_CONFIG_PARSE,
         );
     }
 
     #[test]
     fn yaml_syntax_error_has_a_location() {
-        let diagnostics = assert_code(load_yaml("schemaVersion: [\n"), CODE_PARSE);
+        let diagnostics = assert_code(load_yaml("schemaVersion: [\n"), CODE_CONFIG_PARSE);
         let diagnostic = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == CODE_PARSE)
+            .find(|diagnostic| diagnostic.code == CODE_CONFIG_PARSE)
             .expect("parse diagnostic should exist");
         assert!(diagnostic.line.is_some());
         assert!(diagnostic.col.is_some());
@@ -2814,7 +2814,7 @@ mod tests {
             load_yaml(
                 "schemaVersion: 1\ninput: &input { path: openapi.yaml }\noutput: generated\n",
             ),
-            CODE_PARSE,
+            CODE_CONFIG_PARSE,
         );
     }
 
@@ -2844,7 +2844,7 @@ mod tests {
     fn string_schema_version_is_a_wrong_type() {
         let mut value = valid_json_value();
         value["schemaVersion"] = json!("1");
-        assert_code(load_json(&value), CODE_PARSE);
+        assert_code(load_json(&value), CODE_CONFIG_PARSE);
     }
 
     #[test]
@@ -3193,7 +3193,7 @@ mod tests {
     fn artifact_selector_rejects_string_coercion() {
         let mut value = valid_json_value();
         value["artifacts"] = json!({ "types": "true" });
-        assert_code(load_json(&value), CODE_PARSE);
+        assert_code(load_json(&value), CODE_CONFIG_PARSE);
     }
 
     #[test]
@@ -3728,7 +3728,7 @@ mod tests {
         ] {
             let mut value = valid_client_json_value();
             value["client"]["fetchOptions"] = fetch_options;
-            assert_code(load_json(&value), CODE_PARSE);
+            assert_code(load_json(&value), CODE_CONFIG_PARSE);
         }
 
         let mut value = valid_client_json_value();
@@ -3913,7 +3913,7 @@ mod tests {
     fn naming_overrides_reject_unknown_namespace() {
         let mut value = valid_json_value();
         value["naming"] = json!({ "overrides": { "params": { "x": "Y" } } });
-        assert_code(load_json(&value), CODE_PARSE);
+        assert_code(load_json(&value), CODE_CONFIG_PARSE);
     }
 
     #[test]
@@ -4158,7 +4158,7 @@ mod tests {
         for name in ["input", "output", "namespace", "artifacts", "types"] {
             let mut value = valid_json_value();
             value[name] = Value::Null;
-            assert_code(load_json(&value), CODE_PARSE);
+            assert_code(load_json(&value), CODE_CONFIG_PARSE);
         }
     }
 
@@ -4234,7 +4234,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == CODE_IO)
+                .any(|diagnostic| diagnostic.code == CODE_CONFIG_READ)
         );
     }
 

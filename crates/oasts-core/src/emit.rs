@@ -58,7 +58,7 @@ use model::{EmissionModel, SchemaTarget};
 const CODE_FILE_NAME: &str = "OASTS4001";
 const CODE_PATH_COLLISION: &str = "OASTS4002";
 const CODE_DISCRIMINATOR: &str = "OASTS4202";
-const CODE_REFERENCE: &str = "OASTS4203";
+const CODE_UNALLOCATED_REFERENCE: &str = "OASTS4203";
 const CODE_VARIANT_COLLISION: &str = "OASTS4101";
 /// A component import an operation module renames to escape shadowing one of its own declarations,
 /// whose role-derived replacement is itself taken by another import or declaration in that module.
@@ -1062,7 +1062,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     .is_none()
                 {
                     diagnostics.push(source_diagnostic(
-                        CODE_REFERENCE,
+                        CODE_UNALLOCATED_REFERENCE,
                         format!(
                             "schema reference {}#{} has no allocated component type",
                             target.source_id, target.json_pointer
@@ -6180,7 +6180,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == CODE_REFERENCE)
+                .filter(|diagnostic| diagnostic.code == CODE_UNALLOCATED_REFERENCE)
                 .count(),
             2
         );
