@@ -2399,9 +2399,7 @@ fn normalize_config_path(path: PathBuf) -> PathBuf {
     let Some(file_name) = path.file_name().map(OsStr::to_os_string) else {
         return path;
     };
-    let Some(parent) = path.parent() else {
-        return path;
-    };
+    let parent = path.with_file_name("");
     match fs::canonicalize(parent) {
         Ok(parent) => parent.join(file_name),
         Err(_) => path,
@@ -2428,6 +2426,7 @@ fn to_u32(value: usize) -> u32 {
 mod tests {
     use crate::filter::{CODE_FILTER_PATTERN, PatternKind};
 
+    use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use serde_json::json;
@@ -2615,6 +2614,28 @@ mod tests {
             .join("oasts.json");
         let resolved = load_config_from_json(&relative, json).expect("relative path resolves");
         assert!(resolved.input.is_absolute());
+    }
+
+    #[test]
+    fn bare_relative_config_loads_when_its_empty_parent_cannot_be_canonicalized() {
+        let mut file = tempfile::Builder::new()
+            .prefix("oasts-config-")
+            .suffix(".json")
+            .tempfile_in(".")
+            .expect("bare relative config file");
+        let json = serde_json::to_vec(&valid_json_value()).expect("valid config JSON");
+        file.write_all(&json).expect("config contents");
+        let bare_path = PathBuf::from(file.path().file_name().expect("config file name"));
+
+        let resolved = load_config(Some(&bare_path), Path::new(""))
+            .expect("bare relative config path should load");
+
+        assert_eq!(
+            resolved.config_path,
+            fs::canonicalize(".")
+                .expect("current directory")
+                .join(bare_path)
+        );
     }
 
     #[test]
