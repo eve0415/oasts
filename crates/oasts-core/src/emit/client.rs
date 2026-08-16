@@ -8652,7 +8652,7 @@ mod tests {
         );
         let collision = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1400")
+            .find(|diagnostic| diagnostic.code == "OASTS6001")
             .expect("media alias warning");
         assert_eq!(collision.severity, Severity::Warning);
         assert!(collision.message.contains("application/json;a-b=1"));
@@ -8689,7 +8689,7 @@ mod tests {
         );
         let collision = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1400")
+            .find(|diagnostic| diagnostic.code == "OASTS6001")
             .expect("media alias warning");
         assert_eq!(collision.severity, Severity::Warning);
         assert!(
@@ -8742,7 +8742,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1400")
+                .filter(|diagnostic| diagnostic.code == "OASTS6001")
                 .count(),
             2,
             "{diagnostics:#?}"

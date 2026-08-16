@@ -40,11 +40,11 @@ const ZOD_RUNTIME_TS: &str = include_str!("../../runtime/zod-runtime.ts");
 const VALIDATORS_RUNTIME_TS: &str = include_str!("../../runtime/validators-runtime.ts");
 
 /// A schema carries a validation keyword the Zod artifact does not implement.
-const CODE_REJECTED_KEYWORD: &str = "OASTS1504";
+const CODE_REJECTED_KEYWORD: &str = "OASTS6101";
 /// A schema degraded to an unknown leaf, so no faithful Zod schema can be emitted.
-const CODE_UNKNOWN_LEAF: &str = "OASTS1505";
+const CODE_UNKNOWN_LEAF: &str = "OASTS6102";
 /// A JSON response media entry was renamed because its Zod schema-name fragment collided.
-const CODE_MEDIA_TAG_COLLISION: &str = "OASTS1400";
+const CODE_MEDIA_TAG_COLLISION: &str = "OASTS6001";
 
 const ZOD_RESERVED_NAMES: &[&str] = &[
     "z",

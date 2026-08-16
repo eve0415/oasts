@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Transform MSW
   version: '1'
-# The MSW artifact refuses a request-surface transform by name (OASTS1508/OASTS1509), because a
+# The MSW artifact refuses a request-surface transform by name (OASTS6203/OASTS6204), because a
 # handler cannot invert a wire parameter or body back into its declared application type. The
 # response surface has no such guard: the handler declares the application type and the author
 # supplies a `Date`, which `JSON.stringify` serialises to exactly the wire form the client's codecs

@@ -545,19 +545,19 @@ fn classify(code: &str) -> Outcome {
         // A config knob resolves it, and the diagnostic prints the block to paste. A public type
         // name is the user's to choose, so these stay fatal by design.
         "OASTS1202"     // a component name collision -> naming.overrides.schemas
-        | "OASTS1512"   // a path segment that is not a usable name -> naming.overrides.pathSegments
+        | "OASTS6302"   // a path segment that is not a usable name -> naming.overrides.pathSegments
         => Outcome::RefusedWithRemedy,
 
         // Constructs the project documents as out of scope.
         "OASTS1403"     // XML
         | "OASTS1405"   // a text request media whose schema does not project to string
-        | "OASTS1501"   // validators: a rejected validation keyword
-        | "OASTS1502"   // validators: an unknown leaf there is nothing to check
-        | "OASTS1504"   // zod: a rejected validation keyword
-        | "OASTS1505"   // zod: an unknown leaf
+        | "OASTS6002"   // validators: a rejected validation keyword
+        | "OASTS6003"   // validators: an unknown leaf there is nothing to check
+        | "OASTS6101"   // zod: a rejected validation keyword
+        | "OASTS6102"   // zod: an unknown leaf
         => Outcome::Unsupported,
 
-        // No arm for the msw projection refusals (OASTS1506-1510): each is scoped to the operation
+        // No arm for the msw projection refusals (OASTS6201-1510): each is scoped to the operation
         // that earned it and carries warning severity, so it never reaches an outcome. They are
         // still work owed — a parameter whose wire form has no unique inverse gets no handler —
         // but the document generates, and a category here would never be read.
