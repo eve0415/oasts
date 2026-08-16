@@ -23,9 +23,8 @@ Pointer** into the document or config file: the exact node the diagnostic is abo
 key escaped as `~1`.
 
 The two source names are not the same kind of thing. A config diagnostic names the config file by
-its absolute path, because that is what oasts resolved it to before reading it — or plain `<config>`
-where the pointer alone is enough to place it. A document
-diagnostic names a **logical source ID** instead — `workspace/<path>` for anything under the
+its normalized absolute path, because that is what oasts resolved it to before reading it. A
+document diagnostic names a **logical source ID** instead — `workspace/<path>` for anything under the
 workspace root, `allow/<n>/<path>` for a document reached through the *n*th `local.allowPaths` root.
 Those are stable across machines, which is what makes diagnostics comparable between a laptop and
 CI.
