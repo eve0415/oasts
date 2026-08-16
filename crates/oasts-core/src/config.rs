@@ -2386,28 +2386,20 @@ fn normalize_join(base: &Path, relative: &Path) -> PathBuf {
     result
 }
 
-/// Gives every config path one lexical identity before it reaches diagnostics or the resolved
-/// config. This does not touch the filesystem: an in-memory script-config path need not exist, and
-/// resolving a config-file symlink would change the directory its relative settings are anchored
-/// to.
+/// Gives every config path one filesystem-aware parent before it reaches diagnostics or the
+/// resolved config. An in-memory script-config path need not exist, so only its parent is
+/// canonicalized. This also preserves a config-file symlink as the anchor for relative settings.
 fn normalize_config_path(path: PathBuf) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => match normalized.components().next_back() {
-                Some(Component::RootDir | Component::Prefix(_)) => {}
-                Some(Component::ParentDir) | None => normalized.push(".."),
-                Some(Component::CurDir | Component::Normal(_)) => {
-                    normalized.pop();
-                }
-            },
-            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
-                normalized.push(component.as_os_str());
-            }
-        }
+    let Some(file_name) = path.file_name().map(OsStr::to_os_string) else {
+        return path;
+    };
+    let Some(parent) = path.parent() else {
+        return path;
+    };
+    match fs::canonicalize(parent) {
+        Ok(parent) => parent.join(file_name),
+        Err(_) => path,
     }
-    normalized
 }
 
 fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
@@ -2647,6 +2639,35 @@ mod tests {
         let rendered = crate::diag::render_to_string(diagnostics);
         assert!(rendered.contains(&canonical.to_string_lossy().into_owned()));
         assert!(!rendered.contains("/nested/../"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_path_parent_components_resolve_after_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let target = TestDirectory::new();
+        fs::create_dir(target.path().join("nested")).expect("symlink target directory");
+        symlink(target.path().join("nested"), directory.path().join("link"))
+            .expect("config path symlink");
+        target.write("openapi.yaml", "openapi: 3.1.0\npaths: {}\n");
+        let json = br#"{"schemaVersion":1,"input":{"path":"openapi.yaml"},"output":"generated"}"#;
+        let config = target.write("oasts.json", std::str::from_utf8(json).expect("UTF-8"));
+        let through_symlink = directory.path().join("link").join("..").join("oasts.json");
+
+        let discovered = discover_candidate(directory.path(), Some(&through_symlink))
+            .expect("config path through symlink should resolve");
+        assert_eq!(
+            fs::canonicalize(discovered.path).expect("discovered config should exist"),
+            fs::canonicalize(config).expect("expected config should exist")
+        );
+
+        let resolved = load_config_from_json(&through_symlink, json)
+            .expect("in-memory config path through symlink should resolve");
+        let target = fs::canonicalize(target.path()).expect("target directory should exist");
+        assert_eq!(resolved.config_dir, target);
+        assert_eq!(resolved.input, target.join("openapi.yaml"));
     }
 
     #[test]
@@ -4307,14 +4328,13 @@ mod tests {
             None
         );
         assert_eq!(to_u32(usize::MAX), u32::MAX);
-        assert_eq!(normalize_config_path(PathBuf::from(".")), PathBuf::new());
         assert_eq!(
-            normalize_config_path(PathBuf::from("../../one/./two/../three")),
-            PathBuf::from("../../one/three")
+            normalize_config_path(PathBuf::from(".")),
+            PathBuf::from(".")
         );
         assert_eq!(
-            normalize_config_path(PathBuf::from("/../../one/./two/../three")),
-            PathBuf::from("/one/three")
+            normalize_config_path(PathBuf::from("/")),
+            PathBuf::from("/")
         );
         assert_eq!(
             canonicalize_result(Ok(PathBuf::from("resolved")), "path"),
