@@ -5225,7 +5225,7 @@ mod tests {
         })));
         assert!(
             diagnostics.iter().all(|diagnostic| {
-                diagnostic.code == "OASTS1103" && diagnostic.severity == Severity::Warning
+                diagnostic.code == "OASTS2201" && diagnostic.severity == Severity::Warning
             }),
             "{diagnostics:?}"
         );
@@ -6798,7 +6798,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.code == "OASTS1103"),
+                .all(|diagnostic| diagnostic.code == "OASTS2201"),
             "{diagnostics:?}"
         );
         let bounded = component(&files, "bounded");
@@ -6837,7 +6837,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.code == "OASTS1103"),
+                .all(|diagnostic| diagnostic.code == "OASTS2201"),
             "{diagnostics:?}"
         );
         let content = component(&files, "account");
@@ -7278,7 +7278,7 @@ mod tests {
             let warning = diagnostics
                 .iter()
                 .find(|diagnostic| {
-                    diagnostic.code == "OASTS1118"
+                    diagnostic.code == "OASTS2216"
                         && diagnostic.json_pointer.as_deref() == Some(pointer)
                 })
                 .expect("path-dependent dynamic reference should warn");
@@ -8847,7 +8847,7 @@ mod tests {
         assert_clean(&diagnostics);
         let warning = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1111")
+            .find(|diagnostic| diagnostic.code == "OASTS2203")
             .expect("phantom required warning");
         assert_eq!(warning.severity, Severity::Warning);
         assert_eq!(

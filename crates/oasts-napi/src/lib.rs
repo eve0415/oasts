@@ -340,7 +340,7 @@ mod tests {
         .expect("invalid input");
         let input_failure = run(options(&compile_failure, "generate", false));
         assert_eq!(input_failure.exit_code, 1);
-        assert!(input_failure.rendered_stderr.contains("OASTS1101"));
+        assert!(input_failure.rendered_stderr.contains("OASTS2101"));
 
         let hostile = copy_fixture("petstore-3.0");
         assert_eq!(run(options(&hostile, "generate", false)).exit_code, 0);

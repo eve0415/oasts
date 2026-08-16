@@ -7612,7 +7612,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1103")
+                .filter(|diagnostic| diagnostic.code == "OASTS2201")
                 .count(),
             4,
             "{diagnostics:?}"
@@ -10503,7 +10503,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1103")
+                .any(|diagnostic| diagnostic.code == "OASTS2201")
         );
         assert!(generated_body(&files[0]).ends_with("export type Conditional = unknown;\n"));
     }

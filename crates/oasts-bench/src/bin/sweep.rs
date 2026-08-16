@@ -535,7 +535,7 @@ fn classify(code: &str) -> Outcome {
     match code {
         // The document contradicts OpenAPI or JSON Schema. No generator change accepts these; the
         // fix belongs upstream, in the document.
-        "OASTS1011"     // a $ref whose JSON pointer resolves to nothing
+        "OASTS2005"     // a $ref whose JSON pointer resolves to nothing
         | "OASTS3001"   // a duplicate operationId, which OpenAPI requires to be unique
         | "OASTS5106"   // a form media whose schema has no properties to name its fields with
         | "OASTS5402"   // a security requirement naming a scheme components never declares
@@ -1766,7 +1766,7 @@ mod tests {
         let stderr = concat!(
             "error[OASTS3002]: schema name collision\n",
             "  --> workspace/openapi.json:1:1 /components/schemas/Pet\n",
-            "warning[OASTS1111]: required property is absent\n",
+            "warning[OASTS2203]: required property is absent\n",
             "  --> workspace/openapi.json:4:2\n",
             "renderer note\n",
         );

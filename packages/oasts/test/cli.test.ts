@@ -150,7 +150,7 @@ test("input errors from the core exit 1", async () => {
   );
   const failed = await invoke(["generate"], directory);
   assert.equal(failed.code, 1);
-  assert.match(failed.stderr, /error\[OASTS1101\]/);
+  assert.match(failed.stderr, /error\[OASTS2101\]/);
 });
 
 test("unexpected non-CliFailure errors exit 2", async () => {

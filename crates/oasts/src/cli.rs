@@ -441,7 +441,7 @@ mod tests {
 
         assert_eq!(code, 1, "{stderr}");
         assert!(stdout.is_empty(), "{stdout}");
-        assert!(stderr.contains("error[OASTS1112]"), "{stderr}");
+        assert!(stderr.contains("error[OASTS2204]"), "{stderr}");
     }
 
     #[test]
@@ -724,7 +724,7 @@ mod tests {
         .expect("invalid input");
         let (code, _, stderr) = invoke(&["oasts", "check"], invalid_input.path());
         assert_eq!(code, 1);
-        assert!(stderr.contains("error[OASTS1101]"), "{stderr}");
+        assert!(stderr.contains("error[OASTS2101]"), "{stderr}");
 
         let invalid_config = copy_fixture("petstore-3.0");
         fs::write(
@@ -971,7 +971,7 @@ mod tests {
 
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(stdout, "generated 0 files\n");
-        assert!(stderr.contains("warning[OASTS1119]"), "{stderr}");
+        assert!(stderr.contains("warning[OASTS2107]"), "{stderr}");
         assert!(stderr.contains("filters.orphans"), "{stderr}");
     }
 

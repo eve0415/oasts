@@ -3715,7 +3715,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1111")
+                .any(|diagnostic| diagnostic.code == "OASTS2203")
         );
         assert_clean(&diagnostics);
         let content = component(&files, "account");

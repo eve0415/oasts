@@ -1356,7 +1356,7 @@ paths:
 
         assert!(files.is_none());
         let codes: Vec<&str> = sink.as_slice().iter().map(|d| d.code).collect();
-        assert!(codes.contains(&"OASTS1116"), "{codes:?}");
+        assert!(codes.contains(&"OASTS2104"), "{codes:?}");
         assert!(
             !codes.contains(&"OASTS0262"),
             "the config is not at fault: {codes:?}"
@@ -1497,7 +1497,7 @@ paths:
         let diagnostics = sink.as_slice();
         assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
         assert!(diagnostics.iter().all(|diagnostic| {
-            diagnostic.code == "OASTS1116"
+            diagnostic.code == "OASTS2104"
                 && diagnostic.message
                     == "OpenAPI defines '$ref' on a Path Item Object but not on an Operation Object; bundle the document before compiling, or place '$ref' on the whole path item when its target is a Path Item Object"
         }));

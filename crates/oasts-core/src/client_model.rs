@@ -6635,7 +6635,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1103")
+                .any(|diagnostic| diagnostic.code == "OASTS2201")
         );
         assert!(
             !diagnostics
@@ -7416,7 +7416,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1103")
+                .any(|diagnostic| diagnostic.code == "OASTS2201")
         );
         assert!(
             diagnostics

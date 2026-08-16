@@ -22,17 +22,17 @@ use crate::syntax::parse_yaml_document_value;
 
 const CODE_IO: &str = "OASTS1001";
 const CODE_REMOTE_UNSUPPORTED: &str = "OASTS9101";
-const CODE_REF_ESCAPE: &str = "OASTS1003";
-const CODE_NON_UNICODE_PATH: &str = "OASTS1004";
-const CODE_PARSE: &str = "OASTS1005";
-const CODE_MAX_DOCUMENT_BYTES: &str = "OASTS1006";
-const CODE_MAX_TOTAL_BYTES: &str = "OASTS1007";
-const CODE_MAX_DOCUMENTS: &str = "OASTS1008";
-const CODE_MAX_REF_DEPTH: &str = "OASTS1009";
-const CODE_INVALID_REFERENCE: &str = "OASTS1010";
-const CODE_POINTER: &str = "OASTS1011";
-const CODE_NON_SCHEMA_CYCLE: &str = "OASTS1012";
-const CODE_EXTENSION_FALLBACK: &str = "OASTS1013";
+const CODE_REF_ESCAPE: &str = "OASTS2001";
+const CODE_NON_UNICODE_PATH: &str = "OASTS2002";
+const CODE_PARSE: &str = "OASTS2003";
+const CODE_MAX_DOCUMENT_BYTES: &str = "OASTS2011";
+const CODE_MAX_TOTAL_BYTES: &str = "OASTS2012";
+const CODE_MAX_DOCUMENTS: &str = "OASTS2013";
+const CODE_MAX_REF_DEPTH: &str = "OASTS2014";
+const CODE_INVALID_REFERENCE: &str = "OASTS2004";
+const CODE_POINTER: &str = "OASTS2005";
+const CODE_NON_SCHEMA_CYCLE: &str = "OASTS2006";
+const CODE_EXTENSION_FALLBACK: &str = "OASTS2007";
 const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
 
 /// Stable index of a document within one graph.
@@ -3960,7 +3960,7 @@ mod tests {
         assert_eq!(graph.entry().value["openapi"], "3.1.0");
         assert_eq!(sink.as_slice().len(), 1);
         let warning = &sink.as_slice()[0];
-        assert_eq!(warning.code, "OASTS1013");
+        assert_eq!(warning.code, "OASTS2007");
         assert_eq!(warning.severity, Severity::Warning);
         assert_eq!(warning.category, Category::Input);
         assert_eq!(warning.source_id.as_deref(), Some("workspace/entry.json"));
@@ -3986,7 +3986,7 @@ mod tests {
         assert_eq!(graph.entry().value["info"]["title"], "𝄞");
         assert_eq!(sink.as_slice().len(), 1);
         let warning = &sink.as_slice()[0];
-        assert_eq!(warning.code, "OASTS1013");
+        assert_eq!(warning.code, "OASTS2007");
         assert_eq!(warning.severity, Severity::Warning);
         assert_eq!(warning.source_id.as_deref(), Some("workspace/entry.yaml"));
         assert_eq!(
