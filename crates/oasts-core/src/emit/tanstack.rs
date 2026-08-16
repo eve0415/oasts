@@ -574,6 +574,7 @@ fn collect_bindings(
 /// one already allocated for it rather than re-derived.
 fn key_element(kind: &SegmentKind, scope: &[KeyParameter]) -> KeyElement {
     let allocated = |wire: &str| {
+        // `collect_bindings` appended every parameter from this segment before calling here.
         scope
             .iter()
             .rev()
@@ -702,6 +703,7 @@ impl KeyFactory {
             let Some(binding) = self.bindings.get(&child_address) else {
                 continue;
             };
+            // A child binding is created only after its derived member is appended.
             let member = binding
                 .members
                 .last()

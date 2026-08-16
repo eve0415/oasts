@@ -518,6 +518,7 @@ fn parse_yaml_float(value: &str, marker: Marker) -> Result<Option<Number>, YamlV
         return Ok(None);
     }
     let normalized = value.replace('_', "");
+    // `is_yaml_float` accepted only the decimal grammar implemented by `f64::from_str`.
     let parsed = normalized
         .parse::<f64>()
         .expect("validated YAML float must parse as f64");
@@ -568,6 +569,7 @@ fn parse_yaml_integer(value: &str) -> Option<Result<Number, String>> {
         Ok(magnitude) => (|| {
             if negative {
                 if magnitude == 0 {
+                    // Negative zero is finite, and `Number::from_f64` accepts every finite value.
                     return Ok(Number::from_f64(-0.0)
                         .expect("JSON numbers support every finite f64 value"));
                 }
@@ -577,14 +579,18 @@ fn parse_yaml_integer(value: &str) -> Option<Result<Number, String>> {
                 if let Ok(magnitude) = i64::try_from(magnitude) {
                     return Ok(Number::from(-magnitude));
                 }
+                // The normalizer receives a validated decimal integer and emits JSON number syntax.
                 Ok(Number::from_str(&normalize_yaml_integer_for_json(value))
                     .expect("a normalized decimal integer is valid JSON number syntax"))
             } else {
                 Ok(Number::from(magnitude))
             }
         })(),
-        Err(_) if radix == 10 => Ok(Number::from_str(&normalize_yaml_integer_for_json(value))
-            .expect("a normalized decimal integer is valid JSON number syntax")),
+        Err(_) if radix == 10 => {
+            // The normalizer receives a validated decimal integer and emits JSON number syntax.
+            Ok(Number::from_str(&normalize_yaml_integer_for_json(value))
+                .expect("a normalized decimal integer is valid JSON number syntax"))
+        }
         Err(_) => Err(format!(
             "YAML integer '{value}' is outside the JSON number domain"
         )),
@@ -632,6 +638,7 @@ fn is_yaml_non_finite(value: &str) -> bool {
 fn is_yaml_float(value: &str) -> bool {
     let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
     let mut exponent_parts = unsigned.split(['e', 'E']);
+    // `split` always yields at least the original string, including for an empty input.
     let mantissa = exponent_parts.next().expect("split always yields one part");
     let exponent = exponent_parts.next();
     if exponent_parts.next().is_some() {

@@ -113,6 +113,7 @@ impl<'a> TargetValidator<'a> {
         let mut components = relative_path.split('/').peekable();
         let mut unresolved_parent = self.output_dir.to_path_buf();
         let mut resolved_parent = self.output_dir.to_path_buf();
+        // `validate_relative_path` rejects empty paths and trailing separators.
         let file_name = components
             .next_back()
             .expect("validated relative paths contain a file name");
@@ -287,6 +288,7 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
             continue;
         }
         let target = validate_target(&canonical_output, &file.relative_path)?;
+        // A validated relative file is joined below the canonical absolute output directory.
         let parent = target
             .parent()
             .expect("a validated target inside an absolute output directory has a parent");
@@ -685,6 +687,7 @@ fn is_strictly_within(output_dir: &Path, target: &Path) -> bool {
 }
 
 fn manifest_bytes(manifest: &Manifest) -> Vec<u8> {
+    // `Manifest` contains only an integer version and owned UTF-8 path strings.
     let mut bytes = serde_json::to_vec(manifest)
         .expect("the ownership manifest contains only JSON-serializable fields");
     bytes.push(b'\n');

@@ -453,6 +453,7 @@ fn server_variable_union(variables: &[(String, ServerVariable)]) -> Option<Strin
         if lacks_enum.contains(name) {
             format!("{{ {key}: string }}")
         } else {
+            // Every name enters either `lacks_enum` or `literals` in the collection loop above.
             let union = literals
                 .remove(name)
                 .expect("a name absent from lacks_enum declared an enum at least once")

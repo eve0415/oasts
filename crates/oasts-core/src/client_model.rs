@@ -443,6 +443,8 @@ pub fn build_client_model(
     config: &ResolvedConfig,
     sink: &mut DiagnosticSink,
 ) -> ClientModel {
+    // The pipeline calls this only when the resolved client artifact is enabled, which also
+    // requires the config resolver to materialize client settings.
     let client = config
         .client
         .as_ref()
@@ -1198,6 +1200,7 @@ fn field_plan(
                 || encoding.allow_reserved_explicit)
     });
     let (serialization, wrapper) = if style_applicable {
+        // `style_applicable` can be true only through `Option::is_some_and` above.
         let encoding = encoding.expect("style applicability requires an Encoding Object");
         let style = encoding.style.unwrap_or(ParamStyle::Form);
         (
@@ -2199,6 +2202,7 @@ fn diagnose_form_media(
                     || encoding.allow_reserved_explicit
             })
         {
+            // The enclosing condition reached this block through `encoding.is_some_and`.
             let encoding = encoding.expect("multipart style keywords require an Encoding Object");
             sink.push(source_diagnostic(
                 CODE_MULTIPART_30_STYLE_IGNORED,
@@ -2214,6 +2218,7 @@ fn diagnose_form_media(
                     || encoding.allow_reserved_explicit)
         });
         if style_applicable {
+            // `style_applicable` can be true only through `Option::is_some_and` above.
             let encoding = encoding.expect("style applicability requires an Encoding Object");
             if encoding.content_type.is_some() {
                 sink.push(source_diagnostic(

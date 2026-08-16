@@ -10,7 +10,7 @@
 import { ArgsError, USAGE, parse } from "./args.ts";
 import { loadScriptConfig } from "./config/load.ts";
 import { CliFailure, fromNativeError } from "./diagnostics.ts";
-import { commandRefusal, discoverConfig, run as nativeRun } from "./native.ts";
+import { loadNative } from "./native.ts";
 
 /** Byte sinks for CLI output; `process.stdout`/`process.stderr` in the shim. */
 export interface OutputStreams {
@@ -24,6 +24,7 @@ async function dispatch(
   stderr: OutputStreams,
 ): Promise<number> {
   const args = parse(argv);
+  const { commandRefusal, discoverConfig, run: nativeRun } = await loadNative();
   // Asked before discovery so an unimplemented command never fails on a missing config first.
   const refusal = commandRefusal(args.command);
   if (refusal !== null) {

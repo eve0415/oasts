@@ -1644,6 +1644,8 @@ fn operation_input_schema(
         let resolved = parameters
             .into_iter()
             .map(|parameter| {
+                // Client parameter plans retain the source identity of the operation parameter
+                // from which the planner created them.
                 let required = operation
                     .parameters
                     .iter()
@@ -2263,6 +2265,7 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
                 return Some(format!("{helper}({path})"));
             }
             let pointer = self.pointer(&node.meta().source);
+            // This branch handles only revive and encode; both have a codec for every transform.
             let codec = direction
                 .codec(kind)
                 .expect("decode and encode directions always have a transform codec");
@@ -2801,15 +2804,18 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
         path: &str,
         frame: Frame,
     ) -> Option<String> {
+        // `convert` dispatches here only from its `OneOf | AnyOf` match arm.
         let (branches, _) =
             union_parts(node).expect("convert_union is called only for oneOf and anyOf nodes");
         // The refusal walk has already reported an indistinguishable union, so the run fails; there
         // is nothing honest to emit for it, and identity is what keeps the emitter total.
+        // `resolve_dispatch` returns `Some` for exactly the same two union variants.
         match resolve_dispatch(self.emitter, self.facts(), node)
             .expect("a oneOf or anyOf node always resolves to a dispatch")
         {
             Ok(ResolvedDispatch::Identity) | Err(_) => None,
             Ok(ResolvedDispatch::Shared) => self.convert(
+                // `Shared` requires at least one converting branch; an empty union is `Identity`.
                 branches
                     .first()
                     .expect("a shared union dispatch has at least one branch"),
@@ -2899,6 +2905,7 @@ impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
     ) -> Option<String> {
         let mut rendered = Vec::new();
         for (test, index) in arms {
+            // Dispatch arms are built by enumerating this exact branch slice.
             let branch = branches
                 .get(index)
                 .expect("a dispatch arm index originates from this union's branches");

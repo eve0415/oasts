@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { CliFailure, configFailure, fromNativeError, render } from "../src/diagnostics.ts";
+import {
+  CliFailure,
+  configFailure,
+  fromNativeError,
+  fromNativeLoadError,
+  render,
+} from "../src/diagnostics.ts";
 
 test("render matches the core stderr dialect", () => {
   const rendered = render([
@@ -44,4 +50,16 @@ test("fromNativeError wraps unstructured failures", () => {
   assert.match(nonError.renderedStderr, /native invocation failed: just a string/);
 
   assert.ok(plain instanceof CliFailure);
+});
+
+test("fromNativeLoadError renders an exit 2 diagnostic", () => {
+  const error = fromNativeLoadError(new Error("missing binary"));
+  assert.equal(error.exitCode, 2);
+  assert.equal(
+    error.renderedStderr,
+    "error[OASTS1023]: native module load failed: missing binary\n",
+  );
+
+  const thrownValue = fromNativeLoadError("missing value");
+  assert.match(thrownValue.renderedStderr, /native module load failed: missing value/);
 });

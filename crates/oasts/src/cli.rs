@@ -430,6 +430,54 @@ mod tests {
     }
 
     #[test]
+    fn numeric_member_with_oversized_exponent_is_an_input_diagnostic() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("openapi.json"),
+            r#"{
+  "openapi": "3.1.0",
+  "paths": {
+    "/value": {
+      "get": {
+        "operationId": "getValue",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "number",
+                  "enum": [1e-99999999999999999999]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#,
+        )
+        .expect("OpenAPI JSON");
+        fs::write(
+            temp.path().join("oasts.json"),
+            r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated"}"#,
+        )
+        .expect("config JSON");
+
+        let (code, stdout, stderr) =
+            invoke(&["oasts", "check", "--config", "oasts.json"], temp.path());
+
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("error[OASTS3104]"), "{stderr}");
+        assert!(
+            stderr.contains("exponent outside the supported decimal domain"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
     fn invalid_multiple_of_is_an_input_diagnostic() {
         let temp = raw_json_project(
             r#"{"openapi":"3.1.0","paths":{},"components":{"schemas":{"Value":{"type":"number","multipleOf":"invalid"}}}}"#,

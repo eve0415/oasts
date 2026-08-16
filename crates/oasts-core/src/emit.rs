@@ -273,6 +273,7 @@ fn change_first_ascii_letter(token: &str, transform: fn(&u8) -> u8) -> String {
     if let Some(byte) = bytes.iter_mut().find(|byte| byte.is_ascii_alphabetic()) {
         *byte = transform(byte);
     }
+    // The only mutation replaces one ASCII byte with another, preserving the input's UTF-8.
     String::from_utf8(bytes).expect("transforming ASCII letters preserves UTF-8")
 }
 
@@ -1819,6 +1820,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             allocated.schema_index,
             &mut imports,
         );
+        // Path allocation registers the component file and its schema target in one pass.
         let target = self
             .model
             .schema_target(&schema.source.source_id, &schema.source.json_pointer)
@@ -2796,6 +2798,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
             .map(|(properties, additional_properties)| {
                 (Arc::from(properties), additional_properties)
             });
+        // Prewarming completes before the cache is shared with any rendering clone.
         Arc::get_mut(&mut self.merge_cache)
             .expect("the allOf cache is not shared until prewarming finishes")
             .insert(key, entry);
@@ -3945,6 +3948,7 @@ pub(super) fn render_ts_value(value: &Value) -> String {
 /// Encodes an untrusted value for a TypeScript double-quoted string literal.
 #[must_use]
 pub fn render_ts_string(value: &str) -> String {
+    // A Rust string is always a serializable JSON string scalar.
     let mut encoded = serde_json::to_string(value).expect("serializing a string cannot fail");
     if encoded.contains('\u{2028}') {
         encoded = encoded.replace('\u{2028}', "\\u2028");
@@ -4794,6 +4798,7 @@ fn write_comment_inline(output: &mut String, value: &str) {
             previous_whitespace = false;
             continue;
         }
+        // The loop guard keeps `index` below `len`, and every update advances by a UTF-8 width.
         let character = rest.chars().next().expect("non-empty suffix");
         let character_len = character.len_utf8();
         let next = rest[character_len..].chars().next();
@@ -4871,6 +4876,7 @@ fn write_link_part(output: &mut String, value: &str) {
             index += "sourceMappingURL=".len();
             continue;
         }
+        // The loop guard keeps `index` below `len`, and every update advances by a UTF-8 width.
         let character = rest.chars().next().expect("non-empty suffix");
         match character {
             '{' => output.push_str("\\{"),

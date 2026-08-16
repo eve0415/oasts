@@ -423,6 +423,7 @@ impl UnmatchedPatterns {
             ("include", &patterns.include),
             ("exclude", &patterns.exclude),
         ] {
+            // Construction registers both lists for every configured axis before any matching run.
             let flags = self
                 .matched
                 .get_mut(&(axis.key(), list))
