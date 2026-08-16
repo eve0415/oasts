@@ -138,10 +138,14 @@ run prints a ready-made block of them after its diagnostics.
 
 ### Artifact projections
 
-Only MSW degrades. An operation MSW cannot mock is skipped with a warning and the rest of the
-handlers still generate, and it refuses that way **on purpose**: an error would throw the whole
-run's output away over one operation it could not project. Everything else in this band is an
-error, so it stops the build.
+MSW and TanStack degrade; validators and Zod refuse. An operation MSW cannot mock, or TanStack
+cannot give a descriptor, is skipped with a warning and the rest of the file still generates — that
+is **on purpose**, because an error would throw the whole run's output away over one operation it
+could not project. The validation artifacts take the other line: anything they cannot check
+faithfully is an error, since a validator that quietly checks less than the document says is worse
+than no build. Their one warning only renames a colliding schema.
+
+The severity column below is the authority. Read that, not the artifact name.
 
 | Code | Artifact | Severity | Meaning |
 | --- | --- | --- | --- |
