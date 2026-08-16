@@ -55,14 +55,14 @@ const VALIDATORS_RUNTIME_TS: &str = include_str!("../../runtime/validators-runti
 const VALIDATORS_STANDARD_SCHEMA_TS: &str =
     include_str!("../../runtime/validators-standard-schema.ts");
 
+/// A JSON response media entry was renamed because its validator-name fragment collided.
+pub(super) const CODE_MEDIA_TAG_COLLISION: &str = "OASTS6001";
 /// A schema carries a validation keyword the validators artifact does not implement.
 const CODE_REJECTED_KEYWORD: &str = "OASTS6002";
 /// A schema degraded to an unknown leaf, so no faithful validator can be emitted for it.
 const CODE_UNKNOWN_LEAF: &str = "OASTS6003";
 /// An applicator's subschema is not fully checkable, so emitting the outer check would be unsound.
 const CODE_INCOMPLETE_APPLICATOR: &str = "OASTS6004";
-/// A JSON response media entry was renamed because its validator-name fragment collided.
-pub(super) const CODE_MEDIA_TAG_COLLISION: &str = "OASTS6001";
 
 /// TypeScript aborts control-flow analysis at 2,000 recursive flow-node visits. The estimate below
 /// counts the flow-producing bindings, conditions, merges, mutations, and effectful calls emitted

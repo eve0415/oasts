@@ -21,18 +21,18 @@ use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::syntax::parse_yaml_document_value;
 
 const CODE_DOCUMENT_IO: &str = "OASTS1003";
-const CODE_REMOTE_UNSUPPORTED: &str = "OASTS9101";
 const CODE_REF_ESCAPE: &str = "OASTS2001";
 const CODE_NON_UNICODE_PATH: &str = "OASTS2002";
 const CODE_DOCUMENT_PARSE: &str = "OASTS2003";
-const CODE_MAX_DOCUMENT_BYTES: &str = "OASTS2011";
-const CODE_MAX_TOTAL_BYTES: &str = "OASTS2012";
-const CODE_MAX_DOCUMENTS: &str = "OASTS2013";
-const CODE_MAX_REF_DEPTH: &str = "OASTS2014";
 const CODE_INVALID_REFERENCE: &str = "OASTS2004";
 const CODE_POINTER: &str = "OASTS2005";
 const CODE_NON_SCHEMA_CYCLE: &str = "OASTS2006";
 const CODE_EXTENSION_FALLBACK: &str = "OASTS2007";
+const CODE_MAX_DOCUMENT_BYTES: &str = "OASTS2011";
+const CODE_MAX_TOTAL_BYTES: &str = "OASTS2012";
+const CODE_MAX_DOCUMENTS: &str = "OASTS2013";
+const CODE_MAX_REF_DEPTH: &str = "OASTS2014";
+const CODE_REMOTE_UNSUPPORTED: &str = "OASTS9101";
 const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
 
 /// Stable index of a document within one graph.

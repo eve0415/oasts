@@ -57,13 +57,17 @@ use model::{EmissionModel, SchemaTarget};
 
 const CODE_FILE_NAME: &str = "OASTS4001";
 const CODE_PATH_COLLISION: &str = "OASTS4002";
-const CODE_DISCRIMINATOR: &str = "OASTS4202";
-const CODE_UNALLOCATED_REFERENCE: &str = "OASTS4203";
 const CODE_VARIANT_COLLISION: &str = "OASTS4101";
 /// A component import an operation module renames to escape shadowing one of its own declarations,
 /// whose role-derived replacement is itself taken by another import or declaration in that module.
 /// Nothing is left to rename it to, so the module is refused rather than emitted uncompilable.
 const CODE_IMPORT_ALIAS: &str = "OASTS4102";
+/// A generated request/response variant whose colliding-name replacement is itself a declared
+/// component or another variant's replacement. No local remedy exists, so the document is refused
+/// rather than emitted with two declarations fighting over one identifier.
+const CODE_VARIANT_ALIAS: &str = "OASTS4103";
+const CODE_DISCRIMINATOR: &str = "OASTS4202";
+const CODE_UNALLOCATED_REFERENCE: &str = "OASTS4203";
 /// A discriminator `mapping` value that resolves to no allocated component schema. A mapping target
 /// can only ever matter when it equals a branch's `$ref` target, and those are always materialized,
 /// so a value that fails to resolve could never have matched a branch: it is a dead entry, not a
@@ -74,10 +78,9 @@ const CODE_MAPPING_TARGET: &str = "OASTS4204";
 /// contradicts the branch's own fixed value, or an allOf idiom that fixes the tag property to an
 /// empty (uninhabitable) value set. The render degrades to a plain structural union.
 const CODE_DISCRIMINATOR_PROOF: &str = "OASTS4205";
-/// A generated request/response variant whose colliding-name replacement is itself a declared
-/// component or another variant's replacement. No local remedy exists, so the document is refused
-/// rather than emitted with two declarations fighting over one identifier.
-const CODE_VARIANT_ALIAS: &str = "OASTS4103";
+/// A discriminator whose proof can select branches but whose emitted TypeScript union does not
+/// carry required unit-literal tags on every branch, so consumers cannot narrow it exhaustively.
+const CODE_DISCRIMINATOR_NARROWING: &str = "OASTS4207";
 /// A union whose branches convert date/time values differently, where no JSON value kind and no
 /// declared discriminator tells them apart. Applying either branch's conversion to the other's value
 /// would corrupt it silently, and ordered try-each-branch decoding cannot detect the mistake — a
@@ -88,9 +91,6 @@ const CODE_TRANSFORM_UNION: &str = "OASTS4301";
 /// a shape no single codec is keyed on, and emitting nothing for one would leave a wire string
 /// behind a type promising an application value.
 pub(super) const CODE_UNCONVERTIBLE_TRANSFORM: &str = "OASTS4302";
-/// A discriminator whose proof can select branches but whose emitted TypeScript union does not
-/// carry required unit-literal tags on every branch, so consumers cannot narrow it exhaustively.
-const CODE_DISCRIMINATOR_NARROWING: &str = "OASTS4207";
 
 /// A wire twin whose derived `{Name}Wire` is already a declared component's name. The document owns
 /// its name; the compiler invented the other, so the twin yields to `{Name}WireValue` and generation

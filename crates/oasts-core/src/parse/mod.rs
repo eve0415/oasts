@@ -25,33 +25,35 @@ use crate::semantic::CODE_ENUM_RULE_14;
 
 const CODE_VERSION: &str = "OASTS2101";
 const CODE_SHAPE: &str = "OASTS2102";
+const CODE_RESPONSE_STATUS: &str = "OASTS2103";
+const CODE_OPERATION_REF: &str = "OASTS2104";
+/// A status range written in lowercase. OpenAPI specifies the uppercase wildcard, but real
+/// documents ship `4xx`, so it is canonicalized and reported rather than rejected.
+const CODE_RESPONSE_STATUS_CASE: &str = "OASTS2105";
+/// Two keys in one responses object that name the same status once canonicalized.
+const CODE_RESPONSE_STATUS_DUPLICATE: &str = "OASTS2106";
+const CODE_MEDIA_TYPE: &str = "OASTS2111";
+const CODE_DUPLICATE_MEDIA_TYPE: &str = "OASTS2112";
+const CODE_RESERVED_HEADER_PARAMETER: &str = "OASTS2113";
+const CODE_HEADER_CONTENT_TYPE: &str = "OASTS2114";
+const CODE_HEADER_DUPLICATE: &str = "OASTS2115";
+const CODE_SERVER_VAR_ENUM_EMPTY: &str = "OASTS2121";
+const CODE_SERVER_VAR_DEFAULT: &str = "OASTS2122";
+const CODE_WEBHOOKS_VERSION: &str = "OASTS2123";
 const CODE_UNSUPPORTED: &str = "OASTS2201";
+const CODE_PATH_PARAMETER: &str = "OASTS2202";
+const CODE_PHANTOM_REQUIRED: &str = "OASTS2203";
+const CODE_MULTIPLE_OF: &str = "OASTS2204";
 /// A narrowing schema keyword the emitted TypeScript cannot apply. Unlike `CODE_UNSUPPORTED`, the
 /// leaf does not widen to `unknown` — the sibling type survives exactly as declared and only the
 /// narrowing is lost, so the emitted type is wider than the document. Reported rather than dropped
 /// because a keyword is never silently ignored when doing so widens a public type; the validators
 /// artifact still enforces it exactly.
 const CODE_UNAPPLIED_NARROWING: &str = "OASTS2205";
-const CODE_RESPONSE_STATUS: &str = "OASTS2103";
-/// A status range written in lowercase. OpenAPI specifies the uppercase wildcard, but real
-/// documents ship `4xx`, so it is canonicalized and reported rather than rejected.
-const CODE_RESPONSE_STATUS_CASE: &str = "OASTS2105";
-/// Two keys in one responses object that name the same status once canonicalized.
-const CODE_RESPONSE_STATUS_DUPLICATE: &str = "OASTS2106";
-const CODE_PATH_PARAMETER: &str = "OASTS2202";
 const CODE_RECURSIVE_REF_TARGET: &str = "OASTS2211";
-const CODE_MEDIA_TYPE: &str = "OASTS2111";
-const CODE_DUPLICATE_MEDIA_TYPE: &str = "OASTS2112";
-const CODE_RESERVED_HEADER_PARAMETER: &str = "OASTS2113";
 const CODE_REF_SIBLINGS: &str = "OASTS2212";
-const CODE_MULTIPLE_OF: &str = "OASTS2204";
 const CODE_REF_CYCLE: &str = "OASTS2213";
 const CODE_REF_DEPTH: &str = "OASTS2214";
-/// A discriminator `mapping` value that is not a JSON string. It cannot name a schema, so it drops
-/// out of tag resolution — diagnosed rather than dropped silently so a malformed entry is no
-/// quieter than a dangling one.
-const CODE_MAPPING_VALUE_SHAPE: &str = "OASTS2221";
-const CODE_OPERATION_REF: &str = "OASTS2104";
 /// A `$recursiveRef` written with any value other than `"#"`. JSON Schema 2019-09 §8.2.4.2.1:
 /// "The behavior of this keyword is defined only for the value '#'. Implementations MAY choose to
 /// consider other values to be errors."
@@ -60,13 +62,11 @@ const CODE_RECURSIVE_REF_VALUE: &str = "OASTS2215";
 /// because two or more schema resources declare the anchor it names. No single schema can stand in
 /// for it, so the node widens to unknown and the validators artifact refuses rather than guessing.
 const CODE_DYNAMIC_SCOPE: &str = "OASTS2216";
-const CODE_SERVER_VAR_ENUM_EMPTY: &str = "OASTS2121";
-const CODE_SERVER_VAR_DEFAULT: &str = "OASTS2122";
-const CODE_HEADER_CONTENT_TYPE: &str = "OASTS2114";
-const CODE_HEADER_DUPLICATE: &str = "OASTS2115";
-const CODE_WEBHOOKS_VERSION: &str = "OASTS2123";
+/// A discriminator `mapping` value that is not a JSON string. It cannot name a schema, so it drops
+/// out of tag resolution — diagnosed rather than dropped silently so a malformed entry is no
+/// quieter than a dangling one.
+const CODE_MAPPING_VALUE_SHAPE: &str = "OASTS2221";
 const CODE_LINK_TARGET: &str = "OASTS3204";
-const CODE_PHANTOM_REQUIRED: &str = "OASTS2203";
 const CODE_SECURITY_FLOWS_SHAPE: &str = "OASTS5406";
 
 const METHODS: [&str; 8] = [

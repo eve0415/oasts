@@ -24,21 +24,21 @@ use crate::ir::{
 };
 use crate::num::{finite_binary64, first_number_outside_binary64, render_number};
 
+// Config-category (exit code 2): an override key that names no declaration in the document.
+const CODE_OVERRIDE_UNMATCHED: &str = "OASTS0202";
 const CODE_OPERATION_NAME: &str = "OASTS3001";
 const CODE_TYPE_NAME: &str = "OASTS3002";
+// Webhook and callback name stems allocate in their own scopes (see `allocate_webhook_names`
+// and `allocate_callback_names`) but share one collision/normalization-failure code: both are
+// the same failure shape (a generated identifier collides or fails to normalize) just applied
+// to a different declaration kind.
+const CODE_WEBHOOK_NAME: &str = "OASTS3003";
 pub(crate) const CODE_ENUM_RULE_14: &str = "OASTS3101";
 const CODE_NUMERIC_BOUND_DOMAIN: &str = "OASTS3102";
 const CODE_ANNOTATION_DOMAIN: &str = "OASTS3103";
 const CODE_LINK_OPERATION_ID: &str = "OASTS3201";
 const CODE_LINK_OPERATION_REF: &str = "OASTS3202";
 const CODE_LINK_PARAMETER: &str = "OASTS3203";
-// Webhook and callback name stems allocate in their own scopes (see `allocate_webhook_names`
-// and `allocate_callback_names`) but share one collision/normalization-failure code: both are
-// the same failure shape (a generated identifier collides or fails to normalize) just applied
-// to a different declaration kind.
-const CODE_WEBHOOK_NAME: &str = "OASTS3003";
-// Config-category (exit code 2): an override key that names no declaration in the document.
-const CODE_OVERRIDE_UNMATCHED: &str = "OASTS0202";
 
 const RESERVED_WORDS: [&str; 46] = [
     "break",
