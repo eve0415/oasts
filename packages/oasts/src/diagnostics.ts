@@ -3,7 +3,7 @@
  *
  * These cover only what the Rust core cannot see: evaluating the config
  * module (OASTS0012), validating its export is plain JSON data (OASTS0013),
- * and a native call that failed without a structured reason (OASTS1001).
+ * and a native call that failed without a structured reason (OASTS1022).
  * Rendering matches `oasts_core::diag::render` so both hosts produce one
  * stderr dialect. Everything else renders in Rust and passes through verbatim.
  */
@@ -12,6 +12,8 @@
 export const CODE_CONFIG_EVALUATION = "OASTS0012";
 /** Config default export is not plain JSON-serializable data. */
 export const CODE_CONFIG_NOT_SERIALIZABLE = "OASTS0013";
+/** A native call failed without giving back a structured reason. */
+export const CODE_NATIVE_INVOCATION = "OASTS1022";
 
 /** A Node-side diagnostic in the shared cross-host shape. */
 export interface Diagnostic {
@@ -75,7 +77,7 @@ export function fromNativeError(error: unknown): CliFailure {
     } catch {
       // Not a structured reason; fall through to the generic wrapper.
     }
-    return configFailure("OASTS1001", `native invocation failed: ${error.message}`);
+    return configFailure(CODE_NATIVE_INVOCATION, `native invocation failed: ${error.message}`);
   }
-  return configFailure("OASTS1001", `native invocation failed: ${String(error)}`);
+  return configFailure(CODE_NATIVE_INVOCATION, `native invocation failed: ${String(error)}`);
 }

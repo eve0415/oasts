@@ -389,12 +389,12 @@ mod tests {
 
     #[test]
     fn diagnostic_conversion_preserves_location_fields() {
-        let diagnostic = Diagnostic::config("OASTS1001", "message")
+        let diagnostic = Diagnostic::config("OASTS9902", "message")
             .with_source("config.yaml")
             .with_location(3, 7)
             .with_json_pointer("/input");
         let converted = to_diagnostic_js(&diagnostic);
-        assert_eq!(converted.code, "OASTS1001");
+        assert_eq!(converted.code, "OASTS9902");
         assert_eq!(converted.severity, "error");
         assert_eq!(converted.source_id.as_deref(), Some("config.yaml"));
         assert_eq!((converted.line, converted.col), (Some(3), Some(7)));

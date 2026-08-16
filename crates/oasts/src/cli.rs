@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use oasts_core::diag::{self, Diagnostic};
 use oasts_core::driver::{self, Command as DriverCommand, ConfigSource, Outcome};
 
-const CODE_CURRENT_DIR: &str = "OASTS1001";
+const CODE_CURRENT_DIR: &str = "OASTS1021";
 
 #[derive(Debug, Parser)]
 #[command(name = "oasts", disable_help_subcommand = true)]
