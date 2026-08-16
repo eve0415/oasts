@@ -1301,11 +1301,17 @@ pub fn resolve_config(
 ) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     let mut sink = DiagnosticSink::new();
     let source_path = config_path.as_path();
-    // Config resolution is entered with a selected file path; even a relative file has an empty
-    // parent path rather than no parent.
-    let config_parent = config_path
+    let Some(config_parent) = config_path
         .parent()
-        .expect("resolved config paths always have a parent");
+        .filter(|_| config_path.file_name().is_some())
+    else {
+        return Err(vec![config_error(
+            CODE_CONFIG_READ,
+            "config path must name a file",
+            Some(source_path),
+            None,
+        )]);
+    };
     let config_dir = match fs::canonicalize(config_parent) {
         Ok(path) => path,
         Err(error) => {
@@ -2668,6 +2674,14 @@ mod tests {
         let target = fs::canonicalize(target.path()).expect("target directory should exist");
         assert_eq!(resolved.config_dir, target);
         assert_eq!(resolved.input, target.join("openapi.yaml"));
+    }
+
+    #[test]
+    fn config_path_that_lexically_collapses_to_root_is_diagnosed() {
+        let json = serde_json::to_vec(&valid_json_value()).expect("valid config JSON");
+        for path in [Path::new("/missing/.."), Path::new("/")] {
+            assert_code(load_config_from_json(path, &json), CODE_CONFIG_READ);
+        }
     }
 
     #[test]
