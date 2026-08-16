@@ -9,10 +9,15 @@ sidebar:
 
 Configuration lives in `oasts.yaml`, `oasts.json`, or a typed `oasts.config.ts`. The YAML and JSON
 forms are validated against a published JSON Schema, so a typo fails with a rule ID rather than
-silently doing nothing. Unknown keys are rejected.
+silently doing nothing. Unknown keys are rejected. Point `$schema` at it for editor completion —
+oasts validates it as a URI and otherwise ignores it:
 
-Paths inside the file resolve relative to the **config file's** directory, not your working
-directory. See [CLI](/reference/cli#config-discovery) for how the file is found.
+```yaml
+$schema: https://example.com/oasts.schema.json
+```
+
+Paths inside the file resolve relative to `workspaceRoot` (see below), not your working directory.
+See [CLI](/reference/cli#config-discovery) for how the file is found.
 
 ```yaml title="oasts.yaml"
 schemaVersion: 1
@@ -33,6 +38,19 @@ validation:
 ```
 
 Three keys are required: `schemaVersion` (always `1`), `input`, and `output`.
+
+## `workspaceRoot`
+
+`input`, `output`, and `typescript.tsconfig` all resolve relative to `workspaceRoot`, not directly
+to the config file. It defaults to `.` — the config file's own directory — so leaving it out means
+"relative to the config file" is exactly right:
+
+```yaml
+workspaceRoot: .
+```
+
+`local.allowPaths` is the one path that always resolves against the config file's directory,
+regardless of `workspaceRoot`.
 
 ## `input`
 
