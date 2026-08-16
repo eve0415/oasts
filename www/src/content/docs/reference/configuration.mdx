@@ -118,36 +118,36 @@ client:
   authEnforcement: types    # types | runtime
   aggregate: false
   baseUrl:
-    source: server          # runtime | server | literal
-    index: 0
-  fetchOptions:
-    credentials: same-origin
-    cache: no-store
-    redirect: follow
-    referrerPolicy: no-referrer
-    mode: cors
-    keepalive: false
+    source: runtime         # runtime | server | literal
+  fetchOptions: {}          # every key below is unset unless you set it
+    # credentials: omit | same-origin | include
+    # cache: default | no-store | reload | no-cache | force-cache | only-if-cached
+    # redirect: follow | error | manual
+    # referrerPolicy: no-referrer | no-referrer-when-downgrade | same-origin | origin |
+    #   strict-origin | origin-when-cross-origin | strict-origin-when-cross-origin | unsafe-url
+    # mode: cors | no-cors | same-origin
+    # keepalive: false
 ```
 
 - **`baseUrl.source: runtime`** — the caller supplies it when constructing the transport, and the
-  generated `TransportConfig` requires it.
+  generated `TransportConfig` requires it. This is the default.
 - **`baseUrl.source: server`** — take the document's `servers[index]`.
 - **`baseUrl.source: literal`** — a `value` you write here.
 - **`authEnforcement`** — `types` puts security requirements in the call signature; `runtime` moves
   the check to call time. See [Auth](/guides/auth#compile-time-or-call-time).
 - **`aggregate`** — also re-export every operation from `generated/client/api.ts`. Off by default,
   because the aggregate names every operation and a bundler cannot drop the ones you never call.
-- **`fetchOptions`** — static defaults baked into every operation descriptor. See
-  [Transport](/guides/transport#static-fetch-defaults).
+- **`fetchOptions`** — static defaults baked into every operation descriptor. Nothing is baked in
+  until you set a key yourself. See [Transport](/guides/transport#static-fetch-defaults).
 
 ## `validation`
 
 ```yaml
 validation:
   engine: off        # off | zod | generated
-  request: true
-  response: true
-  unchecked: allow   # warn | error | allow
+  request: false
+  response: false
+  unchecked: warn    # warn | error | allow
 ```
 
 `unchecked` is the policy for successful response data the document declares no schema for. See
