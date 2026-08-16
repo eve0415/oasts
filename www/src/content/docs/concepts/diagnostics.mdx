@@ -31,20 +31,15 @@ CI.
 
 ## Severity
 
-- **`error`** — a refusal. Everything up to the write is all-or-nothing: the compiler builds every
-  file before it writes any of them, so an error found while compiling discards the run's whole
-  output — not the artifact that failed, and not the ones that succeeded.
+- **`error`** — a refusal. The run is transactional: oasts builds and stages the whole output before
+  committing it, and rolls back a write that fails part-way. A failed run leaves the previous
+  generated tree and ownership manifest unchanged.
 - **`warning`** — generation continues, and the warning names what was skipped or adjusted. A
   warning always means one operation, one component, or one artifact projection did *not* come out
   the way an unqualified reading of the document would suggest.
 
 Warnings matter more here than in most tools, because oasts never resolves an ambiguity silently.
 If an operation vanished from an artifact, a warning says so and names it.
-
-The write itself is not transactional. If it fails part-way — a permission, a full disk, a path that
-turns out not to be a directory — the files written before the failure stay on disk, and the
-ownership manifest, which is written last, does not. Fix the cause and re-run; a completed run
-rewrites the tree and the manifest together.
 
 ## Code families
 
