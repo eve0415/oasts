@@ -12,7 +12,7 @@
 # a copy, so both engines are exercised against one document and can be compared pairwise.
 files:
   - path: fixtures/validators-keyword-matrix.yaml
-    sha256: 015c2cf5316c8b76c8103a92a91d7b0bfa88713b6e5921a6a1c1fda78a0ace18
+    sha256: b56aa883dcef6813d4df3d2621bc00a9c78151df1e0249b2bde5cdff333b800d
   - path: crates/oasts-core/runtime/test-conformance/vectors-validators-conformance.ts
     sha256: 413eefb417efae6dac5b93de05d56be338ca66f8b76a408d60c8da7c143e9d7a
   - path: crates/oasts-core/runtime/test-conformance/vectors-zod-conformance.ts
