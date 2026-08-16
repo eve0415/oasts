@@ -141,10 +141,15 @@ the output. See [Determinism](/concepts/determinism).
 
 ## Why does it refuse to build instead of renaming something?
 
-Because a compiler-invented name is assigned by whatever order the document happened to be walked,
-and it silently moves the next time the document changes. A refusal you resolve once in
-`naming.overrides` cannot move. The same reasoning applies to filters that stop matching and to
-types that would widen past what the document says. See [Diagnostics](/concepts/diagnostics).
+It does rename, when the collision is with an identifier oasts invented itself — that gets a
+deterministic rename and a warning, because nothing about your intent is ambiguous. It refuses when
+the replacement is taken too, and when the name in question is one your document owns: picking for
+you there means a name assigned by whatever order the document happened to be walked, which moves
+the next time the document changes. An override you write once in `naming.overrides` cannot move.
+
+The rule underneath is that nothing happens *silently* — a widened type, a filter that stopped
+matching, a renamed identifier each come with a code and a source pointer. See
+[Diagnostics](/concepts/diagnostics).
 
 ## How fast is it?
 
