@@ -1123,11 +1123,11 @@ pub fn discover_candidate(
     explicit: Option<&Path>,
 ) -> Result<DiscoveredConfig, Diagnostic> {
     if let Some(explicit_path) = explicit {
-        let path = if explicit_path.is_absolute() {
+        let path = normalize_config_path(if explicit_path.is_absolute() {
             explicit_path.to_path_buf()
         } else {
             cwd.join(explicit_path)
-        };
+        });
         let extension = path.extension().and_then(OsStr::to_str);
         let supported = extension.is_some_and(|candidate| {
             SCRIPT_EXTENSIONS.contains(&candidate) || DATA_EXTENSIONS.contains(&candidate)
@@ -1159,7 +1159,7 @@ pub fn discover_candidate(
 
     let mut candidates = DISCOVERY_NAMES
         .iter()
-        .map(|name| cwd.join(name))
+        .map(|name| normalize_config_path(cwd.join(name)))
         .filter(|path| path.is_file())
         .collect::<Vec<_>>();
     if candidates.len() != 1 {
@@ -1230,7 +1230,7 @@ pub fn load_config_from_json(
     json: &[u8],
 ) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     let config_path = if config_path.is_absolute() {
-        config_path.to_path_buf()
+        normalize_config_path(config_path.to_path_buf())
     } else {
         absolutize_config_path(config_path.to_path_buf(), std::env::current_dir())?
     };
@@ -1256,7 +1256,7 @@ fn absolutize_config_path(
     current_dir: io::Result<PathBuf>,
 ) -> Result<PathBuf, Vec<Diagnostic>> {
     current_dir
-        .map(|current| current.join(discovered))
+        .map(|current| normalize_config_path(current.join(discovered)))
         .map_err(|error| {
             vec![config_error(
                 CODE_CONFIG_READ,
@@ -2386,6 +2386,30 @@ fn normalize_join(base: &Path, relative: &Path) -> PathBuf {
     result
 }
 
+/// Gives every config path one lexical identity before it reaches diagnostics or the resolved
+/// config. This does not touch the filesystem: an in-memory script-config path need not exist, and
+/// resolving a config-file symlink would change the directory its relative settings are anchored
+/// to.
+fn normalize_config_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                Some(Component::ParentDir) | None => normalized.push(".."),
+                Some(Component::CurDir | Component::Normal(_)) => {
+                    normalized.pop();
+                }
+            },
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
 fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let mut candidate = path.to_path_buf();
     loop {
@@ -2593,6 +2617,36 @@ mod tests {
             .join("oasts.json");
         let resolved = load_config_from_json(&relative, json).expect("relative path resolves");
         assert!(resolved.input.is_absolute());
+    }
+
+    #[test]
+    fn equivalent_config_paths_compare_and_render_identically() {
+        let directory = TestDirectory::new();
+        fs::create_dir(directory.path().join("nested")).expect("nested directory");
+        directory.write("openapi.yaml", "openapi: 3.1.0\npaths: {}\n");
+        let json = br#"{"schemaVersion":1,"input":{"path":"openapi.yaml"},"output":"generated"}"#;
+        let canonical = directory.write("oasts.json", std::str::from_utf8(json).expect("UTF-8"));
+        let equivalent = directory
+            .path()
+            .join("nested")
+            .join("..")
+            .join(".")
+            .join("oasts.json");
+
+        let direct = load_config_from_json(&canonical, json).expect("direct config path");
+        let normalized = load_config_from_json(&equivalent, json).expect("equivalent config path");
+        assert_eq!(direct, normalized);
+        assert_eq!(
+            discover_candidate(directory.path(), Some(&equivalent))
+                .expect("explicit config discovery")
+                .path,
+            canonical
+        );
+
+        let diagnostics = load_config_from_json(&equivalent, b"{").expect_err("malformed config");
+        let rendered = crate::diag::render_to_string(diagnostics);
+        assert!(rendered.contains(&canonical.to_string_lossy().into_owned()));
+        assert!(!rendered.contains("/nested/../"));
     }
 
     #[test]
@@ -4253,6 +4307,15 @@ mod tests {
             None
         );
         assert_eq!(to_u32(usize::MAX), u32::MAX);
+        assert_eq!(normalize_config_path(PathBuf::from(".")), PathBuf::new());
+        assert_eq!(
+            normalize_config_path(PathBuf::from("../../one/./two/../three")),
+            PathBuf::from("../../one/three")
+        );
+        assert_eq!(
+            normalize_config_path(PathBuf::from("/../../one/./two/../three")),
+            PathBuf::from("/one/three")
+        );
         assert_eq!(
             canonicalize_result(Ok(PathBuf::from("resolved")), "path"),
             Ok(PathBuf::from("resolved"))
