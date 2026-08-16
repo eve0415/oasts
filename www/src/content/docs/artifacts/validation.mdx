@@ -24,8 +24,11 @@ artifacts:
   zod: true
 ```
 
-Both are compiled from the same model and held to the same conformance vectors, so for any value
-they return the same verdict and the same parsed result. Validation-only keywords that the
+Both are compiled from the same model and share one capability matrix, and each engine's frozen
+conformance vectors hold it to the same verdicts — for any value the two agree on pass or fail.
+Success values agree structurally, not by identity: the generated validators hand back the input by
+reference, while Zod reconstructs the object with declared properties first. Issue messages and
+issue grouping are engine-local and deliberately not pinned. Validation-only keywords that the
 [types artifact](/artifacts/types) cannot express — numeric ranges, string patterns, length bounds —
 are exactly what these two carry.
 
@@ -44,15 +47,18 @@ validation:
 ```
 
 `engine` selects the implementation the client calls: `generated` uses the validators artifact,
-`zod` uses the Zod schemas, `off` (the default) does no runtime checking. `request` and `response`
-choose the positions.
+`zod` uses the Zod schemas, `off` does no runtime checking. There is no default — with the client
+artifact enabled, `validation.engine` is required, so the choice is always written down. `request`
+and `response` choose the positions.
 
 A failed check comes back as a result, not a throw — a `request-validation` or
 `response-validation` outcome carrying its issues, branched in the same `switch` as everything
 else. See [Client](/artifacts/client#failure-complete-results).
 
-`unchecked` is the policy for successful response data the document declares no schema for:
-`allow` passes it through, `warn` reports it at generation, `error` refuses.
+`unchecked` is the policy for successful response data that is decoded and then never checked
+against the OpenAPI schema — because `response: false` turns response validation off, or because the
+branch is a raw byte stream, which carries no schema to check. `allow` passes it through, `warn`
+reports it at generation, `error` refuses. The default is `warn`.
 
 <Aside type="note">
   Validators only ever observe wire values. When a [date representation](/guides/dates) is
@@ -86,6 +92,10 @@ the GitHub spec's generated artifact, minified and gzipped:
 
 Zod itself dominates a small bundle and amortizes across a large one, which is why the smallest
 operation gains the most proportionally.
+
+Those are figures from a one-off measurement, not numbers any gate holds, so read the ratio between
+the columns rather than the absolute kilobytes — your own spec, bundler and zod version will move
+them.
 
 Pick `classic` if you hand the emitted schemas to something that expects a classic `ZodType` — under
 `mini` they are `ZodMiniType`.
