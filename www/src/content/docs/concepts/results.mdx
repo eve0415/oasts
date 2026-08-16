@@ -9,6 +9,11 @@ A generated call resolves; it does not throw. What it resolves to is a discrimin
 `outcome`, and that union is **complete**: every documented response and every way the call can fail
 is a branch you can handle.
 
+One exception: a streaming body (`AsyncIterable<SseEvent<T>>` or `ReadableStream<Uint8Array>`)
+resolves successfully and can then fail mid-iteration. That surfaces as a `StreamFailure` —
+`{ kind: "sse"; eventsYielded; cause }` or `{ kind: "raw"; bytesRead; cause }` — thrown from the
+iterator, not as a result branch. See [Streaming](/guides/streaming).
+
 ```ts
 const result = await getPet(transport, { path: { petId: "42" } });
 
@@ -78,6 +83,10 @@ A documented non-2xx response is `ok: false` and carries `error` instead of `dat
 { outcome: "4XX"; ok: false; status: number; error: Problem; meta: ResponseMeta }
 ```
 
+`default` is the exception: because it can match any status, it emits **two** arms — an `ok: true`
+arm carrying `data` and an `ok: false` arm carrying `error`, both with the same declared schema.
+`if (result.ok)` picks the right one at runtime.
+
 ## `unmatched` — an undocumented status
 
 When the server answers with a status the document never declares, you get the response, classified
@@ -103,7 +112,7 @@ Nothing was successfully sent, or the failure happened before a response was mat
 
 | `outcome` | Carries | When |
 | --- | --- | --- |
-| `auth` | `message`, `triedAlternatives`, `cause?` | No configured credential satisfied any security alternative (under [`authEnforcement: runtime`](/guides/auth)) |
+| `auth` | `message`, `triedAlternatives`, `cause?` | No configured credential satisfied any security alternative — a provider returned `null` or threw, or the call passed `auth: 'anonymous'`. Reachable under either [`authEnforcement`](/guides/auth) mode; the default `types` additionally makes the *missing* credential a compile error. |
 | `aborted` | `reason` | The caller's `AbortSignal` fired |
 | `timeout` | `reason` | The request timed out |
 | `network` | `cause: TypeError` | `fetch` rejected — DNS, TLS, connection refused |
@@ -170,6 +179,9 @@ try {
   }
 }
 ```
+
+`unwrap(result)` is the same operation as a standalone function — it returns `{ data, meta }` or
+throws `ApiError`. `<op>OrThrow` is `unwrap` applied for you.
   </TabItem>
   <TabItem label="Just the happy path">
 ```ts
