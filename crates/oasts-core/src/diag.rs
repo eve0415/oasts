@@ -1,15 +1,31 @@
 //! Stable Oasts diagnostics.
 //!
-//! Configuration diagnostics use `OASTS0rrs`, where `rr` is the two-digit
-//! config rejection-rule number and `s` is a per-rule sequence digit.
-//! Input and semantic diagnostics use the reserved `OASTS1xxx` range.
+//! The thousands digit is the compiler stage a code comes from. Stages are
+//! drawn so that every code within one shares a single exit code:
 //!
-//! `OASTS9xxx` is the provisional band: capabilities this build gates off
-//! rather than refuses on the merits. A provisional code retires when its
-//! capability lands, so the band is expected to develop holes and nothing may
-//! renumber to close them. The second digit mirrors the category the code
-//! keeps — `90xx` config, `91xx` input — so a provisional code's exit code
-//! still reads off its number. `99xx` is reserved for test sentinels.
+//! | Stage  | Meaning                                             | Exit |
+//! |--------|-----------------------------------------------------|------|
+//! | `0xxx` | config validation, as `0rrs` — rule `rr`, sequence `s` | 2  |
+//! | `1xxx` | I/O and write failures                              | 2    |
+//! | `2xxx` | document loading, structure, and schema keywords    | 1    |
+//! | `3xxx` | semantic: names, value domains, links                | 1    |
+//! | `4xxx` | type emission                                       | 1    |
+//! | `5xxx` | client model                                        | 1    |
+//! | `6xxx` | artifacts, one sub-band per artifact                | 1    |
+//!
+//! The exit code is carried by [`Category`], not parsed out of the number; the
+//! table holds because stage membership is chosen to keep it true, and a code
+//! whose category disagrees with its stage is a bug.
+//!
+//! The hundreds digit sub-divides a stage. Sub-bands stay sparse deliberately,
+//! so a new code joins its siblings instead of landing at the end of a run.
+//!
+//! `9xxx` is the provisional band: capabilities this build gates off rather
+//! than refuses on the merits. A provisional code retires when its capability
+//! lands, so the band is expected to develop holes and nothing may renumber to
+//! close them. The second digit mirrors the stage the code would otherwise have
+//! had, so it keeps its category. `99xx` is reserved for test sentinels, which
+//! are never emitted.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
