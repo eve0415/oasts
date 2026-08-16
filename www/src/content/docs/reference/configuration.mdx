@@ -137,7 +137,7 @@ instead of honoring them; `accept` (the default) uses them to name and describe 
 
 ```yaml
 client:
-  transport: fetch
+  transport: fetch          # fetch (the only transport today)
   authEnforcement: types    # types | runtime
   aggregate: false
   baseUrl:
@@ -265,7 +265,7 @@ imports for resolvers that want those instead.
 
 ```yaml
 typescript:
-  tsconfig: auto     # auto | off | a path relative to the config file
+  tsconfig: auto     # auto | off | a path relative to workspaceRoot
 ```
 
 ## `limits`
