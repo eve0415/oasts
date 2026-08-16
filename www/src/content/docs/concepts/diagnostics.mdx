@@ -83,24 +83,28 @@ category the diagnostic carries. `99xx` is reserved for test sentinels and is ne
 
 ### Configuration
 
+All errors, all exit `2`.
+
 | Code | Meaning |
 | --- | --- |
-| `OASTS0102` | Two enabled artifacts share a directory, or one nests inside another |
+| `OASTS0102` | An artifact's output directory is unusable: it overlaps another enabled artifact's — equal or nested — or its own value is not a relative path of `[A-Za-z0-9_-]` segments |
+| `OASTS0221` | A `local.allowPaths` entry that is not relative, or a `limits.*` value outside its permitted range |
 | `OASTS0261` | A filter pattern is a regex literal whose body does not compile |
-| `OASTS0262` | A filter pattern matches no operation in the document |
-| `OASTS0263` | Filters selected operations but left none of them, and no webhooks either |
+| `OASTS0262` | A filter pattern matches no operation — or matches only callback operations, which are never filtered independently of the operation that declares them |
+| `OASTS0263` | Filters are declared and nothing survives them: no operations and no webhooks |
 
 ### Document and schema
 
-| Code | Meaning |
-| --- | --- |
-| `OASTS1115` | A discriminator `mapping` value that is not a JSON string, so it cannot name a schema |
-| `OASTS1117` | A `$recursiveRef` written with a value other than `"#"` |
-| `OASTS1118` | A dynamic reference whose target genuinely depends on the path evaluation took to reach it |
-| `OASTS1119` | Pruning removed every component schema and there was nothing else to emit |
-| `OASTS1120` | A lowercase status range (`4xx`) — canonicalized and reported, not rejected |
-| `OASTS1121` | Two keys in one responses object naming the same status once canonicalized |
-| `OASTS1122` | A narrowing keyword the emitted TypeScript cannot apply, where the leaf does *not* widen to `unknown` |
+| Code | Severity | Meaning |
+| --- | --- | --- |
+| `OASTS2105` | warning | A lowercase status range (`4xx`) — canonicalized and reported, not rejected |
+| `OASTS2106` | error | Two keys in one responses object naming the same status once canonicalized |
+| `OASTS2107` | warning | Pruning removed every component schema and no operation survived either |
+| `OASTS2201` | warning | A schema construct this OpenAPI version does not define — a 3.1-only keyword in a 3.0 document, a boolean schema in 3.0, a parameter with neither `schema` nor `content`. The type widens to `unknown` |
+| `OASTS2205` | warning | A narrowing keyword the emitted TypeScript cannot apply, where the leaf does *not* widen to `unknown`. The validators artifact enforces it instead |
+| `OASTS2215` | error | A `$recursiveRef` written with a value other than `"#"` |
+| `OASTS2216` | warning | A `$dynamicRef` or `$recursiveRef` whose target genuinely depends on the path evaluation took to reach it |
+| `OASTS2221` | warning | A discriminator `mapping` value that is not a JSON string, so it cannot name a schema |
 
 ### Names the compiler will not invent
 
