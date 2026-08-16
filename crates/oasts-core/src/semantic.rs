@@ -26,7 +26,7 @@ use crate::num::{finite_binary64, first_number_outside_binary64, render_number};
 
 const CODE_OPERATION_NAME: &str = "OASTS3001";
 const CODE_TYPE_NAME: &str = "OASTS3002";
-const CODE_ENUM_RULE_14: &str = "OASTS3101";
+pub(crate) const CODE_ENUM_RULE_14: &str = "OASTS3101";
 const CODE_NUMERIC_BOUND_DOMAIN: &str = "OASTS3102";
 const CODE_ANNOTATION_DOMAIN: &str = "OASTS3103";
 const CODE_LINK_OPERATION_ID: &str = "OASTS3201";

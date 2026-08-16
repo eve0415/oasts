@@ -21,6 +21,7 @@ use crate::loader::{
     DocId, DocumentGraph, DynamicResolution, append_pointer, append_pointer_index,
 };
 use crate::media::canonical_content_key;
+use crate::semantic::CODE_ENUM_RULE_14;
 
 const CODE_VERSION: &str = "OASTS2101";
 const CODE_SHAPE: &str = "OASTS2102";
@@ -59,7 +60,6 @@ const CODE_RECURSIVE_REF_VALUE: &str = "OASTS2215";
 /// because two or more schema resources declare the anchor it names. No single schema can stand in
 /// for it, so the node widens to unknown and the validators artifact refuses rather than guessing.
 const CODE_DYNAMIC_SCOPE: &str = "OASTS2216";
-const CODE_ENUM_RULE_14: &str = "OASTS3101";
 const CODE_SERVER_VAR_ENUM_EMPTY: &str = "OASTS2121";
 const CODE_SERVER_VAR_DEFAULT: &str = "OASTS2122";
 const CODE_HEADER_CONTENT_TYPE: &str = "OASTS2114";
