@@ -76,8 +76,10 @@ a request to fetch one. Only something that actually has to be *read* over the n
 
 ## `output`, `namespace`
 
-`output` is the directory everything is written under. `namespace` prefixes the emitted module
-namespace when more than one API is generated into one tree.
+`output` is the directory everything is written under. `namespace` defaults to `api` and names the
+aggregate client file (`client/api.ts` — see `aggregate` below) and the TanStack query-key
+namespace. It's also what will prefix the emitted module namespace once more than one API can be
+generated into one tree.
 
 ## `artifacts`
 
