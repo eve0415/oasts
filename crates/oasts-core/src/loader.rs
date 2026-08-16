@@ -32,7 +32,7 @@ const CODE_MAX_DOCUMENT_BYTES: &str = "OASTS2011";
 const CODE_MAX_TOTAL_BYTES: &str = "OASTS2012";
 const CODE_MAX_DOCUMENTS: &str = "OASTS2013";
 const CODE_MAX_REF_DEPTH: &str = "OASTS2014";
-const CODE_REMOTE_UNSUPPORTED: &str = "OASTS9101";
+const CODE_REMOTE_UNSUPPORTED: &str = "OASTS9201";
 const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
 
 /// Stable index of a document within one graph.
@@ -1869,7 +1869,7 @@ fn encode_relative_path(path: &Path) -> Result<String, String> {
 /// `$id` names a schema resource; it is not a request to fetch one. A bundled document that
 /// identifies its resources with `https://` URIs resolves entirely in memory, so the scheme check
 /// belongs at the point something is actually read — `local_path_from_url`, which every path that
-/// reaches the filesystem goes through, and which is where OASTS9101 now comes from.
+/// reaches the filesystem goes through, and which is where OASTS9201 now comes from.
 fn resolve_identity_uri(
     base: &Url,
     reference: &str,
