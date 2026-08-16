@@ -6685,9 +6685,11 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.severity == Severity::Warning)
         );
-        assert!(!diagnostics.iter().any(|diagnostic| {
-            matches!(diagnostic.code, "OASTS5201" | "OASTS5202")
-        }));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| { matches!(diagnostic.code, "OASTS5201" | "OASTS5202") })
+        );
     }
 
     #[test]
