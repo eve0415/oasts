@@ -237,6 +237,7 @@ components:
 
             let mut sink = DiagnosticSink::new();
             let files = compile(&config, true, &mut sink).expect("emitted files");
+            let diagnostics = format!("{:#?}", sink.as_slice());
 
             assert!(!files.is_empty(), "{artifact}");
             assert_eq!(
@@ -245,10 +246,9 @@ components:
                     .filter(|diagnostic| diagnostic.code == "OASTS4202")
                     .count(),
                 1,
-                "{artifact}: {:#?}",
-                sink.as_slice()
+                "{artifact}: {diagnostics}"
             );
-            assert!(!sink.has_errors(), "{artifact}: {:#?}", sink.as_slice());
+            assert!(!sink.has_errors(), "{artifact}: {diagnostics}");
         }
     }
 
