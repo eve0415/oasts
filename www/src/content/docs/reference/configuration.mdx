@@ -278,6 +278,10 @@ limits:
   maxRefDepth: 64
 ```
 
+Each is clamped to a range, and a value outside it fails the build rather than silently clamping:
+`maxDocumentBytes` 1 KiB–1 GiB, `maxTotalBytes` 1 KiB–4 GiB, `maxDocuments` 1–4096, `maxRefDepth`
+1–1024.
+
 ## `local`
 
 The trust boundary for local documents and their `$ref` targets. Each entry widens the set of
