@@ -93,7 +93,13 @@ artifacts:
   validators: false
   tanstack: false
   msw: false
+validation:
+  engine: "off"
+  unchecked: allow
 ```
+
+The client artifact requires an explicit `validation` block; `engine: "off"` opts out of boundary
+checking. See [`validation`](#validation) below.
 
 ```yaml
 artifacts:
@@ -112,6 +118,10 @@ share a directory, or nest one inside another — that is an `OASTS0102` at conf
 collision at write time.
 
 With no `artifacts` block you get types.
+
+Every block below is a fragment, not a whole config. Options for an artifact you have not enabled are
+an error, not a no-op — a `zod:` block without `artifacts.zod` is an `OASTS0121`, and a `validation:`
+block without `artifacts.client` is an `OASTS0161`. Enable the artifact first, then configure it.
 
 ## `types`
 
