@@ -5,8 +5,9 @@ sidebar:
   order: 1
 ---
 
-The types artifact is the one every other artifact builds on, and it is what you get with no
-`artifacts` block at all.
+The types artifact is what the client, MSW and TanStack artifacts build on, and it is what you get
+with no `artifacts` block at all. (Zod and validators declare their own interfaces and can run
+without it.)
 
 ```yaml title="oasts.yaml"
 artifacts:
@@ -26,9 +27,10 @@ export interface Pet {
 
 Supported keywords are the ones TypeScript can represent soundly: primitive and aggregate types,
 `properties`, `required`, `additionalProperties`, `enum`, `const`, nullable forms, `allOf`, `oneOf`,
-`anyOf`, tuple and array forms, and local or external references. Validation-only constraints —
-numeric ranges, string patterns, length bounds — do not change the TypeScript output; they compile
-into the [Zod and validators artifacts](/artifacts/validation) instead.
+`anyOf`, tuple and array forms, and references — local, or into other local files (remote `http(s)`
+`$ref`s are refused). Validation-only constraints — numeric ranges, string patterns, length
+bounds — do not change the TypeScript output; they compile into the
+[Zod and validators artifacts](/artifacts/validation) instead.
 
 ## Constraints the type cannot hold go in the doc comment
 
@@ -114,12 +116,13 @@ survive the round trip:
 // bigint                cents: bigint;
 ```
 
-Conversion happens at the client boundary, so this one needs the client artifact enabled.
+Conversion happens at the client boundary, so this one needs the client artifact enabled. `bigint`
+is also refused alongside the TanStack artifact, whose keys must stay JSON-serializable.
 
 ### Dates
 
-`types.dateTime` and `types.date` turn wire strings into `Date` or `Temporal` values in your code.
-They have their own page — [Dates and times](/guides/dates).
+`types.dateTime` turns wire strings into `Date` or `Temporal` values in your code; `types.date` into
+`Temporal`. They have their own page — [Dates and times](/guides/dates).
 
 ## Naming collisions
 
