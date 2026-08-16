@@ -177,14 +177,26 @@ client:
 
 ```yaml
 validation:
-  engine: off        # off | zod | generated
+  engine: "off"      # off | zod | generated — required, no default
   request: false
   response: false
   unchecked: warn    # warn | error | allow
 ```
 
-`unchecked` is the policy for successful response data the document declares no schema for. See
-[Validation](/artifacts/validation).
+With the client artifact enabled the whole block is required, and `engine` has no default — the
+choice is always written down. The rest has to agree with it: `"off"` needs `request` and `response`
+both `false`, any other engine needs at least one of them `true`, `zod` needs `artifacts.zod`, and
+`generated` needs `artifacts.validators`.
+
+`unchecked` is the policy for successful response data the document declares no schema for. It is
+settled at generation rather than at runtime, so `error` refuses to build and only makes sense
+alongside `response: true`. See [Validation](/artifacts/validation).
+
+<Aside type="caution" title="`warn` prints nothing today">
+  `warn` is the default and is currently silent — the diagnostic it raises is dropped before the run
+  reports, so it behaves as `allow`. If you need responses the document leaves unschema'd to fail the
+  build, set `unchecked: error`.
+</Aside>
 
 ## `zod`
 
