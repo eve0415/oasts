@@ -92,7 +92,7 @@ test("invalid script config exits 2 through the spawned bin", () => {
   writeFileSync(join(directory, "oasts.config.ts"), "export default Promise.resolve({});\n");
   const result = nodeCli(["generate"], directory);
   assert.equal(result.status, 2);
-  assert.match(result.stderr, /error\[OASTS0013\]: config default export is a promise/);
+  assert.match(result.stderr, /error\[OASTS0012\]: config default export is a promise/);
 });
 
 test("the standalone Rust binary still rejects script configs with OASTS9001", () => {

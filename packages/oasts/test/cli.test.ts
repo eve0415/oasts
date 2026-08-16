@@ -130,7 +130,7 @@ test("usage, watch, discovery, spec, and config failures exit 2", async () => {
   writeFileSync(join(invalid, "oasts.config.ts"), "export default Promise.resolve({});\n");
   const asyncConfig = await invoke(["generate"], invalid);
   assert.equal(asyncConfig.code, 2);
-  assert.match(asyncConfig.stderr, /error\[OASTS0013\]: config default export is a promise/);
+  assert.match(asyncConfig.stderr, /error\[OASTS0012\]: config default export is a promise/);
 
   const badSchema = scriptFixture();
   writeFileSync(

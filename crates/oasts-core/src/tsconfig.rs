@@ -138,7 +138,7 @@ impl TsconfigError {
                 ),
             ),
             Self::ExtendsCycle { path, target } => Diagnostic::config(
-                "OASTS0254",
+                "OASTS0252",
                 format!(
                     "tsconfig '{}' extends '{}', which is already in its own extends chain",
                     path.display(),
@@ -146,21 +146,21 @@ impl TsconfigError {
                 ),
             ),
             Self::ExtendsTooDeep { path } => Diagnostic::config(
-                "OASTS0254",
+                "OASTS0252",
                 format!(
                     "tsconfig '{}' extends a chain deeper than {MAX_EXTENDS_DEPTH} files",
                     path.display()
                 ),
             ),
             Self::ExtendsUnresolved { path, target } => Diagnostic::config(
-                "OASTS0255",
+                "OASTS0253",
                 format!(
                     "tsconfig '{}' extends '{target}', which does not resolve to a readable file",
                     path.display()
                 ),
             ),
             Self::TooManyFiles { path } => Diagnostic::config(
-                "OASTS0254",
+                "OASTS0252",
                 format!(
                     "reading tsconfig '{}' would pass the {MAX_TSCONFIG_FILES}-file budget for one run",
                     path.display()
@@ -675,7 +675,7 @@ mod tests {
             matches!(&error, TsconfigError::ExtendsCycle { target, .. } if target == &temp.path().join("a.json")),
             "{error:?}"
         );
-        assert_eq!(error.into_diagnostic().code, "OASTS0254");
+        assert_eq!(error.into_diagnostic().code, "OASTS0252");
     }
 
     #[test]
@@ -697,7 +697,7 @@ mod tests {
             matches!(error, TsconfigError::ExtendsTooDeep { .. }),
             "{error:?}"
         );
-        assert_eq!(error.into_diagnostic().code, "OASTS0254");
+        assert_eq!(error.into_diagnostic().code, "OASTS0252");
     }
 
     #[test]
@@ -713,7 +713,7 @@ mod tests {
             matches!(&error, TsconfigError::ExtendsUnresolved { target, .. } if target == "./absent.json"),
             "{error:?}"
         );
-        assert_eq!(error.clone().into_diagnostic().code, "OASTS0255");
+        assert_eq!(error.clone().into_diagnostic().code, "OASTS0253");
         assert!(error.into_diagnostic().message.contains("./absent.json"));
 
         // A bare specifier is a package lookup this reader deliberately does not perform.
@@ -774,7 +774,7 @@ mod tests {
             matches!(error, TsconfigError::TooManyFiles { .. }),
             "{error:?}"
         );
-        assert_eq!(error.into_diagnostic().code, "OASTS0254");
+        assert_eq!(error.into_diagnostic().code, "OASTS0252");
     }
 
     #[test]
