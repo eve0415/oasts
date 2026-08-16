@@ -31,7 +31,8 @@ CI.
 
 ## Severity
 
-- **`error`** — nothing is written. The build fails.
+- **`error`** — nothing is written. Not the artifact that failed, not the ones that succeeded: the
+  run's whole output is discarded.
 - **`warning`** — generation continues, and the warning names what was skipped or adjusted. A
   warning always means one operation, one component, or one artifact projection did *not* come out
   the way an unqualified reading of the document would suggest.
@@ -108,42 +109,52 @@ All errors, all exit `2`.
 
 ### Names the compiler will not invent
 
-These are the [naming](/guides/naming) refusals. Each has a remedy in `naming.overrides`.
+These are the [naming](/guides/naming) refusals. Each has a remedy in `naming.overrides`, and the
+run prints a ready-made block of them after its diagnostics.
 
-| Code | Meaning |
-| --- | --- |
-| `OASTS1307` | A renamed component import collides with another operation-module rename |
-| `OASTS1308` | A discriminator `mapping` value resolving to no allocated component schema |
-| `OASTS1309` | A discriminator whose `mapping`/`const` proof is internally incoherent |
-| `OASTS1310` | A request/response variant's replacement name is itself declared, or another variant's replacement |
-| `OASTS1311` | A wire twin's derived `{Name}Wire` is already a declared component's name |
-| `OASTS1312` | `{Name}WireValue` is itself declared — nothing compiler-invented remains, so the document is refused |
-| `OASTS1313` | A union whose branches convert date/time values differently, with nothing to tell them apart |
-| `OASTS1315` | A property two `allOf` branches declare with schemas that intersect to nothing (warning) |
-| `OASTS1316` | A discriminator that can select branches, but whose union lacks unit-literal tags on every branch |
-| `OASTS1400` | A JSON response media entry renamed because its validator-name fragment collided |
+| Code | Severity | Meaning |
+| --- | --- | --- |
+| `OASTS4102` | error | An operation module declares a name it also imports, and the import's replacement name is taken here too |
+| `OASTS4103` | error | A request/response variant's replacement name is itself declared, or is another variant's replacement |
+| `OASTS4104` | warning | A `{Name}Wire` twin collides with a declared name, so it is emitted as `{Name}WireValue` instead |
+| `OASTS4105` | error | `{Name}WireValue` is declared too — nothing compiler-invented is left to move |
+
+### Composition and discriminators
+
+| Code | Severity | Meaning |
+| --- | --- | --- |
+| `OASTS4201` | warning | An `allOf` proven to have no inhabitants, lowered to `never` |
+| `OASTS4204` | warning | A discriminator `mapping` value resolving to no allocated component schema; the entry contributes no tag |
+| `OASTS4205` | warning | A discriminator whose `mapping`/`const` proof is internally incoherent — a structural union is emitted instead |
+| `OASTS4206` | warning | A property two `allOf` branches declare with schemas that intersect to nothing |
+| `OASTS4207` | warning | A discriminator that can select branches, but whose union lacks unit-literal tags on every branch |
+| `OASTS4301` | error | A union whose date/time conversions cannot be told apart — branches converting the same values differently, or disagreeing on which of those properties they require |
 
 ### Artifact projections
 
-An artifact that cannot express one thing skips that thing and warns; the rest still generates.
+Only MSW degrades. An operation MSW cannot mock is skipped with a warning and the rest of the
+handlers still generate, and it refuses that way **on purpose**: an error would throw the whole
+run's output away over one operation it could not project. Everything else in this band is an
+error, so it stops the build.
 
-| Code | Artifact | Meaning |
-| --- | --- | --- |
-| `OASTS1501` | validators | A validation keyword the validators artifact does not implement |
-| `OASTS1502` | validators | A schema degraded to an unknown leaf, so no faithful validator exists |
-| `OASTS1503` | validators | An applicator's subschema is not fully checkable, so the outer check would be unsound |
-| `OASTS1504` | zod | A validation keyword the Zod artifact does not implement |
-| `OASTS1505` | zod | A schema degraded to an unknown leaf, so no faithful Zod schema exists |
-| `OASTS1506` | msw | A path literal carrying a character the MSW matcher cannot match |
-| `OASTS1507` | msw | An HTTP method for which MSW exposes no handler factory |
-| `OASTS1508` | msw | A parameter's wire form cannot be inverted into its TypeScript type |
-| `OASTS1509` | msw | A body cannot be projected between wire form and TypeScript type |
-| `OASTS1510` | msw | A parameter serialization loses boundaries before the handler can project it |
-| `OASTS1511` | tanstack | A read carries no payload on at least one success branch, so it emits no query descriptor |
-| `OASTS1512` | tanstack | Two path nodes normalize to the same key-factory name |
-| `OASTS1513` | tanstack | A `naming.overrides.pathSegments` entry matched no path segment |
-| `OASTS1514` | msw | A streaming body has no buffered value to project in either direction |
-| `OASTS1515` | msw | A form body whose schema declares no properties — the handler is emitted with no body fields |
+| Code | Artifact | Severity | Meaning |
+| --- | --- | --- | --- |
+| `OASTS6001` | validators, zod | warning | A response media entry renamed because its generated schema name collided with another's |
+| `OASTS6002` | validators | error | A validation keyword the validators artifact does not implement |
+| `OASTS6003` | validators | error | A schema degraded to an unknown leaf, so no faithful validator exists |
+| `OASTS6004` | validators | error | An applicator's subschema is not fully checkable, so the outer check would be unsound |
+| `OASTS6101` | zod | error | A validation keyword the Zod artifact does not implement |
+| `OASTS6102` | zod | error | A schema degraded to an unknown leaf, so no faithful Zod schema exists |
+| `OASTS6201` | msw | warning | A path literal carrying a character the MSW matcher always reads as a wildcard |
+| `OASTS6202` | msw | warning | An HTTP method for which MSW exposes no handler factory |
+| `OASTS6203` | msw | warning | A parameter's wire form cannot be projected into its TypeScript type |
+| `OASTS6204` | msw | warning | A request or response body cannot be projected between wire form and TypeScript type |
+| `OASTS6205` | msw | warning | A parameter serialization loses boundaries before the handler can invert it |
+| `OASTS6206` | msw | warning | A streaming body has no buffered value to project in either direction |
+| `OASTS6207` | msw | warning | A form body whose schema declares no properties — the handler is emitted projecting no body fields |
+| `OASTS6301` | tanstack | warning | An operation that gets no descriptor: a read with an empty success branch, or a stream, which is excluded on the mutation side too |
+| `OASTS6302` | tanstack | error | Two things collide over one key-factory name — two paths, two sibling segments, a reserved import, or a duplicated path parameter |
+| `OASTS6303` | tanstack | warning | A `naming.overrides.pathSegments` entry matched no path segment |
 
 <Aside type="note">
   This is the set you are most likely to hit, not the complete allocation. Run
