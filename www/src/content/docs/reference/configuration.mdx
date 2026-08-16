@@ -167,7 +167,6 @@ instead of honoring them; `accept` (the default) uses them to name and describe 
 
 ```yaml
 client:
-  transport: fetch          # fetch (the only transport today)
   authEnforcement: types    # types | runtime
   aggregate: false
   baseUrl:
@@ -181,6 +180,8 @@ client:
     # mode: cors | no-cors | same-origin
     # keepalive: false
 ```
+
+Fetch is the only client implementation today, so there is no `client.transport` selector.
 
 - **`baseUrl.source: runtime`** — the caller supplies it when constructing the transport, and the
   generated `TransportConfig` requires it. This is the default.
