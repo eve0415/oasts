@@ -74,6 +74,7 @@ Two things worth knowing:
 
 - **Origin is enforced.** The matcher is built from the operation's server URL, so two APIs mocked
   in one suite never answer for each other. Pass `{ baseUrl }` to point a handler somewhere else.
+  When the document declares no absolute server URL, `baseUrl` is required rather than an override.
 - **MSW resolves first match wins**, and a parameterized path shadows a static sibling — put
   `/pets/mine` ahead of `/pets/{petId}` in your handler array. Registering a handler through
   `server.use()` in a test always wins, because MSW prepends it.
@@ -94,8 +95,17 @@ const handler = http.get("/pets/{petId}", ({ response }) => response("200").json
 
 ## When an operation cannot be mocked
 
-An operation MSW cannot express — a path its matcher cannot represent, a parameter whose wire form
-has no unique inverse — gets no handler and a warning naming it, rather than a handler that
+An operation MSW cannot express gets no handler and a warning naming it, rather than a handler that
 silently never matches (which otherwise surfaces as some unrelated test's unhandled-request
-warning). The rest of the document still generates: one operation the mock cannot express should
-not cost you the others.
+warning). The reasons: a path literal containing `*`, which the matcher always reads as a wildcard;
+an HTTP method MSW exposes no factory for; a parameter or body whose wire form has no unique inverse
+(`allowReserved`, exploded `label` over a collection) or that this artifact cannot project back into
+its declared type (recursive or tuple schemas, `patternProperties`, or a date/int64 codec, which
+lives in the client output a handler never imports); and a streaming body, which has no buffered
+value in either direction.
+
+The rest of the document still generates: one operation the mock cannot express should not cost you
+the others. That holds for anything the *handler* cannot express. A response media oasts refuses
+outright — XML, an unnamed multipart part, a `text/*` whose schema admits no string — is an error
+rather than a warning, and [an error anywhere](/concepts/diagnostics) discards the whole document's
+output.
