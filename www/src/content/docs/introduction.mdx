@@ -18,8 +18,9 @@ oasts is a compiler. It reads an OpenAPI 3.0 or 3.1 document and writes TypeScri
     case, and exhaustiveness checking proves it.
   </Card>
   <Card title="Byte-identical output" icon="ph:fingerprint">
-    Same input, same config, same version ⇒ the same bytes on every machine and OS. Generated code
-    is meant to be committed; `oasts generate --check` makes drift a CI failure.
+    Same document bytes, same config, same version, same consumer `tsconfig.json` ⇒ the same bytes
+    on every machine and OS. Generated code is meant to be committed; `oasts generate --check`
+    makes drift a CI failure. See [Determinism](/concepts/determinism).
   </Card>
   <Card title="Auth the compiler checks" icon="ph:lock-key">
     An operation's security requirements compile into its call signature, so calling one whose auth
@@ -63,19 +64,9 @@ oasts is a compiler. It reads an OpenAPI 3.0 or 3.1 document and writes TypeScri
   </Card>
 </CardGrid>
 
-Have a question about how it compares, what it refuses, or what it deliberately does not do? The
-[FAQ](/faq) answers the common ones.
+Have a question about what it refuses, or what it deliberately does not do? The [FAQ](/faq) answers
+the common ones.
 
-## How it compares
+## Performance
 
-| | oasts | openapi-typescript | orval / hey-api | openapi-generator |
-| --- | --- | --- | --- | --- |
-| Types | ✅ | ✅ | ✅ | ✅ |
-| Typed client | ✅ zero-dependency | — | ✅ needs runtime deps | ✅ heavyweight templates |
-| Failure-complete results | ✅ | — | — | — |
-| Hierarchical, prefix-invalidatable query keys | ✅ | — | — | — |
-| Serialization matrix (style/explode, multipart) | ✅ full | n/a | partial | partial |
-| Deterministic committed output | ✅ byte-identical, `--check` gated | — | — | — |
-| Toolchain | native binary via npm | Node | Node | Java |
-
-Performance is measured, not promised: the in-repo benchmark harness compiles GitHub's full OpenAPI spec to types in ~80 ms — warm p50 of end-to-end `oasts generate` runs on the reference container — with every run gated on repeatability.
+Measured, not promised: the in-repo benchmark harness compiles GitHub's full OpenAPI spec to types in ~80 ms — warm p50 of end-to-end `oasts generate` runs on the reference container — with every run gated on repeatability.
