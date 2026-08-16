@@ -13,10 +13,10 @@ use crate::diag::Diagnostic;
 use crate::emit::GeneratedFile;
 
 const MANIFEST_NAME: &str = ".oasts-manifest.json";
-const CODE_MANIFEST: &str = "OASTS0231";
-const CODE_PATH: &str = "OASTS0232";
-const CODE_IO: &str = "OASTS0233";
-const CODE_DUPLICATE: &str = "OASTS0234";
+const CODE_MANIFEST: &str = "OASTS1011";
+const CODE_PATH: &str = "OASTS1012";
+const CODE_IO: &str = "OASTS1013";
+const CODE_DUPLICATE: &str = "OASTS1014";
 const PARALLEL_IO_MIN_FILES: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use oasts_core::diag::{self, Diagnostic};
 use oasts_core::driver::{self, Command as DriverCommand, ConfigSource, Outcome};
 
-const CODE_CURRENT_DIR: &str = "OASTS0001";
+const CODE_CURRENT_DIR: &str = "OASTS1001";
 
 #[derive(Debug, Parser)]
 #[command(name = "oasts", disable_help_subcommand = true)]
@@ -780,7 +780,7 @@ mod tests {
         let (code, _, stderr) = invoke(&["oasts", "generate"], temp.path());
 
         assert_eq!(code, 2, "{stderr}");
-        assert!(stderr.contains("error[OASTS0231]"), "{stderr}");
+        assert!(stderr.contains("error[OASTS1011]"), "{stderr}");
         assert!(!output.join(generated).exists());
     }
 
@@ -857,7 +857,7 @@ mod tests {
         .expect("invalid manifest");
         let (code, _, stderr) = invoke(&["oasts", "generate", "--check"], temp.path());
         assert_eq!(code, 2);
-        assert!(stderr.contains("OASTS0231"));
+        assert!(stderr.contains("OASTS1011"));
     }
 
     #[test]

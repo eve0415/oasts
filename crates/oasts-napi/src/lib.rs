@@ -289,7 +289,7 @@ mod tests {
         .expect("invalid manifest");
         let invalid_manifest = run(options(&temp, "generate", true));
         assert_eq!(invalid_manifest.exit_code, 2);
-        assert!(invalid_manifest.rendered_stderr.contains("OASTS0231"));
+        assert!(invalid_manifest.rendered_stderr.contains("OASTS1011"));
     }
 
     #[test]
@@ -389,12 +389,12 @@ mod tests {
 
     #[test]
     fn diagnostic_conversion_preserves_location_fields() {
-        let diagnostic = Diagnostic::config("OASTS0001", "message")
+        let diagnostic = Diagnostic::config("OASTS1001", "message")
             .with_source("config.yaml")
             .with_location(3, 7)
             .with_json_pointer("/input");
         let converted = to_diagnostic_js(&diagnostic);
-        assert_eq!(converted.code, "OASTS0001");
+        assert_eq!(converted.code, "OASTS1001");
         assert_eq!(converted.severity, "error");
         assert_eq!(converted.source_id.as_deref(), Some("config.yaml"));
         assert_eq!((converted.line, converted.col), (Some(3), Some(7)));
@@ -453,7 +453,7 @@ mod tests {
         let failed = run(options(&temp, "generate", false));
 
         assert_eq!(failed.exit_code, 2, "{}", failed.rendered_stderr);
-        for code in ["OASTS0231", "OASTS0241"] {
+        for code in ["OASTS1011", "OASTS0241"] {
             assert!(
                 failed
                     .diagnostics

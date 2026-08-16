@@ -13,7 +13,7 @@ use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::filter::Filters;
 use crate::syntax::parse_yaml_value;
 
-const CODE_IO: &str = "OASTS0001";
+const CODE_IO: &str = "OASTS1001";
 const CODE_DISCOVERY: &str = "OASTS0011";
 const CODE_SCRIPT_CONFIG_UNSUPPORTED: &str = "OASTS9001";
 const CODE_PARSE: &str = "OASTS0031";

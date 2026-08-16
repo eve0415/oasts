@@ -20,7 +20,7 @@ use crate::config::ResolvedConfig;
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::syntax::parse_yaml_document_value;
 
-const CODE_IO: &str = "OASTS1001";
+const CODE_IO: &str = "OASTS1003";
 const CODE_REMOTE_UNSUPPORTED: &str = "OASTS9101";
 const CODE_REF_ESCAPE: &str = "OASTS2001";
 const CODE_NON_UNICODE_PATH: &str = "OASTS2002";

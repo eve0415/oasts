@@ -369,7 +369,7 @@ mod tests {
         let mut writer = FailingWriter;
         std::io::Write::flush(&mut writer).expect("flush is infallible");
         render(
-            vec![Diagnostic::config("OASTS0001", "failure")],
+            vec![Diagnostic::config("OASTS1001", "failure")],
             &mut writer,
         )
         .expect_err("write failure");
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn render_writes_located_diagnostics_to_writer() {
-        let located = Diagnostic::config("OASTS0001", "failure")
+        let located = Diagnostic::config("OASTS1001", "failure")
             .with_source("config.yaml")
             .with_location(4, 2)
             .with_json_pointer("/input");
@@ -385,7 +385,7 @@ mod tests {
         render(vec![located], &mut buffer).expect("render");
         assert_eq!(
             String::from_utf8(buffer).expect("UTF-8"),
-            "error[OASTS0001]: failure\n  --> config.yaml:4:2 /input\n"
+            "error[OASTS1001]: failure\n  --> config.yaml:4:2 /input\n"
         );
     }
 
@@ -436,7 +436,7 @@ mod tests {
         };
         let input_error = Diagnostic {
             category: Category::Input,
-            ..diagnostic(None, None, None, "OASTS1001", "input")
+            ..diagnostic(None, None, None, "OASTS1003", "input")
         };
         let mut sink = DiagnosticSink::new();
         sink.push(warning);
@@ -451,11 +451,11 @@ mod tests {
 
     #[test]
     fn constructors_metadata_and_collection_accessors_are_covered() {
-        let configured = Diagnostic::config("OASTS0001", "config")
+        let configured = Diagnostic::config("OASTS1001", "config")
             .with_source("config.yaml")
             .with_location(3, 7)
             .with_json_pointer("/input");
-        let input = Diagnostic::input("OASTS1001", "input");
+        let input = Diagnostic::input("OASTS1003", "input");
 
         assert_eq!(configured.source_id.as_deref(), Some("config.yaml"));
         assert_eq!((configured.line, configured.col), (Some(3), Some(7)));

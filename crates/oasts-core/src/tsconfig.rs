@@ -127,11 +127,11 @@ impl TsconfigError {
     pub(crate) fn into_diagnostic(self) -> Diagnostic {
         match self {
             Self::Unreadable { path, reason } => Diagnostic::config(
-                "OASTS0253",
+                "OASTS1002",
                 format!("tsconfig '{}' could not be read: {reason}", path.display()),
             ),
             Self::Malformed { path, reason } => Diagnostic::config(
-                "OASTS0253",
+                "OASTS1002",
                 format!(
                     "tsconfig '{}' is not valid JSON with comments: {reason}",
                     path.display()
@@ -737,7 +737,7 @@ mod tests {
             matches!(error, TsconfigError::Unreadable { .. }),
             "{error:?}"
         );
-        assert_eq!(error.into_diagnostic().code, "OASTS0253");
+        assert_eq!(error.into_diagnostic().code, "OASTS1002");
 
         let malformed = write(temp.path(), "bad.json", r#"{ "compilerOptions": }"#);
         let error = read_err(&malformed);
@@ -745,7 +745,7 @@ mod tests {
             matches!(error, TsconfigError::Malformed { .. }),
             "{error:?}"
         );
-        assert_eq!(error.into_diagnostic().code, "OASTS0253");
+        assert_eq!(error.into_diagnostic().code, "OASTS1002");
 
         let oversized = write(
             temp.path(),
@@ -966,7 +966,7 @@ mod tests {
             consumer_provides_temporal(&output, &TsconfigSource::Path(broken));
         assert!(!provides);
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "OASTS0253");
+        assert_eq!(diagnostics[0].code, "OASTS1002");
     }
 
     #[test]
