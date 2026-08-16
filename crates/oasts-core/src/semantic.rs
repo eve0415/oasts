@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde_json::{Number, Value};
@@ -272,14 +273,30 @@ pub struct Analyzed {
 
 /// Runs name allocation and rule-14 enum analysis using resolved config.
 pub fn analyze(ir: Ir, config: &ResolvedConfig, sink: &mut DiagnosticSink) -> Analyzed {
-    analyze_with_options(ir, &config.naming, &config.types, sink)
+    analyze_with_options_and_config_path(
+        ir,
+        &config.naming,
+        &config.types,
+        Some(&config.config_path),
+        sink,
+    )
 }
 
 /// Runs semantic analysis with the two option groups that affect Phase 3.
 pub fn analyze_with_options(
+    ir: Ir,
+    naming: &NamingConfig,
+    types: &TypesConfig,
+    sink: &mut DiagnosticSink,
+) -> Analyzed {
+    analyze_with_options_and_config_path(ir, naming, types, None, sink)
+}
+
+fn analyze_with_options_and_config_path(
     mut ir: Ir,
     naming: &NamingConfig,
     types: &TypesConfig,
+    config_path: Option<&Path>,
     sink: &mut DiagnosticSink,
 ) -> Analyzed {
     lower_uninhabitable_all_ofs(&mut ir, sink);
@@ -290,7 +307,7 @@ pub fn analyze_with_options(
         allocate_callback_names(&ir, naming, &operation_names, &webhook_names, sink);
     let link_targets = resolve_links(&ir, sink);
     let schema_names = allocate_schema_names(&ir, naming, sink);
-    report_unmatched_overrides(&ir, naming, sink);
+    report_unmatched_overrides(&ir, naming, config_path, sink);
     let mut enum_members = Vec::new();
     let mut enum_analysis = EnumAnalysis {
         naming,
@@ -1331,14 +1348,24 @@ fn collect_schema_override_suggestions(
 /// count as declared — otherwise default-on pruning would break configs that were valid.
 /// The check needs the document, so it runs here rather than at config load. Keys are visited
 /// in the map's sorted order, so the diagnostics are deterministic.
-fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut DiagnosticSink) {
+fn report_unmatched_overrides(
+    ir: &Ir,
+    naming: &NamingConfig,
+    config_path: Option<&Path>,
+    sink: &mut DiagnosticSink,
+) {
     for key in naming.overrides.schemas.keys() {
         let declared = ir
             .schemas
             .iter()
             .any(|schema| &schema.name == key && is_overrideable_schema(&schema.source));
         if !declared && !ir.removed.schemas.contains(key) {
-            sink.push(unmatched_override_diagnostic("schema", "schemas", key));
+            sink.push(unmatched_override_diagnostic(
+                "schema",
+                "schemas",
+                key,
+                config_path,
+            ));
         }
     }
     if !naming.overrides.schemas_by_source.is_empty() {
@@ -1362,6 +1389,7 @@ fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut Diagnos
                     "schema",
                     "schemasBySource",
                     key,
+                    config_path,
                 ));
             }
         }
@@ -1376,13 +1404,19 @@ fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut Diagnos
                 "operation",
                 "operations",
                 key,
+                config_path,
             ));
         }
     }
     for key in naming.overrides.webhooks.keys() {
         let declared = ir.webhooks.iter().any(|webhook| &webhook.name == key);
         if !declared && !ir.removed.webhooks.contains(key) {
-            sink.push(unmatched_override_diagnostic("webhook", "webhooks", key));
+            sink.push(unmatched_override_diagnostic(
+                "webhook",
+                "webhooks",
+                key,
+                config_path,
+            ));
         }
     }
     for key in naming.overrides.callbacks.keys() {
@@ -1394,20 +1428,34 @@ fn report_unmatched_overrides(ir: &Ir, naming: &NamingConfig, sink: &mut Diagnos
                 .any(|callback| &callback.name == key);
         });
         if !matched && !ir.removed.callbacks.contains(key) {
-            sink.push(unmatched_override_diagnostic("callback", "callbacks", key));
+            sink.push(unmatched_override_diagnostic(
+                "callback",
+                "callbacks",
+                key,
+                config_path,
+            ));
         }
     }
 }
 
-fn unmatched_override_diagnostic(kind: &str, namespace: &str, key: &str) -> Diagnostic {
-    Diagnostic::config(
+fn unmatched_override_diagnostic(
+    kind: &str,
+    namespace: &str,
+    key: &str,
+    config_path: Option<&Path>,
+) -> Diagnostic {
+    let diagnostic = Diagnostic::config(
         CODE_OVERRIDE_UNMATCHED,
         format!("naming override key '{key}' matches no {kind} in the document"),
     )
     .with_json_pointer(format!(
         "/naming/overrides/{namespace}/{}",
         escape_json_pointer_token(key)
-    ))
+    ));
+    match config_path {
+        Some(path) => diagnostic.with_source(path.to_string_lossy()),
+        None => diagnostic,
+    }
 }
 
 /// Escapes a single JSON Pointer reference token per RFC 6901 (`~` -> `~0`, `/` -> `~1`).

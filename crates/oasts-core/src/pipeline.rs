@@ -268,6 +268,46 @@ components:
     }
 
     #[test]
+    fn config_pointer_diagnostics_render_the_absolute_config_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("openapi.yaml"),
+            "openapi: 3.1.1\ninfo: {title: t, version: 1.0.0}\npaths: {}\n",
+        )
+        .expect("OpenAPI document");
+        let raw = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.yaml" },
+            "output": "generated",
+            "naming": { "overrides": { "schemas": { "Missing": "Missing" } } }
+        });
+        let config = load_config_from_json(
+            &temp.path().join("oasts.json"),
+            &serde_json::to_vec(&raw).expect("config JSON"),
+        )
+        .expect("resolved config");
+
+        let mut sink = DiagnosticSink::new();
+        assert!(compile(&config, true, &mut sink).is_none());
+        let diagnostic = sink
+            .as_slice()
+            .iter()
+            .find(|diagnostic| diagnostic.code == "OASTS0202")
+            .expect("unmatched override diagnostic");
+        let expected_source = config.config_path.to_string_lossy();
+        assert_eq!(
+            diagnostic.source_id.as_deref(),
+            Some(expected_source.as_ref())
+        );
+        let rendered = crate::diag::render_to_string(sink.into_sorted_vec());
+        assert!(rendered.contains(&format!(
+            "  --> {}:1:1 /naming/overrides/schemas/Missing\n",
+            config.config_path.display()
+        )));
+        assert!(!rendered.contains("<config>"));
+    }
+
+    #[test]
     fn client_enabled_petstore_emits_client_runtime_and_identical_types() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/petstore-3.0");
