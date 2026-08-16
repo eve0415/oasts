@@ -97,7 +97,8 @@ impl Outcome {
         }
     }
 
-    fn succeeded(summary: &str, diagnostics: Vec<Diagnostic>) -> Self {
+    fn succeeded(summary: &str, mut diagnostics: Vec<Diagnostic>) -> Self {
+        diagnostics.sort();
         Self {
             exit_code: 0,
             stdout_summary: Some(summary.to_owned()),
@@ -119,13 +120,14 @@ fn load(source: ConfigSource<'_>) -> Result<ResolvedConfig, Vec<Diagnostic>> {
 /// Loads, compiles, and either reports drift or writes the generated files.
 pub fn run(command: Command, source: ConfigSource<'_>) -> Outcome {
     let mut sink = DiagnosticSink::new();
-    let config = match load(source) {
+    let mut config = match load(source) {
         Ok(config) => config,
         Err(diagnostics) => {
             sink.extend(diagnostics);
             return Outcome::failed(sink);
         }
     };
+    sink.extend(std::mem::take(&mut config.diagnostics));
 
     let should_emit = matches!(command, Command::Generate { .. });
     let files = pipeline::compile(&config, should_emit, &mut sink);
@@ -198,5 +200,87 @@ fn emit(
             sink.extend(diagnostics);
             Outcome::failed(sink)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use crate::diag::render_to_string;
+
+    use super::*;
+
+    #[test]
+    fn run_preserves_config_warnings_once_in_deterministic_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("openapi.yaml"),
+            r#"openapi: 3.1.0
+info: {title: test, version: 1.0.0}
+paths:
+  /things:
+    get:
+      operationId: listThings
+      parameters:
+        - {name: Cookie, in: header, schema: {type: string}}
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json: {}
+"#,
+        )
+        .expect("OpenAPI document");
+        fs::write(
+            temp.path().join("oasts.yaml"),
+            r#"schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+artifacts:
+  types: true
+  client: true
+client:
+  authEnforcement: types
+validation:
+  engine: off
+"#,
+        )
+        .expect("config");
+        let run_check = || {
+            run(
+                Command::Check,
+                ConfigSource::Path {
+                    explicit: None,
+                    cwd: temp.path(),
+                },
+            )
+        };
+
+        let first = run_check();
+        let second = run_check();
+
+        assert_eq!(first.exit_code, 0, "{:#?}", first.diagnostics);
+        assert_eq!(
+            first
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            ["OASTS0172", "OASTS5001"]
+        );
+        assert_eq!(
+            first
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS0172")
+                .count(),
+            1
+        );
+        assert_eq!(
+            render_to_string(first.diagnostics),
+            render_to_string(second.diagnostics)
+        );
     }
 }
