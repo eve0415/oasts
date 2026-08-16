@@ -321,11 +321,11 @@ mod tests {
 
     #[test]
     fn render_to_string_covers_warnings_locations_and_config_pointers() {
-        let mut warning = Diagnostic::input("OASTS1999", "warning").with_source("source.yaml");
+        let mut warning = Diagnostic::input("OASTS9906", "warning").with_source("source.yaml");
         warning.severity = Severity::Warning;
-        let pointer_only = Diagnostic::config("OASTS0999", "config").with_json_pointer("/config");
+        let pointer_only = Diagnostic::config("OASTS9902", "config").with_json_pointer("/config");
         let rendered = render_to_string(vec![warning, pointer_only]);
-        assert!(rendered.contains("warning[OASTS1999]"));
+        assert!(rendered.contains("warning[OASTS9906]"));
         assert!(rendered.contains("source.yaml:1:1"));
         assert!(rendered.contains("<config>:1:1 /config"));
     }

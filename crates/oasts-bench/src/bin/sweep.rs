@@ -1855,9 +1855,9 @@ mod tests {
             configs: vec![config_report(
                 ConfigKind::Types,
                 vec![
-                    diagnostic(Severity::Warning, "OASTS1300", "one"),
-                    diagnostic(Severity::Error, "OASTS1200", "two"),
-                    diagnostic(Severity::Warning, "OASTS1200", "three"),
+                    diagnostic(Severity::Warning, "OASTS9905", "one"),
+                    diagnostic(Severity::Error, "OASTS9904", "two"),
+                    diagnostic(Severity::Warning, "OASTS9904", "three"),
                 ],
             )],
             harness_error: None,
@@ -1869,8 +1869,8 @@ mod tests {
             configs: vec![config_report(
                 ConfigKind::Full,
                 vec![
-                    diagnostic(Severity::Warning, "OASTS1200", "four"),
-                    diagnostic(Severity::Warning, "OASTS1200", "five"),
+                    diagnostic(Severity::Warning, "OASTS9904", "four"),
+                    diagnostic(Severity::Warning, "OASTS9904", "five"),
                 ],
             )],
             harness_error: None,
@@ -1880,14 +1880,14 @@ mod tests {
 
         assert_eq!(
             codes.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["OASTS1200", "OASTS1300"]
+            vec!["OASTS9904", "OASTS9905"]
         );
-        let shared = codes.get("OASTS1200").expect("shared code");
+        let shared = codes.get("OASTS9904").expect("shared code");
         assert_eq!(shared.severity, "both");
         assert_eq!(shared.spec_count, 2);
         assert_eq!(shared.occurrence_count, 4);
         assert_eq!(shared.samples.len(), 3);
-        assert_eq!(human_code_order(&codes)[0].0, "OASTS1200");
+        assert_eq!(human_code_order(&codes)[0].0, "OASTS9904");
     }
 
     #[test]

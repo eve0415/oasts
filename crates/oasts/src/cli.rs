@@ -790,7 +790,7 @@ mod tests {
             exit_code: 2,
             stdout_summary: Some("check ok".to_owned()),
             diagnostics: vec![
-                Diagnostic::input("OASTS1000", "input")
+                Diagnostic::input("OASTS9903", "input")
                     .with_source("workspace/api.yaml")
                     .with_location(4, 2)
                     .with_json_pointer("/paths"),
@@ -807,7 +807,7 @@ mod tests {
         assert_eq!(String::from_utf8(stdout).expect("stdout"), "check ok\n");
         assert_eq!(
             String::from_utf8(stderr).expect("stderr"),
-            "error[OASTS0031]: config\nerror[OASTS1000]: input\n  --> workspace/api.yaml:4:2 /paths\nmodified: generated/api.ts\n"
+            "error[OASTS0031]: config\nerror[OASTS9903]: input\n  --> workspace/api.yaml:4:2 /paths\nmodified: generated/api.ts\n"
         );
     }
 
@@ -838,7 +838,7 @@ mod tests {
         let mut writer = FailingWriter;
         std::io::Write::flush(&mut writer).expect("flush");
         let error = render_diagnostics(
-            vec![Diagnostic::config("OASTS0000", "failure")],
+            vec![Diagnostic::config("OASTS9901", "failure")],
             &mut writer,
         )
         .expect_err("writer failure");

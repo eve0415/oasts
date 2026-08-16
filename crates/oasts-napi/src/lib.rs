@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn failure_reason_renders_warning_severity() {
-        let mut warning = Diagnostic::config("OASTS0999", "warning");
+        let mut warning = Diagnostic::config("OASTS9902", "warning");
         warning.severity = Severity::Warning;
         let payload: serde_json::Value =
             serde_json::from_str(&failure_reason(0, &[warning])).expect("JSON reason");
