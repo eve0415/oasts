@@ -87,24 +87,36 @@ mod tests {
     }
 
     #[test]
-    fn compile_honors_disabled_types_for_a_standalone_artifact() {
+    fn validators_only_can_reuse_the_disabled_types_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("openapi.yaml"),
-            r#"openapi: 3.1.1
+            r##"openapi: 3.1.1
 info: {title: t, version: 1.0.0}
-paths: {}
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Pet"}
 components:
   schemas:
     Pet: {type: object, properties: {name: {type: string}}}
-"#,
+"##,
         )
         .expect("OpenAPI document");
         let raw = json!({
             "schemaVersion": 1,
             "input": { "path": "openapi.yaml" },
             "output": "generated",
-            "artifacts": { "types": false, "validators": true }
+            "artifacts": {
+                "types": false,
+                "validators": { "directory": "types" }
+            }
         });
         let config = load_config_from_json(
             &temp.path().join("oasts.json"),
@@ -119,7 +131,58 @@ components:
         assert!(
             files
                 .iter()
-                .all(|file| file.relative_path.starts_with("validators/")),
+                .all(|file| file.relative_path.starts_with("types/")),
+            "{files:#?}"
+        );
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+    }
+
+    #[test]
+    fn zod_only_can_reuse_the_disabled_types_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("openapi.yaml"),
+            r##"openapi: 3.1.1
+info: {title: t, version: 1.0.0}
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Pet"}
+components:
+  schemas:
+    Pet: {type: object, properties: {name: {type: string}}}
+"##,
+        )
+        .expect("OpenAPI document");
+        let raw = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.yaml" },
+            "output": "generated",
+            "artifacts": {
+                "types": false,
+                "zod": { "directory": "types" }
+            }
+        });
+        let config = load_config_from_json(
+            &temp.path().join("oasts.json"),
+            &serde_json::to_vec(&raw).expect("config JSON"),
+        )
+        .expect("resolved config");
+
+        let mut sink = DiagnosticSink::new();
+        let files = compile(&config, true, &mut sink).expect("emitted files");
+
+        assert!(!files.is_empty());
+        assert!(
+            files
+                .iter()
+                .all(|file| file.relative_path.starts_with("types/")),
             "{files:#?}"
         );
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());

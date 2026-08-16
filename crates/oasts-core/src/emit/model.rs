@@ -686,7 +686,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                 continue;
             };
             let relative = format!("{}/components/{file_base}.ts", self.dirs.types);
-            self.register_path(&relative, &schema.source);
+            self.register_type_path(&relative, &schema.source);
             self.component_files[allocated.schema_index] = Some(file_base.clone());
             let (request_differs, response_differs) = shape_variants(&schema.schema);
             self.schema_targets
@@ -730,7 +730,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                 continue;
             };
             let relative = format!("{}/operations/{file_base}.ts", self.dirs.types);
-            self.register_path(&relative, &operation.source);
+            self.register_type_path(&relative, &operation.source);
             self.operation_files[allocated.operation_index] = Some(file_base);
         }
         // Webhook and callback operations mirror the path-operation branch exactly (operationId if
@@ -746,7 +746,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                 continue;
             };
             let relative = format!("{}/webhooks/{file_base}.ts", self.dirs.types);
-            self.register_path(&relative, &source);
+            self.register_type_path(&relative, &source);
             self.webhook_files[index] = Some(file_base);
         }
         for (index, allocated) in self.analyzed.callback_names.iter().enumerate() {
@@ -761,7 +761,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                 continue;
             };
             let relative = format!("{}/callbacks/{file_base}.ts", self.dirs.types);
-            self.register_path(&relative, &source);
+            self.register_type_path(&relative, &source);
             self.callback_files[index] = Some(file_base);
         }
     }
@@ -777,6 +777,12 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                 ));
                 None
             }
+        }
+    }
+
+    fn register_type_path(&mut self, path: &str, source: &SourceRef) {
+        if self.config.artifacts.types.enabled {
+            self.register_path(path, source);
         }
     }
 
