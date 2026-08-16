@@ -118,7 +118,8 @@ const transport = createTransport({
 
 This is the seam for anything the Fetch API cannot express portably — an undici dispatcher, a proxy
 agent, mTLS client certificates, an instrumented client, or a stub in tests. The second parameter
-carries platform extensions when the runtime supplies them.
+carries the non-standard `fetchOptions` keys you passed, so a Workers `cf` or a Next.js `next`
+reaches your dispatcher.
 
 ## Per-call options
 
@@ -142,8 +143,11 @@ const result = await getPet(
 ```
 
 `method`, `body`, `headers` and `signal` are excluded from `fetchOptions` because oasts owns them —
-they come from the document and from the options above. Everything else on `RequestInit` passes
-through, including runtime-specific keys such as Cloudflare Workers' `cf` or Next.js's `next`.
+they come from the document and from the options above. The ten standard `RequestInit` options
+(`cache`, `credentials`, `integrity`, `keepalive`, `mode`, `redirect`, `referrer`, `referrerPolicy`,
+`priority`, `duplex`) go on the `Request`. Any other key — Cloudflare Workers' `cf`, Next.js's
+`next` — is collected into an extensions object handed to `fetch` as its second argument, which is
+the parameter a [custom `fetch`](#a-custom-fetch) receives.
 
 Cancelling through `signal` produces an `aborted` or `response-aborted` result, distinct from
 `timeout`, so retry logic can tell "the caller changed their mind" from "the server was slow".
@@ -178,9 +182,9 @@ Each layer overwrites the one above it:
 7. Whatever `onRequest` middleware sets last.
 
 <Aside type="caution" title="Operation-owned headers are refused">
-  Setting `content-type`, `accept`, or a header an operation uses for credentials — through either
-  transport or per-call `headers` — throws a `TypeError` rather than being silently overwritten at
-  step 4, 5 or 6. Set the body's media type by choosing the request variant, and set credentials
+  Setting `content-type`, a header an operation uses for credentials, or `accept` on an operation
+  that declares one — through either transport or per-call `headers` — throws a `TypeError` rather
+  than being silently overwritten at step 4, 5 or 6. Set the body's media type by choosing the request variant, and set credentials
   through [auth](/guides/auth). Forbidden request headers (`proxy-*`, `sec-*`, and the rest the
   Fetch standard reserves) are refused the same way, including when middleware adds them.
 </Aside>
