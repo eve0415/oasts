@@ -1101,6 +1101,10 @@ fn io_diagnostic(message: String, path: Option<&Path>) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::sync::{Arc, Barrier};
+
+    #[cfg(unix)]
+    use std::cell::RefCell;
 
     use super::*;
 
@@ -1121,41 +1125,63 @@ mod tests {
         }
     }
 
-    struct InterruptBeforeInstallRenamer {
+    #[cfg(unix)]
+    struct LockParentBeforeInstallRenamer {
         observed_old_target: Cell<Option<bool>>,
     }
 
-    impl Renamer for InterruptBeforeInstallRenamer {
+    #[cfg(unix)]
+    impl Renamer for LockParentBeforeInstallRenamer {
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-            if from
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("new-"))
-            {
-                self.observed_old_target
-                    .set(Some(fs::read(to).is_ok_and(|content| content == b"old")));
-                Err(io::Error::new(
-                    ErrorKind::Interrupted,
-                    "forced interruption before installation",
-                ))
-            } else {
-                fs::rename(from, to)
-            }
+            use std::os::unix::fs::PermissionsExt;
+
+            self.observed_old_target
+                .set(Some(fs::read(to).is_ok_and(|content| content == b"old")));
+            let parent = to.parent().expect("generated target parent");
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o555))?;
+            fs::rename(from, to)
         }
     }
 
-    struct FailCommitAndRollbackRenamer {
+    #[cfg(unix)]
+    struct LockParentOnSecondRenameRenamer {
         calls: Cell<usize>,
     }
 
-    impl Renamer for FailCommitAndRollbackRenamer {
+    #[cfg(unix)]
+    impl Renamer for LockParentOnSecondRenameRenamer {
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            use std::os::unix::fs::PermissionsExt;
+
             let call = self.calls.get() + 1;
             self.calls.set(call);
-            if matches!(call, 2 | 3) {
-                Err(io::Error::other("forced commit or rollback failure"))
-            } else {
-                fs::rename(from, to)
+            if call == 2 {
+                let parent = to.parent().expect("generated target parent");
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o555))?;
             }
+            fs::rename(from, to)
+        }
+    }
+
+    #[cfg(unix)]
+    struct LeaveLockedStagingAfterManifestRename {
+        locked_directory: RefCell<Option<PathBuf>>,
+    }
+
+    #[cfg(unix)]
+    impl Renamer for LeaveLockedStagingAfterManifestRename {
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::rename(from, to)?;
+            if to.file_name().is_some_and(|name| name == MANIFEST_NAME) {
+                let locked = from.parent().expect("staged file parent").join("locked");
+                fs::create_dir(&locked)?;
+                fs::write(locked.join("file"), "x")?;
+                fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))?;
+                self.locked_directory.replace(Some(locked));
+            }
+            Ok(())
         }
     }
 
@@ -1590,6 +1616,49 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_target_removed_after_staging_is_harmless() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        write(&output, vec![generated("stale.ts", "stale")]).expect("initial write");
+        let watched_output = output.clone();
+        let stale_target = output.join("stale.ts");
+        let started = Arc::new(Barrier::new(2));
+        let watcher_started = Arc::clone(&started);
+        let remover = std::thread::spawn(move || {
+            watcher_started.wait();
+            loop {
+                let staging_exists = fs::read_dir(&watched_output)
+                    .expect("output entries")
+                    .filter_map(Result::ok)
+                    .any(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".oasts-stage-")
+                    });
+                if staging_exists {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            fs::remove_file(stale_target).expect("concurrent stale removal");
+        });
+        started.wait();
+        std::thread::yield_now();
+
+        let report = write(
+            &output,
+            vec![generated("replacement.ts", &"x".repeat(16 * 1024 * 1024))],
+        )
+        .expect("concurrent stale removal is harmless");
+        remover.join().expect("stale remover");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.files_deleted, 0);
+        assert!(!output.join("stale.ts").exists());
+    }
+
+    #[test]
     fn relocating_an_artifact_leaves_no_husk_of_its_old_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("generated");
@@ -1661,25 +1730,32 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_old_target_remains_visible_until_its_replacement_is_installed() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("generated");
         write(&output, vec![generated("a.ts", "old")]).expect("initial write");
-        let renamer = InterruptBeforeInstallRenamer {
+        let renamer = LockParentBeforeInstallRenamer {
             observed_old_target: Cell::new(None),
         };
 
         let diagnostics = write_with_renamer(&output, vec![generated("a.ts", "new")], &renamer)
-            .expect_err("installation interruption");
+            .expect_err("read-only parent must reject installation");
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).expect("unlock output");
 
         assert_eq!(diagnostics[0].code, CODE_WRITE_IO);
         assert_eq!(renamer.observed_old_target.get(), Some(true));
         assert_eq!(fs::read(output.join("a.ts")).expect("old target"), b"old");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_rollback_retains_the_only_old_copy() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("generated");
         write(
@@ -1687,7 +1763,7 @@ mod tests {
             vec![generated("a.ts", "old a"), generated("z.ts", "old z")],
         )
         .expect("initial write");
-        let renamer = FailCommitAndRollbackRenamer {
+        let renamer = LockParentOnSecondRenameRenamer {
             calls: Cell::new(0),
         };
 
@@ -1697,6 +1773,7 @@ mod tests {
             &renamer,
         )
         .expect_err("commit and rollback must fail");
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).expect("unlock output");
 
         assert_eq!(renamer.calls.get(), 3);
         assert_eq!(fs::read(output.join("a.ts")).expect("new a"), b"new a");
@@ -1876,24 +1953,28 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut staging = StagingDirectories::default();
-        let (nested, _) = staging.paths(temp.path()).expect("staging paths");
-        fs::create_dir(&nested).expect("nested staging directory");
-        fs::write(nested.join("file"), "x").expect("nested staging file");
-        fs::set_permissions(&nested, fs::Permissions::from_mode(0o000))
-            .expect("lock staging directory");
-        let staging_root = nested.parent().expect("staging root").to_path_buf();
-        let report = WriteReport {
-            files_written: 1,
-            files_deleted: 2,
+        let output = temp.path().join("generated");
+        let renamer = LeaveLockedStagingAfterManifestRename {
+            locked_directory: RefCell::new(None),
         };
 
-        assert_eq!(
-            finish_successful_commit(report, Vec::new(), temp.path(), staging),
-            report
+        let report = write_with_renamer(&output, vec![generated("a.ts", "a")], &renamer)
+            .expect("cleanup failure must not fail a committed write");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(fs::read(output.join("a.ts")).expect("committed file"), b"a");
+        let locked = renamer
+            .locked_directory
+            .borrow_mut()
+            .take()
+            .expect("locked staging directory");
+        let staging_root = locked.parent().expect("staging root").to_path_buf();
+        assert!(
+            staging_root.exists(),
+            "failed cleanup must leave staging behind"
         );
 
-        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700))
             .expect("unlock staging directory");
         fs::remove_dir_all(staging_root).expect("staging cleanup");
     }
