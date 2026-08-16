@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::{ErrorKind, Read};
+use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
@@ -83,6 +83,84 @@ pub struct WriteReport {
 struct PreparedFile {
     relative_path: String,
     content: Vec<u8>,
+}
+
+trait Renamer {
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+}
+
+struct FileRenamer;
+
+impl Renamer for FileRenamer {
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+}
+
+enum ChangeKind {
+    Generated(String),
+    Manifest,
+    Obsolete(String),
+}
+
+struct StagedChange {
+    kind: ChangeKind,
+    staged: Option<PathBuf>,
+    backup: PathBuf,
+}
+
+struct AppliedChange {
+    target: PathBuf,
+    backup: Option<PathBuf>,
+    installed: bool,
+}
+
+#[derive(Default)]
+struct StagingDirectories {
+    // Staging beside each target keeps every commit rename on the target's filesystem, including
+    // when one generated subtree is a separate mount.
+    directories: BTreeMap<PathBuf, tempfile::TempDir>,
+    next_file: usize,
+}
+
+impl StagingDirectories {
+    fn paths(&mut self, parent: &Path) -> Result<(PathBuf, PathBuf), Vec<Diagnostic>> {
+        let index = self.next_file;
+        self.next_file += 1;
+        let directory = match self.directories.entry(parent.to_path_buf()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let directory = tempfile::Builder::new()
+                    .prefix(".oasts-stage-")
+                    .tempdir_in(parent)
+                    .map_err(|error| {
+                        vec![io_diagnostic(
+                            format!("failed to create staging directory: {error}"),
+                            Some(parent),
+                        )]
+                    })?;
+                entry.insert(directory)
+            }
+        };
+        Ok((
+            directory.path().join(format!("new-{index}")),
+            directory.path().join(format!("old-{index}")),
+        ))
+    }
+
+    fn close(self) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        for (_, directory) in self.directories {
+            let path = directory.path().to_path_buf();
+            if let Err(error) = directory.close() {
+                diagnostics.push(io_diagnostic(
+                    format!("failed to remove staging directory: {error}"),
+                    Some(&path),
+                ));
+            }
+        }
+        diagnostics
+    }
 }
 
 /// Resolves generated paths against the output directory, memoising parent resolution.
@@ -194,42 +272,65 @@ fn prune_emptied_directories(output_root: &Path, emptied: Vec<PathBuf>) {
 
 /// Writes generated files and updates the output-root ownership manifest.
 pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport, Vec<Diagnostic>> {
-    let prepared = prepare_files(files)?;
-    validate_output_path(output_dir)?;
+    write_with_renamer(output_dir, files, &FileRenamer)
+}
 
-    let output_existed = output_dir.exists();
-    let canonical_output = if output_existed {
-        canonical_output_dir(output_dir)?
-    } else {
-        output_dir.to_path_buf()
-    };
-    let previous_read = if output_existed {
-        validate_target(&canonical_output, MANIFEST_NAME)?;
-        read_manifest_bytes(&canonical_output)?
-    } else {
-        None
-    };
-    let previous = previous_read.as_ref().map(|(manifest, _)| manifest);
-    validate_manifest_paths(previous)?;
+fn write_with_renamer(
+    output_dir: &Path,
+    files: Vec<GeneratedFile>,
+    renamer: &dyn Renamer,
+) -> Result<WriteReport, Vec<Diagnostic>> {
+    let mut created_directories = Vec::new();
+    let result = (|| {
+        let prepared = prepare_files(files)?;
+        validate_output_path(output_dir)?;
 
-    if !output_existed {
-        fs::create_dir_all(output_dir).map_err(|error| {
-            vec![io_diagnostic(
-                format!("failed to create output directory: {error}"),
-                Some(output_dir),
-            )]
-        })?;
-    }
+        let output_existed = output_dir.exists();
+        let canonical_output = if output_existed {
+            canonical_output_dir(output_dir)?
+        } else {
+            output_dir.to_path_buf()
+        };
+        let previous_read = if output_existed {
+            validate_target(&canonical_output, MANIFEST_NAME)?;
+            read_manifest_bytes(&canonical_output)?
+        } else {
+            None
+        };
+        let previous = previous_read.as_ref().map(|(manifest, _)| manifest);
+        validate_manifest_paths(previous)?;
+
+        if !output_existed {
+            create_directories(output_dir, &mut created_directories)?;
+        }
+        write_transaction(
+            output_dir,
+            &prepared,
+            previous_read.as_ref(),
+            &mut created_directories,
+            renamer,
+        )
+    })();
+    finish_created_directories(result, created_directories)
+}
+
+fn write_transaction(
+    output_dir: &Path,
+    prepared: &[PreparedFile],
+    previous_read: Option<&(Manifest, Vec<u8>)>,
+    created_directories: &mut Vec<PathBuf>,
+    renamer: &dyn Renamer,
+) -> Result<WriteReport, Vec<Diagnostic>> {
     let canonical_output = canonical_output_dir(output_dir)?;
+    let previous = previous_read.map(|(manifest, _)| manifest);
     let mut targets = TargetValidator::new(&canonical_output);
-    preflight_targets(&mut targets, &prepared, previous)?;
+    preflight_targets(&mut targets, prepared, previous)?;
 
     let new_paths = prepared
         .iter()
         .map(|file| file.relative_path.clone())
         .collect::<BTreeSet<_>>();
     let mut stale_paths = previous
-        .as_ref()
         .into_iter()
         .flat_map(|manifest| manifest.files.iter())
         .filter(|path| !new_paths.contains(*path))
@@ -237,105 +338,357 @@ pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport
         .collect::<Vec<_>>();
     stale_paths.sort_unstable();
 
-    let mut files_deleted = 0;
-    let mut emptied = Vec::new();
-    for relative_path in stale_paths {
-        let target = validate_target(&canonical_output, &relative_path)?;
-        match fs::remove_file(&target) {
-            Ok(()) => {
-                files_deleted += 1;
-                if let Some(parent) = target.parent() {
-                    emptied.push(parent.to_path_buf());
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(vec![io_diagnostic(
-                    format!("failed to delete obsolete generated file '{relative_path}': {error}"),
-                    Some(&target),
-                )]);
-            }
-        }
-    }
-    prune_emptied_directories(&canonical_output, emptied);
-
-    let unchanged = if output_existed {
-        if rayon::current_num_threads() == 1 || prepared.len() < PARALLEL_IO_MIN_FILES {
-            let mut existing_content = Vec::new();
-            prepared
-                .iter()
-                .map(|file| {
-                    existing_content_matches(&canonical_output, file, &mut existing_content)
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            prepared
-                .par_iter()
-                .map_init(Vec::new, |existing_content, file| {
-                    existing_content_matches(&canonical_output, file, existing_content)
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?
-        }
+    let unchanged = if rayon::current_num_threads() == 1 || prepared.len() < PARALLEL_IO_MIN_FILES {
+        let mut existing_content = Vec::new();
+        prepared
+            .iter()
+            .map(|file| existing_content_matches(&canonical_output, file, &mut existing_content))
+            .collect::<Result<Vec<_>, _>>()?
     } else {
-        vec![false; prepared.len()]
+        prepared
+            .par_iter()
+            .map_init(Vec::new, |existing_content, file| {
+                existing_content_matches(&canonical_output, file, existing_content)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
     };
-
-    let mut files_written = 0;
-    for (file, is_unchanged) in prepared.iter().zip(unchanged) {
-        if is_unchanged {
-            continue;
-        }
-        let target = validate_target(&canonical_output, &file.relative_path)?;
-        // A validated relative file is joined below the canonical absolute output directory.
-        let parent = target
-            .parent()
-            .expect("a validated target inside an absolute output directory has a parent");
-        fs::create_dir_all(parent).map_err(|error| {
-            vec![io_diagnostic(
-                format!(
-                    "failed to create parent directory for '{}': {error}",
-                    file.relative_path
-                ),
-                Some(parent),
-            )]
-        })?;
-        let target = validate_target(&canonical_output, &file.relative_path)?;
-        fs::write(&target, &file.content).map_err(|error| {
-            vec![io_diagnostic(
-                format!(
-                    "failed to write generated file '{}': {error}",
-                    file.relative_path
-                ),
-                Some(&target),
-            )]
-        })?;
-        files_written += 1;
-    }
 
     let manifest = Manifest {
         manifest_version: 1,
         files: new_paths.into_iter().collect(),
     };
     let manifest_bytes = manifest_bytes(&manifest);
-    let manifest_target = validate_target(&canonical_output, MANIFEST_NAME)?;
     let manifest_is_current = previous_read
-        .as_ref()
         .is_some_and(|(_, previous_bytes)| previous_bytes.as_slice() == manifest_bytes.as_slice());
-    if !manifest_is_current {
-        fs::write(&manifest_target, manifest_bytes).map_err(|error| {
-            vec![io_diagnostic(
-                format!("failed to write ownership manifest: {error}"),
-                Some(&manifest_target),
-            )]
-        })?;
+    let pending_manifest = if manifest_is_current {
+        None
+    } else {
+        Some(manifest_bytes)
+    };
+
+    let mut staging = StagingDirectories::default();
+    let staged = stage_changes(
+        &canonical_output,
+        prepared,
+        unchanged,
+        stale_paths,
+        pending_manifest,
+        created_directories,
+        &mut staging,
+    );
+    let changes = match staged {
+        Ok(changes) => changes,
+        Err(mut diagnostics) => {
+            diagnostics.extend(staging.close());
+            return Err(diagnostics);
+        }
+    };
+
+    let mut applied = Vec::with_capacity(changes.len());
+    let committed = finish_changes(
+        commit_changes(&canonical_output, &changes, renamer, &mut applied),
+        renamer,
+        applied,
+    );
+    let (report, emptied) = match committed {
+        Ok(committed) => committed,
+        Err(mut diagnostics) => {
+            diagnostics.extend(staging.close());
+            return Err(diagnostics);
+        }
+    };
+    require_clean_staging(staging.close())?;
+    prune_emptied_directories(&canonical_output, emptied);
+    Ok(report)
+}
+
+fn stage_changes(
+    output_dir: &Path,
+    prepared: &[PreparedFile],
+    unchanged: Vec<bool>,
+    stale_paths: Vec<String>,
+    manifest_bytes: Option<Vec<u8>>,
+    created_directories: &mut Vec<PathBuf>,
+    staging: &mut StagingDirectories,
+) -> Result<Vec<StagedChange>, Vec<Diagnostic>> {
+    let mut changes = Vec::new();
+    for relative_path in stale_paths {
+        let target = validate_target(output_dir, &relative_path)?;
+        let kind = ChangeKind::Obsolete(relative_path);
+        if target_metadata(&kind, &target, fs::symlink_metadata(&target))?.is_some() {
+            let parent = target
+                .parent()
+                .expect("a validated target inside an absolute output directory has a parent");
+            let (_, backup) = staging.paths(parent)?;
+            changes.push(StagedChange {
+                kind,
+                staged: None,
+                backup,
+            });
+        }
     }
 
-    Ok(WriteReport {
-        files_written,
-        files_deleted,
+    for (file, is_unchanged) in prepared.iter().zip(unchanged) {
+        if !is_unchanged {
+            let target = validate_target(output_dir, &file.relative_path)?;
+            let parent = target
+                .parent()
+                .expect("a validated target inside an absolute output directory has a parent");
+            create_directories(parent, created_directories)?;
+            changes.push(stage_write(
+                output_dir,
+                ChangeKind::Generated(file.relative_path.clone()),
+                &file.content,
+                staging,
+            )?);
+        }
+    }
+
+    if let Some(manifest_bytes) = manifest_bytes {
+        changes.push(stage_write(
+            output_dir,
+            ChangeKind::Manifest,
+            &manifest_bytes,
+            staging,
+        )?);
+    }
+    Ok(changes)
+}
+
+fn stage_write(
+    output_dir: &Path,
+    kind: ChangeKind,
+    content: &[u8],
+    staging: &mut StagingDirectories,
+) -> Result<StagedChange, Vec<Diagnostic>> {
+    let relative_path = match &kind {
+        ChangeKind::Generated(relative_path) | ChangeKind::Obsolete(relative_path) => relative_path,
+        ChangeKind::Manifest => MANIFEST_NAME,
+    };
+    let target = validate_target(output_dir, relative_path)?;
+    let permissions = writable_target_permissions(&kind, &target)?;
+    let parent = target
+        .parent()
+        .expect("a validated target inside an absolute output directory has a parent");
+    let (staged, backup) = staging.paths(parent)?;
+    fs::write(&staged, content).map_err(change_error(&kind, &target))?;
+    if let Some(permissions) = permissions {
+        fs::set_permissions(&staged, permissions).map_err(change_error(&kind, &target))?;
+    }
+    Ok(StagedChange {
+        kind,
+        staged: Some(staged),
+        backup,
     })
+}
+
+fn writable_target_permissions(
+    kind: &ChangeKind,
+    target: &Path,
+) -> Result<Option<fs::Permissions>, Vec<Diagnostic>> {
+    let Some(metadata) = target_metadata(kind, target, fs::symlink_metadata(target))? else {
+        return Ok(None);
+    };
+    fs::OpenOptions::new()
+        .write(true)
+        .open(target)
+        .map_err(change_error(kind, target))?;
+    Ok(Some(metadata.permissions()))
+}
+
+fn target_metadata(
+    kind: &ChangeKind,
+    target: &Path,
+    metadata: io::Result<fs::Metadata>,
+) -> Result<Option<fs::Metadata>, Vec<Diagnostic>> {
+    match metadata {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(change_error(kind, target)(error)),
+    }
+}
+
+fn commit_changes(
+    output_dir: &Path,
+    changes: &[StagedChange],
+    renamer: &dyn Renamer,
+    applied: &mut Vec<AppliedChange>,
+) -> Result<(WriteReport, Vec<PathBuf>), Vec<Diagnostic>> {
+    let mut report = WriteReport::default();
+    let mut emptied = Vec::new();
+    for change in changes {
+        let relative_path = match &change.kind {
+            ChangeKind::Generated(relative_path) | ChangeKind::Obsolete(relative_path) => {
+                relative_path
+            }
+            ChangeKind::Manifest => MANIFEST_NAME,
+        };
+        let target = validate_target(output_dir, relative_path)?;
+        let backup =
+            if target_metadata(&change.kind, &target, fs::symlink_metadata(&target))?.is_some() {
+                renamer
+                    .rename(&target, &change.backup)
+                    .map_err(change_error(&change.kind, &target))?;
+                Some(change.backup.clone())
+            } else {
+                None
+            };
+        applied.push(AppliedChange {
+            target: target.clone(),
+            backup,
+            installed: false,
+        });
+
+        if let Some(staged) = &change.staged {
+            let target = validate_target(output_dir, relative_path)?;
+            renamer
+                .rename(staged, &target)
+                .map_err(change_error(&change.kind, &target))?;
+            applied
+                .last_mut()
+                .expect("the current change was recorded before installation")
+                .installed = true;
+            if matches!(change.kind, ChangeKind::Generated(_)) {
+                report.files_written += 1;
+            }
+        } else if applied
+            .last()
+            .expect("the current change was recorded before deletion")
+            .backup
+            .is_some()
+        {
+            report.files_deleted += 1;
+            emptied.push(
+                target
+                    .parent()
+                    .expect("a validated target inside an absolute output directory has a parent")
+                    .to_path_buf(),
+            );
+        }
+    }
+    Ok((report, emptied))
+}
+
+fn finish_changes(
+    committed: Result<(WriteReport, Vec<PathBuf>), Vec<Diagnostic>>,
+    renamer: &dyn Renamer,
+    applied: Vec<AppliedChange>,
+) -> Result<(WriteReport, Vec<PathBuf>), Vec<Diagnostic>> {
+    let Err(mut diagnostics) = committed else {
+        return committed;
+    };
+    for change in applied.into_iter().rev() {
+        if change.installed {
+            match fs::remove_file(&change.target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => diagnostics.push(io_diagnostic(
+                    format!("failed to remove a committed file during rollback: {error}"),
+                    Some(&change.target),
+                )),
+            }
+        }
+        if let Some(backup) = change.backup
+            && let Err(error) = renamer.rename(&backup, &change.target)
+        {
+            diagnostics.push(io_diagnostic(
+                format!("failed to restore a generated file during rollback: {error}"),
+                Some(&change.target),
+            ));
+        }
+    }
+    Err(diagnostics)
+}
+
+fn create_directories(
+    directory: &Path,
+    created_directories: &mut Vec<PathBuf>,
+) -> Result<(), Vec<Diagnostic>> {
+    let mut missing = Vec::new();
+    let mut current = directory;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) => break,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                missing.push(current.to_path_buf());
+                current = current.parent().ok_or_else(|| {
+                    vec![io_diagnostic(
+                        "failed to find an existing parent directory".to_owned(),
+                        Some(directory),
+                    )]
+                })?;
+            }
+            Err(error) => {
+                return Err(vec![io_diagnostic(
+                    format!("failed to inspect output directory: {error}"),
+                    Some(current),
+                )]);
+            }
+        }
+    }
+    created_directories.extend(missing);
+    fs::create_dir_all(directory).map_err(|error| {
+        vec![io_diagnostic(
+            format!("failed to create output directory: {error}"),
+            Some(directory),
+        )]
+    })
+}
+
+fn finish_created_directories(
+    result: Result<WriteReport, Vec<Diagnostic>>,
+    created_directories: Vec<PathBuf>,
+) -> Result<WriteReport, Vec<Diagnostic>> {
+    let Err(mut diagnostics) = result else {
+        return result;
+    };
+    let mut created_directories = created_directories;
+    created_directories
+        .sort_unstable_by_key(|directory| std::cmp::Reverse(directory.components().count()));
+    created_directories.dedup();
+    for directory in created_directories {
+        match fs::remove_dir(&directory) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => diagnostics.push(io_diagnostic(
+                format!("failed to remove a directory created during staging: {error}"),
+                Some(&directory),
+            )),
+        }
+    }
+    Err(diagnostics)
+}
+
+fn require_clean_staging(diagnostics: Vec<Diagnostic>) -> Result<(), Vec<Diagnostic>> {
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(diagnostics)
+    }
+}
+
+fn change_error<'a>(
+    kind: &'a ChangeKind,
+    target: &'a Path,
+) -> impl FnOnce(io::Error) -> Vec<Diagnostic> + 'a {
+    move |error| {
+        let message = match kind {
+            ChangeKind::Generated(relative_path) => {
+                format!("failed to write generated file '{relative_path}': {error}")
+            }
+            ChangeKind::Manifest => format!("failed to write ownership manifest: {error}"),
+            ChangeKind::Obsolete(relative_path) => {
+                format!("failed to delete obsolete generated file '{relative_path}': {error}")
+            }
+        };
+        vec![io_diagnostic(message, Some(target))]
+    }
 }
 
 fn existing_content_matches(
@@ -712,13 +1065,55 @@ fn io_diagnostic(message: String, path: Option<&Path>) -> Diagnostic {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    struct FailOnceRenamer {
+        calls: Cell<usize>,
+        fail_at: usize,
+    }
+
+    impl Renamer for FailOnceRenamer {
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if call == self.fail_at {
+                Err(io::Error::other("forced mid-commit failure"))
+            } else {
+                fs::rename(from, to)
+            }
+        }
+    }
 
     fn generated(path: &str, content: &str) -> GeneratedFile {
         GeneratedFile {
             relative_path: path.to_owned(),
             content: content.to_owned(),
         }
+    }
+
+    fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            for entry in fs::read_dir(directory).expect("read directory") {
+                let entry = entry.expect("directory entry");
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("path below root")
+                    .to_path_buf();
+                if entry.file_type().expect("file type").is_dir() {
+                    snapshot.insert(relative, None);
+                    visit(root, &path, snapshot);
+                } else {
+                    snapshot.insert(relative, Some(fs::read(path).expect("file contents")));
+                }
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
     }
 
     #[test]
@@ -1157,6 +1552,183 @@ mod tests {
         write(&output, vec![generated("shared/pet.ts", "new")]).expect("relocated layout");
 
         assert!(output.join("types/components/notes.md").exists());
+    }
+
+    #[test]
+    fn a_mid_write_failure_leaves_the_output_tree_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        let original = vec![
+            generated("a.ts", "old a"),
+            generated("locked/z.ts", "old z"),
+        ];
+        write(&output, original).expect("initial write");
+        let before = tree_snapshot(&output);
+        let renamer = FailOnceRenamer {
+            calls: Cell::new(0),
+            fail_at: 4,
+        };
+
+        let diagnostics = write_with_renamer(
+            &output,
+            vec![
+                generated("a.ts", "new a"),
+                generated("locked/z.ts", "new z"),
+            ],
+            &renamer,
+        )
+        .expect_err("second file must reject the write");
+
+        assert_eq!(diagnostics[0].code, CODE_WRITE_IO);
+        assert_eq!(tree_snapshot(&output), before);
+        assert_eq!(renamer.calls.get(), 6, "rollback must restore both files");
+    }
+
+    #[test]
+    fn a_failed_first_write_removes_the_new_output_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        let renamer = FailOnceRenamer {
+            calls: Cell::new(0),
+            fail_at: 2,
+        };
+
+        let diagnostics = write_with_renamer(
+            &output,
+            vec![generated("a.ts", "a"), generated("nested/z.ts", "z")],
+            &renamer,
+        )
+        .expect_err("second commit must fail");
+
+        assert_eq!(diagnostics[0].code, CODE_WRITE_IO);
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn transaction_error_helpers_report_rollback_and_cleanup_failures() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.ts");
+        let metadata_error = target_metadata(
+            &ChangeKind::Obsolete("target.ts".to_owned()),
+            &target,
+            Err(io::Error::other("metadata failure")),
+        )
+        .expect_err("metadata error");
+        assert_eq!(metadata_error[0].code, CODE_WRITE_IO);
+
+        let missing_rollback = finish_changes(
+            Err(Vec::new()),
+            &FileRenamer,
+            vec![AppliedChange {
+                target: target.clone(),
+                backup: None,
+                installed: true,
+            }],
+        )
+        .expect_err("rollback result");
+        assert!(missing_rollback.is_empty());
+
+        fs::create_dir(&target).expect("target directory");
+        let remove_error = finish_changes(
+            Err(Vec::new()),
+            &FileRenamer,
+            vec![AppliedChange {
+                target: target.clone(),
+                backup: None,
+                installed: true,
+            }],
+        )
+        .expect_err("rollback remove error");
+        assert_eq!(remove_error[0].code, CODE_WRITE_IO);
+        fs::remove_dir(&target).expect("target directory cleanup");
+
+        let backup = temp.path().join("backup.ts");
+        fs::write(&backup, "old").expect("backup");
+        let failing_renamer = FailOnceRenamer {
+            calls: Cell::new(0),
+            fail_at: 1,
+        };
+        let restore_error = finish_changes(
+            Err(Vec::new()),
+            &failing_renamer,
+            vec![AppliedChange {
+                target,
+                backup: Some(backup.clone()),
+                installed: false,
+            }],
+        )
+        .expect_err("rollback restore error");
+        assert_eq!(restore_error[0].code, CODE_WRITE_IO);
+        fs::remove_file(backup).expect("backup cleanup");
+
+        require_clean_staging(Vec::new()).expect("empty cleanup result");
+        let cleanup_error =
+            require_clean_staging(vec![io_diagnostic("cleanup".to_owned(), Some(temp.path()))])
+                .expect_err("cleanup diagnostic");
+        assert_eq!(cleanup_error[0].code, CODE_WRITE_IO);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_and_staging_cleanup_failures_are_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let locked = temp.path().join("locked");
+        fs::create_dir(&locked).expect("locked directory");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock directory");
+        let create_error = create_directories(&locked.join("child"), &mut Vec::new())
+            .expect_err("locked parent inspection");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("unlock directory");
+        assert_eq!(create_error[0].code, CODE_WRITE_IO);
+
+        let no_parent =
+            create_directories(Path::new(""), &mut Vec::new()).expect_err("path without parent");
+        assert_eq!(no_parent[0].code, CODE_WRITE_IO);
+
+        let empty = temp.path().join("empty");
+        fs::create_dir(&empty).expect("empty directory");
+        assert!(
+            finish_created_directories(Err(Vec::new()), vec![empty])
+                .expect_err("empty cleanup result")
+                .is_empty()
+        );
+        assert!(
+            finish_created_directories(Err(Vec::new()), vec![temp.path().join("missing")])
+                .expect_err("missing cleanup result")
+                .is_empty()
+        );
+        let nonempty = temp.path().join("nonempty");
+        fs::create_dir(&nonempty).expect("nonempty directory");
+        fs::write(nonempty.join("file"), "x").expect("nonempty file");
+        assert!(
+            finish_created_directories(Err(Vec::new()), vec![nonempty.clone()])
+                .expect_err("nonempty cleanup result")
+                .is_empty()
+        );
+        fs::remove_dir_all(nonempty).expect("nonempty cleanup");
+        let file = temp.path().join("file");
+        fs::write(&file, "x").expect("file");
+        assert_eq!(
+            finish_created_directories(Err(Vec::new()), vec![file.clone()])
+                .expect_err("file cleanup error")
+                .len(),
+            1
+        );
+        fs::remove_file(file).expect("file cleanup");
+
+        let mut staging = StagingDirectories::default();
+        let (nested, _) = staging.paths(temp.path()).expect("staging paths");
+        fs::create_dir(&nested).expect("nested staging directory");
+        fs::write(nested.join("file"), "x").expect("nested staging file");
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o000))
+            .expect("lock staging directory");
+        let staging_root = nested.parent().expect("staging root").to_path_buf();
+        let cleanup_error = staging.close();
+        assert_eq!(cleanup_error.len(), 1);
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
+            .expect("unlock staging directory");
+        fs::remove_dir_all(staging_root).expect("staging cleanup");
     }
 
     #[cfg(unix)]
