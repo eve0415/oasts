@@ -97,7 +97,8 @@ impl Outcome {
         }
     }
 
-    fn succeeded(summary: &str, diagnostics: Vec<Diagnostic>) -> Self {
+    fn succeeded(summary: &str, mut diagnostics: Vec<Diagnostic>) -> Self {
+        diagnostics.sort();
         Self {
             exit_code: 0,
             stdout_summary: Some(summary.to_owned()),

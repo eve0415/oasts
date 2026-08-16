@@ -406,12 +406,12 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("openapi.yaml"),
-            "openapi: 3.1.0\npaths: {}\ncomponents:\n  schemas:\n    Thing:\n      type: string\n",
+            "openapi: 3.1.0\ninfo: {title: test, version: 1.0.0}\npaths:\n  /things:\n    get:\n      operationId: listThings\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json:\n              schema:\n                $ref: '#/components/schemas/Thing'\ncomponents:\n  schemas:\n    Thing:\n      type: string\n",
         )
         .expect("OpenAPI YAML");
         fs::write(
             temp.path().join("oasts.yaml"),
-            "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\noutput: ./generated\nartifacts:\n  types: true\n  zod: true\n",
+            "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\noutput: ./generated\nartifacts:\n  types: true\n  client: true\n  zod: true\nclient:\n  authEnforcement: types\nvalidation:\n  engine: off\n",
         )
         .expect("config YAML");
         let package = temp.path().join("node_modules").join("zod");
@@ -438,6 +438,30 @@ mod tests {
             generated.rendered_stderr
         );
         assert!(generated.rendered_stderr.contains("^4.4.0"));
+    }
+
+    #[test]
+    fn successful_generate_keeps_structured_and_rendered_warning_order_aligned() {
+        let temp = project_with_outdated_zod();
+        let generated = run(options(&temp, "generate", false));
+        assert_eq!(generated.exit_code, 0, "{}", generated.rendered_stderr);
+
+        let structured_codes = generated
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>();
+        let rendered_codes = generated
+            .rendered_stderr
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("warning[")
+                    .and_then(|warning| warning.split_once("]:").map(|(code, _)| code))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(structured_codes, ["OASTS0241", "OASTS0172"]);
+        assert_eq!(rendered_codes, structured_codes);
     }
 
     #[test]
