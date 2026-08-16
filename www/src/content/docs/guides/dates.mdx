@@ -56,5 +56,6 @@ switch (result.outcome) {
 
 <Aside type="caution">
   The representations need the client artifact. The codecs are emitted under it and only run at its
-  pipeline positions — types alone will keep the wire strings.
+  pipeline positions, so setting `dateTime` or `date` to a non-string value without
+  `artifacts.client: true` is a config error, not a silent fall back to strings.
 </Aside>
