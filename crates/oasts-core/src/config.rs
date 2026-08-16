@@ -310,8 +310,6 @@ pub struct FiltersConfig {
 )]
 pub struct RawClient {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    pub transport: Option<ClientTransport>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub auth_enforcement: Option<AuthEnforcement>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub aggregate: Option<bool>,
@@ -319,15 +317,6 @@ pub struct RawClient {
     pub base_url: Option<BaseUrlConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub fetch_options: Option<FetchDefaults>,
-}
-
-/// The schema-version 1 client transport.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
-pub enum ClientTransport {
-    Fetch,
 }
 
 /// Whether generated auth requirements are enforced by types or only at runtime.
@@ -3386,7 +3375,6 @@ mod tests {
         let raw = serde_json::from_value::<RawConfig>(json!({
             "schemaVersion": 1,
             "client": {
-                "transport": "fetch",
                 "authEnforcement": "runtime",
                 "aggregate": true,
                 "baseUrl": { "source": "server", "index": 2 },
@@ -3401,7 +3389,6 @@ mod tests {
         }))
         .expect("typed client and validation blocks should deserialize");
         let client = raw.client.expect("client block");
-        assert_eq!(client.transport, Some(ClientTransport::Fetch));
         assert_eq!(client.auth_enforcement, Some(AuthEnforcement::Runtime));
         assert_eq!(
             client.base_url,
@@ -3422,6 +3409,7 @@ mod tests {
         for value in [
             json!({ "client": { "fetchOptions": { "method": "GET" } } }),
             json!({ "client": { "fetchOptions": { "mode": "navigate" } } }),
+            json!({ "client": { "transport": "fetch" } }),
             json!({ "client": { "transport": "axios" } }),
             json!({ "client": { "aggregate": null } }),
             json!({ "validation": { "engine": "valibot" } }),

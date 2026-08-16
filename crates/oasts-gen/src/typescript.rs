@@ -665,6 +665,7 @@ mod tests {
         assert!(ts.contains("source: \"runtime\""));
         assert!(ts.contains("source: \"server\""));
         assert!(ts.contains("source: \"literal\""));
+        assert!(!ts.contains("transport?:"));
     }
 
     #[test]

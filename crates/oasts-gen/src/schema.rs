@@ -197,6 +197,15 @@ mod tests {
     }
 
     #[test]
+    fn fetch_client_has_no_ignored_transport_selector() {
+        let schema = config_schema();
+        let client = &schema["$defs"]["RawClient"];
+        assert_eq!(client["additionalProperties"], json!(false));
+        assert!(client["properties"].get("transport").is_none());
+        assert!(schema["$defs"].get("ClientTransport").is_none());
+    }
+
+    #[test]
     fn input_one_of_is_preserved() {
         let schema = config_schema();
         let input = &schema["$defs"]["Input"];

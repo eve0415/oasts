@@ -7,10 +7,10 @@
 //!   - component and operation codec modules for every payload reaching a transform.
 //!
 //! Nothing goes under the shared `runtime/` directory. Two specs may share one emitted runtime
-//! whenever their `emit.importExtension` and `client.transport` agree, and the date options are
-//! explicitly allowed to differ between them — so a runtime file whose bytes depended on a date
-//! option would break that sharing. `validators/runtime.ts` is the precedent for a per-artifact
-//! runtime file, and this module mirrors it.
+//! whenever their `emit.importExtension` agrees, and the date options are explicitly allowed to
+//! differ between them — so a runtime file whose bytes depended on a date option would break that
+//! sharing. `validators/runtime.ts` is the precedent for a per-artifact runtime file, and this
+//! module mirrors it.
 //!
 //! The re-export exists so the asset stays verbatim. Every embedded runtime asset imports only its
 //! own siblings, which is what lets the emitter copy it and rewrite nothing but the import
