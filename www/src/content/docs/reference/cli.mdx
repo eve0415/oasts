@@ -90,8 +90,12 @@ export default defineConfig({
   input: { path: "./openapi.yaml" },
   output: "./generated",
   artifacts: { types: true, client: true },
+  validation: { engine: "off", unchecked: "allow" },
 });
 ```
+
+The client artifact requires an explicit `validation` block; `engine: "off"` opts out of boundary
+checking. See [Validation](/artifacts/validation) for the other engines.
 
 The `.yaml` and `.json` forms are validated against the published JSON Schema instead — see
 [Configuration](/reference/configuration).
