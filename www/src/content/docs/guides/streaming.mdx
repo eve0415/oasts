@@ -1,13 +1,14 @@
 ---
 title: Streaming
-description: Server-sent events and raw byte bodies, in both directions, with per-event typing.
+description: Server-sent events and raw byte bodies, in both directions, with per-event typing on responses.
 sidebar:
   order: 3
 ---
 
-A response whose media type is `text/event-stream` becomes an async iterable of typed events. A body
-oasts cannot buffer — `application/octet-stream` and friends — becomes a `ReadableStream`. Both work
-in either direction, and neither needs a flag: the document's media types decide.
+A response whose media type is `text/event-stream` becomes an async iterable of typed events — no
+flag needed, the media type decides. A byte body becomes a `ReadableStream` only when you mark its
+media type with `x-oasts-streaming: true`; without the marker `application/octet-stream` and friends
+are buffered as `Uint8Array`. Both kinds work in either direction.
 
 ## Server-sent events
 
@@ -108,7 +109,7 @@ Raw bytes are never checked against a schema — there is nothing to check them 
 
 ## Sending a stream
 
-The same applies to request bodies:
+A marked byte body streams on the way out too:
 
 ```ts title="generated/client/operations/uploadblob.ts"
 export type UploadBlobInput = {
@@ -120,18 +121,28 @@ export type UploadBlobInput = {
 await uploadBlob(transport, { body: file.stream() });
 ```
 
+Per-event typing is response-side only. An SSE **request** body is also a
+`ReadableStream<Uint8Array>`, so frame your events with the generated `encodeSseEvents` helper:
+
+```ts
+await publishTicks(transport, { body: encodeSseEvents(ticks) });
+```
+
 ## What the other artifacts do with streams
 
 - **[Validation](/artifacts/validation)** — SSE events are validated individually, as wire values.
   Raw streams are not validated.
 - **[MSW](/artifacts/msw)** — an operation with a streaming body has no buffered value to project in
-  either direction, so it gets no handler and an `OASTS1514` warning naming it. The rest of the
+  either direction, so it gets no handler and an `OASTS6206` warning naming it. The rest of the
   document still generates handlers.
-- **[TanStack Query](/artifacts/tanstack)** — a streaming read gets **no** query descriptor, and an
-  `OASTS1511` warning says why: a stream is consumable once and cannot be handed to two cache
-  readers. Call the client operation directly.
+- **[TanStack Query](/artifacts/tanstack)** — a streaming operation gets **no** descriptor at all,
+  read or write, and an `OASTS6301` warning says why: a response stream is consumable once and
+  cannot be handed to two cache readers, and a request-body stream cannot be re-sent on a retry.
+  Call the client operation directly.
 
 <Aside type="note">
-  A response the document declares as bodyless (`HEAD`, `204`) that also lists
-  `text/event-stream` gets an `OASTS1406` warning. The status wins: there is no stream to open.
+  A response the document declares as bodyless (`HEAD`, or an exact `204`, `205` or `304`) that also
+  lists `text/event-stream` gets an `OASTS5204` warning. The status wins in the client: the branch
+  delivers `undefined` and no stream is opened. The types artifact still names the declared stream
+  type for that key, so read the client's result type as the authority.
 </Aside>
