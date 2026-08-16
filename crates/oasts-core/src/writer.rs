@@ -115,6 +115,11 @@ struct AppliedChange {
     installed: bool,
 }
 
+struct CommitFailure {
+    diagnostics: Vec<Diagnostic>,
+    retain_staging: bool,
+}
+
 #[derive(Default)]
 struct StagingDirectories {
     // Staging beside each target keeps every commit rename on the target's filesystem, including
@@ -160,6 +165,12 @@ impl StagingDirectories {
             }
         }
         diagnostics
+    }
+
+    fn keep(self) {
+        for (_, directory) in self.directories {
+            let _ = directory.keep();
+        }
     }
 }
 
@@ -394,9 +405,13 @@ fn write_transaction(
     );
     let (report, emptied) = match committed {
         Ok(committed) => committed,
-        Err(mut diagnostics) => {
-            diagnostics.extend(staging.close());
-            return Err(diagnostics);
+        Err(mut failure) => {
+            if failure.retain_staging {
+                staging.keep();
+            } else {
+                failure.diagnostics.extend(staging.close());
+            }
+            return Err(failure.diagnostics);
         }
     };
     require_clean_staging(staging.close())?;
@@ -579,24 +594,33 @@ fn finish_changes(
     committed: Result<(WriteReport, Vec<PathBuf>), Vec<Diagnostic>>,
     renamer: &dyn Renamer,
     applied: Vec<AppliedChange>,
-) -> Result<(WriteReport, Vec<PathBuf>), Vec<Diagnostic>> {
-    let Err(mut diagnostics) = committed else {
-        return committed;
+) -> Result<(WriteReport, Vec<PathBuf>), CommitFailure> {
+    let diagnostics = match committed {
+        Ok(committed) => return Ok(committed),
+        Err(diagnostics) => diagnostics,
+    };
+    let mut failure = CommitFailure {
+        diagnostics,
+        retain_staging: false,
     };
     for change in applied.into_iter().rev() {
         if change.installed {
             if let Some(backup) = change.backup {
                 if let Err(error) = renamer.rename(&backup, &change.target) {
-                    diagnostics.push(io_diagnostic(
-                        format!("failed to restore a generated file during rollback: {error}"),
+                    failure.diagnostics.push(io_diagnostic(
+                        format!(
+                            "failed to restore a generated file during rollback: {error}; old contents remain at '{}'",
+                            backup.display()
+                        ),
                         Some(&change.target),
                     ));
+                    failure.retain_staging = true;
                 }
             } else {
                 match fs::remove_file(&change.target) {
                     Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => diagnostics.push(io_diagnostic(
+                    Err(error) => failure.diagnostics.push(io_diagnostic(
                         format!("failed to remove a committed file during rollback: {error}"),
                         Some(&change.target),
                     )),
@@ -604,7 +628,7 @@ fn finish_changes(
             }
         }
     }
-    Err(diagnostics)
+    Err(failure)
 }
 
 fn create_directories(
@@ -1107,6 +1131,22 @@ mod tests {
                     ErrorKind::Interrupted,
                     "forced interruption before installation",
                 ))
+            } else {
+                fs::rename(from, to)
+            }
+        }
+    }
+
+    struct FailCommitAndRollbackRenamer {
+        calls: Cell<usize>,
+    }
+
+    impl Renamer for FailCommitAndRollbackRenamer {
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if matches!(call, 2 | 3) {
+                Err(io::Error::other("forced commit or rollback failure"))
             } else {
                 fs::rename(from, to)
             }
@@ -1633,6 +1673,54 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_rollback_retains_the_only_old_copy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("generated");
+        write(
+            &output,
+            vec![generated("a.ts", "old a"), generated("z.ts", "old z")],
+        )
+        .expect("initial write");
+        let renamer = FailCommitAndRollbackRenamer {
+            calls: Cell::new(0),
+        };
+
+        let diagnostics = write_with_renamer(
+            &output,
+            vec![generated("a.ts", "new a"), generated("z.ts", "new z")],
+            &renamer,
+        )
+        .expect_err("commit and rollback must fail");
+
+        assert_eq!(renamer.calls.get(), 3);
+        assert_eq!(fs::read(output.join("a.ts")).expect("new a"), b"new a");
+        assert_eq!(fs::read(output.join("z.ts")).expect("old z"), b"old z");
+        let retained_staging = fs::read_dir(&output)
+            .expect("output entries")
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".oasts-stage-")
+            })
+            .expect("retained staging directory")
+            .path();
+        let retained_backup = fs::read_dir(&retained_staging)
+            .expect("staging entries")
+            .filter_map(Result::ok)
+            .find(|entry| fs::read(entry.path()).is_ok_and(|content| content == b"old a"))
+            .expect("retained old a backup")
+            .path();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains(retained_backup.to_string_lossy().as_ref())
+        }));
+        fs::remove_dir_all(retained_staging).expect("retained staging cleanup");
+    }
+
+    #[test]
     fn a_failed_first_write_removes_the_new_output_tree() {
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("generated");
@@ -1674,7 +1762,8 @@ mod tests {
             }],
         )
         .expect_err("rollback result");
-        assert!(missing_rollback.is_empty());
+        assert!(missing_rollback.diagnostics.is_empty());
+        assert!(!missing_rollback.retain_staging);
 
         fs::create_dir(&target).expect("target directory");
         let remove_error = finish_changes(
@@ -1687,7 +1776,8 @@ mod tests {
             }],
         )
         .expect_err("rollback remove error");
-        assert_eq!(remove_error[0].code, CODE_WRITE_IO);
+        assert_eq!(remove_error.diagnostics[0].code, CODE_WRITE_IO);
+        assert!(!remove_error.retain_staging);
         fs::remove_dir(&target).expect("target directory cleanup");
 
         let backup = temp.path().join("backup.ts");
@@ -1706,7 +1796,8 @@ mod tests {
             }],
         )
         .expect_err("rollback restore error");
-        assert_eq!(restore_error[0].code, CODE_WRITE_IO);
+        assert_eq!(restore_error.diagnostics[0].code, CODE_WRITE_IO);
+        assert!(restore_error.retain_staging);
         fs::remove_file(backup).expect("backup cleanup");
 
         require_clean_staging(Vec::new()).expect("empty cleanup result");
