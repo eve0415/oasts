@@ -286,8 +286,6 @@ pub fn render_to_string(mut diagnostics: Vec<Diagnostic>) -> String {
                 rendered.push_str(&format!(" {pointer}"));
             }
             rendered.push('\n');
-        } else if let Some(pointer) = diagnostic.json_pointer {
-            rendered.push_str(&format!("  --> <config>:1:1 {pointer}\n"));
         }
     }
     if !suggestions.is_empty() {
@@ -336,14 +334,15 @@ mod tests {
     }
 
     #[test]
-    fn render_to_string_covers_warnings_locations_and_config_pointers() {
+    fn render_to_string_covers_warnings_and_never_invents_a_config_source() {
         let mut warning = Diagnostic::input("OASTS9906", "warning").with_source("source.yaml");
         warning.severity = Severity::Warning;
         let pointer_only = Diagnostic::config("OASTS9902", "config").with_json_pointer("/config");
         let rendered = render_to_string(vec![warning, pointer_only]);
         assert!(rendered.contains("warning[OASTS9906]"));
         assert!(rendered.contains("source.yaml:1:1"));
-        assert!(rendered.contains("<config>:1:1 /config"));
+        assert!(!rendered.contains("<config>"));
+        assert!(!rendered.contains("/config"));
     }
 
     #[test]

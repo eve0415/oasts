@@ -310,8 +310,6 @@ pub struct FiltersConfig {
 )]
 pub struct RawClient {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    pub transport: Option<ClientTransport>,
-    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub auth_enforcement: Option<AuthEnforcement>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub aggregate: Option<bool>,
@@ -319,15 +317,6 @@ pub struct RawClient {
     pub base_url: Option<BaseUrlConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub fetch_options: Option<FetchDefaults>,
-}
-
-/// The schema-version 1 client transport.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "json-schema", schemars(rename_all = "camelCase"))]
-pub enum ClientTransport {
-    Fetch,
 }
 
 /// Whether generated auth requirements are enforced by types or only at runtime.
@@ -736,7 +725,15 @@ pub enum EnumMemberCase {
 )]
 pub struct NamingConfig {
     pub file_case: FileCase,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(schema_with = "pascal_literal_schema")
+    )]
     pub type_case: String,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(schema_with = "preserve_literal_schema")
+    )]
     pub property_case: String,
     pub operation_case: OperationCase,
     pub enum_member_case: EnumMemberCase,
@@ -849,9 +846,49 @@ impl Default for DocumentationConfig {
 )]
 pub struct EmitConfig {
     pub runtime_directory: String,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(schema_with = "import_extension_schema")
+    )]
     pub import_extension: String,
     pub banner: Vec<String>,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(schema_with = "deterministic_literal_schema")
+    )]
     pub format: String,
+}
+
+#[cfg(feature = "json-schema")]
+fn pascal_literal_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "pascal"
+    })
+}
+
+#[cfg(feature = "json-schema")]
+fn preserve_literal_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "preserve"
+    })
+}
+
+#[cfg(feature = "json-schema")]
+fn import_extension_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": [".js", "none"]
+    })
+}
+
+#[cfg(feature = "json-schema")]
+fn deterministic_literal_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "const": "deterministic"
+    })
 }
 
 impl Default for EmitConfig {
@@ -918,9 +955,19 @@ pub struct LocalTrustConfig {
     )
 )]
 pub struct LimitsConfig {
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 1_024, max = 1_073_741_824))
+    )]
     pub max_document_bytes: u64,
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(range(min = 1_024_u64, max = 4_294_967_296_u64))
+    )]
     pub max_total_bytes: u64,
+    #[cfg_attr(feature = "json-schema", schemars(range(min = 1, max = 4_096)))]
     pub max_documents: u64,
+    #[cfg_attr(feature = "json-schema", schemars(range(min = 1, max = 1_024)))]
     pub max_ref_depth: u64,
 }
 
@@ -1076,11 +1123,11 @@ pub fn discover_candidate(
     explicit: Option<&Path>,
 ) -> Result<DiscoveredConfig, Diagnostic> {
     if let Some(explicit_path) = explicit {
-        let path = if explicit_path.is_absolute() {
+        let path = normalize_config_path(if explicit_path.is_absolute() {
             explicit_path.to_path_buf()
         } else {
             cwd.join(explicit_path)
-        };
+        });
         let extension = path.extension().and_then(OsStr::to_str);
         let supported = extension.is_some_and(|candidate| {
             SCRIPT_EXTENSIONS.contains(&candidate) || DATA_EXTENSIONS.contains(&candidate)
@@ -1112,7 +1159,7 @@ pub fn discover_candidate(
 
     let mut candidates = DISCOVERY_NAMES
         .iter()
-        .map(|name| cwd.join(name))
+        .map(|name| normalize_config_path(cwd.join(name)))
         .filter(|path| path.is_file())
         .collect::<Vec<_>>();
     if candidates.len() != 1 {
@@ -1183,7 +1230,7 @@ pub fn load_config_from_json(
     json: &[u8],
 ) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     let config_path = if config_path.is_absolute() {
-        config_path.to_path_buf()
+        normalize_config_path(config_path.to_path_buf())
     } else {
         absolutize_config_path(config_path.to_path_buf(), std::env::current_dir())?
     };
@@ -1209,7 +1256,7 @@ fn absolutize_config_path(
     current_dir: io::Result<PathBuf>,
 ) -> Result<PathBuf, Vec<Diagnostic>> {
     current_dir
-        .map(|current| current.join(discovered))
+        .map(|current| normalize_config_path(current.join(discovered)))
         .map_err(|error| {
             vec![config_error(
                 CODE_CONFIG_READ,
@@ -1254,11 +1301,17 @@ pub fn resolve_config(
 ) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     let mut sink = DiagnosticSink::new();
     let source_path = config_path.as_path();
-    // Config resolution is entered with a selected file path; even a relative file has an empty
-    // parent path rather than no parent.
-    let config_parent = config_path
+    let Some(config_parent) = config_path
         .parent()
-        .expect("resolved config paths always have a parent");
+        .filter(|_| config_path.file_name().is_some())
+    else {
+        return Err(vec![config_error(
+            CODE_CONFIG_READ,
+            "config path must name a file",
+            Some(source_path),
+            None,
+        )]);
+    };
     let config_dir = match fs::canonicalize(config_parent) {
         Ok(path) => path,
         Err(error) => {
@@ -2339,6 +2392,20 @@ fn normalize_join(base: &Path, relative: &Path) -> PathBuf {
     result
 }
 
+/// Gives every config path one filesystem-aware parent before it reaches diagnostics or the
+/// resolved config. An in-memory script-config path need not exist, so only its parent is
+/// canonicalized. This also preserves a config-file symlink as the anchor for relative settings.
+fn normalize_config_path(path: PathBuf) -> PathBuf {
+    let Some(file_name) = path.file_name().map(OsStr::to_os_string) else {
+        return path;
+    };
+    let parent = path.with_file_name("");
+    match fs::canonicalize(parent) {
+        Ok(parent) => parent.join(file_name),
+        Err(_) => path,
+    }
+}
+
 fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let mut candidate = path.to_path_buf();
     loop {
@@ -2359,6 +2426,7 @@ fn to_u32(value: usize) -> u32 {
 mod tests {
     use crate::filter::{CODE_FILTER_PATTERN, PatternKind};
 
+    use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use serde_json::json;
@@ -2546,6 +2614,95 @@ mod tests {
             .join("oasts.json");
         let resolved = load_config_from_json(&relative, json).expect("relative path resolves");
         assert!(resolved.input.is_absolute());
+    }
+
+    #[test]
+    fn bare_relative_config_loads_when_its_empty_parent_cannot_be_canonicalized() {
+        let mut file = tempfile::Builder::new()
+            .prefix("oasts-config-")
+            .suffix(".json")
+            .tempfile_in(".")
+            .expect("bare relative config file");
+        let json = serde_json::to_vec(&valid_json_value()).expect("valid config JSON");
+        file.write_all(&json).expect("config contents");
+        let bare_path = PathBuf::from(file.path().file_name().expect("config file name"));
+
+        let resolved = load_config(Some(&bare_path), Path::new(""))
+            .expect("bare relative config path should load");
+
+        assert_eq!(
+            resolved.config_path,
+            fs::canonicalize(".")
+                .expect("current directory")
+                .join(bare_path)
+        );
+    }
+
+    #[test]
+    fn equivalent_config_paths_compare_and_render_identically() {
+        let directory = TestDirectory::new();
+        fs::create_dir(directory.path().join("nested")).expect("nested directory");
+        directory.write("openapi.yaml", "openapi: 3.1.0\npaths: {}\n");
+        let json = br#"{"schemaVersion":1,"input":{"path":"openapi.yaml"},"output":"generated"}"#;
+        let canonical = directory.write("oasts.json", std::str::from_utf8(json).expect("UTF-8"));
+        let equivalent = directory
+            .path()
+            .join("nested")
+            .join("..")
+            .join(".")
+            .join("oasts.json");
+
+        let direct = load_config_from_json(&canonical, json).expect("direct config path");
+        let normalized = load_config_from_json(&equivalent, json).expect("equivalent config path");
+        assert_eq!(direct, normalized);
+        assert_eq!(
+            discover_candidate(directory.path(), Some(&equivalent))
+                .expect("explicit config discovery")
+                .path,
+            canonical
+        );
+
+        let diagnostics = load_config_from_json(&equivalent, b"{").expect_err("malformed config");
+        let rendered = crate::diag::render_to_string(diagnostics);
+        assert!(rendered.contains(&canonical.to_string_lossy().into_owned()));
+        assert!(!rendered.contains("/nested/../"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_path_parent_components_resolve_after_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let target = TestDirectory::new();
+        fs::create_dir(target.path().join("nested")).expect("symlink target directory");
+        symlink(target.path().join("nested"), directory.path().join("link"))
+            .expect("config path symlink");
+        target.write("openapi.yaml", "openapi: 3.1.0\npaths: {}\n");
+        let json = br#"{"schemaVersion":1,"input":{"path":"openapi.yaml"},"output":"generated"}"#;
+        let config = target.write("oasts.json", std::str::from_utf8(json).expect("UTF-8"));
+        let through_symlink = directory.path().join("link").join("..").join("oasts.json");
+
+        let discovered = discover_candidate(directory.path(), Some(&through_symlink))
+            .expect("config path through symlink should resolve");
+        assert_eq!(
+            fs::canonicalize(discovered.path).expect("discovered config should exist"),
+            fs::canonicalize(config).expect("expected config should exist")
+        );
+
+        let resolved = load_config_from_json(&through_symlink, json)
+            .expect("in-memory config path through symlink should resolve");
+        let target = fs::canonicalize(target.path()).expect("target directory should exist");
+        assert_eq!(resolved.config_dir, target);
+        assert_eq!(resolved.input, target.join("openapi.yaml"));
+    }
+
+    #[test]
+    fn config_path_that_lexically_collapses_to_root_is_diagnosed() {
+        let json = serde_json::to_vec(&valid_json_value()).expect("valid config JSON");
+        for path in [Path::new("/missing/.."), Path::new("/")] {
+            assert_code(load_config_from_json(path, &json), CODE_CONFIG_READ);
+        }
     }
 
     #[test]
@@ -3328,7 +3485,6 @@ mod tests {
         let raw = serde_json::from_value::<RawConfig>(json!({
             "schemaVersion": 1,
             "client": {
-                "transport": "fetch",
                 "authEnforcement": "runtime",
                 "aggregate": true,
                 "baseUrl": { "source": "server", "index": 2 },
@@ -3343,7 +3499,6 @@ mod tests {
         }))
         .expect("typed client and validation blocks should deserialize");
         let client = raw.client.expect("client block");
-        assert_eq!(client.transport, Some(ClientTransport::Fetch));
         assert_eq!(client.auth_enforcement, Some(AuthEnforcement::Runtime));
         assert_eq!(
             client.base_url,
@@ -3364,6 +3519,7 @@ mod tests {
         for value in [
             json!({ "client": { "fetchOptions": { "method": "GET" } } }),
             json!({ "client": { "fetchOptions": { "mode": "navigate" } } }),
+            json!({ "client": { "transport": "fetch" } }),
             json!({ "client": { "transport": "axios" } }),
             json!({ "client": { "aggregate": null } }),
             json!({ "validation": { "engine": "valibot" } }),
@@ -4207,6 +4363,14 @@ mod tests {
             None
         );
         assert_eq!(to_u32(usize::MAX), u32::MAX);
+        assert_eq!(
+            normalize_config_path(PathBuf::from(".")),
+            PathBuf::from(".")
+        );
+        assert_eq!(
+            normalize_config_path(PathBuf::from("/")),
+            PathBuf::from("/")
+        );
         assert_eq!(
             canonicalize_result(Ok(PathBuf::from("resolved")), "path"),
             Ok(PathBuf::from("resolved"))

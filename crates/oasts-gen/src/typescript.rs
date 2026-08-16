@@ -665,6 +665,7 @@ mod tests {
         assert!(ts.contains("source: \"runtime\""));
         assert!(ts.contains("source: \"server\""));
         assert!(ts.contains("source: \"literal\""));
+        assert!(!ts.contains("transport?:"));
     }
 
     #[test]
@@ -687,6 +688,10 @@ mod tests {
             "string enums should not appear as named types"
         );
         assert!(ts.contains("\"literal\" | \"const\""));
+        assert!(ts.contains("typeCase?: \"pascal\";"));
+        assert!(ts.contains("propertyCase?: \"preserve\";"));
+        assert!(ts.contains("importExtension?: \".js\" | \"none\";"));
+        assert!(ts.contains("format?: \"deterministic\";"));
     }
 
     #[test]
