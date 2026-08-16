@@ -102,21 +102,41 @@ The `.yaml` and `.json` forms are validated against the published JSON Schema in
 
 ## Exit codes
 
-There are only three:
+The compiler ends a run with one of three:
 
 | Code | Meaning |
 | --- | --- |
 | `0` | Success. Warnings may still have been printed. |
-| `1` | The document was read and refused — a diagnostic about its content, or drift under `--check`. |
-| `2` | The run never got as far as the document: a usage error, an invalid or missing config, or an input file that could not be read. |
+| `1` | An **input** diagnostic — something about the document itself. Also drift under `--check`. |
+| `2` | A **config** diagnostic — usage, the config file, or any file oasts had to read or write. |
 
-The split is not a severity ranking. It is *where* the run stopped: `2` means oasts could not establish
-what to compile, `1` means it compiled and the answer was no. Each diagnostic carries its category, so
-the code is a property of the diagnostic rather than something the CLI decides after the fact — the
-[stage bands](/concepts/diagnostics) line up with it exactly.
+The split is the diagnostic's category. It is not a severity ranking, not the stage the diagnostic
+came from, and not how far the run got. Every diagnostic carries a category of its own, and the run
+exits on the highest code it saw. Two consequences follow from that, and both surprise people:
+
+**Anything to do with files is `2`, including the write.** Failing to write an artifact — or to read
+your committed output back under `--check` — is a config-category diagnostic. So a run that read your
+document, compiled it, and then tripped over the output tree exits `2`, not `1`.
+
+**One config-category error re-codes the whole run.** When a config diagnostic and a content
+diagnostic land together, both are reported and the exit code is `2`. The way you meet this by
+accident is the default `typescript.tsconfig: auto`: a broken `tsconfig.json` sitting in your
+workspace gets discovered, read, and reported, which turns what would have been a `1` into a `2`
+without anything changing in your document.
 
 Warnings never change the exit code. If you want a warning to fail your build, grep the output or
 gate on `oasts check` in a step of its own.
+
+### Codes oasts did not choose
+
+Anything outside `0`–`2` means the run never reached a verdict. A refusal always prints
+`error[OASTSnnnn]`; these do not, which is how you tell them apart:
+
+- **`134`** — the compiler crashed. You get a Rust panic message and no diagnostic. (Invoking the
+  native binary directly gives `101` instead.) That is always a bug — please report it along with the
+  document that provoked it.
+- **anything else** — `oasts.config.ts` is evaluated as a module, so your config can end the process
+  itself. A `process.exit(3)` in there is exit `3`, before oasts has looked at anything.
 
 ## What the package exports
 
