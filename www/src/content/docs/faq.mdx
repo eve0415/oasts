@@ -127,7 +127,8 @@ API that fails silently at runtime. Write `infiniteQueryOptions` by hand over th
 
 They are hierarchical, derived from the URL path template, so a prefix invalidates everything
 beneath it. Literal segments contribute strings and parameters contribute single-key objects, so
-`/pets/mine` and `/pets/{petId}` with `petId = "mine"` are different entries at every depth. Each
+`/pets/mine` and `/pets/{petId}` with `petId = "mine"` share their ancestors and then part company
+at the segment that differs — a string is never equal to an object. Each
 mutation also exports a companion listing the keys it structurally affects. See
 [TanStack Query](/artifacts/tanstack#keys-are-hierarchical).
 

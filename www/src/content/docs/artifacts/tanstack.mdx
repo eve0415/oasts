@@ -46,9 +46,12 @@ queryClient.setQueryDefaults(apiPetsAll, { staleTime: 30_000 });
 keys.pets.byPetId.all(petId);                                 // everything under one pet
 ```
 
-A literal path segment contributes a string and a parameter contributes a single-key object, so
-`/pets/mine` and `/pets/{petId}` with `petId = "mine"` are different cache entries at every prefix
-depth — they cannot be confused the way a template-string key can.
+A literal path segment contributes a string and a parameter contributes a single-key object. So
+`/pets/mine` and `/pets/{petId}` with `petId = "mine"` share every ancestor — `["api", "pets"]`,
+which is exactly what makes prefix invalidation work — and then diverge at the segment where
+`"mine"` meets `{ petId: "mine" }`. A string never equals an object, so nothing below that point can
+collide the way a template-string key can. An optional path parameter you leave `undefined`
+contributes `[]`, which is a segment of its own rather than a hole.
 
 Every path node is also exported as a flat binding (`apiPetsAll`, `apiPetsByPetId`). A query module
 imports one leaf, and a mutation imports only the chain it invalidates, so bundling a single
