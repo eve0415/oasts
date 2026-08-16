@@ -57,14 +57,8 @@ else. See [Client](/artifacts/client#failure-complete-results).
 
 `unchecked` is the policy for successful response data that is decoded and then never checked
 against the OpenAPI schema — because `response: false` turns response validation off, or because the
-branch is a raw byte stream, which carries no schema to check. `allow` passes it through, `warn` is
-meant to report it at generation, `error` refuses. The default is `warn`.
-
-<Aside type="caution" title="`warn` is silent today">
-  The diagnostic is produced and then dropped before anything prints, so `warn` currently behaves as
-  `allow`. Use `unchecked: error` if you need unschema'd responses to fail the build. See
-  [Configuration](/reference/configuration).
-</Aside>
+branch is a raw byte stream, which carries no schema to check. `allow` passes it through, `warn`
+prints a generation-time warning and continues, and `error` refuses. The default is `warn`.
 
 <Aside type="note">
   Validators only ever observe wire values. When a [date representation](/guides/dates) is
