@@ -246,7 +246,7 @@ paths:
         let diagnostics = client_sink
             .as_slice()
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1411")
+            .filter(|diagnostic| diagnostic.code == "OASTS5001")
             .collect::<Vec<_>>();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert_eq!(diagnostics[0].severity, crate::diag::Severity::Warning);
@@ -1193,7 +1193,7 @@ content:
         let msw = diagnostics("oasts-msw.yaml");
         assert_eq!(client, msw);
         assert_eq!(client.len(), 1);
-        assert_eq!(client[0].0, "OASTS1403");
+        assert_eq!(client[0].0, "OASTS5201");
         assert_eq!(
             client[0].1,
             "response media 'text/xml' is XML, which Oasts does not support"

@@ -67,7 +67,7 @@ const CODE_HEADER_DUPLICATE: &str = "OASTS1134";
 const CODE_WEBHOOKS_VERSION: &str = "OASTS1135";
 const CODE_LINK_TARGET: &str = "OASTS1234";
 const CODE_PHANTOM_REQUIRED: &str = "OASTS1111";
-const CODE_SECURITY_FLOWS_SHAPE: &str = "OASTS1438";
+const CODE_SECURITY_FLOWS_SHAPE: &str = "OASTS5406";
 
 const METHODS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
@@ -6817,7 +6817,7 @@ mod tests {
         assert!(
             sink.as_slice()
                 .iter()
-                .all(|diagnostic| diagnostic.code != "OASTS1411")
+                .all(|diagnostic| diagnostic.code != "OASTS5001")
         );
         assert_eq!(
             sink.as_slice()

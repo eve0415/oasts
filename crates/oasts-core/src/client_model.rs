@@ -30,18 +30,18 @@ use crate::response_media::{
 };
 use crate::semantic::Analyzed;
 
-const CODE_OAUTH2_EMPTY_FLOWS: &str = "OASTS1435";
-const CODE_OAUTH2_FLOW_REQUIRED_URL: &str = "OASTS1436";
-const CODE_OAUTH2_FLOW_URL: &str = "OASTS1437";
-const CODE_OPENID_CONNECT_URL: &str = "OASTS1439";
-const CODE_HTTP_SCHEME_TOKEN: &str = "OASTS1444";
-const CODE_OAUTH2_REQUIREMENT_SCOPE: &str = "OASTS1440";
-const CODE_NON_OAUTH_REQUIREMENT_SCOPES: &str = "OASTS1441";
-const CODE_URLENCODED_CONTENT_TYPE_IGNORED: &str = "OASTS1425";
-const CODE_MULTIPART_30_STYLE_IGNORED: &str = "OASTS1426";
-const CODE_MULTIPART_STYLE_UNDEFINED: &str = "OASTS1427";
-const CODE_FORM_SCHEMA_PROPERTIES: &str = "OASTS1421";
-const CODE_FORM_SCHEMA_UNCONSTRAINED: &str = "OASTS1428";
+const CODE_OAUTH2_EMPTY_FLOWS: &str = "OASTS5403";
+const CODE_OAUTH2_FLOW_REQUIRED_URL: &str = "OASTS5404";
+const CODE_OAUTH2_FLOW_URL: &str = "OASTS5405";
+const CODE_OPENID_CONNECT_URL: &str = "OASTS5407";
+const CODE_HTTP_SCHEME_TOKEN: &str = "OASTS5411";
+const CODE_OAUTH2_REQUIREMENT_SCOPE: &str = "OASTS5408";
+const CODE_NON_OAUTH_REQUIREMENT_SCOPES: &str = "OASTS5409";
+const CODE_URLENCODED_CONTENT_TYPE_IGNORED: &str = "OASTS5109";
+const CODE_MULTIPART_30_STYLE_IGNORED: &str = "OASTS5111";
+const CODE_MULTIPART_STYLE_UNDEFINED: &str = "OASTS5112";
+const CODE_FORM_SCHEMA_PROPERTIES: &str = "OASTS5106";
+const CODE_FORM_SCHEMA_UNCONSTRAINED: &str = "OASTS5113";
 const JSON_PART_MEDIA: &str = "application/json";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,7 +105,7 @@ pub struct ParameterPlan {
     pub resolved: ResolvedParameterSerialization,
     /// The caller supplies a pre-serialized `string`, so the client input type ignores `schema`.
     /// Set for content-sourced parameters whose media type is neither JSON-family nor a
-    /// text/plain-over-string passthrough (the OASTS1443 case); every typed case keeps this false.
+    /// text/plain-over-string passthrough (the OASTS5006 case); every typed case keeps this false.
     pub caller_serialized: bool,
     pub source: SourceRef,
 }
@@ -1614,8 +1614,8 @@ fn response_table(
         .collect()
 }
 
-const CODE_DEEP_OBJECT_FALSE_EXPLODE: &str = "OASTS1442";
-const CODE_CONTENT_CALLER_SERIALIZED: &str = "OASTS1443";
+const CODE_DEEP_OBJECT_FALSE_EXPLODE: &str = "OASTS5005";
+const CODE_CONTENT_CALLER_SERIALIZED: &str = "OASTS5006";
 
 fn plan_parameters(
     operation: &Operation,
@@ -1631,7 +1631,7 @@ fn plan_parameters(
                 && forbidden_request_header_name(&parameter.name)
             {
                 sink.push(source_diagnostic(
-                    "OASTS1411",
+                    "OASTS5001",
                     format!(
                         "header parameter '{}' is dropped from the generated client because Fetch forbids setting that request header",
                         parameter.name
@@ -1674,7 +1674,7 @@ fn plan_parameters(
                 deep_object,
             ) {
                 sink.push(source_diagnostic(
-                    "OASTS1419",
+                    "OASTS5004",
                     format!(
                         "parameter '{}' has an unsupported {:?} serialization combination{}",
                         parameter.name,
@@ -1745,7 +1745,7 @@ fn invalid_style_combination(
     }
 }
 
-/// The remedy clause appended to `OASTS1419` when the only thing rejecting this combination is the
+/// The remedy clause appended to `OASTS5004` when the only thing rejecting this combination is the
 /// strict `deepObject` reading — the one axis a user can move without editing a document they may
 /// not own. Every other rejection (an illegal location/style pair, `explode: false`, a delimited
 /// style over a scalar) is unaffected by the compat setting, so naming it there would send the
@@ -1791,7 +1791,7 @@ fn diagnose_security(
         {
             if forbidden_request_header_name(name) {
                 sink.push(source_diagnostic(
-                    "OASTS1411",
+                    "OASTS5001",
                     format!(
                         "header API key '{}' uses Fetch-forbidden header '{}'",
                         scheme.name, name
@@ -1805,7 +1805,7 @@ fn diagnose_security(
                 "accept" | "content-type"
             ) {
                 sink.push(source_diagnostic(
-                    "OASTS1412",
+                    "OASTS5002",
                     format!(
                         "header API key '{}' collides with operation-owned header '{}'",
                         scheme.name, name
@@ -1821,7 +1821,7 @@ fn diagnose_security(
                     && wire_names_equal(location, &parameter.name, &key)
                 {
                     sink.push(source_diagnostic(
-                        "OASTS1413",
+                        "OASTS5003",
                         format!(
                             "security scheme '{}' collides with parameter '{}' at the same wire key",
                             scheme.name, parameter.name
@@ -1854,7 +1854,7 @@ fn diagnose_security(
                     && wire_names_equal(left_location, &left_key, &right_key)
                 {
                     sink.push(source_diagnostic(
-                        "OASTS1413",
+                        "OASTS5003",
                         format!(
                             "AND security alternative maps incompatible schemes '{}' and '{}' to one wire key",
                             left.name, right.name
@@ -1909,7 +1909,7 @@ fn index_security_schemes(ir: &Ir) -> HashMap<&str, SchemeLookup<'_>> {
 }
 
 /// Resolves effective security into ordered OR alternatives. Every spec-legal security scheme
-/// kind is representable; spec-illegal kinds remain fatal through OASTS1433 so the client never
+/// kind is representable; spec-illegal kinds remain fatal through OASTS5401 so the client never
 /// silently drops a documented auth member.
 fn plan_auth(
     operation: &Operation,
@@ -1941,7 +1941,7 @@ fn auth_scheme_use(
 ) -> Option<AuthSchemeUse> {
     let Some(lookup) = schemes.get(name) else {
         sink.push(source_diagnostic(
-            "OASTS1434",
+            "OASTS5402",
             format!(
                 "operation '{}' security requirement references security scheme '{name}', which is not declared in components.securitySchemes",
                 operation_label(operation)
@@ -2013,7 +2013,7 @@ fn auth_scheme_use(
         }
         | SecKind::Other => {
             sink.push(source_diagnostic(
-                "OASTS1433",
+                "OASTS5401",
                 format!(
                     "operation '{}' security scheme '{}' uses an unrecognized security scheme kind, which the fetch client cannot serialize",
                     operation_label(operation),
@@ -2076,7 +2076,7 @@ fn diagnose_base_url(operation: &Operation, base_url: &BaseUrlPlan, sink: &mut D
     let index = *index as usize;
     if servers.get(index).is_none() {
         sink.push(source_diagnostic(
-            "OASTS1420",
+            "OASTS5301",
             format!("operation has no effective server at index {index}"),
             &operation.source,
             Severity::Error,
@@ -2097,7 +2097,7 @@ fn has_relative_server_url(base_url: &BaseUrlPlan) -> bool {
     })
 }
 
-/// Multipart-only admission matrix for an explicit encoding `style`/`explode` keyword (OASTS1427).
+/// Multipart-only admission matrix for an explicit encoding `style`/`explode` keyword (OASTS5112).
 ///
 /// The OAS 3.1.1 Encoding Object defines per-part serialization for a narrow set of shapes: a
 /// primitive — text or binary alike, any style/explode — always maps to its existing scalar
@@ -2179,7 +2179,7 @@ fn diagnose_form_media(
         let schema = property.schema.as_ref();
         if multipart && contains_control(name) {
             sink.push(source_diagnostic(
-                "OASTS1414",
+                "OASTS5101",
                 format!(
                     "multipart field name {name:?} contains a control byte and cannot be represented"
                 ),
@@ -2244,7 +2244,7 @@ fn diagnose_form_media(
                     deep_object,
                 );
                 sink.push(source_diagnostic(
-                    "OASTS1419",
+                    "OASTS5004",
                     format!(
                         "encoding for field '{name}' has an unsupported {style:?} serialization combination{remedy}"
                     ),
@@ -2282,7 +2282,7 @@ fn diagnose_form_media(
                 for value in values {
                     if crate::media::canonical_encoding_content_type(value).is_err() {
                         sink.push(source_diagnostic(
-                            "OASTS1418",
+                            "OASTS5105",
                             format!(
                                 "encoding contentType value {value:?} is malformed or has a control/non-ASCII parameter value"
                             ),
@@ -2301,7 +2301,7 @@ fn diagnose_form_media(
                 && default_part_media(schema, media.oas_version, projector, &mut HashSet::new()).1
             {
                 sink.push(source_diagnostic(
-                    "OASTS1423",
+                    "OASTS5107",
                     format!(
                         "form field '{name}' has a binary payload that application/x-www-form-urlencoded cannot represent; use multipart/form-data for binary uploads or base64-encode the value (type: string, contentEncoding: base64url)"
                     ),
@@ -2331,7 +2331,7 @@ fn diagnose_form_media(
                 });
                 if declares_text {
                     sink.push(source_diagnostic(
-                        "OASTS1424",
+                        "OASTS5108",
                         format!(
                             "form field '{name}' declares a text media type but its schema is an object; use application/json (or a *+json media type) for structured urlencoded values"
                         ),
@@ -2397,7 +2397,7 @@ fn diagnose_multipart_headers(
                 let canonical = canonical_content_disposition(field_name);
                 if schema_admits_string(&header.schema, &canonical, projector) != Some(true) {
                     sink.push(source_diagnostic(
-                        "OASTS1416",
+                        "OASTS5103",
                         format!(
                             "declared Content-Disposition for field '{field_name}' does not admit the encoder-owned value"
                         ),
@@ -2411,7 +2411,7 @@ fn diagnose_multipart_headers(
                     values.is_empty() || values.iter().any(|value| !admitted_cte(value))
                 }) {
                     sink.push(source_diagnostic(
-                        "OASTS1415",
+                        "OASTS5102",
                         format!(
                             "declared Content-Transfer-Encoding for field '{field_name}' includes a value other than 7bit, 8bit, or binary and is never emitted"
                         ),
@@ -2421,7 +2421,7 @@ fn diagnose_multipart_headers(
                 }
             }
             _ => sink.push(source_diagnostic(
-                "OASTS1417",
+                "OASTS5104",
                 format!(
                     "multipart field '{field_name}' declares header '{header_name}', but it is never emitted because RFC 7578 §4.8 permits only Content-Disposition, Content-Type, and Content-Transfer-Encoding part headers"
                 ),
@@ -2553,7 +2553,7 @@ fn diagnose_request_media(
         // opaque byte stream. The response classifier applies the same precedence.
         if xml_requires_structural_mapping(media, projector) {
             sink.push(source_diagnostic(
-                "OASTS1403",
+                "OASTS5201",
                 format!(
                     "request body media '{}' is XML, which Oasts does not support",
                     media.essence
@@ -2572,7 +2572,7 @@ fn diagnose_request_media(
             && projection_excludes_string(projector.project(&media.schema))
         {
             sink.push(source_diagnostic(
-                "OASTS1405",
+                "OASTS5203",
                 format!(
                     "top-level text request media '{}' requires a schema whose primitive projection contains string",
                     media.essence
@@ -3555,7 +3555,7 @@ mod tests {
         let diagnostic = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == CODE_FORM_SCHEMA_PROPERTIES)
-            .expect("OASTS1421 diagnostic");
+            .expect("OASTS5106 diagnostic");
 
         assert_eq!(diagnostic.severity, Severity::Error);
         assert!(
@@ -5382,7 +5382,7 @@ mod tests {
             line: Some(7),
             col: Some(9),
         };
-        let diagnostic = source_diagnostic("OASTS1419", "located", &located, Severity::Error);
+        let diagnostic = source_diagnostic("OASTS5004", "located", &located, Severity::Error);
         assert_eq!((diagnostic.line, diagnostic.col), (Some(7), Some(9)));
 
         let string = test_primitive(PrimitiveType::String, "/string");
@@ -5675,7 +5675,7 @@ mod tests {
         assert_eq!(
             sink.as_slice()
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1433")
+                .filter(|diagnostic| diagnostic.code == "OASTS5401")
                 .count(),
             1
         );
@@ -6144,8 +6144,8 @@ mod tests {
         // The SSE branch contributes nothing here: its events are validated one at a time when
         // response validation is on, so it is not unchecked data under any policy.
         for (policy, expected) in [
-            ("error", vec!["OASTS1407"]),
-            ("warn", vec!["OASTS1408"]),
+            ("error", vec!["OASTS5205"]),
+            ("warn", vec!["OASTS5206"]),
             ("allow", Vec::new()),
         ] {
             let (_temp, analyzed, config) = analyzed_with_validation(
@@ -6235,7 +6235,7 @@ mod tests {
                 .iter()
                 .map(|(code, _)| *code)
                 .collect::<Vec<&str>>(),
-            ["OASTS1408", "OASTS1408"],
+            ["OASTS5206", "OASTS5206"],
             "{reported:?}"
         );
         assert!(
@@ -6460,7 +6460,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1403")
+                .filter(|diagnostic| diagnostic.code == "OASTS5201")
                 .count(),
             4
         );
@@ -6508,7 +6508,7 @@ mod tests {
         // its parts, so it decodes, and the multipart *request* body was never in question.
         let rejected = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1404")
+            .filter(|diagnostic| diagnostic.code == "OASTS5202")
             .collect::<Vec<_>>();
         assert_eq!(rejected.len(), 1);
         assert!(rejected[0].message.contains("multipart/mixed"));
@@ -6600,7 +6600,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1405")
+                .filter(|diagnostic| diagnostic.code == "OASTS5203")
                 .count(),
             5
         );
@@ -6640,7 +6640,7 @@ mod tests {
         assert!(
             !diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1405")
+                .any(|diagnostic| diagnostic.code == "OASTS5203")
         );
     }
 
@@ -6676,7 +6676,7 @@ mod tests {
         let diagnostics = client_diagnostics(&document);
         let bodyless = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1406")
+            .filter(|diagnostic| diagnostic.code == "OASTS5204")
             .collect::<Vec<_>>();
 
         assert_eq!(bodyless.len(), 4);
@@ -6686,7 +6686,7 @@ mod tests {
                 .all(|diagnostic| diagnostic.severity == Severity::Warning)
         );
         assert!(!diagnostics.iter().any(|diagnostic| {
-            matches!(diagnostic.code, "OASTS1402" | "OASTS1403" | "OASTS1404")
+            matches!(diagnostic.code, "OASTS1402" | "OASTS5201" | "OASTS5202")
         }));
     }
 
@@ -6851,7 +6851,7 @@ mod tests {
         let (model, diagnostics) =
             content_param_model("query", "text/plain", json!({ "type": "string" }));
         // A string-shaped text/plain content parameter serializes exactly like a schema+style string
-        // — the location default helper, a typed input, and no OASTS1443.
+        // — the location default helper, a typed input, and no OASTS5006.
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
         let plan = only_param(&model);
         assert_eq!(plan.resolved.helper, HelperId::QueryFormExplode);
@@ -6869,7 +6869,7 @@ mod tests {
         assert_eq!(plan.resolved.helper, HelperId::QueryForm);
         let warnings: Vec<_> = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1443")
+            .filter(|diagnostic| diagnostic.code == "OASTS5006")
             .collect();
         assert_eq!(warnings.len(), 1, "{diagnostics:#?}");
         assert_eq!(warnings[0].severity, Severity::Warning);
@@ -6879,14 +6879,14 @@ mod tests {
 
     #[test]
     fn text_plain_non_string_content_parameter_is_caller_serialized() {
-        // The passthrough is string-only; text/plain over a non-string schema falls to OASTS1443.
+        // The passthrough is string-only; text/plain over a non-string schema falls to OASTS5006.
         let (model, diagnostics) =
             content_param_model("query", "text/plain", json!({ "type": "object" }));
         assert!(only_param(&model).caller_serialized);
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1443")
+                .filter(|diagnostic| diagnostic.code == "OASTS5006")
                 .count(),
             1,
         );
@@ -6925,7 +6925,7 @@ mod tests {
             assert_eq!(
                 diagnostics
                     .iter()
-                    .filter(|diagnostic| diagnostic.code == "OASTS1443")
+                    .filter(|diagnostic| diagnostic.code == "OASTS5006")
                     .count(),
                 1,
                 "{location}"
@@ -6968,22 +6968,22 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1411")
+                .filter(|diagnostic| diagnostic.code == "OASTS5001")
                 .count(),
             2
         );
         assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "OASTS1411"
+            diagnostic.code == "OASTS5001"
                 && diagnostic.severity == Severity::Warning
                 && diagnostic.message.contains("Content-Length")
         }));
         assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "OASTS1411"
+            diagnostic.code == "OASTS5001"
                 && diagnostic.severity == Severity::Error
                 && diagnostic.message.contains("proxyKey")
         }));
         assert!(!diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "OASTS1411"
+            diagnostic.code == "OASTS5001"
                 && (diagnostic.message.contains("X-HTTP-Method")
                     || diagnostic.message.contains("inactive"))
         }));
@@ -7077,7 +7077,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1412")
+                .filter(|diagnostic| diagnostic.code == "OASTS5002")
                 .count(),
             2
         );
@@ -7117,7 +7117,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1413")
+                .filter(|diagnostic| diagnostic.code == "OASTS5003")
                 .count(),
             2
         );
@@ -7154,7 +7154,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1414")
+                .filter(|diagnostic| diagnostic.code == "OASTS5101")
                 .count(),
             2
         );
@@ -7225,7 +7225,7 @@ mod tests {
         };
 
         assert_eq!(diagnostics.len(), 2);
-        for code in ["OASTS1415", "OASTS1417"] {
+        for code in ["OASTS5102", "OASTS5104"] {
             let diagnostic = diagnostics
                 .iter()
                 .find(|diagnostic| diagnostic.code == code)
@@ -7310,7 +7310,7 @@ mod tests {
 
         let diagnostics = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1415")
+            .filter(|diagnostic| diagnostic.code == "OASTS5102")
             .collect::<Vec<_>>();
         assert_eq!(diagnostics.len(), 4);
         assert!(
@@ -7367,7 +7367,7 @@ mod tests {
 
         let diagnostics = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1415")
+            .filter(|diagnostic| diagnostic.code == "OASTS5102")
             .collect::<Vec<_>>();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Severity::Warning);
@@ -7421,7 +7421,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.code != "OASTS1415")
+                .all(|diagnostic| diagnostic.code != "OASTS5102")
         );
     }
 
@@ -7473,7 +7473,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1416")
+                .filter(|diagnostic| diagnostic.code == "OASTS5103")
                 .count(),
             1
         );
@@ -7515,7 +7515,7 @@ mod tests {
 
         let diagnostics = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1417")
+            .filter(|diagnostic| diagnostic.code == "OASTS5104")
             .collect::<Vec<_>>();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Severity::Warning);
@@ -7569,7 +7569,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1418")
+                .filter(|diagnostic| diagnostic.code == "OASTS5105")
                 .count(),
             6
         );
@@ -7643,7 +7643,7 @@ mod tests {
         let flagged = |document: &Value| -> Vec<Diagnostic> {
             client_diagnostics(document)
                 .into_iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1423")
+                .filter(|diagnostic| diagnostic.code == "OASTS5107")
                 .collect()
         };
         let names = |diagnostics: &[Diagnostic]| -> Vec<String> {
@@ -7719,7 +7719,7 @@ mod tests {
         });
         let flagged = client_diagnostics(&document)
             .into_iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1424")
+            .filter(|diagnostic| diagnostic.code == "OASTS5108")
             .collect::<Vec<_>>();
         // Only `obj` and `arr` are structured-under-text; `objOctet` classifies JSON and `str` is
         // text-representable.
@@ -7770,7 +7770,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1419")
+                .filter(|diagnostic| diagnostic.code == "OASTS5004")
                 .count(),
             5
         );
@@ -7821,7 +7821,7 @@ mod tests {
             deep_object_plan(&deep_object_document(), DeepObjectEncoding::Strict);
         let rejected = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1419")
+            .filter(|diagnostic| diagnostic.code == "OASTS5004")
             .count();
         assert_eq!(rejected, 3, "{diagnostics:#?}");
         // Only the object-typed parameter survives the strict gate.
@@ -7842,7 +7842,7 @@ mod tests {
             deep_object_plan(&deep_object_document(), DeepObjectEncoding::Strict);
         let deep_object: Vec<_> = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1419")
+            .filter(|diagnostic| diagnostic.code == "OASTS5004")
             .collect();
         assert!(
             deep_object.iter().all(|diagnostic| diagnostic
@@ -7866,7 +7866,7 @@ mod tests {
         }));
         let illegal_style = unrelated
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1419")
+            .find(|diagnostic| diagnostic.code == "OASTS5004")
             .expect("an illegal query style is still rejected");
         assert!(
             !illegal_style.message.contains("compat"),
@@ -7958,7 +7958,7 @@ mod tests {
         );
         assert_eq!(sink.as_slice().len(), 1, "{:#?}", sink.as_slice());
         let diagnostic = &sink.as_slice()[0];
-        assert_eq!(diagnostic.code, "OASTS1442");
+        assert_eq!(diagnostic.code, "OASTS5005");
         assert_eq!(diagnostic.severity, Severity::Warning);
         assert_eq!(
             diagnostic.message,
@@ -7985,7 +7985,7 @@ mod tests {
             let diagnostic = diagnostics
                 .iter()
                 .find(|diagnostic| diagnostic.code == CODE_URLENCODED_CONTENT_TYPE_IGNORED)
-                .expect("OASTS1425 diagnostic");
+                .expect("OASTS5109 diagnostic");
             assert_eq!(diagnostic.severity, Severity::Warning);
             assert_eq!(
                 diagnostic.json_pointer.as_deref(),
@@ -8143,7 +8143,7 @@ mod tests {
                         .is_some_and(|pointer| pointer.ends_with(&format!("/encoding/{field}"))))
                     .count(),
                 1,
-                "expected exactly one OASTS1427 for '{field}'"
+                "expected exactly one OASTS5112 for '{field}'"
             );
         }
         for (field, rendering) in [
@@ -8177,7 +8177,7 @@ mod tests {
     /// The conjunction lowering (allOf/$ref/applicator coexistence) resolves an allOf-of-objects
     /// schema to a `Domain::OBJECT` projection without ever producing a `SchemaNode::Object` node.
     /// The admission matrix classifies via `default_part_media`'s own domain-projection catch-all,
-    /// so this still reports OASTS1427 instead of silently falling through as unclassified.
+    /// so this still reports OASTS5112 instead of silently falling through as unclassified.
     #[test]
     fn allof_object_conjunction_with_style_is_rejected() {
         let document = json!({
@@ -8232,8 +8232,8 @@ mod tests {
         assert!(client_diagnostics(&document).is_empty());
     }
 
-    /// OASTS1427 is 3.1-only: 3.0 multipart style keywords are already warn-ignored by OASTS1426, so
-    /// the same object+style shape in a 3.0 document must not additionally report OASTS1427.
+    /// OASTS5112 is 3.1-only: 3.0 multipart style keywords are already warn-ignored by OASTS5111, so
+    /// the same object+style shape in a 3.0 document must not additionally report OASTS5112.
     #[test]
     fn oasts1427_does_not_fire_on_30_documents() {
         let document = json!({
@@ -8251,13 +8251,13 @@ mod tests {
             }}}
         });
         let diagnostics = client_diagnostics(&document);
-        // OASTS1426 (the 3.0 multipart style warning) is expected on this exact shape, so the
+        // OASTS5111 (the 3.0 multipart style warning) is expected on this exact shape, so the
         // diagnostics list here is never empty — the `.filter()` below always has a non-empty
         // source to iterate.
         diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == CODE_MULTIPART_30_STYLE_IGNORED)
-            .expect("OASTS1426 diagnostic");
+            .expect("OASTS5111 diagnostic");
         let oasts1427 = diagnostics
             .into_iter()
             .filter(|diagnostic| diagnostic.code == CODE_MULTIPART_STYLE_UNDEFINED)
@@ -8306,14 +8306,14 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1419")
+                .filter(|diagnostic| diagnostic.code == "OASTS5004")
                 .count(),
             1
         );
         assert!(
             !diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1418")
+                .any(|diagnostic| diagnostic.code == "OASTS5105")
         );
     }
 
@@ -8360,12 +8360,12 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1420")
+                .filter(|diagnostic| diagnostic.code == "OASTS5301")
                 .count(),
             1
         );
         assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "OASTS1420"
+            diagnostic.code == "OASTS5301"
                 && diagnostic
                     .message
                     .contains("operation has no effective server at index 1")
@@ -9072,7 +9072,7 @@ mod tests {
             let hits = sink
                 .as_slice()
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1433")
+                .filter(|diagnostic| diagnostic.code == "OASTS5401")
                 .collect::<Vec<_>>();
             assert_eq!(hits.len(), 1);
             assert!(hits[0].message.contains("weird"));
@@ -9100,7 +9100,7 @@ mod tests {
         let hits = sink
             .as_slice()
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1434")
+            .filter(|diagnostic| diagnostic.code == "OASTS5402")
             .collect::<Vec<_>>();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].message.contains("ghost"));
@@ -9402,7 +9402,7 @@ mod tests {
     fn media_less_30_document_still_gates_version_dependent_rules() {
         // A 3.0 document with no media anywhere (204-only response, no request/response content) has
         // no media type to infer the OAS version from. The version now rides the IR from the parser,
-        // so the 3.0-only non-oauth-scopes gate (OASTS1441) still fires; the same document as 3.1 is
+        // so the 3.0-only non-oauth-scopes gate (OASTS5409) still fires; the same document as 3.1 is
         // clean. (Regression: media inference defaulted a media-less document to 3.1 and silently
         // skipped the gate.)
         for (version, expected) in [("3.0.3", 1usize), ("3.1.0", 0usize)] {

@@ -781,7 +781,7 @@ fn plan_projected_body(
         {
             let reason = match error {
                 // Valid OpenAPI that simply declares nothing, so the handler is still emitted —
-                // with an empty projection. Said here rather than left to the client's OASTS1428,
+                // with an empty projection. Said here rather than left to the client's OASTS5113,
                 // because that one only runs when the client artifact is enabled and `types + msw`
                 // is a configuration the documentation puts in front of people.
                 FormPropertiesError::Unconstrained => {

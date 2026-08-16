@@ -371,7 +371,7 @@ generate_and_verify variant-name-shadow-3.0 oasts-client.yaml "$work/client-vari
 generate_and_verify uninhabitable-allof-3.0 oasts.yaml "$work/uninhabitable-allof-3.0" client "uninhabitable-allof-3.0"
 
 # deepObject carries one document per conformance mode, because the extended-only shapes (array,
-# untyped) are a hard OASTS1419 under the strict default and so cannot share a document.
+# untyped) are a hard OASTS5004 under the strict default and so cannot share a document.
 generate_and_verify deep-object-3.0 oasts.yaml "$work/deep-object-strict" client "deep-object-3.0 (strict)"
 generate_and_verify deep-object-3.0 oasts-compat.yaml "$work/deep-object-extended" client "deep-object-3.0 (extended)"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-builtin-name-shadow-3.0/compile-assert/cases.ts"

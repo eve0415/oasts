@@ -150,7 +150,7 @@ pub(crate) fn diagnose_operation_response_media(
         for media in &response.media_types {
             if static_bodyless {
                 sink.push(source_diagnostic(
-                    "OASTS1406",
+                    "OASTS5204",
                     format!(
                         "response key '{}' is statically bodyless but declares media '{}'",
                         response_status_name(&response.status),
@@ -175,14 +175,14 @@ fn response_media_diagnostic(
     let projection = projector.response_schema_projection(&media.schema);
     let (code, message) = match classify_response_media(media, projector) {
         ResponseMediaKind::Xml => (
-            "OASTS1403",
+            "OASTS5201",
             format!(
                 "response media '{}' is XML, which Oasts does not support",
                 media.essence
             ),
         ),
         ResponseMediaKind::MultipartUnnamed => (
-            "OASTS1404",
+            "OASTS5202",
             format!(
                 "multipart response media '{}' has no part-to-property mapping; only multipart/form-data names its parts (RFC 7578 section 4.2 Content-Disposition), so nothing decides which declared property a part belongs to",
                 media.essence
@@ -192,7 +192,7 @@ fn response_media_diagnostic(
             if media.schema_present && projection == ResponseSchemaProjection::ExcludesString =>
         {
             (
-                "OASTS1405",
+                "OASTS5203",
                 format!(
                     "text response media '{}' requires a schema whose primitive projection contains string",
                     media.essence
@@ -241,9 +241,9 @@ pub(crate) fn diagnose_unchecked_raw_streams(
                 continue;
             }
             let (code, severity) = if reject {
-                ("OASTS1407", Severity::Error)
+                ("OASTS5205", Severity::Error)
             } else {
-                ("OASTS1408", Severity::Warning)
+                ("OASTS5206", Severity::Warning)
             };
             sink.push(source_diagnostic(
                 code,
@@ -318,7 +318,7 @@ mod tests {
             col: Some(9),
         };
         let diagnostic = source_diagnostic(
-            "OASTS1403",
+            "OASTS5201",
             "unsupported response",
             &source,
             Severity::Error,
