@@ -34,19 +34,43 @@ If an operation vanished from an artifact, a warning says so and names it.
 
 ## Code families
 
-The number tells you which stage refused:
+The **thousands** digit is the stage that refused, and every code in a stage shares an exit code:
 
-| Range | Stage | Typical cause |
-| --- | --- | --- |
-| `OASTS00xx` | CLI and config loading | The config file is missing, unreadable, or not valid against the schema |
-| `OASTS01xx` | Config validation | A key holds a value the schema does not allow |
-| `OASTS02xx` | Config semantics | Two settings contradict each other, a filter pattern is unusable, a peer dependency is missing |
-| `OASTS10xx` | Document loading | A `$ref` target cannot be resolved, or a limit was exceeded |
-| `OASTS11xx` | Schema model | A keyword cannot be represented, or filtering left nothing |
-| `OASTS12xx` | Naming | Two things in the document want the same identifier |
-| `OASTS13xx` | Composition and emit | A compiler-invented name collides with one the document owns |
-| `OASTS14xx` | Client model | A request or response cannot be projected into the client pipeline |
-| `OASTS15xx` | Artifact projections | The zod, validators, MSW or TanStack view cannot express something |
+| Stage | What refused | Exit | For example |
+| --- | --- | --- | --- |
+| `0xxx` | **Config validation.** The file parsed, but something in it is not a usable instruction. | `2` | `OASTS0101` no artifact is enabled · `OASTS0111` the client artifact needs types on · `OASTS0262` a filter pattern matches nothing |
+| `1xxx` | **I/O.** A file oasts had to read or write did not cooperate. | `2` | `OASTS1001` the config could not be read · `OASTS1002` your tsconfig is unreadable or is not valid JSONC · `OASTS1013` writing an output file failed |
+| `2xxx` | **Document loading and structure.** The document, its `$ref` graph, or a schema keyword. | `1` | `OASTS2003` the document is not valid YAML or JSON · `OASTS2013` the `limits.maxDocuments` bound was exceeded · `OASTS2201` a construct this OpenAPI version does not define |
+| `3xxx` | **Semantics.** Names, value domains, links. | `1` | `OASTS3001` two operations want the same identifier · `OASTS3002` two schemas want the same type name · `OASTS3201` a Link Object's `operationId` names no operation |
+| `4xxx` | **Type emission.** Turning the model into TypeScript. | `1` | `OASTS4105` a compiler-invented name has nowhere left to move · `OASTS4201` an `allOf` proven empty, lowered to `never` |
+| `5xxx` | **Client model.** Projecting operations into the request and response pipeline. | `1` | `OASTS5201` an XML response media · `OASTS5403` an OAuth2 scheme declaring no flows |
+| `6xxx` | **Artifacts.** One sub-band per artifact. | `1` | `OASTS6002` validators cannot check a keyword · `OASTS6201` a path literal MSW's matcher cannot match |
+| `9xxx` | **Provisional.** A capability this build gates off rather than refuses. | varies | `OASTS9003` a reserved config block · `OASTS9101` a remote `$ref` |
+
+The **hundreds** digit sub-divides a stage: `62xx` is MSW's corner of the artifact stage, `22xx` is
+the schema-keyword corner of document loading. Sub-bands are kept sparse deliberately, so a new code
+joins its siblings instead of landing at the end of a run.
+
+The exit code is a property of each diagnostic, not something parsed back out of its number. Every
+code carries a category, and stages are drawn so that all the codes in one share it — that is what
+makes the `Exit` column true rather than coincidental. A code whose category disagrees with its
+stage is a bug. See [exit codes](/reference/cli) for what `1` and `2` mean at the shell.
+
+`0xxx` has a finer address: `0rrs`, where `rr` is a config rule and `s` is a sequence within it.
+`OASTS0262` is rule 26 — filters — sequence 2. Codes sharing an `rr` are different ways of failing
+the same rule, so `0261`, `0262` and `0263` are all about filters, widening from one pattern to one
+axis to the whole block.
+
+### The provisional band
+
+`9xxx` is not a stage. It holds capabilities this build gates off rather than refuses on the merits
+— `OASTS9101` for a remote `$ref`, `OASTS9003` for a config block that is accepted by the schema but
+not implemented. A provisional code **retires when its capability lands**, so the band is expected to
+develop holes, and nothing is renumbered to close them.
+
+The second digit tells you which stage the code would otherwise have sat in. Treat it as a hint
+about where the refusal came from, not as a way to work out the exit code — read that off the
+category the diagnostic carries. `99xx` is reserved for test sentinels and is never emitted.
 
 ## Refusals you are most likely to meet
 
