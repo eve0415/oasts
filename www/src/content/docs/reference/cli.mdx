@@ -98,11 +98,18 @@ The `.yaml` and `.json` forms are validated against the published JSON Schema in
 
 ## Exit codes
 
+There are only three:
+
 | Code | Meaning |
 | --- | --- |
 | `0` | Success. Warnings may still have been printed. |
-| `2` | A usage error — unknown command, unexpected argument, `--check` on the wrong command. |
-| non-zero | A diagnostic that stops the run: an invalid config, an unresolvable document, a refusal, or drift under `--check`. |
+| `1` | The document was read and refused — a diagnostic about its content, or drift under `--check`. |
+| `2` | The run never got as far as the document: a usage error, an invalid or missing config, or an input file that could not be read. |
+
+The split is not a severity ranking. It is *where* the run stopped: `2` means oasts could not establish
+what to compile, `1` means it compiled and the answer was no. Each diagnostic carries its category, so
+the code is a property of the diagnostic rather than something the CLI decides after the fact — the
+[stage bands](/concepts/diagnostics) line up with it exactly.
 
 Warnings never change the exit code. If you want a warning to fail your build, grep the output or
 gate on `oasts check` in a step of its own.
