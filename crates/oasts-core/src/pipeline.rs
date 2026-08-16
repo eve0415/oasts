@@ -189,6 +189,70 @@ components:
     }
 
     #[test]
+    fn standalone_artifacts_preserve_shared_model_diagnostics_without_types() {
+        for artifact in ["validators", "zod"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            fs::write(
+                temp.path().join("openapi.yaml"),
+                r##"openapi: 3.1.1
+info: {title: t, version: 1.0.0}
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Pet"}
+components:
+  schemas:
+    Cat:
+      type: object
+      required: [kind]
+      properties:
+        kind: {type: string, const: cat}
+    Pet:
+      oneOf:
+        - {$ref: "#/components/schemas/Cat"}
+        - {type: string}
+      discriminator: {propertyName: kind}
+"##,
+            )
+            .expect("OpenAPI document");
+            let mut artifacts = json!({ "types": false });
+            artifacts[artifact] = json!(true);
+            let raw = json!({
+                "schemaVersion": 1,
+                "input": { "path": "openapi.yaml" },
+                "output": "generated",
+                "artifacts": artifacts
+            });
+            let config = load_config_from_json(
+                &temp.path().join("oasts.json"),
+                &serde_json::to_vec(&raw).expect("config JSON"),
+            )
+            .expect("resolved config");
+
+            let mut sink = DiagnosticSink::new();
+            let files = compile(&config, true, &mut sink).expect("emitted files");
+
+            assert!(!files.is_empty(), "{artifact}");
+            assert_eq!(
+                sink.as_slice()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == "OASTS4202")
+                    .count(),
+                1,
+                "{artifact}: {:#?}",
+                sink.as_slice()
+            );
+            assert!(!sink.has_errors(), "{artifact}: {:#?}", sink.as_slice());
+        }
+    }
+
+    #[test]
     fn compile_stops_on_load_failure() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
