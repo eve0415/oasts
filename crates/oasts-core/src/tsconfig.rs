@@ -127,18 +127,18 @@ impl TsconfigError {
     pub(crate) fn into_diagnostic(self) -> Diagnostic {
         match self {
             Self::Unreadable { path, reason } => Diagnostic::config(
-                "OASTS0253",
+                "OASTS1002",
                 format!("tsconfig '{}' could not be read: {reason}", path.display()),
             ),
             Self::Malformed { path, reason } => Diagnostic::config(
-                "OASTS0253",
+                "OASTS1002",
                 format!(
                     "tsconfig '{}' is not valid JSON with comments: {reason}",
                     path.display()
                 ),
             ),
             Self::ExtendsCycle { path, target } => Diagnostic::config(
-                "OASTS0254",
+                "OASTS0252",
                 format!(
                     "tsconfig '{}' extends '{}', which is already in its own extends chain",
                     path.display(),
@@ -146,21 +146,21 @@ impl TsconfigError {
                 ),
             ),
             Self::ExtendsTooDeep { path } => Diagnostic::config(
-                "OASTS0254",
+                "OASTS0252",
                 format!(
                     "tsconfig '{}' extends a chain deeper than {MAX_EXTENDS_DEPTH} files",
                     path.display()
                 ),
             ),
             Self::ExtendsUnresolved { path, target } => Diagnostic::config(
-                "OASTS0255",
+                "OASTS0253",
                 format!(
                     "tsconfig '{}' extends '{target}', which does not resolve to a readable file",
                     path.display()
                 ),
             ),
             Self::TooManyFiles { path } => Diagnostic::config(
-                "OASTS0254",
+                "OASTS0252",
                 format!(
                     "reading tsconfig '{}' would pass the {MAX_TSCONFIG_FILES}-file budget for one run",
                     path.display()
@@ -675,7 +675,7 @@ mod tests {
             matches!(&error, TsconfigError::ExtendsCycle { target, .. } if target == &temp.path().join("a.json")),
             "{error:?}"
         );
-        assert_eq!(error.into_diagnostic().code, "OASTS0254");
+        assert_eq!(error.into_diagnostic().code, "OASTS0252");
     }
 
     #[test]
@@ -697,7 +697,7 @@ mod tests {
             matches!(error, TsconfigError::ExtendsTooDeep { .. }),
             "{error:?}"
         );
-        assert_eq!(error.into_diagnostic().code, "OASTS0254");
+        assert_eq!(error.into_diagnostic().code, "OASTS0252");
     }
 
     #[test]
@@ -713,7 +713,7 @@ mod tests {
             matches!(&error, TsconfigError::ExtendsUnresolved { target, .. } if target == "./absent.json"),
             "{error:?}"
         );
-        assert_eq!(error.clone().into_diagnostic().code, "OASTS0255");
+        assert_eq!(error.clone().into_diagnostic().code, "OASTS0253");
         assert!(error.into_diagnostic().message.contains("./absent.json"));
 
         // A bare specifier is a package lookup this reader deliberately does not perform.
@@ -737,7 +737,7 @@ mod tests {
             matches!(error, TsconfigError::Unreadable { .. }),
             "{error:?}"
         );
-        assert_eq!(error.into_diagnostic().code, "OASTS0253");
+        assert_eq!(error.into_diagnostic().code, "OASTS1002");
 
         let malformed = write(temp.path(), "bad.json", r#"{ "compilerOptions": }"#);
         let error = read_err(&malformed);
@@ -745,7 +745,7 @@ mod tests {
             matches!(error, TsconfigError::Malformed { .. }),
             "{error:?}"
         );
-        assert_eq!(error.into_diagnostic().code, "OASTS0253");
+        assert_eq!(error.into_diagnostic().code, "OASTS1002");
 
         let oversized = write(
             temp.path(),
@@ -774,7 +774,7 @@ mod tests {
             matches!(error, TsconfigError::TooManyFiles { .. }),
             "{error:?}"
         );
-        assert_eq!(error.into_diagnostic().code, "OASTS0254");
+        assert_eq!(error.into_diagnostic().code, "OASTS0252");
     }
 
     #[test]
@@ -966,7 +966,7 @@ mod tests {
             consumer_provides_temporal(&output, &TsconfigSource::Path(broken));
         assert!(!provides);
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "OASTS0253");
+        assert_eq!(diagnostics[0].code, "OASTS1002");
     }
 
     #[test]

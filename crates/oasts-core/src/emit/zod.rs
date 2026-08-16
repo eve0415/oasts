@@ -24,7 +24,8 @@ use crate::response_media::media_has_validatable_schema;
 use super::model::EmissionModel;
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::validators::{
-    identical_component_delegate, operation_parameter_validator_names, validator_wire_type_name,
+    CODE_MEDIA_TAG_COLLISION, identical_component_delegate, operation_parameter_validator_names,
+    validator_wire_type_name,
 };
 use super::{
     Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypeAxis, TypePosition,
@@ -40,11 +41,9 @@ const ZOD_RUNTIME_TS: &str = include_str!("../../runtime/zod-runtime.ts");
 const VALIDATORS_RUNTIME_TS: &str = include_str!("../../runtime/validators-runtime.ts");
 
 /// A schema carries a validation keyword the Zod artifact does not implement.
-const CODE_REJECTED_KEYWORD: &str = "OASTS1504";
+const CODE_REJECTED_KEYWORD: &str = "OASTS6101";
 /// A schema degraded to an unknown leaf, so no faithful Zod schema can be emitted.
-const CODE_UNKNOWN_LEAF: &str = "OASTS1505";
-/// A JSON response media entry was renamed because its Zod schema-name fragment collided.
-const CODE_MEDIA_TAG_COLLISION: &str = "OASTS1400";
+const CODE_UNKNOWN_LEAF: &str = "OASTS6102";
 
 const ZOD_RESERVED_NAMES: &[&str] = &[
     "z",
@@ -3715,7 +3714,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1111")
+                .any(|diagnostic| diagnostic.code == "OASTS2203")
         );
         assert_clean(&diagnostics);
         let content = component(&files, "account");

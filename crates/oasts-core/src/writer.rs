@@ -13,10 +13,10 @@ use crate::diag::Diagnostic;
 use crate::emit::GeneratedFile;
 
 const MANIFEST_NAME: &str = ".oasts-manifest.json";
-const CODE_MANIFEST: &str = "OASTS0231";
-const CODE_PATH: &str = "OASTS0232";
-const CODE_IO: &str = "OASTS0233";
-const CODE_DUPLICATE: &str = "OASTS0234";
+const CODE_MANIFEST: &str = "OASTS1011";
+const CODE_PATH: &str = "OASTS1012";
+const CODE_WRITE_IO: &str = "OASTS1013";
+const CODE_DUPLICATE: &str = "OASTS1014";
 const PARALLEL_IO_MIN_FILES: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -699,7 +699,7 @@ fn path_diagnostic(relative_path: &str, reason: &str) -> Diagnostic {
 }
 
 fn io_diagnostic(message: String, path: Option<&Path>) -> Diagnostic {
-    let diagnostic = Diagnostic::config(CODE_IO, message);
+    let diagnostic = Diagnostic::config(CODE_WRITE_IO, message);
     if let Some(path) = path {
         diagnostic.with_source(path.to_string_lossy())
     } else {
@@ -1081,13 +1081,13 @@ mod tests {
         let missing = temp.path().join("missing");
         assert_eq!(
             canonical_output_dir(&missing).expect_err("missing")[0].code,
-            CODE_IO
+            CODE_WRITE_IO
         );
         let file = temp.path().join("file");
         fs::write(&file, "x").expect("file");
         assert_eq!(
             canonical_output_dir(&file).expect_err("file output")[0].code,
-            CODE_IO
+            CODE_WRITE_IO
         );
 
         let report = check_drift(temp.path(), vec![generated("../bad.ts", "")]);
@@ -1169,7 +1169,7 @@ mod tests {
         mode(create_temp.path(), 0o555);
         let create_error = write(&create_temp.path().join("new"), Vec::new()).expect_err("create");
         mode(create_temp.path(), 0o755);
-        assert_eq!(create_error[0].code, CODE_IO);
+        assert_eq!(create_error[0].code, CODE_WRITE_IO);
 
         let delete_temp = tempfile::tempdir().expect("tempdir");
         let delete_output = delete_temp.path().join("generated");
@@ -1177,7 +1177,7 @@ mod tests {
         mode(&delete_output, 0o555);
         let delete_error = write(&delete_output, Vec::new()).expect_err("delete");
         mode(&delete_output, 0o755);
-        assert_eq!(delete_error[0].code, CODE_IO);
+        assert_eq!(delete_error[0].code, CODE_WRITE_IO);
 
         let parent_temp = tempfile::tempdir().expect("tempdir");
         let parent_output = parent_temp.path().join("generated");
@@ -1186,7 +1186,7 @@ mod tests {
         let parent_error =
             write(&parent_output, vec![generated("nested/a.ts", "a")]).expect_err("parent create");
         mode(&parent_output, 0o755);
-        assert_eq!(parent_error[0].code, CODE_IO);
+        assert_eq!(parent_error[0].code, CODE_WRITE_IO);
 
         let file_temp = tempfile::tempdir().expect("tempdir");
         let file_output = file_temp.path().join("generated");
@@ -1194,7 +1194,7 @@ mod tests {
         mode(&file_output.join("a.ts"), 0o400);
         let file_error = write(&file_output, vec![generated("a.ts", "b")]).expect_err("file write");
         mode(&file_output.join("a.ts"), 0o600);
-        assert_eq!(file_error[0].code, CODE_IO);
+        assert_eq!(file_error[0].code, CODE_WRITE_IO);
 
         let manifest_path = file_output.join(MANIFEST_NAME);
         fs::write(
@@ -1206,7 +1206,7 @@ mod tests {
         let manifest_error =
             write(&file_output, vec![generated("a.ts", "a")]).expect_err("manifest write");
         mode(&manifest_path, 0o600);
-        assert_eq!(manifest_error[0].code, CODE_IO);
+        assert_eq!(manifest_error[0].code, CODE_WRITE_IO);
     }
 
     #[cfg(unix)]
@@ -1225,12 +1225,12 @@ mod tests {
         mode(&output.join("a.ts"), 0o000);
         let report = check_drift(&output, files.clone());
         mode(&output.join("a.ts"), 0o600);
-        assert_eq!(report.diagnostics[0].code, CODE_IO);
+        assert_eq!(report.diagnostics[0].code, CODE_WRITE_IO);
 
         mode(&output.join(MANIFEST_NAME), 0o000);
         let report = check_drift(&output, files);
         mode(&output.join(MANIFEST_NAME), 0o600);
-        assert_eq!(report.diagnostics[0].code, CODE_IO);
+        assert_eq!(report.diagnostics[0].code, CODE_WRITE_IO);
     }
 
     #[cfg(unix)]
@@ -1250,7 +1250,7 @@ mod tests {
         symlink(output.join("missing"), output.join("dangling")).expect("dangling symlink");
         assert_eq!(
             validate_target(&output, "dangling/a.ts").expect_err("dangling")[0].code,
-            CODE_IO
+            CODE_WRITE_IO
         );
 
         symlink(output.join("parent-file"), output.join("file-link")).expect("file symlink");
@@ -1275,13 +1275,13 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock");
         let error = validate_target(&output, "locked/inside/a.ts").expect_err("locked target");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("unlock");
-        assert_eq!(error[0].code, CODE_IO);
+        assert_eq!(error[0].code, CODE_WRITE_IO);
     }
 
     #[test]
     fn diagnostic_helpers_cover_optional_path() {
         let diagnostic = io_diagnostic("io".to_owned(), None);
-        assert_eq!(diagnostic.code, CODE_IO);
+        assert_eq!(diagnostic.code, CODE_WRITE_IO);
         assert!(diagnostic.source_id.is_none());
         assert_eq!(path_diagnostic("bad", "reason").code, CODE_PATH);
 
@@ -1291,6 +1291,6 @@ mod tests {
             Err(std::io::Error::from(ErrorKind::PermissionDenied)),
         )
         .expect_err("metadata failure");
-        assert_eq!(error[0].code, CODE_IO);
+        assert_eq!(error[0].code, CODE_WRITE_IO);
     }
 }

@@ -1,8 +1,31 @@
 //! Stable Oasts diagnostics.
 //!
-//! Configuration diagnostics use `OASTS0rrs`, where `rr` is the two-digit
-//! config rejection-rule number and `s` is a per-rule sequence digit.
-//! Input and semantic diagnostics use the reserved `OASTS1xxx` range.
+//! The thousands digit is the compiler stage a code comes from. Stages are
+//! drawn so that every code within one shares a single exit code:
+//!
+//! | Stage  | Meaning                                             | Exit |
+//! |--------|-----------------------------------------------------|------|
+//! | `0xxx` | config validation, as `0rrs` — rule `rr`, sequence `s` | 2  |
+//! | `1xxx` | I/O and write failures                              | 2    |
+//! | `2xxx` | document loading, structure, and schema keywords    | 1    |
+//! | `3xxx` | semantic: names, value domains, links                | 1    |
+//! | `4xxx` | type emission                                       | 1    |
+//! | `5xxx` | client model                                        | 1    |
+//! | `6xxx` | artifacts, one sub-band per artifact                | 1    |
+//!
+//! The exit code is carried by [`Category`], not parsed out of the number; the
+//! table holds because stage membership is chosen to keep it true, and a code
+//! whose category disagrees with its stage is a bug.
+//!
+//! The hundreds digit sub-divides a stage. Sub-bands stay sparse deliberately,
+//! so a new code joins its siblings instead of landing at the end of a run.
+//!
+//! `9xxx` is the provisional band: capabilities this build gates off rather
+//! than refuses on the merits. A provisional code retires when its capability
+//! lands, so the band is expected to develop holes and nothing may renumber to
+//! close them. The second digit mirrors the stage the code would otherwise have
+//! had, so it keeps its category. `99xx` is reserved for test sentinels, which
+//! are never emitted.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -314,24 +337,24 @@ mod tests {
 
     #[test]
     fn render_to_string_covers_warnings_locations_and_config_pointers() {
-        let mut warning = Diagnostic::input("OASTS1999", "warning").with_source("source.yaml");
+        let mut warning = Diagnostic::input("OASTS9906", "warning").with_source("source.yaml");
         warning.severity = Severity::Warning;
-        let pointer_only = Diagnostic::config("OASTS0999", "config").with_json_pointer("/config");
+        let pointer_only = Diagnostic::config("OASTS9902", "config").with_json_pointer("/config");
         let rendered = render_to_string(vec![warning, pointer_only]);
-        assert!(rendered.contains("warning[OASTS1999]"));
+        assert!(rendered.contains("warning[OASTS9906]"));
         assert!(rendered.contains("source.yaml:1:1"));
         assert!(rendered.contains("<config>:1:1 /config"));
     }
 
     #[test]
     fn render_appends_one_yaml_safe_run_level_override_block() {
-        let schemas = Diagnostic::input("OASTS1202", "schema collision")
+        let schemas = Diagnostic::input("OASTS3002", "schema collision")
             .with_naming_override_suggestions(vec![NamingOverrideSuggestion {
                 namespace: NamingOverrideNamespace::Schemas,
                 source_name: "Owner's pet".to_owned(),
                 identifier: "OwnersPet_1".to_owned(),
             }]);
-        let operations = Diagnostic::input("OASTS1201", "operation collision")
+        let operations = Diagnostic::input("OASTS3001", "operation collision")
             .with_naming_override_suggestions(vec![NamingOverrideSuggestion {
                 namespace: NamingOverrideNamespace::Operations,
                 source_name: "get-pet".to_owned(),
@@ -362,7 +385,7 @@ mod tests {
         let mut writer = FailingWriter;
         std::io::Write::flush(&mut writer).expect("flush is infallible");
         render(
-            vec![Diagnostic::config("OASTS0001", "failure")],
+            vec![Diagnostic::config("OASTS9902", "failure")],
             &mut writer,
         )
         .expect_err("write failure");
@@ -370,7 +393,7 @@ mod tests {
 
     #[test]
     fn render_writes_located_diagnostics_to_writer() {
-        let located = Diagnostic::config("OASTS0001", "failure")
+        let located = Diagnostic::config("OASTS9902", "failure")
             .with_source("config.yaml")
             .with_location(4, 2)
             .with_json_pointer("/input");
@@ -378,7 +401,7 @@ mod tests {
         render(vec![located], &mut buffer).expect("render");
         assert_eq!(
             String::from_utf8(buffer).expect("UTF-8"),
-            "error[OASTS0001]: failure\n  --> config.yaml:4:2 /input\n"
+            "error[OASTS9902]: failure\n  --> config.yaml:4:2 /input\n"
         );
     }
 
@@ -429,7 +452,7 @@ mod tests {
         };
         let input_error = Diagnostic {
             category: Category::Input,
-            ..diagnostic(None, None, None, "OASTS1001", "input")
+            ..diagnostic(None, None, None, "OASTS1003", "input")
         };
         let mut sink = DiagnosticSink::new();
         sink.push(warning);
@@ -444,11 +467,11 @@ mod tests {
 
     #[test]
     fn constructors_metadata_and_collection_accessors_are_covered() {
-        let configured = Diagnostic::config("OASTS0001", "config")
+        let configured = Diagnostic::config("OASTS9902", "config")
             .with_source("config.yaml")
             .with_location(3, 7)
             .with_json_pointer("/input");
-        let input = Diagnostic::input("OASTS1001", "input");
+        let input = Diagnostic::input("OASTS1003", "input");
 
         assert_eq!(configured.source_id.as_deref(), Some("config.yaml"));
         assert_eq!((configured.line, configured.col), (Some(3), Some(7)));

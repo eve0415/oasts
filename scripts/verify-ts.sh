@@ -371,7 +371,7 @@ generate_and_verify variant-name-shadow-3.0 oasts-client.yaml "$work/client-vari
 generate_and_verify uninhabitable-allof-3.0 oasts.yaml "$work/uninhabitable-allof-3.0" client "uninhabitable-allof-3.0"
 
 # deepObject carries one document per conformance mode, because the extended-only shapes (array,
-# untyped) are a hard OASTS1419 under the strict default and so cannot share a document.
+# untyped) are a hard OASTS5004 under the strict default and so cannot share a document.
 generate_and_verify deep-object-3.0 oasts.yaml "$work/deep-object-strict" client "deep-object-3.0 (strict)"
 generate_and_verify deep-object-3.0 oasts-compat.yaml "$work/deep-object-extended" client "deep-object-3.0 (extended)"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/client-builtin-name-shadow-3.0/compile-assert/cases.ts"
@@ -529,7 +529,7 @@ generate_and_verify msw-enum-parameters-3.1 oasts-msw.yaml "$work/msw-enum-param
 generate_and_verify msw-openapi-msw-3.1 oasts-msw.yaml "$work/msw-openapi-msw" msw \
   "msw-openapi-msw-3.1" link
 # The response surface under a date/time transform. The request surface is refused by name
-# (OASTS1508/OASTS1509), so this document declares responses only: the handler declares the
+# (OASTS6203/OASTS6204), so this document declares responses only: the handler declares the
 # application type and `JSON.stringify` produces the wire the client's codecs parse.
 generate_and_verify transform-msw-3.1 oasts-msw.yaml "$work/transform-msw" msw \
   "transform-msw-3.1" link
@@ -573,8 +573,8 @@ if (cd "$work/tanstack-collision" && "$OLDPWD/$bin" generate --config oasts-tans
   echo "verify-ts: the colliding path-segment document generated instead of failing" >&2
   exit 1
 fi
-grep -q 'OASTS1512' "$work/tanstack-collision.log" \
-  || { echo "verify-ts: colliding segments did not report OASTS1512" >&2; exit 1; }
+grep -q 'OASTS6302' "$work/tanstack-collision.log" \
+  || { echo "verify-ts: colliding segments did not report OASTS6302" >&2; exit 1; }
 grep -q 'naming.overrides.pathSegments' "$work/tanstack-collision.log" \
   || { echo "verify-ts: the collision diagnostic named no resolution" >&2; exit 1; }
 echo "segment collision refused: tanstack-segment-collision-3.1"
@@ -583,7 +583,7 @@ generate_and_verify tanstack-segment-override-3.1 oasts-tanstack.yaml "$work/tan
   tanstack "tanstack-segment-override-3.1"
 (cd "$work/tanstack-override" && "$OLDPWD/$bin" generate --config oasts-tanstack.yaml) \
   >"$work/tanstack-override.log" 2>&1
-grep -q 'OASTS1513' "$work/tanstack-override.log" \
+grep -q 'OASTS6303' "$work/tanstack-override.log" \
   || { echo "verify-ts: an unmatched pathSegments override did not warn" >&2; exit 1; }
 echo "segment override resolves the collision and warns on an unmatched key"
 

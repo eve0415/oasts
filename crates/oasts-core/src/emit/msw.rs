@@ -8,7 +8,7 @@
 //! import aliasing the client uses instead.
 //!
 //! That containment is what makes this artifact refuse request positions reaching date/time or
-//! int64 transforms and response positions reaching int64 (`OASTS1508`/`OASTS1509`). The refusal
+//! int64 transforms and response positions reaching int64 (`OASTS6203`/`OASTS6204`). The refusal
 //! is a deliberate limitation, not an impossibility: the
 //! conversion is perfectly expressible, but the codecs are emitted under the client's output
 //! directory, so importing them would break the one rule above and emit a module that does not
@@ -52,26 +52,26 @@ const MSW_RUNTIME_TS: &str = include_str!("../../runtime/msw-runtime.ts");
 const MSW_PROJECT_TS: &str = include_str!("../../runtime/msw-project.ts");
 
 /// A path literal carries a character the MSW matcher cannot be made to match.
-const CODE_UNMATCHABLE_PATH: &str = "OASTS1506";
+const CODE_UNMATCHABLE_PATH: &str = "OASTS6201";
 
 /// An operation uses an HTTP method for which MSW exposes no handler factory.
-const CODE_UNMATCHABLE_METHOD: &str = "OASTS1507";
+const CODE_UNMATCHABLE_METHOD: &str = "OASTS6202";
 
 /// A parameter's declared wire form cannot be inverted into its generated TypeScript type.
-const CODE_PARAMETER_PROJECTION: &str = "OASTS1508";
+const CODE_PARAMETER_PROJECTION: &str = "OASTS6203";
 
 /// A body cannot be projected between its wire form and generated TypeScript type.
-const CODE_BODY_PROJECTION: &str = "OASTS1509";
+const CODE_BODY_PROJECTION: &str = "OASTS6204";
 
 /// A parameter serialization loses boundaries before the handler can project its value.
-const CODE_NONINVERTIBLE_PARAMETER: &str = "OASTS1510";
+const CODE_NONINVERTIBLE_PARAMETER: &str = "OASTS6205";
 /// A streaming body has no buffered value to project, in either direction, so this artifact
 /// emits no handler for the operation at all.
-const CODE_STREAMING_OPERATION: &str = "OASTS1514";
+const CODE_STREAMING_OPERATION: &str = "OASTS6206";
 
 /// A form body whose schema declares no properties. The handler is still emitted; it just has no
 /// body fields to project.
-const CODE_UNCONSTRAINED_FORM_BODY: &str = "OASTS1515";
+const CODE_UNCONSTRAINED_FORM_BODY: &str = "OASTS6207";
 
 const MAX_PARAMETER_SHAPE_DEPTH: usize = 10;
 
@@ -781,7 +781,7 @@ fn plan_projected_body(
         {
             let reason = match error {
                 // Valid OpenAPI that simply declares nothing, so the handler is still emitted —
-                // with an empty projection. Said here rather than left to the client's OASTS1428,
+                // with an empty projection. Said here rather than left to the client's OASTS5113,
                 // because that one only runs when the client artifact is enabled and `types + msw`
                 // is a configuration the documentation puts in front of people.
                 FormPropertiesError::Unconstrained => {
@@ -4541,7 +4541,7 @@ paths:
         let (files, diagnostics) = generate_with_diagnostics(STREAMING_REQUEST, MSW_CONFIG);
         let streaming = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1514")
+            .find(|diagnostic| diagnostic.code == "OASTS6206")
             .expect("the streaming operation is reported");
         // Severity is the rule here, not a detail: `pipeline` discards every generated file as soon
         // as any error is raised, so an error would make one streaming operation refuse the whole

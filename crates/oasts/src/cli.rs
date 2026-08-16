@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use oasts_core::diag::{self, Diagnostic};
 use oasts_core::driver::{self, Command as DriverCommand, ConfigSource, Outcome};
 
-const CODE_CURRENT_DIR: &str = "OASTS0001";
+const CODE_CURRENT_DIR: &str = "OASTS1021";
 
 #[derive(Debug, Parser)]
 #[command(name = "oasts", disable_help_subcommand = true)]
@@ -381,7 +381,7 @@ mod tests {
 
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(stdout, "check ok\n");
-        assert!(stderr.contains("warning[OASTS1303]"), "{stderr}");
+        assert!(stderr.contains("warning[OASTS4201]"), "{stderr}");
         assert!(stderr.contains("disjoint primitive type sets"), "{stderr}");
         assert!(!temp.path().join("generated").exists());
 
@@ -393,7 +393,7 @@ mod tests {
             reserved.path(),
         );
         assert_eq!(code, 1, "{stderr}");
-        assert!(stderr.contains("error[OASTS1301]"), "{stderr}");
+        assert!(stderr.contains("error[OASTS4001]"), "{stderr}");
         assert!(stderr.contains("Windows reserved device"), "{stderr}");
         assert!(!reserved.path().join("generated").exists());
     }
@@ -412,7 +412,7 @@ mod tests {
             );
             assert_eq!(code, 1, "{stderr}");
             assert!(stdout.is_empty(), "{stdout}");
-            assert!(stderr.contains("error[OASTS1214]"), "{stderr}");
+            assert!(stderr.contains("error[OASTS3101]"), "{stderr}");
             assert!(stderr.contains("outside the binary64 domain"), "{stderr}");
 
             fs::write(
@@ -441,7 +441,7 @@ mod tests {
 
         assert_eq!(code, 1, "{stderr}");
         assert!(stdout.is_empty(), "{stdout}");
-        assert!(stderr.contains("error[OASTS1112]"), "{stderr}");
+        assert!(stderr.contains("error[OASTS2204]"), "{stderr}");
     }
 
     #[test]
@@ -457,7 +457,7 @@ mod tests {
 
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(stdout, "generated 2 files\n");
-        assert!(stderr.contains("OASTS1216"), "{stderr}");
+        assert!(stderr.contains("OASTS3103"), "{stderr}");
         let top = fs::read_to_string(temp.path().join("generated/types/components/top.ts"))
             .expect("Top output");
         assert!(
@@ -492,7 +492,7 @@ mod tests {
 
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(stdout, "generated 1 files\n");
-        assert!(stderr.contains("warning[OASTS1304]"), "{stderr}");
+        assert!(stderr.contains("warning[OASTS4202]"), "{stderr}");
         assert!(
             stderr.contains("emitting a structural union because"),
             "{stderr}"
@@ -724,7 +724,7 @@ mod tests {
         .expect("invalid input");
         let (code, _, stderr) = invoke(&["oasts", "check"], invalid_input.path());
         assert_eq!(code, 1);
-        assert!(stderr.contains("error[OASTS1101]"), "{stderr}");
+        assert!(stderr.contains("error[OASTS2101]"), "{stderr}");
 
         let invalid_config = copy_fixture("petstore-3.0");
         fs::write(
@@ -780,7 +780,7 @@ mod tests {
         let (code, _, stderr) = invoke(&["oasts", "generate"], temp.path());
 
         assert_eq!(code, 2, "{stderr}");
-        assert!(stderr.contains("error[OASTS0231]"), "{stderr}");
+        assert!(stderr.contains("error[OASTS1011]"), "{stderr}");
         assert!(!output.join(generated).exists());
     }
 
@@ -790,7 +790,7 @@ mod tests {
             exit_code: 2,
             stdout_summary: Some("check ok".to_owned()),
             diagnostics: vec![
-                Diagnostic::input("OASTS1000", "input")
+                Diagnostic::input("OASTS9903", "input")
                     .with_source("workspace/api.yaml")
                     .with_location(4, 2)
                     .with_json_pointer("/paths"),
@@ -807,7 +807,7 @@ mod tests {
         assert_eq!(String::from_utf8(stdout).expect("stdout"), "check ok\n");
         assert_eq!(
             String::from_utf8(stderr).expect("stderr"),
-            "error[OASTS0031]: config\nerror[OASTS1000]: input\n  --> workspace/api.yaml:4:2 /paths\nmodified: generated/api.ts\n"
+            "error[OASTS0031]: config\nerror[OASTS9903]: input\n  --> workspace/api.yaml:4:2 /paths\nmodified: generated/api.ts\n"
         );
     }
 
@@ -838,7 +838,7 @@ mod tests {
         let mut writer = FailingWriter;
         std::io::Write::flush(&mut writer).expect("flush");
         let error = render_diagnostics(
-            vec![Diagnostic::config("OASTS0000", "failure")],
+            vec![Diagnostic::config("OASTS9901", "failure")],
             &mut writer,
         )
         .expect_err("writer failure");
@@ -857,7 +857,7 @@ mod tests {
         .expect("invalid manifest");
         let (code, _, stderr) = invoke(&["oasts", "generate", "--check"], temp.path());
         assert_eq!(code, 2);
-        assert!(stderr.contains("OASTS0231"));
+        assert!(stderr.contains("OASTS1011"));
     }
 
     #[test]
@@ -971,7 +971,7 @@ mod tests {
 
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(stdout, "generated 0 files\n");
-        assert!(stderr.contains("warning[OASTS1119]"), "{stderr}");
+        assert!(stderr.contains("warning[OASTS2107]"), "{stderr}");
         assert!(stderr.contains("filters.orphans"), "{stderr}");
     }
 

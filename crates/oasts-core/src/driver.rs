@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::config::{self, CODE_BLOCK_UNSUPPORTED, CODE_WORKSPACE_UNSUPPORTED, ResolvedConfig};
+use crate::config::{self, CODE_COMMAND_UNSUPPORTED, CODE_WORKSPACE_UNSUPPORTED, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::emit::GeneratedFile;
 use crate::writer::{DriftState, check_drift, write};
@@ -42,7 +42,7 @@ pub enum Unsupported<'a> {
 pub fn refuse(surface: Unsupported<'_>) -> Outcome {
     let diagnostic = match surface {
         Unsupported::Command(command) => Diagnostic::config(
-            CODE_BLOCK_UNSUPPORTED,
+            CODE_COMMAND_UNSUPPORTED,
             format!("the {command} command is not supported in this build"),
         ),
         Unsupported::SpecSelection => Diagnostic::config(

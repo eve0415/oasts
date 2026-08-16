@@ -2248,7 +2248,7 @@ fn render_input(
             output.push_str(": ");
             if parameter_plan.caller_serialized {
                 // The client cannot serialize this media type, so the input is the caller's
-                // pre-serialized wire string rather than the declared schema (OASTS1443).
+                // pre-serialized wire string rather than the declared schema (OASTS5006).
                 output.push_str("string");
             } else {
                 let parameter_axis = if axis == TypeAxis::Wire
@@ -4341,7 +4341,7 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
-            ["OASTS1406"]
+            ["OASTS5204"]
         );
         let operation = operation_file(&files, "readcounter");
         assert!(
@@ -4570,7 +4570,7 @@ mod tests {
                 diagnostics
                     .iter()
                     .filter(|diagnostic| {
-                        diagnostic.code == "OASTS1411"
+                        diagnostic.code == "OASTS5001"
                             && diagnostic.severity == crate::diag::Severity::Warning
                     })
                     .count(),
@@ -4626,7 +4626,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1443")
+                .filter(|diagnostic| diagnostic.code == "OASTS5006")
                 .count(),
             1,
         );
@@ -5190,7 +5190,7 @@ mod tests {
     }
 
     /// A multipart field with an explicit `style` on an object-shaped schema has no OAS-defined
-    /// per-part serialization: OASTS1427 (`crates/oasts-core/src/client_model.rs`) rejects it
+    /// per-part serialization: OASTS5112 (`crates/oasts-core/src/client_model.rs`) rejects it
     /// instead of the retired pinned behavior this test replaces, where `field_payload` silently
     /// classified it the same as a JSON content field with no content-type header — a wire format
     /// the spec never sanctions.
@@ -5242,8 +5242,8 @@ mod tests {
         let diagnostic = sink
             .as_slice()
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1427")
-            .expect("OASTS1427 diagnostic");
+            .find(|diagnostic| diagnostic.code == "OASTS5112")
+            .expect("OASTS5112 diagnostic");
         assert_eq!(diagnostic.severity, Severity::Error);
         assert_eq!(
             diagnostic.json_pointer.as_deref(),
@@ -5272,7 +5272,7 @@ mod tests {
     }
 
     /// A styled primitive field has a defined per-part serialization for any style/explode
-    /// combination (OASTS1427's SUPPORTED case): it keeps the exact `text` payload emission this
+    /// combination (OASTS5112's SUPPORTED case): it keeps the exact `text` payload emission this
     /// pins, unchanged from before the admission matrix landed.
     #[test]
     fn styled_primitive_multipart_field_emits_text_payload() {
@@ -5313,7 +5313,7 @@ mod tests {
         assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     }
 
-    /// An exploded `form`-style array of primitives has a defined per-part serialization (OASTS1427's
+    /// An exploded `form`-style array of primitives has a defined per-part serialization (OASTS5112's
     /// SUPPORTED array case): it keeps the `repeated` descriptor, unchanged from before the
     /// admission matrix landed.
     #[test]
@@ -6454,7 +6454,7 @@ mod tests {
         let (_, diagnostics) = emit_operation(document, "readpet");
         let flagged = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1307")
+            .find(|diagnostic| diagnostic.code == "OASTS4102")
             .expect("alias collision diagnostic");
         assert_eq!(flagged.severity, Severity::Error);
         assert!(flagged.message.contains("ReadpetInputBody"));
@@ -7465,7 +7465,7 @@ mod tests {
         });
         let (actual, diagnostics) = emit_auth_module(document);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].code, "OASTS1440");
+        assert_eq!(diagnostics[0].code, "OASTS5408");
         assert_eq!(diagnostics[0].severity, Severity::Warning);
         assert_eq!(
             actual.expect("auth module"),
@@ -8652,7 +8652,7 @@ mod tests {
         );
         let collision = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1400")
+            .find(|diagnostic| diagnostic.code == "OASTS6001")
             .expect("media alias warning");
         assert_eq!(collision.severity, Severity::Warning);
         assert!(collision.message.contains("application/json;a-b=1"));
@@ -8689,7 +8689,7 @@ mod tests {
         );
         let collision = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1400")
+            .find(|diagnostic| diagnostic.code == "OASTS6001")
             .expect("media alias warning");
         assert_eq!(collision.severity, Severity::Warning);
         assert!(
@@ -8742,7 +8742,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1400")
+                .filter(|diagnostic| diagnostic.code == "OASTS6001")
                 .count(),
             2,
             "{diagnostics:#?}"
@@ -9457,7 +9457,7 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.code)
                 .collect::<Vec<&str>>(),
-            ["OASTS1406", "OASTS1406", "OASTS1406"],
+            ["OASTS5204", "OASTS5204", "OASTS5204"],
             "{diagnostics:#?}"
         );
 

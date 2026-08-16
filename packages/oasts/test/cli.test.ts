@@ -105,7 +105,7 @@ test("warnings reach stderr on successful runs", async () => {
   );
   const generated = await invoke(["generate"], directory);
   assert.equal(generated.code, 0);
-  assert.match(generated.stderr, /warning\[OASTS1304\]/);
+  assert.match(generated.stderr, /warning\[OASTS4202\]/);
 });
 
 test("usage, watch, discovery, spec, and config failures exit 2", async () => {
@@ -116,7 +116,7 @@ test("usage, watch, discovery, spec, and config failures exit 2", async () => {
 
   const watch = await invoke(["watch"], empty);
   assert.equal(watch.code, 2);
-  assert.match(watch.stderr, /error\[OASTS0222\]: the watch command is not supported/);
+  assert.match(watch.stderr, /error\[OASTS9004\]: the watch command is not supported/);
 
   const undiscovered = await invoke(["check"], empty);
   assert.equal(undiscovered.code, 2);
@@ -124,13 +124,13 @@ test("usage, watch, discovery, spec, and config failures exit 2", async () => {
 
   const spec = await invoke(["generate", "--spec", "petstore"], scriptFixture());
   assert.equal(spec.code, 2);
-  assert.match(spec.stderr, /error\[OASTS0062\]/);
+  assert.match(spec.stderr, /error\[OASTS9002\]/);
 
   const invalid = scriptFixture();
   writeFileSync(join(invalid, "oasts.config.ts"), "export default Promise.resolve({});\n");
   const asyncConfig = await invoke(["generate"], invalid);
   assert.equal(asyncConfig.code, 2);
-  assert.match(asyncConfig.stderr, /error\[OASTS0013\]: config default export is a promise/);
+  assert.match(asyncConfig.stderr, /error\[OASTS0012\]: config default export is a promise/);
 
   const badSchema = scriptFixture();
   writeFileSync(
@@ -150,7 +150,7 @@ test("input errors from the core exit 1", async () => {
   );
   const failed = await invoke(["generate"], directory);
   assert.equal(failed.code, 1);
-  assert.match(failed.stderr, /error\[OASTS1101\]/);
+  assert.match(failed.stderr, /error\[OASTS2101\]/);
 });
 
 test("unexpected non-CliFailure errors exit 2", async () => {

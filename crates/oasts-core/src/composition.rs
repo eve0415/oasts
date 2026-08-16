@@ -11,11 +11,11 @@ use crate::ir::{
     PropMeta, SchemaNode, SchemaRef, SourceRef, TupleRest,
 };
 
-pub(crate) const CODE_COMPOSITION: &str = "OASTS1303";
+pub(crate) const CODE_COMPOSITION: &str = "OASTS4201";
 /// A property two `allOf` branches declare with intersecting-to-nothing schemas. A warning,
 /// not one of the four emptiness proofs: the node keeps its intersection type and only the
 /// one property is uninhabitable, which TypeScript shows as a silent `never`.
-pub(crate) const CODE_CONFLICTING_PROPERTY: &str = "OASTS1315";
+pub(crate) const CODE_CONFLICTING_PROPERTY: &str = "OASTS4206";
 
 /// Replaces every `allOf` proven empty with `Never`, preserving its source metadata and reporting
 /// each independent proof as a warning. The proof pass is immutable so references can resolve

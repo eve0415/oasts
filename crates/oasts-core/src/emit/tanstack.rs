@@ -27,7 +27,7 @@ use crate::semantic::{TargetCase, normalize_identifier};
 
 /// A read operation carries no payload on at least one success branch, so it emits no query
 /// descriptor: a query function may not resolve `undefined`.
-const CODE_INELIGIBLE_QUERY: &str = "OASTS1511";
+const CODE_INELIGIBLE_QUERY: &str = "OASTS6301";
 
 /// Names the emitted modules import unconditionally: `ParamValue` in `keys.ts`, the rest in every
 /// operation module. A key binding taking one of these would shadow the import — an override is the
@@ -51,10 +51,10 @@ const COMPOSED_SELF_MEMBER: &str = "all";
 const TANSTACK_RUNTIME_TS: &str = include_str!("../../runtime/tanstack-runtime.ts");
 
 /// Two path nodes normalize to the same key-factory name.
-pub(crate) const CODE_SEGMENT_COLLISION: &str = "OASTS1512";
+pub(crate) const CODE_SEGMENT_COLLISION: &str = "OASTS6302";
 
 /// A `naming.overrides.pathSegments` entry matched no path segment in the document.
-pub(crate) const CODE_UNMATCHED_SEGMENT_OVERRIDE: &str = "OASTS1513";
+pub(crate) const CODE_UNMATCHED_SEGMENT_OVERRIDE: &str = "OASTS6303";
 
 /// What one URL path segment contributes to a query key.
 ///

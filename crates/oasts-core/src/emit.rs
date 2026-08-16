@@ -55,50 +55,49 @@ mod zod;
 
 use model::{EmissionModel, SchemaTarget};
 
-const CODE_FILE_NAME: &str = "OASTS1301";
-const CODE_PATH_COLLISION: &str = "OASTS1302";
-const CODE_DISCRIMINATOR: &str = "OASTS1304";
-const CODE_REFERENCE: &str = "OASTS1305";
-const CODE_VARIANT_COLLISION: &str = "OASTS1306";
+const CODE_FILE_NAME: &str = "OASTS4001";
+const CODE_PATH_COLLISION: &str = "OASTS4002";
+const CODE_VARIANT_COLLISION: &str = "OASTS4101";
 /// A component import an operation module renames to escape shadowing one of its own declarations,
 /// whose role-derived replacement is itself taken by another import or declaration in that module.
 /// Nothing is left to rename it to, so the module is refused rather than emitted uncompilable.
-const CODE_IMPORT_ALIAS: &str = "OASTS1307";
+const CODE_IMPORT_ALIAS: &str = "OASTS4102";
+/// A generated request/response variant whose colliding-name replacement is itself a declared
+/// component or another variant's replacement. No local remedy exists, so the document is refused
+/// rather than emitted with two declarations fighting over one identifier.
+const CODE_VARIANT_ALIAS: &str = "OASTS4103";
+/// A wire twin whose derived `{Name}Wire` is already a declared component's name. The document owns
+/// its name; the compiler invented the other, so the twin yields to `{Name}WireValue` and generation
+/// continues — the same rule OASTS4101 applies to a colliding request/response variant.
+const CODE_WIRE_ALIAS: &str = "OASTS4104";
+/// The residual: `{Name}WireValue` is itself declared. Nothing compiler-invented remains, so the
+/// document is refused rather than emitted with two declarations fighting over one identifier.
+const CODE_WIRE_COLLISION: &str = "OASTS4105";
+const CODE_DISCRIMINATOR: &str = "OASTS4202";
+const CODE_UNALLOCATED_REFERENCE: &str = "OASTS4203";
 /// A discriminator `mapping` value that resolves to no allocated component schema. A mapping target
 /// can only ever matter when it equals a branch's `$ref` target, and those are always materialized,
 /// so a value that fails to resolve could never have matched a branch: it is a dead entry, not a
 /// broken document. It drops out of tag resolution and proof falls back to the branch's own
 /// `const`/`enum` or component name.
-const CODE_MAPPING_TARGET: &str = "OASTS1308";
+const CODE_MAPPING_TARGET: &str = "OASTS4204";
 /// A discriminator whose `mapping`/`const` proof is internally incoherent — a mapping tag that
 /// contradicts the branch's own fixed value, or an allOf idiom that fixes the tag property to an
 /// empty (uninhabitable) value set. The render degrades to a plain structural union.
-const CODE_DISCRIMINATOR_PROOF: &str = "OASTS1309";
-/// A generated request/response variant whose colliding-name replacement is itself a declared
-/// component or another variant's replacement. No local remedy exists, so the document is refused
-/// rather than emitted with two declarations fighting over one identifier.
-const CODE_VARIANT_ALIAS: &str = "OASTS1310";
+const CODE_DISCRIMINATOR_PROOF: &str = "OASTS4205";
+/// A discriminator whose proof can select branches but whose emitted TypeScript union does not
+/// carry required unit-literal tags on every branch, so consumers cannot narrow it exhaustively.
+const CODE_DISCRIMINATOR_NARROWING: &str = "OASTS4207";
 /// A union whose branches convert date/time values differently, where no JSON value kind and no
 /// declared discriminator tells them apart. Applying either branch's conversion to the other's value
 /// would corrupt it silently, and ordered try-each-branch decoding cannot detect the mistake — a
 /// non-converting branch always succeeds by identity — so the document is refused instead.
-const CODE_TRANSFORM_UNION: &str = "OASTS1313";
+const CODE_TRANSFORM_UNION: &str = "OASTS4301";
 /// A position that reaches a transform the client pipeline cannot carry: a form or multipart field,
 /// a content-type-discriminated request body, or a per-media-entry response payload. Each declares
 /// a shape no single codec is keyed on, and emitting nothing for one would leave a wire string
 /// behind a type promising an application value.
-pub(super) const CODE_UNCONVERTIBLE_TRANSFORM: &str = "OASTS1314";
-/// A discriminator whose proof can select branches but whose emitted TypeScript union does not
-/// carry required unit-literal tags on every branch, so consumers cannot narrow it exhaustively.
-const CODE_DISCRIMINATOR_NARROWING: &str = "OASTS1316";
-
-/// A wire twin whose derived `{Name}Wire` is already a declared component's name. The document owns
-/// its name; the compiler invented the other, so the twin yields to `{Name}WireValue` and generation
-/// continues — the same rule OASTS1306 applies to a colliding request/response variant.
-const CODE_WIRE_ALIAS: &str = "OASTS1311";
-/// The residual: `{Name}WireValue` is itself declared. Nothing compiler-invented remains, so the
-/// document is refused rather than emitted with two declarations fighting over one identifier.
-const CODE_WIRE_COLLISION: &str = "OASTS1312";
+pub(super) const CODE_UNCONVERTIBLE_TRANSFORM: &str = "OASTS4302";
 
 const INDENT_CHUNK: &str = "                                ";
 
@@ -1062,7 +1061,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
                     .is_none()
                 {
                     diagnostics.push(source_diagnostic(
-                        CODE_REFERENCE,
+                        CODE_UNALLOCATED_REFERENCE,
                         format!(
                             "schema reference {}#{} has no allocated component type",
                             target.source_id, target.json_pointer
@@ -6180,7 +6179,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == CODE_REFERENCE)
+                .filter(|diagnostic| diagnostic.code == CODE_UNALLOCATED_REFERENCE)
                 .count(),
             2
         );
@@ -6613,7 +6612,7 @@ mod tests {
     #[test]
     fn lowered_conjunction_disjoint_type_reports_oasts1303() {
         // {type:"string", oneOf:[number, integer]} lowers to AllOf[OneOf(number|integer), string].
-        // The primitive domains are disjoint, so the existing composition check now fires OASTS1303 on
+        // The primitive domains are disjoint, so the existing composition check now fires OASTS4201 on
         // a spec that used to be silently wrong.
         let (files, diagnostics) = compile(
             openapi(json!({
@@ -6645,7 +6644,7 @@ mod tests {
     #[test]
     fn lowered_conjunction_compatible_no_diag() {
         // A compatible coexistence — string on both the allOf branch and the typed piece — intersects
-        // to a non-empty domain, so no OASTS1303.
+        // to a non-empty domain, so no OASTS4201.
         let (_files, diagnostics) = compile(
             openapi(json!({
                 "Thing": {
@@ -7612,7 +7611,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1103")
+                .filter(|diagnostic| diagnostic.code == "OASTS2201")
                 .count(),
             4,
             "{diagnostics:?}"
@@ -8416,7 +8415,7 @@ mod tests {
         let (files, diagnostics) = compile(document, json!({}));
         let warnings = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1214")
+            .filter(|diagnostic| diagnostic.code == "OASTS3101")
             .collect::<Vec<_>>();
         assert_eq!(warnings.len(), 4);
         assert!(warnings.iter().all(|diagnostic| {
@@ -8483,7 +8482,7 @@ mod tests {
         let (files, diagnostics) = compile(document, json!({}));
         let warnings = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1214")
+            .filter(|diagnostic| diagnostic.code == "OASTS3101")
             .collect::<Vec<_>>();
         assert_eq!(warnings.len(), 3);
         assert!(
@@ -8519,7 +8518,7 @@ mod tests {
         );
         let diagnostic = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1214")
+            .find(|diagnostic| diagnostic.code == "OASTS3101")
             .expect("empty enum diagnostic");
         assert_eq!(diagnostic.severity, Severity::Warning);
         assert!(diagnostic.message.contains("OpenAPI 3.1 (SHOULD)"));
@@ -8542,7 +8541,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1214")
+                .filter(|diagnostic| diagnostic.code == "OASTS3101")
                 .count(),
             1
         );
@@ -8605,7 +8604,7 @@ mod tests {
                 .count(),
             1
         );
-        // Two: the discriminator warning above, and OASTS1315 for `Intersected`. `Cat & Dog`
+        // Two: the discriminator warning above, and OASTS4206 for `Intersected`. `Cat & Dog`
         // types `kind` as `"cat" & "dog"`, so that one property really is uninhabitable —
         // the intersection is still what gets emitted, and the warning is the only thing
         // that says the property inside it collapsed.
@@ -8744,7 +8743,7 @@ mod tests {
     #[test]
     fn a_single_self_contradictory_branch_is_not_a_property_conflict() {
         // One branch declaring `n` with minimum above maximum empties the whole node, which
-        // is OASTS1303's job. Reporting it as branches disagreeing about `n` names a cause
+        // is OASTS4201's job. Reporting it as branches disagreeing about `n` names a cause
         // that is not there — there is only one declaration of `n`.
         let (_files, diagnostics) = compile(
             openapi(json!({
@@ -9044,7 +9043,7 @@ mod tests {
             let (_files, diagnostics) = compile(document, json!({}));
             let warnings = diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1316")
+                .filter(|diagnostic| diagnostic.code == "OASTS4207")
                 .collect::<Vec<_>>();
             assert_eq!(warnings.len(), 1, "{reason}: {diagnostics:?}");
             assert_eq!(warnings[0].severity, Severity::Warning);
@@ -9637,7 +9636,7 @@ mod tests {
     fn oneof_and_anyof_discriminator_proof_runs_once() {
         // oneOf, anyOf, and a discriminator coexist, so the schema lowers to a conjunction. Only the
         // oneOf branch carries the discriminator, so the structural-fallback proof — and its single
-        // OASTS1304 — fires once, not once per synthetic branch.
+        // OASTS4202 — fires once, not once per synthetic branch.
         let document = openapi(json!({
             "Cat": { "type": "object", "required": ["kind"], "properties": { "kind": { "type": "string", "const": "cat" } } },
             "Wrapped": {
@@ -9929,7 +9928,7 @@ mod tests {
         // Identity-first sends every all-`$ref` `allOf` down the intersection path, so a
         // property two branches disagree about is no longer folded away by the merge — it
         // reaches TypeScript as `string & number`, which is silently `never` at exactly one
-        // property. OASTS1315 is the only signal that says so.
+        // property. OASTS4206 is the only signal that says so.
         //
         // It fires on a provably empty intersection, not on any inequality. Narrowing a
         // property is what `allOf` is *for* — the discriminator idiom refines a base's
@@ -10192,7 +10191,7 @@ mod tests {
         assert_eq!(diagnostics.len(), 4, "{diagnostics:?}");
         assert!(
             diagnostics.iter().all(|diagnostic| {
-                diagnostic.code == "OASTS1216" && diagnostic.severity == Severity::Warning
+                diagnostic.code == "OASTS3103" && diagnostic.severity == Severity::Warning
             }),
             "{diagnostics:?}"
         );
@@ -10503,7 +10502,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1103")
+                .any(|diagnostic| diagnostic.code == "OASTS2201")
         );
         assert!(generated_body(&files[0]).ends_with("export type Conditional = unknown;\n"));
     }
@@ -11903,7 +11902,7 @@ mod tests {
             }
         });
         let (files, diagnostics) = compile(document, json!({}));
-        // The invalid file names are reported (OASTS1301), not silently absorbed.
+        // The invalid file names are reported (OASTS4001), not silently absorbed.
         assert!(diagnostics.iter().any(|d| d.code == CODE_FILE_NAME));
         // No per-operation webhook file, and the webhook is an empty object in the map.
         assert!(!files.iter().any(|file| {

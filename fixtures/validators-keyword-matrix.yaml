@@ -164,12 +164,12 @@ rows:
     dialects:
       - "3.1"
     disposition: exact
-    notes: Delegates to the statically pinned target, including recursive checks; path-dependent dynamic scope refuses validators generation with OASTS1501.
+    notes: Delegates to the statically pinned target, including recursive checks; path-dependent dynamic scope refuses validators generation with OASTS6002.
   - keyword: "$recursiveRef"
     dialects:
       - "3.1"
     disposition: exact
-    notes: Delegates to the statically pinned target, including recursive checks; in an OpenAPI document with no $id, "#" is re-targeted to the nearest enclosing $recursiveAnchor because 2020-12 §9.4.2 leaves a reference from a known keyword to a known non-schema target undefined; path-dependent dynamic scope refuses validators generation with OASTS1501.
+    notes: Delegates to the statically pinned target, including recursive checks; in an OpenAPI document with no $id, "#" is re-targeted to the nearest enclosing $recursiveAnchor because 2020-12 §9.4.2 leaves a reference from a known keyword to a known non-schema target undefined; path-dependent dynamic scope refuses validators generation with OASTS6002.
   - keyword: "format:date-time"
     dialects:
       - "3.0"
@@ -356,43 +356,43 @@ rows:
     dialects:
       - "3.1"
     disposition: exact
-    notes: Its verdict selects then or else without becoming an issue; an incomplete condition fails validators generation with OASTS1503.
+    notes: Its verdict selects then or else without becoming an issue; an incomplete condition fails validators generation with OASTS6004.
   - keyword: then
     dialects:
       - "3.1"
     disposition: exact
-    notes: Applied only when a sibling if succeeds; without if it is ignored, and an incomplete active subschema fails validators generation with OASTS1503.
+    notes: Applied only when a sibling if succeeds; without if it is ignored, and an incomplete active subschema fails validators generation with OASTS6004.
   - keyword: else
     dialects:
       - "3.1"
     disposition: exact
-    notes: Applied only when a sibling if fails; without if it is ignored, and an incomplete active subschema fails validators generation with OASTS1503.
+    notes: Applied only when a sibling if fails; without if it is ignored, and an incomplete active subschema fails validators generation with OASTS6004.
   - keyword: not
     dialects:
       - "3.0"
       - "3.1"
     disposition: exact
-    notes: Exact negation when every declared subschema keyword emits a check; an incomplete subschema fails validators generation with OASTS1503 instead of emitting a negation.
+    notes: Exact negation when every declared subschema keyword emits a check; an incomplete subschema fails validators generation with OASTS6004 instead of emitting a negation.
   - keyword: dependentSchemas
     dialects:
       - "3.1"
     disposition: exact
-    notes: A present trigger applies its subschema to the whole object; an incomplete subschema fails validators generation with OASTS1503.
+    notes: A present trigger applies its subschema to the whole object; an incomplete subschema fails validators generation with OASTS6004.
   - keyword: unevaluatedProperties
     dialects:
       - "3.1"
     disposition: exact
-    notes: Collects successful evaluated-property annotations from every supported in-place applicator and static ref at the same location; an incomplete annotation source or applied subschema fails validators generation with OASTS1503.
+    notes: Collects successful evaluated-property annotations from every supported in-place applicator and static ref at the same location; an incomplete annotation source or applied subschema fails validators generation with OASTS6004.
   - keyword: unevaluatedItems
     dialects:
       - "3.1"
     disposition: exact
-    notes: Collects successful evaluated-item annotations from every supported in-place applicator and static ref at the same location; an incomplete annotation source or applied subschema fails validators generation with OASTS1503.
+    notes: Collects successful evaluated-item annotations from every supported in-place applicator and static ref at the same location; an incomplete annotation source or applied subschema fails validators generation with OASTS6004.
   - keyword: contains
     dialects:
       - "3.1"
     disposition: exact
-    notes: Counts every array item that validates against the subschema; the default minimum is one, and an incomplete subschema fails validators generation with OASTS1503.
+    notes: Counts every array item that validates against the subschema; the default minimum is one, and an incomplete subschema fails validators generation with OASTS6004.
   - keyword: minContains
     dialects:
       - "3.1"
@@ -407,9 +407,9 @@ rows:
     dialects:
       - "3.1"
     disposition: exact
-    notes: Every ECMA-262 Unicode regex match applies its schema, multiple matches all apply, and matched names are excluded from additionalProperties; an incomplete subschema fails with OASTS1503.
+    notes: Every ECMA-262 Unicode regex match applies its schema, multiple matches all apply, and matched names are excluded from additionalProperties; an incomplete subschema fails with OASTS6004.
   - keyword: propertyNames
     dialects:
       - "3.1"
     disposition: exact
-    notes: Each key is checked when every declared subschema keyword emits a check; an incomplete subschema fails validators generation with OASTS1503 instead of emitting propertyNames.
+    notes: Each key is checked when every declared subschema keyword emits a check; an incomplete subschema fails validators generation with OASTS6004 instead of emitting propertyNames.

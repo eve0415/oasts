@@ -535,29 +535,29 @@ fn classify(code: &str) -> Outcome {
     match code {
         // The document contradicts OpenAPI or JSON Schema. No generator change accepts these; the
         // fix belongs upstream, in the document.
-        "OASTS1011"     // a $ref whose JSON pointer resolves to nothing
-        | "OASTS1201"   // a duplicate operationId, which OpenAPI requires to be unique
-        | "OASTS1421"   // a form media whose schema has no properties to name its fields with
-        | "OASTS1434"   // a security requirement naming a scheme components never declares
-        | "OASTS1441"   // OpenAPI 3.0: non-oauth2/openIdConnect requirement scopes MUST be empty
+        "OASTS2005"     // a $ref whose JSON pointer resolves to nothing
+        | "OASTS3001"   // a duplicate operationId, which OpenAPI requires to be unique
+        | "OASTS5106"   // a form media whose schema has no properties to name its fields with
+        | "OASTS5402"   // a security requirement naming a scheme components never declares
+        | "OASTS5409"   // OpenAPI 3.0: non-oauth2/openIdConnect requirement scopes MUST be empty
         => Outcome::InvalidDocument,
 
         // A config knob resolves it, and the diagnostic prints the block to paste. A public type
         // name is the user's to choose, so these stay fatal by design.
-        "OASTS1202"     // a component name collision -> naming.overrides.schemas
-        | "OASTS1512"   // a path segment that is not a usable name -> naming.overrides.pathSegments
+        "OASTS3002"     // a component name collision -> naming.overrides.schemas
+        | "OASTS6302"   // a path segment that is not a usable name -> naming.overrides.pathSegments
         => Outcome::RefusedWithRemedy,
 
         // Constructs the project documents as out of scope.
-        "OASTS1403"     // XML
-        | "OASTS1405"   // a text request media whose schema does not project to string
-        | "OASTS1501"   // validators: a rejected validation keyword
-        | "OASTS1502"   // validators: an unknown leaf there is nothing to check
-        | "OASTS1504"   // zod: a rejected validation keyword
-        | "OASTS1505"   // zod: an unknown leaf
+        "OASTS5201"     // XML
+        | "OASTS5203"   // a text request media whose schema does not project to string
+        | "OASTS6002"   // validators: a rejected validation keyword
+        | "OASTS6003"   // validators: an unknown leaf there is nothing to check
+        | "OASTS6101"   // zod: a rejected validation keyword
+        | "OASTS6102"   // zod: an unknown leaf
         => Outcome::Unsupported,
 
-        // No arm for the msw projection refusals (OASTS1506-1510): each is scoped to the operation
+        // No arm for the msw projection refusals (OASTS6201-1510): each is scoped to the operation
         // that earned it and carries warning severity, so it never reaches an outcome. They are
         // still work owed — a parameter whose wire form has no unique inverse gets no handler —
         // but the document generates, and a category here would never be read.
@@ -1111,7 +1111,7 @@ fn should_retry_base_url(exit_code: i32, diagnostics: &[ParsedDiagnostic]) -> bo
     exit_code == 1
         && diagnostics.iter().any(|diagnostic| {
             diagnostic.severity == Severity::Error
-                && diagnostic.code == "OASTS1420"
+                && diagnostic.code == "OASTS5301"
                 && diagnostic
                     .message
                     .contains("no effective server at index 0")
@@ -1764,9 +1764,9 @@ mod tests {
     #[test]
     fn diagnostic_parser_captures_locations_summary_and_unparsed_lines() {
         let stderr = concat!(
-            "error[OASTS1202]: schema name collision\n",
+            "error[OASTS3002]: schema name collision\n",
             "  --> workspace/openapi.json:1:1 /components/schemas/Pet\n",
-            "warning[OASTS1111]: required property is absent\n",
+            "warning[OASTS2203]: required property is absent\n",
             "  --> workspace/openapi.json:4:2\n",
             "renderer note\n",
         );
@@ -1835,14 +1835,14 @@ mod tests {
     fn base_url_retry_matches_the_live_oasts1420_contract() {
         let diagnostics = vec![diagnostic(
             Severity::Error,
-            "OASTS1420",
+            "OASTS5301",
             "operation has no effective server at index 0",
         )];
         assert!(should_retry_base_url(1, &diagnostics));
         assert!(!should_retry_base_url(2, &diagnostics));
         assert!(!should_retry_base_url(
             1,
-            &[diagnostic(Severity::Error, "OASTS1403", "unsupported XML")]
+            &[diagnostic(Severity::Error, "OASTS5201", "unsupported XML")]
         ));
     }
 
@@ -1855,9 +1855,9 @@ mod tests {
             configs: vec![config_report(
                 ConfigKind::Types,
                 vec![
-                    diagnostic(Severity::Warning, "OASTS1300", "one"),
-                    diagnostic(Severity::Error, "OASTS1200", "two"),
-                    diagnostic(Severity::Warning, "OASTS1200", "three"),
+                    diagnostic(Severity::Warning, "OASTS9905", "one"),
+                    diagnostic(Severity::Error, "OASTS9904", "two"),
+                    diagnostic(Severity::Warning, "OASTS9904", "three"),
                 ],
             )],
             harness_error: None,
@@ -1869,8 +1869,8 @@ mod tests {
             configs: vec![config_report(
                 ConfigKind::Full,
                 vec![
-                    diagnostic(Severity::Warning, "OASTS1200", "four"),
-                    diagnostic(Severity::Warning, "OASTS1200", "five"),
+                    diagnostic(Severity::Warning, "OASTS9904", "four"),
+                    diagnostic(Severity::Warning, "OASTS9904", "five"),
                 ],
             )],
             harness_error: None,
@@ -1880,14 +1880,14 @@ mod tests {
 
         assert_eq!(
             codes.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["OASTS1200", "OASTS1300"]
+            vec!["OASTS9904", "OASTS9905"]
         );
-        let shared = codes.get("OASTS1200").expect("shared code");
+        let shared = codes.get("OASTS9904").expect("shared code");
         assert_eq!(shared.severity, "both");
         assert_eq!(shared.spec_count, 2);
         assert_eq!(shared.occurrence_count, 4);
         assert_eq!(shared.samples.len(), 3);
-        assert_eq!(human_code_order(&codes)[0].0, "OASTS1200");
+        assert_eq!(human_code_order(&codes)[0].0, "OASTS9904");
     }
 
     #[test]
@@ -1900,9 +1900,9 @@ mod tests {
     #[test]
     fn outcome_reads_the_classification_of_its_errors() {
         for (code, expected) in [
-            ("OASTS1441", Outcome::InvalidDocument),
-            ("OASTS1202", Outcome::RefusedWithRemedy),
-            ("OASTS1403", Outcome::Unsupported),
+            ("OASTS5409", Outcome::InvalidDocument),
+            ("OASTS3002", Outcome::RefusedWithRemedy),
+            ("OASTS5201", Outcome::Unsupported),
         ] {
             let report = config_report(
                 ConfigKind::Full,
@@ -1918,9 +1918,9 @@ mod tests {
         let report = config_report(
             ConfigKind::Full,
             vec![
-                diagnostic(Severity::Error, "OASTS1441", "invalid document"),
-                diagnostic(Severity::Error, "OASTS1202", "remedy exists"),
-                diagnostic(Severity::Error, "OASTS1403", "out of scope"),
+                diagnostic(Severity::Error, "OASTS5409", "invalid document"),
+                diagnostic(Severity::Error, "OASTS3002", "remedy exists"),
+                diagnostic(Severity::Error, "OASTS5201", "out of scope"),
                 diagnostic(Severity::Error, "OASTS9999", "nobody classified this"),
             ],
         );
@@ -1934,7 +1934,7 @@ mod tests {
             ConfigKind::Full,
             vec![
                 diagnostic(Severity::Warning, "OASTS9999", "unclassified warning"),
-                diagnostic(Severity::Error, "OASTS1403", "out of scope"),
+                diagnostic(Severity::Error, "OASTS5201", "out of scope"),
             ],
         );
         assert_eq!(report.outcome(), Outcome::Unsupported);
@@ -1957,11 +1957,11 @@ mod tests {
             configs: vec![
                 config_report(
                     ConfigKind::Full,
-                    vec![diagnostic(Severity::Error, "OASTS1403", "out of scope")],
+                    vec![diagnostic(Severity::Error, "OASTS5201", "out of scope")],
                 ),
                 config_report(
                     ConfigKind::Types,
-                    vec![diagnostic(Severity::Error, "OASTS1441", "invalid")],
+                    vec![diagnostic(Severity::Error, "OASTS5409", "invalid")],
                 ),
             ],
             harness_error: None,

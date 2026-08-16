@@ -21,53 +21,53 @@ use crate::loader::{
     DocId, DocumentGraph, DynamicResolution, append_pointer, append_pointer_index,
 };
 use crate::media::canonical_content_key;
+use crate::semantic::CODE_ENUM_RULE_14;
 
-const CODE_VERSION: &str = "OASTS1101";
-const CODE_SHAPE: &str = "OASTS1102";
-const CODE_UNSUPPORTED: &str = "OASTS1103";
+const CODE_VERSION: &str = "OASTS2101";
+const CODE_SHAPE: &str = "OASTS2102";
+const CODE_RESPONSE_STATUS: &str = "OASTS2103";
+const CODE_OPERATION_REF: &str = "OASTS2104";
+/// A status range written in lowercase. OpenAPI specifies the uppercase wildcard, but real
+/// documents ship `4xx`, so it is canonicalized and reported rather than rejected.
+const CODE_RESPONSE_STATUS_CASE: &str = "OASTS2105";
+/// Two keys in one responses object that name the same status once canonicalized.
+const CODE_RESPONSE_STATUS_DUPLICATE: &str = "OASTS2106";
+const CODE_MEDIA_TYPE: &str = "OASTS2111";
+const CODE_DUPLICATE_MEDIA_TYPE: &str = "OASTS2112";
+const CODE_RESERVED_HEADER_PARAMETER: &str = "OASTS2113";
+const CODE_HEADER_CONTENT_TYPE: &str = "OASTS2114";
+const CODE_HEADER_DUPLICATE: &str = "OASTS2115";
+const CODE_SERVER_VAR_ENUM_EMPTY: &str = "OASTS2121";
+const CODE_SERVER_VAR_DEFAULT: &str = "OASTS2122";
+const CODE_WEBHOOKS_VERSION: &str = "OASTS2123";
+const CODE_UNSUPPORTED: &str = "OASTS2201";
+const CODE_PATH_PARAMETER: &str = "OASTS2202";
+const CODE_PHANTOM_REQUIRED: &str = "OASTS2203";
+const CODE_MULTIPLE_OF: &str = "OASTS2204";
 /// A narrowing schema keyword the emitted TypeScript cannot apply. Unlike `CODE_UNSUPPORTED`, the
 /// leaf does not widen to `unknown` — the sibling type survives exactly as declared and only the
 /// narrowing is lost, so the emitted type is wider than the document. Reported rather than dropped
 /// because a keyword is never silently ignored when doing so widens a public type; the validators
 /// artifact still enforces it exactly.
-const CODE_UNAPPLIED_NARROWING: &str = "OASTS1122";
-const CODE_RESPONSE_STATUS: &str = "OASTS1104";
-/// A status range written in lowercase. OpenAPI specifies the uppercase wildcard, but real
-/// documents ship `4xx`, so it is canonicalized and reported rather than rejected.
-const CODE_RESPONSE_STATUS_CASE: &str = "OASTS1120";
-/// Two keys in one responses object that name the same status once canonicalized.
-const CODE_RESPONSE_STATUS_DUPLICATE: &str = "OASTS1121";
-const CODE_PATH_PARAMETER: &str = "OASTS1105";
-const CODE_REFERENCE: &str = "OASTS1106";
-const CODE_MEDIA_TYPE: &str = "OASTS1107";
-const CODE_DUPLICATE_MEDIA_TYPE: &str = "OASTS1108";
-const CODE_RESERVED_HEADER_PARAMETER: &str = "OASTS1109";
-const CODE_REF_SIBLINGS: &str = "OASTS1110";
-const CODE_MULTIPLE_OF: &str = "OASTS1112";
-const CODE_REF_CYCLE: &str = "OASTS1113";
-const CODE_REF_DEPTH: &str = "OASTS1114";
-/// A discriminator `mapping` value that is not a JSON string. It cannot name a schema, so it drops
-/// out of tag resolution — diagnosed rather than dropped silently so a malformed entry is no
-/// quieter than a dangling one.
-const CODE_MAPPING_VALUE_SHAPE: &str = "OASTS1115";
-const CODE_OPERATION_REF: &str = "OASTS1116";
+const CODE_UNAPPLIED_NARROWING: &str = "OASTS2205";
+const CODE_RECURSIVE_REF_TARGET: &str = "OASTS2211";
+const CODE_REF_SIBLINGS: &str = "OASTS2212";
+const CODE_REF_CYCLE: &str = "OASTS2213";
+const CODE_REF_DEPTH: &str = "OASTS2214";
 /// A `$recursiveRef` written with any value other than `"#"`. JSON Schema 2019-09 §8.2.4.2.1:
 /// "The behavior of this keyword is defined only for the value '#'. Implementations MAY choose to
 /// consider other values to be errors."
-const CODE_RECURSIVE_REF_VALUE: &str = "OASTS1117";
+const CODE_RECURSIVE_REF_VALUE: &str = "OASTS2215";
 /// A dynamic reference whose target genuinely depends on the path evaluation took to reach it,
 /// because two or more schema resources declare the anchor it names. No single schema can stand in
 /// for it, so the node widens to unknown and the validators artifact refuses rather than guessing.
-const CODE_DYNAMIC_SCOPE: &str = "OASTS1118";
-const CODE_ENUM_RULE_14: &str = "OASTS1214";
-const CODE_SERVER_VAR_ENUM_EMPTY: &str = "OASTS1131";
-const CODE_SERVER_VAR_DEFAULT: &str = "OASTS1132";
-const CODE_HEADER_CONTENT_TYPE: &str = "OASTS1133";
-const CODE_HEADER_DUPLICATE: &str = "OASTS1134";
-const CODE_WEBHOOKS_VERSION: &str = "OASTS1135";
-const CODE_LINK_TARGET: &str = "OASTS1234";
-const CODE_PHANTOM_REQUIRED: &str = "OASTS1111";
-const CODE_SECURITY_FLOWS_SHAPE: &str = "OASTS1438";
+const CODE_DYNAMIC_SCOPE: &str = "OASTS2216";
+/// A discriminator `mapping` value that is not a JSON string. It cannot name a schema, so it drops
+/// out of tag resolution — diagnosed rather than dropped silently so a malformed entry is no
+/// quieter than a dangling one.
+const CODE_MAPPING_VALUE_SHAPE: &str = "OASTS2221";
+const CODE_LINK_TARGET: &str = "OASTS3204";
+const CODE_SECURITY_FLOWS_SHAPE: &str = "OASTS5406";
 
 const METHODS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
@@ -468,7 +468,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             let Some(node) = node else {
                 // A mapping value is not a `$ref`, so nothing validated it upstream and a document
                 // is free to point one at a pointer that resolves to nothing. Emission reports the
-                // dangling entry (OASTS1308) and drops its tag, so there is nothing to materialize
+                // dangling entry (OASTS4204) and drops its tag, so there is nothing to materialize
                 // here and nothing to say twice. A `$ref` reaching this arm would mean the loader
                 // let an unresolved target through, which is why the assert stays.
                 debug_assert_eq!(
@@ -2042,7 +2042,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
     /// It runs *after* the whole dispatch rather than as an early return inside it. Returning early
     /// skipped every sibling keyword the dispatch would have parsed — not only their unsupported-
     /// keyword warnings but their shape validation — so `{ not: {}, oneOf: "invalid" }` generated
-    /// successfully and exit 0 where the same document without the `not` is a fatal `OASTS1102`.
+    /// successfully and exit 0 where the same document without the `not` is a fatal `OASTS2102`.
     /// A keyword that says "no instance is valid" says nothing about whether the document is valid.
     fn parse_schema(&mut self, node: NodeView<'graph>) -> SchemaNode {
         let outer = std::mem::replace(&mut self.admits_no_instance, false);
@@ -2501,7 +2501,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 Some(pointer) => self.schema_ref_node(node.doc_id, pointer, meta),
                 None => {
                     self.sink.push(self.input_diagnostic(
-                        CODE_REFERENCE,
+                        CODE_RECURSIVE_REF_TARGET,
                         node.doc_id,
                         &keyword_pointer,
                         "$recursiveRef resolves to the OpenAPI Object, which is not a schema, \
@@ -2537,7 +2537,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             Err(diagnostic) => {
                 self.sink.push(diagnostic);
                 self.sink.push(self.input_diagnostic(
-                    CODE_REFERENCE,
+                    CODE_RECURSIVE_REF_TARGET,
                     node.doc_id,
                     &keyword_pointer,
                     format!("schema reference '{reference}' could not be resolved"),
@@ -2601,7 +2601,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 self.sink.push(diagnostic);
                 self.sink.push(
                     Diagnostic::input(
-                        CODE_REFERENCE,
+                        CODE_RECURSIVE_REF_TARGET,
                         format!("schema reference '{reference}' could not be resolved"),
                     )
                     .with_source(self.source_id(node.doc_id))
@@ -2655,7 +2655,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 match value.as_str() {
                     Some(value) => mapping.push((key.clone(), value.to_owned())),
                     // Dropped either way; the discriminator never shapes the union. Diagnosing it
-                    // keeps a malformed value from being quieter than a dangling one (OASTS1308).
+                    // keeps a malformed value from being quieter than a dangling one (OASTS4204).
                     None => self.sink.push(self.warning_diagnostic(
                         CODE_MAPPING_VALUE_SHAPE,
                         parent.doc_id,
@@ -4084,7 +4084,7 @@ fn collect_numeric_constraints(
         exclusive_minimum: exclusive("exclusiveMinimum"),
         exclusive_maximum: exclusive("exclusiveMaximum"),
         // JSON Schema requires multipleOf > 0 and codegen requires a finite binary64. Invalid
-        // divisors are diagnosed as OASTS1112 in schema_meta; this filter keeps them out of the
+        // divisors are diagnosed as OASTS2204 in schema_meta; this filter keeps them out of the
         // validator kernel and constraint docs.
         multiple_of: object
             .get("multipleOf")
@@ -4857,7 +4857,7 @@ mod tests {
                 }),
             );
             // A second family of paths whose template parameters and declared parameters
-            // disagree in both directions, so each one emits several OASTS1105 diagnostics
+            // disagree in both directions, so each one emits several OASTS2202 diagnostics
             // out of a HashSet difference. Ordering those by hasher iteration would make the
             // sequence inside one path depend on the hasher's per-instance seed.
             paths.insert(
@@ -5287,7 +5287,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1202"),
+                .any(|diagnostic| diagnostic.code == "OASTS3002"),
             "{diagnostics:#?}"
         );
     }
@@ -6166,7 +6166,7 @@ mod tests {
                 "/components/schemas/BadRecursiveValue/$recursiveRef",
             ),
             (
-                CODE_REFERENCE,
+                CODE_RECURSIVE_REF_TARGET,
                 "/components/schemas/MissingRecursiveAnchor/$recursiveRef",
             ),
             (
@@ -6178,7 +6178,7 @@ mod tests {
                 "/components/schemas/BadRecursiveShape/$recursiveRef",
             ),
             (
-                CODE_REFERENCE,
+                CODE_RECURSIVE_REF_TARGET,
                 "/components/schemas/BrokenDynamicUri/$dynamicRef",
             ),
         ] {
@@ -6426,7 +6426,7 @@ mod tests {
     fn oneof_and_anyof_conjunction_carries_single_discriminator() {
         // When oneOf, anyOf, and a discriminator coexist, the lowered conjunction attaches the
         // discriminator to the oneOf branch only (the conventional carrier). Attaching it to both
-        // synthetic branches would run the downstream proof — and its OASTS1304 diagnostic — twice.
+        // synthetic branches would run the downstream proof — and its OASTS4202 diagnostic — twice.
         let document = schemas_doc(
             "3.1.0",
             json!({
@@ -6496,7 +6496,7 @@ mod tests {
     #[test]
     fn ref_with_structural_sibling_warns_and_ignores_in_30() {
         // OpenAPI 3.0 substitutes the Reference Object, dropping siblings; the structural sibling
-        // earns exactly one OASTS1110 warning at the node pointer, and the node stays a plain Ref.
+        // earns exactly one OASTS2212 warning at the node pointer, and the node stays a plain Ref.
         let document = schemas_doc(
             "3.0.3",
             json!({
@@ -6756,7 +6756,7 @@ mod tests {
         let diagnostics = sink
             .as_slice()
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1109")
+            .filter(|diagnostic| diagnostic.code == "OASTS2113")
             .collect::<Vec<_>>();
         assert_eq!(diagnostics.len(), 3);
         assert!(
@@ -6817,12 +6817,12 @@ mod tests {
         assert!(
             sink.as_slice()
                 .iter()
-                .all(|diagnostic| diagnostic.code != "OASTS1411")
+                .all(|diagnostic| diagnostic.code != "OASTS5001")
         );
         assert_eq!(
             sink.as_slice()
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1109")
+                .filter(|diagnostic| diagnostic.code == "OASTS2113")
                 .count(),
             1
         );
@@ -6914,7 +6914,7 @@ mod tests {
         let invalid = sink
             .as_slice()
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1107")
+            .filter(|diagnostic| diagnostic.code == "OASTS2111")
             .collect::<Vec<_>>();
         assert_eq!(invalid.len(), 3);
         assert!(
@@ -6992,7 +6992,7 @@ mod tests {
         let warnings = sink
             .as_slice()
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1107")
+            .filter(|diagnostic| diagnostic.code == "OASTS2111")
             .collect::<Vec<_>>();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].severity, Severity::Warning);
@@ -7034,7 +7034,7 @@ mod tests {
         let warnings = sink
             .as_slice()
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1107")
+            .filter(|diagnostic| diagnostic.code == "OASTS2111")
             .collect::<Vec<_>>();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].severity, Severity::Warning);
@@ -7086,7 +7086,7 @@ mod tests {
         let duplicates = sink
             .as_slice()
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1108")
+            .filter(|diagnostic| diagnostic.code == "OASTS2112")
             .collect::<Vec<_>>();
         assert_eq!(duplicates.len(), 2);
         assert!(
@@ -10242,7 +10242,7 @@ mod tests {
         assert!(
             sink.as_slice()
                 .iter()
-                .any(|diagnostic| diagnostic.code == CODE_REFERENCE)
+                .any(|diagnostic| diagnostic.code == CODE_RECURSIVE_REF_TARGET)
         );
     }
 

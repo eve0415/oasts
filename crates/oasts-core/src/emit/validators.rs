@@ -55,14 +55,14 @@ const VALIDATORS_RUNTIME_TS: &str = include_str!("../../runtime/validators-runti
 const VALIDATORS_STANDARD_SCHEMA_TS: &str =
     include_str!("../../runtime/validators-standard-schema.ts");
 
-/// A schema carries a validation keyword the validators artifact does not implement.
-const CODE_REJECTED_KEYWORD: &str = "OASTS1501";
-/// A schema degraded to an unknown leaf, so no faithful validator can be emitted for it.
-const CODE_UNKNOWN_LEAF: &str = "OASTS1502";
-/// An applicator's subschema is not fully checkable, so emitting the outer check would be unsound.
-const CODE_INCOMPLETE_APPLICATOR: &str = "OASTS1503";
 /// A JSON response media entry was renamed because its validator-name fragment collided.
-const CODE_MEDIA_TAG_COLLISION: &str = "OASTS1400";
+pub(super) const CODE_MEDIA_TAG_COLLISION: &str = "OASTS6001";
+/// A schema carries a validation keyword the validators artifact does not implement.
+const CODE_REJECTED_KEYWORD: &str = "OASTS6002";
+/// A schema degraded to an unknown leaf, so no faithful validator can be emitted for it.
+const CODE_UNKNOWN_LEAF: &str = "OASTS6003";
+/// An applicator's subschema is not fully checkable, so emitting the outer check would be unsound.
+const CODE_INCOMPLETE_APPLICATOR: &str = "OASTS6004";
 
 /// TypeScript aborts control-flow analysis at 2,000 recursive flow-node visits. The estimate below
 /// counts the flow-producing bindings, conditions, merges, mutations, and effectful calls emitted
@@ -289,8 +289,8 @@ fn embedded_asset(
 
 fn collect_rejects(emitter: &Emitter<'_, '_, '_>, schema: &SchemaNode, out: &mut Vec<Diagnostic>) {
     let meta = schema.meta();
-    // One rejected keyword is one root cause: it drives OASTS1501, and the same parse degrades the
-    // node to an unknown leaf. Surfacing OASTS1502 as well would double-report it against the frozen
+    // One rejected keyword is one root cause: it drives OASTS6002, and the same parse degrades the
+    // node to an unknown leaf. Surfacing OASTS6003 as well would double-report it against the frozen
     // matrix's single-diagnostic contract, so the unknown-leaf code fires only for nodes that
     // reached Unknown without carrying a rejected keyword (e.g. an unknown `type`).
     if meta.rejected_validation_keywords.is_empty() {
@@ -1140,7 +1140,7 @@ impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
                 } else {
                     self.mark_incomplete();
                 }
-                // An unresolved reference is already reported as OASTS1305 by the types pass.
+                // An unresolved reference is already reported as OASTS4203 by the types pass.
             }
             SchemaNode::Primitive {
                 ty,
@@ -4893,7 +4893,7 @@ mod tests {
         );
         let mut warned = false;
         for diagnostic in &diagnostics {
-            if diagnostic.code == "OASTS1311" {
+            if diagnostic.code == "OASTS4104" {
                 warned = true;
             }
         }
@@ -4940,7 +4940,7 @@ mod tests {
 
         let mut fatal = Vec::new();
         for diagnostic in &diagnostics {
-            if diagnostic.code == "OASTS1312" {
+            if diagnostic.code == "OASTS4105" {
                 fatal.push(diagnostic.message.as_str());
             }
         }
@@ -5225,7 +5225,7 @@ mod tests {
         })));
         assert!(
             diagnostics.iter().all(|diagnostic| {
-                diagnostic.code == "OASTS1103" && diagnostic.severity == Severity::Warning
+                diagnostic.code == "OASTS2201" && diagnostic.severity == Severity::Warning
             }),
             "{diagnostics:?}"
         );
@@ -6798,7 +6798,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.code == "OASTS1103"),
+                .all(|diagnostic| diagnostic.code == "OASTS2201"),
             "{diagnostics:?}"
         );
         let bounded = component(&files, "bounded");
@@ -6837,7 +6837,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.code == "OASTS1103"),
+                .all(|diagnostic| diagnostic.code == "OASTS2201"),
             "{diagnostics:?}"
         );
         let content = component(&files, "account");
@@ -7213,20 +7213,20 @@ mod tests {
             })));
             let rejected = diagnostics
                 .iter()
-                .find(|d| d.code == "OASTS1501" && d.message.contains(keyword))
-                .expect("rejected keyword fails with OASTS1501");
+                .find(|d| d.code == "OASTS6002" && d.message.contains(keyword))
+                .expect("rejected keyword fails with OASTS6002");
             assert_eq!(rejected.severity, Severity::Error);
             assert_eq!(
                 rejected.json_pointer.as_deref(),
                 Some("/components/schemas/Rejected")
             );
             // Exactly one validators-side diagnostic per rejected keyword: the same parse also
-            // degrades the node to an unknown leaf, but OASTS1502 must not double-report it. (The
+            // degrades the node to an unknown leaf, but OASTS6003 must not double-report it. (The
             // parse-time unsupported-keyword warning is a separate category and still fires.)
             assert_eq!(
                 diagnostics
                     .iter()
-                    .filter(|d| d.code == "OASTS1501" || d.code == "OASTS1502")
+                    .filter(|d| d.code == "OASTS6002" || d.code == "OASTS6003")
                     .count(),
                 1,
                 "rejected keyword '{keyword}' must raise exactly one validators diagnostic",
@@ -7278,7 +7278,7 @@ mod tests {
             let warning = diagnostics
                 .iter()
                 .find(|diagnostic| {
-                    diagnostic.code == "OASTS1118"
+                    diagnostic.code == "OASTS2216"
                         && diagnostic.json_pointer.as_deref() == Some(pointer)
                 })
                 .expect("path-dependent dynamic reference should warn");
@@ -7306,8 +7306,8 @@ mod tests {
         })));
         let unknown = diagnostics
             .iter()
-            .find(|d| d.code == "OASTS1502")
-            .expect("unknown leaf fails with OASTS1502");
+            .find(|d| d.code == "OASTS6003")
+            .expect("unknown leaf fails with OASTS6003");
         assert_eq!(unknown.severity, Severity::Error);
         assert!(unknown.message.contains("unsupported type mystery"));
         assert_eq!(
@@ -8686,7 +8686,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1214")
+                .filter(|diagnostic| diagnostic.code == "OASTS3101")
                 .count(),
             6
         );
@@ -8847,7 +8847,7 @@ mod tests {
         assert_clean(&diagnostics);
         let warning = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1111")
+            .find(|diagnostic| diagnostic.code == "OASTS2203")
             .expect("phantom required warning");
         assert_eq!(warning.severity, Severity::Warning);
         assert_eq!(

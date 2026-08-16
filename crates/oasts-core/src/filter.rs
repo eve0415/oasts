@@ -26,7 +26,7 @@ pub(crate) const CODE_FILTER_UNMATCHED: &str = "OASTS0262";
 pub(crate) const CODE_FILTER_EMPTY: &str = "OASTS0263";
 
 /// Pruning removed every component schema and there was nothing else to emit.
-pub(crate) const CODE_PRUNED_EVERYTHING: &str = "OASTS1119";
+pub(crate) const CODE_PRUNED_EVERYTHING: &str = "OASTS2107";
 
 /// What one compiled pattern matches with.
 #[derive(Clone, Debug)]

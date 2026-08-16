@@ -92,7 +92,7 @@ enum ParamContentClass {
     /// Content JSON family: `JSON.stringify` then location encoding; the input stays typed.
     ContentJson,
     /// Content media the client cannot serialize (any non-JSON that is not a text/plain-over-string
-    /// passthrough): the caller pre-serializes to a `string`, and OASTS1443 records it.
+    /// passthrough): the caller pre-serializes to a `string`, and OASTS5006 records it.
     CallerSerialized,
 }
 

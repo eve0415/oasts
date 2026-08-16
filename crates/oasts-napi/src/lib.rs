@@ -289,7 +289,7 @@ mod tests {
         .expect("invalid manifest");
         let invalid_manifest = run(options(&temp, "generate", true));
         assert_eq!(invalid_manifest.exit_code, 2);
-        assert!(invalid_manifest.rendered_stderr.contains("OASTS0231"));
+        assert!(invalid_manifest.rendered_stderr.contains("OASTS1011"));
     }
 
     #[test]
@@ -313,7 +313,7 @@ mod tests {
         );
         let result = run(options);
         assert_eq!(result.exit_code, 0, "{}", result.rendered_stderr);
-        assert!(result.rendered_stderr.contains("warning[OASTS1304]"));
+        assert!(result.rendered_stderr.contains("warning[OASTS4202]"));
         assert_eq!(result.diagnostics[0].severity, "warning");
         assert!(temp.path().join("generated").is_dir());
     }
@@ -330,7 +330,7 @@ mod tests {
         with_spec.specs = vec!["petstore".to_owned()];
         let spec_failure = run(with_spec);
         assert_eq!(spec_failure.exit_code, 2);
-        assert_eq!(spec_failure.diagnostics[0].code, "OASTS0062");
+        assert_eq!(spec_failure.diagnostics[0].code, "OASTS9002");
 
         let compile_failure = copy_fixture("petstore-3.0");
         fs::write(
@@ -340,7 +340,7 @@ mod tests {
         .expect("invalid input");
         let input_failure = run(options(&compile_failure, "generate", false));
         assert_eq!(input_failure.exit_code, 1);
-        assert!(input_failure.rendered_stderr.contains("OASTS1101"));
+        assert!(input_failure.rendered_stderr.contains("OASTS2101"));
 
         let hostile = copy_fixture("petstore-3.0");
         assert_eq!(run(options(&hostile, "generate", false)).exit_code, 0);
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn failure_reason_renders_warning_severity() {
-        let mut warning = Diagnostic::config("OASTS0999", "warning");
+        let mut warning = Diagnostic::config("OASTS9902", "warning");
         warning.severity = Severity::Warning;
         let payload: serde_json::Value =
             serde_json::from_str(&failure_reason(0, &[warning])).expect("JSON reason");
@@ -377,7 +377,7 @@ mod tests {
 
         let refusal = command_refusal("watch".to_owned()).expect("watch is unimplemented");
         assert_eq!(refusal.exit_code, 2);
-        assert_eq!(refusal.diagnostics[0].code, "OASTS0222");
+        assert_eq!(refusal.diagnostics[0].code, "OASTS9004");
         assert!(
             refusal
                 .rendered_stderr
@@ -389,12 +389,12 @@ mod tests {
 
     #[test]
     fn diagnostic_conversion_preserves_location_fields() {
-        let diagnostic = Diagnostic::config("OASTS0001", "message")
+        let diagnostic = Diagnostic::config("OASTS9902", "message")
             .with_source("config.yaml")
             .with_location(3, 7)
             .with_json_pointer("/input");
         let converted = to_diagnostic_js(&diagnostic);
-        assert_eq!(converted.code, "OASTS0001");
+        assert_eq!(converted.code, "OASTS9902");
         assert_eq!(converted.severity, "error");
         assert_eq!(converted.source_id.as_deref(), Some("config.yaml"));
         assert_eq!((converted.line, converted.col), (Some(3), Some(7)));
@@ -453,7 +453,7 @@ mod tests {
         let failed = run(options(&temp, "generate", false));
 
         assert_eq!(failed.exit_code, 2, "{}", failed.rendered_stderr);
-        for code in ["OASTS0231", "OASTS0241"] {
+        for code in ["OASTS1011", "OASTS0241"] {
             assert!(
                 failed
                     .diagnostics

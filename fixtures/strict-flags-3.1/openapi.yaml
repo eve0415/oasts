@@ -288,7 +288,7 @@ paths:
                 additionalProperties: false
                 properties:
                   # Deliberately free of date/time formats: a multipart response carrying one is a
-                  # named refusal (OASTS1314), and this fixture also runs under the transform config.
+                  # named refusal (OASTS4302), and this fixture also runs under the transform config.
                   manifest:
                     $ref: '#/components/schemas/Manifest'
                   archive:
