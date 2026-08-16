@@ -234,9 +234,9 @@ keys:
         deallocs: 30
         allocBytes: 2788
       - stage: "emit"
-        allocs: 452
+        allocs: 456
         reallocs: 162
-        deallocs: 437
+        deallocs: 441
         allocBytes: 31238
     informational:
       peakBytes: 93424
@@ -264,9 +264,9 @@ keys:
         deallocs: 30
         allocBytes: 2788
       - stage: "emit"
-        allocs: 1319
+        allocs: 1323
         reallocs: 277
-        deallocs: 1292
+        deallocs: 1296
         allocBytes: 247088
     informational:
       peakBytes: 172674
@@ -294,9 +294,9 @@ keys:
         deallocs: 30
         allocBytes: 2788
       - stage: "emit"
-        allocs: 917
+        allocs: 921
         reallocs: 306
-        deallocs: 888
+        deallocs: 892
         allocBytes: 101763
     informational:
       peakBytes: 93424
@@ -329,9 +329,9 @@ keys:
         deallocs: 24
         allocBytes: 18194
       - stage: "emit"
-        allocs: 1364
+        allocs: 1368
         reallocs: 353
-        deallocs: 1300
+        deallocs: 1304
         allocBytes: 335446
     informational:
       peakBytes: 308618
@@ -364,9 +364,9 @@ keys:
         deallocs: 30
         allocBytes: 18020
       - stage: "emit"
-        allocs: 1866
+        allocs: 1870
         reallocs: 471
-        deallocs: 1827
+        deallocs: 1831
         allocBytes: 470528
     informational:
       peakBytes: 304455
@@ -394,9 +394,9 @@ keys:
         deallocs: 65
         allocBytes: 7145
       - stage: "emit"
-        allocs: 825
+        allocs: 837
         reallocs: 279
-        deallocs: 796
+        deallocs: 808
         allocBytes: 74187
     informational:
       peakBytes: 185293
@@ -429,9 +429,9 @@ keys:
         deallocs: 175
         allocBytes: 89003
       - stage: "emit"
-        allocs: 4037
+        allocs: 4041
         reallocs: 1016
-        deallocs: 3966
+        deallocs: 3970
         allocBytes: 705709
     informational:
       peakBytes: 534305
@@ -464,9 +464,9 @@ keys:
         deallocs: 189
         allocBytes: 45476
       - stage: "emit"
-        allocs: 2959
+        allocs: 2963
         reallocs: 843
-        deallocs: 2902
+        deallocs: 2906
         allocBytes: 473887
     informational:
       peakBytes: 405556
@@ -494,9 +494,9 @@ keys:
         deallocs: 659
         allocBytes: 118893
       - stage: "emit"
-        allocs: 4306
+        allocs: 4310
         reallocs: 1334
-        deallocs: 4197
+        deallocs: 4201
         allocBytes: 496884
     informational:
       peakBytes: 957771
