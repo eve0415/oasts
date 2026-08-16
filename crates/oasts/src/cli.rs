@@ -412,7 +412,7 @@ mod tests {
             );
             assert_eq!(code, 1, "{stderr}");
             assert!(stdout.is_empty(), "{stdout}");
-            assert!(stderr.contains("error[OASTS1214]"), "{stderr}");
+            assert!(stderr.contains("error[OASTS3101]"), "{stderr}");
             assert!(stderr.contains("outside the binary64 domain"), "{stderr}");
 
             fs::write(
@@ -457,7 +457,7 @@ mod tests {
 
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(stdout, "generated 2 files\n");
-        assert!(stderr.contains("OASTS1216"), "{stderr}");
+        assert!(stderr.contains("OASTS3103"), "{stderr}");
         let top = fs::read_to_string(temp.path().join("generated/types/components/top.ts"))
             .expect("Top output");
         assert!(

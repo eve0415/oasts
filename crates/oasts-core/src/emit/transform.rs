@@ -6995,7 +6995,7 @@ mod operation_pair_tests {
             date_mode,
         );
         assert!(has_errors, "{diagnostics:#?}");
-        for code in ["OASTS1201", "OASTS4001"] {
+        for code in ["OASTS3001", "OASTS4001"] {
             assert!(
                 diagnostics.iter().any(|diagnostic| diagnostic.code == code),
                 "missing {code}: {diagnostics:#?}"

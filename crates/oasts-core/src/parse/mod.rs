@@ -59,13 +59,13 @@ const CODE_RECURSIVE_REF_VALUE: &str = "OASTS1117";
 /// because two or more schema resources declare the anchor it names. No single schema can stand in
 /// for it, so the node widens to unknown and the validators artifact refuses rather than guessing.
 const CODE_DYNAMIC_SCOPE: &str = "OASTS1118";
-const CODE_ENUM_RULE_14: &str = "OASTS1214";
+const CODE_ENUM_RULE_14: &str = "OASTS3101";
 const CODE_SERVER_VAR_ENUM_EMPTY: &str = "OASTS1131";
 const CODE_SERVER_VAR_DEFAULT: &str = "OASTS1132";
 const CODE_HEADER_CONTENT_TYPE: &str = "OASTS1133";
 const CODE_HEADER_DUPLICATE: &str = "OASTS1134";
 const CODE_WEBHOOKS_VERSION: &str = "OASTS1135";
-const CODE_LINK_TARGET: &str = "OASTS1234";
+const CODE_LINK_TARGET: &str = "OASTS3204";
 const CODE_PHANTOM_REQUIRED: &str = "OASTS1111";
 const CODE_SECURITY_FLOWS_SHAPE: &str = "OASTS5406";
 
@@ -5287,7 +5287,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "OASTS1202"),
+                .any(|diagnostic| diagnostic.code == "OASTS3002"),
             "{diagnostics:#?}"
         );
     }

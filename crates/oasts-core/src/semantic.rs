@@ -24,19 +24,19 @@ use crate::ir::{
 };
 use crate::num::{finite_binary64, first_number_outside_binary64, render_number};
 
-const CODE_OPERATION_NAME: &str = "OASTS1201";
-const CODE_TYPE_NAME: &str = "OASTS1202";
-const CODE_ENUM_RULE_14: &str = "OASTS1214";
-const CODE_NUMERIC_BOUND_DOMAIN: &str = "OASTS1215";
-const CODE_ANNOTATION_DOMAIN: &str = "OASTS1216";
-const CODE_LINK_OPERATION_ID: &str = "OASTS1231";
-const CODE_LINK_OPERATION_REF: &str = "OASTS1232";
-const CODE_LINK_PARAMETER: &str = "OASTS1233";
+const CODE_OPERATION_NAME: &str = "OASTS3001";
+const CODE_TYPE_NAME: &str = "OASTS3002";
+const CODE_ENUM_RULE_14: &str = "OASTS3101";
+const CODE_NUMERIC_BOUND_DOMAIN: &str = "OASTS3102";
+const CODE_ANNOTATION_DOMAIN: &str = "OASTS3103";
+const CODE_LINK_OPERATION_ID: &str = "OASTS3201";
+const CODE_LINK_OPERATION_REF: &str = "OASTS3202";
+const CODE_LINK_PARAMETER: &str = "OASTS3203";
 // Webhook and callback name stems allocate in their own scopes (see `allocate_webhook_names`
 // and `allocate_callback_names`) but share one collision/normalization-failure code: both are
 // the same failure shape (a generated identifier collides or fails to normalize) just applied
 // to a different declaration kind.
-const CODE_WEBHOOK_NAME: &str = "OASTS1321";
+const CODE_WEBHOOK_NAME: &str = "OASTS3003";
 // Config-category (exit code 2): an override key that names no declaration in the document.
 const CODE_OVERRIDE_UNMATCHED: &str = "OASTS0202";
 
@@ -1161,7 +1161,7 @@ fn allocate_schema_names(
     drop(first_indices);
 
     let mut all_suggestions = Vec::new();
-    // Suggestions only ever reach the user attached to an OASTS1202, so a document with no
+    // Suggestions only ever reach the user attached to an OASTS3002, so a document with no
     // identifier collision can never be shown one. Everything below — indexing every allocated
     // name, deriving a file base per schema, grouping those — is remedy machinery, and skipping
     // it outright is what keeps the overwhelmingly common clean run from paying for it.
@@ -1269,7 +1269,7 @@ fn collect_schema_override_suggestions(
     }
 
     // A pasted identifier override also becomes that declaration's file-base source. Include
-    // latent raw-name path collisions in the same block so resolving OASTS1202 cannot merely
+    // latent raw-name path collisions in the same block so resolving OASTS3002 cannot merely
     // uncover OASTS4002 on the next run.
     let mut file_groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, schema) in pending.iter().enumerate() {

@@ -8416,7 +8416,7 @@ mod tests {
         let (files, diagnostics) = compile(document, json!({}));
         let warnings = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1214")
+            .filter(|diagnostic| diagnostic.code == "OASTS3101")
             .collect::<Vec<_>>();
         assert_eq!(warnings.len(), 4);
         assert!(warnings.iter().all(|diagnostic| {
@@ -8483,7 +8483,7 @@ mod tests {
         let (files, diagnostics) = compile(document, json!({}));
         let warnings = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "OASTS1214")
+            .filter(|diagnostic| diagnostic.code == "OASTS3101")
             .collect::<Vec<_>>();
         assert_eq!(warnings.len(), 3);
         assert!(
@@ -8519,7 +8519,7 @@ mod tests {
         );
         let diagnostic = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "OASTS1214")
+            .find(|diagnostic| diagnostic.code == "OASTS3101")
             .expect("empty enum diagnostic");
         assert_eq!(diagnostic.severity, Severity::Warning);
         assert!(diagnostic.message.contains("OpenAPI 3.1 (SHOULD)"));
@@ -8542,7 +8542,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1214")
+                .filter(|diagnostic| diagnostic.code == "OASTS3101")
                 .count(),
             1
         );
@@ -10192,7 +10192,7 @@ mod tests {
         assert_eq!(diagnostics.len(), 4, "{diagnostics:?}");
         assert!(
             diagnostics.iter().all(|diagnostic| {
-                diagnostic.code == "OASTS1216" && diagnostic.severity == Severity::Warning
+                diagnostic.code == "OASTS3103" && diagnostic.severity == Severity::Warning
             }),
             "{diagnostics:?}"
         );

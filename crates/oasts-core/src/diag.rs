@@ -332,13 +332,13 @@ mod tests {
 
     #[test]
     fn render_appends_one_yaml_safe_run_level_override_block() {
-        let schemas = Diagnostic::input("OASTS1202", "schema collision")
+        let schemas = Diagnostic::input("OASTS3002", "schema collision")
             .with_naming_override_suggestions(vec![NamingOverrideSuggestion {
                 namespace: NamingOverrideNamespace::Schemas,
                 source_name: "Owner's pet".to_owned(),
                 identifier: "OwnersPet_1".to_owned(),
             }]);
-        let operations = Diagnostic::input("OASTS1201", "operation collision")
+        let operations = Diagnostic::input("OASTS3001", "operation collision")
             .with_naming_override_suggestions(vec![NamingOverrideSuggestion {
                 namespace: NamingOverrideNamespace::Operations,
                 source_name: "get-pet".to_owned(),

@@ -8686,7 +8686,7 @@ mod tests {
         assert_eq!(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code == "OASTS1214")
+                .filter(|diagnostic| diagnostic.code == "OASTS3101")
                 .count(),
             6
         );

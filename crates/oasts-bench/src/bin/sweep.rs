@@ -536,7 +536,7 @@ fn classify(code: &str) -> Outcome {
         // The document contradicts OpenAPI or JSON Schema. No generator change accepts these; the
         // fix belongs upstream, in the document.
         "OASTS1011"     // a $ref whose JSON pointer resolves to nothing
-        | "OASTS1201"   // a duplicate operationId, which OpenAPI requires to be unique
+        | "OASTS3001"   // a duplicate operationId, which OpenAPI requires to be unique
         | "OASTS5106"   // a form media whose schema has no properties to name its fields with
         | "OASTS5402"   // a security requirement naming a scheme components never declares
         | "OASTS5409"   // OpenAPI 3.0: non-oauth2/openIdConnect requirement scopes MUST be empty
@@ -544,7 +544,7 @@ fn classify(code: &str) -> Outcome {
 
         // A config knob resolves it, and the diagnostic prints the block to paste. A public type
         // name is the user's to choose, so these stay fatal by design.
-        "OASTS1202"     // a component name collision -> naming.overrides.schemas
+        "OASTS3002"     // a component name collision -> naming.overrides.schemas
         | "OASTS6302"   // a path segment that is not a usable name -> naming.overrides.pathSegments
         => Outcome::RefusedWithRemedy,
 
@@ -1764,7 +1764,7 @@ mod tests {
     #[test]
     fn diagnostic_parser_captures_locations_summary_and_unparsed_lines() {
         let stderr = concat!(
-            "error[OASTS1202]: schema name collision\n",
+            "error[OASTS3002]: schema name collision\n",
             "  --> workspace/openapi.json:1:1 /components/schemas/Pet\n",
             "warning[OASTS1111]: required property is absent\n",
             "  --> workspace/openapi.json:4:2\n",
@@ -1901,7 +1901,7 @@ mod tests {
     fn outcome_reads_the_classification_of_its_errors() {
         for (code, expected) in [
             ("OASTS5409", Outcome::InvalidDocument),
-            ("OASTS1202", Outcome::RefusedWithRemedy),
+            ("OASTS3002", Outcome::RefusedWithRemedy),
             ("OASTS5201", Outcome::Unsupported),
         ] {
             let report = config_report(
@@ -1919,7 +1919,7 @@ mod tests {
             ConfigKind::Full,
             vec![
                 diagnostic(Severity::Error, "OASTS5409", "invalid document"),
-                diagnostic(Severity::Error, "OASTS1202", "remedy exists"),
+                diagnostic(Severity::Error, "OASTS3002", "remedy exists"),
                 diagnostic(Severity::Error, "OASTS5201", "out of scope"),
                 diagnostic(Severity::Error, "OASTS9999", "nobody classified this"),
             ],

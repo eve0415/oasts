@@ -487,7 +487,7 @@ components:
         );
         assert!(files.is_none(), "collision must be fatal");
         let collided = sink.as_slice().iter().any(|diagnostic| {
-            diagnostic.code == "OASTS1202" && diagnostic.message.contains("collision")
+            diagnostic.code == "OASTS3002" && diagnostic.message.contains("collision")
         });
         assert!(collided, "expected exact identifier collision diagnostic");
     }
@@ -545,7 +545,7 @@ components:
     #[test]
     fn case_fold_only_names_sharing_a_generated_path_collide() {
         // `custom-hostname` -> `CustomHostname` and `custom-hostName` -> `CustomHostName`
-        // are distinct identifiers, so the identifier layer allocates both (no OASTS1202).
+        // are distinct identifiers, so the identifier layer allocates both (no OASTS3002).
         // Their kebab file bases both fold to `custom-hostname.ts`, so filesystem safety is
         // still enforced — at the path layer, via OASTS4002.
         let openapi = r##"openapi: "3.1.0"
@@ -585,7 +585,7 @@ components:
         let (sink, files) = compile_multifile(&[("openapi.yaml", openapi)], true);
         assert!(files.is_none(), "path collision must be fatal");
         let has_code = |code: &str| sink.as_slice().iter().any(|d| d.code == code);
-        assert!(!has_code("OASTS1202"), "case-only diff must not be fatal");
+        assert!(!has_code("OASTS3002"), "case-only diff must not be fatal");
         assert!(has_code("OASTS4002"), "path layer must still collide");
     }
 
@@ -1001,7 +1001,7 @@ paths:
         );
         assert!(files.is_none(), "same-stem roots must not emit");
         assert!(sink.as_slice().iter().any(|diagnostic| {
-            diagnostic.code == "OASTS1202"
+            diagnostic.code == "OASTS3002"
                 && diagnostic.message.contains("collision")
                 && diagnostic.message.contains("'Pet'")
         }));
@@ -1045,7 +1045,7 @@ paths:
         let (sink, files) = compile_multifile(&numeric_files, true);
         assert!(files.is_none(), "a leading-digit stem must not emit");
         assert!(sink.as_slice().iter().any(|diagnostic| {
-            diagnostic.code == "OASTS1202"
+            diagnostic.code == "OASTS3002"
                 && diagnostic
                     .message
                     .contains("invalid schema identifier '123'")
@@ -1325,7 +1325,7 @@ paths:
 
         assert!(files.is_none());
         let codes: Vec<&str> = sink.as_slice().iter().map(|d| d.code).collect();
-        assert!(codes.contains(&"OASTS1231"), "{codes:?}");
+        assert!(codes.contains(&"OASTS3201"), "{codes:?}");
     }
 
     #[test]
@@ -1374,7 +1374,7 @@ paths:
         let diagnostics = sink.as_slice();
         let collided = diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "OASTS1202");
+            .any(|diagnostic| diagnostic.code == "OASTS3002");
         assert!(collided, "{diagnostics:#?}");
     }
 
