@@ -14,8 +14,7 @@
 
 ## Why oasts
 
-Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtime dependency into your bundle, or approximates the parts of the spec that are hard to get right.
-oasts is a compiler, not a platform:
+Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtime dependency into your bundle, or approximates the parts of the spec that are hard to get right. oasts is a compiler, not a platform:
 
 - **Failure-complete result types.** Every call returns a discriminated union covering documented responses, undocumented HTTP responses, network failures, and decode failures — not just the 2xx happy path. Exhaustive `switch` over an API call is a type error away from correct.
 - **Deterministic, byte-identical output.** Same input, same config, same version ⇒ the same bytes on every machine and OS. Generated code is meant to be committed and reviewed; `--check` makes drift a CI failure.
@@ -43,9 +42,7 @@ oasts is a compiler, not a platform:
 pnpm add -D @oasts/cli
 ```
 
-The package is `@oasts/cli`; the command it installs is `oasts`.
-Node 24 or newer.
-Drop an `oasts.yaml` next to your spec:
+The package is `@oasts/cli`; the command it installs is `oasts`. Node 24 or newer. Drop an `oasts.yaml` next to your spec:
 
 ```yaml
 schemaVersion: 1
@@ -106,9 +103,7 @@ switch (result.outcome) {
 
 An exact declared status is a number literal, a range or `default` key and every failure tag a string literal — the two never overlap, so `case 200:` can never also match `"4XX"`.
 
-Every operation also gets a `getPetShowcaseOrThrow` companion for the call sites where a failure is not worth branching on: it resolves to the matched success arm's `{ data, meta }` and throws `ApiError` otherwise, with the whole failed result preserved on `error.result`.
-Set `client.aggregate: true` and both forms are also re-exported from `generated/client/api.ts`, if you would rather import one object than one module per operation.
-It is off by default, because the aggregate names every operation and a bundler cannot drop the ones you never call.
+Every operation also gets a `getPetShowcaseOrThrow` companion for the call sites where a failure is not worth branching on: it resolves to the matched success arm's `{ data, meta }` and throws `ApiError` otherwise, with the whole failed result preserved on `error.result`. Set `client.aggregate: true` and both forms are also re-exported from `generated/client/api.ts`, if you would rather import one object than one module per operation. It is off by default, because the aggregate names every operation and a bundler cannot drop the ones you never call.
 
 In CI, fail on drift instead of writing files:
 
@@ -282,13 +277,11 @@ naming:
 | Deterministic committed output | ✅ byte-identical, `--check` gated | — | — | — |
 | Toolchain | native binary via npm | Node | Node | Java |
 
-Performance is measured, not promised: the in-repo benchmark harness compiles GitHub's full OpenAPI spec to types in ~80 ms — warm p50 of end-to-end `oasts generate` runs on the reference container — with every run gated on repeatability.
-Reproduce it with `cargo run -p oasts-bench` — the harness, corpus manifest, and recorded baseline live in [`bench/`](./bench).
+Performance is measured, not promised: the in-repo benchmark harness compiles GitHub's full OpenAPI spec to types in ~80 ms — warm p50 of end-to-end `oasts generate` runs on the reference container — with every run gated on repeatability. Reproduce it with `cargo run -p oasts-bench` — the harness, corpus manifest, and recorded baseline live in [`bench/`](./bench).
 
 ## Configuration
 
-`oasts.yaml` (or `.json`) is validated against a published JSON Schema, so typos fail loudly with a rule ID instead of silently doing nothing.
-A typed TypeScript config is supported too (`oasts.config.ts`).
+`oasts.yaml` (or `.json`) is validated against a published JSON Schema, so typos fail loudly with a rule ID instead of silently doing nothing. A typed TypeScript config is supported too (`oasts.config.ts`).
 
 ```yaml
 schemaVersion: 1
@@ -310,8 +303,7 @@ validation:
 
 ### Output layout
 
-Each artifact gets its own directory under `output`, named after the artifact.
-Rename or nest any of them and the imports between artifacts follow:
+Each artifact gets its own directory under `output`, named after the artifact. Rename or nest any of them and the imports between artifacts follow:
 
 ```yaml
 artifacts:
@@ -338,8 +330,7 @@ export type Pet = Cat | Dog;
 export type Pet = (Cat & { petType: "feline" }) | (Dog & { petType: "canine" });
 ```
 
-`types.integer: bigint` maps `format: int64` to `bigint` instead of `number`, so values past 2^53 survive the round trip.
-It converts at the client boundary, so it needs the client artifact:
+`types.integer: bigint` maps `format: int64` to `bigint` instead of `number`, so values past 2^53 survive the round trip. It converts at the client boundary, so it needs the client artifact:
 
 ```ts
 // number (default)      cents: number;
@@ -371,8 +362,7 @@ The representations need the client artifact — the codecs are emitted under it
 
 ### Zod flavor
 
-The zod artifact imports classic `zod` by default.
-Set `zod.flavor: mini` to import `zod/mini` instead — the tree-shakable entry point, same package, same `^4.4.0` peer range, no extra dependency.
+The zod artifact imports classic `zod` by default. Set `zod.flavor: mini` to import `zod/mini` instead — the tree-shakable entry point, same package, same `^4.4.0` peer range, no extra dependency.
 
 ```yaml
 artifacts:
@@ -382,9 +372,7 @@ zod:
   flavor: mini
 ```
 
-Both flavors share one parsing core and are held to the same conformance vectors, so verdicts and parsed values are identical.
-What changes is what your bundler can drop.
-Each row below is one esbuild bundle over the named entry points from the GitHub spec's generated artifact, minified, gzipped:
+Both flavors share one parsing core and are held to the same conformance vectors, so verdicts and parsed values are identical. What changes is what your bundler can drop. Each row below is one esbuild bundle over the named entry points from the GitHub spec's generated artifact, minified, gzipped:
 
 | bundle | `zod` | `zod/mini` |
 | --- | --- | --- |
@@ -398,8 +386,7 @@ Pick classic if you hand the emitted schemas to something that expects a classic
 
 ## Determinism
 
-Generated output is a build artifact you can commit: given the same input document, config, and oasts version, output is byte-identical across machines and operating systems.
-The repo's own gates generate everything twice and diff the bytes; `oasts generate --check` gives your CI the same guarantee.
+Generated output is a build artifact you can commit: given the same input document, config, and oasts version, output is byte-identical across machines and operating systems. The repo's own gates generate everything twice and diff the bytes; `oasts generate --check` gives your CI the same guarantee.
 
 That also means oasts never reformats your project and you never reformat oasts's output — emitted code has one canonical shape.
 
@@ -414,10 +401,7 @@ pnpm -C packages/oasts build:napi       # build the native Node binding
 pnpm -C packages/oasts build            # bundle the npm package
 ```
 
-`scripts/*.sh` are the gates.
-`gate.sh` runs lint and tests; `coverage.sh` / `coverage-ts.sh` hold the coverage floors; `verify-ts.sh` typechecks generated fixture output under the consumer compiler-flag matrix — `strict` plus `noUncheckedIndexedAccess`, `noUnusedLocals`, `noUnusedParameters`, `noImplicitOverride` and `exactOptionalPropertyTypes` off and on, because the output has to compile in your project, not ours (run `cargo build` first); `consume-gate.sh` proves generated clients resolve, bundle, tree-shake, and run as consumed artifacts; `allocs-gate.sh` catches drift in the per-stage allocation counters.
-`auth-gate.sh`, `msw-gate.sh`, `streaming-gate.sh`, `tanstack-gate.sh`, `transform-gate.sh`, `validators-gate.sh` and `zod-gate.sh` check the SHA-256 of each artifact's frozen test vectors — those were authored from the contract before the implementation existed, so a mismatch means the freeze was broken.
-`client-size.sh` reports emitted per-operation client sizes without enforcing a ceiling.
+`scripts/*.sh` are the gates. `gate.sh` runs lint and tests; `coverage.sh` / `coverage-ts.sh` hold the coverage floors; `verify-ts.sh` typechecks generated fixture output under the consumer compiler-flag matrix — `strict` plus `noUncheckedIndexedAccess`, `noUnusedLocals`, `noUnusedParameters`, `noImplicitOverride` and `exactOptionalPropertyTypes` off and on, because the output has to compile in your project, not ours (run `cargo build` first); `consume-gate.sh` proves generated clients resolve, bundle, tree-shake, and run as consumed artifacts; `allocs-gate.sh` catches drift in the per-stage allocation counters. `auth-gate.sh`, `msw-gate.sh`, `streaming-gate.sh`, `tanstack-gate.sh`, `transform-gate.sh`, `validators-gate.sh` and `zod-gate.sh` check the SHA-256 of each artifact's frozen test vectors — those were authored from the contract before the implementation existed, so a mismatch means the freeze was broken. `client-size.sh` reports emitted per-operation client sizes without enforcing a ceiling.
 
 ## Roadmap
 

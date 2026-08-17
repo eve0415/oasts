@@ -1,8 +1,6 @@
 # This Nimbus docs site
 
-Astro-based docs.
-The `nimbus-docs` package handles content schemas, sidebar/TOC, MDX→markdown, build hooks, and the `nimbus` CLI.
-Everything in `src/` is yours to edit.
+Astro-based docs. The `nimbus-docs` package handles content schemas, sidebar/TOC, MDX→markdown, build hooks, and the `nimbus` CLI. Everything in `src/` is yours to edit.
 
 ## File layout
 
@@ -33,8 +31,7 @@ Cloudflare deploys also have `wrangler.jsonc` at the project root.
 
 ## Writing docs
 
-Frontmatter validates against `docsSchema` (`nimbus-docs/schemas`).
-Required: `title`.
+Frontmatter validates against `docsSchema` (`nimbus-docs/schemas`). Required: `title`.
 
 ```mdx
 ---
@@ -73,19 +70,15 @@ List installable items: `pnpm exec nimbus-docs list`.
 
 ## Audit this site
 
-Start with `pnpm exec nimbus-docs check --json`.
-It runs the environment, structural, authoring, and type checks build-free — config validity, `site` placeholder, route collisions, MDX component resolution, the lint rules, and a `tsc` type-check — and returns three top-level signals plus per-scope detail:
+Start with `pnpm exec nimbus-docs check --json`. It runs the environment, structural, authoring, and type checks build-free — config validity, `site` placeholder, route collisions, MDX component resolution, the lint rules, and a `tsc` type-check — and returns three top-level signals plus per-scope detail:
 
 - **`status`** (`passed` | `failed` | `partial`) and **`readiness`** (`buildable` | `blocked` | `unknown`) are the primary signals. `status` is the whole-run verdict; `readiness` answers "does env + structure say it builds?". `ok` (=== zero errors) is kept for back-compat only.
 - **`findings[{scope,code,severity,file,line,message,fixable,fix}]`** are problems we evaluated. Apply each `fix` (or `check --fix`).
 - **`scopes[].notes[{code,reason,requiresBuild?,requiresInput?}]`** are checks we *couldn't* evaluate yet (e.g. types before a build). A note is never a finding and never carries a `fix` — you resolve it by making the missing thing exist (usually a build), not by `--fix`. `summary.notes` counts them.
 
-Loop terminates on `status !== "failed" && summary.fixable === 0` — a `partial` run with nothing left to fix is a **stop** (optionally build, then re-check), not a `--fix` retry.
-Exit is `1` only when `status` is `"failed"`.
-For full coverage (types + link-checking) run a build first, then `check` again.
+Loop terminates on `status !== "failed" && summary.fixable === 0` — a `partial` run with nothing left to fix is a **stop** (optionally build, then re-check), not a `--fix` retry. Exit is `1` only when `status` is `"failed"`. For full coverage (types + link-checking) run a build first, then `check` again.
 
-Then walk the categories below for what `check` doesn't cover yet — route-file existence, registry hygiene, the AI surface, post-build search, and Cloudflare config.
-Emit findings as:
+Then walk the categories below for what `check` doesn't cover yet — route-file existence, registry hygiene, the AI surface, post-build search, and Cloudflare config. Emit findings as:
 
 ```
 - [error|warn|info] FILE:LINE — what + why + fix.
