@@ -46,7 +46,7 @@ export interface Pet {
 
 Turn on the client artifact and every operation becomes a typed call:
 
-```yaml title="oasts.yaml" {4-6}
+```yaml title="oasts.yaml" {5-11}
 schemaVersion: 1
 input:
   path: ./openapi.yaml
@@ -54,6 +54,9 @@ output: ./generated
 artifacts:
   types: true
   client: true
+validation:
+  engine: "off"
+  unchecked: allow
 ```
 
 ```ts
