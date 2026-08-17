@@ -1,0 +1,79 @@
+openapi: 3.1.0
+info:
+  title: Documentation snippets
+  version: 1.0.0
+servers:
+  - url: https://example.test
+paths:
+  /pets/{petId}:
+    parameters:
+      - name: petId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getPet
+      tags: [pets]
+      responses:
+        "200":
+          description: A pet.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Pet" }
+    delete:
+      operationId: deletePet
+      tags: [stores]
+      responses:
+        "204": { description: Deleted. }
+  /foo_bar:
+    get:
+      operationId: getFooBar
+      responses:
+        "204": { description: Found. }
+  /callbacks:
+    post:
+      operationId: registerCallback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [callbackUrl]
+              properties:
+                callbackUrl: { type: string, format: uri }
+      callbacks:
+        onData:
+          '{$request.body#/callbackUrl}':
+            post:
+              operationId: receiveCallbackData
+              responses:
+                "204": { description: Received. }
+      responses:
+        "204": { description: Registered. }
+webhooks:
+  pet.created:
+    post:
+      operationId: petCreated
+      responses:
+        "204": { description: Received. }
+components:
+  schemas:
+    Pet:
+      type: object
+      properties:
+        createdAt: { type: string, format: date-time }
+        birthday: { type: string, format: date }
+    Tick:
+      type: object
+      properties:
+        value: { type: integer }
+  securitySchemes:
+    headerKey: { type: apiKey, in: header, name: X-API-Key }
+    oauthFlow:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://example.test/token
+          scopes: { scope.a: Example scope. }
+    basicAuth: { type: http, scheme: basic }
