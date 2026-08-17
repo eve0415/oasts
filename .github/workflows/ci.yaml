@@ -261,6 +261,43 @@ jobs:
       - name: Consume gate
         run: scripts/consume-gate.sh
 
+  # www/ is its own pnpm workspace with its own lockfile, so it installs separately.
+  docs:
+    name: docs site
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
+      - name: Install
+        working-directory: www
+        run: pnpm install --frozen-lockfile
+
+      # Build first: nimbus/internal-link resolves against .nimbus/routes.json, which
+      # is materialized at astro:build:done. Linting before a build skips every link
+      # and still reports clean.
+      - name: Build
+        working-directory: www
+        run: pnpm build
+
+      - name: Lint docs
+        working-directory: www
+        run: pnpm lint:docs
+
+      - name: Typecheck
+        working-directory: www
+        run: pnpm typecheck
+
   workflows:
     name: workflow audit
     runs-on: ubuntu-24.04-arm
@@ -365,6 +402,7 @@ jobs:
       - verify-ts
       - consume
       - coverage
+      - docs
       - workflows
       - wasm
     permissions:
