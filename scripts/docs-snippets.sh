@@ -26,7 +26,7 @@ work=$(mktemp -d)
 mkdir -p "$work/extracted"
 metadata="$work/snippets.tsv"
 
-mapfile -t pages < <(rg --files www/src/content/docs -g '*.mdx' | sort)
+mapfile -t pages < <(find www/src/content/docs -type f -name '*.mdx' | sort)
 if ((${#pages[@]} == 0)); then
   echo "docs-snippets: no MDX pages found" >&2
   exit 1
