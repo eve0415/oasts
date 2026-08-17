@@ -14,7 +14,8 @@
 
 ## Why oasts
 
-Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtime dependency into your bundle, or approximates the parts of the spec that are hard to get right. oasts is a compiler, not a platform:
+Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtime dependency into your bundle, or approximates the parts of the spec that are hard to get right.
+oasts is a compiler, not a platform:
 
 - **Failure-complete result types.** Every call returns a discriminated union covering documented responses, undocumented HTTP responses, network failures, and decode failures — not just the 2xx happy path. Exhaustive `switch` over an API call is a type error away from correct.
 - **Deterministic, byte-identical output.** Same input, same config, same version ⇒ the same bytes on every machine and OS. Generated code is meant to be committed and reviewed; `--check` makes drift a CI failure.
@@ -42,7 +43,9 @@ Most OpenAPI-to-TypeScript tooling is either in maintenance mode, drags a runtim
 pnpm add -D @oasts/cli
 ```
 
-The package is `@oasts/cli`; the command it installs is `oasts`. Node 24 or newer. Drop an `oasts.yaml` next to your spec:
+The package is `@oasts/cli`; the command it installs is `oasts`.
+Node 24 or newer.
+Drop an `oasts.yaml` next to your spec:
 
 ```yaml
 schemaVersion: 1
@@ -103,7 +106,9 @@ switch (result.outcome) {
 
 An exact declared status is a number literal, a range or `default` key and every failure tag a string literal — the two never overlap, so `case 200:` can never also match `"4XX"`.
 
-Every operation also gets a `getPetShowcaseOrThrow` companion for the call sites where a failure is not worth branching on: it resolves to the matched success arm's `{ data, meta }` and throws `ApiError` otherwise, with the whole failed result preserved on `error.result`. Set `client.aggregate: true` and both forms are also re-exported from `generated/client/api.ts`, if you would rather import one object than one module per operation. It is off by default, because the aggregate names every operation and a bundler cannot drop the ones you never call.
+Every operation also gets a `getPetShowcaseOrThrow` companion for the call sites where a failure is not worth branching on: it resolves to the matched success arm's `{ data, meta }` and throws `ApiError` otherwise, with the whole failed result preserved on `error.result`.
+Set `client.aggregate: true` and both forms are also re-exported from `generated/client/api.ts`, if you would rather import one object than one module per operation.
+It is off by default, because the aggregate names every operation and a bundler cannot drop the ones you never call.
 
 In CI, fail on drift instead of writing files:
 
@@ -113,9 +118,8 @@ pnpm exec oasts generate --check
 
 ## MSW handlers
 
-Enable the artifact and every operation gets a typed handler factory next to your types. Handlers
-mock the server side, so they import your generated types and a small local helper — never the
-client, its transport, or a validation engine.
+Enable the artifact and every operation gets a typed handler factory next to your types.
+Handlers mock the server side, so they import your generated types and a small local helper — never the client, its transport, or a validation engine.
 
 ```yaml
 artifacts:
@@ -138,27 +142,21 @@ const server = setupServer(
 );
 ```
 
-`respond` is the whole surface, and it is checked against the document: `match` picks a declared
-response key, and `status`, `contentType` and `body` have to agree with what that key declares.
-Responding `404` from an operation that documents no `4XX`, or handing a `text/plain` arm a JSON
-object, is a compile error rather than a mock that quietly lies. A response the document declares
-with no content takes `respond({ match, status })` and nothing else — passing even
-`body: undefined` is rejected, under `exactOptionalPropertyTypes` either way.
+`respond` is the whole surface, and it is checked against the document: `match` picks a declared response key, and `status`, `contentType` and `body` have to agree with what that key declares.
+Responding `404` from an operation that documents no `4XX`, or handing a `text/plain` arm a JSON object, is a compile error rather than a mock that quietly lies.
+A response the document declares with no content takes `respond({ match, status })` and nothing else — passing even `body: undefined` is rejected, under `exactOptionalPropertyTypes` either way.
 
-Request values arrive **decoded**, not as the raw strings MSW hands a hand-written handler. A path
-parameter documented as an integer is a `number`; an array query parameter is an array, whichever
-`style`/`explode` the document declares. That is the same serialization matrix the client encodes
-with, run backwards.
+Request values arrive **decoded**, not as the raw strings MSW hands a hand-written handler.
+A path parameter documented as an integer is a `number`; an array query parameter is an array, whichever `style`/`explode` the document declares.
+That is the same serialization matrix the client encodes with, run backwards.
 
-**oasts emits no mock data.** There is no faker, no seeded generator, and no placeholder body — you
-write the data, or you do not get one. That is a deliberate trade: every generator that synthesizes
-bodies does it through faker, where recursive schemas overflow the stack and seeding still does not
-make values stable across a faker upgrade. A typed slot you fill is worth more than a plausible
-body nobody reviewed.
+**oasts emits no mock data.**
+There is no faker, no seeded generator, and no placeholder body — you write the data, or you do not get one.
+That is a deliberate trade: every generator that synthesizes bodies does it through faker, where recursive schemas overflow the stack and seeding still does not make values stable across a faker upgrade.
+A typed slot you fill is worth more than a plausible body nobody reviewed.
 
-Everything you already know about MSW keeps working. Returning nothing falls through to the next
-handler, `passthrough()` performs the request for real, and a generator resolver answers a
-different branch per call:
+Everything you already know about MSW keeps working.
+Returning nothing falls through to the next handler, `passthrough()` performs the request for real, and a generator resolver answers a different branch per call:
 
 ```ts
 server.use(
@@ -171,15 +169,10 @@ server.use(
 
 Two things worth knowing:
 
-- **Origin is enforced.** The matcher is built from the operation's server URL, so two APIs mocked
-  in one suite never answer for each other. Pass `{ baseUrl }` to point a handler somewhere else.
-- **MSW resolves first match wins**, and a parameterized path shadows a static sibling — put
-  `/pets/mine` ahead of `/pets/{petId}` in your handler array. Registering a handler through
-  `server.use()` in a test always wins, because MSW prepends it.
+- **Origin is enforced.** The matcher is built from the operation's server URL, so two APIs mocked in one suite never answer for each other. Pass `{ baseUrl }` to point a handler somewhere else.
+- **MSW resolves first match wins**, and a parameterized path shadows a static sibling — put `/pets/mine` ahead of `/pets/{petId}` in your handler array. Registering a handler through `server.use()` in a test always wins, because MSW prepends it.
 
-If you would rather write handlers by hand, the artifact also emits a `paths` type that
-[openapi-msw](https://github.com/christoph-fricke/openapi-msw) accepts, so both styles work against
-the same generated output:
+If you would rather write handlers by hand, the artifact also emits a `paths` type that [openapi-msw](https://github.com/christoph-fricke/openapi-msw) accepts, so both styles work against the same generated output:
 
 ```ts
 import { createOpenApiHttp } from "openapi-msw";
@@ -189,17 +182,13 @@ const http = createOpenApiHttp<paths>();
 const handler = http.get("/pets/{petId}", ({ response }) => response("200").json(pet));
 ```
 
-An operation MSW cannot mock — a path its matcher cannot express, a parameter whose wire form has no
-unique inverse — gets no handler and a warning naming it, rather than a handler that silently never
-matches, which otherwise surfaces as some unrelated test's unhandled-request warning. The rest of
-the document still generates: one operation the mock cannot express should not cost you the others.
+An operation MSW cannot mock — a path its matcher cannot express, a parameter whose wire form has no unique inverse — gets no handler and a warning naming it, rather than a handler that silently never matches, which otherwise surfaces as some unrelated test's unhandled-request warning.
+The rest of the document still generates: one operation the mock cannot express should not cost you the others.
 
 ## TanStack Query
 
-Enable the artifact and every operation gets a descriptor — a plain `{ queryKey, queryFn }` or
-`{ mutationKey, mutationFn }` object you spread into whatever adapter you already use. No hooks, no
-peer dependency, no React context to carry the transport: generated code imports nothing from
-TanStack, so the same descriptor works in React, Solid, Svelte, a route loader, or a prefetch.
+Enable the artifact and every operation gets a descriptor — a plain `{ queryKey, queryFn }` or `{ mutationKey, mutationFn }` object you spread into whatever adapter you already use.
+No hooks, no peer dependency, no React context to carry the transport: generated code imports nothing from TanStack, so the same descriptor works in React, Solid, Svelte, a route loader, or a prefetch.
 
 ```yaml
 artifacts:
@@ -215,9 +204,8 @@ import { getPetQuery } from "./generated/tanstack/operations/getpet.js";
 const pet = useQuery(getPetQuery(transport, { path: { petId } }));
 ```
 
-`queryFn` resolves the response payload, so `pet.data` is your `Pet` — not an envelope you have to
-unwrap twice. Errors reject with the typed `ApiError` for that operation, and each module exports
-`{Operation}QueryKey`, `{Operation}QueryData` and `{Operation}QueryError` so you can name them.
+`queryFn` resolves the response payload, so `pet.data` is your `Pet` — not an envelope you have to unwrap twice.
+Errors reject with the typed `ApiError` for that operation, and each module exports `{Operation}QueryKey`, `{Operation}QueryData` and `{Operation}QueryError` so you can name them.
 
 ### Keys are hierarchical
 
@@ -231,18 +219,14 @@ queryClient.setQueryDefaults(apiPetsAll, { staleTime: 30_000 });
 keys.pets.byPetId.all(petId);                                 // everything under one pet
 ```
 
-A literal path segment contributes a string and a parameter contributes a single-key object, so
-`/pets/mine` and `/pets/{petId}` with `petId = "mine"` are different cache entries at every prefix
-depth — they cannot be confused the way a template-string key can.
+A literal path segment contributes a string and a parameter contributes a single-key object, so `/pets/mine` and `/pets/{petId}` with `petId = "mine"` are different cache entries at every prefix depth — they cannot be confused the way a template-string key can.
 
-Every path node is also exported as a flat binding (`apiPetsAll`, `apiPetsByPetId`). Operation
-modules import one leaf, so bundling a single descriptor does not drag in the rest of the spec's
-key data; import the composed `keys` object when you want the whole tree.
+Every path node is also exported as a flat binding (`apiPetsAll`, `apiPetsByPetId`).
+Operation modules import one leaf, so bundling a single descriptor does not drag in the rest of the spec's key data; import the composed `keys` object when you want the whole tree.
 
 ### Invalidating after a mutation
 
-Each mutation exports a companion that takes the same input and returns the keys it structurally
-affects, broadest first:
+Each mutation exports a companion that takes the same input and returns the keys it structurally affects, broadest first:
 
 ```ts
 import { updatePetMutation, updatePetMutationAffects } from "./generated/tanstack/operations/updatepet.js";
@@ -257,33 +241,27 @@ useMutation({
 });
 ```
 
-It takes the input, so it always has the path parameters it needs. It is a structural derivation
-from the path template, never a claim about what your API means — compose it with what you know.
+It takes the input, so it always has the path parameters it needs.
+It is a structural derivation from the path template, never a claim about what your API means — compose it with what you know.
 
-These are **prefix** keys. A query that carried query, header or cookie input has those appended as
-a further key element, so `exact: true` against the entity entry matches only the unfiltered query —
-invalidate without it to catch every filtered variant of the same resource.
+These are **prefix** keys.
+A query that carried query, header or cookie input has those appended as a further key element, so `exact: true` against the entity entry matches only the unfiltered query — invalidate without it to catch every filtered variant of the same resource.
 
 ### What does not get a query descriptor
 
-A read gets one only when **every** documented success response carries a body. A `HEAD`, a 204-only
-`GET`, and a `GET` returning 200 *or* 204 all fail that — the last one is the easy one to miss,
-because it only resolves `undefined` on the days the server picks the 204. TanStack rejects a
-`queryFn` that resolves `undefined`, so each of these emits no descriptor and a warning naming the
-operation, rather than a descriptor that fails at runtime. Non-reads are unaffected: a 204 `DELETE`
-gets a mutation descriptor, because mutations may resolve `undefined`.
+A read gets one only when **every** documented success response carries a body.
+A `HEAD`, a 204-only `GET`, and a `GET` returning 200 *or* 204 all fail that — the last one is the easy one to miss, because it only resolves `undefined` on the days the server picks the 204.
+TanStack rejects a `queryFn` that resolves `undefined`, so each of these emits no descriptor and a warning naming the operation, rather than a descriptor that fails at runtime.
+Non-reads are unaffected: a 204 `DELETE` gets a mutation descriptor, because mutations may resolve `undefined`.
 
-Infinite queries are not generated either. OpenAPI has no pagination vocabulary, so any such support
-would be a guess about your API that fails silently at runtime; write `infiniteQueryOptions` by hand
-over the same call.
+Infinite queries are not generated either.
+OpenAPI has no pagination vocabulary, so any such support would be a guess about your API that fails silently at runtime; write `infiniteQueryOptions` by hand over the same call.
 
 ### When two paths would fight over a name
 
-Key bindings are derived from path text, so `/foo-bar` and `/foo_bar` want the same name — and so do
-`/foo/bar` and `/foo-bar`, a segment named `all`, and anything that normalizes to a name the
-generated module already uses. Every one of these is refused at generation with the two paths named,
-never resolved by a compiler-invented suffix that would shift under you the next time the document
-changes. `naming.overrides.pathSegments` is the way out, keyed by the raw segment text:
+Key bindings are derived from path text, so `/foo-bar` and `/foo_bar` want the same name — and so do `/foo/bar` and `/foo-bar`, a segment named `all`, and anything that normalizes to a name the generated module already uses.
+Every one of these is refused at generation with the two paths named, never resolved by a compiler-invented suffix that would shift under you the next time the document changes.
+`naming.overrides.pathSegments` is the way out, keyed by the raw segment text:
 
 ```yaml
 naming:
@@ -304,11 +282,13 @@ naming:
 | Deterministic committed output | ✅ byte-identical, `--check` gated | — | — | — |
 | Toolchain | native binary via npm | Node | Node | Java |
 
-Performance is measured, not promised: the in-repo benchmark harness compiles GitHub's full OpenAPI spec to types in ~80 ms — warm p50 of end-to-end `oasts generate` runs on the reference container — with every run gated on repeatability. Reproduce it with `cargo run -p oasts-bench` — the harness, corpus manifest, and recorded baseline live in [`bench/`](./bench).
+Performance is measured, not promised: the in-repo benchmark harness compiles GitHub's full OpenAPI spec to types in ~80 ms — warm p50 of end-to-end `oasts generate` runs on the reference container — with every run gated on repeatability.
+Reproduce it with `cargo run -p oasts-bench` — the harness, corpus manifest, and recorded baseline live in [`bench/`](./bench).
 
 ## Configuration
 
-`oasts.yaml` (or `.json`) is validated against a published JSON Schema, so typos fail loudly with a rule ID instead of silently doing nothing. A typed TypeScript config is supported too (`oasts.config.ts`).
+`oasts.yaml` (or `.json`) is validated against a published JSON Schema, so typos fail loudly with a rule ID instead of silently doing nothing.
+A typed TypeScript config is supported too (`oasts.config.ts`).
 
 ```yaml
 schemaVersion: 1
@@ -330,7 +310,8 @@ validation:
 
 ### Output layout
 
-Each artifact gets its own directory under `output`, named after the artifact. Rename or nest any of them and the imports between artifacts follow:
+Each artifact gets its own directory under `output`, named after the artifact.
+Rename or nest any of them and the imports between artifacts follow:
 
 ```yaml
 artifacts:
@@ -357,7 +338,8 @@ export type Pet = Cat | Dog;
 export type Pet = (Cat & { petType: "feline" }) | (Dog & { petType: "canine" });
 ```
 
-`types.integer: bigint` maps `format: int64` to `bigint` instead of `number`, so values past 2^53 survive the round trip. It converts at the client boundary, so it needs the client artifact:
+`types.integer: bigint` maps `format: int64` to `bigint` instead of `number`, so values past 2^53 survive the round trip.
+It converts at the client boundary, so it needs the client artifact:
 
 ```ts
 // number (default)      cents: number;
@@ -378,22 +360,19 @@ types:
   date: temporal      # string | temporal
 ```
 
-`dateTime: date` gives you `Date`, `dateTime: temporal` gives you `Temporal.Instant`, and
-`date: temporal` gives you `Temporal.PlainDate`. The wire grammar is RFC 3339 and is checked field
-by field rather than handed to `new Date` or `Temporal.Instant.from`, both of which accept more than
-the contract does.
+`dateTime: date` gives you `Date`, `dateTime: temporal` gives you `Temporal.Instant`, and `date: temporal` gives you `Temporal.PlainDate`.
+The wire grammar is RFC 3339 and is checked field by field rather than handed to `new Date` or `Temporal.Instant.from`, both of which accept more than the contract does.
 
-Conversion is unconditional and ordered: a request is converted before validation and before
-serialization, a response after decoding, so validators only ever observe wire values. A value the
-wire cannot represent is a `request-transform` result with nothing sent; one the application cannot
-represent is a `response-transform` result. Neither throws.
+Conversion is unconditional and ordered: a request is converted before validation and before serialization, a response after decoding, so validators only ever observe wire values.
+A value the wire cannot represent is a `request-transform` result with nothing sent; one the application cannot represent is a `response-transform` result.
+Neither throws.
 
-The representations need the client artifact — the codecs are emitted under it and only run at its
-pipeline positions.
+The representations need the client artifact — the codecs are emitted under it and only run at its pipeline positions.
 
 ### Zod flavor
 
-The zod artifact imports classic `zod` by default. Set `zod.flavor: mini` to import `zod/mini` instead — the tree-shakable entry point, same package, same `^4.4.0` peer range, no extra dependency.
+The zod artifact imports classic `zod` by default.
+Set `zod.flavor: mini` to import `zod/mini` instead — the tree-shakable entry point, same package, same `^4.4.0` peer range, no extra dependency.
 
 ```yaml
 artifacts:
@@ -403,7 +382,9 @@ zod:
   flavor: mini
 ```
 
-Both flavors share one parsing core and are held to the same conformance vectors, so verdicts and parsed values are identical. What changes is what your bundler can drop. Each row below is one esbuild bundle over the named entry points from the GitHub spec's generated artifact, minified, gzipped:
+Both flavors share one parsing core and are held to the same conformance vectors, so verdicts and parsed values are identical.
+What changes is what your bundler can drop.
+Each row below is one esbuild bundle over the named entry points from the GitHub spec's generated artifact, minified, gzipped:
 
 | bundle | `zod` | `zod/mini` |
 | --- | --- | --- |
@@ -417,7 +398,8 @@ Pick classic if you hand the emitted schemas to something that expects a classic
 
 ## Determinism
 
-Generated output is a build artifact you can commit: given the same input document, config, and oasts version, output is byte-identical across machines and operating systems. The repo's own gates generate everything twice and diff the bytes; `oasts generate --check` gives your CI the same guarantee.
+Generated output is a build artifact you can commit: given the same input document, config, and oasts version, output is byte-identical across machines and operating systems.
+The repo's own gates generate everything twice and diff the bytes; `oasts generate --check` gives your CI the same guarantee.
 
 That also means oasts never reformats your project and you never reformat oasts's output — emitted code has one canonical shape.
 
@@ -432,12 +414,14 @@ pnpm -C packages/oasts build:napi       # build the native Node binding
 pnpm -C packages/oasts build            # bundle the npm package
 ```
 
-`scripts/*.sh` are the gates. `gate.sh` runs lint and tests; `coverage.sh` / `coverage-ts.sh` hold the coverage floors; `verify-ts.sh` typechecks generated fixture output under the consumer compiler-flag matrix — `strict` plus `noUncheckedIndexedAccess`, `noUnusedLocals`, `noUnusedParameters`, `noImplicitOverride` and `exactOptionalPropertyTypes` off and on, because the output has to compile in your project, not ours (run `cargo build` first); `consume-gate.sh` proves generated clients resolve, bundle, tree-shake, and run as consumed artifacts; `allocs-gate.sh` catches drift in the per-stage allocation counters. `auth-gate.sh`, `msw-gate.sh`, `streaming-gate.sh`, `tanstack-gate.sh`, `transform-gate.sh`, `validators-gate.sh` and `zod-gate.sh` check the SHA-256 of each artifact's frozen test vectors — those were authored from the contract before the implementation existed, so a mismatch means the freeze was broken. `client-size.sh` reports emitted per-operation client sizes without enforcing a ceiling.
+`scripts/*.sh` are the gates.
+`gate.sh` runs lint and tests; `coverage.sh` / `coverage-ts.sh` hold the coverage floors; `verify-ts.sh` typechecks generated fixture output under the consumer compiler-flag matrix — `strict` plus `noUncheckedIndexedAccess`, `noUnusedLocals`, `noUnusedParameters`, `noImplicitOverride` and `exactOptionalPropertyTypes` off and on, because the output has to compile in your project, not ours (run `cargo build` first); `consume-gate.sh` proves generated clients resolve, bundle, tree-shake, and run as consumed artifacts; `allocs-gate.sh` catches drift in the per-stage allocation counters.
+`auth-gate.sh`, `msw-gate.sh`, `streaming-gate.sh`, `tanstack-gate.sh`, `transform-gate.sh`, `validators-gate.sh` and `zod-gate.sh` check the SHA-256 of each artifact's frozen test vectors — those were authored from the contract before the implementation existed, so a mismatch means the freeze was broken.
+`client-size.sh` reports emitted per-operation client sizes without enforcing a ceiling.
 
 ## Roadmap
 
-- Infinite-query support for the TanStack artifact, once there is a way to say where the cursor
-  lives that is not a guess
+- Infinite-query support for the TanStack artifact, once there is a way to say where the cursor lives that is not a guess
 
 ## License
 
