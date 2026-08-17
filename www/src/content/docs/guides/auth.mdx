@@ -6,8 +6,7 @@ sidebar:
 ---
 
 An operation's `security` requirements are not documentation in oasts — they are part of its type.
-Configure the schemes on the transport and calls type-check; leave one out and the calls that need
-it stop compiling.
+Configure the schemes on the transport and calls type-check; leave one out and the calls that need it stop compiling.
 
 ```ts
 const transport = createTransport({
@@ -23,8 +22,7 @@ await adminPurge(transport, {});               // ❌ needs adminKey — a compi
 
 ## Providers
 
-Each key is a scheme name from the document's `securitySchemes`; each value is called when a request
-needs that scheme:
+Each key is a scheme name from the document's `securitySchemes`; each value is called when a request needs that scheme:
 
 ```ts
 type AuthProvider = (context: AuthContext) => AuthCredential | null | Promise<AuthCredential | null>;
@@ -45,10 +43,8 @@ auth: {
 }
 ```
 
-Returning `null` means "I cannot satisfy this scheme right now" — oasts then tries the next security
-alternative the operation declares, and if none is left the call comes back as an
-[`auth` result](/concepts/results#request-phase-failures) with `triedAlternatives` naming the sets it
-attempted. Credential values are never in that list.
+Returning `null` means "I cannot satisfy this scheme right now" — oasts then tries the next security alternative the operation declares, and if none is left the call comes back as an [`auth` result](/concepts/results#request-phase-failures) with `triedAlternatives` naming the sets it attempted.
+Credential values are never in that list.
 
 ## The credential each scheme kind wants
 
@@ -65,9 +61,8 @@ The generated type tells you, per scheme, and the compiler enforces it:
 
 <Aside type="note" title="Why two symbols">
   A cookie credential and a TLS client certificate are not values a `fetch` caller can attach.
-  Cookies are set by the environment and TLS happens below HTTP. The two symbols are how an
-  operation says "this is satisfied ambiently" — you acknowledge it at the type level, and supply
-  the actual credential through your cookie jar or a [custom `fetch`](/guides/transport#a-custom-fetch).
+  Cookies are set by the environment and TLS happens below HTTP.
+  The two symbols are how an operation says "this is satisfied ambiently" — you acknowledge it at the type level, and supply the actual credential through your cookie jar or a [custom `fetch`](/guides/transport#a-custom-fetch).
 </Aside>
 
 ## AND, OR, and what the signature does
@@ -83,8 +78,8 @@ security:
   - oauthFlow: [scope.a]
 ```
 
-Configure **either** on the transport and the call needs nothing extra. Configure neither and you
-must supply one at the call site:
+Configure **either** on the transport and the call needs nothing extra.
+Configure neither and you must supply one at the call site:
 
 ```ts
 await orHeaderOauth(transport, {}, { auth: { headerKey: "k-123" } });
@@ -99,8 +94,8 @@ security:
     headerKey: []
 ```
 
-Both are required. Configure one on the transport and the signature asks only for the other — the
-generated type subtracts what you already have:
+Both are required.
+Configure one on the transport and the signature asks only for the other — the generated type subtracts what you already have:
 
 ```ts
 await andBasicHeader(transport, {}, { auth: { headerKey: "k-123" } });
@@ -108,10 +103,8 @@ await andBasicHeader(transport, {}, { auth: { headerKey: "k-123" } });
   </TabItem>
 </Tabs>
 
-An operation whose `security` includes the empty requirement `{}` never asks for credentials in its
-signature — but at runtime a configured alternative still wins, and the anonymous path is taken only
-when nothing was configured for it or the caller opts in. One with `security: []` needs nothing at
-all, at either level.
+An operation whose `security` includes the empty requirement `{}` never asks for credentials in its signature — but at runtime a configured alternative still wins, and the anonymous path is taken only when nothing was configured for it or the caller opts in.
+One with `security: []` needs nothing at all, at either level.
 
 ## Per-call overrides
 
@@ -125,22 +118,19 @@ That is the shape for impersonation and for tests.
 
 ### `"anonymous"` is permission, not a way to strip credentials
 
-`CallOptions.auth` also accepts the literal `"anonymous"`. It does **not** send the request without
-credentials. Credentialed alternatives are still evaluated first and their providers still run; if
-one succeeds, the call goes out authenticated:
+`CallOptions.auth` also accepts the literal `"anonymous"`.
+It does **not** send the request without credentials.
+Credentialed alternatives are still evaluated first and their providers still run; if one succeeds, the call goes out authenticated:
 
 ```ts
 await getPet(transport, input, { auth: "anonymous" }); // still sends bearerAuth if configured
 ```
 
-The opt-in only changes the outcome for an operation whose `security` includes the empty requirement
-`{}`, where without it a provider returning `null` is an `auth` failure rather than a silent
-downgrade to anonymous.
+The opt-in only changes the outcome for an operation whose `security` includes the empty requirement `{}`, where without it a provider returning `null` is an `auth` failure rather than a silent downgrade to anonymous.
 
 <Aside type="caution">
-  There is no way to force a secured call out with no credentials. For a health check that must not
-  carry them, use a transport with no providers configured, or a per-call
-  [custom `fetch`](/guides/transport#a-custom-fetch).
+  There is no way to force a secured call out with no credentials.
+  For a health check that must not carry them, use a transport with no providers configured, or a per-call [custom `fetch`](/guides/transport#a-custom-fetch).
 </Aside>
 
 ## Compile time or call time
@@ -150,15 +140,13 @@ client:
   authEnforcement: types    # types | runtime
 ```
 
-`types` is the default: requirements are in the call signature, and an unsatisfied one is a compile
-error. `runtime` removes them from the signature, so every call takes plain `CallOptions`, and an
-unsatisfied requirement comes back as an `auth` result instead.
+`types` is the default: requirements are in the call signature, and an unsatisfied one is a compile error.
+`runtime` removes them from the signature, so every call takes plain `CallOptions`, and an unsatisfied requirement comes back as an `auth` result instead.
 
-Pick `runtime` when the set of configured schemes is genuinely not known statically — a multi-tenant
-client assembled from config, for instance. Pick `types` (or leave it) everywhere else: the whole
-point is finding out at build time.
+Pick `runtime` when the set of configured schemes is genuinely not known statically — a multi-tenant client assembled from config, for instance.
+Pick `types` (or leave it) everywhere else: the whole point is finding out at build time.
 
 <Aside type="tip">
-  Nothing about `runtime` weakens the check — the same alternatives are evaluated, in the same
-  order. It moves *when* you learn, not *whether*.
+  Nothing about `runtime` weakens the check — the same alternatives are evaluated, in the same order.
+  It moves *when* you learn, not *whether*.
 </Aside>

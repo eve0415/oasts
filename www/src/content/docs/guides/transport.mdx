@@ -5,7 +5,8 @@ sidebar:
   order: 1
 ---
 
-The transport is the one object every generated call takes. You build it once and pass it around:
+The transport is the one object every generated call takes.
+You build it once and pass it around:
 
 ```ts
 import { createTransport } from "./generated/runtime/transport.js";
@@ -16,8 +17,7 @@ const transport = createTransport({
 });
 ```
 
-It is frozen on construction and holds no mutable state, so it is safe to share across concurrent
-calls, share between modules, or create per request on a server.
+It is frozen on construction and holds no mutable state, so it is safe to share across concurrent calls, share between modules, or create per request on a server.
 
 ## The full shape
 
@@ -33,19 +33,14 @@ type TransportConfig<S extends string = never> = {
 };
 ```
 
-Whether `baseUrl` is optional or **required** depends on your config: with
-`client.baseUrl.source: runtime` the generated type demands it, and with `server` or `literal` the
-URL comes from the document or your config and `baseUrl` becomes an override. See
-[Configuration](/reference/configuration#client).
+Whether `baseUrl` is optional or **required** depends on your config: with `client.baseUrl.source: runtime` the generated type demands it, and with `server` or `literal` the URL comes from the document or your config and `baseUrl` becomes an override.
+See [Configuration](/reference/configuration#client).
 
-`baseUrl` must be an absolute URL — `createTransport` throws a `TypeError` otherwise, at construction
-rather than at the first call.
+`baseUrl` must be an absolute URL — `createTransport` throws a `TypeError` otherwise, at construction rather than at the first call.
 
 ## Server variables
 
-An OpenAPI server URL with `{variable}` placeholders is filled from `serverVariables`, and the
-generated type is narrowed to what your document actually declares — one member per server, with
-enums as literal unions:
+An OpenAPI server URL with `{variable}` placeholders is filled from `serverVariables`, and the generated type is narrowed to what your document actually declares — one member per server, with enums as literal unions:
 
 ```ts title="generated/runtime/transport.ts"
 serverVariables?: Record<string, never> | { version: "v1" | "v2" } | { region: string };
@@ -59,9 +54,8 @@ A variable you leave out falls back to the default the document declares for it,
 
 ## Middleware
 
-`onRequest` sees the final `Request` — after URL resolution, serialization and auth — and `onResponse`
-sees the `Response` before it is decoded. Return a replacement, or return nothing to keep the one you
-were given:
+`onRequest` sees the final `Request` — after URL resolution, serialization and auth — and `onResponse` sees the `Response` before it is decoded.
+Return a replacement, or return nothing to keep the one you were given:
 
 ```ts
 const logging: Middleware = {
@@ -99,10 +93,8 @@ type OperationContext = {
 ```
 
 <Aside type="caution">
-  A middleware that throws does not throw out of the call. It comes back as a
-  `request-middleware` or `response-middleware` [result](/concepts/results) carrying your error as
-  `cause` — so a broken interceptor is a branch you handle, not an exception from a call site that
-  documents itself as never throwing.
+  A middleware that throws does not throw out of the call.
+  It comes back as a `request-middleware` or `response-middleware` [result](/concepts/results) carrying your error as `cause` — so a broken interceptor is a branch you handle, not an exception from a call site that documents itself as never throwing.
 </Aside>
 
 ## A custom `fetch`
@@ -116,10 +108,8 @@ const transport = createTransport({
 });
 ```
 
-This is the seam for anything the Fetch API cannot express portably — an undici dispatcher, a proxy
-agent, mTLS client certificates, an instrumented client, or a stub in tests. The second parameter
-carries the non-standard `fetchOptions` keys you passed, so a Workers `cf` or a Next.js `next`
-reaches your dispatcher.
+This is the seam for anything the Fetch API cannot express portably — an undici dispatcher, a proxy agent, mTLS client certificates, an instrumented client, or a stub in tests.
+The second parameter carries the non-standard `fetchOptions` keys you passed, so a Workers `cf` or a Next.js `next` reaches your dispatcher.
 
 ## Per-call options
 
@@ -142,15 +132,11 @@ const result = await getPet(
 );
 ```
 
-`method`, `body`, `headers` and `signal` are excluded from `fetchOptions` because oasts owns them —
-they come from the document and from the options above. The ten standard `RequestInit` options
-(`cache`, `credentials`, `integrity`, `keepalive`, `mode`, `redirect`, `referrer`, `referrerPolicy`,
-`priority`, `duplex`) go on the `Request`. Any other key — Cloudflare Workers' `cf`, Next.js's
-`next` — is collected into an extensions object handed to `fetch` as its second argument, which is
-the parameter a [custom `fetch`](#a-custom-fetch) receives.
+`method`, `body`, `headers` and `signal` are excluded from `fetchOptions` because oasts owns them — they come from the document and from the options above.
+The ten standard `RequestInit` options (`cache`, `credentials`, `integrity`, `keepalive`, `mode`, `redirect`, `referrer`, `referrerPolicy`, `priority`, `duplex`) go on the `Request`.
+Any other key — Cloudflare Workers' `cf`, Next.js's `next` — is collected into an extensions object handed to `fetch` as its second argument, which is the parameter a [custom `fetch`](#a-custom-fetch) receives.
 
-Cancelling through `signal` produces an `aborted` or `response-aborted` result, distinct from
-`timeout`, so retry logic can tell "the caller changed their mind" from "the server was slow".
+Cancelling through `signal` produces an `aborted` or `response-aborted` result, distinct from `timeout`, so retry logic can tell "the caller changed their mind" from "the server was slow".
 
 ## Static fetch defaults
 
@@ -182,9 +168,7 @@ Each layer overwrites the one above it:
 7. Whatever `onRequest` middleware sets last.
 
 <Aside type="caution" title="Operation-owned headers are refused">
-  Setting `content-type`, a header an operation uses for credentials, or `accept` on an operation
-  that declares one — through either transport or per-call `headers` — throws a `TypeError` rather
-  than being silently overwritten at step 4, 5 or 6. Set the body's media type by choosing the request variant, and set credentials
-  through [auth](/guides/auth). Forbidden request headers (`proxy-*`, `sec-*`, and the rest the
-  Fetch standard reserves) are refused the same way, including when middleware adds them.
+  Setting `content-type`, a header an operation uses for credentials, or `accept` on an operation that declares one — through either transport or per-call `headers` — throws a `TypeError` rather than being silently overwritten at step 4, 5 or 6.
+  Set the body's media type by choosing the request variant, and set credentials through [auth](/guides/auth).
+  Forbidden request headers (`proxy-*`, `sec-*`, and the rest the Fetch standard reserves) are refused the same way, including when middleware adds them.
 </Aside>

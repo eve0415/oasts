@@ -11,9 +11,9 @@ artifacts:
   msw: true
 ```
 
-Every operation gets a typed handler factory next to your types. Handlers mock the server side, so
-they import your generated types and a small local helper — never the client, its transport, or a
-validation engine. Needs `msw` ^2.8.0 in your project.
+Every operation gets a typed handler factory next to your types.
+Handlers mock the server side, so they import your generated types and a small local helper — never the client, its transport, or a validation engine.
+Needs `msw` ^2.8.0 in your project.
 
 ```ts
 import { setupServer } from "msw/node";
@@ -32,34 +32,29 @@ const server = setupServer(
 
 ## `respond` is checked against the document
 
-`respond` is the whole surface. `match` picks a declared response key, and `status`, `contentType`
-and `body` have to agree with what that key declares. Responding `404` from an operation that
-documents no `4XX`, or handing a `text/plain` arm a JSON object, is a compile error rather than a
-mock that quietly lies.
+`respond` is the whole surface.
+`match` picks a declared response key, and `status`, `contentType` and `body` have to agree with what that key declares.
+Responding `404` from an operation that documents no `4XX`, or handing a `text/plain` arm a JSON object, is a compile error rather than a mock that quietly lies.
 
-A response the document declares with no content takes `respond({ match, status })` and nothing
-else — passing even `body: undefined` is rejected, under `exactOptionalPropertyTypes` either way.
+A response the document declares with no content takes `respond({ match, status })` and nothing else — passing even `body: undefined` is rejected, under `exactOptionalPropertyTypes` either way.
 
 ## Request values arrive decoded
 
-Not as the raw strings MSW hands a hand-written handler. A path parameter documented as an integer
-is a `number`; an array query parameter is an array, whichever `style`/`explode` the document
-declares. That is the same serialization matrix the [client](/artifacts/client) encodes with, run
-backwards.
+Not as the raw strings MSW hands a hand-written handler.
+A path parameter documented as an integer is a `number`; an array query parameter is an array, whichever `style`/`explode` the document declares.
+That is the same serialization matrix the [client](/artifacts/client) encodes with, run backwards.
 
 ## No mock data
 
-oasts emits none. There is no faker, no seeded generator, and no placeholder body — you write the
-data, or you do not get one.
+oasts emits none.
+There is no faker, no seeded generator, and no placeholder body — you write the data, or you do not get one.
 
-That is a deliberate trade: every generator that synthesizes bodies does it through faker, where
-recursive schemas overflow the stack and seeding still does not make values stable across a faker
-upgrade. A typed slot you fill is worth more than a plausible body nobody reviewed.
+That is a deliberate trade: every generator that synthesizes bodies does it through faker, where recursive schemas overflow the stack and seeding still does not make values stable across a faker upgrade.
+A typed slot you fill is worth more than a plausible body nobody reviewed.
 
 ## Everything you know about MSW still works
 
-Returning nothing falls through to the next handler, `passthrough()` performs the request for real,
-and a generator resolver answers a different branch per call:
+Returning nothing falls through to the next handler, `passthrough()` performs the request for real, and a generator resolver answers a different branch per call:
 
 ```ts
 server.use(
@@ -72,18 +67,12 @@ server.use(
 
 Two things worth knowing:
 
-- **Origin is enforced.** The matcher is built from the operation's server URL, so two APIs mocked
-  in one suite never answer for each other. Pass `{ baseUrl }` to point a handler somewhere else.
-  When the document declares no absolute server URL, `baseUrl` is required rather than an override.
-- **MSW resolves first match wins**, and a parameterized path shadows a static sibling — put
-  `/pets/mine` ahead of `/pets/{petId}` in your handler array. Registering a handler through
-  `server.use()` in a test always wins, because MSW prepends it.
+- **Origin is enforced.** The matcher is built from the operation's server URL, so two APIs mocked in one suite never answer for each other. Pass `{ baseUrl }` to point a handler somewhere else. When the document declares no absolute server URL, `baseUrl` is required rather than an override.
+- **MSW resolves first match wins**, and a parameterized path shadows a static sibling — put `/pets/mine` ahead of `/pets/{petId}` in your handler array. Registering a handler through `server.use()` in a test always wins, because MSW prepends it.
 
 ## Hand-written handlers, same output
 
-If you would rather write handlers yourself, the artifact also emits a `paths` type that
-[openapi-msw](https://github.com/christoph-fricke/openapi-msw) accepts, so both styles work against
-the same generated output:
+If you would rather write handlers yourself, the artifact also emits a `paths` type that [openapi-msw](https://github.com/christoph-fricke/openapi-msw) accepts, so both styles work against the same generated output:
 
 ```ts
 import { createOpenApiHttp } from "openapi-msw";
@@ -95,17 +84,9 @@ const handler = http.get("/pets/{petId}", ({ response }) => response("200").json
 
 ## When an operation cannot be mocked
 
-An operation MSW cannot express gets no handler and a warning naming it, rather than a handler that
-silently never matches (which otherwise surfaces as some unrelated test's unhandled-request
-warning). The reasons: a path literal containing `*`, which the matcher always reads as a wildcard;
-an HTTP method MSW exposes no factory for; a parameter or body whose wire form has no unique inverse
-(`allowReserved`, exploded `label` over a collection) or that this artifact cannot project back into
-its declared type (recursive or tuple schemas, `patternProperties`, or a date/int64 codec, which
-lives in the client output a handler never imports); and a streaming body, which has no buffered
-value in either direction.
+An operation MSW cannot express gets no handler and a warning naming it, rather than a handler that silently never matches (which otherwise surfaces as some unrelated test's unhandled-request warning).
+The reasons: a path literal containing `*`, which the matcher always reads as a wildcard; an HTTP method MSW exposes no factory for; a parameter or body whose wire form has no unique inverse (`allowReserved`, exploded `label` over a collection) or that this artifact cannot project back into its declared type (recursive or tuple schemas, `patternProperties`, or a date/int64 codec, which lives in the client output a handler never imports); and a streaming body, which has no buffered value in either direction.
 
-The rest of the document still generates: one operation the mock cannot express should not cost you
-the others. That holds for anything the *handler* cannot express. A response media oasts refuses
-outright — XML, an unnamed multipart part, a `text/*` whose schema admits no string — is an error
-rather than a warning, and [an error anywhere](/concepts/diagnostics) discards the whole document's
-output.
+The rest of the document still generates: one operation the mock cannot express should not cost you the others.
+That holds for anything the *handler* cannot express.
+A response media oasts refuses outright — XML, an unnamed multipart part, a `text/*` whose schema admits no string — is an error rather than a warning, and [an error anywhere](/concepts/diagnostics) discards the whole document's output.

@@ -5,8 +5,8 @@ sidebar:
   order: 5
 ---
 
-Most projects use a fraction of a vendor's API. A `filters` block narrows what gets generated along
-four axes:
+Most projects use a fraction of a vendor's API.
+A `filters` block narrows what gets generated along four axes:
 
 ```yaml title="oasts.yaml"
 filters:
@@ -18,18 +18,20 @@ filters:
     include: ["/^\\/pets\\/.*/"]
 ```
 
-Each axis takes `include` and `exclude` lists. A pattern is either **exact string equality** or a
-**slash-delimited regex** with an optional trailing `i` flag. Exclude beats include.
+Each axis takes `include` and `exclude` lists.
+A pattern is either **exact string equality** or a **slash-delimited regex** with an optional trailing `i` flag.
+Exclude beats include.
 
 <Aside type="caution" title="A regex matches the whole subject">
-  `"/^\\/pets/"` matches the path `/pets` and nothing else — not `/pets/{petId}`. Add `.*` when you
-  mean a prefix. A pattern that matches nothing is an `OASTS0262`, so this shows up as a failed
-  build rather than a smaller client.
+  `"/^\\/pets/"` matches the path `/pets` and nothing else — not `/pets/{petId}`.
+  Add `.*` when you mean a prefix.
+  A pattern that matches nothing is an `OASTS0262`, so this shows up as a failed build rather than a smaller client.
 </Aside>
 
 ## Unreachable schemas are dropped
 
-Component schemas nothing reaches are dropped by default. On Sentry's spec that is all 188 of them.
+Component schemas nothing reaches are dropped by default.
+On Sentry's spec that is all 188 of them.
 Keep them with:
 
 ```yaml title="oasts.yaml"
@@ -41,16 +43,14 @@ Deprecated operations are kept by default — set `deprecated: false` to drop th
 
 ## A filter that stops matching fails the build
 
-A pattern that matches nothing is an error, not a silent no-op — in either direction, `include` and
-`exclude` alike. So is a filter combination that would leave nothing to generate.
+A pattern that matches nothing is an error, not a silent no-op — in either direction, `include` and `exclude` alike.
+So is a filter combination that would leave nothing to generate.
 
-This is the point of the feature. The failure mode of every filter system is that the upstream
-document renames a tag, your pattern quietly matches zero operations, and your client shrinks
-without anyone noticing until a call site disappears. oasts refuses to generate rather than let that
-happen — you find out at build time, with the pattern named.
+This is the point of the feature.
+The failure mode of every filter system is that the upstream document renames a tag, your pattern quietly matches zero operations, and your client shrinks without anyone noticing until a call site disappears.
+oasts refuses to generate rather than let that happen — you find out at build time, with the pattern named.
 
 <Aside type="note">
-  Filters narrow every artifact together. Types, client, validators, mocks and query descriptors are
-  all derived from the same filtered model, so they cannot end up describing different subsets of
-  your API.
+  Filters narrow every artifact together.
+  Types, client, validators, mocks and query descriptors are all derived from the same filtered model, so they cannot end up describing different subsets of your API.
 </Aside>

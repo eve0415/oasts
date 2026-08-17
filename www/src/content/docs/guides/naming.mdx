@@ -7,9 +7,8 @@ sidebar:
 
 ## File names
 
-`naming.fileCase` controls the filename derived from an `operationId` or schema name. Word
-boundaries come from any non-alphanumeric character in the source name — `-`, `_`, `.`, `/` —
-**and never from case transitions**:
+`naming.fileCase` controls the filename derived from an `operationId` or schema name.
+Word boundaries come from any non-alphanumeric character in the source name — `-`, `_`, `.`, `/` — **and never from case transitions**:
 
 | `fileCase` | `get_pet_by_id` | `getPet` |
 | --- | --- | --- |
@@ -24,15 +23,12 @@ naming:
   fileCase: kebab
 ```
 
-`kebab` and `snake` lowercase the token; `camel` and `pascal` join the tokens and capitalize. So an
-already-camelCase `operationId` looks unchanged under `camel`/`preserve` and runs together under
-`kebab`/`snake` — `getPet` becomes `getpet.ts`, not `get-pet.ts`, because there is no separator to
-split on.
+`kebab` and `snake` lowercase the token; `camel` and `pascal` join the tokens and capitalize.
+So an already-camelCase `operationId` looks unchanged under `camel`/`preserve` and runs together under `kebab`/`snake` — `getPet` becomes `getpet.ts`, not `get-pet.ts`, because there is no separator to split on.
 
 <Aside type="caution">
-  Renaming the operation to introduce a separator moves the filename *and* the type names with it —
-  `operations: { getPet: get_pet }` gives you `get-pet.ts` and `Get_petRequest`. The override sets
-  one identifier and everything derives from it; it is not a filename-only knob.
+  Renaming the operation to introduce a separator moves the filename *and* the type names with it — `operations: { getPet: get_pet }` gives you `get-pet.ts` and `Get_petRequest`.
+  The override sets one identifier and everything derives from it; it is not a filename-only knob.
 </Aside>
 
 ## Identifiers
@@ -51,25 +47,23 @@ naming:
 ```
 
 <Aside type="note" title="Two settings are pinned">
-  `typeCase` accepts only `pascal` and `propertyCase` only `preserve`. Type names are TypeScript
-  identifiers, where PascalCase is the universal convention; **property names are wire names**, and
-  re-casing them would make the emitted type describe a payload your API does not send. They exist
-  in the schema so the surface can grow, and any other value is a config error today.
+  `typeCase` accepts only `pascal` and `propertyCase` only `preserve`.
+  Type names are TypeScript identifiers, where PascalCase is the universal convention; **property names are wire names**, and re-casing them would make the emitted type describe a payload your API does not send.
+  They exist in the schema so the surface can grow, and any other value is a config error today.
 </Aside>
 
 ## Collisions in names your document owns are refused
 
-Two schemas, operations or webhooks that normalize to the same identifier stop the build, with both
-offenders named. oasts never picks a winner for you.
+Two schemas, operations or webhooks that normalize to the same identifier stop the build, with both offenders named.
+oasts never picks a winner for you.
 
-The reason is ambiguity. A suffix like `Pet2` would attach to whichever of the two declarations the
-walk reached first, and nothing in your document says which one you meant it for. A refusal you
-resolve once, in `naming.overrides`, cannot move.
+The reason is ambiguity.
+A suffix like `Pet2` would attach to whichever of the two declarations the walk reached first, and nothing in your document says which one you meant it for.
+A refusal you resolve once, in `naming.overrides`, cannot move.
 
-Names the *compiler* invented are different. A request/response variant that collides with a
-declared component is re-emitted as `{Name}Body`, and a wire twin as `{Name}WireValue`, each with a
-warning saying so and generation continuing — your document owns its name, so the invented one
-yields. Only when that replacement is also taken is the document refused.
+Names the *compiler* invented are different.
+A request/response variant that collides with a declared component is re-emitted as `{Name}Body`, and a wire twin as `{Name}WireValue`, each with a warning saying so and generation continuing — your document owns its name, so the invented one yields.
+Only when that replacement is also taken is the document refused.
 
 ## Overrides
 
@@ -92,17 +86,13 @@ naming:
       "workspace/vendor/openapi.yaml#/components/schemas/Pet": VendorPet
 ```
 
-`schemasBySource` is keyed by `<source_id>#<json_pointer>` and exists for the case two documents
-contribute a schema with the same name — the plain `schemas` key cannot tell them apart. A local
-`source_id` is `workspace/<path>` relative to the workspace root, or `allow/<n>/<path>` for a
-`local.allowPaths` root.
+`schemasBySource` is keyed by `<source_id>#<json_pointer>` and exists for the case two documents contribute a schema with the same name — the plain `schemas` key cannot tell them apart.
+A local `source_id` is `workspace/<path>` relative to the workspace root, or `allow/<n>/<path>` for a `local.allowPaths` root.
 
 <Aside type="caution">
-  An override that matches nothing is an error too — for `schemas`, `schemasBySource`, `operations`,
-  `webhooks` and `callbacks`, the same rule that makes filters fail loudly applies, and for the same
-  reason: a stale override is a rename you think is happening and is not. `pathSegments` is the
-  exception. Only the TanStack artifact consumes it, so a stale entry is an `OASTS6303` **warning**
-  raised there, and is silent entirely when that artifact is off.
+  An override that matches nothing is an error too — for `schemas`, `schemasBySource`, `operations`, `webhooks` and `callbacks`, the same rule that makes filters fail loudly applies, and for the same reason: a stale override is a rename you think is happening and is not.
+  `pathSegments` is the exception.
+  Only the TanStack artifact consumes it, so a stale entry is an `OASTS6303` **warning** raised there, and is silent entirely when that artifact is off.
 </Aside>
 
 ## Which collisions you might meet

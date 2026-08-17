@@ -5,7 +5,8 @@ sidebar:
   order: 0
 ---
 
-oasts is a compiler. It reads an OpenAPI 3.0 or 3.1 document and writes TypeScript you commit and review: per-operation types, a zero-dependency fetch client, Zod schemas, standalone validators, TanStack Query descriptors, and MSW handlers — all derived from one model, so they cannot disagree about your API.
+oasts is a compiler.
+It reads an OpenAPI 3.0 or 3.1 document and writes TypeScript you commit and review: per-operation types, a zero-dependency fetch client, Zod schemas, standalone validators, TanStack Query descriptors, and MSW handlers — all derived from one model, so they cannot disagree about your API.
 
 <Render file="install" />
 
@@ -13,22 +14,20 @@ oasts is a compiler. It reads an OpenAPI 3.0 or 3.1 document and writes TypeScri
 
 <CardGrid>
   <Card title="Failure-complete results" icon="ph:git-branch">
-    Every call returns a discriminated union covering documented responses, undocumented statuses,
-    network failures, and decode failures — not just the 2xx happy path. One `switch` reaches every
-    case, and exhaustiveness checking proves it.
+    Every call returns a discriminated union covering documented responses, undocumented statuses, network failures, and decode failures — not just the 2xx happy path.
+    One `switch` reaches every case, and exhaustiveness checking proves it.
   </Card>
   <Card title="Byte-identical output" icon="ph:fingerprint">
-    Same document bytes, same config, same version, same consumer `tsconfig.json` ⇒ the same bytes
-    on every machine and OS. Generated code is meant to be committed; `oasts generate --check`
-    makes drift a CI failure. See [Determinism](/concepts/determinism).
+    Same document bytes, same config, same version, same consumer `tsconfig.json` ⇒ the same bytes on every machine and OS.
+    Generated code is meant to be committed; `oasts generate --check` makes drift a CI failure.
+    See [Determinism](/concepts/determinism).
   </Card>
   <Card title="Auth the compiler checks" icon="ph:lock-key">
-    An operation's security requirements compile into its call signature, so calling one whose auth
-    you never configured is a type error rather than a 401 you find in staging.
+    An operation's security requirements compile into its call signature, so calling one whose auth you never configured is a type error rather than a 401 you find in staging.
   </Card>
   <Card title="Nothing in your bundle" icon="ph:feather">
-    The typed fetch client is emitted next to your types. No runtime package to version-match,
-    nothing added to your dependency tree.
+    The typed fetch client is emitted next to your types.
+    No runtime package to version-match, nothing added to your dependency tree.
   </Card>
 </CardGrid>
 
@@ -64,8 +63,8 @@ oasts is a compiler. It reads an OpenAPI 3.0 or 3.1 document and writes TypeScri
   </Card>
 </CardGrid>
 
-Have a question about what it refuses, or what it deliberately does not do? The [FAQ](/faq) answers
-the common ones.
+Have a question about what it refuses, or what it deliberately does not do?
+The [FAQ](/faq) answers the common ones.
 
 ## Performance
 

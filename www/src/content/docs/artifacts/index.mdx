@@ -7,8 +7,8 @@ sidebar:
     label: Artifacts
 ---
 
-Everything oasts emits is derived from one model of your document, so the artifacts cannot disagree
-about your API. Turn them on individually:
+Everything oasts emits is derived from one model of your document, so the artifacts cannot disagree about your API.
+Turn them on individually:
 
 ```yaml title="oasts.yaml"
 artifacts:
@@ -23,14 +23,15 @@ validation:
   unchecked: allow
 ```
 
-The client artifact requires an explicit `validation` block; `engine: "off"` opts out of boundary
-checking. See [Validation](/artifacts/validation) for the other engines.
+The client artifact requires an explicit `validation` block; `engine: "off"` opts out of boundary checking.
+See [Validation](/artifacts/validation) for the other engines.
 
 <Aside type="note">
-  Types default on. Set `types: false` to omit the artifact; oasts does not write `types/` or
-  silently turn it back on. Zod and validators can stand alone. Client and MSW each require types
-  (`OASTS0111` and `OASTS0112`), and TanStack requires client (`OASTS0113`), so it requires types
-  transitively. At least one artifact must remain enabled.
+  Types default on.
+  Set `types: false` to omit the artifact; oasts does not write `types/` or silently turn it back on.
+  Zod and validators can stand alone.
+  Client and MSW each require types (`OASTS0111` and `OASTS0112`), and TanStack requires client (`OASTS0113`), so it requires types transitively.
+  At least one artifact must remain enabled.
 </Aside>
 
 <CardGrid>
@@ -56,6 +57,5 @@ checking. See [Validation](/artifacts/validation) for the other engines.
   </Card>
 </CardGrid>
 
-Each artifact writes into its own directory under `output`, named after the artifact. Rename or nest
-any of them with `artifacts.<name>.directory` and the imports between them follow — see
-[Configuration](/reference/configuration#artifacts).
+Each artifact writes into its own directory under `output`, named after the artifact.
+Rename or nest any of them with `artifacts.<name>.directory` and the imports between them follow — see [Configuration](/reference/configuration#artifacts).

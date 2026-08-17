@@ -5,8 +5,7 @@ sidebar:
   order: 3
 ---
 
-Every message oasts prints carries a stable code, a severity, and a pointer into the thing it is
-talking about:
+Every message oasts prints carries a stable code, a severity, and a pointer into the thing it is talking about:
 
 ```text
 error[OASTS0262]: filters.paths.include pattern '/^\/pets/' matches no operation; a regex pattern must match the whole subject, so add `.*` to match a prefix or a substring
@@ -18,25 +17,18 @@ warning[OASTS5204]: response key '200' is statically bodyless but declares media
   --> workspace/openapi.yaml:1:1 /paths/~1probe/head/responses/200/content/text~1event-stream
 ```
 
-The message is one line however long it runs — nothing wraps it. The trailing path is a **JSON
-Pointer** into the document or config file: the exact node the diagnostic is about, with `/` in a
-key escaped as `~1`.
+The message is one line however long it runs — nothing wraps it.
+The trailing path is a **JSON Pointer** into the document or config file: the exact node the diagnostic is about, with `/` in a key escaped as `~1`.
 
-The two source names are not the same kind of thing. A config diagnostic names the config file by
-its normalized absolute path, because that is what oasts resolved it to before reading it. A
-document diagnostic names a **logical source ID** instead — `workspace/<path>` for anything under the
-workspace root, `allow/<n>/<path>` for a document reached through the *n*th `local.allowPaths` root.
-Those are stable across machines, which is what makes diagnostics comparable between a laptop and
-CI.
+The two source names are not the same kind of thing.
+A config diagnostic names the config file by its normalized absolute path, because that is what oasts resolved it to before reading it.
+A document diagnostic names a **logical source ID** instead — `workspace/<path>` for anything under the workspace root, `allow/<n>/<path>` for a document reached through the *n*th `local.allowPaths` root.
+Those are stable across machines, which is what makes diagnostics comparable between a laptop and CI.
 
 ## Severity
 
-- **`error`** — a refusal. The run is transactional: oasts builds and stages the whole output before
-  committing it, and rolls back a write that fails part-way. A failed run leaves the previous
-  generated tree and ownership manifest unchanged.
-- **`warning`** — generation continues, and the warning names what was skipped or adjusted. A
-  warning always means one operation, one component, or one artifact projection did *not* come out
-  the way an unqualified reading of the document would suggest.
+- **`error`** — a refusal. The run is transactional: oasts builds and stages the whole output before committing it, and rolls back a write that fails part-way. A failed run leaves the previous generated tree and ownership manifest unchanged.
+- **`warning`** — generation continues, and the warning names what was skipped or adjusted. A warning always means one operation, one component, or one artifact projection did *not* come out the way an unqualified reading of the document would suggest.
 
 Warnings matter more here than in most tools, because oasts never resolves an ambiguity silently.
 If an operation vanished from an artifact, a warning says so and names it.
@@ -56,30 +48,27 @@ The **thousands** digit is the stage that refused, and every code in a stage sha
 | `6xxx` | **Artifacts.** One sub-band per artifact. | `1` | `OASTS6002` validators cannot check a keyword · `OASTS6201` a path literal MSW's matcher cannot match |
 | `9xxx` | **Provisional.** A capability this build gates off rather than refuses. | varies | `OASTS9003` a reserved config block · `OASTS9201` a remote `$ref` |
 
-The **hundreds** digit sub-divides a stage: `62xx` is MSW's corner of the artifact stage, `22xx` is
-the schema-keyword corner of document loading. Sub-bands are kept sparse deliberately, so a new code
-joins its siblings instead of landing at the end of a run.
+The **hundreds** digit sub-divides a stage: `62xx` is MSW's corner of the artifact stage, `22xx` is the schema-keyword corner of document loading.
+Sub-bands are kept sparse deliberately, so a new code joins its siblings instead of landing at the end of a run.
 
-The exit code is a property of each diagnostic, not something parsed back out of its number. Every
-code carries a category, and stages are drawn so that all the codes in one share it — that is what
-makes the `Exit` column true rather than coincidental. A code whose category disagrees with its
-stage is a bug. See [exit codes](/reference/cli) for what `1` and `2` mean at the shell.
+The exit code is a property of each diagnostic, not something parsed back out of its number.
+Every code carries a category, and stages are drawn so that all the codes in one share it — that is what makes the `Exit` column true rather than coincidental.
+A code whose category disagrees with its stage is a bug.
+See [exit codes](/reference/cli) for what `1` and `2` mean at the shell.
 
 `0xxx` has a finer address: `0rrs`, where `rr` is a config rule and `s` is a sequence within it.
-`OASTS0262` is rule 26 — filters — sequence 2. Codes sharing an `rr` are different ways of failing
-the same rule, so `0261`, `0262` and `0263` are all about filters: two ways one pattern can be wrong,
-then the whole block leaving nothing behind.
+`OASTS0262` is rule 26 — filters — sequence 2.
+Codes sharing an `rr` are different ways of failing the same rule, so `0261`, `0262` and `0263` are all about filters: two ways one pattern can be wrong, then the whole block leaving nothing behind.
 
 ### The provisional band
 
-`9xxx` is not a stage. It holds capabilities this build gates off rather than refuses on the merits
-— `OASTS9201` for a remote `$ref`, `OASTS9003` for a config block that is accepted by the schema but
-not implemented. A provisional code **retires when its capability lands**, so the band is expected to
-develop holes, and nothing is renumbered to close them.
+`9xxx` is not a stage.
+It holds capabilities this build gates off rather than refuses on the merits — `OASTS9201` for a remote `$ref`, `OASTS9003` for a config block that is accepted by the schema but not implemented.
+A provisional code **retires when its capability lands**, so the band is expected to develop holes, and nothing is renumbered to close them.
 
-The second digit tells you which stage the code would otherwise have sat in. Treat it as a hint
-about where the refusal came from, not as a way to work out the exit code — read that off the
-category the diagnostic carries. `99xx` is reserved for test sentinels and is never emitted.
+The second digit tells you which stage the code would otherwise have sat in.
+Treat it as a hint about where the refusal came from, not as a way to work out the exit code — read that off the category the diagnostic carries.
+`99xx` is reserved for test sentinels and is never emitted.
 
 ## Refusals you are most likely to meet
 
@@ -110,8 +99,8 @@ All errors, all exit `2`.
 
 ### Names the compiler will not invent
 
-These are the [naming](/guides/naming) refusals. Each has a remedy in `naming.overrides`, and the
-run prints a ready-made block of them after its diagnostics.
+These are the [naming](/guides/naming) refusals.
+Each has a remedy in `naming.overrides`, and the run prints a ready-made block of them after its diagnostics.
 
 | Code | Severity | Meaning |
 | --- | --- | --- |
@@ -133,14 +122,13 @@ run prints a ready-made block of them after its diagnostics.
 
 ### Artifact projections
 
-MSW and TanStack degrade; validators and Zod refuse. An operation MSW cannot mock, or TanStack
-cannot give a descriptor, is skipped with a warning and the rest of the file still generates — that
-is **on purpose**, because an error would throw the whole run's output away over one operation it
-could not project. The validation artifacts take the other line: anything they cannot check
-faithfully is an error, since a validator that quietly checks less than the document says is worse
-than no build. Their one warning only renames a colliding schema.
+MSW and TanStack degrade; validators and Zod refuse.
+An operation MSW cannot mock, or TanStack cannot give a descriptor, is skipped with a warning and the rest of the file still generates — that is **on purpose**, because an error would throw the whole run's output away over one operation it could not project.
+The validation artifacts take the other line: anything they cannot check faithfully is an error, since a validator that quietly checks less than the document says is worse than no build.
+Their one warning only renames a colliding schema.
 
-The severity column below is the authority. Read that, not the artifact name.
+The severity column below is the authority.
+Read that, not the artifact name.
 
 | Code | Artifact | Severity | Meaning |
 | --- | --- | --- | --- |
@@ -162,7 +150,6 @@ The severity column below is the authority. Read that, not the artifact name.
 | `OASTS6303` | tanstack | warning | A `naming.overrides.pathSegments` entry matched no path segment |
 
 <Aside type="note">
-  This is the set you are most likely to hit, not the complete allocation. Run
-  [`oasts check`](/reference/cli) to see every diagnostic your own document and config produce,
-  without writing any files.
+  This is the set you are most likely to hit, not the complete allocation.
+  Run [`oasts check`](/reference/cli) to see every diagnostic your own document and config produce, without writing any files.
 </Aside>

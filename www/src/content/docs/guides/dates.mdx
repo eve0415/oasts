@@ -23,8 +23,7 @@ types:
 | `dateTime: temporal` | `Temporal.Instant` |
 | `date: temporal` | `Temporal.PlainDate` |
 
-The wire grammar is RFC 3339, and it is checked field by field rather than handed to `new Date` or
-`Temporal.Instant.from` — both of which accept more than the contract does.
+The wire grammar is RFC 3339, and it is checked field by field rather than handed to `new Date` or `Temporal.Instant.from` — both of which accept more than the contract does.
 
 ## Where conversion happens
 
@@ -33,15 +32,14 @@ Conversion is unconditional and ordered:
 - A **request** is converted *before* validation and *before* serialization.
 - A **response** is converted *after* decoding.
 
-So validators only ever observe wire values. A schema never sees a `Date` or a `Temporal` object,
-which is what keeps the [validation artifacts](/artifacts/validation) checking the document rather
-than your runtime representation.
+So validators only ever observe wire values.
+A schema never sees a `Date` or a `Temporal` object, which is what keeps the [validation artifacts](/artifacts/validation) checking the document rather than your runtime representation.
 
 ## Failures are results, not throws
 
-A value the wire cannot represent comes back as a `request-transform` result with nothing sent. One
-the application cannot represent comes back as a `response-transform` result. Both are branches of
-the same union as every other outcome — see [Client](/artifacts/client#failure-complete-results):
+A value the wire cannot represent comes back as a `request-transform` result with nothing sent.
+One the application cannot represent comes back as a `response-transform` result.
+Both are branches of the same union as every other outcome — see [Client](/artifacts/client#failure-complete-results):
 
 ```ts
 switch (result.outcome) {
@@ -55,7 +53,6 @@ switch (result.outcome) {
 ```
 
 <Aside type="caution">
-  The representations need the client artifact. The codecs are emitted under it and only run at its
-  pipeline positions, so setting `dateTime` or `date` to a non-string value without
-  `artifacts.client: true` is a config error, not a silent fall back to strings.
+  The representations need the client artifact.
+  The codecs are emitted under it and only run at its pipeline positions, so setting `dateTime` or `date` to a non-string value without `artifacts.client: true` is a config error, not a silent fall back to strings.
 </Aside>

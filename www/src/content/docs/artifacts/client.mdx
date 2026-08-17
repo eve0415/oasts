@@ -14,11 +14,10 @@ validation:
   unchecked: allow
 ```
 
-The client artifact requires an explicit `validation` block — `engine: "off"` opts out of boundary
-checking.
+The client artifact requires an explicit `validation` block — `engine: "off"` opts out of boundary checking.
 
-The client is emitted next to your types. It imports nothing — no runtime package to version-match,
-nothing added to your dependency tree.
+The client is emitted next to your types.
+It imports nothing — no runtime package to version-match, nothing added to your dependency tree.
 
 ```ts
 import { createTransport } from "./generated/runtime/transport.js";
@@ -32,13 +31,12 @@ const result = await getPetShowcase(transport, {
 });
 ```
 
-A third, optional argument carries per-call `CallOptions` — `auth`, `headers`, `signal`,
-`fetchOptions`.
+A third, optional argument carries per-call `CallOptions` — `auth`, `headers`, `signal`, `fetchOptions`.
 
 ## Failure-complete results
 
-A call resolves; it does not throw. The result is a discriminated union over `outcome` covering
-every documented response *and* every way the call can fail:
+A call resolves; it does not throw.
+The result is a discriminated union over `outcome` covering every documented response *and* every way the call can fail:
 
 ```ts
 switch (result.outcome) {
@@ -62,33 +60,29 @@ switch (result.outcome) {
 }
 ```
 
-An exact declared status is a number literal; a range key, `default`, and every failure tag are
-string literals. The two can never overlap, so `case 200:` can never also match `"4XX"`. Handling
-the union is exhaustiveness checking — add a response to the document and the compiler shows you
-every `switch` that no longer covers it.
+An exact declared status is a number literal; a range key, `default`, and every failure tag are string literals.
+The two can never overlap, so `case 200:` can never also match `"4XX"`.
+Handling the union is exhaustiveness checking — add a response to the document and the compiler shows you every `switch` that no longer covers it.
 
-The union above is abbreviated. Every branch, including the six response-phase failures and the
-nine request-phase ones, is catalogued in [Results](/concepts/results).
+The union above is abbreviated.
+Every branch, including the six response-phase failures and the nine request-phase ones, is catalogued in [Results](/concepts/results).
 
 <Aside type="tip">
-  For call sites where branching is not worth it, every operation also gets an
-  `{operation}OrThrow` companion. It resolves to the matched success arm's `{ data, meta }` and
-  throws `ApiError` otherwise, with the whole failed result preserved on `error.result`.
+  For call sites where branching is not worth it, every operation also gets an `{operation}OrThrow` companion.
+  It resolves to the matched success arm's `{ data, meta }` and throws `ApiError` otherwise, with the whole failed result preserved on `error.result`.
 </Aside>
 
 ## Auth
 
-An operation's security requirements compile into its call signature, so calling one whose auth you
-never configured is a type error rather than a 401 you find in staging. That is the default:
+An operation's security requirements compile into its call signature, so calling one whose auth you never configured is a type error rather than a 401 you find in staging.
+That is the default:
 
 ```yaml title="oasts.yaml"
 client:
   authEnforcement: types
 ```
 
-Set `authEnforcement: runtime` to move the check to call time instead, where an unsatisfied
-requirement comes back as an `auth` result — the same shape as any other failure, branched in the
-same `switch`.
+Set `authEnforcement: runtime` to move the check to call time instead, where an unsatisfied requirement comes back as an `auth` result — the same shape as any other failure, branched in the same `switch`.
 
 ## Base URL
 
@@ -105,31 +99,26 @@ client:
 
 ## Parameter serialization
 
-The full OpenAPI matrix is implemented to the letter, not approximated: `style`/`explode` for path,
-query, header and cookie parameters (`form`, `spaceDelimited`, `pipeDelimited`, `deepObject`,
-`label`, `matrix`, `simple`), and multipart encoding with per-part content types. Combinations
-OpenAPI leaves undefined are refused rather than guessed — `deepObject` over an array or a scalar is
-one, and `compat.deepObjectEncoding: extended` opts into a bracket-path encoding for it. The
-[MSW artifact](/artifacts/msw) runs the same matrix backwards to decode request values.
+The full OpenAPI matrix is implemented to the letter, not approximated: `style`/`explode` for path, query, header and cookie parameters (`form`, `spaceDelimited`, `pipeDelimited`, `deepObject`, `label`, `matrix`, `simple`), and multipart encoding with per-part content types.
+Combinations OpenAPI leaves undefined are refused rather than guessed — `deepObject` over an array or a scalar is one, and `compat.deepObjectEncoding: extended` opts into a bracket-path encoding for it.
+The [MSW artifact](/artifacts/msw) runs the same matrix backwards to decode request values.
 
 ## One module per operation, or one object
 
-Each operation is its own module, so a bundler drops the ones you never import. Set
-`client.aggregate: true` and both call forms are also collected into a single `api` object exported
-from `generated/client/api.ts`:
+Each operation is its own module, so a bundler drops the ones you never import.
+Set `client.aggregate: true` and both call forms are also collected into a single `api` object exported from `generated/client/api.ts`:
 
 ```yaml title="oasts.yaml"
 client:
   aggregate: true
 ```
 
-It is off by default, because the aggregate names every operation and a bundler cannot drop the
-ones you never call.
+It is off by default, because the aggregate names every operation and a bundler cannot drop the ones you never call.
 
 ## Validation at the boundary
 
-The client can check payloads against the document as they pass through. Swap the `engine: "off"`
-above for a real engine and the artifact backing it, then pick the positions:
+The client can check payloads against the document as they pass through.
+Swap the `engine: "off"` above for a real engine and the artifact backing it, then pick the positions:
 
 ```yaml title="oasts.yaml"
 artifacts:
