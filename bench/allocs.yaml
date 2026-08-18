@@ -214,14 +214,14 @@ keys:
     config: "oasts.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 1316
+        allocs: 1325
         reallocs: 87
-        deallocs: 998
+        deallocs: 1007
         allocBytes: 139839
       - stage: "parse"
-        allocs: 367
+        allocs: 381
         reallocs: 45
-        deallocs: 164
+        deallocs: 178
         allocBytes: 75024
       - stage: "filter"
         allocs: 18
@@ -244,14 +244,14 @@ keys:
     config: "oasts-msw.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 1316
+        allocs: 1325
         reallocs: 87
-        deallocs: 998
+        deallocs: 1007
         allocBytes: 139839
       - stage: "parse"
-        allocs: 367
+        allocs: 381
         reallocs: 45
-        deallocs: 164
+        deallocs: 178
         allocBytes: 75024
       - stage: "filter"
         allocs: 18
@@ -274,14 +274,14 @@ keys:
     config: "oasts-zod.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 1316
+        allocs: 1325
         reallocs: 87
-        deallocs: 998
+        deallocs: 1007
         allocBytes: 139839
       - stage: "parse"
-        allocs: 367
+        allocs: 381
         reallocs: 45
-        deallocs: 164
+        deallocs: 178
         allocBytes: 75024
       - stage: "filter"
         allocs: 18
@@ -304,14 +304,14 @@ keys:
     config: "oasts-client.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 1316
+        allocs: 1325
         reallocs: 87
-        deallocs: 998
+        deallocs: 1007
         allocBytes: 139839
       - stage: "parse"
-        allocs: 367
+        allocs: 381
         reallocs: 45
-        deallocs: 164
+        deallocs: 178
         allocBytes: 75024
       - stage: "filter"
         allocs: 18
@@ -339,14 +339,14 @@ keys:
     config: "oasts-tanstack.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 1316
+        allocs: 1325
         reallocs: 87
-        deallocs: 998
+        deallocs: 1007
         allocBytes: 139839
       - stage: "parse"
-        allocs: 367
+        allocs: 381
         reallocs: 45
-        deallocs: 164
+        deallocs: 178
         allocBytes: 75024
       - stage: "filter"
         allocs: 18
@@ -374,14 +374,14 @@ keys:
     config: "oasts.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 2560
+        allocs: 2577
         reallocs: 186
-        deallocs: 1953
+        deallocs: 1970
         allocBytes: 280740
       - stage: "parse"
-        allocs: 698
+        allocs: 728
         reallocs: 93
-        deallocs: 305
+        deallocs: 335
         allocBytes: 112169
       - stage: "filter"
         allocs: 34
@@ -404,14 +404,14 @@ keys:
     config: "oasts.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 4201
+        allocs: 4207
         reallocs: 110
-        deallocs: 3165
+        deallocs: 3171
         allocBytes: 487694
       - stage: "parse"
-        allocs: 1033
+        allocs: 1041
         reallocs: 54
-        deallocs: 408
+        deallocs: 416
         allocBytes: 222983
       - stage: "filter"
         allocs: 12
@@ -439,9 +439,9 @@ keys:
     config: "oasts.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 1862
+        allocs: 1864
         reallocs: 35
-        deallocs: 1374
+        deallocs: 1376
         allocBytes: 245116
       - stage: "parse"
         allocs: 546
@@ -474,14 +474,14 @@ keys:
     config: "oasts.yaml"
     stages:
       - stage: "loadGraph"
-        allocs: 12633
+        allocs: 12678
         reallocs: 581
-        deallocs: 9291
+        deallocs: 9336
         allocBytes: 1332628
       - stage: "parse"
-        allocs: 3989
+        allocs: 4082
         reallocs: 275
-        deallocs: 1739
+        deallocs: 1832
         allocBytes: 734188
       - stage: "filter"
         allocs: 102
