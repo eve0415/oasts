@@ -34,6 +34,8 @@ const CODE_MAX_DOCUMENTS: &str = "OASTS2013";
 const CODE_MAX_REF_DEPTH: &str = "OASTS2014";
 const CODE_REMOTE_UNSUPPORTED: &str = "OASTS9201";
 const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
+/// Percent-encoding writes uppercase hex, which is what `percent_encoding` emits.
+const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
 
 /// Stable index of a document within one graph.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1870,10 +1872,9 @@ fn encode_relative_path(path: &Path) -> Result<String, String> {
             if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'-') {
                 encoded.push(char::from(*byte));
             } else {
-                const HEX: &[u8; 16] = b"0123456789ABCDEF";
                 encoded.push('%');
-                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+                encoded.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
             }
         }
         encoded_segments.push(encoded);
@@ -1903,13 +1904,137 @@ fn resolve_identity_uri(
     })
 }
 
+/// The bytes `Url::from_file_path` percent-encodes a path component with: the WHATWG special
+/// path segment set, plus every non-ASCII byte.
+///
+/// Restated here rather than borrowed, because `url`'s file-path helpers are compiled out on
+/// `wasm32-unknown-unknown` — they are gated on `any(unix, windows, redox, wasi, hermit)` and no
+/// cargo feature re-enables them. One conversion on every target is what keeps a browser build
+/// resolving `$ref`s to the same documents the CLI resolves them to;
+/// `file_url_conversion_agrees_with_the_url_crate` is the check that they stay the same function.
+fn must_percent_encode(byte: u8) -> bool {
+    !byte.is_ascii()
+        || byte.is_ascii_control()
+        || matches!(
+            byte,
+            b' ' | b'"' | b'<' | b'>' | b'`' | b'#' | b'?' | b'{' | b'}' | b'/' | b'%' | b'\\'
+        )
+}
+
+/// A path component's bytes. Only unix can offer them for a non-Unicode component; elsewhere a
+/// component that is not UTF-8 has no representation, which the caller reports as a failure.
+#[cfg(unix)]
+fn component_bytes(segment: &OsStr) -> Option<&[u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(segment.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn component_bytes(segment: &OsStr) -> Option<&[u8]> {
+    segment.to_str().map(str::as_bytes)
+}
+
+/// The inverse, subject to the same limit.
+#[cfg(unix)]
+fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(bytes).ok().map(PathBuf::from)
+}
+
 fn file_url(path: &Path) -> Result<Url, String> {
-    Url::from_file_path(path).map_err(|()| {
+    let unrepresentable = || {
         format!(
             "local document path '{}' cannot be represented as a file URI",
             path.display()
         )
-    })
+    };
+    if !path.is_absolute() {
+        return Err(unrepresentable());
+    }
+    let mut serialization = String::from("file://");
+    let mut empty = true;
+    // The root component is skipped because the separator below reintroduces it.
+    for component in path.components().skip(1) {
+        empty = false;
+        serialization.push('/');
+        let bytes = component_bytes(component.as_os_str()).ok_or_else(unrepresentable)?;
+        for byte in bytes {
+            if must_percent_encode(*byte) {
+                serialization.push('%');
+                serialization.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+                serialization.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+            } else {
+                serialization.push(char::from(*byte));
+            }
+        }
+    }
+    if empty {
+        // A URL's path is never empty.
+        serialization.push('/');
+    }
+    // Every byte that could end a path segment early is percent-encoded above, so what is left is
+    // a well-formed `file://` URL by construction and the parser has nothing to reject.
+    Ok(Url::parse(&serialization).expect("a percent-encoded absolute path is a file URL"))
+}
+
+/// The inverse of [`file_url`], for a URL already known to use the `file` scheme.
+///
+/// Mirrors `Url::to_file_path`: a host other than an empty one or `localhost` is refused, and a
+/// trailing Windows drive letter grows the slash that makes it a directory. That last rule fires on
+/// every platform in `url`, so it fires here too.
+fn file_path_from_url(url: &Url) -> Option<PathBuf> {
+    match url.host() {
+        None => {}
+        Some(url::Host::Domain("localhost")) => {}
+        Some(_) => return None,
+    }
+    let mut bytes = Vec::new();
+    for segment in url.path_segments()? {
+        bytes.push(b'/');
+        bytes.extend(percent_decode_segment(segment.as_bytes()));
+    }
+    if bytes.len() > 2
+        && bytes[bytes.len() - 2].is_ascii_alphabetic()
+        && matches!(bytes[bytes.len() - 1], b':' | b'|')
+    {
+        bytes.push(b'/');
+    }
+    path_from_bytes(bytes)
+}
+
+/// Percent-decodes one path segment, leniently.
+///
+/// `url` leaves a malformed escape as literal bytes rather than rejecting it, and a path segment
+/// never contains an unencoded `/` — it was split on one — so this is byte-wise with no separator
+/// to preserve. Distinct from [`percent_decode`], which decodes a URI fragment and does reject.
+fn percent_decode_segment(segment: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(segment.len());
+    let mut index = 0;
+    while index < segment.len() {
+        let escape = (segment[index] == b'%' && index.saturating_add(2) < segment.len())
+            .then(|| {
+                let high = hex_value(segment[index + 1])?;
+                let low = hex_value(segment[index + 2])?;
+                Some((high << 4) | low)
+            })
+            .flatten();
+        match escape {
+            Some(byte) => {
+                decoded.push(byte);
+                index = index.saturating_add(3);
+            }
+            None => {
+                decoded.push(segment[index]);
+                index = index.saturating_add(1);
+            }
+        }
+    }
+    decoded
 }
 
 fn local_path_from_url(
@@ -1928,7 +2053,7 @@ fn local_path_from_url(
             pointer,
         ));
     }
-    url.to_file_path().map_err(|()| {
+    file_path_from_url(url).ok_or_else(|| {
         input_error(
             CODE_INVALID_REFERENCE,
             format!("file URI '{}' is not a local filesystem path", url.as_str()),
@@ -2282,6 +2407,115 @@ mod tests {
 
     use serde_json::json;
     use tempfile::TempDir;
+
+    /// A path corpus covering every rule in the encode set, plus the shapes `url`'s own conversion
+    /// treats specially: a bare root, a trailing drive letter, and a component that is already an
+    /// escape.
+    fn file_url_corpus() -> Vec<PathBuf> {
+        [
+            "/",
+            "/workspace/openapi.yaml",
+            "/workspace/with space/openapi.yaml",
+            "/workspace/with#hash/openapi.yaml",
+            "/workspace/with?query/openapi.yaml",
+            "/workspace/with%25percent/openapi.yaml",
+            "/workspace/with%2Falready/openapi.yaml",
+            "/workspace/with\"quote/openapi.yaml",
+            "/workspace/with<angle>/openapi.yaml",
+            "/workspace/with`backtick/openapi.yaml",
+            "/workspace/with{brace}/openapi.yaml",
+            "/workspace/with\\backslash/openapi.yaml",
+            "/workspace/with\u{7f}delete/openapi.yaml",
+            "/workspace/\u{3042}\u{3044}/openapi.yaml",
+            "/workspace/emoji\u{1f600}/openapi.yaml",
+            "/workspace/trailing/",
+            "/tmp/C:",
+            "/tmp/c|",
+            "/workspace/..hidden/openapi.yaml",
+            "/workspace/a.b.c/openapi.yaml",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+
+    /// Byte strings a UTF-8-only conversion cannot represent, which is why the byte extraction is
+    /// `cfg(unix)` rather than `to_str`.
+    #[cfg(unix)]
+    fn non_unicode_paths() -> Vec<PathBuf> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut paths = Vec::new();
+        // A deterministic byte spray, so the corpus covers escapes no hand-picked literal would.
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..256 {
+            let mut bytes = b"/workspace/".to_vec();
+            for _ in 0..12 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let byte = u8::try_from((state >> 33) & 0xff).expect("masked to one byte");
+                // A NUL cannot appear in a path, and a separator would change the component count.
+                if byte != 0 && byte != b'/' {
+                    bytes.push(byte);
+                }
+            }
+            paths.push(PathBuf::from(OsString::from_vec(bytes)));
+        }
+        paths
+    }
+
+    #[test]
+    fn file_url_conversion_agrees_with_the_url_crate() {
+        let mut corpus = file_url_corpus();
+        #[cfg(unix)]
+        corpus.extend(non_unicode_paths());
+
+        for path in &corpus {
+            // The label is built before the assert: a call evaluated only on failure is a region
+            // the coverage gate counts and no passing run reaches.
+            let shown = path.display().to_string();
+            assert_eq!(
+                file_url(path).map_err(|_| ()),
+                Url::from_file_path(path),
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_path_conversion_agrees_with_the_url_crate() {
+        let mut corpus = file_url_corpus();
+        #[cfg(unix)]
+        corpus.extend(non_unicode_paths());
+
+        for path in &corpus {
+            let url = Url::from_file_path(path).expect("an absolute path is a file URI");
+            assert_eq!(
+                file_path_from_url(&url).ok_or(()),
+                url.to_file_path(),
+                "{url}"
+            );
+        }
+
+        // The shapes that reach this function from a `$ref` rather than from a path.
+        for raw in [
+            "file:///workspace/openapi.yaml",
+            "file://localhost/workspace/openapi.yaml",
+            "file://elsewhere/workspace/openapi.yaml",
+            "file:///workspace/%zz-not-an-escape/openapi.yaml",
+            "file:///workspace/truncated%2",
+            "file:///",
+        ] {
+            let url = Url::parse(raw).expect("parsable URL");
+            assert_eq!(
+                file_path_from_url(&url).ok_or(()),
+                url.to_file_path(),
+                "{raw}"
+            );
+        }
+    }
 
     use super::*;
     use crate::config::{ResolvedConfig, load_config};
