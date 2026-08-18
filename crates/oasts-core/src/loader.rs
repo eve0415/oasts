@@ -4,7 +4,6 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -18,6 +17,7 @@ use url::Url;
 
 use crate::config::ResolvedConfig;
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
+use crate::source::{DocumentSource, SourceHandle};
 use crate::syntax::parse_yaml_document_value;
 
 const CODE_DOCUMENT_IO: &str = "OASTS1003";
@@ -141,6 +141,7 @@ struct AllowRoot {
 /// Parsed local documents plus their retained reference edges.
 #[derive(Clone, Debug)]
 pub struct DocumentGraph {
+    source: SourceHandle,
     documents: Vec<Document>,
     path_to_id: HashMap<PathBuf, DocId>,
     identifiers: IdentifierRegistry,
@@ -249,7 +250,7 @@ impl DocumentGraph {
         } else {
             let target_path =
                 local_path_from_url(&target_url, Some(&base_document.source_id), None)?;
-            let canonical = fs::canonicalize(&target_path).map_err(|error| {
+            let canonical = self.source.canonicalize(&target_path).map_err(|error| {
                 io_error(
                     CODE_DOCUMENT_IO,
                     format!("failed to canonicalize referenced document: {error}"),
@@ -461,9 +462,18 @@ impl DocumentGraph {
     }
 }
 
-/// Loads the configured local document graph, reporting the first load failure.
+/// Loads the configured document graph from the real filesystem.
 pub fn load_graph(config: &ResolvedConfig, sink: &mut DiagnosticSink) -> Option<DocumentGraph> {
-    match GraphBuilder::new(config).and_then(GraphBuilder::build) {
+    load_graph_with_source(config, SourceHandle::Fs, sink)
+}
+
+/// Loads the configured document graph from `source`, reporting the first load failure.
+pub fn load_graph_with_source(
+    config: &ResolvedConfig,
+    source: SourceHandle,
+    sink: &mut DiagnosticSink,
+) -> Option<DocumentGraph> {
+    match GraphBuilder::new(config, source).and_then(GraphBuilder::build) {
         Ok((graph, warnings)) => {
             sink.extend(warnings);
             Some(graph)
@@ -537,6 +547,7 @@ struct ResolvedWalkNode<'value> {
 
 struct GraphBuilder<'a> {
     config: &'a ResolvedConfig,
+    source: SourceHandle,
     documents: Vec<Rc<Document>>,
     path_to_id: HashMap<PathBuf, DocId>,
     identifiers: IdentifierRegistry,
@@ -549,18 +560,20 @@ struct GraphBuilder<'a> {
 }
 
 impl<'a> GraphBuilder<'a> {
-    fn new(config: &'a ResolvedConfig) -> Result<Self, Diagnostic> {
-        let workspace_root = fs::canonicalize(&config.workspace_root).map_err(|error| {
-            io_error(
-                CODE_DOCUMENT_IO,
-                format!("failed to canonicalize workspaceRoot: {error}"),
-                Some(&config.config_path.to_string_lossy()),
-                Some("/workspaceRoot"),
-            )
-        })?;
+    fn new(config: &'a ResolvedConfig, source: SourceHandle) -> Result<Self, Diagnostic> {
+        let workspace_root = source
+            .canonicalize(&config.workspace_root)
+            .map_err(|error| {
+                io_error(
+                    CODE_DOCUMENT_IO,
+                    format!("failed to canonicalize workspaceRoot: {error}"),
+                    Some(&config.config_path.to_string_lossy()),
+                    Some("/workspaceRoot"),
+                )
+            })?;
         let mut allow_roots = Vec::with_capacity(config.local_allow_paths.len());
         for (config_index, path) in config.local_allow_paths.iter().enumerate() {
-            let canonical_path = fs::canonicalize(path).map_err(|error| {
+            let canonical_path = source.canonicalize(path).map_err(|error| {
                 io_error(
                     CODE_DOCUMENT_IO,
                     format!(
@@ -575,6 +588,7 @@ impl<'a> GraphBuilder<'a> {
         }
         Ok(Self {
             config,
+            source,
             documents: Vec::new(),
             path_to_id: HashMap::new(),
             identifiers: IdentifierRegistry::default(),
@@ -616,6 +630,7 @@ impl<'a> GraphBuilder<'a> {
             .collect();
         Ok((
             DocumentGraph {
+                source: self.source,
                 documents,
                 path_to_id: self.path_to_id,
                 identifiers: self.identifiers,
@@ -635,7 +650,7 @@ impl<'a> GraphBuilder<'a> {
         if let Some(id) = self.path_to_id.get(requested_path) {
             return Ok(*id);
         }
-        let canonical_path = fs::canonicalize(requested_path).map_err(|error| {
+        let canonical_path = self.source.canonicalize(requested_path).map_err(|error| {
             io_error(
                 CODE_DOCUMENT_IO,
                 format!(
@@ -667,7 +682,7 @@ impl<'a> GraphBuilder<'a> {
 
         // Size limits gate on metadata BEFORE reading, so an oversized target
         // is never buffered into memory just to be rejected.
-        let byte_len = document_byte_len(&canonical_path, &source_id)?;
+        let byte_len = document_byte_len(&self.source, &canonical_path, &source_id)?;
         if byte_len > self.config.limits.max_document_bytes {
             return Err(limit_error(
                 CODE_MAX_DOCUMENT_BYTES,
@@ -686,7 +701,7 @@ impl<'a> GraphBuilder<'a> {
             ));
         }
 
-        let raw = fs::read(&canonical_path).map_err(|error| {
+        let raw = self.source.read(&canonical_path).map_err(|error| {
             io_error(
                 CODE_DOCUMENT_IO,
                 format!("failed to read document: {error}"),
@@ -1424,17 +1439,19 @@ fn resource_base_uri(url: &Url) -> String {
     resource.into()
 }
 
-fn document_byte_len(path: &Path, source_id: &str) -> Result<u64, Diagnostic> {
-    fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .map_err(|error| {
-            io_error(
-                CODE_DOCUMENT_IO,
-                format!("failed to read document metadata: {error}"),
-                Some(source_id),
-                None,
-            )
-        })
+fn document_byte_len(
+    source: &dyn DocumentSource,
+    path: &Path,
+    source_id: &str,
+) -> Result<u64, Diagnostic> {
+    source.byte_len(path).map_err(|error| {
+        io_error(
+            CODE_DOCUMENT_IO,
+            format!("failed to read document metadata: {error}"),
+            Some(source_id),
+            None,
+        )
+    })
 }
 
 type DocumentParser = fn(&[u8], &str) -> Result<Value, Diagnostic>;
@@ -2260,6 +2277,7 @@ fn to_u32(value: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
     use serde_json::json;
@@ -3648,6 +3666,7 @@ mod tests {
         }
 
         let error = document_byte_len(
+            &SourceHandle::Fs,
             &directory.path().join("workspace/missing-metadata.yaml"),
             "workspace/missing-metadata.yaml",
         )
@@ -3754,7 +3773,7 @@ mod tests {
             "openapi: 3.1.0\ntags:\n  - name: one\ncomponents:\n  schemas:\n    Mixed:\n      allOf:\n        - type: object\n      prefixItems:\n        - type: string\n      items:\n        - type: number\n      example:\n        $ref: missing.yaml\n",
         );
         let config = resolved_config(directory.path(), "");
-        let mut builder = GraphBuilder::new(&config).expect("builder");
+        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs).expect("builder");
         let entry_id = builder
             .load_document(&config.input)
             .expect("entry should load");
@@ -3831,7 +3850,7 @@ mod tests {
             "openapi: 3.1.0\ninfo:\n  title: Example\n  version: 1.0.0\n",
         );
         let config = resolved_config(directory.path(), "");
-        let mut builder = GraphBuilder::new(&config).expect("builder");
+        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs).expect("builder");
         let entry_id = builder
             .load_document(&config.input)
             .expect("entry should load");
@@ -3864,7 +3883,7 @@ mod tests {
         let directory = TempDir::new().expect("tempdir should be created");
         let entry = write(directory.path(), "workspace/entry.yaml", "openapi: 3.1.0\n");
         let config = resolved_config(directory.path(), "");
-        let mut builder = GraphBuilder::new(&config).expect("builder");
+        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs).expect("builder");
         let id = builder.load_document(&entry).expect("entry should load");
         let canonical_path = builder.documents[id.0].canonical_path.clone();
         fs::remove_file(&canonical_path).expect("cached document should be removable");
@@ -3887,7 +3906,7 @@ mod tests {
         let alias = directory.path().join("workspace/alias.yaml");
         symlink(&entry, &alias).expect("fixture symlink should be created");
         let config = resolved_config(directory.path(), "");
-        let mut builder = GraphBuilder::new(&config).expect("builder");
+        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs).expect("builder");
         let id = builder.load_document(&entry).expect("entry should load");
 
         assert_eq!(
@@ -4252,6 +4271,7 @@ mod tests {
             sha256: [0; 32],
         };
         let graph = DocumentGraph {
+            source: SourceHandle::Fs,
             documents: vec![document],
             path_to_id: HashMap::new(),
             identifiers: IdentifierRegistry::default(),
@@ -4277,7 +4297,7 @@ mod tests {
         );
         let mut config = resolved_config(directory.path(), "");
         config.input = directory.path().join("workspace/entry.json");
-        let mut builder = GraphBuilder::new(&config).expect("builder");
+        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs).expect("builder");
         let id = builder
             .load_document(&config.input)
             .expect("document should load");

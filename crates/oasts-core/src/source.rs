@@ -4,11 +4,16 @@
 //! path serves a filesystem host and a host that has no filesystem at all. One path cannot drift
 //! from itself, and emitted bytes are contractual across every front-end.
 
+use std::fmt::Debug;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Supplies document bytes and the identities documents are deduplicated by.
-pub trait DocumentSource {
+///
+/// `Send + Sync` because the document graph outlives loading and is read from rayon workers during
+/// parse; `Debug` because the graph derives it.
+pub trait DocumentSource: Debug + Send + Sync {
     /// Identity for dedup and `$ref` resolution — canonical on a real filesystem, minted from the
     /// in-memory key otherwise. Never re-derived into a location.
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
@@ -35,6 +40,47 @@ impl DocumentSource for FsSource {
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
+    }
+}
+
+/// A shared handle to a document source.
+///
+/// The filesystem variant carries no data, so seating the ordinary hosts costs no allocation —
+/// `bench/allocs.yaml` pins `loadGraph.allocs` exactly, and an `Arc<FsSource>` would move it.
+#[derive(Clone, Debug)]
+pub enum SourceHandle {
+    /// The real filesystem.
+    Fs,
+    /// Anything else, shared across the graph and its rayon readers.
+    Shared(Arc<dyn DocumentSource>),
+}
+
+impl SourceHandle {
+    fn as_source(&self) -> &dyn DocumentSource {
+        match self {
+            Self::Fs => &FsSource,
+            Self::Shared(source) => source.as_ref(),
+        }
+    }
+}
+
+impl From<Arc<dyn DocumentSource>> for SourceHandle {
+    fn from(source: Arc<dyn DocumentSource>) -> Self {
+        Self::Shared(source)
+    }
+}
+
+impl DocumentSource for SourceHandle {
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        self.as_source().canonicalize(path)
+    }
+
+    fn byte_len(&self, path: &Path) -> io::Result<u64> {
+        self.as_source().byte_len(path)
+    }
+
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.as_source().read(path)
     }
 }
 
@@ -78,6 +124,18 @@ mod tests {
             source.read(&missing).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn a_shared_handle_answers_from_the_source_it_wraps() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("openapi.yaml");
+        fs::write(&path, b"openapi: 3.1.1\n").expect("write document");
+
+        let shared = SourceHandle::from(Arc::new(FsSource) as Arc<dyn DocumentSource>);
+        let canonical = shared.canonicalize(&path).expect("canonicalize");
+        assert_eq!(shared.byte_len(&canonical).expect("byte_len"), 15);
+        assert_eq!(shared.read(&canonical).expect("read"), b"openapi: 3.1.1\n");
     }
 
     #[test]
