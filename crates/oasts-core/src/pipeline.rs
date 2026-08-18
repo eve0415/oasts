@@ -100,7 +100,9 @@ pub fn compile_in_memory(
     let config_path = Path::new(MEMORY_CONFIG_PATH);
     let raw = crate::config::parse_config_json(config_path, config_json)
         .map_err(|diagnostic| vec![diagnostic])?;
-    crate::config::require_tsconfig_off(&raw, config_path)
+    let tsconfig_default = crate::config::require_tsconfig_off(&raw, config_path)
+        .map_err(|diagnostic| vec![diagnostic])?;
+    crate::config::require_no_local_allow_paths(&raw, config_path)
         .map_err(|diagnostic| vec![diagnostic])?;
 
     let mut source = MemorySource::new(MEMORY_ROOT);
@@ -112,6 +114,7 @@ pub fn compile_in_memory(
 
     let mut sink = DiagnosticSink::new();
     sink.extend(std::mem::take(&mut config.diagnostics));
+    sink.extend(tsconfig_default);
     let files = compile_from(
         &config,
         SourceHandle::Shared(Arc::new(source)),
@@ -218,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn an_omitted_tsconfig_key_compiles_rather_than_being_refused() {
+    fn an_omitted_tsconfig_key_compiles_and_says_what_it_assumed() {
         let mut raw = shared_config();
         raw.as_object_mut()
             .expect("config object")
@@ -233,6 +236,48 @@ mod tests {
         let compiled = compile_in_memory(&spec, &config_json).expect("emitted files");
 
         assert!(!compiled.files.is_empty());
+        // An absent key means `auto` to the CLI, which probes; this host cannot, and the
+        // difference reaches emitted bytes, so it is reported rather than assumed silently.
+        let defaulted = compiled
+            .diagnostics
+            .iter()
+            .find(|entry| entry.code == "OASTS0251")
+            .expect("the defaulted tsconfig is reported");
+        assert_eq!(defaulted.severity, crate::diag::Severity::Warning);
+    }
+
+    #[test]
+    fn an_explicit_tsconfig_off_assumes_nothing_and_says_nothing() {
+        let config_json = serde_json::to_vec(&shared_config()).expect("config JSON");
+        // A document that does warn, so the search runs over something.
+        let spec = fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/client-showcase-3.1/openapi.yaml"),
+        )
+        .expect("showcase document");
+
+        let compiled = compile_in_memory(&spec, &config_json).expect("emitted files");
+
+        // Bound first: an argument evaluated only on failure is a region no passing run reaches.
+        let diagnostics = compiled.diagnostics;
+        assert!(!diagnostics.is_empty());
+        assert!(
+            !diagnostics.iter().any(|entry| entry.code == "OASTS0251"),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn local_allow_paths_are_refused_rather_than_read_as_missing_documents() {
+        let mut raw = shared_config();
+        raw["local"] = json!({ "allowPaths": ["../shared"] });
+        let config_json = serde_json::to_vec(&raw).expect("config JSON");
+
+        let diagnostics = compile_in_memory(b"openapi: 3.1.1\n", &config_json)
+            .expect_err("a trust boundary with nothing behind it is refused");
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, "OASTS0221");
     }
 
     #[test]

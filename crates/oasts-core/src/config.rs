@@ -1606,19 +1606,41 @@ fn resolve_input(
 /// `auto` and `off` are the two words; anything else is a path, held to the same below-workspace
 /// containment every other path in this config gets. A path is resolved against the config
 /// directory the way `input` and `output` are, so a config can name a tsconfig beside itself.
-/// Refuses a config asking for a `tsconfig.json` that a host with no filesystem cannot read.
+/// Refuses a config asking for a `tsconfig.json` that a host with no filesystem cannot read, and
+/// reports the one default whose meaning changes without one.
 ///
 /// The ambient tsconfig probe is the one input outside version, config and document that reaches
 /// emitted bytes, so a filesystem-free host states its answer rather than inheriting one. `auto` is
 /// refused alongside a path: it would quietly mean `off` here while meaning something else to the
 /// same config run through the CLI.
-pub fn require_tsconfig_off(raw: &RawConfig, config_path: &Path) -> Result<(), Diagnostic> {
+///
+/// An absent key is the same divergence with nobody to blame for it — it means `auto`, and the CLI
+/// would probe ancestors of the output directory that a browser does not have. Refusing it would
+/// reject almost every real config, so it is answered with `off` and a warning saying so. The
+/// difference is visible: an ambient `tsconfig.json` declaring `esnext.temporal` suppresses the
+/// emitted `/// <reference lib="esnext.temporal">` line, and without one it is emitted.
+pub fn require_tsconfig_off(
+    raw: &RawConfig,
+    config_path: &Path,
+) -> Result<Option<Diagnostic>, Diagnostic> {
     match raw
         .typescript
         .as_ref()
         .and_then(|block| block.tsconfig.as_deref())
     {
-        None | Some("off") => Ok(()),
+        Some("off") => Ok(None),
+        None => {
+            let mut diagnostic = config_error(
+                CODE_TYPESCRIPT,
+                "typescript.tsconfig defaulted to \"off\" because this host has no filesystem to \
+                 probe; a local run whose tsconfig.json declares esnext.temporal emits different \
+                 bytes",
+                Some(config_path),
+                Some("/typescript/tsconfig"),
+            );
+            diagnostic.severity = Severity::Warning;
+            Ok(Some(diagnostic))
+        }
         Some(requested) => Err(config_error(
             CODE_TYPESCRIPT,
             format!(
@@ -1627,6 +1649,23 @@ pub fn require_tsconfig_off(raw: &RawConfig, config_path: &Path) -> Result<(), D
             Some(config_path),
             Some("/typescript/tsconfig"),
         )),
+    }
+}
+
+/// Refuses `local.allowPaths`, which widens a trust boundary that has nothing behind it.
+///
+/// Every entry names a directory outside the workspace root, and a host with no filesystem has no
+/// directories at all. Left to run, each entry fails canonicalization and the caller reads a
+/// document-IO error about a path they never supplied a document for.
+pub fn require_no_local_allow_paths(raw: &RawConfig, config_path: &Path) -> Result<(), Diagnostic> {
+    match raw.local.as_ref() {
+        Some(local) if !local.allow_paths.is_empty() => Err(config_error(
+            CODE_TRUST_LIMITS,
+            "local.allowPaths widens the set of readable directories, and this host has none",
+            Some(config_path),
+            Some("/local/allowPaths"),
+        )),
+        _ => Ok(()),
     }
 }
 
