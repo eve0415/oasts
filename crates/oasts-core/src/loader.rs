@@ -1993,10 +1993,10 @@ fn file_path_from_url(url: &Url) -> Option<PathBuf> {
         Some(url::Host::Domain("localhost")) => {}
         Some(_) => return None,
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(url.path().len());
     for segment in url.path_segments()? {
         bytes.push(b'/');
-        bytes.extend(percent_decode_segment(segment.as_bytes()));
+        percent_decode_segment(segment.as_bytes(), &mut bytes);
     }
     if bytes.len() > 2
         && bytes[bytes.len() - 2].is_ascii_alphabetic()
@@ -2007,13 +2007,15 @@ fn file_path_from_url(url: &Url) -> Option<PathBuf> {
     path_from_bytes(bytes)
 }
 
-/// Percent-decodes one path segment, leniently.
+/// Percent-decodes one path segment onto `decoded`, leniently.
 ///
 /// `url` leaves a malformed escape as literal bytes rather than rejecting it, and a path segment
 /// never contains an unencoded `/` — it was split on one — so this is byte-wise with no separator
 /// to preserve. Distinct from [`percent_decode`], which decodes a URI fragment and does reject.
-fn percent_decode_segment(segment: &[u8]) -> Vec<u8> {
-    let mut decoded = Vec::with_capacity(segment.len());
+///
+/// Appends rather than returning, because the caller is assembling one path out of every segment
+/// and a `Vec` per segment is an allocation per `$ref` resolved.
+fn percent_decode_segment(segment: &[u8], decoded: &mut Vec<u8>) {
     let mut index = 0;
     while index < segment.len() {
         let escape = (segment[index] == b'%' && index.saturating_add(2) < segment.len())
@@ -2034,7 +2036,6 @@ fn percent_decode_segment(segment: &[u8]) -> Vec<u8> {
             }
         }
     }
-    decoded
 }
 
 fn local_path_from_url(
