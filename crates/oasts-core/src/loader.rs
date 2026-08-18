@@ -17,7 +17,7 @@ use url::Url;
 
 use crate::config::ResolvedConfig;
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
-use crate::source::{DocumentSource, SourceHandle};
+use crate::source::{DocumentSource, SourceHandle, is_rooted};
 use crate::syntax::parse_yaml_document_value;
 
 const CODE_DOCUMENT_IO: &str = "OASTS1003";
@@ -1564,7 +1564,7 @@ fn extension_fallback_warning(source_id: &str, extension: &str, format: &str) ->
 }
 
 fn configured_entry_path(path: &Path) -> Result<PathBuf, Diagnostic> {
-    if path.is_absolute() {
+    if is_rooted(path) {
         return Ok(path.to_path_buf());
     }
     let Some(value) = path.to_str() else {
@@ -1953,7 +1953,7 @@ fn file_url(path: &Path) -> Result<Url, String> {
             path.display()
         )
     };
-    if !path.is_absolute() {
+    if !is_rooted(path) {
         return Err(unrepresentable());
     }
     let mut serialization = String::from("file://");

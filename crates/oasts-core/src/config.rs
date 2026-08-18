@@ -11,7 +11,7 @@ use serde_json::{Number, Value};
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::filter::Filters;
-use crate::source::{DocumentSource, FsSource};
+use crate::source::{DocumentSource, FsSource, is_rooted};
 use crate::syntax::parse_yaml_value;
 
 const CODE_DISCOVERY: &str = "OASTS0011";
@@ -2223,7 +2223,7 @@ fn resolve_local_paths(
         .iter()
         .filter_map(|entry| {
             let path = Path::new(entry);
-            if path.is_absolute() {
+            if is_rooted(path) {
                 sink.push(config_error(
                     CODE_TRUST_LIMITS,
                     format!("local.allowPaths entry '{entry}' must be relative"),
@@ -2364,7 +2364,7 @@ fn normalize_directory(value: &str) -> String {
 }
 
 fn resolve_below(base: &Path, relative: &Path, allow_equal: bool) -> Result<PathBuf, String> {
-    if relative.is_absolute() {
+    if is_rooted(relative) {
         return Err("path must be relative".to_owned());
     }
     let candidate = lexical_join_below(base, relative)

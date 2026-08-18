@@ -10,6 +10,17 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+/// Whether `path` starts at a root.
+///
+/// `Path::is_absolute` answers for the host platform, and `wasm32-unknown-unknown` has no path
+/// semantics to answer with: std reports every path there as relative, including the synthetic
+/// absolute paths a host with no filesystem mints. A leading root component is the question
+/// actually being asked, and it agrees with `is_absolute` on every target that has an opinion.
+#[must_use]
+pub fn is_rooted(path: &Path) -> bool {
+    path.has_root() && (path.is_absolute() || cfg!(target_family = "wasm"))
+}
+
 /// Supplies document bytes and the identities documents are deduplicated by.
 ///
 /// `Send + Sync` because the document graph outlives loading and is read from rayon workers during
@@ -114,7 +125,7 @@ impl MemorySource {
 
     /// Resolves `.` and `..` against the root without asking anything about the world.
     fn normalize(&self, path: &Path) -> PathBuf {
-        let mut resolved = if path.is_absolute() {
+        let mut resolved = if is_rooted(path) {
             PathBuf::new()
         } else {
             self.root.clone()
