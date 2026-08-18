@@ -11,6 +11,7 @@ use serde_json::{Number, Value};
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::filter::Filters;
+use crate::source::{DocumentSource, FsSource};
 use crate::syntax::parse_yaml_value;
 
 const CODE_DISCOVERY: &str = "OASTS0011";
@@ -1216,7 +1217,7 @@ pub fn load_config(explicit: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig
         )]
     })?;
     let raw = parse_config(&config_path, &source).map_err(|diagnostic| vec![diagnostic])?;
-    resolve_config(config_path, raw)
+    resolve_config(config_path, raw, &FsSource)
 }
 
 /// Loads a configuration from in-memory JSON bytes anchored at `config_path`.
@@ -1229,13 +1230,25 @@ pub fn load_config_from_json(
     config_path: &Path,
     json: &[u8],
 ) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+    load_config_from_json_with_source(config_path, json, &FsSource)
+}
+
+/// Loads a configuration from in-memory JSON bytes, resolving paths through `source`.
+///
+/// An absolute `config_path` needs no filesystem at all: it normalises lexically, and `source`
+/// answers for its parent directory.
+pub fn load_config_from_json_with_source(
+    config_path: &Path,
+    json: &[u8],
+    source: &dyn DocumentSource,
+) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     let config_path = if config_path.is_absolute() {
         normalize_config_path(config_path.to_path_buf())
     } else {
         absolutize_config_path(config_path.to_path_buf(), std::env::current_dir())?
     };
     let raw = parse_config_json(&config_path, json).map_err(|diagnostic| vec![diagnostic])?;
-    resolve_config(config_path, raw)
+    resolve_config(config_path, raw, source)
 }
 
 /// Parses in-memory JSON config bytes into an unvalidated [`RawConfig`].
@@ -1298,6 +1311,7 @@ fn parse_config(path: &Path, source: &str) -> Result<RawConfig, Diagnostic> {
 pub fn resolve_config(
     config_path: PathBuf,
     raw: RawConfig,
+    source: &dyn DocumentSource,
 ) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     let mut sink = DiagnosticSink::new();
     let source_path = config_path.as_path();
@@ -1312,7 +1326,7 @@ pub fn resolve_config(
             None,
         )]);
     };
-    let config_dir = match fs::canonicalize(config_parent) {
+    let config_dir = match source.canonicalize(config_parent) {
         Ok(path) => path,
         Err(error) => {
             sink.push(config_error(
@@ -2435,6 +2449,45 @@ mod tests {
     use crate::diag::Category;
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    /// A source with no filesystem behind it: paths are their own identities, and nothing is
+    /// readable. Enough to resolve a config, which reads no document.
+    #[derive(Debug)]
+    struct IdentitySource;
+
+    impl DocumentSource for IdentitySource {
+        fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            Ok(path.to_path_buf())
+        }
+
+        fn byte_len(&self, _path: &Path) -> std::io::Result<u64> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+
+        fn read(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+    }
+
+    #[test]
+    fn an_absolute_config_path_resolves_without_a_filesystem() {
+        let config_path = Path::new("/workspace/oasts.json");
+        let json = serde_json::to_vec(&valid_json_value()).expect("config JSON");
+
+        let resolved = load_config_from_json_with_source(config_path, &json, &IdentitySource)
+            .expect("config resolves against a source with no filesystem");
+
+        assert_eq!(resolved.config_dir, PathBuf::from("/workspace"));
+        assert_eq!(resolved.config_path, PathBuf::from("/workspace/oasts.json"));
+        assert_eq!(
+            IdentitySource.byte_len(config_path).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            IdentitySource.read(config_path).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
 
     struct TestDirectory {
         path: PathBuf,
@@ -4412,7 +4465,8 @@ mod tests {
         let missing = std::env::temp_dir()
             .join("oasts-parent-that-does-not-exist")
             .join("config.json");
-        let diagnostics = resolve_config(missing, raw).expect_err("missing parent should fail");
+        let diagnostics =
+            resolve_config(missing, raw, &FsSource).expect_err("missing parent should fail");
         assert!(
             diagnostics
                 .iter()
