@@ -4,9 +4,10 @@
 //! path serves a filesystem host and a host that has no filesystem at all. One path cannot drift
 //! from itself, and emitted bytes are contractual across every front-end.
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 /// Supplies document bytes and the identities documents are deduplicated by.
@@ -84,6 +85,109 @@ impl DocumentSource for SourceHandle {
     }
 }
 
+/// Documents held in memory, rooted at a synthetic workspace.
+///
+/// A host with no filesystem still needs identities to deduplicate documents by and to resolve
+/// `$ref`s against. Those identities are minted from the supplied keys: normalised lexically,
+/// contained below the root, and never re-derived into a location. A `$ref` naming a document
+/// nobody supplied fails as a missing document rather than reaching the host.
+#[derive(Clone, Debug)]
+pub struct MemorySource {
+    root: PathBuf,
+    documents: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+impl MemorySource {
+    /// Creates an empty source rooted at `root`, which is treated as an absolute directory.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            documents: BTreeMap::new(),
+        }
+    }
+
+    /// Seats one document. A relative `path` is taken as relative to the root.
+    pub fn insert(&mut self, path: impl AsRef<Path>, contents: Vec<u8>) {
+        let path = self.normalize(path.as_ref());
+        self.documents.insert(path, contents);
+    }
+
+    /// Resolves `.` and `..` against the root without asking anything about the world.
+    fn normalize(&self, path: &Path) -> PathBuf {
+        let mut resolved = if path.is_absolute() {
+            PathBuf::new()
+        } else {
+            self.root.clone()
+        };
+        for component in path.components() {
+            match component {
+                // A prefix only occurs on Windows; both are roots, and both restart the path.
+                Component::RootDir | Component::Prefix(_) => {
+                    resolved.push(component.as_os_str());
+                }
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                Component::Normal(segment) => resolved.push(segment),
+            }
+        }
+        resolved
+    }
+
+    /// The identity of `path`, or the reason it has none.
+    fn locate(&self, path: &Path) -> io::Result<PathBuf> {
+        let resolved = self.normalize(path);
+        if !resolved.starts_with(&self.root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "'{}' resolves outside the workspace root '{}'",
+                    resolved.display(),
+                    self.root.display()
+                ),
+            ));
+        }
+        if resolved == self.root || self.documents.contains_key(&resolved) {
+            return Ok(resolved);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no document was supplied at '{}'", resolved.display()),
+        ))
+    }
+
+    fn contents(&self, path: &Path) -> io::Result<&[u8]> {
+        let resolved = self.locate(path)?;
+        self.documents
+            .get(&resolved)
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "'{}' is the workspace root, not a document",
+                        resolved.display()
+                    ),
+                )
+            })
+    }
+}
+
+impl DocumentSource for MemorySource {
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        self.locate(path)
+    }
+
+    fn byte_len(&self, path: &Path) -> io::Result<u64> {
+        self.contents(path).map(|contents| contents.len() as u64)
+    }
+
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.contents(path).map(<[u8]>::to_vec)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +240,106 @@ mod tests {
         let canonical = shared.canonicalize(&path).expect("canonicalize");
         assert_eq!(shared.byte_len(&canonical).expect("byte_len"), 15);
         assert_eq!(shared.read(&canonical).expect("read"), b"openapi: 3.1.1\n");
+    }
+
+    #[test]
+    fn a_supplied_document_reads_back() {
+        let mut source = MemorySource::new("/workspace");
+        source.insert("/workspace/openapi.yaml", b"openapi: 3.1.1\n".to_vec());
+
+        let canonical = source
+            .canonicalize(Path::new("/workspace/openapi.yaml"))
+            .expect("canonicalize");
+
+        assert_eq!(canonical, PathBuf::from("/workspace/openapi.yaml"));
+        assert_eq!(source.byte_len(&canonical).expect("byte_len"), 15);
+        assert_eq!(source.read(&canonical).expect("read"), b"openapi: 3.1.1\n");
+    }
+
+    #[test]
+    fn an_unsupplied_document_is_missing_rather_than_empty() {
+        let source = MemorySource::new("/workspace");
+        let absent = Path::new("/workspace/components.yaml");
+
+        assert_eq!(
+            source.canonicalize(absent).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            source.byte_len(absent).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            source.read(absent).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn the_root_is_its_own_identity() {
+        // Config resolution canonicalizes the config's parent directory, and the graph builder
+        // canonicalizes the workspace root. Neither is a document, and both must answer.
+        let source = MemorySource::new("/workspace");
+
+        assert_eq!(
+            source.canonicalize(Path::new("/workspace")).expect("root"),
+            PathBuf::from("/workspace")
+        );
+    }
+
+    #[test]
+    fn the_root_is_an_identity_but_not_a_document() {
+        let source = MemorySource::new("/workspace");
+        let root = Path::new("/workspace");
+
+        assert!(source.canonicalize(root).is_ok());
+        assert_eq!(
+            source.byte_len(root).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            source.read(root).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn dot_segments_resolve_without_a_filesystem() {
+        let mut source = MemorySource::new("/workspace");
+        source.insert("/workspace/api/openapi.yaml", b"openapi: 3.1.1\n".to_vec());
+
+        for written in [
+            "/workspace/api/./openapi.yaml",
+            "/workspace/api/nested/../openapi.yaml",
+            "api/openapi.yaml",
+        ] {
+            assert_eq!(
+                source.canonicalize(Path::new(written)).expect(written),
+                PathBuf::from("/workspace/api/openapi.yaml"),
+                "{written}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reference_climbing_out_of_the_root_is_refused() {
+        let mut source = MemorySource::new("/workspace");
+        source.insert("/workspace/openapi.yaml", b"openapi: 3.1.1\n".to_vec());
+
+        let escaping = Path::new("/workspace/../etc/passwd");
+
+        assert_eq!(
+            source.canonicalize(escaping).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            source.byte_len(escaping).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            source.read(escaping).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
