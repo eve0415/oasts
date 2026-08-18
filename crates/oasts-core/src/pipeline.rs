@@ -67,6 +67,70 @@ mod tests {
 
     use crate::config::{load_config, load_config_from_json};
 
+    /// Builds a document wide enough to cross `PARALLEL_PARSE_MIN_ITEMS`, which no fixture in the
+    /// repository does, so parse takes its rayon branch rather than the sequential fallback.
+    fn wide_document(schema_count: usize, path_count: usize) -> String {
+        let mut spec = String::from("openapi: 3.1.1\ninfo: {title: t, version: 1.0.0}\npaths:\n");
+        for index in 0..path_count {
+            let schema = index % schema_count;
+            spec.push_str(&format!(
+                "  /items{index}:\n    get:\n      operationId: getItem{index}\n      parameters:\n        - {{name: q, in: query, schema: {{type: string}}}}\n      responses:\n        \"200\":\n          description: ok\n          content:\n            application/json:\n              schema: {{$ref: \"#/components/schemas/Schema{schema}\"}}\n"
+            ));
+        }
+        spec.push_str("components:\n  schemas:\n");
+        for index in 0..schema_count {
+            spec.push_str(&format!(
+                "    Schema{index}: {{type: object, required: [name], properties: {{name: {{type: string}}, index: {{type: integer}}}}}}\n"
+            ));
+        }
+        spec
+    }
+
+    #[test]
+    fn compile_emits_identical_bytes_regardless_of_thread_count() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("openapi.yaml"), wide_document(80, 80))
+            .expect("OpenAPI document");
+        let raw = json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.yaml" },
+            "output": "generated",
+            "artifacts": {
+                "types": true,
+                "client": true,
+                "validators": true,
+                "zod": true,
+                "tanstack": true,
+                "msw": true
+            },
+            "validation": { "engine": "generated", "request": true, "response": true }
+        });
+        let config = load_config_from_json(
+            &temp.path().join("oasts.json"),
+            &serde_json::to_vec(&raw).expect("config JSON"),
+        )
+        .expect("resolved config");
+
+        let compile_with = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("rayon pool");
+            pool.install(|| {
+                let mut sink = DiagnosticSink::new();
+                let files = compile(&config, true, &mut sink).expect("emitted files");
+                assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+                files
+            })
+        };
+
+        let single = compile_with(1);
+        let parallel = compile_with(8);
+
+        assert!(single.len() > 1, "{}", single.len());
+        assert_eq!(single, parallel);
+    }
+
     #[test]
     fn compile_emits_files_only_when_requested() {
         let temp = tempfile::tempdir().expect("tempdir");
