@@ -1904,14 +1904,19 @@ fn resolve_identity_uri(
     })
 }
 
-/// The bytes `Url::from_file_path` percent-encodes a path component with: the WHATWG special
-/// path segment set, plus every non-ASCII byte.
-///
-/// Restated here rather than borrowed, because `url`'s file-path helpers are compiled out on
-/// `wasm32-unknown-unknown` — they are gated on `any(unix, windows, redox, wasi, hermit)` and no
-/// cargo feature re-enables them. One conversion on every target is what keeps a browser build
-/// resolving `$ref`s to the same documents the CLI resolves them to;
-/// `file_url_conversion_agrees_with_the_url_crate` is the check that they stay the same function.
+// The stand-in conversions below are compiled for the browser, and for tests everywhere.
+//
+// `Url::from_file_path` and `Url::to_file_path` are gated on `any(unix, windows, redox, wasi,
+// hermit)` and no cargo feature re-enables them, so `wasm32-unknown-unknown` has to be served some
+// other way. Everywhere else `url` stays the definition rather than a reference implementation:
+// its Windows half maps a drive prefix to `/C:`, runs a UNC server through IDNA host parsing, and
+// encodes with a different set — none of which this crate can reproduce faithfully.
+// `file_url_conversion_agrees_with_the_url_crate` is what holds the two to the same answer.
+
+/// The bytes `Url::from_file_path` percent-encodes a path component with: the WHATWG special path
+/// segment set, plus every non-ASCII byte. Restated rather than borrowed, because the set is
+/// private to `url`.
+#[cfg(any(test, all(target_family = "wasm", not(target_os = "wasi"))))]
 fn must_percent_encode(byte: u8) -> bool {
     !byte.is_ascii()
         || byte.is_ascii_control()
@@ -1923,30 +1928,54 @@ fn must_percent_encode(byte: u8) -> bool {
 
 /// A path component's bytes. Only unix can offer them for a non-Unicode component; elsewhere a
 /// component that is not UTF-8 has no representation, which the caller reports as a failure.
-#[cfg(unix)]
+#[cfg(all(unix, any(test, all(target_family = "wasm", not(target_os = "wasi")))))]
 fn component_bytes(segment: &OsStr) -> Option<&[u8]> {
     use std::os::unix::ffi::OsStrExt;
     Some(segment.as_bytes())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(
+    not(unix),
+    any(test, all(target_family = "wasm", not(target_os = "wasi")))
+))]
 fn component_bytes(segment: &OsStr) -> Option<&[u8]> {
     segment.to_str().map(str::as_bytes)
 }
 
 /// The inverse, subject to the same limit.
-#[cfg(unix)]
+#[cfg(all(unix, any(test, all(target_family = "wasm", not(target_os = "wasi")))))]
 fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(
+    not(unix),
+    any(test, all(target_family = "wasm", not(target_os = "wasi")))
+))]
 fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
     String::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
+/// A document's retrieval URI, which `$ref`s resolve against.
+#[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
 fn file_url(path: &Path) -> Result<Url, String> {
+    Url::from_file_path(path).map_err(|()| {
+        format!(
+            "local document path '{}' cannot be represented as a file URI",
+            path.display()
+        )
+    })
+}
+
+#[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
+fn file_url(path: &Path) -> Result<Url, String> {
+    portable_file_url(path)
+}
+
+/// The browser's stand-in for `Url::from_file_path`, holding to its unix shape byte for byte.
+#[cfg(any(test, all(target_family = "wasm", not(target_os = "wasi"))))]
+fn portable_file_url(path: &Path) -> Result<Url, String> {
     let unrepresentable = || {
         format!(
             "local document path '{}' cannot be represented as a file URI",
@@ -1982,12 +2011,25 @@ fn file_url(path: &Path) -> Result<Url, String> {
     Ok(Url::parse(&serialization).expect("a percent-encoded absolute path is a file URL"))
 }
 
-/// The inverse of [`file_url`], for a URL already known to use the `file` scheme.
+/// The local path a `file` URL names.
+#[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
+fn file_path_from_url(url: &Url) -> Option<PathBuf> {
+    url.to_file_path().ok()
+}
+
+#[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
+fn file_path_from_url(url: &Url) -> Option<PathBuf> {
+    portable_file_path_from_url(url)
+}
+
+#[cfg(any(test, all(target_family = "wasm", not(target_os = "wasi"))))]
+/// The browser's stand-in for `Url::to_file_path`, for a URL already known to use the `file`
+/// scheme.
 ///
 /// Mirrors `Url::to_file_path`: a host other than an empty one or `localhost` is refused, and a
 /// trailing Windows drive letter grows the slash that makes it a directory. That last rule fires on
 /// every platform in `url`, so it fires here too.
-fn file_path_from_url(url: &Url) -> Option<PathBuf> {
+fn portable_file_path_from_url(url: &Url) -> Option<PathBuf> {
     match url.host() {
         None => {}
         Some(url::Host::Domain("localhost")) => {}
@@ -2007,6 +2049,7 @@ fn file_path_from_url(url: &Url) -> Option<PathBuf> {
     path_from_bytes(bytes)
 }
 
+#[cfg(any(test, all(target_family = "wasm", not(target_os = "wasi"))))]
 /// Percent-decodes one path segment onto `decoded`, leniently.
 ///
 /// `url` leaves a malformed escape as literal bytes rather than rejecting it, and a path segment
@@ -2478,11 +2521,17 @@ mod tests {
             // the coverage gate counts and no passing run reaches.
             let shown = path.display().to_string();
             assert_eq!(
-                file_url(path).map_err(|_| ()),
+                portable_file_url(path).map_err(|_| ()),
                 Url::from_file_path(path),
                 "{shown}"
             );
         }
+
+        // A relative path is not a file URI, and both say so.
+        assert_eq!(
+            portable_file_url(Path::new("relative/path")).map_err(|_| ()),
+            Url::from_file_path("relative/path")
+        );
     }
 
     #[test]
@@ -2494,7 +2543,7 @@ mod tests {
         for path in &corpus {
             let url = Url::from_file_path(path).expect("an absolute path is a file URI");
             assert_eq!(
-                file_path_from_url(&url).ok_or(()),
+                portable_file_path_from_url(&url).ok_or(()),
                 url.to_file_path(),
                 "{url}"
             );
@@ -2511,7 +2560,7 @@ mod tests {
         ] {
             let url = Url::parse(raw).expect("parsable URL");
             assert_eq!(
-                file_path_from_url(&url).ok_or(()),
+                portable_file_path_from_url(&url).ok_or(()),
                 url.to_file_path(),
                 "{raw}"
             );
