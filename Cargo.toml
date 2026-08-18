@@ -18,6 +18,11 @@ codegen-units = 1
 lto = "fat"
 strip = "symbols"
 
+# The browser artifact is a CDN asset, so it optimises for size where the CLI optimises for speed.
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+
 # Release-equivalent code generation with symbols retained for the feature-gated
 # oasts-bench CPU and heap profilers.
 [profile.profiling]
