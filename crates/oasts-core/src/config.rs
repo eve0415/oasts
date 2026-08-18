@@ -11,6 +11,7 @@ use serde_json::{Number, Value};
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::filter::Filters;
+use crate::source::{DocumentSource, FsSource, is_rooted};
 use crate::syntax::parse_yaml_value;
 
 const CODE_DISCOVERY: &str = "OASTS0011";
@@ -1216,7 +1217,7 @@ pub fn load_config(explicit: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig
         )]
     })?;
     let raw = parse_config(&config_path, &source).map_err(|diagnostic| vec![diagnostic])?;
-    resolve_config(config_path, raw)
+    resolve_config(config_path, raw, &FsSource)
 }
 
 /// Loads a configuration from in-memory JSON bytes anchored at `config_path`.
@@ -1229,13 +1230,25 @@ pub fn load_config_from_json(
     config_path: &Path,
     json: &[u8],
 ) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+    load_config_from_json_with_source(config_path, json, &FsSource)
+}
+
+/// Loads a configuration from in-memory JSON bytes, resolving paths through `source`.
+///
+/// An absolute `config_path` needs no filesystem at all: it normalises lexically, and `source`
+/// answers for its parent directory.
+pub fn load_config_from_json_with_source(
+    config_path: &Path,
+    json: &[u8],
+    source: &dyn DocumentSource,
+) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     let config_path = if config_path.is_absolute() {
         normalize_config_path(config_path.to_path_buf())
     } else {
         absolutize_config_path(config_path.to_path_buf(), std::env::current_dir())?
     };
     let raw = parse_config_json(&config_path, json).map_err(|diagnostic| vec![diagnostic])?;
-    resolve_config(config_path, raw)
+    resolve_config(config_path, raw, source)
 }
 
 /// Parses in-memory JSON config bytes into an unvalidated [`RawConfig`].
@@ -1298,6 +1311,7 @@ fn parse_config(path: &Path, source: &str) -> Result<RawConfig, Diagnostic> {
 pub fn resolve_config(
     config_path: PathBuf,
     raw: RawConfig,
+    source: &dyn DocumentSource,
 ) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     let mut sink = DiagnosticSink::new();
     let source_path = config_path.as_path();
@@ -1312,7 +1326,7 @@ pub fn resolve_config(
             None,
         )]);
     };
-    let config_dir = match fs::canonicalize(config_parent) {
+    let config_dir = match source.canonicalize(config_parent) {
         Ok(path) => path,
         Err(error) => {
             sink.push(config_error(
@@ -1592,6 +1606,69 @@ fn resolve_input(
 /// `auto` and `off` are the two words; anything else is a path, held to the same below-workspace
 /// containment every other path in this config gets. A path is resolved against the config
 /// directory the way `input` and `output` are, so a config can name a tsconfig beside itself.
+/// Refuses a config asking for a `tsconfig.json` that a host with no filesystem cannot read, and
+/// reports the one default whose meaning changes without one.
+///
+/// The ambient tsconfig probe is the one input outside version, config and document that reaches
+/// emitted bytes, so a filesystem-free host states its answer rather than inheriting one. `auto` is
+/// refused alongside a path: it would quietly mean `off` here while meaning something else to the
+/// same config run through the CLI.
+///
+/// An absent key is the same divergence with nobody to blame for it — it means `auto`, and the CLI
+/// would probe ancestors of the output directory that a browser does not have. Refusing it would
+/// reject almost every real config, so it is answered with `off` and a warning saying so. The
+/// difference is visible: an ambient `tsconfig.json` declaring `esnext.temporal` suppresses the
+/// emitted `/// <reference lib="esnext.temporal">` line, and without one it is emitted.
+pub fn require_tsconfig_off(
+    raw: &RawConfig,
+    config_path: &Path,
+) -> Result<Option<Diagnostic>, Diagnostic> {
+    match raw
+        .typescript
+        .as_ref()
+        .and_then(|block| block.tsconfig.as_deref())
+    {
+        Some("off") => Ok(None),
+        None => {
+            let mut diagnostic = config_error(
+                CODE_TYPESCRIPT,
+                "typescript.tsconfig defaulted to \"off\" because this host has no filesystem to \
+                 probe; a local run whose tsconfig.json declares esnext.temporal emits different \
+                 bytes",
+                Some(config_path),
+                Some("/typescript/tsconfig"),
+            );
+            diagnostic.severity = Severity::Warning;
+            Ok(Some(diagnostic))
+        }
+        Some(requested) => Err(config_error(
+            CODE_TYPESCRIPT,
+            format!(
+                "typescript.tsconfig must be \"off\" without a filesystem, not \"{requested}\""
+            ),
+            Some(config_path),
+            Some("/typescript/tsconfig"),
+        )),
+    }
+}
+
+/// Refuses `local.allowPaths`, which widens a trust boundary that has nothing behind it.
+///
+/// Every entry names a directory outside the workspace root, and a host with no filesystem has no
+/// directories at all. Left to run, each entry fails canonicalization and the caller reads a
+/// document-IO error about a path they never supplied a document for.
+pub fn require_no_local_allow_paths(raw: &RawConfig, config_path: &Path) -> Result<(), Diagnostic> {
+    match raw.local.as_ref() {
+        Some(local) if !local.allow_paths.is_empty() => Err(config_error(
+            CODE_TRUST_LIMITS,
+            "local.allowPaths widens the set of readable directories, and this host has none",
+            Some(config_path),
+            Some("/local/allowPaths"),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn resolve_tsconfig_source(
     raw: Option<&RawTypescript>,
     workspace_root: &Path,
@@ -2185,7 +2262,7 @@ fn resolve_local_paths(
         .iter()
         .filter_map(|entry| {
             let path = Path::new(entry);
-            if path.is_absolute() {
+            if is_rooted(path) {
                 sink.push(config_error(
                     CODE_TRUST_LIMITS,
                     format!("local.allowPaths entry '{entry}' must be relative"),
@@ -2326,7 +2403,7 @@ fn normalize_directory(value: &str) -> String {
 }
 
 fn resolve_below(base: &Path, relative: &Path, allow_equal: bool) -> Result<PathBuf, String> {
-    if relative.is_absolute() {
+    if is_rooted(relative) {
         return Err("path must be relative".to_owned());
     }
     let candidate = lexical_join_below(base, relative)
@@ -2435,6 +2512,45 @@ mod tests {
     use crate::diag::Category;
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    /// A source with no filesystem behind it: paths are their own identities, and nothing is
+    /// readable. Enough to resolve a config, which reads no document.
+    #[derive(Debug)]
+    struct IdentitySource;
+
+    impl DocumentSource for IdentitySource {
+        fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            Ok(path.to_path_buf())
+        }
+
+        fn byte_len(&self, _path: &Path) -> std::io::Result<u64> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+
+        fn read(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+    }
+
+    #[test]
+    fn an_absolute_config_path_resolves_without_a_filesystem() {
+        let config_path = Path::new("/workspace/oasts.json");
+        let json = serde_json::to_vec(&valid_json_value()).expect("config JSON");
+
+        let resolved = load_config_from_json_with_source(config_path, &json, &IdentitySource)
+            .expect("config resolves against a source with no filesystem");
+
+        assert_eq!(resolved.config_dir, PathBuf::from("/workspace"));
+        assert_eq!(resolved.config_path, PathBuf::from("/workspace/oasts.json"));
+        assert_eq!(
+            IdentitySource.byte_len(config_path).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            IdentitySource.read(config_path).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
 
     struct TestDirectory {
         path: PathBuf,
@@ -4412,7 +4528,8 @@ mod tests {
         let missing = std::env::temp_dir()
             .join("oasts-parent-that-does-not-exist")
             .join("config.json");
-        let diagnostics = resolve_config(missing, raw).expect_err("missing parent should fail");
+        let diagnostics =
+            resolve_config(missing, raw, &FsSource).expect_err("missing parent should fail");
         assert!(
             diagnostics
                 .iter()

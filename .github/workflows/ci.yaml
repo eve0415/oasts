@@ -325,6 +325,30 @@ jobs:
       - name: Coverage gate
         run: scripts/coverage.sh
 
+  wasm:
+    name: wasm output against the CLI
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
+      # rust-toolchain.toml declares wasm32-unknown-unknown, so rustup installs it here.
+      - name: Compare wasm output with the CLI
+        run: scripts/wasm-gate.sh
+
   # One status to require in branch protection, so adding a job above does not
   # mean editing the protection rule.
   ci:
@@ -342,6 +366,7 @@ jobs:
       - consume
       - coverage
       - workflows
+      - wasm
     permissions:
       contents: read
 

@@ -1144,6 +1144,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oasts-wasm"
+version = "0.0.4"
+dependencies = [
+ "oasts-core",
+ "serde_json",
+]
+
+[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

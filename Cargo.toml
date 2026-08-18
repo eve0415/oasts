@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/oasts-core", "crates/oasts", "crates/oasts-napi", "crates/oasts-gen", "crates/oasts-bench"]
+members = ["crates/oasts-core", "crates/oasts", "crates/oasts-napi", "crates/oasts-wasm", "crates/oasts-gen", "crates/oasts-bench"]
 
 [workspace.package]
 version = "0.0.4"
@@ -17,6 +17,11 @@ categories = ["command-line-utilities", "development-tools"]
 codegen-units = 1
 lto = "fat"
 strip = "symbols"
+
+# The browser artifact is a CDN asset, so it optimises for size where the CLI optimises for speed.
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
 
 # Release-equivalent code generation with symbols retained for the feature-gated
 # oasts-bench CPU and heap profilers.

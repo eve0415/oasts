@@ -1,0 +1,18 @@
+[package]
+name = "oasts-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oasts-core = { path = "../oasts-core" }
+serde_json = { version = "=1.0.151", features = ["arbitrary_precision", "preserve_order"] }

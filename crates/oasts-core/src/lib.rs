@@ -17,6 +17,7 @@ mod peer;
 pub mod pipeline;
 mod response_media;
 pub mod semantic;
+pub mod source;
 mod syntax;
 pub mod transform;
 mod tsconfig;
