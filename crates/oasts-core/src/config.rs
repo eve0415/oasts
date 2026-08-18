@@ -1606,6 +1606,30 @@ fn resolve_input(
 /// `auto` and `off` are the two words; anything else is a path, held to the same below-workspace
 /// containment every other path in this config gets. A path is resolved against the config
 /// directory the way `input` and `output` are, so a config can name a tsconfig beside itself.
+/// Refuses a config asking for a `tsconfig.json` that a host with no filesystem cannot read.
+///
+/// The ambient tsconfig probe is the one input outside version, config and document that reaches
+/// emitted bytes, so a filesystem-free host states its answer rather than inheriting one. `auto` is
+/// refused alongside a path: it would quietly mean `off` here while meaning something else to the
+/// same config run through the CLI.
+pub fn require_tsconfig_off(raw: &RawConfig, config_path: &Path) -> Result<(), Diagnostic> {
+    match raw
+        .typescript
+        .as_ref()
+        .and_then(|block| block.tsconfig.as_deref())
+    {
+        None | Some("off") => Ok(()),
+        Some(requested) => Err(config_error(
+            CODE_TYPESCRIPT,
+            format!(
+                "typescript.tsconfig must be \"off\" without a filesystem, not \"{requested}\""
+            ),
+            Some(config_path),
+            Some("/typescript/tsconfig"),
+        )),
+    }
+}
+
 fn resolve_tsconfig_source(
     raw: Option<&RawTypescript>,
     workspace_root: &Path,

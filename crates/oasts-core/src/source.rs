@@ -312,6 +312,8 @@ mod tests {
             "/workspace/api/./openapi.yaml",
             "/workspace/api/nested/../openapi.yaml",
             "api/openapi.yaml",
+            // Only a leading `.` survives `Path::components`; an interior one is folded away.
+            "./api/openapi.yaml",
         ] {
             assert_eq!(
                 source.canonicalize(Path::new(written)).expect(written),

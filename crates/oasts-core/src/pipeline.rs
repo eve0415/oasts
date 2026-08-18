@@ -4,15 +4,26 @@
 //! resolved configuration so the standalone binary and the Node binding run
 //! the identical sequence.
 
+use std::path::Path;
+use std::sync::Arc;
+
 use crate::client_model::build_client_model;
-use crate::config::ResolvedConfig;
-use crate::diag::DiagnosticSink;
+use crate::config::{ResolvedConfig, TsconfigSource};
+use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::emit::{GeneratedFile, emit_artifacts};
-use crate::loader::load_graph;
+use crate::loader::load_graph_with_source;
 use crate::parse::parse;
 use crate::semantic::analyze;
+use crate::source::{MemorySource, SourceHandle};
 
-/// Compiles one resolved configuration into generated files.
+/// The synthetic root an in-memory compile is seated at.
+///
+/// Nothing on any host is named by it. `authorize_path` writes the literal prefix `workspace` into
+/// every source id whatever the root is called, so this choice never reaches emitted bytes.
+const MEMORY_ROOT: &str = "/workspace";
+const MEMORY_CONFIG_PATH: &str = "/workspace/oasts.json";
+
+/// Compiles one resolved configuration into generated files, reading from the filesystem.
 ///
 /// Returns `Some(files)` only when the pipeline reached emission and
 /// `should_emit` is true; diagnostics accumulate in `sink` either way.
@@ -21,7 +32,17 @@ pub fn compile(
     should_emit: bool,
     sink: &mut DiagnosticSink,
 ) -> Option<Vec<GeneratedFile>> {
-    let graph = load_graph(config, sink)?;
+    compile_from(config, SourceHandle::Fs, should_emit, sink)
+}
+
+/// Compiles one resolved configuration, reading documents from `source`.
+pub fn compile_from(
+    config: &ResolvedConfig,
+    source: SourceHandle,
+    should_emit: bool,
+    sink: &mut DiagnosticSink,
+) -> Option<Vec<GeneratedFile>> {
+    let graph = load_graph_with_source(config, source, sink)?;
     let ir = parse(&graph, sink)?;
     // Filtering and pruning run before analysis so name allocation, collision detection and path
     // registration see only survivors, and a filter diagnostic short-circuits here rather than
@@ -56,6 +77,54 @@ pub fn compile(
     should_emit.then_some(files)
 }
 
+/// One in-memory compilation: the files, and every diagnostic the run produced.
+///
+/// Warnings survive a successful compile, because a host that shows generated code has to be able
+/// to show what the compiler said about it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InMemoryCompilation {
+    pub files: Vec<GeneratedFile>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Compiles one OpenAPI document and one JSON config with no filesystem at all.
+///
+/// The document is seated at whatever path the config's `input.path` resolves to below a synthetic
+/// root, so a config naming any input is answered by the supplied document rather than by a missing
+/// file. `output` is left as the config wrote it: it resolves lexically below the same root, and
+/// every `GeneratedFile.relative_path` is output-root-relative regardless.
+pub fn compile_in_memory(
+    spec: &[u8],
+    config_json: &[u8],
+) -> Result<InMemoryCompilation, Vec<Diagnostic>> {
+    let config_path = Path::new(MEMORY_CONFIG_PATH);
+    let raw = crate::config::parse_config_json(config_path, config_json)
+        .map_err(|diagnostic| vec![diagnostic])?;
+    crate::config::require_tsconfig_off(&raw, config_path)
+        .map_err(|diagnostic| vec![diagnostic])?;
+
+    let mut source = MemorySource::new(MEMORY_ROOT);
+    let mut config = crate::config::resolve_config(config_path.to_path_buf(), raw, &source)?;
+    // Stated rather than inherited: `require_tsconfig_off` has already refused every config that
+    // asked for anything else, so this only closes the gap left by an absent key.
+    config.tsconfig = TsconfigSource::Off;
+    source.insert(&config.input, spec.to_vec());
+
+    let mut sink = DiagnosticSink::new();
+    sink.extend(std::mem::take(&mut config.diagnostics));
+    let files = compile_from(
+        &config,
+        SourceHandle::Shared(Arc::new(source)),
+        true,
+        &mut sink,
+    );
+    let diagnostics = sink.into_sorted_vec();
+    match files {
+        Some(files) => Ok(InMemoryCompilation { files, diagnostics }),
+        None => Err(diagnostics),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -84,6 +153,136 @@ mod tests {
             ));
         }
         spec
+    }
+
+    /// The one config both halves of the identity test run, so nothing but the read path differs.
+    /// `tsconfig` is `off` on purpose: left to `auto`, the native half probes ancestors of its
+    /// temporary output directory for a `tsconfig.json` and the in-memory half cannot.
+    fn shared_config() -> Value {
+        json!({
+            "schemaVersion": 1,
+            "input": { "path": "openapi.yaml" },
+            "output": "generated",
+            "typescript": { "tsconfig": "off" },
+            "artifacts": {
+                "types": true,
+                "client": true,
+                "validators": true,
+                "zod": true,
+                "tanstack": true,
+                "msw": true
+            },
+            "validation": { "engine": "generated", "request": true, "response": true }
+        })
+    }
+
+    #[test]
+    fn compiling_in_memory_emits_the_bytes_the_filesystem_path_emits() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let documents = [
+            fs::read(fixtures.join("petstore-3.0/openapi.yaml")).expect("petstore document"),
+            fs::read(fixtures.join("client-showcase-3.1/openapi.yaml")).expect("showcase document"),
+            wide_document(80, 80).into_bytes(),
+        ];
+        let config_json = serde_json::to_vec(&shared_config()).expect("config JSON");
+
+        for spec in documents {
+            let temp = tempfile::tempdir().expect("tempdir");
+            fs::write(temp.path().join("openapi.yaml"), &spec).expect("OpenAPI document");
+            let config = load_config_from_json(&temp.path().join("oasts.json"), &config_json)
+                .expect("config");
+
+            let mut sink = DiagnosticSink::new();
+            let from_disk = compile(&config, true, &mut sink).expect("emitted files");
+            assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+
+            let in_memory = compile_in_memory(&spec, &config_json).expect("emitted files");
+
+            assert_eq!(from_disk, in_memory.files);
+        }
+    }
+
+    #[test]
+    fn an_ambient_tsconfig_is_refused_rather_than_silently_overridden() {
+        let mut raw = shared_config();
+        for requested in ["auto", "./tsconfig.json"] {
+            raw["typescript"] = json!({ "tsconfig": requested });
+            let config_json = serde_json::to_vec(&raw).expect("config JSON");
+
+            let diagnostics = compile_in_memory(b"openapi: 3.1.1\n", &config_json)
+                .expect_err("a tsconfig this host cannot read is refused");
+
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+            assert_eq!(diagnostics[0].code, "OASTS0251");
+        }
+    }
+
+    #[test]
+    fn an_omitted_tsconfig_key_compiles_rather_than_being_refused() {
+        let mut raw = shared_config();
+        raw.as_object_mut()
+            .expect("config object")
+            .remove("typescript");
+        let config_json = serde_json::to_vec(&raw).expect("config JSON");
+        let spec = fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/petstore-3.0/openapi.yaml"),
+        )
+        .expect("petstore document");
+
+        let compiled = compile_in_memory(&spec, &config_json).expect("emitted files");
+
+        assert!(!compiled.files.is_empty());
+    }
+
+    #[test]
+    fn config_bytes_that_are_not_json_come_back_as_one_diagnostic() {
+        let diagnostics = compile_in_memory(b"openapi: 3.1.1\n", b"{not json")
+            .expect_err("config bytes that are not JSON fail");
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, "OASTS0031");
+    }
+
+    #[test]
+    fn a_config_that_does_not_resolve_comes_back_as_diagnostics() {
+        let mut raw = shared_config();
+        raw.as_object_mut().expect("config object").remove("output");
+        let config_json = serde_json::to_vec(&raw).expect("config JSON");
+
+        let diagnostics = compile_in_memory(b"openapi: 3.1.1\n", &config_json)
+            .expect_err("a config missing output fails");
+
+        assert!(
+            diagnostics.iter().any(|entry| entry.code == "OASTS0061"),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn a_reference_to_a_document_nobody_supplied_is_a_missing_document() {
+        let config_json = serde_json::to_vec(&shared_config()).expect("config JSON");
+        let spec = r##"openapi: 3.1.1
+info: {title: t, version: 1.0.0}
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: {$ref: "./components.yaml#/Pet"}
+"##;
+
+        let diagnostics = compile_in_memory(spec.as_bytes(), &config_json)
+            .expect_err("a second document was never supplied");
+
+        assert!(
+            diagnostics.iter().any(|entry| entry.code == "OASTS1003"),
+            "{diagnostics:#?}"
+        );
     }
 
     #[test]
@@ -555,7 +754,7 @@ paths:
         // Re-run the stages to inspect the planned auth for get-board, whose security is
         // `[{ defaultApiKey: [] }, { app2AppOauth: [board:read] }]` in the fixture.
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("graph");
+        let graph = crate::loader::load_graph(&config, &mut sink).expect("graph");
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
         let model = build_client_model(&analyzed, &config, &mut sink);
