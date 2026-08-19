@@ -61,11 +61,15 @@ export class CompilerModule {
 		this.#exports = exports;
 	}
 
-	static async instantiate(source: Response | ArrayBuffer): Promise<CompilerModule> {
-		const { instance } =
+	static async instantiate(
+		source: Response | ArrayBuffer | WebAssembly.Module,
+	): Promise<CompilerModule> {
+		const instance =
 			source instanceof Response
-				? await WebAssembly.instantiateStreaming(source, {})
-				: await WebAssembly.instantiate(source, {});
+				? (await WebAssembly.instantiateStreaming(source, {})).instance
+				: source instanceof WebAssembly.Module
+					? await WebAssembly.instantiate(source, {})
+					: (await WebAssembly.instantiate(source, {})).instance;
 
 		if (!hasExports(instance.exports)) {
 			throw new Error("the compiler module does not export the expected boundary");
