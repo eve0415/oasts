@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "oasts-docs",
+  "name": "oasts",
   "compatibility_date": "2026-08-15",
   "assets": {
     "directory": "./dist/client",
