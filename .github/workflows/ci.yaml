@@ -306,10 +306,12 @@ jobs:
 
       # The playground page ships the compiler as an asset and the plain-text route imports
       # it, so the site cannot build until both are staged.
+      # A pull request builds unreleased code. Labelling it with the plain Cargo.toml version
+      # would present it as the release of that number, so previews carry the ref instead.
       - name: Stage the playground compiler
         run: scripts/playground-wasm.sh
         env:
-          GH_TOKEN: ${{ github.token }}
+          PLAYGROUND_PREVIEW_LABEL: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || '' }}
 
       # Build first: nimbus/internal-link resolves against .nimbus/routes.json, which
       # is materialized at astro:build:done. Linting before a build skips every link

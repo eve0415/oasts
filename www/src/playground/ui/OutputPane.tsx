@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Editor } from "./Editor";
 import type { GeneratedFile } from "../types";
+import { copyText } from "../clipboard";
 
 /**
  * A generate run emits tens of files across several artifacts, so the output needs a browser
@@ -119,7 +120,7 @@ export const OutputPane = ({ files, selected, onSelect, stale, busy }: OutputPan
 						type="button"
 						className="pg-button"
 						onClick={() => {
-							if (active) void navigator.clipboard.writeText(active.content);
+							if (active) void copyText(active.content);
 						}}
 					>
 						Copy
