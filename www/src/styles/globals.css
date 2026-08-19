@@ -30,7 +30,8 @@
 	--nb-card-foreground: var(--nb-foreground);
 
 	--nb-muted: oklch(0.967 0 0);
-	--nb-muted-foreground: oklch(0.556 0 0);
+	/* AA against --nb-muted, not just --nb-background: 0.556 measures 4.31:1 on it. */
+	--nb-muted-foreground: oklch(0.53 0 0);
 
 	--nb-accent: oklch(0.967 0 0);
 	--nb-accent-foreground: var(--nb-foreground);
@@ -110,7 +111,8 @@
 	--nb-card-foreground: var(--nb-foreground);
 
 	--nb-muted: #060606;
-	--nb-muted-foreground: oklch(0.556 0 0);
+	/* AA against --nb-card, where 0.556 measures 4.04:1. */
+	--nb-muted-foreground: oklch(0.62 0 0);
 
 	--nb-accent: oklch(0.269 0 0);
 	--nb-accent-foreground: var(--nb-foreground);

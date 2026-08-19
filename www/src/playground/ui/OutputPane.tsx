@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Editor } from "./Editor";
 import type { GeneratedFile } from "../types";
 
@@ -10,6 +10,8 @@ import type { GeneratedFile } from "../types";
  * collapse keys, level semantics — and this is one fixed level of grouping. Grouped lists of
  * buttons under real headings navigate the same way with native semantics.
  */
+
+const WRAP_KEY = "oasts-playground-wrap";
 
 export interface OutputPaneProps {
 	files: GeneratedFile[];
@@ -30,6 +32,13 @@ const groupOf = (path: string): string => {
 };
 
 export const OutputPane = ({ files, selected, onSelect, stale, busy }: OutputPaneProps) => {
+	// Remembered per visitor, the way an editor remembers word wrap.
+	const [wrap, setWrap] = useState(() => window.localStorage.getItem(WRAP_KEY) !== "off");
+
+	useEffect(() => {
+		window.localStorage.setItem(WRAP_KEY, wrap ? "on" : "off");
+	}, [wrap]);
+
 	const groups = useMemo(() => {
 		const byName = new Map<string, GeneratedFile[]>();
 		for (const file of files) {
@@ -101,6 +110,14 @@ export const OutputPane = ({ files, selected, onSelect, stale, busy }: OutputPan
 					<button
 						type="button"
 						className="pg-button"
+						aria-pressed={wrap}
+						onClick={() => setWrap((current) => !current)}
+					>
+						Wrap
+					</button>
+					<button
+						type="button"
+						className="pg-button"
 						onClick={() => {
 							if (active) void navigator.clipboard.writeText(active.content);
 						}}
@@ -114,6 +131,7 @@ export const OutputPane = ({ files, selected, onSelect, stale, busy }: OutputPan
 						value={active?.content ?? ""}
 						language="typescript"
 						readOnly
+						wrap={wrap}
 						ariaLabel={`Generated ${active?.path ?? "file"}, read only`}
 					/>
 				</div>

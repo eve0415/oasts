@@ -1,5 +1,5 @@
 import { useEffect, useEffectEvent, useRef, useState } from "react";
-import { EditorState, StateEffect, StateField, type Extension } from "@codemirror/state";
+import { Compartment, EditorState, StateEffect, StateField, type Extension } from "@codemirror/state";
 import {
 	Decoration,
 	EditorView,
@@ -83,7 +83,7 @@ const theme = EditorView.theme({
 	},
 	".cm-gutters": {
 		backgroundColor: "var(--nb-card)",
-		color: "var(--pg-dim)",
+		color: "var(--nb-muted-foreground)",
 		border: "none",
 		borderRight: "1px solid var(--nb-border)",
 	},
@@ -104,6 +104,8 @@ export interface EditorProps {
 	markers?: Marker[];
 	onChange?: (value: string) => void;
 	ariaLabel: string;
+	/** Soft-wrap long lines. Off means the editor scrolls horizontally, as an IDE does. */
+	wrap?: boolean;
 }
 
 export const Editor = ({
@@ -113,12 +115,15 @@ export const Editor = ({
 	markers = NO_MARKERS,
 	onChange,
 	ariaLabel,
+	wrap = true,
 }: EditorProps) => {
 	const host = useRef<HTMLDivElement | null>(null);
 	const view = useRef<EditorView | null>(null);
 	// The document the editor is created with. Later changes arrive through the sync effect
 	// below, so `value` must not rebuild the editor.
 	const [initialDoc] = useState(() => value);
+	// Wrapping is reconfigured rather than rebuilt, so toggling it keeps scroll and selection.
+	const [wrapping] = useState(() => new Compartment());
 	// Reads the latest handler without making the editor reactive to it.
 	const emitChange = useEffectEvent((next: string) => {
 		onChange?.(next);
@@ -137,7 +142,7 @@ export const Editor = ({
 			syntaxHighlighting(highlight),
 			markerField,
 			theme,
-			EditorView.lineWrapping,
+			wrapping.of([]),
 			// contenteditable alone leaves the content at tabIndex -1, so the scrolling region has
 			// no keyboard route into it — worst for the read-only pane, which cannot be scrolled
 			// any other way.
@@ -162,7 +167,7 @@ export const Editor = ({
 		return () => {
 			instance.destroy();
 		};
-	}, [language, readOnly, ariaLabel, initialDoc]);
+	}, [language, readOnly, ariaLabel, initialDoc, wrapping]);
 
 	// Replace the document only when it genuinely differs, so typing is never interrupted and
 	// the cursor does not jump on a round-trip through shared state.
@@ -177,6 +182,12 @@ export const Editor = ({
 	useEffect(() => {
 		view.current?.dispatch({ effects: setMarkers.of(markers) });
 	}, [markers]);
+
+	useEffect(() => {
+		view.current?.dispatch({
+			effects: wrapping.reconfigure(wrap ? EditorView.lineWrapping : []),
+		});
+	}, [wrap, wrapping]);
 
 	return <div ref={host} className="pg-editor" />;
 };

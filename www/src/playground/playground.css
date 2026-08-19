@@ -3,8 +3,7 @@
    one lightness and chroma, varying hue. */
 
 .pg-root {
-	--pg-dim: oklch(0.53 0 0);
-	--pg-comment: var(--pg-dim);
+	--pg-comment: var(--nb-muted-foreground);
 	--pg-keyword: oklch(0.45 0.16 300);
 	--pg-string: oklch(0.44 0.14 152);
 	--pg-number: oklch(0.46 0.15 65);
@@ -24,9 +23,6 @@
 }
 
 [data-mode="dark"] .pg-root {
-	/* muted-foreground measures 4.04:1 on the dark card — fine for the docs' airy prose,
-	   short of AA for this denser UI. */
-	--pg-dim: oklch(0.62 0 0);
 	--pg-keyword: oklch(0.75 0.12 300);
 	--pg-string: oklch(0.72 0.12 150);
 	--pg-number: oklch(0.78 0.11 80);
@@ -71,7 +67,7 @@
 	font-weight: 600;
 	letter-spacing: 0.04em;
 	text-transform: uppercase;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 	border: 1px solid var(--nb-border);
 	border-radius: 0.3125rem;
 	padding: 0.1875rem 0.4375rem;
@@ -85,7 +81,7 @@
 
 .pg-version-label {
 	font-size: 0.75rem;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 }
 
 .pg-spacer {
@@ -113,6 +109,13 @@
 
 .pg-button:hover {
 	background: var(--nb-accent);
+}
+
+/* A pressed toggle has to read as pressed without relying on colour alone. */
+.pg-button[aria-pressed="true"] {
+	background: var(--nb-selected);
+	border-color: var(--nb-border-strong);
+	font-weight: 600;
 }
 
 .pg-button-link {
@@ -191,7 +194,7 @@
 	border: 1px solid transparent;
 	border-radius: 0.4375rem;
 	background: transparent;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 	font: inherit;
 	font-size: 0.78125rem;
 	font-weight: 500;
@@ -223,7 +226,7 @@
 
 .pg-badge {
 	background: var(--nb-muted);
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 }
 
 /* ---- Squiggles ---- */
@@ -269,7 +272,7 @@
 	font-family: var(--nb-font-mono);
 	font-size: 0.71875rem;
 	font-weight: 700;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 }
 
 .pg-file-count {
@@ -290,7 +293,7 @@
 	padding: 0.25rem 0.75rem 0.25rem 1.5rem;
 	border: none;
 	background: transparent;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 	font-family: var(--nb-font-mono);
 	font-size: 0.75rem;
 	text-align: left;
@@ -351,7 +354,7 @@
 	gap: 0.5rem;
 	padding: 2.5rem;
 	text-align: center;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 }
 
 .pg-output-empty h2 {
@@ -487,13 +490,13 @@
 	flex-shrink: 0;
 	font-family: var(--nb-font-mono);
 	font-size: 0.71875rem;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 }
 
 .pg-host-notes {
 	padding: 0.625rem 0.875rem;
 	border-top: 1px solid var(--nb-border);
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 	font-size: 0.78125rem;
 }
 
@@ -547,13 +550,13 @@
 	font-weight: 700;
 	text-transform: uppercase;
 	letter-spacing: 0.03em;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 }
 
 .pg-section-note {
 	margin: 0.25rem 0 0.625rem;
 	font-size: 0.78125rem;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 	text-wrap: pretty;
 }
 
@@ -590,7 +593,7 @@
 	flex-basis: 100%;
 	margin: 0;
 	font-size: 0.75rem;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 	text-wrap: pretty;
 }
 
@@ -599,7 +602,7 @@
 }
 
 .pg-default {
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 }
 
 .pg-empty-note,
@@ -607,7 +610,7 @@
 	margin: 0;
 	padding: 0.6875rem 0.875rem;
 	font-size: 0.8125rem;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 }
 
 .pg-parse-error {
@@ -627,7 +630,7 @@
 	border-top: 1px solid var(--nb-border);
 	background: var(--nb-muted);
 	font-size: 0.71875rem;
-	color: var(--pg-dim);
+	color: var(--nb-muted-foreground);
 }
 
 .pg-dot {
