@@ -23,6 +23,9 @@ export default defineConfig({
   // nimbus reads content collections and git from disk, and the OG generator drives
   // canvaskit; none of that survives workerd, so prerendering stays in node.
   adapter: cloudflare({ prerenderEnvironment: "node" }),
+  // Nothing here keeps server state — the playground carries its own in the URL — and
+  // leaving sessions on makes the adapter demand a KV namespace that does not exist.
+  session: false,
   // Tailwind v4 via its Vite plugin (the integration Astro recommends for
   // Tailwind v4 — replaces the PostCSS plugin, which doesn't build under
   // Astro 7's Vite 8 bundler).
