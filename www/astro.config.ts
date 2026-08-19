@@ -39,7 +39,9 @@ export default defineConfig({
     defaultStrategy: "hover",
   },
   integrations: [
-    react(),
+    // React Compiler handles memoization, so the playground does not hand-roll it.
+    // Only the playground island is React; every docs page still ships zero React.
+    react({ babel: { plugins: ["babel-plugin-react-compiler"] } }),
     nimbus(nimbusConfig, {
       // Authoring rules are opt-in by design — your repo, your taste. The
       // two below are the load-bearing pair: frontmatter has to validate
