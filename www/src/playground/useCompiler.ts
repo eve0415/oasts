@@ -86,7 +86,7 @@ export const useCompiler = (): UseCompiler => {
 		let cancelled = false;
 		void (async () => {
 			try {
-				const response = await fetch("/play/wasm/versions.json");
+				const response = await fetch("/playground/wasm/versions.json");
 				const manifest: unknown = await response.json();
 				if (cancelled) return;
 				const entries: VersionEntry[] = [];

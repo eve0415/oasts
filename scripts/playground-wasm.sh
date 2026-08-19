@@ -10,7 +10,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-target=www/public/play/wasm
+target=www/public/playground/wasm
 manifest=$target/versions.json
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
@@ -61,9 +61,9 @@ fi
 
 {
   printf '{\n  "current": "%s",\n  "versions": [\n' "$label"
-  printf '    { "version": "%s", "url": "/play/wasm/oasts-%s.wasm", "schema": "/play/wasm/config-%s.json" }' "$label" "$label" "$label"
+  printf '    { "version": "%s", "url": "/playground/wasm/oasts-%s.wasm", "schema": "/playground/wasm/config-%s.json" }' "$label" "$label" "$label"
   for previous in "${released[@]}"; do
-    printf ',\n    { "version": "%s", "url": "/play/wasm/oasts-%s.wasm", "schema": "/play/wasm/config-%s.json" }' "$previous" "$previous" "$previous"
+    printf ',\n    { "version": "%s", "url": "/playground/wasm/oasts-%s.wasm", "schema": "/playground/wasm/config-%s.json" }' "$previous" "$previous" "$previous"
   done
   printf '\n  ]\n}\n'
 } >"$manifest"

@@ -484,8 +484,8 @@ jobs:
         with:
           name: playground
           path: |
-            www/public/play/wasm/oasts-*.wasm
-            www/public/play/wasm/config-*.json
+            www/public/playground/wasm/oasts-*.wasm
+            www/public/playground/wasm/config-*.json
           if-no-files-found: error
 
   github-release:

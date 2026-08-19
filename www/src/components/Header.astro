@@ -62,11 +62,11 @@ const showSections = sections.length >= 2;
 
     <div class="flex items-center gap-2">
       <a
-        href="/play"
-        aria-current={currentSlug === "/play" ? "page" : undefined}
+        href="/playground"
+        aria-current={currentSlug === "/playground" ? "page" : undefined}
         class:list={[
           "hidden sm:inline-flex items-center px-2 py-1 rounded-md text-[0.8125rem] font-medium no-underline transition-colors",
-          currentSlug === "/play"
+          currentSlug === "/playground"
             ? "text-foreground bg-accent"
             : "text-muted-foreground hover:text-foreground hover:bg-accent/60",
         ]}
