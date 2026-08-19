@@ -29,5 +29,6 @@
   "upload_source_maps": true,
   "placement": {
     "mode": "smart"
-  }
+  },
+  "preview_urls": true
 }
