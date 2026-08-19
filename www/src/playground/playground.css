@@ -14,7 +14,9 @@
 
 	display: flex;
 	flex-direction: column;
-	height: calc(100vh - 3.5rem);
+	/* BaseLayout renders no site chrome above this, and dvh keeps mobile browser bars from
+	   cropping the status bar. */
+	height: 100dvh;
 	min-height: 32rem;
 	background: var(--nb-background);
 	color: var(--nb-foreground);
