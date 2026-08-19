@@ -29,10 +29,9 @@ function prefersReducedMotion(): boolean {
 }
 
 function initMobileToc(root: HTMLElement): () => void {
-  const select = root.querySelector<HTMLSelectElement>(
-    "[data-nb-mobile-toc-select]",
-  );
-  if (!select) return () => {};
+  const found = root.querySelector("[data-nb-mobile-toc-select]");
+  if (!(found instanceof HTMLSelectElement)) return () => {};
+  const select = found;
 
   // Paired so slug/element indices stay aligned; `inBand` indexes into this.
   type Heading = { slug: string; el: HTMLElement };
@@ -50,7 +49,7 @@ function initMobileToc(root: HTMLElement): () => void {
   let suppressTimer: ReturnType<typeof setTimeout> | undefined;
 
   function setActive(slug: string) {
-    if (select!.value !== slug) select!.value = slug;
+    if (select.value !== slug) select.value = slug;
   }
 
   // select → page

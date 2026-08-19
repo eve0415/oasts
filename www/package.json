@@ -4,10 +4,10 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"dev": "astro dev",
-		"build": "astro build",
+		"dev": "wrangler types && astro dev",
+		"build": "wrangler types && astro build",
 		"preview": "astro preview",
-		"typecheck": "astro check",
+		"typecheck": "wrangler types && astro check",
 		"lint:docs": "nimbus-docs lint",
 		"lint:docs:fix": "nimbus-docs lint --fix",
 		"prepreview:cf": "astro build",
