@@ -1,0 +1,51 @@
+---
+import BaseLayout from "@/layouts/BaseLayout.astro";
+import { Playground } from "@/playground/ui/Playground";
+import "@/playground/playground.css";
+
+export const prerender = true;
+
+const title = "Playground";
+const description =
+	"Compile an OpenAPI document to TypeScript in your browser. Nothing is uploaded — the compiler runs as WebAssembly on this page.";
+---
+
+<BaseLayout title={title} description={description}>
+  <a class="pg-skip" href="#pg-output">Skip to generated output</a>
+  <main id="main-content">
+    <h1 class="pg-visually-hidden">{title}</h1>
+    <Playground client:only="react" />
+    <noscript>
+      <p style="padding: 2rem; max-width: 42rem;">
+        The playground compiles in your browser, so it needs JavaScript. You can run the same
+        compiler locally instead — see <a href="/get-started">Get started</a>.
+      </p>
+    </noscript>
+  </main>
+</BaseLayout>
+
+<style>
+  .pg-skip {
+    position: absolute;
+    left: 0.75rem;
+    top: -3rem;
+    z-index: 50;
+    padding: 0.5rem 0.875rem;
+    border-radius: 0.375rem;
+    background: var(--nb-primary);
+    color: var(--nb-primary-foreground);
+    font-size: 0.8125rem;
+    font-weight: 600;
+    transition: top 120ms ease;
+  }
+
+  .pg-skip:focus {
+    top: 0.75rem;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pg-skip {
+      transition: none;
+    }
+  }
+</style>

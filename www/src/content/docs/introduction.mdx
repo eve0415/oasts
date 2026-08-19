@@ -1,0 +1,70 @@
+---
+title: Introduction
+description: Compile OpenAPI 3.0/3.1 into TypeScript types and a zero-dependency typed client — deterministic, fast, Rust-powered.
+sidebar:
+  order: 0
+---
+
+oasts is a compiler. It reads an OpenAPI 3.0 or 3.1 document and writes TypeScript you commit and review: per-operation types, a zero-dependency fetch client, Zod schemas, standalone validators, TanStack Query descriptors, and MSW handlers — all derived from one model, so they cannot disagree about your API.
+
+<Render file="install" />
+
+## What makes it different
+
+<CardGrid>
+  <Card title="Failure-complete results" icon="ph:git-branch">
+    Every call returns a discriminated union covering documented responses, undocumented statuses, network failures, and decode failures — not just the 2xx happy path.
+    One `switch` reaches every case, and exhaustiveness checking proves it.
+  </Card>
+  <Card title="Byte-identical output" icon="ph:fingerprint">
+    Same document bytes, same config, same version, same consumer `tsconfig.json` ⇒ the same bytes on every machine and OS.
+    Generated code is meant to be committed; `oasts generate --check` makes drift a CI failure.
+    See [Determinism](/concepts/determinism).
+  </Card>
+  <Card title="Auth the compiler checks" icon="ph:lock-key">
+    An operation's security requirements compile into its call signature, so calling one whose auth you never configured is a type error rather than a 401 you find in staging.
+  </Card>
+  <Card title="Nothing in your bundle" icon="ph:feather">
+    The typed fetch client is emitted next to your types.
+    No runtime package to version-match, nothing added to your dependency tree.
+  </Card>
+</CardGrid>
+
+## Artifacts
+
+| Artifact | Status |
+| --- | --- |
+| [TypeScript types](/artifacts/types) | ✅ |
+| [Typed fetch client](/artifacts/client) | ✅ |
+| [Zod schemas](/artifacts/validation) | ✅ — needs `zod` ^4.4.0 in your project; `zod/mini` supported |
+| [Standalone validators](/artifacts/validation) | ✅ |
+| [MSW handlers](/artifacts/msw) | ✅ — needs `msw` ^2.8.0 in your project |
+| [TanStack Query descriptors](/artifacts/tanstack) | ✅ — imports no TanStack package |
+
+## Where to go next
+
+<CardGrid>
+  <Card title="Get started" icon="ph:rocket-launch">
+    Install, write an `oasts.yaml`, generate your first client, and make a call.
+    [Start here](/get-started).
+  </Card>
+  <Card title="How it works" icon="ph:tree-structure">
+    One model, many artifacts — and why output is a file you commit.
+    [Read the concepts](/concepts).
+  </Card>
+  <Card title="Results" icon="ph:git-branch">
+    Every outcome a call can produce, and how to handle the union.
+    [Read more](/concepts/results).
+  </Card>
+  <Card title="Configuration" icon="ph:sliders">
+    The `oasts.yaml` surface, block by block.
+    [Read the reference](/reference/configuration).
+  </Card>
+</CardGrid>
+
+Have a question about what it refuses, or what it deliberately does not do?
+The [FAQ](/faq) answers the common ones.
+
+## Performance
+
+Measured, not promised: the in-repo benchmark harness compiles GitHub's full OpenAPI spec to types in ~80 ms — warm p50 of end-to-end `oasts generate` runs on the reference container — with every run gated on repeatability.

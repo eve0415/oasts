@@ -1,0 +1,135 @@
+---
+title: CLI
+description: Commands, flags, config discovery, and exit codes.
+sidebar:
+  order: 2
+---
+
+The package is `@oasts/cli`; the command it installs is `oasts`.
+
+```text
+Usage: oasts <command> [options]
+
+Commands:
+  generate           Generate configured artifacts
+  check              Validate configuration and input without emitting
+  watch              (unsupported in this build)
+
+Options:
+  --config <path>    Use an explicit configuration file
+  --check            With generate: check committed output without writing
+  --spec <name>      Select a workspace spec (workspace configs are
+                     unsupported in this build; selecting one fails)
+```
+
+`watch` and `--spec` are parsed but not implemented in this build.
+They are in the help text because the argument surface is fixed; using either exits `2` — `oasts watch` with `OASTS9004` ("the watch command is not supported in this build"), `--spec` with the `OASTS9002` that workspace configs refuse under.
+Both are [provisional](/concepts/diagnostics) codes, so they retire when the capability lands.
+
+## `oasts generate`
+
+Reads your document and writes every enabled artifact under `output`.
+
+<PackageManagers pkg="oasts" type="exec" args="generate" />
+
+### `--check`
+
+Does everything `generate` does except writing.
+Any difference between what would be written and what is committed exits non-zero and reports the drift.
+This is the CI form:
+
+<PackageManagers pkg="oasts" type="exec" args="generate --check" />
+
+Because output is [byte-identical](/concepts/determinism) for the same inputs, `--check` is a real gate, not a heuristic — see [Determinism](/concepts/determinism).
+
+## `oasts check`
+
+Validates the configuration and the input document, and reports every diagnostic, without writing anything.
+
+<PackageManagers pkg="oasts" type="exec" args="check" />
+
+Use it to see what your document produces — including every warning about an operation an artifact had to skip — before committing to a run.
+
+## `--config`
+
+Points at an explicit configuration file:
+
+<PackageManagers pkg="oasts" type="exec" args="generate --config ./config/oasts.yaml" />
+
+Paths inside the config (`input.path`, `output`, and the rest) resolve relative to the **config file's** directory, not to your working directory.
+Moving the config moves everything with it.
+
+## Config discovery
+
+With no `--config`, oasts looks in the current directory for exactly these names:
+
+```text
+oasts.config.ts   oasts.config.mts   oasts.config.cts
+oasts.config.js   oasts.config.mjs   oasts.config.cjs
+oasts.yaml        oasts.json
+```
+
+<Aside type="caution" title="Exactly one, or it is an error">
+  Discovery does not apply a precedence order.
+  Finding two candidates — say `oasts.yaml` next to `oasts.config.ts` — fails, and so does finding none.
+  Note also that `oasts.yml` is **not** in the list; the spelling is `oasts.yaml`.
+</Aside>
+
+A `oasts.config.ts` is evaluated as a module.
+Import `defineConfig` from the package for editor completion and a compile-time check of the whole config:
+
+```ts title="oasts.config.ts"
+import { defineConfig } from "@oasts/cli";
+
+export default defineConfig({
+  schemaVersion: 1,
+  input: { path: "./openapi.yaml" },
+  output: "./generated",
+  artifacts: { types: true, client: true },
+  validation: { engine: "off", unchecked: "allow" },
+});
+```
+
+The client artifact requires an explicit `validation` block; `engine: "off"` opts out of boundary checking.
+See [Validation](/artifacts/validation) for the other engines.
+
+The `.yaml` and `.json` forms are validated against the published JSON Schema instead — see [Configuration](/reference/configuration).
+
+## Exit codes
+
+The compiler ends a run with one of three:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. Warnings may still have been printed. |
+| `1` | An **input** diagnostic — something about the document itself. Also drift under `--check`. |
+| `2` | A **config** diagnostic — usage, the config file, or any file oasts had to read or write. |
+
+The split is the diagnostic's category.
+It is not a severity ranking, not the stage the diagnostic came from, and not how far the run got.
+Every diagnostic carries a category of its own, and the run exits on the highest code it saw.
+Two consequences follow from that, and both surprise people:
+
+**Anything to do with files is `2`, including the write.**
+Failing to write an artifact — or to read your committed output back under `--check` — is a config-category diagnostic.
+So a run that read your document, compiled it, and then tripped over the output tree exits `2`, not `1`.
+
+**One config-category error re-codes the whole run.**
+When a config diagnostic and a content diagnostic land together, both are reported and the exit code is `2`.
+The way you meet this by accident is the default `typescript.tsconfig: auto`: a broken `tsconfig.json` sitting in your workspace gets discovered, read, and reported, which turns what would have been a `1` into a `2` without anything changing in your document.
+
+Warnings never change the exit code.
+If you want a warning to fail your build, grep the output or gate on `oasts check` in a step of its own.
+
+### Codes oasts did not choose
+
+Anything outside `0`–`2` means the run never reached a verdict.
+A refusal always prints `error[OASTSnnnn]`; these do not, which is how you tell them apart:
+
+- **`134`** — the compiler crashed. You get a Rust panic message and no diagnostic. (Invoking the native binary directly gives `101` instead.) That is always a bug — please report it along with the document that provoked it.
+- **anything else** — `oasts.config.ts` is evaluated as a module, so your config can end the process itself. A `process.exit(3)` in there is exit `3`, before oasts has looked at anything.
+
+## What the package exports
+
+`@oasts/cli`'s public entry is the config surface — `defineConfig` and the `UserConfig` types, both generated from the same schema the YAML form is validated against.
+The compiler itself is a native module loaded through napi, so there is no JavaScript reimplementation that could drift from it.

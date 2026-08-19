@@ -1,0 +1,32 @@
+openapi: 3.1.0
+info:
+  title: Documentation naming snippets
+  version: 1.0.0
+paths:
+  /foo_bar:
+    get:
+      operationId: getPet
+      callbacks:
+        onData:
+          '{$request.query.callbackUrl}':
+            post:
+              operationId: receiveCallbackData
+              responses:
+                "204": { description: Received. }
+      responses:
+        "200":
+          description: A pet.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Pet" }
+webhooks:
+  pet.created:
+    post:
+      operationId: petCreated
+      responses:
+        "204": { description: Received. }
+components:
+  schemas:
+    Pet: { type: object }
+    VendorSchema:
+      $ref: ./vendor/openapi.yaml#/components/schemas/Pet

@@ -1,0 +1,35 @@
+---
+title: Guides
+description: Working practices — the transport, auth, streaming, dates, filtering, and naming.
+sidebar:
+  order: 4
+  group:
+    label: Guides
+---
+
+<CardGrid>
+  <Card title="Transport" icon="ph:plugs-connected">
+    Base URLs, headers, middleware, a custom `fetch`, and the options every call accepts.
+    [Read more](/guides/transport).
+  </Card>
+  <Card title="Auth" icon="ph:lock-key">
+    Security requirements compiled into call signatures, and the credential each scheme kind wants.
+    [Read more](/guides/auth).
+  </Card>
+  <Card title="Streaming" icon="ph:waveform">
+    Server-sent events and raw byte bodies, with per-event typing on the response side.
+    [Read more](/guides/streaming).
+  </Card>
+  <Card title="Naming" icon="ph:text-aa">
+    How identifiers and filenames are derived, and what to do about a collision.
+    [Read more](/guides/naming).
+  </Card>
+  <Card title="Generating a slice" icon="ph:funnel">
+    Narrow a large document by tag, operation, path, or method — and why a filter that stops matching fails the build.
+    [Read more](/guides/filters).
+  </Card>
+  <Card title="Dates and times" icon="ph:calendar-blank">
+    Make a `date-time` schema a `Date` or a `Temporal` value in your code while the wire keeps its string.
+    [Read more](/guides/dates).
+  </Card>
+</CardGrid>

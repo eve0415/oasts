@@ -1,0 +1,83 @@
+---
+title: How oasts works
+description: One model of your document, many artifacts — and why the output is a file you commit rather than a step you run.
+sidebar:
+  order: 2
+  label: Concepts
+  group:
+    label: Concepts
+---
+
+oasts is a compiler, and three of its stages explain most of its behaviour.
+
+<Steps>
+  <Step title="Load">
+    The document is read from `input.path`, along with everything it `$ref`s.
+    Local references stay inside a trust boundary you control; the graph is bounded by `limits`.
+    (`input.url` exists in the config schema, but a remote entry point is refused at load with `OASTS9201` — see the [provisional band](/concepts/diagnostics).)
+  </Step>
+  <Step title="Model">
+    One versioned model is built from the whole document: schemas, operations, parameters, media types, security requirements.
+    [Filters](/guides/filters) narrow it here, once, before anything is emitted.
+  </Step>
+  <Step title="Emit">
+    Every enabled [artifact](/artifacts) is projected from that one model.
+    Types, client, zod, validators, TanStack descriptors and MSW handlers are all views of the same thing.
+  </Step>
+</Steps>
+
+## One model, many artifacts
+
+This is why the artifacts cannot disagree.
+The client's request encoder and the MSW handler's request decoder are the same serialization rules run in opposite directions.
+The validators and the Zod schemas are two renderings of the same checks.
+Turning on a fifth artifact never re-interprets your document; it adds a projection of a model that already exists.
+
+It is also why a refusal in one artifact does not cost you the others.
+When MSW cannot express an operation's path — a path literal containing a `*`, which its matcher always reads as a wildcard — that operation gets no handler and a warning, and the types, client and validators for it are unaffected.
+
+## Output is a build artifact you commit
+
+oasts does not run in your app.
+It writes TypeScript to a directory, and that directory is source you review in a pull request.
+Given the same document *bytes*, config, oasts version and consumer `tsconfig.json`, the bytes are identical on every machine — so a diff in generated output means your API changed, and CI can enforce that with `oasts generate --check`.
+
+<Aside type="note">
+  This is the opposite of a runtime SDK.
+  There is no oasts package in your dependency tree at runtime, nothing to version-match, and no code path that behaves differently in production than the one you read in review.
+  See [Determinism](/concepts/determinism).
+</Aside>
+
+## Refusals are loud, never silent
+
+The compiler will not invent a name to resolve a collision between two things **your document** declares, will not widen a type silently, and will not quietly drop a pattern that stopped matching.
+Each of those is a [diagnostic](/concepts/diagnostics) with a code and a source pointer, and most of them fail the build.
+
+The first two are narrower than they sound.
+A collision with the compiler's *own* emitted identifiers — `Pet` against a generated `PetRequest`, an import shadowed by a local declaration — is renamed deterministically with a warning, because nothing about your intent is ambiguous there; it refuses only when the replacement is taken too.
+And a schema oasts cannot represent does become `unknown`, with a warning naming the keyword — and an error outright under the validators or Zod artifacts, which will not emit a check they cannot back.
+
+The reasoning is that all three failure modes are invisible at the call site if nothing says so.
+A suffix the compiler picked for whichever declaration the walk reached first would move the next time the document changes; a type widened to `unknown` type-checks and then breaks at runtime; a filter that matches nothing shrinks your client without a diff anyone reads.
+
+## What you configure, and what you don't
+
+You configure **what to generate** — which artifacts, which slice of the document, what shape the types take, where files land.
+What you cannot configure is the *formatting*: `emit.format` accepts exactly one value, `deterministic`, so indentation, quoting and member order are fixed.
+A few knobs do change the emitted bytes — `emit.banner`, `emit.importExtension`, the `documentation.*` switches — but each changes *what* is emitted, never how it is laid out.
+Whether a check runs is a CLI flag, never config.
+
+<CardGrid>
+  <Card title="Results" icon="ph:git-branch">
+    Every outcome a call can produce, and the union that carries them.
+    [Read more](/concepts/results).
+  </Card>
+  <Card title="Determinism" icon="ph:fingerprint">
+    Byte-identical output, and how to gate it.
+    [Read more](/concepts/determinism).
+  </Card>
+  <Card title="Diagnostics" icon="ph:warning-circle">
+    How to read a code, and what the families mean.
+    [Read more](/concepts/diagnostics).
+  </Card>
+</CardGrid>

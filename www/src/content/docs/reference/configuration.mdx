@@ -1,0 +1,342 @@
+---
+title: Configuration
+description: Every block of oasts.yaml — input, artifacts, output layout, type shape, client, validation, filters, naming, docs, limits.
+sidebar:
+  order: 1
+  group:
+    label: Reference
+---
+
+Configuration lives in `oasts.yaml`, `oasts.json`, or a typed `oasts.config.ts`.
+The YAML and JSON forms are validated against a published JSON Schema, so a typo fails with a rule ID rather than silently doing nothing.
+Unknown keys are rejected.
+Point `$schema` at it for editor completion — oasts validates it as a URI and otherwise ignores it:
+
+```yaml
+$schema: https://example.com/oasts.schema.json
+```
+
+Paths inside the file resolve relative to `workspaceRoot` (see below), not your working directory.
+See [CLI](/reference/cli#config-discovery) for how the file is found.
+
+```yaml title="oasts.yaml"
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+artifacts:
+  types: true
+  client: true
+client:
+  authEnforcement: types
+  baseUrl:
+    source: server
+    index: 0
+validation:
+  engine: off
+  unchecked: allow
+```
+
+Three keys are required: `schemaVersion` (always `1`), `input`, and `output`.
+
+Examples on this page pin their values rather than showing defaults — the example above asks for `baseUrl.source: server` and `unchecked: allow` because it is making those choices, not because they are what you get by leaving them out.
+The prose under each section below gives the real default.
+
+## `workspaceRoot`
+
+`input`, `output`, and `typescript.tsconfig` all resolve relative to `workspaceRoot`, not directly to the config file.
+It defaults to `.` — the config file's own directory — so leaving it out means "relative to the config file" is exactly right:
+
+```yaml
+workspaceRoot: .
+```
+
+`local.allowPaths` is the one path that always resolves against the config file's directory, regardless of `workspaceRoot`.
+
+## `input`
+
+Exactly one of a local path or an HTTP(S) URL.
+
+```yaml
+input:
+  path: ./openapi.yaml
+```
+
+<Aside type="caution" title="`url` is accepted by the schema but refused at load">
+  This build does not fetch documents.
+  `input.url` — and any `$ref` that resolves to an `http(s)` target — fails with `error[OASTS9201]: remote loading is not supported in this build`.
+  The key is in the schema so configs stay forward-compatible; today, bundle or vendor the document and point `input.path` at it.
+
+  `OASTS9201` is in the [provisional band](/concepts/diagnostics) — a capability gated off rather than a refusal on the merits.
+</Aside>
+
+An `https://` `$id` inside the document is not itself a problem: `$id` names a schema resource, it is not a request to fetch one.
+Only something that actually has to be *read* over the network is refused.
+
+It is not inert, though.
+`$id` re-bases every relative `$ref` beneath it, so a sibling `$ref: "./tag.yaml"` that resolves to a local file today resolves to `https://…/tag.yaml` once you add an `https://` `$id` above it — and then it does have to be read, and it is an `OASTS9201`.
+Same for a `#/components/…` pointer written inside an `$id`'d schema: it resolves against that resource, not the document root.
+If adding an `$id` broke a `$ref` that worked before, this is why.
+
+## `output`, `namespace`
+
+`output` is the directory everything is written under.
+`namespace` defaults to `api` and names the aggregate client file (`client/api.ts` — see `aggregate` below) and the TanStack query-key namespace.
+It's also what will prefix the emitted module namespace once more than one API can be generated into one tree.
+
+## `artifacts`
+
+Each artifact is a boolean, or a block:
+
+```yaml
+artifacts:
+  types: true
+  client: true
+  zod: false
+  validators: false
+  tanstack: false
+  msw: false
+validation:
+  engine: "off"
+  unchecked: allow
+```
+
+The client artifact requires an explicit `validation` block; `engine: "off"` opts out of boundary checking.
+See [`validation`](#validation) below.
+
+```yaml
+artifacts:
+  types:
+    enabled: true
+    directory: shared/model
+  client:
+    directory: sdk/fetch
+emit:
+  runtimeDirectory: shared/kernel
+```
+
+Each artifact lands in its own directory under `output`, named after the artifact by default.
+Rename or nest any of them and the imports between artifacts follow.
+Two enabled artifacts may not share a directory, or nest one inside another — that is an `OASTS0102` at config time rather than a collision at write time.
+
+With no `artifacts` block you get types.
+
+Every block below is a fragment, not a whole config.
+Options for an artifact you have not enabled are an error, not a no-op — a `zod:` block without `artifacts.zod` is an `OASTS0121`, and a `validation:` block without `artifacts.client` is an `OASTS0161`.
+Enable the artifact first, then configure it.
+
+## `types`
+
+```yaml
+types:
+  enum: literal          # literal | const
+  enumExtensions: accept # accept | reject
+  dateTime: string       # string | date | temporal
+  date: string           # string | temporal
+  discriminatedUnions: structural   # structural | tagged
+  integer: number        # number | bigint
+  readonly: false
+```
+
+`discriminatedUnions: tagged` intersects each branch of a `discriminator` union with its own mapping literal so TypeScript can narrow on the tag; `integer: bigint` maps `format: int64` to `bigint`.
+Both are covered in [Types](/artifacts/types#shape-knobs).
+`dateTime` and `date` have their own page — [Dates and times](/guides/dates).
+
+Every value in that block other than the defaults shown needs the **client** artifact: the conversion between the wire form and the TypeScript type lives in the client runtime, so `dateTime: date`, `dateTime: temporal`, `date: temporal` and `integer: bigint` are an `OASTS0131` on a types-only build.
+`integer: bigint` additionally rules out the tanstack artifact, whose query keys are JSON-serialized and cannot carry a `bigint`.
+
+`enumExtensions: reject` turns the vendor extensions `x-enum-varnames`, `x-enumNames`, `x-enum-descriptions` and `x-enumDescriptions` into a build error instead of honoring them; `accept` (the default) uses them to name and describe enum members.
+
+## `client`
+
+```yaml
+client:
+  authEnforcement: types    # types | runtime
+  aggregate: false
+  baseUrl:
+    source: runtime         # runtime | server | literal
+  fetchOptions: {}          # every key below is unset unless you set it
+    # credentials: omit | same-origin | include
+    # cache: default | no-store | reload | no-cache | force-cache | only-if-cached
+    # redirect: follow | error | manual
+    # referrerPolicy: no-referrer | no-referrer-when-downgrade | same-origin | origin |
+    #   strict-origin | origin-when-cross-origin | strict-origin-when-cross-origin | unsafe-url
+    # mode: cors | no-cors | same-origin
+    # keepalive: false
+```
+
+Fetch is the only client implementation today, so there is no `client.transport` selector.
+
+- **`baseUrl.source: runtime`** — the caller supplies it when constructing the transport, and the generated `TransportConfig` requires it. This is the default.
+- **`baseUrl.source: server`** — take the document's `servers[index]`.
+- **`baseUrl.source: literal`** — a `value` you write here.
+- **`authEnforcement`** — `types` puts security requirements in the call signature; `runtime` moves the check to call time. See [Auth](/guides/auth#compile-time-or-call-time).
+- **`aggregate`** — also re-export every operation from `generated/client/api.ts`. Off by default, because the aggregate names every operation and a bundler cannot drop the ones you never call.
+- **`fetchOptions`** — static defaults baked into every operation descriptor. Nothing is baked in until you set a key yourself. See [Transport](/guides/transport#static-fetch-defaults).
+
+## `validation`
+
+```yaml
+validation:
+  engine: "off"      # off | zod | generated — required, no default
+  request: false
+  response: false
+  unchecked: warn    # warn | error | allow
+```
+
+With the client artifact enabled the whole block is required, and `engine` has no default — the choice is always written down.
+The rest has to agree with it: `"off"` needs `request` and `response` both `false`, any other engine needs at least one of them `true`, `zod` needs `artifacts.zod`, and `generated` needs `artifacts.validators`.
+
+`unchecked` is the policy for successful response data the document declares no schema for.
+It is settled at generation rather than at runtime: `allow` accepts it, `warn` (the default) prints a warning and continues, and `error` refuses to build.
+`error` only makes sense alongside `response: true`.
+See [Validation](/artifacts/validation).
+
+## `zod`
+
+```yaml
+zod:
+  flavor: classic    # classic | mini
+```
+
+## `filters`
+
+Narrows what gets generated.
+Each axis takes `include` and `exclude` pattern lists; a pattern is exact string equality or a slash-delimited regex that must match the **whole** subject, with an optional trailing `i` flag.
+Exclude beats include.
+
+```yaml
+filters:
+  tags:
+    include: [pets]
+  operations:
+    exclude: [deletePet]
+  paths:
+    include: ["/^\\/pets\\/.*/"]
+  methods:
+    exclude: ["/^(trace|options)$/i"]
+  deprecated: true    # keep deprecated operations
+  orphans: false      # drop component schemas nothing reaches
+```
+
+A pattern that matches nothing fails the build with an `OASTS0262` rather than quietly shrinking your client.
+See [Generating a slice](/guides/filters).
+
+## `naming`
+
+```yaml
+naming:
+  fileCase: kebab          # kebab | snake | camel | pascal | preserve
+  typeCase: pascal         # pinned
+  propertyCase: preserve   # pinned
+  operationCase: camel     # camel | preserve
+  enumMemberCase: pascal   # pascal | camel | screamingSnake | preserve
+  typePrefix: ""
+  typeSuffix: ""
+  overrides:
+    schemas: {}
+    schemasBySource: {}
+    operations: {}
+    webhooks: {}
+    callbacks: {}
+    pathSegments: {}
+```
+
+`typeCase` accepts only `pascal` and `propertyCase` only `preserve` — property names are wire names.
+See [Naming](/guides/naming).
+
+## `documentation`
+
+TSDoc derived from the document. All on by default:
+
+```yaml
+documentation:
+  enabled: true
+  summary: true
+  description: true
+  deprecated: true
+  examples: true
+  constraints: true
+```
+
+`constraints` is the one worth knowing about: validation-only keywords that cannot appear in the TypeScript type — ranges, patterns, length bounds — are carried into the doc comment instead, so the information is at your cursor even where the type cannot express it.
+
+## `emit`
+
+```yaml
+emit:
+  runtimeDirectory: runtime
+  importExtension: ".js"   # ".js" | "none"
+  banner: []
+  format: deterministic
+```
+
+`banner` prepends lines to every emitted file.
+Each entry has to stay one line and stay out of the compiler's way, so a NUL, a line break of any kind, a `sourceMappingURL=`, or the generated-header text itself is an `OASTS0211`.
+`importExtension` is what emitted imports end in — `.js` suits Node's ESM resolution and the bundlers that follow it; `none` emits extensionless imports for resolvers that want those instead.
+
+## `typescript`
+
+```yaml
+typescript:
+  tsconfig: auto     # auto | off | a path relative to workspaceRoot
+```
+
+## `limits`
+
+Bounds on the document graph, as a guard against a pathological or hostile input:
+
+```yaml
+limits:
+  maxDocumentBytes: 33554432     # 32 MiB
+  maxTotalBytes: 268435456       # 256 MiB
+  maxDocuments: 256
+  maxRefDepth: 64
+```
+
+Each is clamped to a range, and a value outside it fails the build rather than silently clamping: `maxDocumentBytes` 1 KiB–1 GiB, `maxTotalBytes` 1 KiB–4 GiB, `maxDocuments` 1–4096, `maxRefDepth` 1–1024.
+
+## `local`
+
+The trust boundary for local documents and their `$ref` targets.
+Each entry widens the set of directories a local reference may be read from:
+
+```yaml
+local:
+  allowPaths:
+    - ../shared-schemas
+```
+
+Entries are resolved relative to the config file and **must be relative** — an absolute path is an `OASTS0221`.
+The default is empty, so a document only reaches what the workspace root already covers.
+
+## `compat`
+
+Opt-in departures from strict OpenAPI conformance, for documents describing a server that is itself non-conformant:
+
+```yaml
+compat:
+  deepObjectEncoding: strict    # strict | extended
+```
+
+`strict` admits `deepObject` only where OpenAPI defines it — an `object`-projecting schema.
+`extended` admits every schema shape, lowering each with the bracket-path encoding `qs` uses, which is what real documents that declare `deepObject` on arrays are usually describing.
+
+<Aside type="note">
+  Add nothing here speculatively.
+  Each key exists because a real server disagrees with the specification, and turning one on means the generated client stops matching what your document literally says.
+</Aside>
+
+## Reserved keys
+
+`specs`, `shared`, `remote`, `watch` and `ci` are accepted by the schema but not implemented in this build.
+They are reserved so a config written today does not have to change shape when they land, and they refuse in the [provisional band](/concepts/diagnostics) rather than as ordinary config errors:
+
+| Key | Code |
+| --- | --- |
+| `specs`, `shared` | `OASTS9002` — workspace configs |
+| `remote`, `watch`, `ci` | `OASTS9003` — the surrounding capability |
+
+The CLI has the same arrangement: `oasts watch` parses and then refuses with `OASTS9004`, and `--spec` refuses with the same `OASTS9002` the `specs` key does.
+Both exit `2`.
+See [CLI](/reference/cli).
