@@ -20,3 +20,6 @@ pnpm-debug.log*
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Staged by scripts/playground-wasm.sh — the compiler module is a build artifact.
+public/play/wasm/
