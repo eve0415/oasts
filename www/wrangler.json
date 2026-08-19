@@ -11,5 +11,16 @@
       "binding": "PLAYGROUND_WASM",
       "bucket_name": "oasts-playground"
     }
-  ]
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    }
+  }
 }
