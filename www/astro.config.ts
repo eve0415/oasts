@@ -1,4 +1,5 @@
 import { defineConfig } from "astro/config";
+import type { AstroIntegration } from "astro";
 import tailwindcss from "@tailwindcss/vite";
 import nimbus, { defineConfig as defineNimbusConfig } from "@cloudflare/nimbus-docs";
 import { tableScroll } from "@cloudflare/nimbus-docs/markdown";
@@ -17,6 +18,21 @@ const nimbusConfig = defineNimbusConfig({
   editPattern: "https://github.com/eve0415/oasts/edit/main/www/{path}",
   socialImageAlt: "oasts documentation",
 });
+
+// Sourcemaps for the Worker bundle only. `upload_source_maps` sends them to
+// Cloudflare so exceptions in the observability logs resolve to TypeScript
+// instead of minified chunk offsets. The client build stays map-free — those
+// would ship to readers and map nothing anyone can act on.
+const serverSourcemaps: AstroIntegration = {
+  name: "server-sourcemaps",
+  hooks: {
+    "astro:build:setup": ({ target, updateConfig }) => {
+      if (target === "server") {
+        updateConfig({ build: { sourcemap: true } });
+      }
+    },
+  },
+};
 
 export default defineConfig({
   output: "static",
@@ -39,6 +55,7 @@ export default defineConfig({
     defaultStrategy: "hover",
   },
   integrations: [
+    serverSourcemaps,
     // React Compiler handles memoization, so the playground does not hand-roll it.
     // Only the playground island is React; every docs page still ships zero React.
     react({ babel: { plugins: ["babel-plugin-react-compiler"] } }),
