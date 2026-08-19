@@ -27,7 +27,7 @@ src/
 └── styles/                  # globals.css, prose.css
 ```
 
-Cloudflare deploys also have `wrangler.jsonc` at the project root.
+Cloudflare deploys also have `wrangler.json` at the project root.
 
 ## Writing docs
 
@@ -94,7 +94,7 @@ End with `Summary: N errors, N warnings.`
 - **Registry hygiene** — every `src/components/ui/<slug>/` is either MDX-registered or imported in `src/`; transitive deps (`lib/cn.ts`, etc.) exist.
 - **AI surface** — `<AgentDirective />` renders in `BaseLayout.astro`; doc `<head>` has `<link rel="alternate" type="text/markdown" ...>`.
 - **Search** — `data-pagefind-body` is on the docs main wrapper; after `pnpm build`, `dist/pagefind/` exists with ≥1 indexed page.
-- **Cloudflare** (if applicable) — `wrangler.jsonc` has `name`, `compatibility_date`, `assets.directory = "./dist"`, `not_found_handling`.
+- **Cloudflare** (if applicable) — `wrangler.json` has `name`, `compatibility_date`, `assets.directory = "./dist/client"`, `not_found_handling`, and the `r2_buckets` binding the playground reads compilers from.
 
 ## Don't
 

@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "oasts-docs",
+  "compatibility_date": "2026-08-15",
+  "assets": {
+    "directory": "./dist/client",
+    "not_found_handling": "404-page"
+  },
+  "r2_buckets": [
+    {
+      "binding": "PLAYGROUND_WASM",
+      "bucket_name": "oasts-playground"
+    }
+  ]
+}
