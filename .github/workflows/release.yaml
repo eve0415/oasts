@@ -474,8 +474,12 @@ jobs:
         with:
           cache: true
 
+      # What this job builds gets published, so it must not restore cache state a pull
+      # request could have written. Lookup-only checks the key without downloading it.
       - name: Cache Rust build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          lookup-only: true
 
       # wrangler is the site workspace's dependency, and the publish runs through it.
       - name: Install
