@@ -43,6 +43,8 @@
 		"@astrojs/check": "^0.9.8",
 		"@bruits/satteri-wasm32-wasi": "0.9.5",
 		"@tailwindcss/vite": "^4.1.4",
+		"@types/react": "^19.2.18",
+		"@types/react-dom": "^19.2.4",
 		"pagefind": "^1.5.2",
 		"tailwindcss": "^4.1.4",
 		"typescript": "^5.8.3",

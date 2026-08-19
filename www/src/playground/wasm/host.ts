@@ -1,4 +1,5 @@
-import type { CompileRequest, CompileResponse } from "../types";
+import type { CompileRequest, CompileResponse, Diagnostic, Severity } from "../types";
+import { arrayOf, numberOf, propertyOf, stringOf } from "../json";
 
 /**
  * The whole host side of the compiler boundary.
@@ -18,6 +19,41 @@ interface Exports {
 	oasts_generate: (ptr: number, len: number) => number;
 }
 
+/** Checks the module really exports the boundary before anything calls through it. */
+const hasExports = (value: unknown): value is Exports => {
+	if (typeof value !== "object" || value === null) return false;
+	if (!("memory" in value) || !(value.memory instanceof WebAssembly.Memory)) return false;
+	return (
+		"oasts_alloc" in value &&
+		typeof value.oasts_alloc === "function" &&
+		"oasts_free" in value &&
+		typeof value.oasts_free === "function" &&
+		"oasts_generate" in value &&
+		typeof value.oasts_generate === "function"
+	);
+};
+
+const toSeverity = (value: unknown): Severity => (value === "error" ? "error" : "warning");
+
+const toDiagnostic = (node: unknown): Diagnostic => ({
+	code: stringOf(node, "code") ?? "",
+	severity: toSeverity(propertyOf(node, "severity")),
+	message: stringOf(node, "message") ?? "",
+	sourceId: stringOf(node, "sourceId"),
+	line: numberOf(node, "line"),
+	col: numberOf(node, "col"),
+	jsonPointer: stringOf(node, "jsonPointer"),
+});
+
+export const toResponse = (node: unknown): CompileResponse => ({
+	files: arrayOf(node, "files").map((file) => ({
+		path: stringOf(file, "path") ?? "",
+		content: stringOf(file, "content") ?? "",
+	})),
+	diagnostics: arrayOf(node, "diagnostics").map(toDiagnostic),
+	error: stringOf(node, "error"),
+});
+
 export class CompilerModule {
 	readonly #exports: Exports;
 
@@ -31,7 +67,10 @@ export class CompilerModule {
 				? await WebAssembly.instantiateStreaming(source, {})
 				: await WebAssembly.instantiate(source, {});
 
-		return new CompilerModule(instance.exports as unknown as Exports);
+		if (!hasExports(instance.exports)) {
+			throw new Error("the compiler module does not export the expected boundary");
+		}
+		return new CompilerModule(instance.exports);
 	}
 
 	generate(request: CompileRequest): CompileResponse {
@@ -44,13 +83,14 @@ export class CompilerModule {
 		const outPtr = oasts_generate(inPtr, encoded.length);
 		oasts_free(inPtr, encoded.length);
 
-		// Re-read the view after the call: growing the heap detaches any buffer taken before it.
+		// Read the views only after the call: growing the heap detaches any buffer taken before it.
 		const length = new DataView(memory.buffer).getUint32(outPtr, true);
 		const body = new TextDecoder().decode(
 			new Uint8Array(memory.buffer, outPtr + LENGTH_PREFIX, length),
 		);
 		oasts_free(outPtr, LENGTH_PREFIX + length);
 
-		return JSON.parse(body) as CompileResponse;
+		const parsed: unknown = JSON.parse(body);
+		return toResponse(parsed);
 	}
 }
