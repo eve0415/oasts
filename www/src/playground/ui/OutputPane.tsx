@@ -48,7 +48,7 @@ export const OutputPane = ({ files, selected, onSelect, stale, busy }: OutputPan
 	if (files.length === 0) {
 		return (
 			<div className="pg-output-empty">
-				<h3>Nothing to compile yet</h3>
+				<h2>Nothing to compile yet</h2>
 				<p>
 					Paste an OpenAPI 3.0 or 3.1 document on the left and the TypeScript appears here as you
 					type.
@@ -59,6 +59,7 @@ export const OutputPane = ({ files, selected, onSelect, stale, busy }: OutputPan
 
 	return (
 		<div className="pg-output" aria-busy={busy || undefined}>
+			<h2 className="pg-visually-hidden">Generated output</h2>
 			<nav className="pg-files" aria-label="Generated files">
 				{groups.map((group) => (
 					<div key={group.name} className="pg-file-group">

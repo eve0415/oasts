@@ -3,7 +3,8 @@
    one lightness and chroma, varying hue. */
 
 .pg-root {
-	--pg-comment: var(--nb-muted-foreground);
+	--pg-dim: oklch(0.53 0 0);
+	--pg-comment: var(--pg-dim);
 	--pg-keyword: oklch(0.45 0.16 300);
 	--pg-string: oklch(0.44 0.14 152);
 	--pg-number: oklch(0.46 0.15 65);
@@ -21,6 +22,9 @@
 }
 
 [data-mode="dark"] .pg-root {
+	/* muted-foreground measures 4.04:1 on the dark card — fine for the docs' airy prose,
+	   short of AA for this denser UI. */
+	--pg-dim: oklch(0.62 0 0);
 	--pg-keyword: oklch(0.75 0.12 300);
 	--pg-string: oklch(0.72 0.12 150);
 	--pg-number: oklch(0.78 0.11 80);
@@ -65,7 +69,7 @@
 	font-weight: 600;
 	letter-spacing: 0.04em;
 	text-transform: uppercase;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 	border: 1px solid var(--nb-border);
 	border-radius: 0.3125rem;
 	padding: 0.1875rem 0.4375rem;
@@ -79,7 +83,7 @@
 
 .pg-version-label {
 	font-size: 0.75rem;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 }
 
 .pg-spacer {
@@ -185,7 +189,7 @@
 	border: 1px solid transparent;
 	border-radius: 0.4375rem;
 	background: transparent;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 	font: inherit;
 	font-size: 0.78125rem;
 	font-weight: 500;
@@ -217,7 +221,7 @@
 
 .pg-badge {
 	background: var(--nb-muted);
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 }
 
 /* ---- Squiggles ---- */
@@ -263,7 +267,7 @@
 	font-family: var(--nb-font-mono);
 	font-size: 0.71875rem;
 	font-weight: 700;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 }
 
 .pg-file-count {
@@ -284,7 +288,7 @@
 	padding: 0.25rem 0.75rem 0.25rem 1.5rem;
 	border: none;
 	background: transparent;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 	font-family: var(--nb-font-mono);
 	font-size: 0.75rem;
 	text-align: left;
@@ -345,10 +349,10 @@
 	gap: 0.5rem;
 	padding: 2.5rem;
 	text-align: center;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 }
 
-.pg-output-empty h3 {
+.pg-output-empty h2 {
 	margin: 0;
 	color: var(--nb-foreground);
 }
@@ -481,13 +485,13 @@
 	flex-shrink: 0;
 	font-family: var(--nb-font-mono);
 	font-size: 0.71875rem;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 }
 
 .pg-host-notes {
 	padding: 0.625rem 0.875rem;
 	border-top: 1px solid var(--nb-border);
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 	font-size: 0.78125rem;
 }
 
@@ -541,13 +545,13 @@
 	font-weight: 700;
 	text-transform: uppercase;
 	letter-spacing: 0.03em;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 }
 
 .pg-section-note {
 	margin: 0.25rem 0 0.625rem;
 	font-size: 0.78125rem;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 	text-wrap: pretty;
 }
 
@@ -584,7 +588,7 @@
 	flex-basis: 100%;
 	margin: 0;
 	font-size: 0.75rem;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 	text-wrap: pretty;
 }
 
@@ -593,7 +597,7 @@
 }
 
 .pg-default {
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 }
 
 .pg-empty-note,
@@ -601,7 +605,7 @@
 	margin: 0;
 	padding: 0.6875rem 0.875rem;
 	font-size: 0.8125rem;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 }
 
 .pg-parse-error {
@@ -621,7 +625,7 @@
 	border-top: 1px solid var(--nb-border);
 	background: var(--nb-muted);
 	font-size: 0.71875rem;
-	color: var(--nb-muted-foreground);
+	color: var(--pg-dim);
 }
 
 .pg-dot {
@@ -692,5 +696,12 @@
 	.pg-file,
 	.pg-diagnostic {
 		min-height: 2.75rem;
+	}
+
+	/* iOS Safari zooms the page when a focused field computes under 16px, and never zooms
+	   back out. That applies to the editors too — they are contenteditable. */
+	.pg-input,
+	.pg-editor .cm-editor {
+		font-size: 1rem;
 	}
 }

@@ -11,9 +11,9 @@
 		"lint:docs": "nimbus-docs lint",
 		"lint:docs:fix": "nimbus-docs lint --fix",
 		"prepreview:cf": "astro build",
-		"preview:cf": "wrangler dev",
+		"preview:cf": "wrangler dev -c dist/server/wrangler.json",
 		"predeploy": "astro check && astro build",
-		"deploy": "wrangler deploy"
+		"deploy": "wrangler deploy -c dist/server/wrangler.json"
 	},
 	"dependencies": {
 		"@astrojs/cloudflare": "^14.2.1",

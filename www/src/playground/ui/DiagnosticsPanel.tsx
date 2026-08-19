@@ -1,4 +1,5 @@
 import type { Diagnostic } from "../types";
+import { describeLocation } from "../sources";
 
 /**
  * Diagnostics are a list of things about YOUR document. Notes the browser host raises about
@@ -11,14 +12,6 @@ export interface DiagnosticsPanelProps {
 	hostNotes: Diagnostic[];
 	onSelect: (diagnostic: Diagnostic) => void;
 }
-
-const where = (diagnostic: Diagnostic): string => {
-	const source = diagnostic.sourceId?.split("/").pop() ?? "";
-	if (diagnostic.line !== null && diagnostic.col !== null) {
-		return `${source}:${diagnostic.line}:${diagnostic.col}`;
-	}
-	return diagnostic.jsonPointer ? `${source} ${diagnostic.jsonPointer}` : source;
-};
 
 export const DiagnosticsPanel = ({
 	diagnostics,
@@ -59,7 +52,7 @@ export const DiagnosticsPanel = ({
 								</span>
 								<code className="pg-code">{diagnostic.code}</code>
 								<span className="pg-message">{diagnostic.message}</span>
-								<span className="pg-where">{where(diagnostic)}</span>
+								<span className="pg-where">{describeLocation(diagnostic)}</span>
 							</button>
 						</li>
 					))}

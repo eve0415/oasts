@@ -177,6 +177,7 @@ export const Playground = () => {
 
 			<div className="pg-workspace">
 				<section className="pg-input" aria-label="Input">
+					<h2 className="pg-visually-hidden">Input</h2>
 					<Tabs
 						label="Input"
 						tabs={tabs}

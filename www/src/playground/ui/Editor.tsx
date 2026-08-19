@@ -83,7 +83,7 @@ const theme = EditorView.theme({
 	},
 	".cm-gutters": {
 		backgroundColor: "var(--nb-card)",
-		color: "var(--nb-muted-foreground)",
+		color: "var(--pg-dim)",
 		border: "none",
 		borderRight: "1px solid var(--nb-border)",
 	},
@@ -138,10 +138,16 @@ export const Editor = ({
 			markerField,
 			theme,
 			EditorView.lineWrapping,
-			EditorView.contentAttributes.of({ "aria-label": ariaLabel }),
+			// contenteditable alone leaves the content at tabIndex -1, so the scrolling region has
+			// no keyboard route into it — worst for the read-only pane, which cannot be scrolled
+			// any other way.
+			EditorView.contentAttributes.of(
+				readOnly
+					? { "aria-label": ariaLabel, "aria-readonly": "true", tabindex: "0" }
+					: { "aria-label": ariaLabel, tabindex: "0" },
+			),
 			language === "yaml" ? yaml() : javascript({ typescript: true }),
 			EditorState.readOnly.of(readOnly),
-			EditorView.editable.of(!readOnly),
 			EditorView.updateListener.of((update) => {
 				if (update.docChanged) emitChange(update.state.doc.toString());
 			}),

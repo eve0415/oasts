@@ -2,10 +2,10 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "oasts-docs",
   "compatibility_date": "2026-08-15",
-  "main": "./dist/server/entry.mjs",
+  // The adapter derives the deploy config (entry point, ASSETS binding) into
+  // dist/server/wrangler.json at build time; `main` here would be validated before it exists.
   "assets": {
     "directory": "./dist/client",
-    "binding": "ASSETS",
     "not_found_handling": "404-page"
   }
 }

@@ -5,6 +5,7 @@ import { parseConfig } from "@/playground/config/yaml";
 import { decodeState, STATE_PARAM } from "@/playground/state";
 import { DEFAULT_CONFIG, DEFAULT_DOCUMENT } from "@/playground/defaults";
 import type { CompileResponse } from "@/playground/types";
+import { describeLocation } from "@/playground/sources";
 
 /**
  * The same playground state, as plain text.
@@ -50,11 +51,9 @@ const render = (response: CompileResponse, version: string, elapsed: number): st
 		lines.push("None.", "");
 	} else {
 		for (const diagnostic of response.diagnostics) {
-			const where =
-				diagnostic.line !== null && diagnostic.col !== null
-					? `${diagnostic.sourceId ?? ""}:${diagnostic.line}:${diagnostic.col}`
-					: `${diagnostic.sourceId ?? ""}${diagnostic.jsonPointer ?? ""}`;
-			lines.push(`- **${diagnostic.severity}** \`${diagnostic.code}\` ${where}`);
+			lines.push(
+				`- **${diagnostic.severity}** \`${diagnostic.code}\` ${describeLocation(diagnostic)}`,
+			);
 			lines.push(`  ${diagnostic.message}`);
 		}
 		lines.push("");
