@@ -3,7 +3,7 @@
   "name": "oasts-docs",
   "compatibility_date": "2026-08-15",
   "assets": {
-    "directory": "./dist",
+    "directory": "./dist/client",
     "not_found_handling": "404-page"
   }
 }

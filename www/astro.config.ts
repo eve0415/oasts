@@ -2,6 +2,8 @@ import { defineConfig } from "astro/config";
 import tailwindcss from "@tailwindcss/vite";
 import nimbus, { defineConfig as defineNimbusConfig } from "@cloudflare/nimbus-docs";
 import { tableScroll } from "@cloudflare/nimbus-docs/markdown";
+import react from "@astrojs/react";
+import cloudflare from "@astrojs/cloudflare";
 
 const nimbusConfig = defineNimbusConfig({
   site: "https://oasts.eve0415.workers.dev",
@@ -18,6 +20,9 @@ const nimbusConfig = defineNimbusConfig({
 
 export default defineConfig({
   output: "static",
+  // nimbus reads content collections and git from disk, and the OG generator drives
+  // canvaskit; none of that survives workerd, so prerendering stays in node.
+  adapter: cloudflare({ prerenderEnvironment: "node" }),
   // Tailwind v4 via its Vite plugin (the integration Astro recommends for
   // Tailwind v4 — replaces the PostCSS plugin, which doesn't build under
   // Astro 7's Vite 8 bundler).
@@ -31,6 +36,7 @@ export default defineConfig({
     defaultStrategy: "hover",
   },
   integrations: [
+    react(),
     nimbus(nimbusConfig, {
       // Authoring rules are opt-in by design — your repo, your taste. The
       // two below are the load-bearing pair: frontmatter has to validate
