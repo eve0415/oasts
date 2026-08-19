@@ -297,9 +297,19 @@ jobs:
         with:
           cache: true
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
       - name: Install
         working-directory: www
         run: pnpm install --frozen-lockfile
+
+      # The playground page ships the compiler as an asset and the plain-text route imports
+      # it, so the site cannot build until both are staged.
+      - name: Stage the playground compiler
+        run: scripts/playground-wasm.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       # Build first: nimbus/internal-link resolves against .nimbus/routes.json, which
       # is materialized at astro:build:done. Linting before a build skips every link

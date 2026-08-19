@@ -454,10 +454,45 @@ jobs:
   # provenance does not cover, so they get an attestation of their own. Like `publish`,
   # this job checks out nothing and installs nothing, which is what makes an id-token
   # here cheap: there is no third-party code on the runner to misuse it.
+  playground:
+    name: Build the browser compiler
+    needs:
+      - plan
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Released alongside the packages so the playground's version selector can offer this
+      # build later. Releases from before the playground landed carry no such asset, and the
+      # site's staging step treats that as normal rather than an error.
+      - name: Build the module and its config schema
+        run: scripts/playground-wasm.sh
+        env:
+          PLAYGROUND_SKIP_RELEASES: "1"
+
+      - name: Upload the browser compiler
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playground
+          path: |
+            www/public/play/wasm/oasts-*.wasm
+            www/public/play/wasm/config-*.json
+          if-no-files-found: error
+
   github-release:
     name: Publish the GitHub release
     needs:
       - plan
+      - playground
       - publish
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04-arm
@@ -478,6 +513,12 @@ jobs:
           # upload-artifact roots an artifact at the least common ancestor of the paths
           # it was given, so `stage` produced a tree rooted at packages/oasts.
           path: packages/oasts
+
+      - name: Download the browser compiler
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: playground
+          path: playground
 
       - name: Attest the platform binaries
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -500,4 +541,6 @@ jobs:
             --verify-tag \
             --generate-notes \
             "${prerelease[@]}" \
-            packages/oasts/npm/*/oasts.*.node
+            packages/oasts/npm/*/oasts.*.node \
+            playground/oasts-*.wasm \
+            playground/config-*.json
