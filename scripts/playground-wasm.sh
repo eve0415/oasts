@@ -55,7 +55,8 @@ if ! pnpm -C www exec wrangler r2 object get "$bucket/versions.json" \
   echo '{"versions":[]}' >"$work/existing.json"
 fi
 
-LABEL="$label" EXISTING="$work/existing.json" node --input-type=module >"$work/versions.json" <<'NODE'
+LABEL="$label" EXISTING="$work/existing.json" CURRENT="${PLAYGROUND_CURRENT:-}" \
+  node --input-type=module >"$work/versions.json" <<'NODE'
 import { readFileSync } from "node:fs";
 
 const version = process.env.LABEL;
@@ -68,7 +69,12 @@ versions.push({
   schema: `/playground/wasm/config-${version}.json`,
 });
 
-process.stdout.write(JSON.stringify({ current: version, versions }, null, 1));
+// Only a release claims the default. Anything else joins the list without displacing it —
+// otherwise publishing a branch build would point every visitor at unreleased code. The
+// fallback covers the first publish, when there is no default to keep.
+const current = process.env.CURRENT === "1" ? version : (existing.current ?? version);
+
+process.stdout.write(JSON.stringify({ current, versions }, null, 1));
 NODE
 
 put versions.json "$work/versions.json" application/json 'public, max-age=300'

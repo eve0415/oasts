@@ -487,6 +487,8 @@ jobs:
       - name: Publish the browser compiler to the archive
         run: scripts/playground-wasm.sh
         env:
+          # A release is the only thing that claims the playground's default version.
+          PLAYGROUND_CURRENT: "1"
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
