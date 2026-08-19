@@ -114,33 +114,31 @@ export const useCompiler = (): UseCompiler => {
 		let cancelled = false;
 		void (async () => {
 			try {
-				// The build this deploy carries is a static asset; everything released before it
-				// lives in R2. A site deployed before the first R2 publish simply has no archive,
-				// which is why the second request is allowed to fail.
-				const [current, archive] = await Promise.all([
-					fetchJson("/playground/wasm/current.json"),
-					fetchJson("/playground/wasm/versions.json").catch(() => null),
-				]);
+				// Every build lives in the archive — the site itself ships no compiler, so a
+				// release reaches the playground without the site being rebuilt.
+				const archive = await fetchJson("/playground/wasm/versions.json");
 				if (cancelled) return;
 
-				const entries = new Map<string, VersionEntry>();
-				for (const entry of [...toEntries(current), ...arrayOf(archive, "versions").flatMap(toEntries)]) {
-					if (!entries.has(entry.version)) entries.set(entry.version, entry);
-				}
+				const entries = arrayOf(archive, "versions")
+					.flatMap(toEntries)
+					.sort(byVersionDescending);
 
-				if (entries.size === 0) {
+				if (entries.length === 0) {
 					setStatus("failed");
 					setFailure("no compiler build is available");
 					return;
 				}
 
-				const currentVersion = stringOf(current, "version") ?? "";
-				setVersions([...entries.values()].sort(byVersionDescending));
-				setVersion(currentVersion === "" ? ([...entries.keys()][0] ?? "") : currentVersion);
+				const named = stringOf(archive, "current") ?? "";
+				const current = entries.some((entry) => entry.version === named)
+					? named
+					: (entries[0]?.version ?? "");
+				setVersions(entries);
+				setVersion(current);
 			} catch {
 				if (!cancelled) {
 					setStatus("failed");
-					setFailure("the compiler version list could not be loaded");
+					setFailure("the compiler archive could not be reached");
 				}
 			}
 		})();

@@ -477,55 +477,18 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: Build the module and its config schema
-        run: scripts/playground-wasm.sh
-
-      # The archive is what the playground's version selector offers. Objects are immutable and
-      # the manifest is rewritten each release, so the site picks up a new version without being
-      # redeployed. Listing is deliberately avoided — it is R2's expensive operation class.
-      - name: Publish to the compiler archive
+      # wrangler is the site workspace's dependency, and the publish runs through it.
+      - name: Install
         working-directory: www
+        run: pnpm install --frozen-lockfile
+
+      # The site ships no compiler; the playground reads every version from this archive, so a
+      # release reaches it without the docs being rebuilt or redeployed.
+      - name: Publish the browser compiler to the archive
+        run: scripts/playground-wasm.sh
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -euo pipefail
-          bucket=oasts-playground
-          staged=public/playground/wasm
-
-          # Cache-Control rides on the object so it is still correct if the archive is ever
-          # served straight from a custom domain rather than through the Worker.
-          put() {
-            pnpm exec wrangler r2 object put "$bucket/$1" \
-              --file "$2" --content-type "$3" --cache-control "$4" --remote
-          }
-
-          immutable='public, max-age=31536000, immutable'
-
-          put "oasts-$VERSION.wasm" "$staged/oasts-$VERSION.wasm" application/wasm "$immutable"
-          put "config-$VERSION.json" "$staged/config-$VERSION.json" application/json "$immutable"
-
-          # Read-modify-write of the one mutable object. Releases are serialised by tag, so
-          # there is no concurrent writer to race with.
-          if ! pnpm exec wrangler r2 object get "$bucket/versions.json" --file existing.json --remote 2>/dev/null; then
-            echo '{"versions":[]}' >existing.json
-          fi
-
-          VERSION="$VERSION" node --input-type=module <<'NODE' >versions.json
-          import { readFileSync } from "node:fs";
-          const version = process.env.VERSION;
-          const existing = JSON.parse(readFileSync("existing.json", "utf8"));
-          const versions = (existing.versions ?? []).filter((entry) => entry.version !== version);
-          versions.push({
-            version,
-            url: `/playground/wasm/oasts-${version}.wasm`,
-            schema: `/playground/wasm/config-${version}.json`,
-          });
-          process.stdout.write(JSON.stringify({ versions }, null, 1));
-          NODE
-
-          put versions.json versions.json application/json 'public, max-age=300'
 
   github-release:
     name: Publish the GitHub release
