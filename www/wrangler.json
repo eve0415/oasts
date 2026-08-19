@@ -1,20 +1,15 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
+
   "name": "oasts",
   "compatibility_date": "2026-08-18",
-  "assets": {
-    "directory": "./dist/client",
-    "not_found_handling": "404-page",
-    "run_worker_first": [
-      "/playground/wasm/*"
-    ]
+
+  "placement": {
+    "mode": "smart"
   },
-  "r2_buckets": [
-    {
-      "binding": "PLAYGROUND_WASM",
-      "bucket_name": "oasts-playground"
-    }
-  ],
+  "preview_urls": true,
+  "upload_source_maps": true,
+
   "observability": {
     "enabled": true,
     "logs": {
@@ -26,9 +21,17 @@
       "head_sampling_rate": 1
     }
   },
-  "upload_source_maps": true,
-  "placement": {
-    "mode": "smart"
+
+  "assets": {
+    "directory": "./dist/client",
+    "not_found_handling": "404-page",
+    "run_worker_first": ["/playground/wasm/*"]
   },
-  "preview_urls": true
+
+  "r2_buckets": [
+    {
+      "binding": "PLAYGROUND_WASM",
+      "bucket_name": "oasts-playground"
+    }
+  ]
 }
