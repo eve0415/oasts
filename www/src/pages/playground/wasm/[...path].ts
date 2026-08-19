@@ -4,9 +4,9 @@ import { env } from "cloudflare:workers";
 /**
  * Serves historical compiler builds out of R2.
  *
- * The version shipped with this deploy is a static asset, and Cloudflare serves assets before the
- * request ever reaches the Worker — so this route runs only for versions the current build does
- * not carry.
+ * The site ships no compiler of its own — every version the playground offers lives in the bucket —
+ * so this route answers every request under the prefix. `run_worker_first` in the wrangler config
+ * keeps the asset layer's not-found handling from intercepting them.
  *
  * There is deliberately no Cache API use here: the edge cache is zone-level and does nothing on a
  * workers.dev subdomain, so calling it would be a no-op dressed up as an optimisation. The
