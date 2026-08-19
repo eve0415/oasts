@@ -47,7 +47,7 @@
 		"babel-plugin-react-compiler": "1.0.0",
 		"pagefind": "1.5.2",
 		"tailwindcss": "4.3.3",
-		"typescript": "5.9.3",
+		"typescript": "6.0.3",
 		"wrangler": "4.124.0"
 	}
 }
