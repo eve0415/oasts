@@ -36,11 +36,6 @@ built=target/wasm32-unknown-unknown/wasm/oasts_wasm.wasm
 install -m 644 "$built" "$target/oasts-$label.wasm"
 install -m 644 schemas/config-v1.json "$target/config-$label.json"
 
-# The plain-text route compiles server-side, and workerd only runs WebAssembly imported as a
-# module — never compiled from bytes at runtime. So the current build is also staged where the
-# route can import it under a stable name.
-mkdir -p www/src/playground/wasm/generated
-install -m 644 "$built" www/src/playground/wasm/generated/compiler.wasm
 
 echo "playground-wasm: staged $label ($(stat -c%s "$built") B)"
 

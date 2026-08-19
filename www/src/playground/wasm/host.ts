@@ -61,15 +61,12 @@ export class CompilerModule {
 		this.#exports = exports;
 	}
 
-	static async instantiate(
-		source: Response | ArrayBuffer | WebAssembly.Module,
-	): Promise<CompilerModule> {
-		const instance =
-			source instanceof Response
-				? (await WebAssembly.instantiateStreaming(source, {})).instance
-				: source instanceof WebAssembly.Module
-					? await WebAssembly.instantiate(source, {})
-					: (await WebAssembly.instantiate(source, {})).instance;
+	/**
+	 * Streaming instantiation specifically: V8 only code-caches modules compiled through the
+	 * streaming API, and at 2 MB this one is well past the 128 kB threshold where that pays.
+	 */
+	static async instantiate(source: Response): Promise<CompilerModule> {
+		const { instance } = await WebAssembly.instantiateStreaming(source, {});
 
 		if (!hasExports(instance.exports)) {
 			throw new Error("the compiler module does not export the expected boundary");
