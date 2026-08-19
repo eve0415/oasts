@@ -455,9 +455,10 @@ jobs:
   # this job checks out nothing and installs nothing, which is what makes an id-token
   # here cheap: there is no third-party code on the runner to misuse it.
   playground:
-    name: Build the browser compiler
+    name: Publish the browser compiler
     needs:
       - plan
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
@@ -468,31 +469,68 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # Released alongside the packages so the playground's version selector can offer this
-      # build later. Releases from before the playground landed carry no such asset, and the
-      # site's staging step treats that as normal rather than an error.
       - name: Build the module and its config schema
         run: scripts/playground-wasm.sh
-        env:
-          PLAYGROUND_SKIP_RELEASES: "1"
 
-      - name: Upload the browser compiler
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: playground
-          path: |
-            www/public/playground/wasm/oasts-*.wasm
-            www/public/playground/wasm/config-*.json
-          if-no-files-found: error
+      # The archive is what the playground's version selector offers. Objects are immutable and
+      # the manifest is rewritten each release, so the site picks up a new version without being
+      # redeployed. Listing is deliberately avoided — it is R2's expensive operation class.
+      - name: Publish to the compiler archive
+        working-directory: www
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          bucket=oasts-playground
+          staged=public/playground/wasm
+
+          # Cache-Control rides on the object so it is still correct if the archive is ever
+          # served straight from a custom domain rather than through the Worker.
+          put() {
+            pnpm exec wrangler r2 object put "$bucket/$1" \
+              --file "$2" --content-type "$3" --cache-control "$4" --remote
+          }
+
+          immutable='public, max-age=31536000, immutable'
+
+          put "oasts-$VERSION.wasm" "$staged/oasts-$VERSION.wasm" application/wasm "$immutable"
+          put "config-$VERSION.json" "$staged/config-$VERSION.json" application/json "$immutable"
+
+          # Read-modify-write of the one mutable object. Releases are serialised by tag, so
+          # there is no concurrent writer to race with.
+          if ! pnpm exec wrangler r2 object get "$bucket/versions.json" --file existing.json --remote 2>/dev/null; then
+            echo '{"versions":[]}' >existing.json
+          fi
+
+          VERSION="$VERSION" node --input-type=module <<'NODE' >versions.json
+          import { readFileSync } from "node:fs";
+          const version = process.env.VERSION;
+          const existing = JSON.parse(readFileSync("existing.json", "utf8"));
+          const versions = (existing.versions ?? []).filter((entry) => entry.version !== version);
+          versions.push({
+            version,
+            url: `/playground/wasm/oasts-${version}.wasm`,
+            schema: `/playground/wasm/config-${version}.json`,
+          });
+          process.stdout.write(JSON.stringify({ versions }, null, 1));
+          NODE
+
+          put versions.json versions.json application/json 'public, max-age=300'
 
   github-release:
     name: Publish the GitHub release
     needs:
       - plan
-      - playground
       - publish
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04-arm
@@ -513,12 +551,6 @@ jobs:
           # upload-artifact roots an artifact at the least common ancestor of the paths
           # it was given, so `stage` produced a tree rooted at packages/oasts.
           path: packages/oasts
-
-      - name: Download the browser compiler
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: playground
-          path: playground
 
       - name: Attest the platform binaries
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -541,6 +573,4 @@ jobs:
             --verify-tag \
             --generate-notes \
             "${prerelease[@]}" \
-            packages/oasts/npm/*/oasts.*.node \
-            playground/oasts-*.wasm \
-            playground/config-*.json
+            packages/oasts/npm/*/oasts.*.node
