@@ -23,6 +23,34 @@ const HOST_NOTE_CODES = new Set(["OASTS0221", "OASTS0251"]);
 const isHostNote = (diagnostic: Diagnostic): boolean =>
 	diagnostic.severity === "warning" && HOST_NOTE_CODES.has(diagnostic.code);
 
+const fetchJson = async (url: string): Promise<unknown> => {
+	const response = await fetch(url);
+	if (!response.ok) throw new Error(`${url} responded ${response.status}`);
+	return response.json();
+};
+
+/** A manifest entry is only usable if it names all three of version, module and schema. */
+const toEntries = (node: unknown): VersionEntry[] => {
+	const version = stringOf(node, "version");
+	const url = stringOf(node, "url");
+	const schema = stringOf(node, "schema");
+	return version === null || url === null || schema === null ? [] : [{ version, url, schema }];
+};
+
+/** Newest first, comparing release numbers rather than strings so 0.0.10 outranks 0.0.9. */
+const byVersionDescending = (left: VersionEntry, right: VersionEntry): number => {
+	const parts = (value: string) => value.split(/[.-]/).map((part) => Number(part));
+	const a = parts(left.version);
+	const b = parts(right.version);
+	for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+		const one = a[index] ?? 0;
+		const two = b[index] ?? 0;
+		if (Number.isNaN(one) || Number.isNaN(two)) return right.version.localeCompare(left.version);
+		if (one !== two) return two - one;
+	}
+	return 0;
+};
+
 export type CompilerStatus = "loading" | "ready" | "compiling" | "failed";
 
 export interface CompileOutcome {
@@ -86,25 +114,29 @@ export const useCompiler = (): UseCompiler => {
 		let cancelled = false;
 		void (async () => {
 			try {
-				const response = await fetch("/playground/wasm/versions.json");
-				const manifest: unknown = await response.json();
+				// The build this deploy carries is a static asset; everything released before it
+				// lives in R2. A site deployed before the first R2 publish simply has no archive,
+				// which is why the second request is allowed to fail.
+				const [current, archive] = await Promise.all([
+					fetchJson("/playground/wasm/current.json"),
+					fetchJson("/playground/wasm/versions.json").catch(() => null),
+				]);
 				if (cancelled) return;
-				const entries: VersionEntry[] = [];
-				for (const entry of arrayOf(manifest, "versions")) {
-					const version = stringOf(entry, "version");
-					const url = stringOf(entry, "url");
-					const schema = stringOf(entry, "schema");
-					if (version === null || url === null || schema === null) continue;
-					entries.push({ version, url, schema });
+
+				const entries = new Map<string, VersionEntry>();
+				for (const entry of [...toEntries(current), ...arrayOf(archive, "versions").flatMap(toEntries)]) {
+					if (!entries.has(entry.version)) entries.set(entry.version, entry);
 				}
-				const current = stringOf(manifest, "current") ?? entries[0]?.version ?? "";
-				if (entries.length === 0) {
+
+				if (entries.size === 0) {
 					setStatus("failed");
 					setFailure("no compiler build is available");
 					return;
 				}
-				setVersions(entries);
-				setVersion(current);
+
+				const currentVersion = stringOf(current, "version") ?? "";
+				setVersions([...entries.values()].sort(byVersionDescending));
+				setVersion(currentVersion === "" ? ([...entries.keys()][0] ?? "") : currentVersion);
 			} catch {
 				if (!cancelled) {
 					setStatus("failed");

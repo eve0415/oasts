@@ -7,5 +7,13 @@
   "assets": {
     "directory": "./dist/client",
     "not_found_handling": "404-page"
-  }
+  },
+  // Historical compiler builds. The version shipped with this deploy is a static asset, so it
+  // is served without ever reaching the Worker; only older versions fall through to R2.
+  "r2_buckets": [
+    {
+      "binding": "PLAYGROUND_WASM",
+      "bucket_name": "oasts-playground"
+    }
+  ]
 }

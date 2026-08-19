@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 target=www/public/playground/wasm
-manifest=$target/versions.json
+manifest=$target/current.json
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
 if [[ -z $version ]]; then
@@ -39,28 +39,10 @@ install -m 644 schemas/config-v1.json "$target/config-$label.json"
 
 echo "playground-wasm: staged $label ($(stat -c%s "$built") B)"
 
-# Releases carry their own module from the next release onward. Fetching is best-effort: a
-# missing asset means that release predates the playground, which is not an error.
-released=()
-if command -v gh >/dev/null 2>&1 && [[ -z ${PLAYGROUND_SKIP_RELEASES:-} ]]; then
-  while read -r tag; do
-    [[ -z $tag ]] && continue
-    tag_version=${tag#v}
-    [[ $tag_version == "$label" ]] && continue
-    if gh release download "$tag" --pattern 'oasts-*.wasm' --pattern 'config-*.json' --dir "$target" --clobber >/dev/null 2>&1; then
-      released+=("$tag_version")
-      echo "playground-wasm: fetched $tag_version"
-    fi
-  done < <(gh release list --limit 50 --json tagName --jq '.[].tagName' 2>/dev/null || true)
-fi
-
+# The released list lives in R2 and is written when a release publishes, so nothing here needs
+# to reach for it. This file describes only the build in this checkout.
 {
-  printf '{\n  "current": "%s",\n  "versions": [\n' "$label"
-  printf '    { "version": "%s", "url": "/playground/wasm/oasts-%s.wasm", "schema": "/playground/wasm/config-%s.json" }' "$label" "$label" "$label"
-  for previous in "${released[@]}"; do
-    printf ',\n    { "version": "%s", "url": "/playground/wasm/oasts-%s.wasm", "schema": "/playground/wasm/config-%s.json" }' "$previous" "$previous" "$previous"
-  done
-  printf '\n  ]\n}\n'
+  printf '{\n  "version": "%s",\n  "url": "/playground/wasm/oasts-%s.wasm",\n  "schema": "/playground/wasm/config-%s.json"\n}\n' "$label" "$label" "$label"
 } >"$manifest"
 
-echo "playground-wasm: wrote $manifest with $((1 + ${#released[@]})) version(s)"
+echo "playground-wasm: wrote $manifest"
