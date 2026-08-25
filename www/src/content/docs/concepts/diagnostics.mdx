@@ -1,0 +1,154 @@
+---
+title: Diagnostics
+description: How to read an OASTS code, what the families mean, and the refusals you are most likely to meet.
+sidebar:
+  order: 3
+---
+
+Every message oasts prints carries a stable code, a severity, and a pointer into the thing it is talking about:
+
+```text
+error[OASTS0262]: filters.paths.include pattern '/^\/pets/' matches no operation; a regex pattern must match the whole subject, so add `.*` to match a prefix or a substring
+  --> /home/you/project/oasts.yaml:1:1 /filters/paths/include/0
+```
+
+```text
+warning[OASTS5204]: response key '200' is statically bodyless but declares media 'text/event-stream'
+  --> workspace/openapi.yaml:1:1 /paths/~1probe/head/responses/200/content/text~1event-stream
+```
+
+The message is one line however long it runs — nothing wraps it.
+The trailing path is a **JSON Pointer** into the document or config file: the exact node the diagnostic is about, with `/` in a key escaped as `~1`.
+
+The two source names are not the same kind of thing.
+A config diagnostic names the config file by its normalized absolute path, because that is what oasts resolved it to before reading it.
+A document diagnostic names a **logical source ID** instead — `workspace/<path>` for anything under the workspace root, `allow/<n>/<path>` for a document reached through the *n*th `local.allowPaths` root.
+Those are stable across machines, which is what makes diagnostics comparable between a laptop and CI.
+
+## Severity
+
+- **`error`** — a refusal. The run is transactional: oasts builds and stages the whole output before committing it, and rolls back a write that fails part-way. A failed run leaves the previous generated tree and ownership manifest unchanged.
+- **`warning`** — generation continues, and the warning names what was skipped or adjusted. A warning always means one operation, one component, or one artifact projection did *not* come out the way an unqualified reading of the document would suggest.
+
+Warnings matter more here than in most tools, because oasts never resolves an ambiguity silently.
+If an operation vanished from an artifact, a warning says so and names it.
+
+## Code families
+
+The **thousands** digit is the stage that refused, and every code in a stage shares an exit code:
+
+| Stage | What refused | Exit | For example |
+| --- | --- | --- | --- |
+| `0xxx` | **Config validation.** The file parsed, but something in it is not a usable instruction. | `2` | `OASTS0101` no artifact is enabled · `OASTS0111` the client artifact needs types on · `OASTS0262` a filter pattern matches nothing |
+| `1xxx` | **I/O.** A file oasts had to read or write did not cooperate. | `2` | `OASTS1001` the config could not be read · `OASTS1002` your tsconfig is unreadable or is not valid JSONC · `OASTS1013` writing an output file failed |
+| `2xxx` | **Document loading and structure.** The document, its `$ref` graph, or a schema keyword. | `1` | `OASTS2003` the document is not valid YAML or JSON · `OASTS2013` the `limits.maxDocuments` bound was exceeded · `OASTS2201` a construct this OpenAPI version does not define |
+| `3xxx` | **Semantics.** Names, value domains, links. | `1` | `OASTS3001` two operations want the same identifier · `OASTS3002` two schemas want the same type name · `OASTS3201` a Link Object's `operationId` names no operation |
+| `4xxx` | **Type emission.** Turning the model into TypeScript. | `1` | `OASTS4105` a compiler-invented name has nowhere left to move · `OASTS4201` an `allOf` proven empty, lowered to `never` |
+| `5xxx` | **Client model.** Projecting operations into the request and response pipeline. | `1` | `OASTS5201` an XML response media · `OASTS5403` an OAuth2 scheme declaring no flows |
+| `6xxx` | **Artifacts.** One sub-band per artifact. | `1` | `OASTS6002` validators cannot check a keyword · `OASTS6201` a path literal MSW's matcher cannot match |
+| `9xxx` | **Provisional.** A capability this build gates off rather than refuses. | varies | `OASTS9003` a reserved config block · `OASTS9201` a remote `$ref` |
+
+The **hundreds** digit sub-divides a stage: `62xx` is MSW's corner of the artifact stage, `22xx` is the schema-keyword corner of document loading.
+Sub-bands are kept sparse deliberately, so a new code joins its siblings instead of landing at the end of a run.
+
+The exit code is a property of each diagnostic, not something parsed back out of its number.
+Every code carries a category, and stages are drawn so that all the codes in one share it — that is what makes the `Exit` column true rather than coincidental.
+A code whose category disagrees with its stage is a bug.
+See [exit codes](/reference/cli) for what `1` and `2` mean at the shell.
+
+`0xxx` has a finer address: `0rrs`, where `rr` is a config rule and `s` is a sequence within it.
+`OASTS0262` is rule 26 — filters — sequence 2.
+Codes sharing an `rr` are different ways of failing the same rule, so `0261`, `0262` and `0263` are all about filters: two ways one pattern can be wrong, then the whole block leaving nothing behind.
+
+### The provisional band
+
+`9xxx` is not a stage.
+It holds capabilities this build gates off rather than refuses on the merits — `OASTS9201` for a remote `$ref`, `OASTS9003` for a config block that is accepted by the schema but not implemented.
+A provisional code **retires when its capability lands**, so the band is expected to develop holes, and nothing is renumbered to close them.
+
+The second digit tells you which stage the code would otherwise have sat in.
+Treat it as a hint about where the refusal came from, not as a way to work out the exit code — read that off the category the diagnostic carries.
+`99xx` is reserved for test sentinels and is never emitted.
+
+## Refusals you are most likely to meet
+
+### Configuration
+
+All errors, all exit `2`.
+
+| Code | Meaning |
+| --- | --- |
+| `OASTS0102` | An artifact's output directory is unusable: it overlaps another enabled artifact's — equal or nested — or its own value is not a relative path of `[A-Za-z0-9_-]` segments |
+| `OASTS0221` | A `local.allowPaths` entry that is not relative, or a `limits.*` value outside its permitted range |
+| `OASTS0261` | A filter pattern is a regex literal whose body does not compile |
+| `OASTS0262` | A filter pattern matches no operation — or matches only callback operations, which are never filtered independently of the operation that declares them |
+| `OASTS0263` | Filters are declared and nothing survives them: no operations and no webhooks |
+
+### Document and schema
+
+| Code | Severity | Meaning |
+| --- | --- | --- |
+| `OASTS2105` | warning | A lowercase status range (`4xx`) — canonicalized and reported, not rejected |
+| `OASTS2106` | error | Two keys in one responses object naming the same status once canonicalized |
+| `OASTS2107` | warning | Pruning removed every component schema and no operation survived either |
+| `OASTS2201` | warning | A schema construct this OpenAPI version does not define — a 3.1-only keyword in a 3.0 document, a boolean schema in 3.0, a parameter with neither `schema` nor `content`. The type widens to `unknown` |
+| `OASTS2205` | warning | A narrowing keyword the emitted TypeScript cannot apply, where the leaf does *not* widen to `unknown`. The validators artifact enforces it instead |
+| `OASTS2215` | error | A `$recursiveRef` written with a value other than `"#"` |
+| `OASTS2216` | warning | A `$dynamicRef` or `$recursiveRef` whose target genuinely depends on the path evaluation took to reach it |
+| `OASTS2221` | warning | A discriminator `mapping` value that is not a JSON string, so it cannot name a schema |
+
+### Names the compiler will not invent
+
+These are the [naming](/guides/naming) refusals.
+Each has a remedy in `naming.overrides`, and the run prints a ready-made block of them after its diagnostics.
+
+| Code | Severity | Meaning |
+| --- | --- | --- |
+| `OASTS4102` | error | An operation module declares a name it also imports, and the import's replacement name is taken here too |
+| `OASTS4103` | error | A request/response variant's replacement name is itself declared, or is another variant's replacement |
+| `OASTS4104` | warning | A `{Name}Wire` twin collides with a declared name, so it is emitted as `{Name}WireValue` instead |
+| `OASTS4105` | error | `{Name}WireValue` is declared too — nothing compiler-invented is left to move |
+
+### Composition and discriminators
+
+| Code | Severity | Meaning |
+| --- | --- | --- |
+| `OASTS4201` | warning | An `allOf` proven to have no inhabitants, lowered to `never` |
+| `OASTS4204` | warning | A discriminator `mapping` value resolving to no allocated component schema; the entry contributes no tag |
+| `OASTS4205` | warning | A discriminator whose `mapping`/`const` proof is internally incoherent — a structural union is emitted instead |
+| `OASTS4206` | warning | A property two `allOf` branches declare with schemas that intersect to nothing |
+| `OASTS4207` | warning | A discriminator that can select branches, but whose union lacks unit-literal tags on every branch |
+| `OASTS4301` | error | A union whose date/time conversions cannot be told apart — branches converting the same values differently, or disagreeing on which of those properties they require |
+
+### Artifact projections
+
+MSW and TanStack degrade; validators and Zod refuse.
+An operation MSW cannot mock, or TanStack cannot give a descriptor, is skipped with a warning and the rest of the file still generates — that is **on purpose**, because an error would throw the whole run's output away over one operation it could not project.
+The validation artifacts take the other line: anything they cannot check faithfully is an error, since a validator that quietly checks less than the document says is worse than no build.
+Their one warning only renames a colliding schema.
+
+The severity column below is the authority. Read that, not the artifact name.
+
+| Code | Artifact | Severity | Meaning |
+| --- | --- | --- | --- |
+| `OASTS6001` | validators, zod | warning | A response media entry renamed because its generated schema name collided with another's |
+| `OASTS6002` | validators | error | A validation keyword the validators artifact does not implement |
+| `OASTS6003` | validators | error | A schema degraded to an unknown leaf, so no faithful validator exists |
+| `OASTS6004` | validators | error | An applicator's subschema is not fully checkable, so the outer check would be unsound |
+| `OASTS6101` | zod | error | A validation keyword the Zod artifact does not implement |
+| `OASTS6102` | zod | error | A schema degraded to an unknown leaf, so no faithful Zod schema exists |
+| `OASTS6201` | msw | warning | A path literal carrying a character the MSW matcher always reads as a wildcard |
+| `OASTS6202` | msw | warning | An HTTP method for which MSW exposes no handler factory |
+| `OASTS6203` | msw | warning | A parameter's wire form cannot be projected into its TypeScript type |
+| `OASTS6204` | msw | warning | A request or response body cannot be projected between wire form and TypeScript type |
+| `OASTS6205` | msw | warning | A parameter serialization loses boundaries before the handler can invert it |
+| `OASTS6206` | msw | warning | A streaming body has no buffered value to project in either direction |
+| `OASTS6207` | msw | warning | A form body whose schema declares no properties — the handler is emitted projecting no body fields |
+| `OASTS6301` | tanstack | warning | An operation that gets no descriptor: a read with an empty success branch, or a stream, which is excluded on the mutation side too |
+| `OASTS6302` | tanstack | error | Two things collide over one key-factory name — two paths, two sibling segments, a reserved import, or a duplicated path parameter |
+| `OASTS6303` | tanstack | warning | A `naming.overrides.pathSegments` entry matched no path segment |
+
+<Aside type="note">
+  This is the set you are most likely to hit, not the complete allocation.
+  Run [`oasts check`](/reference/cli) to see every diagnostic your own document and config produce, without writing any files.
+</Aside>

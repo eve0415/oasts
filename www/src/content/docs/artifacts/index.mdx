@@ -1,0 +1,61 @@
+---
+title: Artifacts
+description: The six things oasts can emit, and what each one is for.
+sidebar:
+  order: 3
+  group:
+    label: Artifacts
+---
+
+Everything oasts emits is derived from one model of your document, so the artifacts cannot disagree about your API.
+Turn them on individually:
+
+```yaml title="oasts.yaml"
+artifacts:
+  types: true
+  client: true
+  zod: false
+  validators: false
+  tanstack: false
+  msw: false
+validation:
+  engine: "off"
+  unchecked: allow
+```
+
+The client artifact requires an explicit `validation` block; `engine: "off"` opts out of boundary checking.
+See [Validation](/artifacts/validation) for the other engines.
+
+<Aside type="note">
+  Types default on.
+  Set `types: false` to omit the artifact; oasts does not write `types/` or silently turn it back on.
+  Zod and validators can stand alone.
+  Client and MSW each require types (`OASTS0111` and `OASTS0112`), and TanStack requires client (`OASTS0113`), so it requires types transitively.
+  At least one artifact must remain enabled.
+</Aside>
+
+<CardGrid>
+  <Card title="Types" icon="ph:brackets-curly">
+    Plain interfaces for every schema, plus per-operation request and response types.
+    [Read more](/artifacts/types).
+  </Card>
+  <Card title="Client" icon="ph:plugs-connected">
+    A zero-dependency fetch client whose calls return failure-complete results.
+    [Read more](/artifacts/client).
+  </Card>
+  <Card title="Validation" icon="ph:shield-check">
+    Zod schemas or dependency-free validators — standalone, or wired into the client.
+    [Read more](/artifacts/validation).
+  </Card>
+  <Card title="TanStack Query" icon="ph:database">
+    Query and mutation descriptors with hierarchical, prefix-invalidatable keys.
+    [Read more](/artifacts/tanstack).
+  </Card>
+  <Card title="MSW" icon="ph:test-tube">
+    Typed handler factories checked against the document you mock.
+    [Read more](/artifacts/msw).
+  </Card>
+</CardGrid>
+
+Each artifact writes into its own directory under `output`, named after the artifact.
+Rename or nest any of them with `artifacts.<name>.directory` and the imports between them follow — see [Configuration](/reference/configuration#artifacts).

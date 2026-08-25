@@ -87,6 +87,10 @@ struct PreparedFile {
 
 trait Renamer {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    // Runs once after staging, before the first change is committed. Production does nothing
+    // here; a test uses it to disturb the tree in exactly that window.
+    fn staged(&self) {}
 }
 
 struct FileRenamer;
@@ -396,6 +400,10 @@ fn write_transaction(
             return Err(diagnostics);
         }
     };
+
+    // Staging recorded which targets are stale; commit re-checks them. This is the gap where
+    // one can vanish underneath us.
+    renamer.staged();
 
     let mut applied = Vec::with_capacity(changes.len());
     let committed = finish_changes(
@@ -1101,7 +1109,6 @@ fn io_diagnostic(message: String, path: Option<&Path>) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::sync::{Arc, Barrier};
 
     #[cfg(unix)]
     use std::cell::RefCell;
@@ -1615,43 +1622,35 @@ mod tests {
         assert_eq!(report.files_deleted, 0);
     }
 
+    // The stale target vanishes after staging recorded it and before the commit that would
+    // delete it. Doing that from the staging hook lands in that window every run; the thread
+    // this replaces only got there when it won a race, and on a loaded runner it often lost.
     #[test]
     fn a_stale_target_removed_after_staging_is_harmless() {
+        struct RemoveStaleAfterStaging {
+            stale_target: PathBuf,
+        }
+
+        impl Renamer for RemoveStaleAfterStaging {
+            fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+                fs::rename(from, to)
+            }
+
+            fn staged(&self) {
+                fs::remove_file(&self.stale_target).expect("concurrent stale removal");
+            }
+        }
+
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("generated");
         write(&output, vec![generated("stale.ts", "stale")]).expect("initial write");
-        let watched_output = output.clone();
-        let stale_target = output.join("stale.ts");
-        let started = Arc::new(Barrier::new(2));
-        let watcher_started = Arc::clone(&started);
-        let remover = std::thread::spawn(move || {
-            watcher_started.wait();
-            loop {
-                let staging_exists = fs::read_dir(&watched_output)
-                    .expect("output entries")
-                    .filter_map(Result::ok)
-                    .any(|entry| {
-                        entry
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with(".oasts-stage-")
-                    });
-                if staging_exists {
-                    break;
-                }
-                std::thread::yield_now();
-            }
-            fs::remove_file(stale_target).expect("concurrent stale removal");
-        });
-        started.wait();
-        std::thread::yield_now();
 
-        let report = write(
-            &output,
-            vec![generated("replacement.ts", &"x".repeat(16 * 1024 * 1024))],
-        )
-        .expect("concurrent stale removal is harmless");
-        remover.join().expect("stale remover");
+        let renamer = RemoveStaleAfterStaging {
+            stale_target: output.join("stale.ts"),
+        };
+        let report =
+            write_with_renamer(&output, vec![generated("replacement.ts", "new")], &renamer)
+                .expect("concurrent stale removal is harmless");
 
         assert_eq!(report.files_written, 1);
         assert_eq!(report.files_deleted, 0);

@@ -454,6 +454,48 @@ jobs:
   # provenance does not cover, so they get an attestation of their own. Like `publish`,
   # this job checks out nothing and installs nothing, which is what makes an id-token
   # here cheap: there is no third-party code on the runner to misuse it.
+  playground:
+    name: Publish the browser compiler
+    needs:
+      - plan
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
+      # What this job builds gets published, so it must not restore cache state a pull
+      # request could have written. Lookup-only checks the key without downloading it.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          lookup-only: true
+
+      # wrangler is the site workspace's dependency, and the publish runs through it.
+      - name: Install
+        working-directory: www
+        run: pnpm install --frozen-lockfile
+
+      # The site ships no compiler; the playground reads every version from this archive, so a
+      # release reaches it without the docs being rebuilt or redeployed.
+      - name: Publish the browser compiler to the archive
+        run: scripts/playground-wasm.sh
+        env:
+          # A release is the only thing that claims the playground's default version.
+          PLAYGROUND_CURRENT: "1"
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
   github-release:
     name: Publish the GitHub release
     needs:

@@ -261,6 +261,100 @@ jobs:
       - name: Consume gate
         run: scripts/consume-gate.sh
 
+  docs-snippets:
+    name: documentation config snippets
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Check documentation config snippets
+        run: scripts/docs-snippets.sh
+
+  # www/ is its own pnpm workspace with its own lockfile, so it installs separately.
+  docs:
+    name: docs site
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
+      - name: Install
+        working-directory: www
+        run: pnpm install --frozen-lockfile
+
+      # No Rust here on purpose: this mirrors what Cloudflare Builds runs, and the site ships
+      # no compiler — the playground reads every version from the archive at runtime.
+      # Build first: nimbus/internal-link resolves against .nimbus/routes.json, which
+      # is materialized at astro:build:done. Linting before a build skips every link
+      # and still reports clean.
+      - name: Build
+        working-directory: www
+        run: pnpm build
+
+      - name: Lint docs
+        working-directory: www
+        run: pnpm lint:docs
+
+      - name: Typecheck
+        working-directory: www
+        run: pnpm typecheck
+
+  # The playground has no compiler of its own — it reads them from the archive. Publishing
+  # main keeps a build there between releases, which is also the only reason the playground
+  # works at all before the first release that carries one.
+  playground:
+    name: publish main to the compiler archive
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          cache: true
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install
+        working-directory: www
+        run: pnpm install --frozen-lockfile
+
+      # Labelled `main`, and it does not claim the default: a release does that, so visitors
+      # keep landing on released code once one exists.
+      - name: Publish
+        run: scripts/playground-wasm.sh
+        env:
+          PLAYGROUND_LABEL: main
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
   workflows:
     name: workflow audit
     runs-on: ubuntu-24.04-arm
@@ -364,7 +458,10 @@ jobs:
       - freeze
       - verify-ts
       - consume
+      - docs-snippets
       - coverage
+      - docs
+      - playground
       - workflows
       - wasm
     permissions:

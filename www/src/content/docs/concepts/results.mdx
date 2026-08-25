@@ -1,0 +1,190 @@
+---
+title: Results
+description: Every outcome a generated call can produce — documented responses, undocumented statuses, and each way the call itself can fail.
+sidebar:
+  order: 1
+---
+
+A generated call resolves; it does not throw.
+What it resolves to is a discriminated union keyed by `outcome`, and that union is **complete**: every documented response and every way the call can fail is a branch you can handle.
+
+One exception: a streaming body (`AsyncIterable<SseEvent<T>>` or `ReadableStream<Uint8Array>`) resolves successfully and can then fail mid-iteration.
+That surfaces as a `StreamFailure` — `{ kind: "sse"; eventsYielded; cause }` or `{ kind: "raw"; bytesRead; cause }` — thrown from the iterator, not as a result branch.
+See [Streaming](/guides/streaming).
+
+```ts
+const result = await getPet(transport, { path: { petId: "42" } });
+
+switch (result.outcome) {
+  case 200:
+    result.data;       // the documented 200 body
+    break;
+  case "4XX":
+    result.error;      // the documented error schema
+    break;
+  case "unmatched":
+    result.error;      // an undocumented status
+    break;
+  case "network":
+    result.cause;      // a TypeError, as a value
+    break;
+  // …and the rest, below
+}
+```
+
+## The discriminant can never be ambiguous
+
+An exact declared status is a **number literal** (`200`, `429`).
+A range key, `default`, and every failure tag are **string literals** (`"4XX"`, `"default"`, `"network"`).
+The two spaces never overlap, so `case 200:` can never also match `"4XX"`, and no `default:` arm is silently absorbing cases you forgot.
+
+Every branch also carries `ok: true | false`, so `if (result.ok)` narrows to the success arms without enumerating them.
+
+## Success arms
+
+One arm per documented response the operation can succeed with:
+
+```ts
+{ outcome: 200; ok: true; status: 200; data: PetResponse200; meta: ResponseMeta }
+```
+
+`meta` is a snapshot, never the live `Response`:
+
+```ts
+type ResponseMeta = {
+  readonly url: string;      // provenance URL, captured before response middleware
+  readonly status: number;
+  readonly headers: Headers; // a decoupled snapshot
+};
+```
+
+When a response declares headers, that arm's `meta` is intersected with their typed form.
+When a response declares more than one media type, the arm carries a `contentType` discriminant so the payload type follows the selected media:
+
+```ts
+case 200:
+  console.log(result.contentType === "text/plain" ? result.data : result.data.name);
+  break;
+```
+
+A response the document declares with no content has `data: undefined` — the arm is still there, so a 204 is something you handle rather than something you infer from a missing field.
+
+## Documented error arms
+
+A documented non-2xx response is `ok: false` and carries `error` instead of `data`:
+
+```ts
+{ outcome: "4XX"; ok: false; status: number; error: Problem; meta: ResponseMeta }
+```
+
+`default` is the exception: because it can match any status, it emits **two** arms — an `ok: true` arm carrying `data` and an `ok: false` arm carrying `error`, both with the same declared schema.
+`if (result.ok)` picks the right one at runtime.
+
+## `unmatched` — an undocumented status
+
+When the server answers with a status the document never declares, you get the response, classified by what actually came back:
+
+```ts
+type UnknownHttpError =
+  | { kind: "empty";  contentType: string | null; body: undefined }
+  | { kind: "json";   contentType: string;        body: unknown }
+  | { kind: "text";   contentType: string;        body: string }
+  | { kind: "binary"; contentType: string | null; body: ArrayBuffer };
+```
+
+<Aside type="tip">
+  `kind: "empty"` is the branch that other generators lose.
+  An error status with no body is a real, common answer, and it is a case you can match on here rather than an `error` field that exists but is `undefined`.
+</Aside>
+
+## Request-phase failures
+
+Nothing was successfully sent, or the failure happened before a response was matched.
+
+| `outcome` | Carries | When |
+| --- | --- | --- |
+| `auth` | `message`, `triedAlternatives`, `cause?` | No configured credential satisfied any security alternative — a provider returned `null` or threw, or the call passed `auth: 'anonymous'`. Reachable under either [`authEnforcement`](/guides/auth) mode; the default `types` additionally makes the *missing* credential a compile error. |
+| `aborted` | `reason` | The caller's `AbortSignal` fired |
+| `timeout` | `reason` | The request timed out |
+| `network` | `cause: TypeError` | `fetch` rejected — DNS, TLS, connection refused |
+| `request-encode` | `message`, `cause?` | The input could not be serialized to the declared wire form |
+| `request-validation` | `issues` | [Validation](/artifacts/validation) rejected the request payload |
+| `request-transform` | `error: TransformError` | A `Date`/`Temporal` value the wire cannot represent — see [Dates](/guides/dates) |
+| `request-middleware` | `cause` | Your `onRequest` [middleware](/guides/transport#middleware) threw |
+| `cookie-params-unsendable` | `names` | Cookie parameters the platform refuses to set on a request |
+
+`triedAlternatives` is a list of the scheme-name sets that were attempted — names only, never credential values.
+
+## Response-phase failures
+
+A response arrived; something after that failed.
+Each carries `match` (the response key it had matched, or `null`), `status`, and `meta`:
+
+| `outcome` | Carries | When |
+| --- | --- | --- |
+| `response-aborted` | `reason` | The signal fired while reading the body |
+| `response-timeout` | `reason` | Reading the body timed out |
+| `response-decode` | `message`, `cause?` | The body did not decode as the declared media type |
+| `response-validation` | `issues` | Validation rejected the decoded payload |
+| `response-transform` | `error: TransformError` | A wire value the application representation cannot hold |
+| `response-middleware` | `cause` | Your `onResponse` middleware threw |
+
+## Handling the whole union
+
+Three shapes, depending on how much you care:
+
+<Tabs>
+  <TabItem label="Exhaustive">
+```ts
+switch (result.outcome) {
+  case 200:
+    return result.data;
+  case "4XX":
+    throw new Error(result.error.message);
+  case "timeout":
+  case "network":
+    return retry();
+  case "aborted":
+    return;                      // the caller cancelled — never auto-retry
+  default:
+    reportUnexpected(result);
+    return;
+}
+```
+  </TabItem>
+  <TabItem label="Success or bust">
+```ts
+// every operation has an OrThrow companion
+const { data, meta } = await getPetOrThrow(transport, { path: { petId } });
+```
+
+It throws `ApiError` on any non-success arm, with the whole failed result preserved:
+
+```ts
+try {
+  await getPetOrThrow(transport, input);
+} catch (error) {
+  if (error instanceof ApiError) {
+    switch (error.result.outcome) { /* the same union */ }
+  }
+}
+```
+
+`unwrap(result)` is the same operation as a standalone function — it returns `{ data, meta }` or throws `ApiError`.
+`<op>OrThrow` is `unwrap` applied for you.
+  </TabItem>
+  <TabItem label="Just the happy path">
+```ts
+if (result.ok) {
+  use(result.data);
+} else {
+  report(result);                // still fully typed
+}
+```
+  </TabItem>
+</Tabs>
+
+## Why exhaustiveness is the point
+
+Add a response to your OpenAPI document, regenerate, and every `switch` that no longer covers the union is a compile error at the call site that needs to change.
+The failure modes that usually reach production — an undocumented 500, a timeout, a body that did not decode — are branches the compiler makes you look at, once, instead of incidents you find later.

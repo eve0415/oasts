@@ -1,0 +1,118 @@
+---
+title: Types
+description: Plain interfaces for every schema, and the knobs that change their shape.
+sidebar:
+  order: 1
+---
+
+The types artifact is what the client, MSW and TanStack artifacts build on, and it is what you get with no `artifacts` block at all.
+(Zod and validators declare their own interfaces and can run without it.)
+
+```yaml title="oasts.yaml"
+artifacts:
+  types: true
+```
+
+Every schema becomes a plain, readable declaration — no branded wrappers, no helper generics to unwrap:
+
+```ts title="generated/types/components/pet.ts"
+export interface Pet {
+  id: number;
+  name: string;
+  tag?: string;
+}
+```
+
+Supported keywords are the ones TypeScript can represent soundly: primitive and aggregate types, `properties`, `required`, `additionalProperties`, `enum`, `const`, nullable forms, `allOf`, `oneOf`, `anyOf`, tuple and array forms, and references — local, or into other local files (remote `http(s)` `$ref`s are refused).
+Validation-only constraints — numeric ranges, string patterns, length bounds — do not change the TypeScript output; they compile into the [Zod and validators artifacts](/artifacts/validation) instead.
+
+## Constraints the type cannot hold go in the doc comment
+
+`minLength`, `pattern`, `minimum` and the rest do not change a TypeScript type — but they are the part of the schema you most want at your cursor.
+oasts carries them into TSDoc, along with the description, deprecation and examples:
+
+```ts title="generated/types/components/thing.ts"
+export interface Thing {
+  /**
+   * The name.
+   *
+   * @remarks
+   * Constraints
+   *
+   * - minLength: 3
+   * - maxLength: 20
+   * - pattern: "^[a-z]+$"
+   */
+  name: string;
+  /**
+   * @remarks
+   * Constraints
+   *
+   * - minimum: 1
+   * - maximum: 99
+   *
+   * @deprecated This property is deprecated.
+   *
+   * @example
+   * ```json
+   * 7
+   * ```
+   */
+  count?: number;
+}
+```
+
+Every switch is on by default and individually disableable — see [`documentation`](/reference/configuration#documentation).
+
+## A type is never wider than the document
+
+oasts refuses to emit a type the validators shipped beside it would contradict.
+A keyword that narrows a value is never silently dropped in a way that would widen a public type — a schema that provably accepts nothing renders `never`, not `unknown`, and a warning names it.
+
+## Shape knobs
+
+```yaml title="oasts.yaml"
+types:
+  enum: literal
+  discriminatedUnions: structural
+  integer: number
+  readonly: false
+```
+
+### Discriminated unions
+
+`structural` (the default) emits the plain union and lets the `discriminator` drive diagnostics only.
+`tagged` intersects each branch with the mapping literal it proves, so TypeScript can narrow on the tag:
+
+```ts
+// structural
+export type Pet = Cat | Dog;
+// tagged
+export type Pet = (Cat & { petType: "feline" }) | (Dog & { petType: "canine" });
+```
+
+`tagged` stays opt-in on purpose.
+The runtime validators never consult a discriminator — it is an annotation, and letting it change a verdict would mean rejecting payloads the underlying schemas accept.
+Under a renamed mapping, `tagged` is a compile-time claim with no runtime backing, which is a trade worth offering and a poor default.
+
+### Integer width
+
+`types.integer: bigint` maps `format: int64` to `bigint` instead of `number`, so values past 2^53 survive the round trip:
+
+```ts
+// number (default)      cents: number;
+// bigint                cents: bigint;
+```
+
+Conversion happens at the client boundary, so this one needs the client artifact enabled.
+`bigint` is also refused alongside the TanStack artifact, whose keys must stay JSON-serializable.
+
+### Dates
+
+`types.dateTime` turns wire strings into `Date` or `Temporal` values in your code; `types.date` into `Temporal`.
+They have their own page — [Dates and times](/guides/dates).
+
+## Naming collisions
+
+Two schemas that normalize to the same TypeScript name are refused at generation with both named, never resolved by an invented suffix.
+`naming.overrides` is the way out — see [Configuration](/reference/configuration#naming).

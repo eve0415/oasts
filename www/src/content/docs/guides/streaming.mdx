@@ -1,0 +1,137 @@
+---
+title: Streaming
+description: Server-sent events and raw byte bodies, in both directions, with per-event typing on responses.
+sidebar:
+  order: 3
+---
+
+A response whose media type is `text/event-stream` becomes an async iterable of typed events — no flag needed, the media type decides.
+A byte body becomes a `ReadableStream` only when you mark its media type with `x-oasts-streaming: true`; without the marker `application/octet-stream` and friends are buffered as `Uint8Array`.
+Both kinds work in either direction.
+
+## Server-sent events
+
+```yaml title="openapi.yaml"
+/ticks:
+  get:
+    operationId: watchTicks
+    responses:
+      "200":
+        description: A stream of ticks.
+        content:
+          text/event-stream:
+            schema: { $ref: "#/components/schemas/Tick" }
+```
+
+```ts title="generated/types/operations/watchticks.ts"
+export type WatchTicksResponse200 = AsyncIterable<SseEvent<Tick>>;
+```
+
+```ts
+const result = await watchTicks(transport, {});
+
+if (result.outcome === 200) {
+  for await (const event of result.data) {
+    event.data;    // Tick — the schema describes the decoded data buffer
+    event.event;   // string | undefined
+    event.id;      // string | undefined
+    event.retry;   // number | undefined
+  }
+}
+```
+
+The declared schema describes the **decoded** data, never the raw field text.
+`event`, `id` and `retry` are the SSE fields the standard makes available to a dispatched event.
+
+## When a streaming call is "successful"
+
+A streaming branch resolves as soon as the response headers arrive.
+`ok: true` attests three things and no more: the matched status, the selected media type, and that the stream handle was created.
+
+Everything else is proved event by event, as you iterate.
+With [validation](/artifacts/validation) enabled, each event is checked against the declared schema at the moment it is yielded — so a stream that goes wrong on its four-hundredth event fails then, rather than having been declared valid at the start.
+
+<Aside type="caution" title="Mid-stream failures throw from the loop">
+  They are not a result branch — the result already resolved.
+  An upstream read error, a framing error, or a failed per-event check errors the stream with a `StreamFailure`:
+
+```ts
+type StreamFailure =
+  | { kind: "sse"; eventsYielded: number; cause: unknown }
+  | { kind: "raw"; bytesRead: number; cause: unknown };
+```
+
+  `eventsYielded` and `bytesRead` tell you how far the consumer actually got, which is what you need to resume or to report.
+</Aside>
+
+```ts
+try {
+  for await (const event of result.data) {
+    apply(event.data);
+  }
+} catch (failure) {
+  // StreamFailure — or your own AbortSignal's reason if you cancelled
+}
+```
+
+## Cancellation
+
+Break out of the loop, or abort the call's signal.
+Cancelling cancels the upstream body, and the error you see is **your own abort reason** — never a synthesized `StreamFailure`.
+A cancellation you caused and a stream that broke are therefore distinguishable at the catch site:
+
+```ts
+const controller = new AbortController();
+const result = await watchTicks(transport, {}, { signal: controller.signal });
+```
+
+## Raw byte streams
+
+A response body with no buffered representation is a `ReadableStream<Uint8Array>`:
+
+```ts title="generated/types/operations/downloadblob.ts"
+export type DownloadBlobResponse200 = ReadableStream<Uint8Array>;
+```
+
+```ts
+const result = await downloadBlob(transport, {});
+if (result.ok) {
+  await result.data.pipeTo(destination);
+}
+```
+
+Raw bytes are never checked against a schema — there is nothing to check them against.
+The `StreamFailure` for a raw stream reports `bytesRead`.
+
+## Sending a stream
+
+A marked byte body streams on the way out too:
+
+```ts title="generated/client/operations/uploadblob.ts"
+export type UploadBlobInput = {
+  body: ReadableStream<Uint8Array>;
+};
+```
+
+```ts
+await uploadBlob(transport, { body: file.stream() });
+```
+
+Per-event typing is response-side only.
+An SSE **request** body is also a `ReadableStream<Uint8Array>`, so frame your events with the generated `encodeSseEvents` helper:
+
+```ts
+await publishTicks(transport, { body: encodeSseEvents(ticks) });
+```
+
+## What the other artifacts do with streams
+
+- **[Validation](/artifacts/validation)** — SSE events are validated individually, as wire values. Raw streams are not validated.
+- **[MSW](/artifacts/msw)** — an operation with a streaming body has no buffered value to project in either direction, so it gets no handler and an `OASTS6206` warning naming it. The rest of the document still generates handlers.
+- **[TanStack Query](/artifacts/tanstack)** — a streaming operation gets **no** descriptor at all, read or write, and an `OASTS6301` warning says why: a response stream is consumable once and cannot be handed to two cache readers, and a request-body stream cannot be re-sent on a retry. Call the client operation directly.
+
+<Aside type="note">
+  A response the document declares as bodyless (`HEAD`, or an exact `204`, `205` or `304`) that also lists `text/event-stream` gets an `OASTS5204` warning.
+  The status wins in the client: the branch delivers `undefined` and no stream is opened.
+  The types artifact still names the declared stream type for that key, so read the client's result type as the authority.
+</Aside>
