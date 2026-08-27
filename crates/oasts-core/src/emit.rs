@@ -66,7 +66,7 @@ mod transform;
 mod validators;
 mod zod;
 
-use model::{EmissionModel, SchemaTarget};
+use model::{EmissionModel, Registrar, SchemaTarget};
 
 const CODE_FILE_NAME: &str = "OASTS4001";
 const CODE_PATH_COLLISION: &str = "OASTS4002";
@@ -292,7 +292,7 @@ fn change_first_ascii_letter(token: &str, transform: fn(&u8) -> u8) -> String {
 
 /// The import specifier suffix for generated cross-file imports: the configured extension, or the
 /// empty string for the `"none"` policy that emits extensionless specifiers.
-pub(super) fn import_extension(model: &EmissionModel<'_, '_>) -> String {
+pub(super) fn import_extension(model: &EmissionModel<'_>) -> String {
     if model.config.emit.import_extension == "none" {
         String::new()
     } else {
@@ -393,20 +393,29 @@ pub fn emit_types(
     source_tuples: &[(String, [u8; 32])],
     sink: &mut DiagnosticSink,
 ) -> Vec<GeneratedFile> {
-    let mut model = EmissionModel::new(analyzed, config, source_digest(source_tuples), sink);
-    validate_emission_model(&mut model);
-    emit_types_from_model(&mut model)
+    let mut registrar = Registrar::new(sink);
+    let model = EmissionModel::new(
+        analyzed,
+        config,
+        source_digest(source_tuples),
+        &mut registrar,
+    );
+    validate_emission_model(&model, &mut registrar);
+    emit_types_from_model(&model, &mut registrar)
 }
 
-pub(crate) fn emit_types_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
+pub(crate) fn emit_types_from_model(
+    model: &EmissionModel<'_>,
+    registrar: &mut Registrar<'_>,
+) -> Vec<GeneratedFile> {
     let (files, diagnostics) = Emitter::new(model).emit();
-    model.sink.extend(diagnostics);
+    registrar.sink.extend(diagnostics);
     files
 }
 
-fn validate_emission_model(model: &mut EmissionModel<'_, '_>) {
+fn validate_emission_model(model: &EmissionModel<'_>, registrar: &mut Registrar<'_>) {
     let diagnostics = Emitter::new(model).validate_model();
-    model.sink.extend(diagnostics);
+    registrar.sink.extend(diagnostics);
 }
 
 /// Emits every enabled artifact (types, client, validators, zod, msw) for one compile.
@@ -427,37 +436,55 @@ pub fn emit_artifacts(
     let (consumer_provides_temporal, tsconfig_diagnostics) =
         crate::tsconfig::consumer_provides_temporal(&config.output, &config.tsconfig);
     sink.extend(tsconfig_diagnostics);
-    let mut model = EmissionModel::new(analyzed, config, source_digest(source_tuples), sink);
+    let mut registrar = Registrar::new(sink);
+    let mut model = EmissionModel::new(
+        analyzed,
+        config,
+        source_digest(source_tuples),
+        &mut registrar,
+    );
     model.consumer_provides_temporal = consumer_provides_temporal;
-    validate_emission_model(&mut model);
+    validate_emission_model(&model, &mut registrar);
     let mut files = if config.artifacts.types.enabled {
-        emit_types_from_model(&mut model)
+        emit_types_from_model(&model, &mut registrar)
     } else {
         Vec::new()
     };
     if let Some(client_model) = client_model {
-        files.extend(client::emit_client_from_model(&mut model, client_model));
+        files.extend(client::emit_client_from_model(
+            &model,
+            &mut registrar,
+            client_model,
+        ));
         // The transform artifact lives under the client's tree and only ever runs at the client's
         // pipeline positions, so it is emitted with the client and never without it.
         files.extend(transform::emit_transform_from_model(
-            &mut model,
+            &model,
+            &mut registrar,
             client_model,
         ));
         // Descriptors wrap the client's own `orThrow` surface and propagate its `CallArgs<S>`, so
         // the tanstack artifact is emitted with the client and never without it — the config layer
         // already refuses the combination, and this placement makes that structural.
         if config.artifacts.tanstack.enabled {
-            files.extend(tanstack::emit_tanstack_from_model(&mut model, client_model));
+            files.extend(tanstack::emit_tanstack_from_model(
+                &model,
+                &mut registrar,
+                client_model,
+            ));
         }
     }
     if config.artifacts.validators.enabled {
-        files.extend(validators::emit_validators_from_model(&mut model));
+        files.extend(validators::emit_validators_from_model(
+            &mut model,
+            &mut registrar,
+        ));
     }
     if config.artifacts.zod.enabled {
-        files.extend(zod::emit_zod_from_model(&mut model));
+        files.extend(zod::emit_zod_from_model(&mut model, &mut registrar));
     }
     if config.artifacts.msw.enabled {
-        files.extend(msw::emit_msw_from_model(&mut model));
+        files.extend(msw::emit_msw_from_model(&model, &mut registrar));
     }
     files.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
     files
@@ -521,8 +548,8 @@ enum SchemaChildMode {
     References(TypePosition),
 }
 
-pub(super) struct Emitter<'model, 'input, 'sink> {
-    model: &'model EmissionModel<'input, 'sink>,
+pub(super) struct Emitter<'model, 'input> {
+    model: &'model EmissionModel<'input>,
     enum_member_indices: Arc<BTreeMap<(String, String), usize>>,
     /// Resolved link indices (into `model.analyzed.link_targets`), grouped by the response
     /// they were declared on and keyed the same way as `enum_member_indices`. Built only when
@@ -556,8 +583,8 @@ pub(super) struct Emitter<'model, 'input, 'sink> {
     deferred_diagnostics: RefCell<Vec<Diagnostic>>,
 }
 
-struct EmitterFactory<'model, 'input, 'sink> {
-    model: &'model EmissionModel<'input, 'sink>,
+struct EmitterFactory<'model, 'input> {
+    model: &'model EmissionModel<'input>,
     enum_member_indices: Arc<BTreeMap<(String, String), usize>>,
     link_targets_by_response: Arc<BTreeMap<(String, String), Vec<usize>>>,
     operation_stems: Arc<HashMap<usize, String>>,
@@ -569,6 +596,62 @@ struct EmittedOperation {
     diagnostics: Vec<Diagnostic>,
     has_response_headers: bool,
     names_sse_event: bool,
+}
+
+/// Everything one item's emission produced, held until the serial merge replays it.
+///
+/// An emitter's per-item worker writes here instead of into the [`Registrar`], which is what lets
+/// the whole loop run under a shared `&EmissionModel` — one emitter factory built above the loop
+/// rather than rebuilt per item.
+#[derive(Default)]
+pub(super) struct Emission {
+    pub(super) files: Vec<GeneratedFile>,
+    /// The same sink type the direct path wrote to, so a helper taking `&mut DiagnosticSink` is
+    /// handed this instead and the within-item order is whatever the item already produced.
+    pub(super) diagnostics: DiagnosticSink,
+    /// Paths this item would have registered, in its own emission order.
+    ///
+    /// Deferring them cannot change the bytes of the file that produced them: `register_path` mints
+    /// no name, returns nothing, and nothing outside it reads the collision map — every call site
+    /// fires after that item's content is already built.
+    registrations: Vec<(String, SourceRef)>,
+}
+
+impl Emission {
+    /// Records a path for the merge to register. Mirrors [`Registrar::register_path`]'s call shape
+    /// so a worker reads the same at either end of the conversion.
+    pub(super) fn register_path(&mut self, path: &str, source: &SourceRef) {
+        self.registrations.push((path.to_owned(), source.clone()));
+    }
+}
+
+/// Which module one operation's descriptors are emitted into, and whether that module declares the
+/// response side — a webhook or callback module validates only what the document sends.
+pub(super) struct OperationModule<'a> {
+    pub(super) allocated_name: &'a str,
+    pub(super) directory: &'a str,
+    pub(super) file_base: &'a str,
+    pub(super) include_responses: bool,
+}
+
+/// Replays one item's emission into the shared state, in the order the item produced it.
+///
+/// **Invariant: deferred registrations and diagnostics are fully replayed before control leaves the
+/// emitter that produced them.** Every caller merges inside its own emitter, before `emit_artifacts`
+/// reaches the next one. Batching replays to the end of `emit_artifacts` would break msw, which
+/// reads `sink.has_errors()` on entry to decide whether it emits at all: it would see a sink missing
+/// every earlier path collision and emit a full handler set where today it emits none. No fixture
+/// combines a case-folding collision with a client-disabled msw config, so no gate would catch it.
+fn merge_emission(
+    files: &mut Vec<GeneratedFile>,
+    registrar: &mut Registrar<'_>,
+    emission: Emission,
+) {
+    registrar.sink.extend(emission.diagnostics.into_vec());
+    for (path, source) in &emission.registrations {
+        registrar.register_path(path, source);
+    }
+    files.extend(emission.files);
 }
 
 /// Whether this operation's rendered types name `SseEvent` — that is, whether any response declares
@@ -596,8 +679,8 @@ fn append_operation_emissions(
     }
 }
 
-impl<'model, 'input, 'sink> EmitterFactory<'model, 'input, 'sink> {
-    fn worker(&self) -> Emitter<'model, 'input, 'sink> {
+impl<'model, 'input> EmitterFactory<'model, 'input> {
+    fn worker(&self) -> Emitter<'model, 'input> {
         Emitter {
             model: self.model,
             enum_member_indices: Arc::clone(&self.enum_member_indices),
@@ -610,8 +693,8 @@ impl<'model, 'input, 'sink> EmitterFactory<'model, 'input, 'sink> {
     }
 }
 
-impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
-    pub(super) fn new(model: &'model EmissionModel<'input, 'sink>) -> Self {
+impl<'model, 'input> Emitter<'model, 'input> {
+    pub(super) fn new(model: &'model EmissionModel<'input>) -> Self {
         let mut enum_member_indices = BTreeMap::new();
         for (index, table) in model.analyzed.enum_members.iter().enumerate() {
             enum_member_indices
@@ -800,7 +883,7 @@ impl<'model, 'input, 'sink> Emitter<'model, 'input, 'sink> {
         (files, diagnostics)
     }
 
-    fn into_factory(self) -> EmitterFactory<'model, 'input, 'sink> {
+    fn into_factory(self) -> EmitterFactory<'model, 'input> {
         EmitterFactory {
             model: self.model,
             enum_member_indices: self.enum_member_indices,
@@ -3151,7 +3234,7 @@ impl SchemaTarget {
     }
 }
 
-impl Emitter<'_, '_, '_> {
+impl Emitter<'_, '_> {
     /// Renders one operation-shaped file and returns its ordered diagnostics and header-helper bit.
     /// Shared by the path-operation, webhook, and callback parallel loops, whose ordered collects
     /// make these per-file accumulators deterministic before the caller appends them.
@@ -6168,7 +6251,8 @@ mod tests {
         };
         let (_temp, config) = resolved_config(json!({}));
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let emitter = Emitter::new(&model);
         let missing = schema_ref("/missing", "/components/schemas/Missing");
         let nested = SchemaNode::AnyOf {
@@ -6273,7 +6357,8 @@ mod tests {
             "types": { "enum": "const" }
         }));
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let emitter = Emitter::new(&model);
         assert!(
             emitter
@@ -6397,7 +6482,8 @@ mod tests {
         };
         let (_temp, config) = resolved_config(json!({}));
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let emitter = Emitter::new(&model);
 
         let unknown = |reason: &str, pointer: &str| SchemaNode::Unknown {
@@ -6531,7 +6617,8 @@ mod tests {
         };
         let (_temp, config) = resolved_config(json!({}));
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let emitter = Emitter::new(&model);
 
         let mut nullable_string = primitive(PrimitiveType::String, "/nullable");
@@ -6764,7 +6851,8 @@ mod tests {
         };
         let (_temp, config) = resolved_config(json!({}));
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let emitter = Emitter::new(&model);
 
         // Terminates (no stack overflow) and the recursive branch is the bare named type.
@@ -6829,7 +6917,8 @@ mod tests {
             "emit": { "importExtension": "none" }
         }));
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let emitter = Emitter::new(&model);
 
         let first = object(
@@ -7094,7 +7183,8 @@ mod tests {
         };
         let (_temp, config) = resolved_config(json!({ "emit": { "importExtension": "none" } }));
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let (files, diagnostics) = Emitter::new(&model).emit();
         assert!(diagnostics.is_empty());
         // The cyclic `allOf` does not merge, so `UsesAlias` renders as its raw branch ref.
@@ -7180,7 +7270,8 @@ mod tests {
             assert!(!sink.has_errors(), "{fixture_name}: {:#?}", sink.as_slice());
 
             let mut sink = DiagnosticSink::new();
-            let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+            let mut registrar = Registrar::new(&mut sink);
+            let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
             let mut emitter = Emitter::new(&model);
             let mut slices = Vec::new();
             for schema in &analyzed.ir.schemas {
@@ -7401,10 +7492,11 @@ mod tests {
             "documentation": { "summary": false, "description": true }
         }));
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let (files, diagnostics) = Emitter::new(&model).emit();
-        model.sink.extend(diagnostics);
-        drop(model);
+        registrar.sink.extend(diagnostics);
+        drop(registrar);
         assert!(sink.as_slice().is_empty());
         let rich = files
             .iter()

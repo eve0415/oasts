@@ -41,7 +41,7 @@ pub(crate) struct SchemaTarget {
 }
 
 /// Shared deterministic allocation product for all emitters.
-pub(crate) struct EmissionModel<'input, 'sink> {
+pub(crate) struct EmissionModel<'input> {
     pub(crate) analyzed: &'input Analyzed,
     pub(crate) config: &'input ResolvedConfig,
     /// Where each artifact's files land. Every emitted path and every cross-artifact import is
@@ -64,19 +64,60 @@ pub(crate) struct EmissionModel<'input, 'sink> {
     /// Parallel to `analyzed.callback_names`: the file base each callback operation emits to under
     /// `types/callbacks/`, or `None` if its name failed file-base validation.
     pub(crate) callback_files: Vec<Option<String>>,
-    seen: HashMap<String, (String, SourceRef)>,
     /// Which schemas reach a date/time transform, computed once here so every emitter reads one
     /// answer rather than recomputing it or threading it through every render call.
     transform_facts: TransformFacts<'input>,
-    pub(crate) sink: &'sink mut DiagnosticSink,
 }
 
-impl<'input, 'sink> EmissionModel<'input, 'sink> {
+/// The two mutable side-channels emission writes: the diagnostic sink and the case-folded
+/// path-collision namespace.
+///
+/// Split out of [`EmissionModel`] so the model is immutable for the whole of emission. That is what
+/// lets an emitter hold one emitter factory borrowing the model across a loop body that still
+/// raises diagnostics and registers paths — the two borrows are disjoint — instead of rebuilding
+/// its per-emitter tables once per item to get the `&mut` back.
+pub(crate) struct Registrar<'sink> {
+    pub(crate) sink: &'sink mut DiagnosticSink,
+    seen: HashMap<String, (String, SourceRef)>,
+}
+
+impl<'sink> Registrar<'sink> {
+    pub(crate) fn new(sink: &'sink mut DiagnosticSink) -> Self {
+        Self {
+            sink,
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Registers an artifact path in the shared case-folded collision namespace.
+    ///
+    /// Detection only: it mints no name and renames nothing, and no caller branches on it. Nothing
+    /// outside this function reads `seen`, so the registration for one file can be replayed after
+    /// that file's content is built without changing a byte of it.
+    pub(crate) fn register_path(&mut self, path: &str, source: &SourceRef) {
+        let folded = path.to_ascii_lowercase();
+        if let Some((previous, previous_source)) = self.seen.get(&folded) {
+            self.sink.push(source_diagnostic(
+                CODE_PATH_COLLISION,
+                format!(
+                    "generated path collision after case folding: '{previous}' at {} and '{path}' at {}",
+                    previous_source.display(),
+                    source.display()
+                ),
+                source,
+            ));
+        } else {
+            self.seen.insert(folded, (path.to_owned(), source.clone()));
+        }
+    }
+}
+
+impl<'input> EmissionModel<'input> {
     pub(crate) fn new(
         analyzed: &'input Analyzed,
         config: &'input ResolvedConfig,
         digest: String,
-        sink: &'sink mut DiagnosticSink,
+        registrar: &mut Registrar<'_>,
     ) -> Self {
         let mut model = Self {
             analyzed,
@@ -89,15 +130,13 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             operation_files: vec![None; analyzed.ir.operations.len()],
             webhook_files: vec![None; analyzed.webhook_names.len()],
             callback_files: vec![None; analyzed.callback_names.len()],
-            seen: HashMap::new(),
             transform_facts: TransformFacts::compute(&analyzed.ir, config),
-            sink,
         };
-        model.allocate_paths();
-        model.resolve_variant_shapes();
+        model.allocate_paths(registrar);
+        model.resolve_variant_shapes(registrar);
         // After variance, because a wire name composes onto `variant_name(position)` — including the
         // alias a variant collision assigned — and never onto the derived name.
-        model.resolve_wire_names();
+        model.resolve_wire_names(registrar);
         model
     }
 
@@ -119,7 +158,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
     ///
     /// Fast-reject: with no representation transforming, nothing declares a twin and the pass returns
     /// before allocating, keeping a default-configured document allocation-identical.
-    fn resolve_wire_names(&mut self) {
+    fn resolve_wire_names(&mut self, registrar: &mut Registrar<'_>) {
         if !self.transform_facts.enabled() {
             return;
         }
@@ -200,7 +239,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             target.transforms = transforms;
             target.wire_variants = wire_variants;
         }
-        self.sink.extend(diagnostics);
+        registrar.sink.extend(diagnostics);
     }
 
     /// Decides which request/response twins each component declares, from two fixpoints over the
@@ -219,7 +258,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
     /// position-of-use to suppress, so the pass returns before allocating any working buffer — the
     /// common marker-free input stays zero-heap, matching the pre-pass allocation profile the drift
     /// gate pins. The operation walk sits behind that return for exactly this reason.
-    fn resolve_variant_shapes(&mut self) {
+    fn resolve_variant_shapes(&mut self, registrar: &mut Registrar<'_>) {
         let any_variance = self.schema_targets.values().any(|by_pointer| {
             by_pointer
                 .values()
@@ -299,7 +338,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             }
         }
 
-        self.resolve_variant_collisions();
+        self.resolve_variant_collisions(registrar);
     }
 
     /// Renames a generated `{Name}Request`/`{Name}Response` variant that collides with a
@@ -333,7 +372,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
     /// remains, so that residual is fatal and points at `naming.overrides`.
     ///
     /// `schema_names` order fixes diagnostic order; one diagnostic per collision.
-    fn resolve_variant_collisions(&mut self) {
+    fn resolve_variant_collisions(&mut self, registrar: &mut Registrar<'_>) {
         let mut by_name: HashMap<&str, &SchemaTarget> = HashMap::new();
         for allocated in &self.analyzed.schema_names {
             let schema = &self.analyzed.ir.schemas[allocated.schema_index];
@@ -417,7 +456,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             }
         }
         for diagnostic in diagnostics {
-            self.sink.push(diagnostic);
+            registrar.sink.push(diagnostic);
         }
     }
 
@@ -668,7 +707,7 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         }
     }
 
-    fn allocate_paths(&mut self) {
+    fn allocate_paths(&mut self, registrar: &mut Registrar<'_>) {
         for allocated in &self.analyzed.schema_names {
             let schema = &self.analyzed.ir.schemas[allocated.schema_index];
             let source_name = if self
@@ -682,11 +721,12 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             } else {
                 &allocated.wire_name
             };
-            let Some(file_base) = self.allocate_file_base(source_name, &schema.source) else {
+            let Some(file_base) = self.allocate_file_base(registrar, source_name, &schema.source)
+            else {
                 continue;
             };
             let relative = format!("{}/components/{file_base}.ts", self.dirs.types);
-            self.register_type_path(&relative, &schema.source);
+            self.register_type_path(registrar, &relative, &schema.source);
             self.component_files[allocated.schema_index] = Some(file_base.clone());
             let (request_differs, response_differs) = shape_variants(&schema.schema);
             self.schema_targets
@@ -726,11 +766,13 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                             operation_id
                         }
                     });
-            let Some(file_base) = self.allocate_file_base(source_name, &operation.source) else {
+            let Some(file_base) =
+                self.allocate_file_base(registrar, source_name, &operation.source)
+            else {
                 continue;
             };
             let relative = format!("{}/operations/{file_base}.ts", self.dirs.types);
-            self.register_type_path(&relative, &operation.source);
+            self.register_type_path(registrar, &relative, &operation.source);
             self.operation_files[allocated.operation_index] = Some(file_base);
         }
         // Webhook and callback operations mirror the path-operation branch exactly (operationId if
@@ -742,11 +784,11 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
                 [allocated.operation_index];
             let source_name = operation.operation_id.as_deref().unwrap_or(&allocated.stem);
             let source = allocated.source.clone();
-            let Some(file_base) = self.allocate_file_base(source_name, &source) else {
+            let Some(file_base) = self.allocate_file_base(registrar, source_name, &source) else {
                 continue;
             };
             let relative = format!("{}/webhooks/{file_base}.ts", self.dirs.types);
-            self.register_type_path(&relative, &source);
+            self.register_type_path(registrar, &relative, &source);
             self.webhook_files[index] = Some(file_base);
         }
         for (index, allocated) in self.analyzed.callback_names.iter().enumerate() {
@@ -757,20 +799,25 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
             );
             let source_name = operation.operation_id.as_deref().unwrap_or(&allocated.stem);
             let source = allocated.source.clone();
-            let Some(file_base) = self.allocate_file_base(source_name, &source) else {
+            let Some(file_base) = self.allocate_file_base(registrar, source_name, &source) else {
                 continue;
             };
             let relative = format!("{}/callbacks/{file_base}.ts", self.dirs.types);
-            self.register_type_path(&relative, &source);
+            self.register_type_path(registrar, &relative, &source);
             self.callback_files[index] = Some(file_base);
         }
     }
 
-    fn allocate_file_base(&mut self, name: &str, source: &SourceRef) -> Option<String> {
+    fn allocate_file_base(
+        &self,
+        registrar: &mut Registrar<'_>,
+        name: &str,
+        source: &SourceRef,
+    ) -> Option<String> {
         match file_base_name(name, self.config.naming.file_case) {
             Ok(file_base) => Some(file_base),
             Err(error) => {
-                self.sink.push(source_diagnostic(
+                registrar.sink.push(source_diagnostic(
                     CODE_FILE_NAME,
                     format!("invalid generated file name for '{name}': {error}"),
                     source,
@@ -780,27 +827,9 @@ impl<'input, 'sink> EmissionModel<'input, 'sink> {
         }
     }
 
-    fn register_type_path(&mut self, path: &str, source: &SourceRef) {
+    fn register_type_path(&self, registrar: &mut Registrar<'_>, path: &str, source: &SourceRef) {
         if self.config.artifacts.types.enabled {
-            self.register_path(path, source);
-        }
-    }
-
-    /// Registers an artifact path in the shared case-folded collision namespace.
-    pub(crate) fn register_path(&mut self, path: &str, source: &SourceRef) {
-        let folded = path.to_ascii_lowercase();
-        if let Some((previous, previous_source)) = self.seen.get(&folded) {
-            self.sink.push(source_diagnostic(
-                CODE_PATH_COLLISION,
-                format!(
-                    "generated path collision after case folding: '{previous}' at {} and '{path}' at {}",
-                    previous_source.display(),
-                    source.display()
-                ),
-                source,
-            ));
-        } else {
-            self.seen.insert(folded, (path.to_owned(), source.clone()));
+            registrar.register_path(path, source);
         }
     }
 
@@ -960,10 +989,7 @@ mod tests {
     /// Looks up the `SchemaTarget` allocated for the component named `name`. `schema_targets` is
     /// keyed by source_id/json_pointer, not name, so every by-name lookup in this module's tests
     /// scans the same way.
-    pub(super) fn find_target<'a>(
-        model: &'a EmissionModel<'_, '_>,
-        name: &str,
-    ) -> &'a SchemaTarget {
+    pub(super) fn find_target<'a>(model: &'a EmissionModel<'_>, name: &str) -> &'a SchemaTarget {
         model
             .schema_targets
             .values()
@@ -978,7 +1004,8 @@ mod tests {
     fn variant_flags(schemas: Value, component: &str) -> (bool, bool) {
         let (_temp, resolved, analyzed, digest) = build_model_inputs(schemas);
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut registrar);
         let target = find_target(&model, component);
         (target.request_differs, target.response_differs)
     }
@@ -1229,7 +1256,8 @@ mod tests {
             }
         }));
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut registrar);
 
         let source_id = analyzed.ir.schemas[0].source.source_id.clone();
         let pet_ref = SchemaNode::Ref {
@@ -1257,7 +1285,8 @@ mod tests {
     fn model_diagnostics(schemas: Value, code: &str) -> Vec<crate::diag::Diagnostic> {
         let (_temp, resolved, analyzed, digest) = build_model_inputs(schemas);
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut registrar);
         drop(model);
         sink.into_sorted_vec()
             .into_iter()
@@ -1507,7 +1536,8 @@ mod wire_variant_tests {
     ) -> (Vec<Option<String>>, Vec<Diagnostic>) {
         let (_temp, resolved, analyzed, digest) = build_model_inputs_with(schemas, patch);
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut registrar);
         let target = find_target(&model, component);
         let exports = [
             TypePosition::Neutral,
@@ -1706,8 +1736,9 @@ mod wire_declaration_tests {
     fn component_file(schemas: Value, base: &str, patch: fn(&mut ResolvedConfig)) -> String {
         let (_temp, resolved, analyzed, digest) = build_model_inputs_with(schemas, patch);
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
-        let files = emit_types_from_model(&mut model);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut registrar);
+        let files = emit_types_from_model(&model, &mut registrar);
         files
             .into_iter()
             .find(|file| file.relative_path == format!("types/components/{base}.ts"))
@@ -2005,8 +2036,9 @@ mod wire_declaration_tests {
         let (_temp, resolved, analyzed, digest) =
             build_model_inputs_from_document(positioned_document(), |_| {});
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
-        emit_types_from_model(&mut model)
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut registrar);
+        emit_types_from_model(&model, &mut registrar)
             .into_iter()
             .find(|file| file.relative_path == format!("types/components/{base}.ts"))
             .expect("component file")
@@ -2142,8 +2174,9 @@ mod wire_declaration_tests {
         let (_temp, resolved, analyzed, digest) =
             build_model_inputs_from_document(document, |_| {});
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
-        let files = emit_types_from_model(&mut model);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut registrar);
+        let files = emit_types_from_model(&model, &mut registrar);
         let content = |base: &str| {
             files
                 .iter()
@@ -2350,8 +2383,9 @@ mod wire_declaration_tests {
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let digest = source_digest(&graph.source_tuples());
-        let mut model = EmissionModel::new(&analyzed, &resolved, digest, &mut sink);
-        emit_types_from_model(&mut model)
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, digest, &mut registrar);
+        emit_types_from_model(&model, &mut registrar)
             .into_iter()
             .find(|file| file.relative_path == format!("types/operations/{base}.ts"))
             .expect("operation file")

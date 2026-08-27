@@ -14,12 +14,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::client::{ResponseBody, request_transform_binding, response_body_side};
 use super::import_extension;
-use super::model::EmissionModel;
+use super::model::{EmissionModel, Registrar};
 use super::paths::{TRANSFORM_SUBDIR, relative_import};
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
-    GeneratedFile, render_literal_key, render_property_key, render_ts_string, source_diagnostic,
-    uppercase_first, warning_diagnostic, write_source_metadata,
+    Emission, GeneratedFile, merge_emission, render_literal_key, render_property_key,
+    render_ts_string, source_diagnostic, uppercase_first, warning_diagnostic,
+    write_source_metadata,
 };
 use crate::client_model::{BodyPlan, ClientModel, DecoderClass, OperationPlan, PayloadDisposition};
 use crate::ir::{Operation, ParamLocation, Segment, SegmentPart, SourceRef};
@@ -276,7 +277,10 @@ pub(crate) struct KeyFactory {
 }
 
 /// Builds the key factory for a document, reporting every naming collision it finds.
-pub(crate) fn build_key_factory(model: &mut EmissionModel<'_, '_>) -> KeyFactory {
+pub(crate) fn build_key_factory(
+    model: &EmissionModel<'_>,
+    registrar: &mut Registrar<'_>,
+) -> KeyFactory {
     let namespace = model.config.namespace.clone();
     let overrides = model.config.naming.overrides.path_segments.clone();
     let fallback_source = model
@@ -306,7 +310,7 @@ pub(crate) fn build_key_factory(model: &mut EmissionModel<'_, '_>) -> KeyFactory
         match addresses.entry(address_of(&operation.path_template)) {
             std::collections::btree_map::Entry::Occupied(existing) => {
                 if *existing.get() != template {
-                    model.sink.push(source_diagnostic(
+                    registrar.sink.push(source_diagnostic(
                         CODE_SEGMENT_COLLISION,
                         format!(
                             "paths '{}' and '{template}' produce the same query key, so their operations would share one cache entry",
@@ -355,13 +359,13 @@ pub(crate) fn build_key_factory(model: &mut EmissionModel<'_, '_>) -> KeyFactory
             elements: &[KeyElement::Literal(namespace.clone())],
         },
         &mut sink,
-        model,
+        registrar,
     );
     let bindings = sink.bindings;
 
     for key in overrides.keys() {
         if !matched_overrides.contains(key) {
-            model.sink.push(warning_diagnostic(
+            registrar.sink.push(warning_diagnostic(
                 CODE_UNMATCHED_SEGMENT_OVERRIDE,
                 format!(
                     "naming.overrides.pathSegments key '{key}' matched no path segment in this document"
@@ -396,7 +400,7 @@ fn collect_bindings(
     matched_overrides: &mut Vec<String>,
     walk: &BindingWalk<'_>,
     sink: &mut BindingSink,
-    model: &mut EmissionModel<'_, '_>,
+    registrar: &mut Registrar<'_>,
 ) {
     let BindingWalk {
         address,
@@ -415,7 +419,7 @@ fn collect_bindings(
 
     if MODULE_IMPORTS.contains(&name.as_str()) {
         let raw = node.kind.raw_text();
-        model.sink.push(source_diagnostic(
+        registrar.sink.push(source_diagnostic(
             CODE_SEGMENT_COLLISION,
             format!(
                 "key binding '{name}' shadows an import every operation module makes — name the segment differently with `naming.overrides.pathSegments: {{ \"{raw}\": \"<distinctName>\" }}`"
@@ -438,7 +442,7 @@ fn collect_bindings(
             ),
             None => String::new(),
         };
-        model.sink.push(source_diagnostic(
+        registrar.sink.push(source_diagnostic(
             CODE_SEGMENT_COLLISION,
             format!(
                 "key factory name collision: '/{}' and '/{}' both bind '{name}' (first declared at {}){suggestion}",
@@ -485,7 +489,7 @@ fn collect_bindings(
         let (member, segment_parameters) = match naming {
             Ok(naming) => naming,
             Err(message) => {
-                model.sink.push(source_diagnostic(
+                registrar.sink.push(source_diagnostic(
                     CODE_SEGMENT_COLLISION,
                     format!(
                         "{message} — name it with `naming.overrides.pathSegments: {{ \"{raw}\": \"<name>\" }}`"
@@ -499,7 +503,7 @@ fn collect_bindings(
         // Finding: `all` is the composed object's own member for a node's key, so a child taking it
         // would emit a duplicate object key — TS1117, or silently the wrong key if it compiled.
         if member == COMPOSED_SELF_MEMBER {
-            model.sink.push(source_diagnostic(
+            registrar.sink.push(source_diagnostic(
                 CODE_SEGMENT_COLLISION,
                 format!(
                     "path segment '{raw}' binds the member '{COMPOSED_SELF_MEMBER}', which the composed key object already uses for a node's own key — name it with `naming.overrides.pathSegments: {{ \"{raw}\": \"<name>\" }}`"
@@ -512,7 +516,7 @@ fn collect_bindings(
         // The flat binding names can still differ here — only a literal segment takes the `All`
         // suffix — so this is a distinct check from the one above, not a subset of it.
         if let Some(previous) = members_here.get(&member) {
-            model.sink.push(source_diagnostic(
+            registrar.sink.push(source_diagnostic(
                 CODE_SEGMENT_COLLISION,
                 format!(
                     "path segments '{previous}' and '{raw}' both bind the member '{member}' under the same parent — name one differently with `naming.overrides.pathSegments: {{ \"{raw}\": \"<distinctName>\" }}`"
@@ -542,7 +546,7 @@ fn collect_bindings(
             child_parameters.push(parameter);
         }
         if let Some(parameter) = duplicated {
-            model.sink.push(source_diagnostic(
+            registrar.sink.push(source_diagnostic(
                 CODE_SEGMENT_COLLISION,
                 format!(
                     "path parameter '{parameter}' is declared twice on the same path, so the key factory cannot name both"
@@ -565,7 +569,7 @@ fn collect_bindings(
                 elements: &child_elements,
             },
             sink,
-            model,
+            registrar,
         );
     }
 }
@@ -637,7 +641,7 @@ impl KeyFactory {
     }
 
     /// Renders `tanstack/keys.ts`.
-    pub(crate) fn render(&self, model: &EmissionModel<'_, '_>) -> String {
+    pub(crate) fn render(&self, model: &EmissionModel<'_>) -> String {
         let mut output = model.header();
         output.push_str(
             "// One binding per path node. An operation module imports the single leaf binding it needs,\n\
@@ -921,10 +925,11 @@ struct ModuleBody {
 
 /// Emits the tanstack artifact: the key factory, the local runtime, and one module per operation.
 pub(crate) fn emit_tanstack_from_model(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    registrar: &mut Registrar<'_>,
     client: &ClientModel,
 ) -> Vec<GeneratedFile> {
-    let factory = build_key_factory(model);
+    let factory = build_key_factory(model, registrar);
     let mut files = Vec::new();
 
     let keys_source = factory
@@ -934,7 +939,7 @@ pub(crate) fn emit_tanstack_from_model(
         .map_or_else(SourceRef::default, |binding| binding.source.clone());
     let keys = factory.render(model);
     let keys_path = format!("{}/keys.ts", model.dirs.tanstack);
-    model.register_path(&keys_path, &keys_source);
+    registrar.register_path(&keys_path, &keys_source);
     files.push(GeneratedFile {
         relative_path: keys_path,
         content: keys,
@@ -958,7 +963,7 @@ pub(crate) fn emit_tanstack_from_model(
                     )
                 ),
             );
-    model.register_path(&runtime_path, &keys_source);
+    registrar.register_path(&runtime_path, &keys_source);
     files.push(GeneratedFile {
         relative_path: runtime_path,
         content: runtime,
@@ -978,29 +983,31 @@ pub(crate) fn emit_tanstack_from_model(
             continue;
         };
         let operation = model.analyzed.ir.operations[plan.operation_index].clone();
-        if let Some(file) = emit_operation(
+        let mut emission = Emission::default();
+        emit_operation(
             model,
+            &mut emission,
             &factory,
             &operation,
             plan,
             &allocated.name,
             &file_base,
-        ) {
-            files.push(file);
-        }
+        );
+        merge_emission(&mut files, registrar, emission);
     }
 
     files
 }
 
 fn emit_operation(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    emission: &mut Emission,
     factory: &KeyFactory,
     operation: &Operation,
     plan: &OperationPlan,
     allocated_name: &str,
     file_base: &str,
-) -> Option<GeneratedFile> {
+) {
     let stem = uppercase_first(allocated_name);
     let encodes = request_transform_binding(model, plan);
 
@@ -1008,25 +1015,28 @@ fn emit_operation(
     // consumable exactly once, so caching one under a query key hands every later cache reader an
     // already-drained iterable, and a mutation descriptor would resolve one into the same trap.
     if let Some(reason) = streaming_ineligibility(plan) {
-        model.sink.push(warning_diagnostic(
+        emission.diagnostics.push(warning_diagnostic(
             CODE_INELIGIBLE_QUERY,
             format!("operation '{allocated_name}' emits no descriptor: {reason}"),
             &operation.source,
         ));
-        return None;
+        return;
     }
     let body = if is_read(operation) {
         if let Err(reason) = is_query_eligible(plan) {
-            model.sink.push(warning_diagnostic(
+            emission.diagnostics.push(warning_diagnostic(
                 CODE_INELIGIBLE_QUERY,
                 format!("operation '{allocated_name}' emits no query descriptor: {reason}"),
                 &operation.source,
             ));
-            return None;
+            return;
         }
-        query_body(factory, operation, allocated_name, &stem, encodes)?
+        let Some(body) = query_body(factory, operation, allocated_name, &stem, encodes) else {
+            return;
+        };
+        body
     } else {
-        mutation_body(
+        let Some(body) = mutation_body(
             factory,
             operation,
             model.config.namespace.as_str(),
@@ -1034,7 +1044,10 @@ fn emit_operation(
             &stem,
             encodes,
             has_successful_response(plan),
-        )?
+        ) else {
+            return;
+        };
+        body
     };
 
     // The per-operation imports are named after the operation, so unlike MODULE_IMPORTS they cannot
@@ -1055,14 +1068,14 @@ fn emit_operation(
         .iter()
         .find(|binding| operation_imports.contains(binding))
     {
-        model.sink.push(source_diagnostic(
+        emission.diagnostics.push(source_diagnostic(
             CODE_SEGMENT_COLLISION,
             format!(
                 "key binding '{shadowed}' collides with a name operation '{allocated_name}'s module already uses — name the colliding path segment differently with `naming.overrides.pathSegments`"
             ),
             &operation.source,
         ));
-        return None;
+        return;
     }
 
     let extension = import_extension(model);
@@ -1121,11 +1134,11 @@ fn emit_operation(
     ));
     output.push_str(&body.content);
 
-    model.register_path(&relative_path, &operation.source);
-    Some(GeneratedFile {
+    emission.register_path(&relative_path, &operation.source);
+    emission.files.push(GeneratedFile {
         relative_path,
         content: output,
-    })
+    });
 }
 
 fn query_body(
@@ -1454,8 +1467,9 @@ mod tests {
         let ir = parse(&graph, &mut sink).expect("document parses");
         drop(graph);
         let analyzed = analyze(ir, &resolved, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
-        let factory = build_key_factory(&mut model);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut registrar);
+        let factory = build_key_factory(&model, &mut registrar);
         let rendered = factory.render(&model);
         (rendered, sink.into_sorted_vec())
     }

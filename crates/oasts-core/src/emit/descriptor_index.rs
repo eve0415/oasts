@@ -20,7 +20,7 @@ use crate::diag::Diagnostic;
 use crate::ir::{Operation, ParamLocation, SchemaNode, SourceRef};
 use crate::media::is_json;
 
-use super::model::EmissionModel;
+use super::model::{EmissionModel, Registrar};
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::validators::operation_parameter_validator_names;
 use super::{
@@ -53,7 +53,7 @@ type RejectDiagnostic = fn(Reject<'_>, &SourceRef) -> Diagnostic;
 // --- reject-handling walk ----------------------------------------------------------------------
 
 pub(super) fn collect_rejects(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     schema: &SchemaNode,
     diagnostic: RejectDiagnostic,
     out: &mut Vec<Diagnostic>,
@@ -81,7 +81,7 @@ pub(super) fn collect_rejects(
 }
 
 pub(super) fn collect_operation_rejects(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     operation: &Operation,
     include_responses: bool,
     diagnostic: RejectDiagnostic,
@@ -121,7 +121,7 @@ impl SiblingImports {
     /// A component's self-reference is local and therefore excluded.
     pub(super) fn collect_types(
         &mut self,
-        emitter: &Emitter<'_, '_, '_>,
+        emitter: &Emitter<'_, '_>,
         schema: &SchemaNode,
         position: TypePosition,
     ) {
@@ -177,7 +177,8 @@ pub(super) fn render_sibling_imports(
 /// Embeds a runtime asset verbatim (no generated header) with `.ts` import specifiers rewritten to
 /// the configured extension, and registers its path in the collision namespace.
 pub(super) fn embedded_asset(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    registrar: &mut Registrar<'_>,
     target: DescriptorTarget<'_>,
     file_name: &str,
     source: &str,
@@ -191,7 +192,7 @@ pub(super) fn embedded_asset(
         .first()
         .map(|schema| schema.source.clone())
         .unwrap_or_default();
-    model.register_path(&relative_path, &asset_source);
+    registrar.register_path(&relative_path, &asset_source);
     GeneratedFile {
         relative_path,
         content,
@@ -201,7 +202,7 @@ pub(super) fn embedded_asset(
 // --- descriptor indexes ------------------------------------------------------------------------
 
 pub(super) fn emit_webhooks_index(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     target: DescriptorTarget<'_>,
 ) -> GeneratedFile {
     let analyzed = model.analyzed;
@@ -260,7 +261,7 @@ pub(super) fn emit_webhooks_index(
 }
 
 pub(super) fn emit_callbacks_index(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     target: DescriptorTarget<'_>,
 ) -> GeneratedFile {
     let analyzed = model.analyzed;
@@ -439,7 +440,7 @@ pub(super) fn location_key(location: ParamLocation) -> &'static str {
 }
 
 fn assemble_descriptor_index(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     relative_path: &str,
     imports: BTreeMap<String, BTreeSet<String>>,
     body: String,

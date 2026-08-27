@@ -27,10 +27,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::paths::relative_import;
 use super::{
-    EmissionModel, Emitter as TypesEmitter, GeneratedFile, TypeAxis, TypePosition,
-    assign_import_aliases, import_clause, import_extension, render_property_key, render_ts_string,
-    render_ts_value, runtime_assets::rewrite_relative_ts_imports, uppercase_first,
-    warning_diagnostic, write_source_metadata,
+    Emission, EmissionModel, Emitter as TypesEmitter, EmitterFactory, GeneratedFile, Registrar,
+    TypeAxis, TypePosition, assign_import_aliases, import_clause, import_extension, merge_emission,
+    render_property_key, render_ts_string, render_ts_value,
+    runtime_assets::rewrite_relative_ts_imports, uppercase_first, warning_diagnostic,
+    write_source_metadata,
 };
 use crate::client_model::{
     BodyPlan, FieldSerializationPlan, FormFieldPlan, FormPropertiesError, HelperId, ParameterPlan,
@@ -203,41 +204,55 @@ fn is_path_to_regexp_identifier(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-pub(crate) fn emit_msw_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
+pub(crate) fn emit_msw_from_model(
+    model: &EmissionModel<'_>,
+    registrar: &mut Registrar<'_>,
+) -> Vec<GeneratedFile> {
     // Built once for the whole artifact and threaded down. The projection is a whole-graph
     // analysis whose only input is the immutable IR, so every construction yields the same value —
-    // constructing it per operation ran it thousands of times per compile for one answer. Binding
-    // `analyzed` out first is what makes this a hoist: it is an `&'input` copy, so the projector
-    // borrows the input rather than the model and coexists with the `&mut model` below. Validators
-    // and zod already hoist it exactly this way.
+    // constructing it per operation ran it thousands of times per compile for one answer.
+    // Validators and zod already hoist it exactly this way.
     let analyzed = model.analyzed;
     let projector = PrimitiveDomainProjector::new(&analyzed.ir);
     if !model.config.artifacts.client.enabled {
         for operation in &analyzed.ir.operations {
-            diagnose_operation_response_media(operation, &projector, model.sink);
+            diagnose_operation_response_media(operation, &projector, registrar.sink);
         }
-        if model.sink.has_errors() {
+        if registrar.sink.has_errors() {
             return Vec::new();
         }
     }
-    let mut files = embedded_assets(model);
+    // One factory for the artifact. Its per-emitter tables index every enum member (and, when the
+    // document declares links, every operation name) — building them per operation as this emitter
+    // used to made that cost quadratic in the operation count. `worker()` still hands each item its
+    // own empty alias and diagnostic cells, so a worker is exactly the emitter this used to build.
+    let factory = TypesEmitter::new(model).into_factory();
+    let mut files = embedded_assets(model, registrar);
     for allocated in model.analyzed.operation_names.clone() {
         let Some(file_base) = model.operation_files[allocated.operation_index].clone() else {
             continue;
         };
         let operation = model.analyzed.ir.operations[allocated.operation_index].clone();
-        if let Some(file) =
-            emit_operation(model, &operation, &allocated.name, &file_base, &projector)
-        {
-            files.push(file);
-        }
+        let mut emission = Emission::default();
+        emit_operation(
+            model,
+            &factory,
+            &mut emission,
+            &operation,
+            &allocated.name,
+            &file_base,
+            &projector,
+        );
+        merge_emission(&mut files, registrar, emission);
     }
-    files.push(emit_paths(model, &projector));
+    files.push(emit_paths(model, &factory, registrar, &projector));
     files
 }
 
 fn emit_paths(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    factory: &EmitterFactory<'_, '_>,
+    registrar: &mut Registrar<'_>,
     projector: &PrimitiveDomainProjector<'_>,
 ) -> GeneratedFile {
     let operations = model.analyzed.ir.operations.clone();
@@ -255,7 +270,7 @@ fn emit_paths(
         .unwrap_or_default();
     let mut component_imports = BTreeMap::<String, BTreeSet<String>>::new();
     {
-        let renderer = TypesEmitter::new(model);
+        let renderer = factory.worker();
         for operation in &operations {
             for parameter in operation.parameters.iter().filter(|parameter| {
                 matches!(
@@ -296,7 +311,7 @@ fn emit_paths(
     reserved.extend(super::representation_globals(&model.config.types));
     let (aliases, diagnostics) =
         assign_import_aliases(&declared, &reserved, &component_imports, &source);
-    model.sink.extend(diagnostics);
+    registrar.sink.extend(diagnostics);
 
     let extension = import_extension(model);
     let relative_path = format!("{}/paths.ts", model.dirs.msw);
@@ -325,7 +340,7 @@ fn emit_paths(
         }
     }
 
-    let renderer = TypesEmitter::new(model);
+    let renderer = factory.worker();
     renderer.set_import_aliases(aliases);
     for (path, methods) in paths {
         output.push_str("  ");
@@ -338,7 +353,7 @@ fn emit_paths(
     }
     output.push_str("};\n");
 
-    model.register_path(&relative_path, &source);
+    registrar.register_path(&relative_path, &source);
     GeneratedFile {
         relative_path,
         content: output,
@@ -347,8 +362,8 @@ fn emit_paths(
 
 fn write_paths_operation(
     output: &mut String,
-    renderer: &TypesEmitter<'_, '_, '_>,
-    model: &EmissionModel<'_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
+    model: &EmissionModel<'_>,
     operation: &Operation,
     projector: &PrimitiveDomainProjector<'_>,
 ) {
@@ -452,14 +467,16 @@ fn response_status_key(status: &ResponseStatus) -> &str {
 }
 
 fn emit_operation(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    factory: &EmitterFactory<'_, '_>,
+    emission: &mut Emission,
     operation: &Operation,
     allocated_name: &str,
     file_base: &str,
     projector: &PrimitiveDomainProjector<'_>,
-) -> Option<GeneratedFile> {
+) {
     let Some(method) = msw_method(&operation.method) else {
-        model.sink.push(warning_diagnostic(
+        emission.diagnostics.push(warning_diagnostic(
             CODE_UNMATCHABLE_METHOD,
             format!(
                 "HTTP method '{}' has no MSW http handler factory",
@@ -467,34 +484,34 @@ fn emit_operation(
             ),
             &operation.source,
         ));
-        return None;
+        return;
     };
     let pattern = match path_pattern(&operation.path_template, &operation.source) {
         Ok(pattern) => pattern,
         Err(diagnostic) => {
-            model.sink.push(diagnostic);
-            return None;
+            emission.diagnostics.push(diagnostic);
+            return;
         }
     };
     let projected_parameters = match plan_projected_parameters(model, operation, projector) {
         Ok(parameters) => parameters,
         Err(diagnostics) => {
-            model.sink.extend(diagnostics);
-            return None;
+            emission.diagnostics.extend(diagnostics);
+            return;
         }
     };
-    let projected_body = match plan_projected_body(model, operation, projector) {
+    let projected_body = match plan_projected_body(model, emission, operation, projector) {
         Ok(body) => body,
         Err(diagnostics) => {
-            model.sink.extend(diagnostics);
-            return None;
+            emission.diagnostics.extend(diagnostics);
+            return;
         }
     };
     let response_transform_diagnostics =
         response_transform_diagnostics(model, operation, projector);
     if !response_transform_diagnostics.is_empty() {
-        model.sink.extend(response_transform_diagnostics);
-        return None;
+        emission.diagnostics.extend(response_transform_diagnostics);
+        return;
     }
 
     let stem = uppercase_first(allocated_name);
@@ -503,7 +520,7 @@ fn emit_operation(
     let handler_name = format!("{allocated_name}Handler");
     let mut component_imports = BTreeMap::<String, BTreeSet<String>>::new();
     let (response_type, aliases, alias_diagnostics, response_body_name, response_body_union) = {
-        let renderer = TypesEmitter::new(model);
+        let renderer = factory.worker();
         for response in &operation.responses {
             for media in &response.media_types {
                 // Byte-oriented media render as `Uint8Array` or a stream of it, so the schema's
@@ -579,14 +596,14 @@ fn emit_operation(
             response_body_union(&renderer, operation, projector),
         )
     };
-    model.sink.extend(alias_diagnostics);
+    emission.diagnostics.extend(alias_diagnostics);
     let has_projected_parameters = !projected_parameters.is_empty();
     let has_projected_cookies = projected_parameters
         .iter()
         .any(|projected| operation.parameters[projected.index].location == ParamLocation::Cookie);
     let has_response_body = response_body_union.is_some();
     let parameter_groups = {
-        let renderer = TypesEmitter::new(model);
+        let renderer = factory.worker();
         renderer.set_import_aliases(aliases.clone());
         render_parameter_groups(&renderer, operation)
     };
@@ -665,7 +682,7 @@ fn emit_operation(
         output.push_str(">;\n");
     }
     if let Some(body) = &projected_body {
-        let renderer = TypesEmitter::new(model);
+        let renderer = factory.worker();
         renderer.set_import_aliases(aliases.clone());
         output.push_str("  body: ");
         output.push_str(&render_request_body_type(&renderer, model, &body.plan, 2));
@@ -739,7 +756,7 @@ fn emit_operation(
         output.push_str("    const projectionContext: ProjectionContext = {\n      request,\n      baseUrl: resolvedBaseUrl,\n      pathTemplate,\n      cookies: rawCookies,\n    };\n");
     }
     if let Some(body) = &projected_body {
-        let renderer = TypesEmitter::new(model);
+        let renderer = factory.worker();
         renderer.set_import_aliases(aliases.clone());
         output.push_str("    const body = await projectRequestBody<");
         output.push_str(&render_request_body_type(&renderer, model, &body.plan, 4));
@@ -757,17 +774,18 @@ fn emit_operation(
     });
     output.push_str("      respond: (response) => {\n        const ownsContentType = Object.hasOwn(response, \"contentType\");\n        const ownsBody = Object.hasOwn(response, \"body\");\n        const contentType =\n          ownsContentType &&\n          \"contentType\" in response &&\n          typeof response.contentType === \"string\"\n            ? response.contentType\n            : null;\n        const body =\n          contentType === null && (ownsContentType || ownsBody)\n            ? response\n            : ownsBody && \"body\" in response\n              ? response.body\n              : null;\n        return respondWith(response.status, contentType, body, responsePayloads);\n      },\n    });\n  });\n}\n");
 
-    model.register_path(&relative_path, &operation.source);
-    Some(GeneratedFile {
+    emission.register_path(&relative_path, &operation.source);
+    emission.files.push(GeneratedFile {
         relative_path,
         content: output,
-    })
+    });
 }
 
-/// Takes the model mutably because the unconstrained-body warning is the one diagnostic here that
-/// does not stop the handler being emitted, so it cannot travel in the `Err` channel.
+/// Takes the emission because the unconstrained-body warning is the one diagnostic here that does
+/// not stop the handler being emitted, so it cannot travel in the `Err` channel.
 fn plan_projected_body(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    emission: &mut Emission,
     operation: &Operation,
     projector: &PrimitiveDomainProjector<'_>,
 ) -> Result<Option<ProjectedBody>, Vec<Diagnostic>> {
@@ -793,7 +811,7 @@ fn plan_projected_body(
                 // because that one only runs when the client artifact is enabled and `types + msw`
                 // is a configuration the documentation puts in front of people.
                 FormPropertiesError::Unconstrained => {
-                    model.sink.push(warning_diagnostic(
+                    emission.diagnostics.push(warning_diagnostic(
                         CODE_UNCONSTRAINED_FORM_BODY,
                         format!(
                             "request media '{}' declares no schema properties, so its handler projects no body fields",
@@ -830,7 +848,7 @@ fn plan_projected_body(
 }
 
 fn inspect_body_projection(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     plan: &BodyPlan,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -943,10 +961,7 @@ fn inspect_body_projection(
     }
 }
 
-fn unsupported_transform(
-    model: &EmissionModel<'_, '_>,
-    schema: &SchemaNode,
-) -> Option<&'static str> {
+fn unsupported_transform(model: &EmissionModel<'_>, schema: &SchemaNode) -> Option<&'static str> {
     if model
         .transform_facts()
         .reaches_kind(schema, TransformKind::IntegerBigInt)
@@ -960,7 +975,7 @@ fn unsupported_transform(
 }
 
 fn response_transform_diagnostics(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     operation: &Operation,
     projector: &PrimitiveDomainProjector<'_>,
 ) -> Vec<Diagnostic> {
@@ -1022,7 +1037,7 @@ fn response_body_projection_diagnostic(source: &SourceRef, reason: &str) -> Diag
 }
 
 fn render_request_body_descriptor(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     plan: &BodyPlan,
     required: bool,
     source: &SourceRef,
@@ -1065,7 +1080,7 @@ fn render_request_body_descriptor(
 
 fn write_request_body_media_descriptor(
     output: &mut String,
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     plan: &BodyPlan,
 ) -> Result<(), (SourceRef, String)> {
     let (media, kind, source) = match plan {
@@ -1120,7 +1135,7 @@ fn write_request_body_media_descriptor(
 
 fn write_urlencoded_field_descriptor(
     output: &mut String,
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     field: &FormFieldPlan,
 ) -> Result<(), (SourceRef, String)> {
     output.push_str("{ name: ");
@@ -1174,7 +1189,7 @@ fn write_urlencoded_field_descriptor(
 }
 
 fn render_body_field_shape(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     field: &FormFieldPlan,
     content_json: bool,
 ) -> Result<String, (SourceRef, String)> {
@@ -1199,7 +1214,7 @@ fn render_body_field_shape(
 
 fn write_multipart_field_descriptor(
     output: &mut String,
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     field: &FormFieldPlan,
 ) -> Result<(), (SourceRef, String)> {
     output.push_str("{ name: ");
@@ -1306,7 +1321,7 @@ fn multipart_field_payload(field: &FormFieldPlan) -> PayloadKind {
 }
 
 fn schema_is_array(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     schema: &SchemaNode,
     visited: &mut BTreeSet<(String, String)>,
 ) -> bool {
@@ -1336,8 +1351,8 @@ fn schema_is_array(
 }
 
 fn render_request_body_type(
-    renderer: &TypesEmitter<'_, '_, '_>,
-    model: &EmissionModel<'_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
+    model: &EmissionModel<'_>,
     plan: &BodyPlan,
     indent: usize,
 ) -> String {
@@ -1378,8 +1393,8 @@ fn render_request_body_type(
 }
 
 fn render_projected_form_type(
-    renderer: &TypesEmitter<'_, '_, '_>,
-    model: &EmissionModel<'_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
+    model: &EmissionModel<'_>,
     fields: &[FormFieldPlan],
     multipart: bool,
     indent: usize,
@@ -1413,7 +1428,7 @@ fn render_projected_form_type(
 }
 
 fn collect_request_body_imports(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     plan: &BodyPlan,
     imports: &mut BTreeMap<String, BTreeSet<String>>,
 ) {
@@ -1462,7 +1477,7 @@ fn collect_request_body_imports(
 }
 
 fn plan_projected_parameters(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     operation: &Operation,
     projector: &PrimitiveDomainProjector<'_>,
 ) -> Result<Vec<ProjectedParameter>, Vec<Diagnostic>> {
@@ -1565,7 +1580,7 @@ fn parameter_style_name(style: ParamStyle) -> &'static str {
 }
 
 fn render_projection_shape(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     schema: &SchemaNode,
     content_json: bool,
     nested_style_value: bool,
@@ -1759,7 +1774,7 @@ fn render_projection_shape(
 }
 
 fn render_projection_variants(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     branches: &[SchemaNode],
     content_json: bool,
     nested_style_value: bool,
@@ -1908,7 +1923,7 @@ fn nullable_shape(shape: String, nullable: bool) -> String {
 }
 
 fn render_parameter_groups(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     operation: &Operation,
 ) -> Vec<(&'static str, String)> {
     [
@@ -2058,7 +2073,7 @@ fn parameter_helper_name(helper: HelperId) -> &'static str {
 }
 
 fn render_response_type(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     operation: &Operation,
     response_name: &str,
     projector: &PrimitiveDomainProjector<'_>,
@@ -2102,7 +2117,7 @@ fn render_response_type(
 /// JSON and supported text entries take the schema's rendered type. Byte-oriented media take the
 /// bytes directly, while unsupported media are rejected before this emitter runs.
 fn response_body_type(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     media: &crate::ir::MediaType,
     projector: &PrimitiveDomainProjector<'_>,
 ) -> String {
@@ -2182,7 +2197,7 @@ fn response_payload_map(operation: &Operation, projector: &PrimitiveDomainProjec
 /// the body such a response actually carries, and never `never` — `never` reads as "no response is
 /// possible" and sends MSW's own resolver-return inference down its GraphQL branch.
 fn response_body_union(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     operation: &Operation,
     projector: &PrimitiveDomainProjector<'_>,
 ) -> Option<String> {
@@ -2290,7 +2305,7 @@ fn msw_method(method: &str) -> Option<&'static str> {
     }
 }
 
-fn embedded_assets(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
+fn embedded_assets(model: &EmissionModel<'_>, registrar: &mut Registrar<'_>) -> Vec<GeneratedFile> {
     let source = model
         .analyzed
         .ir
@@ -2298,12 +2313,11 @@ fn embedded_assets(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
         .first()
         .map(|schema| schema.source.clone())
         .unwrap_or_default();
-    [
+    let mut files = Vec::with_capacity(2);
+    for (file_name, source_text) in [
         ("project.ts", MSW_PROJECT_TS),
         ("runtime.ts", MSW_RUNTIME_TS),
-    ]
-    .into_iter()
-    .map(|(file_name, source_text)| {
+    ] {
         // Both assets sit in the msw directory itself, so the project's import of the runtime is a
         // sibling specifier no matter where that directory is.
         let source_text = if file_name == "project.ts" {
@@ -2314,13 +2328,13 @@ fn embedded_assets(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
         let content =
             rewrite_relative_ts_imports(&source_text, &model.config.emit.import_extension);
         let relative_path = format!("{}/{file_name}", model.dirs.msw);
-        model.register_path(&relative_path, &source);
-        GeneratedFile {
+        registrar.register_path(&relative_path, &source);
+        files.push(GeneratedFile {
             relative_path,
             content,
-        }
-    })
-    .collect()
+        });
+    }
+    files
 }
 
 #[cfg(test)]
@@ -3247,7 +3261,8 @@ paths:
         let ir = parse(&graph, &mut sink).expect("document parses");
         drop(graph);
         let analyzed = analyze(ir, &resolved, &mut sink);
-        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut registrar);
         let source = SourceRef::default();
         let string_schema = SchemaNode::Primitive {
             ty: PrimitiveType::String,
@@ -3387,7 +3402,8 @@ paths:
         assert_eq!(default_base_url(&analyzed.ir.operations[0], &[]), None);
         let value_source = analyzed.ir.schemas[0].source.clone();
         let values_source = analyzed.ir.schemas[1].source.clone();
-        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut registrar);
 
         let primitive = |ty, nullable| SchemaNode::Primitive {
             ty,
@@ -4308,9 +4324,11 @@ paths:
         let ir = parse(&graph, &mut sink).expect("document parses");
         drop(graph);
         let analyzed = analyze(ir, &resolved, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let mut model =
+            EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut registrar);
         model.operation_files[0] = None;
-        let files = emit_msw_from_model(&mut model);
+        let files = emit_msw_from_model(&model, &mut registrar);
         assert!(
             files
                 .iter()
@@ -4680,7 +4698,8 @@ components:
         let ir = parse(&graph, &mut sink).expect("document parses");
         drop(graph);
         let analyzed = analyze(ir, &resolved, &mut sink);
-        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut registrar);
         let source = SourceRef::default();
         let stream = BodyPlan::TopLevelStream {
             media: "text/event-stream".to_owned(),

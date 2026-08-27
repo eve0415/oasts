@@ -39,13 +39,14 @@ use super::descriptor_index::{
     DescriptorTarget, Reject, SiblingImports, collect_operation_rejects, collect_rejects,
     embedded_asset, emit_callbacks_index, emit_webhooks_index, render_sibling_imports,
 };
-use super::model::EmissionModel;
+use super::model::{EmissionModel, Registrar};
 use super::reads_identifier;
 use super::{
-    CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, Emitter, GeneratedFile, ObjectKeyMode, TypeAxis,
-    TypePosition, callback_operation, import_extension, lowercase_first, property_in_position,
-    render_json_compact, render_ts_string, request_body_validator_positions, response_media_names,
-    response_status_type_suffix, source_diagnostic, uppercase_first, warning_diagnostic,
+    CODE_WIRE_ALIAS, CODE_WIRE_COLLISION, Emission, Emitter, EmitterFactory, GeneratedFile,
+    ObjectKeyMode, OperationModule, TypeAxis, TypePosition, callback_operation, import_extension,
+    lowercase_first, merge_emission, property_in_position, render_json_compact, render_ts_string,
+    request_body_validator_positions, response_media_names, response_status_type_suffix,
+    source_diagnostic, uppercase_first, warning_diagnostic,
 };
 use crate::client_model::{PrimitiveDomainProjector, build_body_plan};
 use crate::response_media::media_has_validatable_schema;
@@ -159,7 +160,10 @@ const VALIDATOR_RESERVED_NAMES: &[&str] = &[
     "hasGet",
 ];
 
-pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
+pub(crate) fn emit_validators_from_model(
+    model: &mut EmissionModel<'_>,
+    registrar: &mut Registrar<'_>,
+) -> Vec<GeneratedFile> {
     let analyzed = model.analyzed;
     // Built once per document, never per operation: this indexes every schema in the IR and
     // walks each one's projection dependencies, so constructing it inside the operation loop
@@ -202,30 +206,40 @@ pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> V
             collect_operation_rejects(&emitter, operation, false, reject_diagnostic, &mut rejects);
         }
     }
-    model.sink.extend(rejects);
+    registrar.sink.extend(rejects);
 
     // Validators is the terminal emitter, so renaming component targets that collide with the
     // injected kernel identifiers here is safe — no later emitter reads the allocation.
     model.reserve_names(VALIDATOR_RESERVED_NAMES);
+    // Every rename this artifact performs is done. From here the allocation is frozen, so the model
+    // is reborrowed shared for the whole emission — which is what lets one emitter factory span the
+    // loops below while diagnostics and path registrations still flow through the registrar.
+    let model = &*model;
+    // One factory for the artifact, rather than the three `Emitter::new` rebuilds this emitter used
+    // to pay per item. Each rebuild reindexed every enum member; `worker()` still hands each item
+    // its own empty alias and diagnostic cells, so a worker is exactly the emitter it replaces.
+    let factory = Emitter::new(model).into_factory();
 
     let mut files = Vec::new();
     files.push(embedded_asset(
         model,
+        registrar,
         target,
         "runtime.ts",
         VALIDATORS_RUNTIME_TS,
     ));
     files.push(embedded_asset(
         model,
+        registrar,
         target,
         "standard-schema.ts",
         VALIDATORS_STANDARD_SCHEMA_TS,
     ));
 
     for allocated in &analyzed.schema_names {
-        if model.component_files[allocated.schema_index].is_none() {
+        let Some(file_base) = model.component_files[allocated.schema_index].clone() else {
             continue;
-        }
+        };
         // The export name is the (possibly reserved-renamed) target name, so it agrees with the
         // structural type, self/cross references, and sibling imports — all of which read the target.
         // An allocated file always has a registered target (allocate_paths sets both together).
@@ -234,22 +248,37 @@ pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> V
             .schema_target(&schema.source.source_id, &schema.source.json_pointer)
             .map(|target| target.name.clone())
             .expect("a component with an allocated file has a registered target");
-        if let Some(file) = emit_component(model, allocated.schema_index, &name) {
-            files.push(file);
-        }
+        let mut emission = Emission::default();
+        emit_component(
+            model,
+            &factory,
+            &mut emission,
+            allocated.schema_index,
+            &file_base,
+            &name,
+        );
+        merge_emission(&mut files, registrar, emission);
     }
     for allocated in &analyzed.operation_names {
-        if model.operation_files[allocated.operation_index].is_none() {
+        let Some(file_base) = model.operation_files[allocated.operation_index].clone() else {
             continue;
-        }
-        if let Some(file) = emit_operation(
+        };
+        let operation = &analyzed.ir.operations[allocated.operation_index];
+        let mut emission = Emission::default();
+        emit_operation_file(
             model,
+            &factory,
+            &mut emission,
             &projector,
-            allocated.operation_index,
-            &allocated.name,
-        ) {
-            files.push(file);
-        }
+            operation,
+            OperationModule {
+                allocated_name: &allocated.name,
+                directory: "operations",
+                file_base: &file_base,
+                include_responses: true,
+            },
+        );
+        merge_emission(&mut files, registrar, emission);
     }
     if !analyzed.ir.webhooks.is_empty() {
         for index in 0..analyzed.webhook_names.len() {
@@ -259,17 +288,21 @@ pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> V
             let allocated = &analyzed.webhook_names[index];
             let operation = &analyzed.ir.webhooks[allocated.webhook_index].operations
                 [allocated.operation_index];
-            if let Some(file) = emit_operation_file(
+            let mut emission = Emission::default();
+            emit_operation_file(
                 model,
+                &factory,
+                &mut emission,
                 &projector,
                 operation,
-                &allocated.stem,
-                "webhooks",
-                &file_base,
-                false,
-            ) {
-                files.push(file);
-            }
+                OperationModule {
+                    allocated_name: &allocated.stem,
+                    directory: "webhooks",
+                    file_base: &file_base,
+                    include_responses: false,
+                },
+            );
+            merge_emission(&mut files, registrar, emission);
         }
         files.push(emit_webhooks_index(model, target));
     }
@@ -280,17 +313,21 @@ pub(crate) fn emit_validators_from_model(model: &mut EmissionModel<'_, '_>) -> V
             };
             let allocated = &analyzed.callback_names[index];
             let operation = callback_operation(&analyzed.ir, &analyzed.callback_names, allocated);
-            if let Some(file) = emit_operation_file(
+            let mut emission = Emission::default();
+            emit_operation_file(
                 model,
+                &factory,
+                &mut emission,
                 &projector,
                 operation,
-                &allocated.stem,
-                "callbacks",
-                &file_base,
-                false,
-            ) {
-                files.push(file);
-            }
+                OperationModule {
+                    allocated_name: &allocated.stem,
+                    directory: "callbacks",
+                    file_base: &file_base,
+                    include_responses: false,
+                },
+            );
+            merge_emission(&mut files, registrar, emission);
         }
         files.push(emit_callbacks_index(model, target));
     }
@@ -646,7 +683,7 @@ fn schema_path_digest(path: &[String]) -> String {
 /// file-scoped runtime state and sibling imports (both accumulate across the file's declarations)
 /// plus the immutable emission `model` (for `$ref` target resolution); `position` is the fixed wire
 /// variant of the declaration being generated.
-struct FnBody<'scope, 'model, 'input, 'sink> {
+struct FnBody<'scope, 'model, 'input> {
     out: String,
     helpers: Vec<String>,
     indent: usize,
@@ -655,7 +692,7 @@ struct FnBody<'scope, 'model, 'input, 'sink> {
     schema_path: Vec<String>,
     scope: &'scope mut FileScope,
     imports: &'scope mut SiblingImports,
-    model: &'model EmissionModel<'input, 'sink>,
+    model: &'model EmissionModel<'input>,
     position: TypePosition,
     completeness: Vec<bool>,
     probing_refs: HashSet<(String, String)>,
@@ -730,11 +767,11 @@ impl EvaluationCallbacks {
     }
 }
 
-impl<'scope, 'model, 'input, 'sink> FnBody<'scope, 'model, 'input, 'sink> {
+impl<'scope, 'model, 'input> FnBody<'scope, 'model, 'input> {
     fn new(
         scope: &'scope mut FileScope,
         imports: &'scope mut SiblingImports,
-        model: &'model EmissionModel<'input, 'sink>,
+        model: &'model EmissionModel<'input>,
         position: TypePosition,
         helper_prefix: &str,
         root_path: String,
@@ -3668,7 +3705,7 @@ type SiblingBindings = BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>;
 /// Returning the component file lets the caller preserve the operation module's public surface with
 /// a direct re-export instead of emitting a self-referential alias and recursive wrapper.
 pub(super) fn identical_component_delegate(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     export_type: &str,
     schema: &SchemaNode,
     position: TypePosition,
@@ -3697,7 +3734,7 @@ pub(super) fn identical_component_delegate(
 /// A bare component delegate reuses that component's allocated twin name, including a collision
 /// replacement; every other transforming position owns the ordinary `{Name}Wire` twin.
 pub(super) fn validator_wire_type_name<'a>(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     export_name: &'a str,
     schema: &SchemaNode,
     position: TypePosition,
@@ -3750,12 +3787,14 @@ pub(super) fn validator_wire_type_name<'a>(
 }
 
 fn emit_component(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    factory: &EmitterFactory<'_, '_>,
+    emission: &mut Emission,
     schema_index: usize,
+    file_base: &str,
     name: &str,
-) -> Option<GeneratedFile> {
+) {
     let analyzed = model.analyzed;
-    let file_base = model.component_files[schema_index].clone()?;
     let schema = &analyzed.ir.schemas[schema_index];
 
     // A `readOnly`/`writeOnly` property somewhere in this component (or a component it references)
@@ -3806,7 +3845,7 @@ fn emit_component(
         // Phase 1: render each variant's structural type and collect its sibling imports through the
         // shared emitter, position by position — the position selects which properties survive.
         let type_declarations: Vec<String> = {
-            let emitter = Emitter::new(model);
+            let emitter = factory.worker();
             variants
                 .iter()
                 .map(|(export_name, wire_name, position)| {
@@ -3854,7 +3893,7 @@ fn emit_component(
         // Neutral-only common case: a single declaration, allocation-identical to a marker-free
         // component before variants existed (the drift gate pins this shape).
         let type_declaration = {
-            let emitter = Emitter::new(model);
+            let emitter = factory.worker();
             let mut declaration = String::new();
             emitter.write_schema_declaration(
                 &mut declaration,
@@ -3886,44 +3925,29 @@ fn emit_component(
 
     let reexports = SiblingBindings::new();
     let content = assemble_file(model, "./", &imports, &reexports, &scope, &declarations);
-    report_incomplete_applicators(model.sink, &scope);
+    report_incomplete_applicators(&mut emission.diagnostics, &scope);
     let relative_path = format!("{}/components/{file_base}.ts", model.dirs.validators);
-    model.register_path(&relative_path, &schema.source);
-    Some(GeneratedFile {
+    emission.register_path(&relative_path, &schema.source);
+    emission.files.push(GeneratedFile {
         relative_path,
         content,
-    })
-}
-
-fn emit_operation(
-    model: &mut EmissionModel<'_, '_>,
-    projector: &PrimitiveDomainProjector<'_>,
-    operation_index: usize,
-    allocated_name: &str,
-) -> Option<GeneratedFile> {
-    let analyzed = model.analyzed;
-    let file_base = model.operation_files[operation_index].clone()?;
-    let operation = &analyzed.ir.operations[operation_index];
-    emit_operation_file(
-        model,
-        projector,
-        operation,
-        allocated_name,
-        "operations",
-        &file_base,
-        true,
-    )
+    });
 }
 
 fn emit_operation_file(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    factory: &EmitterFactory<'_, '_>,
+    emission: &mut Emission,
     projector: &PrimitiveDomainProjector<'_>,
     operation: &Operation,
-    allocated_name: &str,
-    directory: &str,
-    file_base: &str,
-    include_responses: bool,
-) -> Option<GeneratedFile> {
+    module: OperationModule<'_>,
+) {
+    let OperationModule {
+        allocated_name,
+        directory,
+        file_base,
+        include_responses,
+    } = module;
     let stem = uppercase_first(allocated_name);
 
     // Held across `positions` because a form field's schema is a projector-resolved clone owned by
@@ -3952,7 +3976,10 @@ fn emit_operation_file(
         for response in &operation.responses {
             let suffix = response_status_type_suffix(&response.status);
             responses.extend(response_body_validators(
-                response, &stem, &suffix, model.sink,
+                response,
+                &stem,
+                &suffix,
+                &mut emission.diagnostics,
             ));
         }
         responses.sort_by(|left, right| left.0.cmp(&right.0));
@@ -3977,7 +4004,7 @@ fn emit_operation_file(
     header_positions.sort_by(|left, right| left.0.cmp(&right.0));
 
     if positions.is_empty() && header_positions.is_empty() {
-        return None;
+        return;
     }
 
     let mut scope = FileScope::default();
@@ -4008,7 +4035,7 @@ fn emit_operation_file(
         Vec<Option<NamedTypeDeclaration>>,
         Vec<NamedTypeDeclaration>,
     ) = {
-        let emitter = Emitter::new(model);
+        let emitter = factory.worker();
         let type_declarations = positions
             .iter()
             .map(|(export_type, schema, position)| {
@@ -4123,14 +4150,14 @@ fn emit_operation_file(
         &scope,
         &declarations,
     );
-    model.sink.extend(wire_diagnostics);
-    report_incomplete_applicators(model.sink, &scope);
+    emission.diagnostics.extend(wire_diagnostics);
+    report_incomplete_applicators(&mut emission.diagnostics, &scope);
     let relative_path = format!("{}/{directory}/{file_base}.ts", model.dirs.validators);
-    model.register_path(&relative_path, &operation.source);
-    Some(GeneratedFile {
+    emission.register_path(&relative_path, &operation.source);
+    emission.files.push(GeneratedFile {
         relative_path,
         content,
-    })
+    });
 }
 
 /// The validator export-type name for each of `operation`'s parameters, aligned 1:1 with
@@ -4208,7 +4235,7 @@ fn render_validator(export_name: &str, declared_type: &str, body: &str) -> Strin
 // --- file assembly -----------------------------------------------------------------------------
 
 fn assemble_file(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     sibling_prefix: &str,
     imports: &SiblingImports,
     reexports: &SiblingBindings,
@@ -7893,7 +7920,8 @@ mod tests {
             callback_names: Vec::new(),
         };
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut registrar);
         let mut scope = FileScope::default();
         let mut imports = SiblingImports::default();
         let mut body = FnBody::new(
@@ -7939,7 +7967,8 @@ mod tests {
             callback_names: Vec::new(),
         };
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut registrar);
         let mut scope = FileScope::default();
         let mut imports = SiblingImports::default();
         let mut body = FnBody::new(
