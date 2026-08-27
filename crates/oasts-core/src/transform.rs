@@ -159,6 +159,26 @@ enum Step {
 
 type Conversions = Vec<(Vec<Step>, Conversion)>;
 
+/// Memo table for component-ref expansion during a `reaches_kind` walk, keyed by schema index.
+///
+/// Without it a shared-ref DAG expands exponentially, so a test bounds the expansion count
+/// rather than the wall clock — the counter exists only in test builds.
+struct RefMemo {
+    entries: Vec<Option<bool>>,
+    #[cfg(test)]
+    expansions: usize,
+}
+
+impl RefMemo {
+    fn new(components: usize) -> Self {
+        Self {
+            entries: vec![None; components],
+            #[cfg(test)]
+            expansions: 0,
+        }
+    }
+}
+
 /// Per-schema transform reachability for one compile.
 ///
 /// Borrows the `Ir` it describes rather than taking it per call: resolving a `$ref` to its target
@@ -284,8 +304,17 @@ impl<'ir> TransformFacts<'ir> {
                 node,
                 kind,
                 &mut Vec::new(),
-                &mut vec![None; self.ir.schemas.len()],
+                &mut RefMemo::new(self.ir.schemas.len()),
             )
+    }
+
+    /// [`Self::reaches_kind`] plus the number of component expansions the walk performed.
+    #[cfg(test)]
+    fn reaches_kind_expansions(&self, node: &SchemaNode, kind: TransformKind) -> (bool, usize) {
+        let mut memo = RefMemo::new(self.ir.schemas.len());
+        let reaches =
+            self.enabled() && self.reaches_kind_inner(node, kind, &mut Vec::new(), &mut memo);
+        (reaches, memo.expansions)
     }
 
     fn reaches_kind_inner(
@@ -293,7 +322,7 @@ impl<'ir> TransformFacts<'ir> {
         node: &SchemaNode,
         kind: TransformKind,
         visiting: &mut Vec<usize>,
-        memo: &mut [Option<bool>],
+        memo: &mut RefMemo,
     ) -> bool {
         if self.site(node) == Some(kind) {
             return true;
@@ -306,17 +335,21 @@ impl<'ir> TransformFacts<'ir> {
                 else {
                     return false;
                 };
-                if let Some(reaches) = memo[index] {
+                if let Some(reaches) = memo.entries[index] {
                     return reaches;
                 }
                 if visiting.contains(&index) {
                     return false;
                 }
                 visiting.push(index);
+                #[cfg(test)]
+                {
+                    memo.expansions += 1;
+                }
                 let reaches =
                     self.reaches_kind_inner(&self.ir.schemas[index].schema, kind, visiting, memo);
                 visiting.pop();
-                memo[index] = Some(reaches);
+                memo.entries[index] = Some(reaches);
                 reaches
             }
             SchemaNode::Object {
@@ -805,7 +838,6 @@ fn finite_kinds(enum_values: Option<&[Value]>, const_value: Option<&Value>) -> J
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::{Duration, Instant};
 
     use serde_json::{Map, Value, json};
     use tempfile::TempDir;
@@ -1622,13 +1654,16 @@ mod tests {
         let fx = fixture(doc(Value::Object(schemas)), date_mode());
         let computed = fx.facts();
 
-        let started = Instant::now();
-        assert!(!computed.reaches_kind(fx.root(&previous), TransformKind::DateTimeDate));
-        let elapsed = started.elapsed();
+        // Every layer refs the one below it twice, so an unmemoized walk expands 2^22 times
+        // while a memoized one expands each of the 23 components at most once. Bounding the
+        // expansions rather than the elapsed time keeps the discriminator machine-independent.
+        let (reaches, expansions) =
+            computed.reaches_kind_expansions(fx.root(&previous), TransformKind::DateTimeDate);
+        assert!(!reaches);
         assert!(
-            elapsed < Duration::from_millis(250),
-            "shared-ref reachability took {:?}",
-            elapsed
+            expansions <= fx.ir.schemas.len(),
+            "shared-ref reachability expanded {expansions} times over {} components",
+            fx.ir.schemas.len()
         );
     }
 
