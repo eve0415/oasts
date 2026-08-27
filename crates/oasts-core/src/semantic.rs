@@ -1354,18 +1354,25 @@ fn report_unmatched_overrides(
     config_path: Option<&Path>,
     sink: &mut DiagnosticSink,
 ) {
-    for key in naming.overrides.schemas.keys() {
-        let declared = ir
-            .schemas
-            .iter()
-            .any(|schema| &schema.name == key && is_overrideable_schema(&schema.source));
-        if !declared && !ir.removed.schemas.contains(key) {
-            sink.push(unmatched_override_diagnostic(
-                "schema",
-                "schemas",
-                key,
-                config_path,
-            ));
+    if !naming.overrides.schemas.is_empty() {
+        let mut declared: HashSet<&str> =
+            HashSet::with_capacity(ir.schemas.len() + ir.removed.schemas.len());
+        declared.extend(
+            ir.schemas
+                .iter()
+                .filter(|schema| is_overrideable_schema(&schema.source))
+                .map(|schema| schema.name.as_str()),
+        );
+        declared.extend(ir.removed.schemas.iter().map(String::as_str));
+        for key in naming.overrides.schemas.keys() {
+            if !declared.contains(key.as_str()) {
+                sink.push(unmatched_override_diagnostic(
+                    "schema",
+                    "schemas",
+                    key,
+                    config_path,
+                ));
+            }
         }
     }
     if !naming.overrides.schemas_by_source.is_empty() {
@@ -1394,46 +1401,64 @@ fn report_unmatched_overrides(
             }
         }
     }
-    for key in naming.overrides.operations.keys() {
-        let declared = ir
-            .operations
-            .iter()
-            .any(|operation| operation.operation_id.as_deref() == Some(key.as_str()));
-        if !declared && !ir.removed.operations.contains(key) {
-            sink.push(unmatched_override_diagnostic(
-                "operation",
-                "operations",
-                key,
-                config_path,
-            ));
-        }
-    }
-    for key in naming.overrides.webhooks.keys() {
-        let declared = ir.webhooks.iter().any(|webhook| &webhook.name == key);
-        if !declared && !ir.removed.webhooks.contains(key) {
-            sink.push(unmatched_override_diagnostic(
-                "webhook",
-                "webhooks",
-                key,
-                config_path,
-            ));
-        }
-    }
-    for key in naming.overrides.callbacks.keys() {
-        let mut matched = false;
-        for_each_operation(ir, &mut |operation| {
-            matched |= operation
-                .callbacks
+    if !naming.overrides.operations.is_empty() {
+        let mut declared: HashSet<&str> =
+            HashSet::with_capacity(ir.operations.len() + ir.removed.operations.len());
+        declared.extend(
+            ir.operations
                 .iter()
-                .any(|callback| &callback.name == key);
+                .filter_map(|operation| operation.operation_id.as_deref()),
+        );
+        declared.extend(ir.removed.operations.iter().map(String::as_str));
+        for key in naming.overrides.operations.keys() {
+            if !declared.contains(key.as_str()) {
+                sink.push(unmatched_override_diagnostic(
+                    "operation",
+                    "operations",
+                    key,
+                    config_path,
+                ));
+            }
+        }
+    }
+    if !naming.overrides.webhooks.is_empty() {
+        let mut declared: HashSet<&str> =
+            HashSet::with_capacity(ir.webhooks.len() + ir.removed.webhooks.len());
+        declared.extend(ir.webhooks.iter().map(|webhook| webhook.name.as_str()));
+        declared.extend(ir.removed.webhooks.iter().map(String::as_str));
+        for key in naming.overrides.webhooks.keys() {
+            if !declared.contains(key.as_str()) {
+                sink.push(unmatched_override_diagnostic(
+                    "webhook",
+                    "webhooks",
+                    key,
+                    config_path,
+                ));
+            }
+        }
+    }
+    if !naming.overrides.callbacks.is_empty() {
+        // The operation tree is walked once for the whole category rather than once per key:
+        // the walk is the expensive part, and what it finds does not depend on the key.
+        let mut declared: HashSet<&str> = HashSet::new();
+        for_each_operation(ir, &mut |operation| {
+            declared.extend(
+                operation
+                    .callbacks
+                    .iter()
+                    .map(|callback| callback.name.as_str()),
+            );
         });
-        if !matched && !ir.removed.callbacks.contains(key) {
-            sink.push(unmatched_override_diagnostic(
-                "callback",
-                "callbacks",
-                key,
-                config_path,
-            ));
+        declared.extend(ir.removed.callbacks.iter().map(String::as_str));
+        for key in naming.overrides.callbacks.keys() {
+            if !declared.contains(key.as_str()) {
+                sink.push(unmatched_override_diagnostic(
+                    "callback",
+                    "callbacks",
+                    key,
+                    config_path,
+                ));
+            }
         }
     }
 }
@@ -4942,6 +4967,43 @@ mod tests {
         assert_eq!(
             callback_diagnostic.json_pointer.as_deref(),
             Some("/naming/overrides/callbacks/phantom~0callback")
+        );
+    }
+
+    #[test]
+    fn an_override_naming_a_removed_declaration_is_not_an_unmatched_key() {
+        let naming = NamingConfig {
+            overrides: NameOverrides {
+                schemas: BTreeMap::from([("Gone".to_owned(), "Gone".to_owned())]),
+                operations: BTreeMap::from([("goneOp".to_owned(), "GoneOp".to_owned())]),
+                webhooks: BTreeMap::from([("gone/hook".to_owned(), "GoneHook".to_owned())]),
+                callbacks: BTreeMap::from([("goneCallback".to_owned(), "GoneCallback".to_owned())]),
+                ..NameOverrides::default()
+            },
+            ..NamingConfig::default()
+        };
+        let ir = Ir {
+            schemas: vec![named_schema("widget")],
+            removed: crate::ir::RemovedDeclarations {
+                schemas: vec!["Gone".to_owned()],
+                operations: vec!["goneOp".to_owned()],
+                webhooks: vec!["gone/hook".to_owned()],
+                callbacks: vec!["goneCallback".to_owned()],
+                ..crate::ir::RemovedDeclarations::default()
+            },
+            ..Ir::default()
+        };
+        let mut sink = DiagnosticSink::new();
+        let _analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
+
+        // Pruning removed the targets, so every key still names a declaration the document had.
+        assert!(
+            !sink
+                .as_slice()
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_OVERRIDE_UNMATCHED),
+            "{:?}",
+            sink.as_slice()
         );
     }
 
