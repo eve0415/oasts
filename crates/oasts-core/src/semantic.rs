@@ -1993,7 +1993,7 @@ fn analyze_finite_values(
             _ => None,
         };
         let name_result = match explicit_name {
-            Some(name) => validate_explicit_enum_name(name.clone()),
+            Some(name) => validate_explicit_enum_name_allocation(name.clone()),
             None => derive_enum_member_name_allocation(value, analysis.naming.enum_member_case),
         };
         let allocation = match name_result {
@@ -2240,7 +2240,7 @@ fn validate_extension_array<T>(
 fn validate_explicit_name_set(names: &[String], meta: &SchemaMeta, sink: &mut DiagnosticSink) {
     let mut seen = HashMap::new();
     for name in names {
-        if let Err(error) = validate_explicit_enum_name(name.clone()) {
+        if let Err(error) = validate_explicit_enum_name(name) {
             enum_error(
                 meta,
                 format!("invalid explicit enum member name '{name}': {error}"),
@@ -2257,7 +2257,13 @@ fn validate_explicit_name_set(names: &[String], meta: &SchemaMeta, sink: &mut Di
     }
 }
 
-fn validate_explicit_enum_name(name: String) -> Result<NameAllocation, NormalizeError> {
+/// Whether an explicit enum member name is usable, discarding the allocation.
+fn validate_explicit_enum_name(name: &str) -> Result<(), NormalizeError> {
+    validate_explicit_enum_name_allocation(name.to_owned()).map(|_| ())
+}
+
+/// The same check, returning the name the member is emitted under.
+fn validate_explicit_enum_name_allocation(name: String) -> Result<NameAllocation, NormalizeError> {
     if let Some(character) = name.chars().find(|character| !character.is_ascii()) {
         return Err(NormalizeError::NonAscii(character));
     }
