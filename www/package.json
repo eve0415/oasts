@@ -3,6 +3,7 @@
 	"version": "0.0.1",
 	"private": true,
 	"type": "module",
+	"//typescript": "typescript is pinned to 6.0.3 here, one major behind the workspace root's 7.0.2, because @astrojs/check (via @volar/kit) only resolves 6.0.3 today — `pnpm -C www why typescript` confirms it's the only version reachable in this workspace's graph. Bump once @astrojs/check supports TypeScript 7.x.",
 	"scripts": {
 		"dev": "wrangler types && astro dev",
 		"build": "wrangler types && astro build",
