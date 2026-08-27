@@ -5,8 +5,11 @@
  * module (OASTS0012), validating its export is plain JSON data (OASTS0013),
  * a native call that failed without a structured reason (OASTS1022), and a
  * native module load failure (OASTS1023).
- * Rendering matches `oasts_core::diag::render` so both hosts produce one
- * stderr dialect. Everything else renders in Rust and passes through verbatim.
+ * `render()` covers a single Node-owned diagnostic at a time — every call site
+ * here passes exactly one. It never sorts (Rust's `render_to_string` always
+ * does) and never prints a line/col (this `Diagnostic` carries none, so the
+ * location line is always `sourceId:1:1`). Everything else renders in Rust
+ * and passes through verbatim.
  */
 
 /** Config module evaluation failed (import error, missing/async/non-object default). */
