@@ -398,8 +398,6 @@ pub fn emit_types(
 }
 
 pub(crate) fn emit_types_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
-    let _client_artifact_emitter = client::emit_client_from_model;
-    let _runtime_asset_emitter = runtime_assets::emit_runtime_files;
     let (files, diagnostics) = Emitter::new(model).emit();
     model.sink.extend(diagnostics);
     files
