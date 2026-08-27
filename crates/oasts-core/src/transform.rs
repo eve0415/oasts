@@ -1660,10 +1660,10 @@ mod tests {
         let (reaches, expansions) =
             computed.reaches_kind_expansions(fx.root(&previous), TransformKind::DateTimeDate);
         assert!(!reaches);
+        let components = fx.ir.schemas.len();
         assert!(
-            expansions <= fx.ir.schemas.len(),
-            "shared-ref reachability expanded {expansions} times over {} components",
-            fx.ir.schemas.len()
+            expansions <= components,
+            "shared-ref reachability expanded {expansions} times over {components} components"
         );
     }
 

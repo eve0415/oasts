@@ -5003,14 +5003,10 @@ mod tests {
         let _analyzed = analyze_with_options(ir, &naming, &TypesConfig::default(), &mut sink);
 
         // Pruning removed the targets, so every key still names a declaration the document had.
-        assert!(
-            !sink
-                .as_slice()
-                .iter()
-                .any(|diagnostic| diagnostic.code == CODE_OVERRIDE_UNMATCHED),
-            "{:?}",
-            sink.as_slice()
-        );
+        // Asserted as a whole-slice comparison rather than a filtered search: a closure over an
+        // empty diagnostic slice never executes, which llvm-cov scores as an uncovered function.
+        let diagnostics = sink.as_slice();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
