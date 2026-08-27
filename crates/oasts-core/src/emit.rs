@@ -1,4 +1,16 @@
-//! Deterministic TypeScript types artifact emission.
+//! Deterministic emission: the artifact orchestrator, the shared emission
+//! kernel, and the types renderer.
+//!
+//! [`emit_artifacts`] is the one entry point a compile goes through,
+//! dispatching every enabled artifact kind in a fixed order. This module is
+//! also the file-module parent of `emit::{client, model, msw, paths,
+//! runtime_assets, tanstack, transform, validators, zod}`, and nearly all of
+//! those children reach back into it through `use super::` for the shared
+//! machinery: the [`Emitter`] type plus the artifact-agnostic rendering
+//! helpers (`push_indent`, `render_ts_string`, `render_json_compact`,
+//! `source_diagnostic`, `warning_diagnostic`, `callback_operation`,
+//! `response_status_type_suffix`). The rest of the module is the types
+//! renderer itself.
 //!
 //! A named, direct object becomes an `interface`; every other named schema is
 //! a `type`. This deliberately small rule keeps declaration form independent
