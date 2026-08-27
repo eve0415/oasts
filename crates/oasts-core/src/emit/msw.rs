@@ -204,9 +204,16 @@ fn is_path_to_regexp_identifier(name: &str) -> bool {
 }
 
 pub(crate) fn emit_msw_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
+    // Built once for the whole artifact and threaded down. The projection is a whole-graph
+    // analysis whose only input is the immutable IR, so every construction yields the same value —
+    // constructing it per operation ran it thousands of times per compile for one answer. Binding
+    // `analyzed` out first is what makes this a hoist: it is an `&'input` copy, so the projector
+    // borrows the input rather than the model and coexists with the `&mut model` below. Validators
+    // and zod already hoist it exactly this way.
+    let analyzed = model.analyzed;
+    let projector = PrimitiveDomainProjector::new(&analyzed.ir);
     if !model.config.artifacts.client.enabled {
-        let projector = PrimitiveDomainProjector::new(&model.analyzed.ir);
-        for operation in &model.analyzed.ir.operations {
+        for operation in &analyzed.ir.operations {
             diagnose_operation_response_media(operation, &projector, model.sink);
         }
         if model.sink.has_errors() {
@@ -219,15 +226,20 @@ pub(crate) fn emit_msw_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Gene
             continue;
         };
         let operation = model.analyzed.ir.operations[allocated.operation_index].clone();
-        if let Some(file) = emit_operation(model, &operation, &allocated.name, &file_base) {
+        if let Some(file) =
+            emit_operation(model, &operation, &allocated.name, &file_base, &projector)
+        {
             files.push(file);
         }
     }
-    files.push(emit_paths(model));
+    files.push(emit_paths(model, &projector));
     files
 }
 
-fn emit_paths(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
+fn emit_paths(
+    model: &mut EmissionModel<'_, '_>,
+    projector: &PrimitiveDomainProjector<'_>,
+) -> GeneratedFile {
     let operations = model.analyzed.ir.operations.clone();
     let source = operations
         .first()
@@ -244,7 +256,6 @@ fn emit_paths(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
     let mut component_imports = BTreeMap::<String, BTreeSet<String>>::new();
     {
         let renderer = TypesEmitter::new(model);
-        let projector = PrimitiveDomainProjector::new(&model.analyzed.ir);
         for operation in &operations {
             for parameter in operation.parameters.iter().filter(|parameter| {
                 matches!(
@@ -261,13 +272,13 @@ fn emit_paths(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
             }
             if let Some(body) = &operation.request_body {
                 for media in &body.media_types {
-                    let plan = body_plan_for_media(media, &projector);
+                    let plan = body_plan_for_media(media, projector);
                     collect_request_body_imports(&renderer, &plan, &mut component_imports);
                 }
             }
             for response in &operation.responses {
                 for media in &response.media_types {
-                    if response_body_uses_schema(media, &projector) {
+                    if response_body_uses_schema(media, projector) {
                         renderer.collect_operation_imports(
                             &media.schema,
                             TypePosition::Response,
@@ -314,7 +325,6 @@ fn emit_paths(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
         }
     }
 
-    let projector = PrimitiveDomainProjector::new(&model.analyzed.ir);
     let renderer = TypesEmitter::new(model);
     renderer.set_import_aliases(aliases);
     for (path, methods) in paths {
@@ -322,7 +332,7 @@ fn emit_paths(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
         output.push_str(&render_ts_string(&path));
         output.push_str(": {\n");
         for operation in methods {
-            write_paths_operation(&mut output, &renderer, model, operation, &projector);
+            write_paths_operation(&mut output, &renderer, model, operation, projector);
         }
         output.push_str("  };\n");
     }
@@ -446,6 +456,7 @@ fn emit_operation(
     operation: &Operation,
     allocated_name: &str,
     file_base: &str,
+    projector: &PrimitiveDomainProjector<'_>,
 ) -> Option<GeneratedFile> {
     let Some(method) = msw_method(&operation.method) else {
         model.sink.push(warning_diagnostic(
@@ -465,29 +476,26 @@ fn emit_operation(
             return None;
         }
     };
-    let projected_parameters = match plan_projected_parameters(model, operation) {
+    let projected_parameters = match plan_projected_parameters(model, operation, projector) {
         Ok(parameters) => parameters,
         Err(diagnostics) => {
             model.sink.extend(diagnostics);
             return None;
         }
     };
-    let projected_body = match plan_projected_body(model, operation) {
+    let projected_body = match plan_projected_body(model, operation, projector) {
         Ok(body) => body,
         Err(diagnostics) => {
             model.sink.extend(diagnostics);
             return None;
         }
     };
-    let response_transform_diagnostics = {
-        let projector = PrimitiveDomainProjector::new(&model.analyzed.ir);
-        response_transform_diagnostics(model, operation, &projector)
-    };
+    let response_transform_diagnostics =
+        response_transform_diagnostics(model, operation, projector);
     if !response_transform_diagnostics.is_empty() {
         model.sink.extend(response_transform_diagnostics);
         return None;
     }
-    let response_projector = PrimitiveDomainProjector::new(&model.analyzed.ir);
 
     let stem = uppercase_first(allocated_name);
     let response_name = format!("{stem}Response");
@@ -502,7 +510,7 @@ fn emit_operation(
                 // components are named nowhere in the module — importing them anyway leaves an
                 // unread binding in the consumer's compile. `paths.ts` already reads the same
                 // predicate; this is the site that did not.
-                if !response_body_uses_schema(media, &response_projector) {
+                if !response_body_uses_schema(media, projector) {
                     continue;
                 }
                 renderer.collect_operation_imports(
@@ -564,11 +572,11 @@ fn emit_operation(
             response_body_name.push_str("Value");
         }
         (
-            render_response_type(&renderer, operation, &response_name, &response_projector),
+            render_response_type(&renderer, operation, &response_name, projector),
             aliases,
             diagnostics,
             response_body_name,
-            response_body_union(&renderer, operation, &response_projector),
+            response_body_union(&renderer, operation, projector),
         )
     };
     model.sink.extend(alias_diagnostics);
@@ -702,7 +710,7 @@ fn emit_operation(
         output.push_str(".baseUrl");
     }
     output.push_str(";\n  const responsePayloads = ");
-    output.push_str(&response_payload_map(operation, &response_projector));
+    output.push_str(&response_payload_map(operation, projector));
     output.push_str(" as const;\n  const pathPattern = ");
     output.push_str(&render_ts_string(&pattern));
     output.push_str(";\n");
@@ -761,12 +769,12 @@ fn emit_operation(
 fn plan_projected_body(
     model: &mut EmissionModel<'_, '_>,
     operation: &Operation,
+    projector: &PrimitiveDomainProjector<'_>,
 ) -> Result<Option<ProjectedBody>, Vec<Diagnostic>> {
     let Some(body) = &operation.request_body else {
         return Ok(None);
     };
-    let projector = PrimitiveDomainProjector::new(&model.analyzed.ir);
-    let Some(plan) = build_body_plan(&body.media_types, &projector) else {
+    let Some(plan) = build_body_plan(&body.media_types, projector) else {
         return Err(vec![body_projection_diagnostic(
             &body.source,
             "the request body declares no usable media type",
@@ -777,7 +785,7 @@ fn plan_projected_body(
         if matches!(
             media.essence.as_str(),
             "application/x-www-form-urlencoded" | "multipart/form-data"
-        ) && let Err(error) = collect_form_properties(&media.schema, &projector)
+        ) && let Err(error) = collect_form_properties(&media.schema, projector)
         {
             let reason = match error {
                 // Valid OpenAPI that simply declares nothing, so the handler is still emitted —
@@ -1456,14 +1464,14 @@ fn collect_request_body_imports(
 fn plan_projected_parameters(
     model: &EmissionModel<'_, '_>,
     operation: &Operation,
+    projector: &PrimitiveDomainProjector<'_>,
 ) -> Result<Vec<ProjectedParameter>, Vec<Diagnostic>> {
-    let projector = PrimitiveDomainProjector::new(&model.analyzed.ir);
     let mut projected = Vec::new();
     let mut diagnostics = Vec::new();
     for (index, parameter) in operation.parameters.iter().enumerate() {
         let plan = parameter_plan(
             parameter,
-            &projector,
+            projector,
             model.config.compat.deep_object_encoding,
         );
         let style = parameter_style_name(plan.resolved.style);
