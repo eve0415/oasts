@@ -18,7 +18,7 @@ use url::Url;
 use crate::config::ResolvedConfig;
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::source::{DocumentSource, SourceHandle, is_rooted};
-use crate::syntax::parse_yaml_document_value;
+use crate::yaml::parse_yaml_document_value;
 
 const CODE_DOCUMENT_IO: &str = "OASTS1003";
 const CODE_REF_ESCAPE: &str = "OASTS2001";

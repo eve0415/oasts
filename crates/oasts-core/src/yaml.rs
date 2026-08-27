@@ -1,3 +1,9 @@
+//! YAML 1.2 documents to `serde_json::Value`.
+//!
+//! Every item here is about reading YAML: the compiler's config and input
+//! documents become the same `Value` shape a JSON document does, so nothing
+//! downstream has to know which syntax a document was written in.
+
 use std::collections::VecDeque;
 use std::str::FromStr;
 
