@@ -79,10 +79,16 @@ export class CompilerModule {
 
 		const encoded = new TextEncoder().encode(JSON.stringify(request));
 		const inPtr = oasts_alloc(encoded.length);
+		if (inPtr === 0) {
+			return { files: [], diagnostics: [], error: "the compiler ran out of memory" };
+		}
 		new Uint8Array(memory.buffer, inPtr, encoded.length).set(encoded);
 
 		const outPtr = oasts_generate(inPtr, encoded.length);
 		oasts_free(inPtr, encoded.length);
+		if (outPtr === 0) {
+			return { files: [], diagnostics: [], error: "the compiler ran out of memory" };
+		}
 
 		// Read the views only after the call: growing the heap detaches any buffer taken before it.
 		const length = new DataView(memory.buffer).getUint32(outPtr, true);
