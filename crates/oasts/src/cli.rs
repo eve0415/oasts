@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use oasts_core::diag::{self, Diagnostic};
-use oasts_core::driver::{self, Command as DriverCommand, ConfigSource, Outcome};
+use oasts_core::driver::{self, Command as DriverCommand, ConfigSource, Outcome, Unsupported};
 
 const CODE_CURRENT_DIR: &str = "OASTS1021";
 
@@ -31,12 +31,27 @@ enum Command {
         /// Use an explicit configuration file.
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
+        /// Select a workspace spec (unsupported in this build).
+        #[arg(long, value_name = "NAME")]
+        spec: Vec<String>,
     },
     /// Validate configuration and input without emitting artifacts.
     Check {
         /// Use an explicit configuration file.
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
+        /// Select a workspace spec (unsupported in this build).
+        #[arg(long, value_name = "NAME")]
+        spec: Vec<String>,
+    },
+    /// Watch inputs and regenerate (unsupported in this build).
+    Watch {
+        /// Use an explicit configuration file.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// Select a workspace spec (unsupported in this build).
+        #[arg(long, value_name = "NAME")]
+        spec: Vec<String>,
     },
 }
 
@@ -87,7 +102,7 @@ fn run_with_io(
     stderr: &mut dyn Write,
 ) -> u8 {
     if args.first().is_none_or(|argument| {
-        matches!(argument.as_str(), "generate" | "check") || argument.starts_with('-')
+        matches!(argument.as_str(), "generate" | "check" | "watch") || argument.starts_with('-')
     }) {
         args.insert(0, "oasts".to_owned());
     }
@@ -113,26 +128,51 @@ fn run_os_with_io(
         }
     };
     match cli.command {
-        Command::Generate { check, config } => dispatch(
+        // The refusal for an unimplemented command is answered before anything else, so `watch`
+        // never fails on a missing config first — the order the Node CLI also runs in.
+        Command::Watch { .. } => report(
+            driver::refuse(Unsupported::Command("watch")),
+            stdout,
+            stderr,
+        ),
+        Command::Generate {
+            check,
+            config,
+            spec,
+        } => dispatch(
             DriverCommand::Generate { check },
             config.as_deref(),
+            &spec,
             cwd,
             stdout,
             stderr,
         ),
-        Command::Check { config } => {
-            dispatch(DriverCommand::Check, config.as_deref(), cwd, stdout, stderr)
-        }
+        Command::Check { config, spec } => dispatch(
+            DriverCommand::Check,
+            config.as_deref(),
+            &spec,
+            cwd,
+            stdout,
+            stderr,
+        ),
     }
 }
 
 fn dispatch(
     command: DriverCommand,
     config_path: Option<&Path>,
+    specs: &[String],
     cwd: &Path,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    // `--spec` is refused before the config is read, matching where the napi host answers it.
+    // The Node CLI discovers the config in its own layer first, so an undiscoverable config
+    // reports the discovery failure there instead — same exit category either way, and only
+    // reachable on a run that was going to fail regardless.
+    if !specs.is_empty() {
+        return report(driver::refuse(Unsupported::SpecSelection), stdout, stderr);
+    }
     let outcome = driver::run(
         command,
         ConfigSource::Path {
@@ -760,6 +800,37 @@ mod tests {
                 .expect("relative tempdir name"),
         );
         assert_eq!(invoke(&["oasts", "check"], &relative_cwd).0, 0);
+    }
+
+    #[test]
+    fn unimplemented_surfaces_refuse_with_the_core_diagnostics() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        for args in [
+            vec!["oasts", "watch"],
+            vec!["watch"],
+            vec!["oasts", "watch", "--config", "oasts.yaml"],
+            vec!["oasts", "watch", "--spec", "petstore"],
+        ] {
+            let (code, stdout, stderr) = invoke(&args, empty.path());
+            assert_eq!(code, 2, "{args:?}: {stderr}");
+            assert!(stdout.is_empty(), "{args:?}: {stdout}");
+            assert!(
+                stderr.contains("error[OASTS9004]: the watch command is not supported"),
+                "{args:?}: {stderr}"
+            );
+        }
+
+        let configured = copy_fixture("petstore-3.0");
+        for args in [
+            vec!["oasts", "generate", "--spec", "petstore"],
+            vec!["oasts", "check", "--spec", "petstore"],
+            vec!["oasts", "generate", "--spec", "petstore", "--spec", "other"],
+        ] {
+            let (code, stdout, stderr) = invoke(&args, configured.path());
+            assert_eq!(code, 2, "{args:?}: {stderr}");
+            assert!(stdout.is_empty(), "{args:?}: {stdout}");
+            assert!(stderr.contains("error[OASTS9002]"), "{args:?}: {stderr}");
+        }
     }
 
     #[test]
