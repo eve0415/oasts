@@ -56,6 +56,7 @@ use crate::semantic::{
 };
 
 mod client;
+mod descriptor_index;
 mod model;
 mod msw;
 mod paths;

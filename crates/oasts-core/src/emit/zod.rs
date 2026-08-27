@@ -7,30 +7,30 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde_json::Value;
 
 use crate::composition::finite_values;
 use crate::config::ZodFlavor;
 use crate::diag::Diagnostic;
 use crate::ir::{
-    AdditionalProperties, ExclusiveBound, Operation, ParamLocation, PrimitiveType, PropMeta,
-    ResponseEntry, SchemaMeta, SchemaNode, TupleRest, finite_parts,
+    AdditionalProperties, ExclusiveBound, Operation, PrimitiveType, PropMeta, ResponseEntry,
+    SchemaMeta, SchemaNode, SourceRef, TupleRest, finite_parts,
 };
-use crate::media::is_json;
 use crate::num::render_number_value;
 use crate::response_media::media_has_validatable_schema;
 
+use super::descriptor_index::{
+    DescriptorTarget, Reject, SiblingImports, collect_operation_rejects, collect_rejects,
+    embedded_asset, emit_callbacks_index, emit_webhooks_index, render_sibling_imports,
+};
 use super::model::EmissionModel;
-use super::runtime_assets::rewrite_relative_ts_imports;
 use super::validators::{
     CODE_MEDIA_TAG_COLLISION, identical_component_delegate, operation_parameter_validator_names,
     validator_wire_type_name,
 };
 use super::{
-    Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypeAxis, TypePosition,
-    callback_operation, callback_parent_operation, import_extension, lowercase_first,
-    property_in_position, push_indent, render_json_compact, render_ts_string,
+    Emitter, GeneratedFile, ObjectKeyMode, TypeAxis, TypePosition, callback_operation,
+    import_extension, lowercase_first, property_in_position, render_json_compact, render_ts_string,
     request_body_validator_positions, response_media_names, response_status_type_suffix,
     source_diagnostic, uppercase_first, warning_diagnostic,
 };
@@ -44,6 +44,22 @@ const VALIDATORS_RUNTIME_TS: &str = include_str!("../../runtime/validators-runti
 const CODE_REJECTED_KEYWORD: &str = "OASTS6101";
 /// A schema degraded to an unknown leaf, so no faithful Zod schema can be emitted.
 const CODE_UNKNOWN_LEAF: &str = "OASTS6102";
+
+/// The diagnostic this artifact raises for one node the shared reject walk found no check for.
+fn reject_diagnostic(reject: Reject<'_>, source: &SourceRef) -> Diagnostic {
+    match reject {
+        Reject::Keyword(keyword) => source_diagnostic(
+            CODE_REJECTED_KEYWORD,
+            format!("zod cannot emit a check for unsupported validation keyword '{keyword}'"),
+            source,
+        ),
+        Reject::UnknownLeaf(reason) => source_diagnostic(
+            CODE_UNKNOWN_LEAF,
+            format!("zod cannot emit a check for an unsupported schema ({reason})"),
+            source,
+        ),
+    }
+}
 
 const ZOD_RESERVED_NAMES: &[&str] = &[
     "z",
@@ -87,28 +103,38 @@ pub(crate) fn emit_zod_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Gene
     // would make request-body planning cost O(operations x schemas).
     let projector = PrimitiveDomainProjector::new(&analyzed.ir);
     let mut rejects = Vec::new();
+    let target = DescriptorTarget {
+        dir: model.dirs.zod,
+        export_suffix: "Schema",
+    };
     {
         let emitter = Emitter::new(model);
         for schema in &analyzed.ir.schemas {
-            collect_rejects(&emitter, &schema.schema, &mut rejects);
+            collect_rejects(&emitter, &schema.schema, reject_diagnostic, &mut rejects);
         }
         for operation in &analyzed.ir.operations {
-            collect_operation_rejects(&emitter, operation, true, &mut rejects);
+            collect_operation_rejects(&emitter, operation, true, reject_diagnostic, &mut rejects);
         }
         for webhook in &analyzed.ir.webhooks {
             for operation in &webhook.operations {
-                collect_operation_rejects(&emitter, operation, false, &mut rejects);
+                collect_operation_rejects(
+                    &emitter,
+                    operation,
+                    false,
+                    reject_diagnostic,
+                    &mut rejects,
+                );
             }
         }
         for allocated in &analyzed.callback_names {
             let operation = callback_operation(&analyzed.ir, &analyzed.callback_names, allocated);
-            collect_operation_rejects(&emitter, operation, false, &mut rejects);
+            collect_operation_rejects(&emitter, operation, false, reject_diagnostic, &mut rejects);
         }
     }
     model.sink.extend(rejects);
     model.reserve_names(ZOD_RESERVED_NAMES);
 
-    let mut files = vec![embedded_asset(model)];
+    let mut files = vec![embedded_asset(model, target, "runtime.ts", ZOD_RUNTIME_TS)];
     for allocated in &analyzed.schema_names {
         if model.component_files[allocated.schema_index].is_none() {
             continue;
@@ -153,7 +179,7 @@ pub(crate) fn emit_zod_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Gene
                 files.push(file);
             }
         }
-        files.push(emit_webhooks_index(model));
+        files.push(emit_webhooks_index(model, target));
     }
     if !analyzed.callback_names.is_empty() {
         for index in 0..analyzed.callback_names.len() {
@@ -174,116 +200,9 @@ pub(crate) fn emit_zod_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<Gene
                 files.push(file);
             }
         }
-        files.push(emit_callbacks_index(model));
+        files.push(emit_callbacks_index(model, target));
     }
     files
-}
-
-fn embedded_asset(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
-    let content = rewrite_relative_ts_imports(ZOD_RUNTIME_TS, &model.config.emit.import_extension);
-    let relative_path = format!("{}/runtime.ts", model.dirs.zod);
-    let source = model
-        .analyzed
-        .ir
-        .schemas
-        .first()
-        .map(|schema| schema.source.clone())
-        .unwrap_or_default();
-    model.register_path(&relative_path, &source);
-    GeneratedFile {
-        relative_path,
-        content,
-    }
-}
-
-fn collect_rejects(emitter: &Emitter<'_, '_, '_>, schema: &SchemaNode, out: &mut Vec<Diagnostic>) {
-    let meta = schema.meta();
-    if meta.rejected_validation_keywords.is_empty() {
-        if let SchemaNode::Unknown { reason, meta } = schema {
-            out.push(source_diagnostic(
-                CODE_UNKNOWN_LEAF,
-                format!("zod cannot emit a check for an unsupported schema ({reason})"),
-                &meta.source,
-            ));
-        }
-    } else {
-        for keyword in &meta.rejected_validation_keywords {
-            out.push(source_diagnostic(
-                CODE_REJECTED_KEYWORD,
-                format!("zod cannot emit a check for unsupported validation keyword '{keyword}'"),
-                &meta.source,
-            ));
-        }
-    }
-    emitter.for_each_schema_child(schema, SchemaChildMode::Validation, &mut |child| {
-        collect_rejects(emitter, child, out);
-    });
-}
-
-fn collect_operation_rejects(
-    emitter: &Emitter<'_, '_, '_>,
-    operation: &Operation,
-    include_responses: bool,
-    out: &mut Vec<Diagnostic>,
-) {
-    for parameter in &operation.parameters {
-        collect_rejects(emitter, &parameter.schema, out);
-    }
-    if let Some(body) = &operation.request_body {
-        for media in &body.media_types {
-            collect_rejects(emitter, &media.schema, out);
-        }
-    }
-    if include_responses {
-        for response in &operation.responses {
-            for media in &response.media_types {
-                collect_rejects(emitter, &media.schema, out);
-            }
-            for (_, header) in &response.headers {
-                collect_rejects(emitter, &header.schema, out);
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct SiblingImports {
-    files: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>,
-    skip_self: Option<usize>,
-}
-
-impl SiblingImports {
-    fn collect_types(
-        &mut self,
-        emitter: &Emitter<'_, '_, '_>,
-        schema: &SchemaNode,
-        position: TypePosition,
-    ) {
-        emitter.walk_refs(schema, position, &mut |target| {
-            if Some(target.index) == self.skip_self {
-                return;
-            }
-            self.files
-                .entry(target.file_base.clone())
-                .or_default()
-                .0
-                .insert(if target.transforms {
-                    target.wire_name(position)
-                } else {
-                    target.variant_name(position)
-                });
-        });
-    }
-
-    fn record_schema(&mut self, target_index: usize, file_base: &str, name: String) {
-        if Some(target_index) != self.skip_self {
-            self.files
-                .entry(file_base.to_owned())
-                .or_default()
-                .1
-                .insert(name);
-        }
-    }
 }
 
 struct SchemaRenderer<'a, 'input, 'sink> {
@@ -330,7 +249,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
                         format!("z.lazy(() => {})", self.current_schema_name)
                     }
                 } else {
-                    self.imports.record_schema(
+                    self.imports.record_export(
                         target.index,
                         &target.file_base,
                         schema_name.clone(),
@@ -2108,18 +2027,7 @@ fn assemble_file(
             render_ts_string(&format!("../runtime{extension}"))
         ));
     }
-    for (file_base, (type_names, schema_names)) in &imports.files {
-        let specifiers = type_names
-            .iter()
-            .map(|name| format!("type {name}"))
-            .chain(schema_names.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(", ");
-        output.push_str(&format!(
-            "import {{ {specifiers} }} from {};\n",
-            render_ts_string(&format!("{sibling_prefix}{file_base}{extension}"))
-        ));
-    }
+    render_sibling_imports(&mut output, imports, sibling_prefix, &extension);
     for (file_base, specifiers) in reexports {
         output.push_str(&format!(
             "export {{ {} }} from {};\n",
@@ -2141,256 +2049,6 @@ fn assemble_file(
     output
 }
 
-fn emit_webhooks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
-    let analyzed = model.analyzed;
-    let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut body = String::from("export const webhooks = {\n");
-    let mut cursor = 0;
-    for (webhook_index, webhook) in analyzed.ir.webhooks.iter().enumerate() {
-        body.push_str("  ");
-        body.push_str(&render_ts_string(&webhook.name));
-        body.push_str(": {");
-        let mut wrote_method = false;
-        while let Some(allocated) = analyzed
-            .webhook_names
-            .get(cursor)
-            .filter(|allocated| allocated.webhook_index == webhook_index)
-        {
-            let file_base = model.webhook_files[cursor].as_deref();
-            cursor += 1;
-            let Some(file_base) = file_base else {
-                continue;
-            };
-            let operation = &webhook.operations[allocated.operation_index];
-            if !operation_has_request_schemas(operation) {
-                continue;
-            }
-            if !wrote_method {
-                body.push('\n');
-                wrote_method = true;
-            }
-            write_request_descriptor_method(
-                &mut body,
-                &mut imports,
-                file_base,
-                &allocated.stem,
-                operation,
-                4,
-            );
-        }
-        if wrote_method {
-            body.push_str("  },\n");
-        } else {
-            body.push_str("},\n");
-        }
-    }
-    body.push_str("};\n");
-    assemble_descriptor_index(
-        model,
-        &format!("{}/webhooks/index.ts", model.dirs.zod),
-        imports,
-        body,
-    )
-}
-
-fn emit_callbacks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
-    let analyzed = model.analyzed;
-    let ir = &analyzed.ir;
-    let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut body = String::new();
-    let mut seen_parents = HashSet::new();
-    let mut entries_by_parent: HashMap<_, Vec<usize>> = HashMap::new();
-    for (index, entry) in analyzed.callback_names.iter().enumerate() {
-        if model.callback_files[index].is_some()
-            && operation_has_request_schemas(callback_operation(
-                ir,
-                &analyzed.callback_names,
-                entry,
-            ))
-        {
-            entries_by_parent
-                .entry(&entry.parent)
-                .or_default()
-                .push(index);
-        }
-    }
-    for (index, entry) in analyzed.callback_names.iter().enumerate() {
-        if model.callback_files[index].is_none()
-            || !operation_has_request_schemas(callback_operation(
-                ir,
-                &analyzed.callback_names,
-                entry,
-            ))
-            || !seen_parents.insert(&entry.parent)
-        {
-            continue;
-        }
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        let parent = &entry.parent;
-        let parent_operation = callback_parent_operation(ir, &analyzed.callback_names, parent);
-        body.push_str("export const ");
-        body.push_str(&lowercase_first(&uppercase_first(&entry.parent_stem)));
-        body.push_str("Callbacks = {\n");
-        let entries = &entries_by_parent[parent];
-        let mut cursor = 0;
-        while cursor < entries.len() {
-            let callback_index = analyzed.callback_names[entries[cursor]].callback_index;
-            let callback = &parent_operation.callbacks[callback_index];
-            body.push_str("  ");
-            body.push_str(&render_ts_string(&callback.name));
-            body.push_str(": {\n");
-            while cursor < entries.len()
-                && analyzed.callback_names[entries[cursor]].callback_index == callback_index
-            {
-                let expression_index = analyzed.callback_names[entries[cursor]].expression_index;
-                body.push_str("    ");
-                body.push_str(&render_ts_string(
-                    &callback.expressions[expression_index].expression,
-                ));
-                body.push_str(": {\n");
-                while cursor < entries.len() && {
-                    let current = &analyzed.callback_names[entries[cursor]];
-                    current.callback_index == callback_index
-                        && current.expression_index == expression_index
-                } {
-                    let index = entries[cursor];
-                    let allocated = &analyzed.callback_names[index];
-                    let file_base = model.callback_files[index].as_deref().unwrap_or_default();
-                    let operation = callback_operation(ir, &analyzed.callback_names, allocated);
-                    write_request_descriptor_method(
-                        &mut body,
-                        &mut imports,
-                        file_base,
-                        &allocated.stem,
-                        operation,
-                        6,
-                    );
-                    cursor += 1;
-                }
-                body.push_str("    },\n");
-            }
-            body.push_str("  },\n");
-        }
-        body.push_str("};\n");
-    }
-    assemble_descriptor_index(
-        model,
-        &format!("{}/callbacks/index.ts", model.dirs.zod),
-        imports,
-        body,
-    )
-}
-
-fn operation_has_request_schemas(operation: &Operation) -> bool {
-    !operation.parameters.is_empty()
-        || operation
-            .request_body
-            .as_ref()
-            .is_some_and(|body| body.media_types.iter().any(|media| is_json(&media.essence)))
-}
-
-fn write_request_descriptor_method(
-    body: &mut String,
-    imports: &mut BTreeMap<String, BTreeSet<String>>,
-    file_base: &str,
-    allocated_name: &str,
-    operation: &Operation,
-    indent: usize,
-) {
-    let stem = uppercase_first(allocated_name);
-    let parameter_names = operation_parameter_validator_names(operation, &stem);
-    let entry = imports.entry(file_base.to_owned()).or_default();
-    push_indent(body, indent);
-    body.push_str(&operation.method);
-    body.push_str(": {\n");
-    if !operation.parameters.is_empty() {
-        push_indent(body, indent + 2);
-        body.push_str("parameters: {\n");
-        for location in [
-            ParamLocation::Path,
-            ParamLocation::Query,
-            ParamLocation::Header,
-            ParamLocation::Cookie,
-        ] {
-            let matching = operation
-                .parameters
-                .iter()
-                .zip(&parameter_names)
-                .filter(|(parameter, _)| parameter.location == location)
-                .collect::<Vec<_>>();
-            if matching.is_empty() {
-                continue;
-            }
-            push_indent(body, indent + 4);
-            body.push_str(location_key(location));
-            body.push_str(": {\n");
-            for (parameter, export_type) in matching {
-                let schema = schema_const_name(export_type);
-                entry.insert(schema.clone());
-                push_indent(body, indent + 6);
-                body.push_str(&render_ts_string(&parameter.name));
-                body.push_str(": ");
-                body.push_str(&schema);
-                body.push_str(",\n");
-            }
-            push_indent(body, indent + 4);
-            body.push_str("},\n");
-        }
-        push_indent(body, indent + 2);
-        body.push_str("},\n");
-    }
-    if operation
-        .request_body
-        .as_ref()
-        .is_some_and(|body| body.media_types.iter().any(|media| is_json(&media.essence)))
-    {
-        let schema = format!("{}RequestBodySchema", lowercase_first(&stem));
-        entry.insert(schema.clone());
-        push_indent(body, indent + 2);
-        body.push_str("requestBody: ");
-        body.push_str(&schema);
-        body.push_str(",\n");
-    }
-    push_indent(body, indent);
-    body.push_str("},\n");
-}
-
-fn location_key(location: ParamLocation) -> &'static str {
-    match location {
-        ParamLocation::Path => "path",
-        ParamLocation::Query => "query",
-        ParamLocation::Header => "header",
-        ParamLocation::Cookie => "cookie",
-    }
-}
-
-fn assemble_descriptor_index(
-    model: &EmissionModel<'_, '_>,
-    relative_path: &str,
-    imports: BTreeMap<String, BTreeSet<String>>,
-    body: String,
-) -> GeneratedFile {
-    let extension = import_extension(model);
-    let mut content = model.header();
-    for (file_base, names) in imports {
-        content.push_str("import { ");
-        content.push_str(&names.into_iter().collect::<Vec<_>>().join(", "));
-        content.push_str(" } from ");
-        content.push_str(&render_ts_string(&format!("./{file_base}{extension}")));
-        content.push_str(";\n");
-    }
-    if !content.ends_with("\n\n") {
-        content.push('\n');
-    }
-    content.push_str(&body);
-    GeneratedFile {
-        relative_path: relative_path.to_owned(),
-        content,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -2401,7 +2059,7 @@ mod tests {
     use super::*;
     use crate::client_model::build_client_model;
     use crate::config::load_config;
-    use crate::diag::{DiagnosticSink, Severity};
+    use crate::diag::{Diagnostic, DiagnosticSink, Severity};
     use crate::emit::emit_artifacts;
     use crate::loader::load_graph;
     use crate::parse::parse;
