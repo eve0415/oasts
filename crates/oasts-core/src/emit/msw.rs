@@ -28,8 +28,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::paths::relative_import;
 use super::{
     Emission, EmissionModel, Emitter as TypesEmitter, EmitterFactory, GeneratedFile, Registrar,
-    TypeAxis, TypePosition, assign_import_aliases, import_clause, import_extension, merge_emission,
-    render_property_key, render_ts_string, render_ts_value,
+    TypeAxis, TypePosition, assign_import_aliases, emit_in_parallel, import_clause,
+    import_extension, merge_emission, render_property_key, render_ts_string, render_ts_value,
     runtime_assets::rewrite_relative_ts_imports, uppercase_first, warning_diagnostic,
     write_source_metadata,
 };
@@ -47,7 +47,9 @@ use crate::ir::{
 use crate::response_media::{
     ResponseMediaKind, classify_response_media, diagnose_operation_response_media,
 };
+use crate::semantic::AllocatedOperationName;
 use crate::transform::TransformKind;
+use rayon::prelude::*;
 
 const MSW_RUNTIME_TS: &str = include_str!("../../runtime/msw-runtime.ts");
 const MSW_PROJECT_TS: &str = include_str!("../../runtime/msw-project.ts");
@@ -228,21 +230,38 @@ pub(crate) fn emit_msw_from_model(
     // own empty alias and diagnostic cells, so a worker is exactly the emitter this used to build.
     let factory = TypesEmitter::new(model).into_factory();
     let mut files = embedded_assets(model, registrar);
-    for allocated in model.analyzed.operation_names.clone() {
-        let Some(file_base) = model.operation_files[allocated.operation_index].clone() else {
-            continue;
-        };
-        let operation = model.analyzed.ir.operations[allocated.operation_index].clone();
+    // One handler module per operation, each reading only the frozen model, the factory and the
+    // projector. Nothing an operation emits is visible to the next one, so the loop divides; the
+    // merge below replays each emission in input order, which is the sequence the sequential
+    // branch produced.
+    let handler = |allocated: &AllocatedOperationName| {
+        let file_base = model.operation_files[allocated.operation_index].as_deref()?;
+        let operation = &analyzed.ir.operations[allocated.operation_index];
         let mut emission = Emission::default();
         emit_operation(
             model,
             &factory,
             &mut emission,
-            &operation,
+            operation,
             &allocated.name,
-            &file_base,
+            file_base,
             &projector,
         );
+        Some(emission)
+    };
+    let operation_names = &analyzed.operation_names;
+    let emissions = if emit_in_parallel(operation_names.len()) {
+        operation_names
+            .par_iter()
+            .filter_map(handler)
+            .collect::<Vec<_>>()
+    } else {
+        operation_names
+            .iter()
+            .filter_map(handler)
+            .collect::<Vec<_>>()
+    };
+    for emission in emissions {
         merge_emission(&mut files, registrar, emission);
     }
     files.push(emit_paths(model, &factory, registrar, &projector));

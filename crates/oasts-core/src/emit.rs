@@ -112,6 +112,21 @@ const CODE_TRANSFORM_UNION: &str = "OASTS4301";
 /// behind a type promising an application value.
 pub(super) const CODE_UNCONVERTIBLE_TRANSFORM: &str = "OASTS4302";
 
+/// How many items an emitter's per-item loop needs before it splits across rayon.
+///
+/// The same shape as `PARALLEL_PARSE_MIN_ITEMS` and `PARALLEL_IO_MIN_FILES`: below it the split
+/// costs more than the work it divides, and every repository fixture stays on the sequential path.
+const PARALLEL_EMIT_MIN_ITEMS: usize = 64;
+
+/// Whether an emitter's per-item loop takes its rayon branch rather than the sequential one.
+///
+/// Both branches build the same per-item emissions and both merge them in input order, so the
+/// choice is invisible in the output — it exists so a single-threaded pool and a small document
+/// stay on one path.
+fn emit_in_parallel(item_count: usize) -> bool {
+    rayon::current_num_threads() > 1 && item_count >= PARALLEL_EMIT_MIN_ITEMS
+}
+
 const INDENT_CHUNK: &str = "                                ";
 
 fn push_indent(output: &mut String, mut width: usize) {

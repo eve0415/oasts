@@ -30,12 +30,14 @@ use super::validators::{
 };
 use super::{
     Emission, Emitter, EmitterFactory, GeneratedFile, ObjectKeyMode, OperationModule, TypeAxis,
-    TypePosition, callback_operation, import_extension, lowercase_first, merge_emission,
-    property_in_position, render_json_compact, render_ts_string, request_body_validator_positions,
-    response_media_names, response_status_type_suffix, source_diagnostic, uppercase_first,
-    warning_diagnostic,
+    TypePosition, callback_operation, emit_in_parallel, import_extension, lowercase_first,
+    merge_emission, property_in_position, render_json_compact, render_ts_string,
+    request_body_validator_positions, response_media_names, response_status_type_suffix,
+    source_diagnostic, uppercase_first, warning_diagnostic,
 };
 use crate::client_model::{PrimitiveDomainProjector, build_body_plan};
+use crate::semantic::{AllocatedOperationName, AllocatedSchemaName};
+use rayon::prelude::*;
 
 const ZOD_RUNTIME_TS: &str = include_str!("../../runtime/zod-runtime.ts");
 #[cfg(test)]
@@ -153,10 +155,12 @@ pub(crate) fn emit_zod_from_model(
         "runtime.ts",
         ZOD_RUNTIME_TS,
     )];
-    for allocated in &analyzed.schema_names {
-        let Some(file_base) = model.component_files[allocated.schema_index].clone() else {
-            continue;
-        };
+    // Each of the four loops below builds one module per item from the frozen model, then hands the
+    // ordered result to a sequential merge. Nothing an item emits is read by the next one, so the
+    // loop divides; replaying the collected emissions in input order is the sequence the
+    // sequential branch produced, registration for registration and diagnostic for diagnostic.
+    let component = |allocated: &AllocatedSchemaName| {
+        let file_base = model.component_files[allocated.schema_index].as_deref()?;
         let schema = &analyzed.ir.schemas[allocated.schema_index];
         // A component file and its target are registered together during path allocation.
         let name = model
@@ -169,12 +173,27 @@ pub(crate) fn emit_zod_from_model(
             &factory,
             &mut emission,
             allocated.schema_index,
-            &file_base,
+            file_base,
             &name,
         );
+        Some(emission)
+    };
+    let schema_names = &analyzed.schema_names;
+    let emissions = if emit_in_parallel(schema_names.len()) {
+        schema_names
+            .par_iter()
+            .filter_map(component)
+            .collect::<Vec<_>>()
+    } else {
+        schema_names
+            .iter()
+            .filter_map(component)
+            .collect::<Vec<_>>()
+    };
+    for emission in emissions {
         merge_emission(&mut files, registrar, emission);
     }
-    for allocated in &analyzed.operation_names {
+    let operation = |allocated: &AllocatedOperationName| {
         let mut emission = Emission::default();
         emit_operation(
             model,
@@ -184,13 +203,23 @@ pub(crate) fn emit_zod_from_model(
             allocated.operation_index,
             &allocated.name,
         );
+        emission
+    };
+    let operation_names = &analyzed.operation_names;
+    let emissions = if emit_in_parallel(operation_names.len()) {
+        operation_names
+            .par_iter()
+            .map(operation)
+            .collect::<Vec<_>>()
+    } else {
+        operation_names.iter().map(operation).collect::<Vec<_>>()
+    };
+    for emission in emissions {
         merge_emission(&mut files, registrar, emission);
     }
     if !analyzed.ir.webhooks.is_empty() {
-        for index in 0..analyzed.webhook_names.len() {
-            let Some(file_base) = model.webhook_files[index].clone() else {
-                continue;
-            };
+        let webhook = |index: usize| {
+            let file_base = model.webhook_files[index].as_deref()?;
             let allocated = &analyzed.webhook_names[index];
             let operation = &analyzed.ir.webhooks[allocated.webhook_index].operations
                 [allocated.operation_index];
@@ -204,19 +233,29 @@ pub(crate) fn emit_zod_from_model(
                 OperationModule {
                     allocated_name: &allocated.stem,
                     directory: "webhooks",
-                    file_base: &file_base,
+                    file_base,
                     include_responses: false,
                 },
             );
+            Some(emission)
+        };
+        let webhook_count = analyzed.webhook_names.len();
+        let emissions = if emit_in_parallel(webhook_count) {
+            (0..webhook_count)
+                .into_par_iter()
+                .filter_map(webhook)
+                .collect::<Vec<_>>()
+        } else {
+            (0..webhook_count).filter_map(webhook).collect::<Vec<_>>()
+        };
+        for emission in emissions {
             merge_emission(&mut files, registrar, emission);
         }
         files.push(emit_webhooks_index(model, target));
     }
     if !analyzed.callback_names.is_empty() {
-        for index in 0..analyzed.callback_names.len() {
-            let Some(file_base) = model.callback_files[index].clone() else {
-                continue;
-            };
+        let callback = |index: usize| {
+            let file_base = model.callback_files[index].as_deref()?;
             let allocated = &analyzed.callback_names[index];
             let operation = callback_operation(&analyzed.ir, &analyzed.callback_names, allocated);
             let mut emission = Emission::default();
@@ -229,10 +268,22 @@ pub(crate) fn emit_zod_from_model(
                 OperationModule {
                     allocated_name: &allocated.stem,
                     directory: "callbacks",
-                    file_base: &file_base,
+                    file_base,
                     include_responses: false,
                 },
             );
+            Some(emission)
+        };
+        let callback_count = analyzed.callback_names.len();
+        let emissions = if emit_in_parallel(callback_count) {
+            (0..callback_count)
+                .into_par_iter()
+                .filter_map(callback)
+                .collect::<Vec<_>>()
+        } else {
+            (0..callback_count).filter_map(callback).collect::<Vec<_>>()
+        };
+        for emission in emissions {
             merge_emission(&mut files, registrar, emission);
         }
         files.push(emit_callbacks_index(model, target));
