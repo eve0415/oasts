@@ -2363,7 +2363,10 @@ mod tests {
         DateTimeRepresentation, IntegerRepresentation, ResolvedConfig, load_config,
     };
     use crate::diag::{DiagnosticSink, Severity};
-    use crate::emit::emit_artifacts;
+    use crate::emit::{
+        CODE_IMPORT_ALIAS, CODE_PATH_COLLISION, PARALLEL_EMIT_MIN_ITEMS, emit_artifacts,
+        source_digest,
+    };
     use crate::ir::{PropMeta, SchemaMeta, SchemaRef};
     use crate::loader::load_graph;
     use crate::parse::parse;
@@ -2477,9 +2480,85 @@ validation:
   unchecked: allow
 "#;
 
+    const ERROR_GATE: &str = include_str!("../../../../fixtures/msw-error-gate-3.1/openapi.yaml");
+    const ERROR_GATE_FOLD_CONFIG: &str =
+        include_str!("../../../../fixtures/msw-error-gate-3.1/oasts.yaml");
+    const ERROR_GATE_ALIAS_CONFIG: &str =
+        include_str!("../../../../fixtures/msw-error-gate-3.1/oasts-alias.yaml");
     const SHOWCASE: &str = include_str!("../../../../fixtures/msw-showcase-3.1/openapi.yaml");
     const ENUM_PARAMETERS: &str =
         include_str!("../../../../fixtures/msw-enum-parameters-3.1/openapi.yaml");
+
+    /// A document wide enough for the handler loop to cross `PARALLEL_EMIT_MIN_ITEMS`, which no
+    /// repository fixture does — so the rayon branch runs rather than the sequential fallback.
+    ///
+    /// Every path also declares a `trace`, which msw has no handler factory for. Those operations
+    /// contribute a warning and no file, so the sink carries one diagnostic per two operations and
+    /// a merge that reordered its input would show up as a reordered sink rather than only as
+    /// missing bytes.
+    fn wide_document(path_count: usize) -> String {
+        let mut document =
+            String::from("openapi: 3.1.0\ninfo: { title: Wide, version: 1.0.0 }\npaths:\n");
+        for index in 0..path_count {
+            document.push_str(&format!(
+                "  /items{index}/{{id}}:\n    get:\n      operationId: getItem{index}\n      parameters:\n        - {{ name: id, in: path, required: true, schema: {{ type: string }} }}\n      responses:\n        \"200\":\n          description: ok\n          content:\n            application/json:\n              schema: {{ type: object, required: [name], properties: {{ name: {{ type: string }}, size: {{ type: integer }} }} }}\n    trace:\n      operationId: traceItem{index}\n      parameters:\n        - {{ name: id, in: path, required: true, schema: {{ type: string }} }}\n      responses:\n        \"204\": {{ description: ok }}\n"
+            ));
+        }
+        document
+    }
+
+    /// Thread-count invariance for the handler loop, asserted on the emitter's own return rather
+    /// than on a whole compile: `emit_artifacts` sorts its files by path at the end, so only the
+    /// emitter's own result still carries the merge order the parallel branch has to reproduce.
+    #[test]
+    fn handler_emission_is_identical_at_every_thread_count() {
+        let temp = TempDir::new().expect("temp dir");
+        fs::write(temp.path().join("openapi.yaml"), wide_document(40)).expect("write document");
+        fs::write(temp.path().join("oasts.yaml"), MSW_CONFIG).expect("write config");
+        let resolved = load_config(None, temp.path()).expect("config loads");
+        let mut prepared = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut prepared).expect("graph loads");
+        let source_tuples = graph.source_tuples();
+        let ir = parse(&graph, &mut prepared).expect("document parses");
+        drop(graph);
+        let analyzed = analyze(ir, &resolved, &mut prepared);
+        assert!(!prepared.has_errors(), "{:#?}", prepared.as_slice());
+        assert!(
+            analyzed.operation_names.len() >= PARALLEL_EMIT_MIN_ITEMS,
+            "the document must cross the parallel threshold"
+        );
+
+        let emit = || {
+            let mut sink = DiagnosticSink::new();
+            let mut registrar = Registrar::new(&mut sink);
+            let model = EmissionModel::new(
+                &analyzed,
+                &resolved,
+                source_digest(&source_tuples),
+                &mut registrar,
+            );
+            let files = emit_msw_from_model(&model, &mut registrar);
+            (files, sink)
+        };
+        let pooled = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("rayon pool")
+                .install(emit)
+        };
+
+        let (expected_files, expected_sink) = pooled(1);
+        assert!(!expected_files.is_empty(), "files emitted");
+        assert!(!expected_sink.as_slice().is_empty(), "sink exercised");
+        for threads in [2, 18] {
+            for _ in 0..4 {
+                let (files, sink) = pooled(threads);
+                assert_eq!(files, expected_files, "thread count {threads}");
+                assert_eq!(sink, expected_sink, "thread count {threads}");
+            }
+        }
+    }
 
     #[test]
     fn msw_artifact_emits_its_local_kernel() {
@@ -2507,6 +2586,41 @@ validation:
                 .iter()
                 .all(|file| !file.relative_path.starts_with("msw/"))
         );
+    }
+
+    /// The client-disabled entry gate: msw emits nothing once the shared sink already holds an
+    /// error, whichever earlier stage put it there.
+    ///
+    /// The fold config's collision is raised by path allocation, before any emitter runs. The alias
+    /// config's is raised by the types emitter and reaches the sink only when that emitter replays
+    /// its per-item emissions — so batching any replay past msw would let handlers through here.
+    #[test]
+    fn an_error_raised_before_msw_suppresses_every_handler() {
+        for (config, code) in [
+            (ERROR_GATE_FOLD_CONFIG, CODE_PATH_COLLISION),
+            (ERROR_GATE_ALIAS_CONFIG, CODE_IMPORT_ALIAS),
+        ] {
+            let (files, diagnostics) = generate_with_diagnostics(ERROR_GATE, config);
+            let raised = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .expect("the gating diagnostic is raised");
+            assert_eq!(raised.severity, Severity::Error, "{code}");
+            assert!(
+                files
+                    .iter()
+                    .all(|file| !file.relative_path.starts_with("msw/")),
+                "{code} left msw files behind"
+            );
+            // The suppression is msw's alone: the types artifact this document also asks for is
+            // still emitted, so an empty msw set is a decision rather than an empty compile.
+            assert!(
+                files
+                    .iter()
+                    .any(|file| file.relative_path.starts_with("types/")),
+                "{code} suppressed the types artifact too"
+            );
+        }
     }
 
     #[test]

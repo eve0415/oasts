@@ -2177,7 +2177,7 @@ mod tests {
     use crate::client_model::build_client_model;
     use crate::config::load_config;
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
-    use crate::emit::emit_artifacts;
+    use crate::emit::{PARALLEL_EMIT_MIN_ITEMS, emit_artifacts, source_digest};
     use crate::loader::load_graph;
     use crate::parse::parse;
     use crate::semantic::analyze;
@@ -2230,6 +2230,107 @@ mod tests {
             &mut sink,
         );
         (files, sink.into_sorted_vec())
+    }
+
+    /// A document wide enough for all four of this emitter's per-item loops to cross
+    /// `PARALLEL_EMIT_MIN_ITEMS`, which no repository fixture does — components, operations,
+    /// webhooks and callbacks each get one entry per index, so the rayon branch runs in every one
+    /// of them rather than the sequential fallback.
+    fn wide_document(count: usize) -> String {
+        let mut document =
+            String::from("openapi: 3.1.0\ninfo: { title: Wide, version: 1.0.0 }\npaths:\n");
+        for index in 0..count {
+            document.push_str(&format!(
+                "  /items{index}:\n    post:\n      operationId: postItem{index}\n      requestBody:\n        required: true\n        content:\n          application/json:\n            schema: {{ $ref: \"#/components/schemas/Item{index}\" }}\n      responses:\n        \"200\":\n          description: ok\n          content:\n            application/json:\n              schema: {{ $ref: \"#/components/schemas/Item{index}\" }}\n      callbacks:\n        onDone{index}:\n          \"{{$request.body#/url}}\":\n            post:\n              requestBody:\n                required: true\n                content:\n                  application/json:\n                    schema: {{ $ref: \"#/components/schemas/Item{index}\" }}\n              responses:\n                \"204\": {{ description: ok }}\n"
+            ));
+        }
+        document.push_str("webhooks:\n");
+        for index in 0..count {
+            document.push_str(&format!(
+                "  event{index}:\n    post:\n      operationId: onEvent{index}\n      requestBody:\n        required: true\n        content:\n          application/json:\n            schema: {{ $ref: \"#/components/schemas/Item{index}\" }}\n      responses:\n        \"204\": {{ description: ok }}\n"
+            ));
+        }
+        document.push_str("components:\n  schemas:\n");
+        for index in 0..count {
+            let extra = if index == 0 {
+                ", upper: { $ref: \"#/components/schemas/ItemURL\" }, title: { $ref: \"#/components/schemas/ItemUrl\" }"
+            } else {
+                ""
+            };
+            document.push_str(&format!(
+                "    Item{index}: {{ type: object, required: [name], properties: {{ name: {{ type: string }}, size: {{ type: integer }}{extra} }} }}\n"
+            ));
+        }
+        // Two component names that fold to one file name. Each loop's registrations are replayed
+        // by the merge, and the collision names which path it saw first — so a merge that reordered
+        // its input would report the pair the other way round rather than fail silently.
+        document.push_str("    ItemURL: { type: string }\n");
+        document.push_str("    ItemUrl: { type: object, properties: { tag: { type: string } } }\n");
+        document
+    }
+
+    /// Thread-count invariance for all four loops, asserted on the emitter's own return rather than
+    /// on a whole compile: `emit_artifacts` sorts its files by path at the end, so only the
+    /// emitter's own result still carries the merge order the parallel branch has to reproduce.
+    #[test]
+    fn zod_emission_is_identical_at_every_thread_count() {
+        let temp = TempDir::new().expect("temp directory");
+        fs::write(temp.path().join("openapi.yaml"), wide_document(80)).expect("write document");
+        fs::write(
+            temp.path().join("oasts.yaml"),
+            "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\noutput: ./generated\nartifacts:\n  types: true\n  zod: true\n",
+        )
+        .expect("write config");
+        let resolved = load_config(None, temp.path()).expect("config resolves");
+        let mut prepared = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut prepared).expect("graph loads");
+        let source_tuples = graph.source_tuples();
+        let ir = parse(&graph, &mut prepared).expect("document parses");
+        drop(graph);
+        let analyzed = analyze(ir, &resolved, &mut prepared);
+        assert!(!prepared.has_errors(), "{:#?}", prepared.as_slice());
+        for (label, count) in [
+            ("schemas", analyzed.schema_names.len()),
+            ("operations", analyzed.operation_names.len()),
+            ("webhooks", analyzed.webhook_names.len()),
+            ("callbacks", analyzed.callback_names.len()),
+        ] {
+            assert!(
+                count >= PARALLEL_EMIT_MIN_ITEMS,
+                "{label} below the threshold"
+            );
+        }
+
+        let emit = || {
+            let mut sink = DiagnosticSink::new();
+            let mut registrar = Registrar::new(&mut sink);
+            let mut model = EmissionModel::new(
+                &analyzed,
+                &resolved,
+                source_digest(&source_tuples),
+                &mut registrar,
+            );
+            let files = emit_zod_from_model(&mut model, &mut registrar);
+            (files, sink)
+        };
+        let pooled = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("rayon pool")
+                .install(emit)
+        };
+
+        let (expected_files, expected_sink) = pooled(1);
+        assert!(!expected_files.is_empty(), "files emitted");
+        assert!(!expected_sink.as_slice().is_empty(), "sink exercised");
+        for threads in [2, 18] {
+            for _ in 0..4 {
+                let (files, sink) = pooled(threads);
+                assert_eq!(files, expected_files, "thread count {threads}");
+                assert_eq!(sink, expected_sink, "thread count {threads}");
+            }
+        }
     }
 
     fn doc(schemas: Value) -> Value {

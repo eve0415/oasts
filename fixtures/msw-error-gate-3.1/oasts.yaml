@@ -1,0 +1,12 @@
+# `preserve` is what makes the collision a case-folding one: PetURL.ts and PetUrl.ts are distinct
+# file names that fold together. msw is on with the client off, which is the configuration whose
+# entry gate reads the sink.
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+naming:
+  fileCase: preserve
+artifacts:
+  types: true
+  msw: true
