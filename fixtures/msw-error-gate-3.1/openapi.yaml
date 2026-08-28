@@ -1,0 +1,44 @@
+# Two error-severity diagnostics raised at different points of the emit stage, so the msw entry
+# gate — which emits nothing when the sink already holds an error — is exercised from both.
+#
+#   - PetURL / PetUrl fold to one generated file name, which path allocation reports before any
+#     emitter runs;
+#   - the upload operation module declares its own `CompleteUploadRequest` and the alias that would
+#     free the imported one is taken, which the types emitter reports from a per-item channel that
+#     is replayed into the shared sink as part of that emitter's run.
+openapi: 3.1.0
+info:
+  title: MSW Error Gate
+  version: 1.0.0
+paths:
+  /uploads:
+    post:
+      operationId: completeUpload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CompleteUploadRequest" }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  taken: { $ref: "#/components/schemas/CompleteUploadRequestBody" }
+                  upper: { $ref: "#/components/schemas/PetURL" }
+                  title: { $ref: "#/components/schemas/PetUrl" }
+components:
+  schemas:
+    CompleteUploadRequest:
+      type: object
+      properties:
+        id: { type: string }
+    CompleteUploadRequestBody: { type: string }
+    PetURL: { type: string }
+    PetUrl:
+      type: object
+      properties:
+        name: { type: string }

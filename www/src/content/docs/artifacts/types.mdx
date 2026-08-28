@@ -79,6 +79,25 @@ types:
   readonly: false
 ```
 
+### Enum representation
+
+`literal` (the default) emits enum values as a plain TypeScript union:
+
+```ts
+export type Status = "active" | "inactive";
+```
+
+`const` emits a `const` object instead, with the union type derived from it — so the values are inspectable at runtime (`Object.values(Status)`, `Status.Active`), not just at the type level:
+
+```ts
+export const Status = {
+  Active: "active",
+  Inactive: "inactive",
+} as const;
+
+export type Status = (typeof Status)[keyof typeof Status];
+```
+
 ### Discriminated unions
 
 `structural` (the default) emits the plain union and lets the `discriminator` drive diagnostics only.
@@ -111,6 +130,17 @@ Conversion happens at the client boundary, so this one needs the client artifact
 
 `types.dateTime` turns wire strings into `Date` or `Temporal` values in your code; `types.date` into `Temporal`.
 They have their own page — [Dates and times](/guides/dates).
+
+### Readonly
+
+`types.readonly: true` prefixes every generated interface property with `readonly`:
+
+```ts
+// false (default)      id: string;
+// true                 readonly id: string;
+```
+
+It's a TypeScript-only marker — nothing stops the object from being mutated at runtime — but it stops your own code from writing to the property through the generated type.
 
 ## Naming collisions
 

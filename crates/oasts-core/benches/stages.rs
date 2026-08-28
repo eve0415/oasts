@@ -87,6 +87,38 @@ fn fixtures() -> Vec<Fixture> {
         .collect()
 }
 
+/// The same fixtures under their non-default artifact configs. `fixtures()` reads only
+/// `oasts.yaml`, which for github is types-only, so the `emit` bench never sees the msw or zod
+/// emitters at that scale. This keeps the existing benches' argument set — and therefore their
+/// baselines — untouched.
+const ARTIFACT_CONFIGS: &[(&str, &str, &str)] = &[
+    (
+        "github-3.0-msw",
+        "../../fixtures/github-3.0",
+        "oasts-msw.yaml",
+    ),
+    (
+        "github-3.0-zod",
+        "../../fixtures/github-3.0",
+        "oasts-zod.yaml",
+    ),
+];
+
+fn artifact_fixtures() -> Vec<Fixture> {
+    ARTIFACT_CONFIGS
+        .iter()
+        .filter_map(|(name, relative_dir, config_file)| {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_dir);
+            if !dir.join("openapi.json").is_file() {
+                return None;
+            }
+            let config = load_config(Some(&dir.join(config_file)), &dir)
+                .unwrap_or_else(|diagnostics| panic!("failed to load {name}: {diagnostics:#?}"));
+            Some(Fixture { name, config })
+        })
+        .collect()
+}
+
 fn client_fixtures() -> Vec<Fixture> {
     fixtures()
         .into_iter()
@@ -196,6 +228,17 @@ fn build_client_model(bencher: Bencher, fixture: &Fixture) {
 
 #[divan::bench(args = fixtures(), sample_count = SAMPLE_COUNT)]
 fn emit(bencher: Bencher, fixture: &Fixture) {
+    bench_emit(bencher, fixture);
+}
+
+/// Emission cost for the artifacts the default config leaves off. Emission only — the files are
+/// returned and dropped, never written, so this is emitter CPU with the writer excluded.
+#[divan::bench(args = artifact_fixtures(), sample_count = SAMPLE_COUNT)]
+fn emit_artifact_configs(bencher: Bencher, fixture: &Fixture) {
+    bench_emit(bencher, fixture);
+}
+
+fn bench_emit(bencher: Bencher, fixture: &Fixture) {
     let graph = prepared_graph(fixture);
     let mut sink = DiagnosticSink::new();
     let ir = run_parse(&graph, &mut sink)

@@ -38,7 +38,7 @@ use crate::ir::{
 use crate::transform::{JsonKinds, KindBranch, TransformFacts, TransformKind, UnionDispatch};
 
 use super::client::{FormFieldRenderSchema, ResponseConversion, form_field_render_schema};
-use super::model::EmissionModel;
+use super::model::{EmissionModel, Registrar};
 use super::paths::{TRANSFORM_SUBDIR, relative_import};
 use super::runtime_assets::rewrite_relative_ts_imports;
 use super::{
@@ -77,7 +77,7 @@ pub(crate) enum ResolvedDispatch {
 /// semantics — a mapping value that resolves to nothing leaves the union indistinguishable rather
 /// than being trusted.
 pub(crate) fn resolve_dispatch(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     facts: &TransformFacts<'_>,
     node: &SchemaNode,
 ) -> Option<Result<ResolvedDispatch, Diagnostic>> {
@@ -164,7 +164,7 @@ fn union_parts(node: &SchemaNode) -> Option<(&[SchemaNode], Option<&Discriminato
 /// converts. Response headers, webhook payloads, and callback payloads keep wire types, so a union
 /// there never converts and is never refused.
 fn collect_union_refusals(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     facts: &TransformFacts<'_>,
     node: &SchemaNode,
     out: &mut Vec<Diagnostic>,
@@ -217,7 +217,7 @@ struct IndexSignature<'schema> {
 /// applies both, one pass can apply only one, and picking silently is the failure this exists to
 /// prevent.
 fn collect_index_signature_refusals(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     facts: &TransformFacts<'_>,
     node: &SchemaNode,
     out: &mut Vec<Diagnostic>,
@@ -313,13 +313,13 @@ fn index_signatures<'schema>(
 }
 
 /// Fills in the type each signature gives the keys it covers.
-fn render_signatures(emitter: &Emitter<'_, '_, '_>, signatures: &mut [IndexSignature<'_>]) {
+fn render_signatures(emitter: &Emitter<'_, '_>, signatures: &mut [IndexSignature<'_>]) {
     for signature in signatures {
         signature.rendered = render_application_type(emitter, signature.schema);
     }
 }
 
-fn render_application_type(emitter: &Emitter<'_, '_, '_>, schema: &SchemaNode) -> String {
+fn render_application_type(emitter: &Emitter<'_, '_>, schema: &SchemaNode) -> String {
     emitter.render_type(schema, TypePosition::Neutral, TypeAxis::Application, 0)
 }
 
@@ -331,7 +331,7 @@ fn render_application_type(emitter: &Emitter<'_, '_, '_>, schema: &SchemaNode) -
 /// rejects. A `readOnly` property refused for the request surface it is absent from is the cost of
 /// that.
 fn refuse_property_conflicts(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     signatures: &[IndexSignature<'_>],
     properties: &[(String, SchemaNode, PropMeta)],
     source: &SourceRef,
@@ -365,7 +365,7 @@ fn refuse_property_conflicts(
 /// A `$ref` branch is followed, because the merged type declares the members it names just as an
 /// inline branch's are declared. Refs already open are skipped, which terminates a recursive schema.
 fn collect_merged_index_signature_refusals(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     facts: &TransformFacts<'_>,
     node: &SchemaNode,
     out: &mut Vec<Diagnostic>,
@@ -457,7 +457,7 @@ fn refuse_merged_signature_pair(
 /// Nothing inhabits what the document declares, so this is refused on the same rule as a declared
 /// property disagreeing with an index signature, rather than emitted as code `tsc` rejects.
 fn collect_whole_value_base_refusals(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     facts: &TransformFacts<'_>,
     node: &SchemaNode,
     out: &mut Vec<Diagnostic>,
@@ -489,7 +489,7 @@ fn collect_whole_value_base_refusals(
 /// would have to carry the walk's ref stack to know. Under-reporting is the safe side, and that
 /// document is uninhabitable for its own reasons.
 fn rebuilds_whole_value(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     facts: &TransformFacts<'_>,
     branch: &SchemaNode,
 ) -> bool {
@@ -525,7 +525,7 @@ fn composed_branches(node: &SchemaNode) -> Option<&[SchemaNode]> {
 /// `$ref` and composed branches. A required one is not reported: a required key in a spread
 /// overrides the value's own rather than unioning with it, which is why that shape compiles.
 fn optional_converting_property(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     facts: &TransformFacts<'_>,
     node: &SchemaNode,
     walked: &mut BTreeSet<usize>,
@@ -563,7 +563,7 @@ type MergedObject<'schema> = (
 
 /// Every object an `allOf`'s branches contribute to the merged type, following `$ref`.
 fn collect_merged_objects<'schema>(
-    emitter: &Emitter<'_, 'schema, '_>,
+    emitter: &Emitter<'_, 'schema>,
     branches: &'schema [SchemaNode],
     walked: &mut BTreeSet<usize>,
     out: &mut Vec<MergedObject<'schema>>,
@@ -627,7 +627,7 @@ fn key_matches(key: Option<&PatternPropertyKey>, name: &str) -> bool {
 /// operation codecs cannot carry. They are refused here because emitting nothing for them would put
 /// a wire string behind a type that promises a `Date`.
 fn unconvertible_transform_diagnostics(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     plan: &OperationPlan,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -673,7 +673,7 @@ fn unconvertible_transform_diagnostics(
 /// schema renders, so no pair names it. Binary parts render `Uint8Array` and never reach their
 /// schema, so they cannot put a wire string behind a `Date` either.
 fn multipart_response_transform_terms(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     entry: &ResponseMediaPlan,
 ) -> Option<(String, String)> {
     let Some(multipart) = &entry.multipart else {
@@ -708,7 +708,7 @@ fn multipart_response_transform_terms(
 }
 
 fn body_transform_refusals(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     plan: Option<&BodyPlan>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -762,7 +762,8 @@ fn body_transform_refusals(
 
 /// Emits the transform artifact's files, or nothing when no representation transforms.
 pub(crate) fn emit_transform_from_model(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    registrar: &mut Registrar<'_>,
     client: &ClientModel,
 ) -> Vec<GeneratedFile> {
     if !model.transform_facts().enabled() {
@@ -851,7 +852,7 @@ pub(crate) fn emit_transform_from_model(
         }
         refusals.extend(emitter.deferred_diagnostics.take());
     }
-    model.sink.extend(refusals);
+    registrar.sink.extend(refusals);
     let extension = import_extension(model);
     let result_module = super::render_ts_string(&relative_import(
         &format!("{}/{TRANSFORM_SUBDIR}/result.ts", model.dirs.client),
@@ -862,6 +863,7 @@ pub(crate) fn emit_transform_from_model(
     let mut files = vec![
         transform_file(
             model,
+            registrar,
             "runtime.ts",
             rewrite_relative_ts_imports(
                 super::strip_temporal_reference(
@@ -873,6 +875,7 @@ pub(crate) fn emit_transform_from_model(
         ),
         transform_file(
             model,
+            registrar,
             "result.ts",
             format!(
                 "{header}export {{ TransformError }} from {result_module};\nexport type {{ ApplicationPath, SourcePointer }} from {result_module};\n"
@@ -880,18 +883,19 @@ pub(crate) fn emit_transform_from_model(
         ),
     ];
     for (file, source) in pairs {
-        model.register_path(&file.relative_path, &source);
+        registrar.register_path(&file.relative_path, &source);
         files.push(file);
     }
     for (file, source) in operation_pairs {
-        model.register_path(&file.relative_path, &source);
+        registrar.register_path(&file.relative_path, &source);
         files.push(file);
     }
     files
 }
 
 fn transform_file(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    registrar: &mut Registrar<'_>,
     file_name: &str,
     content: String,
 ) -> GeneratedFile {
@@ -903,7 +907,7 @@ fn transform_file(
         .first()
         .map(|schema| schema.source.clone())
         .unwrap_or_default();
-    model.register_path(&relative_path, &asset_source);
+    registrar.register_path(&relative_path, &asset_source);
     GeneratedFile {
         relative_path,
         content,
@@ -1006,7 +1010,7 @@ struct RenderedPairs {
 /// Renders one component's codecs under `aliases`, kept separate from the module's imports and
 /// header so the two read as the two things they are.
 fn render_component_pairs(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     index: usize,
     name: &str,
     aliases: &ModuleAliases,
@@ -1118,7 +1122,7 @@ fn render_component_pairs(
 /// is why each takes `path` with a default: called directly on a value the caller owns, the root is
 /// the empty path.
 fn emit_component_pairs(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     index: usize,
     name: &str,
 ) -> Option<GeneratedFile> {
@@ -1283,7 +1287,7 @@ struct ResponseCodec {
 /// codec this emits and the call the client emits cannot disagree about which branches convert or
 /// what their payloads are named.
 fn response_codecs(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     plan: &OperationPlan,
     stem: &str,
 ) -> Vec<ResponseCodec> {
@@ -1343,7 +1347,7 @@ fn response_codecs(
 /// known once the walk has run, and the walk resolves those names through the aliases — so the pass
 /// that discovers a collision is never the pass that can settle it.
 fn render_operation_pairs(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     operation: &Operation,
     plan: &OperationPlan,
     stem: &str,
@@ -1443,7 +1447,7 @@ fn render_operation_pairs(
 /// The request encoder and response decoders for one operation, or `None` when every position is
 /// identity. Names and ordering mirror the operation types module exactly.
 fn emit_operation_pairs(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     operation: &Operation,
     plan: &OperationPlan,
     allocated_name: &str,
@@ -1620,7 +1624,7 @@ fn emit_operation_pairs(
 
 /// The operation request surface represented as the object shape its client module emits.
 fn operation_input_schema(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     operation: &Operation,
     plan: &OperationPlan,
 ) -> SchemaNode {
@@ -1695,7 +1699,7 @@ fn operation_input_schema(
 
 /// Schema roots whose request codec converts date leaves for a non-JSON serializer. Integer leaves
 /// below these roots remain bigint primitives: raw-JSON values belong only at JSON boundaries.
-fn non_json_request_roots(emitter: &Emitter<'_, '_, '_>, plan: &OperationPlan) -> Vec<SourceRef> {
+fn non_json_request_roots(emitter: &Emitter<'_, '_>, plan: &OperationPlan) -> Vec<SourceRef> {
     let mut roots = plan
         .param_plans
         .iter()
@@ -1712,7 +1716,7 @@ fn non_json_request_roots(emitter: &Emitter<'_, '_, '_>, plan: &OperationPlan) -
 }
 
 fn collect_non_json_body_roots(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     plan: &BodyPlan,
     roots: &mut Vec<SourceRef>,
 ) {
@@ -1742,7 +1746,7 @@ fn collect_non_json_body_roots(
 
 /// The request body's rendered client shape, restricted to body plans the encoder can bind.
 fn request_body_schema(
-    emitter: &Emitter<'_, '_, '_>,
+    emitter: &Emitter<'_, '_>,
     plan: &BodyPlan,
     source: SourceRef,
 ) -> SchemaNode {
@@ -2152,8 +2156,8 @@ impl Frame {
 
 /// Builds one module's conversion expressions, collecting the imports and hoisted pointer constants
 /// they need as it goes.
-struct PairBuilder<'a, 'model, 'input, 'sink> {
-    emitter: &'a Emitter<'model, 'input, 'sink>,
+struct PairBuilder<'a, 'model, 'input> {
+    emitter: &'a Emitter<'model, 'input>,
     position: TypePosition,
     aliases: &'a ModuleAliases,
     /// Hoisted `SourcePointer` constants in first-seen order, so the emitted bytes stay stable.
@@ -2175,9 +2179,9 @@ struct PairBuilder<'a, 'model, 'input, 'sink> {
     inline_non_json_refs: bool,
 }
 
-impl<'a, 'model, 'input, 'sink> PairBuilder<'a, 'model, 'input, 'sink> {
+impl<'a, 'model, 'input> PairBuilder<'a, 'model, 'input> {
     fn new(
-        emitter: &'a Emitter<'model, 'input, 'sink>,
+        emitter: &'a Emitter<'model, 'input>,
         position: TypePosition,
         aliases: &'a ModuleAliases,
     ) -> Self {
@@ -3125,7 +3129,8 @@ mod tests {
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let facts = TransformFacts::compute(&analyzed.ir, &resolved);
-        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut registrar);
         let emitter = Emitter::new(&model);
         let node = &analyzed
             .ir

@@ -1,0 +1,15 @@
+# The same document with the file-name collision renamed away, leaving the operation module's alias
+# collision as the only error. That one reaches the sink through the types emitter's deferred
+# per-item channel, so this config is what fails if a replay is ever batched past msw's entry gate.
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated-alias
+naming:
+  fileCase: preserve
+  overrides:
+    schemas:
+      PetUrl: PetHref
+artifacts:
+  types: true
+  msw: true

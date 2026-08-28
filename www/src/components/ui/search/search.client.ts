@@ -54,6 +54,55 @@ export function initSearch(config: SearchConfig): SearchInstance {
     input.removeAttribute("aria-activedescendant");
   }
 
+  const NAMED_ENTITIES: Record<string, string> = {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+  };
+
+  // Decodes the small set of entities Pagefind's excerpt can contain (named + numeric/hex), as
+  // plain string replacement — never through `innerHTML`, so there is no HTML parser in the path
+  // for a crafted string to escape.
+  function decodeHtmlEntities(text: string): string {
+    return text.replace(/&(#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);/g, (entity, code: string) => {
+      if (code.startsWith("#")) {
+        const codePoint =
+          code[1] === "x" || code[1] === "X" ? Number.parseInt(code.slice(2), 16) : Number.parseInt(code.slice(1), 10);
+        return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff
+          ? String.fromCodePoint(codePoint)
+          : entity;
+      }
+      return NAMED_ENTITIES[code] ?? entity;
+    });
+  }
+
+  // Builds `snippet`'s highlighted excerpt as text nodes and <mark> elements instead of assigning
+  // through innerHTML. Pagefind's excerpt is HTML with <mark> wrapping the matched terms — the
+  // provider's own contract says "providers should sanitize HTML" rather than promising the excerpt
+  // is safe, so this parses only the one tag it actually emits and never re-interprets the rest as
+  // markup.
+  function appendHighlightedSnippet(target: HTMLElement, snippet: string): void {
+    const markPattern = /<mark>([\s\S]*?)<\/mark>/g;
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = markPattern.exec(snippet)) !== null) {
+      if (match.index > lastIndex) {
+        target.appendChild(
+          document.createTextNode(decodeHtmlEntities(snippet.slice(lastIndex, match.index))),
+        );
+      }
+      const mark = document.createElement("mark");
+      mark.textContent = decodeHtmlEntities(match[1]);
+      target.appendChild(mark);
+      lastIndex = markPattern.lastIndex;
+    }
+    if (lastIndex < snippet.length) {
+      target.appendChild(document.createTextNode(decodeHtmlEntities(snippet.slice(lastIndex))));
+    }
+  }
+
   function resultLink(title: string, href: string, className: string): HTMLAnchorElement {
     const link = document.createElement("a");
     link.href = href;
@@ -75,7 +124,7 @@ export function initSearch(config: SearchConfig): SearchInstance {
     if (result.snippet) {
       const snippet = document.createElement("p");
       snippet.className = "mt-1 line-clamp-2 text-xs leading-relaxed text-muted-foreground";
-      snippet.innerHTML = result.snippet;
+      appendHighlightedSnippet(snippet, result.snippet);
       option.appendChild(snippet);
     }
 

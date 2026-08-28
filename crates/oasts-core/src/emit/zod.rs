@@ -7,34 +7,37 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde_json::Value;
 
 use crate::composition::finite_values;
 use crate::config::ZodFlavor;
 use crate::diag::Diagnostic;
 use crate::ir::{
-    AdditionalProperties, ExclusiveBound, Operation, ParamLocation, PrimitiveType, PropMeta,
-    ResponseEntry, SchemaMeta, SchemaNode, TupleRest, finite_parts,
+    AdditionalProperties, ExclusiveBound, Operation, PrimitiveType, PropMeta, ResponseEntry,
+    SchemaMeta, SchemaNode, SourceRef, TupleRest, finite_parts,
 };
-use crate::media::is_json;
 use crate::num::render_number_value;
 use crate::response_media::media_has_validatable_schema;
 
-use super::model::EmissionModel;
-use super::runtime_assets::rewrite_relative_ts_imports;
+use super::descriptor_index::{
+    DescriptorTarget, Reject, SiblingImports, collect_operation_rejects, collect_rejects,
+    embedded_asset, emit_callbacks_index, emit_webhooks_index, render_sibling_imports,
+};
+use super::model::{EmissionModel, Registrar};
 use super::validators::{
     CODE_MEDIA_TAG_COLLISION, identical_component_delegate, operation_parameter_validator_names,
     validator_wire_type_name,
 };
 use super::{
-    Emitter, GeneratedFile, ObjectKeyMode, SchemaChildMode, TypeAxis, TypePosition,
-    callback_operation, callback_parent_operation, import_extension, lowercase_first,
-    property_in_position, push_indent, render_json_compact, render_ts_string,
+    Emission, Emitter, EmitterFactory, GeneratedFile, ObjectKeyMode, OperationModule, TypeAxis,
+    TypePosition, callback_operation, emit_in_parallel, import_extension, lowercase_first,
+    merge_emission, property_in_position, render_json_compact, render_ts_string,
     request_body_validator_positions, response_media_names, response_status_type_suffix,
     source_diagnostic, uppercase_first, warning_diagnostic,
 };
 use crate::client_model::{PrimitiveDomainProjector, build_body_plan};
+use crate::semantic::{AllocatedOperationName, AllocatedSchemaName};
+use rayon::prelude::*;
 
 const ZOD_RUNTIME_TS: &str = include_str!("../../runtime/zod-runtime.ts");
 #[cfg(test)]
@@ -44,6 +47,22 @@ const VALIDATORS_RUNTIME_TS: &str = include_str!("../../runtime/validators-runti
 const CODE_REJECTED_KEYWORD: &str = "OASTS6101";
 /// A schema degraded to an unknown leaf, so no faithful Zod schema can be emitted.
 const CODE_UNKNOWN_LEAF: &str = "OASTS6102";
+
+/// The diagnostic this artifact raises for one node the shared reject walk found no check for.
+fn reject_diagnostic(reject: Reject<'_>, source: &SourceRef) -> Diagnostic {
+    match reject {
+        Reject::Keyword(keyword) => source_diagnostic(
+            CODE_REJECTED_KEYWORD,
+            format!("zod cannot emit a check for unsupported validation keyword '{keyword}'"),
+            source,
+        ),
+        Reject::UnknownLeaf(reason) => source_diagnostic(
+            CODE_UNKNOWN_LEAF,
+            format!("zod cannot emit a check for an unsupported schema ({reason})"),
+            source,
+        ),
+    }
+}
 
 const ZOD_RESERVED_NAMES: &[&str] = &[
     "z",
@@ -80,214 +99,204 @@ const ZOD_RESERVED_NAMES: &[&str] = &[
     "headers",
 ];
 
-pub(crate) fn emit_zod_from_model(model: &mut EmissionModel<'_, '_>) -> Vec<GeneratedFile> {
+pub(crate) fn emit_zod_from_model(
+    model: &mut EmissionModel<'_>,
+    registrar: &mut Registrar<'_>,
+) -> Vec<GeneratedFile> {
     let analyzed = model.analyzed;
     // Built once per document, never per operation: this indexes every schema in the IR and
     // walks each one's projection dependencies, so constructing it inside the operation loop
     // would make request-body planning cost O(operations x schemas).
     let projector = PrimitiveDomainProjector::new(&analyzed.ir);
     let mut rejects = Vec::new();
+    let target = DescriptorTarget {
+        dir: model.dirs.zod,
+        export_suffix: "Schema",
+    };
     {
         let emitter = Emitter::new(model);
         for schema in &analyzed.ir.schemas {
-            collect_rejects(&emitter, &schema.schema, &mut rejects);
+            collect_rejects(&emitter, &schema.schema, reject_diagnostic, &mut rejects);
         }
         for operation in &analyzed.ir.operations {
-            collect_operation_rejects(&emitter, operation, true, &mut rejects);
+            collect_operation_rejects(&emitter, operation, true, reject_diagnostic, &mut rejects);
         }
         for webhook in &analyzed.ir.webhooks {
             for operation in &webhook.operations {
-                collect_operation_rejects(&emitter, operation, false, &mut rejects);
+                collect_operation_rejects(
+                    &emitter,
+                    operation,
+                    false,
+                    reject_diagnostic,
+                    &mut rejects,
+                );
             }
         }
         for allocated in &analyzed.callback_names {
             let operation = callback_operation(&analyzed.ir, &analyzed.callback_names, allocated);
-            collect_operation_rejects(&emitter, operation, false, &mut rejects);
+            collect_operation_rejects(&emitter, operation, false, reject_diagnostic, &mut rejects);
         }
     }
-    model.sink.extend(rejects);
+    registrar.sink.extend(rejects);
     model.reserve_names(ZOD_RESERVED_NAMES);
+    // Every rename this artifact performs is done. From here the allocation is frozen, so the model
+    // is reborrowed shared for the whole emission — which is what lets one emitter factory span the
+    // loops below while diagnostics and path registrations still flow through the registrar.
+    let model = &*model;
+    // One factory for the artifact, rather than the four `Emitter::new` rebuilds this emitter used
+    // to pay — three per item plus one per int64 schema node. Each rebuild reindexed every enum
+    // member; `worker()` still hands each item its own empty alias and diagnostic cells.
+    let factory = Emitter::new(model).into_factory();
 
-    let mut files = vec![embedded_asset(model)];
-    for allocated in &analyzed.schema_names {
-        if model.component_files[allocated.schema_index].is_none() {
-            continue;
-        }
+    let mut files = vec![embedded_asset(
+        model,
+        registrar,
+        target,
+        "runtime.ts",
+        ZOD_RUNTIME_TS,
+    )];
+    // Each of the four loops below builds one module per item from the frozen model, then hands the
+    // ordered result to a sequential merge. Nothing an item emits is read by the next one, so the
+    // loop divides; replaying the collected emissions in input order is the sequence the
+    // sequential branch produced, registration for registration and diagnostic for diagnostic.
+    let component = |allocated: &AllocatedSchemaName| {
+        let file_base = model.component_files[allocated.schema_index].as_deref()?;
         let schema = &analyzed.ir.schemas[allocated.schema_index];
         // A component file and its target are registered together during path allocation.
         let name = model
             .schema_target(&schema.source.source_id, &schema.source.json_pointer)
             .map(|target| target.name.clone())
             .expect("a component with an allocated file has a registered target");
-        if let Some(file) = emit_component(model, allocated.schema_index, &name) {
-            files.push(file);
-        }
-    }
-    for allocated in &analyzed.operation_names {
-        if let Some(file) = emit_operation(
+        let mut emission = Emission::default();
+        emit_component(
             model,
+            &factory,
+            &mut emission,
+            allocated.schema_index,
+            file_base,
+            &name,
+        );
+        Some(emission)
+    };
+    let schema_names = &analyzed.schema_names;
+    let emissions = if emit_in_parallel(schema_names.len()) {
+        schema_names
+            .par_iter()
+            .filter_map(component)
+            .collect::<Vec<_>>()
+    } else {
+        schema_names
+            .iter()
+            .filter_map(component)
+            .collect::<Vec<_>>()
+    };
+    for emission in emissions {
+        merge_emission(&mut files, registrar, emission);
+    }
+    let operation = |allocated: &AllocatedOperationName| {
+        let mut emission = Emission::default();
+        emit_operation(
+            model,
+            &factory,
+            &mut emission,
             &projector,
             allocated.operation_index,
             &allocated.name,
-        ) {
-            files.push(file);
-        }
+        );
+        emission
+    };
+    let operation_names = &analyzed.operation_names;
+    let emissions = if emit_in_parallel(operation_names.len()) {
+        operation_names
+            .par_iter()
+            .map(operation)
+            .collect::<Vec<_>>()
+    } else {
+        operation_names.iter().map(operation).collect::<Vec<_>>()
+    };
+    for emission in emissions {
+        merge_emission(&mut files, registrar, emission);
     }
     if !analyzed.ir.webhooks.is_empty() {
-        for index in 0..analyzed.webhook_names.len() {
-            let Some(file_base) = model.webhook_files[index].clone() else {
-                continue;
-            };
+        let webhook = |index: usize| {
+            let file_base = model.webhook_files[index].as_deref()?;
             let allocated = &analyzed.webhook_names[index];
             let operation = &analyzed.ir.webhooks[allocated.webhook_index].operations
                 [allocated.operation_index];
-            if let Some(file) = emit_operation_file(
+            let mut emission = Emission::default();
+            emit_operation_file(
                 model,
+                &factory,
+                &mut emission,
                 &projector,
                 operation,
-                &allocated.stem,
-                "webhooks",
-                &file_base,
-                false,
-            ) {
-                files.push(file);
-            }
+                OperationModule {
+                    allocated_name: &allocated.stem,
+                    directory: "webhooks",
+                    file_base,
+                    include_responses: false,
+                },
+            );
+            Some(emission)
+        };
+        let webhook_count = analyzed.webhook_names.len();
+        let emissions = if emit_in_parallel(webhook_count) {
+            (0..webhook_count)
+                .into_par_iter()
+                .filter_map(webhook)
+                .collect::<Vec<_>>()
+        } else {
+            (0..webhook_count).filter_map(webhook).collect::<Vec<_>>()
+        };
+        for emission in emissions {
+            merge_emission(&mut files, registrar, emission);
         }
-        files.push(emit_webhooks_index(model));
+        files.push(emit_webhooks_index(model, target));
     }
     if !analyzed.callback_names.is_empty() {
-        for index in 0..analyzed.callback_names.len() {
-            let Some(file_base) = model.callback_files[index].clone() else {
-                continue;
-            };
+        let callback = |index: usize| {
+            let file_base = model.callback_files[index].as_deref()?;
             let allocated = &analyzed.callback_names[index];
             let operation = callback_operation(&analyzed.ir, &analyzed.callback_names, allocated);
-            if let Some(file) = emit_operation_file(
+            let mut emission = Emission::default();
+            emit_operation_file(
                 model,
+                &factory,
+                &mut emission,
                 &projector,
                 operation,
-                &allocated.stem,
-                "callbacks",
-                &file_base,
-                false,
-            ) {
-                files.push(file);
-            }
+                OperationModule {
+                    allocated_name: &allocated.stem,
+                    directory: "callbacks",
+                    file_base,
+                    include_responses: false,
+                },
+            );
+            Some(emission)
+        };
+        let callback_count = analyzed.callback_names.len();
+        let emissions = if emit_in_parallel(callback_count) {
+            (0..callback_count)
+                .into_par_iter()
+                .filter_map(callback)
+                .collect::<Vec<_>>()
+        } else {
+            (0..callback_count).filter_map(callback).collect::<Vec<_>>()
+        };
+        for emission in emissions {
+            merge_emission(&mut files, registrar, emission);
         }
-        files.push(emit_callbacks_index(model));
+        files.push(emit_callbacks_index(model, target));
     }
     files
 }
 
-fn embedded_asset(model: &mut EmissionModel<'_, '_>) -> GeneratedFile {
-    let content = rewrite_relative_ts_imports(ZOD_RUNTIME_TS, &model.config.emit.import_extension);
-    let relative_path = format!("{}/runtime.ts", model.dirs.zod);
-    let source = model
-        .analyzed
-        .ir
-        .schemas
-        .first()
-        .map(|schema| schema.source.clone())
-        .unwrap_or_default();
-    model.register_path(&relative_path, &source);
-    GeneratedFile {
-        relative_path,
-        content,
-    }
-}
-
-fn collect_rejects(emitter: &Emitter<'_, '_, '_>, schema: &SchemaNode, out: &mut Vec<Diagnostic>) {
-    let meta = schema.meta();
-    if meta.rejected_validation_keywords.is_empty() {
-        if let SchemaNode::Unknown { reason, meta } = schema {
-            out.push(source_diagnostic(
-                CODE_UNKNOWN_LEAF,
-                format!("zod cannot emit a check for an unsupported schema ({reason})"),
-                &meta.source,
-            ));
-        }
-    } else {
-        for keyword in &meta.rejected_validation_keywords {
-            out.push(source_diagnostic(
-                CODE_REJECTED_KEYWORD,
-                format!("zod cannot emit a check for unsupported validation keyword '{keyword}'"),
-                &meta.source,
-            ));
-        }
-    }
-    emitter.for_each_schema_child(schema, SchemaChildMode::Validation, &mut |child| {
-        collect_rejects(emitter, child, out);
-    });
-}
-
-fn collect_operation_rejects(
-    emitter: &Emitter<'_, '_, '_>,
-    operation: &Operation,
-    include_responses: bool,
-    out: &mut Vec<Diagnostic>,
-) {
-    for parameter in &operation.parameters {
-        collect_rejects(emitter, &parameter.schema, out);
-    }
-    if let Some(body) = &operation.request_body {
-        for media in &body.media_types {
-            collect_rejects(emitter, &media.schema, out);
-        }
-    }
-    if include_responses {
-        for response in &operation.responses {
-            for media in &response.media_types {
-                collect_rejects(emitter, &media.schema, out);
-            }
-            for (_, header) in &response.headers {
-                collect_rejects(emitter, &header.schema, out);
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct SiblingImports {
-    files: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>,
-    skip_self: Option<usize>,
-}
-
-impl SiblingImports {
-    fn collect_types(
-        &mut self,
-        emitter: &Emitter<'_, '_, '_>,
-        schema: &SchemaNode,
-        position: TypePosition,
-    ) {
-        emitter.walk_refs(schema, position, &mut |target| {
-            if Some(target.index) == self.skip_self {
-                return;
-            }
-            self.files
-                .entry(target.file_base.clone())
-                .or_default()
-                .0
-                .insert(if target.transforms {
-                    target.wire_name(position)
-                } else {
-                    target.variant_name(position)
-                });
-        });
-    }
-
-    fn record_schema(&mut self, target_index: usize, file_base: &str, name: String) {
-        if Some(target_index) != self.skip_self {
-            self.files
-                .entry(file_base.to_owned())
-                .or_default()
-                .1
-                .insert(name);
-        }
-    }
-}
-
-struct SchemaRenderer<'a, 'input, 'sink> {
-    model: &'a EmissionModel<'input, 'sink>,
+struct SchemaRenderer<'a, 'input> {
+    model: &'a EmissionModel<'input>,
+    /// The artifact's one emitter factory. `render_bigint_int64` needs a types emitter per int64
+    /// node to spell the wire type; a worker off this factory is that emitter without reindexing
+    /// every enum member for each node.
+    factory: &'a EmitterFactory<'a, 'input>,
     position: TypePosition,
     current_schema: Option<usize>,
     current_schema_name: &'a str,
@@ -305,7 +314,7 @@ struct SchemaRenderer<'a, 'input, 'sink> {
     lazy_closes_cycle: &'a mut bool,
 }
 
-impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
+impl<'a, 'input> SchemaRenderer<'a, 'input> {
     fn render(&mut self, schema: &SchemaNode) -> String {
         self.render_deferred(schema, false)
     }
@@ -330,7 +339,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
                         format!("z.lazy(() => {})", self.current_schema_name)
                     }
                 } else {
-                    self.imports.record_schema(
+                    self.imports.record_export(
                         target.index,
                         &target.file_base,
                         schema_name.clone(),
@@ -565,7 +574,9 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
     fn render_bigint_int64(&mut self, schema: &SchemaNode, meta: &SchemaMeta) -> String {
         self.runtime_values.insert("int64Wire");
         let type_expression =
-            Emitter::new(self.model).render_type(schema, self.position, TypeAxis::Wire, 0);
+            self.factory
+                .worker()
+                .render_type(schema, self.position, TypeAxis::Wire, 0);
         let expression = format!("z.custom<{type_expression}>()");
         let constraints = meta.numeric_constraints();
         let has_constraints = constraints.minimum.is_some()
@@ -1280,7 +1291,7 @@ impl<'a, 'input, 'sink> SchemaRenderer<'a, 'input, 'sink> {
 }
 
 fn schema_contains_ref(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     schema: &SchemaNode,
     target_index: usize,
 ) -> bool {
@@ -1367,7 +1378,7 @@ fn has_array_applicators(meta: &SchemaMeta) -> bool {
 }
 
 fn render_optional_schema(
-    renderer: &mut SchemaRenderer<'_, '_, '_>,
+    renderer: &mut SchemaRenderer<'_, '_>,
     schema: Option<&SchemaNode>,
     self_is_deferred: bool,
 ) -> String {
@@ -1378,7 +1389,7 @@ fn render_optional_schema(
 }
 
 fn render_allowed_schema(
-    renderer: &mut SchemaRenderer<'_, '_, '_>,
+    renderer: &mut SchemaRenderer<'_, '_>,
     schema: &SchemaNode,
     self_is_deferred: bool,
 ) -> String {
@@ -1637,7 +1648,7 @@ fn render_decl(
 /// (a `prefixItems` tuple is declared with its leading elements required, though the schema permits
 /// a shorter array), so annotating every schema against them asserts a type the schema does not
 /// enforce and fails to compile.
-fn participates_in_reference_cycle(model: &EmissionModel<'_, '_>, schema_index: usize) -> bool {
+fn participates_in_reference_cycle(model: &EmissionModel<'_>, schema_index: usize) -> bool {
     let mut visited = BTreeSet::new();
     reaches_component(
         model,
@@ -1648,7 +1659,7 @@ fn participates_in_reference_cycle(model: &EmissionModel<'_, '_>, schema_index: 
 }
 
 fn reaches_component(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     schema: &SchemaNode,
     target_index: usize,
     visited: &mut BTreeSet<usize>,
@@ -1676,12 +1687,14 @@ fn reaches_component(
 }
 
 fn emit_component(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    factory: &EmitterFactory<'_, '_>,
+    emission: &mut Emission,
     schema_index: usize,
+    file_base: &str,
     name: &str,
-) -> Option<GeneratedFile> {
+) {
     let analyzed = model.analyzed;
-    let file_base = model.component_files[schema_index].clone()?;
     let schema = &analyzed.ir.schemas[schema_index];
     let (request_variant, response_variant, neutral_wire, request_wire, response_wire) = {
         // Reaching this emitter with a file base proves path allocation registered the target too.
@@ -1722,6 +1735,7 @@ fn emit_component(
         let mut lazy_closes_cycle = false;
         let expression = SchemaRenderer {
             model,
+            factory,
             position,
             current_schema: Some(schema_index),
             current_schema_name: &schema_name,
@@ -1747,7 +1761,7 @@ fn emit_component(
         // imports named nowhere — `noUnusedLocals` reports the unread type import in the consumer's
         // own compile, which is the same class of defect the drop exists to remove.
         let annotation = (cyclic && lazy_closes_cycle).then(|| {
-            let emitter = Emitter::new(model);
+            let emitter = factory.worker();
             imports.collect_types(&emitter, &schema.schema, position);
             (
                 emitter.render_type(&schema.schema, position, TypeAxis::Wire, 0),
@@ -1773,41 +1787,54 @@ fn emit_component(
         &declarations,
     );
     let relative_path = format!("{}/components/{file_base}.ts", model.dirs.zod);
-    model.register_path(&relative_path, &schema.source);
-    Some(GeneratedFile {
+    emission.register_path(&relative_path, &schema.source);
+    emission.files.push(GeneratedFile {
         relative_path,
         content,
-    })
+    });
 }
 
 fn emit_operation(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    factory: &EmitterFactory<'_, '_>,
+    emission: &mut Emission,
     projector: &PrimitiveDomainProjector<'_>,
     operation_index: usize,
     allocated_name: &str,
-) -> Option<GeneratedFile> {
-    let file_base = model.operation_files[operation_index].clone()?;
+) {
+    let Some(file_base) = model.operation_files[operation_index].clone() else {
+        return;
+    };
     let operation = &model.analyzed.ir.operations[operation_index];
     emit_operation_file(
         model,
+        factory,
+        emission,
         projector,
         operation,
-        allocated_name,
-        "operations",
-        &file_base,
-        true,
-    )
+        OperationModule {
+            allocated_name,
+            directory: "operations",
+            file_base: &file_base,
+            include_responses: true,
+        },
+    );
 }
 
 fn emit_operation_file(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    factory: &EmitterFactory<'_, '_>,
+    emission: &mut Emission,
     projector: &PrimitiveDomainProjector<'_>,
     operation: &Operation,
-    allocated_name: &str,
-    directory: &str,
-    file_base: &str,
-    include_responses: bool,
-) -> Option<GeneratedFile> {
+    module: OperationModule<'_>,
+) {
+    let OperationModule {
+        allocated_name,
+        directory,
+        file_base,
+        include_responses,
+    } = module;
     let stem = uppercase_first(allocated_name);
     // Held across `positions` because a form field's schema is a projector-resolved clone owned by
     // the plan rather than a node the IR can lend.
@@ -1831,7 +1858,12 @@ fn emit_operation_file(
         let mut responses = Vec::new();
         for response in &operation.responses {
             let suffix = response_status_type_suffix(&response.status);
-            responses.extend(response_body_schemas(response, &stem, &suffix, model.sink));
+            responses.extend(response_body_schemas(
+                response,
+                &stem,
+                &suffix,
+                &mut emission.diagnostics,
+            ));
         }
         responses.sort_by(|left, right| left.0.cmp(&right.0));
         for (export_type, schema) in responses {
@@ -1853,7 +1885,7 @@ fn emit_operation_file(
     };
     header_positions.sort_by(|left, right| left.0.cmp(&right.0));
     if positions.is_empty() && header_positions.is_empty() {
-        return None;
+        return;
     }
 
     let mut runtime_values = BTreeSet::new();
@@ -1887,7 +1919,7 @@ fn emit_operation_file(
         // re-export that component rather than declare its own: the two identifiers are the same,
         // so declaring one here both collides with the sibling import and makes the schema
         // reference itself. Airbyte's `AssistV1ProcessRequestBody` is a real case.
-        let emitter = Emitter::new(model);
+        let emitter = factory.worker();
         let declared_type = validator_wire_type_name(
             &emitter,
             export_type,
@@ -1912,6 +1944,7 @@ fn emit_operation_file(
         let mut lazy_closes_cycle = false;
         let expression = SchemaRenderer {
             model,
+            factory,
             position,
             current_schema: None,
             current_schema_name: &schema_name,
@@ -1931,6 +1964,7 @@ fn emit_operation_file(
     for (export_type, response) in header_positions {
         let (_, expression) = render_headers(
             model,
+            factory,
             response,
             &export_type,
             &mut imports,
@@ -1955,7 +1989,7 @@ fn emit_operation_file(
             &expression,
         ));
     }
-    model.sink.extend(wire_diagnostics);
+    emission.diagnostics.extend(wire_diagnostics);
     let content = assemble_file(
         model,
         "../components/",
@@ -1965,15 +1999,16 @@ fn emit_operation_file(
         &declarations,
     );
     let relative_path = format!("{}/{directory}/{file_base}.ts", model.dirs.zod);
-    model.register_path(&relative_path, &operation.source);
-    Some(GeneratedFile {
+    emission.register_path(&relative_path, &operation.source);
+    emission.files.push(GeneratedFile {
         relative_path,
         content,
-    })
+    });
 }
 
 fn render_headers(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    factory: &EmitterFactory<'_, '_>,
     response: &ResponseEntry,
     schema_name: &str,
     imports: &mut SiblingImports,
@@ -1986,7 +2021,7 @@ fn render_headers(
         let type_expression = if opaque {
             "string".to_owned()
         } else {
-            let emitter = Emitter::new(model);
+            let emitter = factory.worker();
             imports.collect_types(&emitter, &header.schema, TypePosition::Response);
             emitter.render_type(&header.schema, TypePosition::Response, TypeAxis::Wire, 2)
         };
@@ -2011,6 +2046,7 @@ fn render_headers(
             let mut lazy_closes_cycle = false;
             let expression = SchemaRenderer {
                 model,
+                factory,
                 position: TypePosition::Response,
                 current_schema: None,
                 current_schema_name: schema_name,
@@ -2078,7 +2114,7 @@ fn response_body_schemas<'ir>(
 }
 
 fn assemble_file(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     sibling_prefix: &str,
     imports: &SiblingImports,
     reexports: &BTreeMap<String, BTreeSet<String>>,
@@ -2108,18 +2144,7 @@ fn assemble_file(
             render_ts_string(&format!("../runtime{extension}"))
         ));
     }
-    for (file_base, (type_names, schema_names)) in &imports.files {
-        let specifiers = type_names
-            .iter()
-            .map(|name| format!("type {name}"))
-            .chain(schema_names.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(", ");
-        output.push_str(&format!(
-            "import {{ {specifiers} }} from {};\n",
-            render_ts_string(&format!("{sibling_prefix}{file_base}{extension}"))
-        ));
-    }
+    render_sibling_imports(&mut output, imports, sibling_prefix, &extension);
     for (file_base, specifiers) in reexports {
         output.push_str(&format!(
             "export {{ {} }} from {};\n",
@@ -2141,256 +2166,6 @@ fn assemble_file(
     output
 }
 
-fn emit_webhooks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
-    let analyzed = model.analyzed;
-    let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut body = String::from("export const webhooks = {\n");
-    let mut cursor = 0;
-    for (webhook_index, webhook) in analyzed.ir.webhooks.iter().enumerate() {
-        body.push_str("  ");
-        body.push_str(&render_ts_string(&webhook.name));
-        body.push_str(": {");
-        let mut wrote_method = false;
-        while let Some(allocated) = analyzed
-            .webhook_names
-            .get(cursor)
-            .filter(|allocated| allocated.webhook_index == webhook_index)
-        {
-            let file_base = model.webhook_files[cursor].as_deref();
-            cursor += 1;
-            let Some(file_base) = file_base else {
-                continue;
-            };
-            let operation = &webhook.operations[allocated.operation_index];
-            if !operation_has_request_schemas(operation) {
-                continue;
-            }
-            if !wrote_method {
-                body.push('\n');
-                wrote_method = true;
-            }
-            write_request_descriptor_method(
-                &mut body,
-                &mut imports,
-                file_base,
-                &allocated.stem,
-                operation,
-                4,
-            );
-        }
-        if wrote_method {
-            body.push_str("  },\n");
-        } else {
-            body.push_str("},\n");
-        }
-    }
-    body.push_str("};\n");
-    assemble_descriptor_index(
-        model,
-        &format!("{}/webhooks/index.ts", model.dirs.zod),
-        imports,
-        body,
-    )
-}
-
-fn emit_callbacks_index(model: &EmissionModel<'_, '_>) -> GeneratedFile {
-    let analyzed = model.analyzed;
-    let ir = &analyzed.ir;
-    let mut imports = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut body = String::new();
-    let mut seen_parents = HashSet::new();
-    let mut entries_by_parent: HashMap<_, Vec<usize>> = HashMap::new();
-    for (index, entry) in analyzed.callback_names.iter().enumerate() {
-        if model.callback_files[index].is_some()
-            && operation_has_request_schemas(callback_operation(
-                ir,
-                &analyzed.callback_names,
-                entry,
-            ))
-        {
-            entries_by_parent
-                .entry(&entry.parent)
-                .or_default()
-                .push(index);
-        }
-    }
-    for (index, entry) in analyzed.callback_names.iter().enumerate() {
-        if model.callback_files[index].is_none()
-            || !operation_has_request_schemas(callback_operation(
-                ir,
-                &analyzed.callback_names,
-                entry,
-            ))
-            || !seen_parents.insert(&entry.parent)
-        {
-            continue;
-        }
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        let parent = &entry.parent;
-        let parent_operation = callback_parent_operation(ir, &analyzed.callback_names, parent);
-        body.push_str("export const ");
-        body.push_str(&lowercase_first(&uppercase_first(&entry.parent_stem)));
-        body.push_str("Callbacks = {\n");
-        let entries = &entries_by_parent[parent];
-        let mut cursor = 0;
-        while cursor < entries.len() {
-            let callback_index = analyzed.callback_names[entries[cursor]].callback_index;
-            let callback = &parent_operation.callbacks[callback_index];
-            body.push_str("  ");
-            body.push_str(&render_ts_string(&callback.name));
-            body.push_str(": {\n");
-            while cursor < entries.len()
-                && analyzed.callback_names[entries[cursor]].callback_index == callback_index
-            {
-                let expression_index = analyzed.callback_names[entries[cursor]].expression_index;
-                body.push_str("    ");
-                body.push_str(&render_ts_string(
-                    &callback.expressions[expression_index].expression,
-                ));
-                body.push_str(": {\n");
-                while cursor < entries.len() && {
-                    let current = &analyzed.callback_names[entries[cursor]];
-                    current.callback_index == callback_index
-                        && current.expression_index == expression_index
-                } {
-                    let index = entries[cursor];
-                    let allocated = &analyzed.callback_names[index];
-                    let file_base = model.callback_files[index].as_deref().unwrap_or_default();
-                    let operation = callback_operation(ir, &analyzed.callback_names, allocated);
-                    write_request_descriptor_method(
-                        &mut body,
-                        &mut imports,
-                        file_base,
-                        &allocated.stem,
-                        operation,
-                        6,
-                    );
-                    cursor += 1;
-                }
-                body.push_str("    },\n");
-            }
-            body.push_str("  },\n");
-        }
-        body.push_str("};\n");
-    }
-    assemble_descriptor_index(
-        model,
-        &format!("{}/callbacks/index.ts", model.dirs.zod),
-        imports,
-        body,
-    )
-}
-
-fn operation_has_request_schemas(operation: &Operation) -> bool {
-    !operation.parameters.is_empty()
-        || operation
-            .request_body
-            .as_ref()
-            .is_some_and(|body| body.media_types.iter().any(|media| is_json(&media.essence)))
-}
-
-fn write_request_descriptor_method(
-    body: &mut String,
-    imports: &mut BTreeMap<String, BTreeSet<String>>,
-    file_base: &str,
-    allocated_name: &str,
-    operation: &Operation,
-    indent: usize,
-) {
-    let stem = uppercase_first(allocated_name);
-    let parameter_names = operation_parameter_validator_names(operation, &stem);
-    let entry = imports.entry(file_base.to_owned()).or_default();
-    push_indent(body, indent);
-    body.push_str(&operation.method);
-    body.push_str(": {\n");
-    if !operation.parameters.is_empty() {
-        push_indent(body, indent + 2);
-        body.push_str("parameters: {\n");
-        for location in [
-            ParamLocation::Path,
-            ParamLocation::Query,
-            ParamLocation::Header,
-            ParamLocation::Cookie,
-        ] {
-            let matching = operation
-                .parameters
-                .iter()
-                .zip(&parameter_names)
-                .filter(|(parameter, _)| parameter.location == location)
-                .collect::<Vec<_>>();
-            if matching.is_empty() {
-                continue;
-            }
-            push_indent(body, indent + 4);
-            body.push_str(location_key(location));
-            body.push_str(": {\n");
-            for (parameter, export_type) in matching {
-                let schema = schema_const_name(export_type);
-                entry.insert(schema.clone());
-                push_indent(body, indent + 6);
-                body.push_str(&render_ts_string(&parameter.name));
-                body.push_str(": ");
-                body.push_str(&schema);
-                body.push_str(",\n");
-            }
-            push_indent(body, indent + 4);
-            body.push_str("},\n");
-        }
-        push_indent(body, indent + 2);
-        body.push_str("},\n");
-    }
-    if operation
-        .request_body
-        .as_ref()
-        .is_some_and(|body| body.media_types.iter().any(|media| is_json(&media.essence)))
-    {
-        let schema = format!("{}RequestBodySchema", lowercase_first(&stem));
-        entry.insert(schema.clone());
-        push_indent(body, indent + 2);
-        body.push_str("requestBody: ");
-        body.push_str(&schema);
-        body.push_str(",\n");
-    }
-    push_indent(body, indent);
-    body.push_str("},\n");
-}
-
-fn location_key(location: ParamLocation) -> &'static str {
-    match location {
-        ParamLocation::Path => "path",
-        ParamLocation::Query => "query",
-        ParamLocation::Header => "header",
-        ParamLocation::Cookie => "cookie",
-    }
-}
-
-fn assemble_descriptor_index(
-    model: &EmissionModel<'_, '_>,
-    relative_path: &str,
-    imports: BTreeMap<String, BTreeSet<String>>,
-    body: String,
-) -> GeneratedFile {
-    let extension = import_extension(model);
-    let mut content = model.header();
-    for (file_base, names) in imports {
-        content.push_str("import { ");
-        content.push_str(&names.into_iter().collect::<Vec<_>>().join(", "));
-        content.push_str(" } from ");
-        content.push_str(&render_ts_string(&format!("./{file_base}{extension}")));
-        content.push_str(";\n");
-    }
-    if !content.ends_with("\n\n") {
-        content.push('\n');
-    }
-    content.push_str(&body);
-    GeneratedFile {
-        relative_path: relative_path.to_owned(),
-        content,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -2401,8 +2176,8 @@ mod tests {
     use super::*;
     use crate::client_model::build_client_model;
     use crate::config::load_config;
-    use crate::diag::{DiagnosticSink, Severity};
-    use crate::emit::emit_artifacts;
+    use crate::diag::{Diagnostic, DiagnosticSink, Severity};
+    use crate::emit::{PARALLEL_EMIT_MIN_ITEMS, emit_artifacts, source_digest};
     use crate::loader::load_graph;
     use crate::parse::parse;
     use crate::semantic::analyze;
@@ -2455,6 +2230,107 @@ mod tests {
             &mut sink,
         );
         (files, sink.into_sorted_vec())
+    }
+
+    /// A document wide enough for all four of this emitter's per-item loops to cross
+    /// `PARALLEL_EMIT_MIN_ITEMS`, which no repository fixture does — components, operations,
+    /// webhooks and callbacks each get one entry per index, so the rayon branch runs in every one
+    /// of them rather than the sequential fallback.
+    fn wide_document(count: usize) -> String {
+        let mut document =
+            String::from("openapi: 3.1.0\ninfo: { title: Wide, version: 1.0.0 }\npaths:\n");
+        for index in 0..count {
+            document.push_str(&format!(
+                "  /items{index}:\n    post:\n      operationId: postItem{index}\n      requestBody:\n        required: true\n        content:\n          application/json:\n            schema: {{ $ref: \"#/components/schemas/Item{index}\" }}\n      responses:\n        \"200\":\n          description: ok\n          content:\n            application/json:\n              schema: {{ $ref: \"#/components/schemas/Item{index}\" }}\n      callbacks:\n        onDone{index}:\n          \"{{$request.body#/url}}\":\n            post:\n              requestBody:\n                required: true\n                content:\n                  application/json:\n                    schema: {{ $ref: \"#/components/schemas/Item{index}\" }}\n              responses:\n                \"204\": {{ description: ok }}\n"
+            ));
+        }
+        document.push_str("webhooks:\n");
+        for index in 0..count {
+            document.push_str(&format!(
+                "  event{index}:\n    post:\n      operationId: onEvent{index}\n      requestBody:\n        required: true\n        content:\n          application/json:\n            schema: {{ $ref: \"#/components/schemas/Item{index}\" }}\n      responses:\n        \"204\": {{ description: ok }}\n"
+            ));
+        }
+        document.push_str("components:\n  schemas:\n");
+        for index in 0..count {
+            let extra = if index == 0 {
+                ", upper: { $ref: \"#/components/schemas/ItemURL\" }, title: { $ref: \"#/components/schemas/ItemUrl\" }"
+            } else {
+                ""
+            };
+            document.push_str(&format!(
+                "    Item{index}: {{ type: object, required: [name], properties: {{ name: {{ type: string }}, size: {{ type: integer }}{extra} }} }}\n"
+            ));
+        }
+        // Two component names that fold to one file name. Each loop's registrations are replayed
+        // by the merge, and the collision names which path it saw first — so a merge that reordered
+        // its input would report the pair the other way round rather than fail silently.
+        document.push_str("    ItemURL: { type: string }\n");
+        document.push_str("    ItemUrl: { type: object, properties: { tag: { type: string } } }\n");
+        document
+    }
+
+    /// Thread-count invariance for all four loops, asserted on the emitter's own return rather than
+    /// on a whole compile: `emit_artifacts` sorts its files by path at the end, so only the
+    /// emitter's own result still carries the merge order the parallel branch has to reproduce.
+    #[test]
+    fn zod_emission_is_identical_at_every_thread_count() {
+        let temp = TempDir::new().expect("temp directory");
+        fs::write(temp.path().join("openapi.yaml"), wide_document(80)).expect("write document");
+        fs::write(
+            temp.path().join("oasts.yaml"),
+            "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\noutput: ./generated\nartifacts:\n  types: true\n  zod: true\n",
+        )
+        .expect("write config");
+        let resolved = load_config(None, temp.path()).expect("config resolves");
+        let mut prepared = DiagnosticSink::new();
+        let graph = load_graph(&resolved, &mut prepared).expect("graph loads");
+        let source_tuples = graph.source_tuples();
+        let ir = parse(&graph, &mut prepared).expect("document parses");
+        drop(graph);
+        let analyzed = analyze(ir, &resolved, &mut prepared);
+        assert!(!prepared.has_errors(), "{:#?}", prepared.as_slice());
+        for (label, count) in [
+            ("schemas", analyzed.schema_names.len()),
+            ("operations", analyzed.operation_names.len()),
+            ("webhooks", analyzed.webhook_names.len()),
+            ("callbacks", analyzed.callback_names.len()),
+        ] {
+            assert!(
+                count >= PARALLEL_EMIT_MIN_ITEMS,
+                "{label} below the threshold"
+            );
+        }
+
+        let emit = || {
+            let mut sink = DiagnosticSink::new();
+            let mut registrar = Registrar::new(&mut sink);
+            let mut model = EmissionModel::new(
+                &analyzed,
+                &resolved,
+                source_digest(&source_tuples),
+                &mut registrar,
+            );
+            let files = emit_zod_from_model(&mut model, &mut registrar);
+            (files, sink)
+        };
+        let pooled = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("rayon pool")
+                .install(emit)
+        };
+
+        let (expected_files, expected_sink) = pooled(1);
+        assert!(!expected_files.is_empty(), "files emitted");
+        assert!(!expected_sink.as_slice().is_empty(), "sink exercised");
+        for threads in [2, 18] {
+            for _ in 0..4 {
+                let (files, sink) = pooled(threads);
+                assert_eq!(files, expected_files, "thread count {threads}");
+                assert_eq!(sink, expected_sink, "thread count {threads}");
+            }
+        }
     }
 
     fn doc(schemas: Value) -> Value {
@@ -4244,12 +4120,15 @@ mod tests {
             callback_names: Vec::new(),
         };
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &resolved, "digest".to_owned(), &mut registrar);
         let mut runtime_values = BTreeSet::new();
         let mut imports = SiblingImports::default();
         let mut lazy_closes_cycle = false;
+        let factory = Emitter::new(&model).into_factory();
         let mut renderer = SchemaRenderer {
             model: &model,
+            factory: &factory,
             position: TypePosition::Neutral,
             current_schema: None,
             lazy_closes_cycle: &mut lazy_closes_cycle,
@@ -4360,8 +4239,10 @@ mod tests {
             links: Vec::new(),
             source: SourceRef::default(),
         };
+        let factory = Emitter::new(&model).into_factory();
         let (header_type, header_schema) = render_headers(
             &model,
+            &factory,
             &response,
             "Headers",
             &mut imports,

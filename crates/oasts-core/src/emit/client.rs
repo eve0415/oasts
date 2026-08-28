@@ -22,7 +22,7 @@ use crate::response_media::StreamKind;
 use crate::transform::TransformKind;
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
-use super::model::EmissionModel;
+use super::model::{EmissionModel, Registrar};
 use super::paths::{TRANSFORM_SUBDIR, relative_import};
 use super::runtime_assets::{RuntimeSelection, emit_runtime_files};
 use super::validators::operation_parameter_validator_names;
@@ -34,7 +34,8 @@ use super::{
 };
 
 pub(crate) fn emit_client_from_model(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    registrar: &mut Registrar<'_>,
     client: &ClientModel,
 ) -> Vec<GeneratedFile> {
     let mut files = Vec::new();
@@ -76,9 +77,10 @@ pub(crate) fn emit_client_from_model(
             helper_ids.insert(SSE_ENCODE_REGION.to_owned());
         }
         let relative_path = format!("{}/operations/{file_base}.ts", model.dirs.client);
-        model.register_path(&relative_path, &operation.source);
+        registrar.register_path(&relative_path, &operation.source);
         let content = emit_operation(
             model,
+            registrar,
             &operation,
             plan,
             &allocated.name,
@@ -109,14 +111,14 @@ pub(crate) fn emit_client_from_model(
     {
         let namespace = model.config.namespace.clone();
         let relative_path = format!("{}/{namespace}.ts", model.dirs.client);
-        model.register_path(&relative_path, &source);
+        registrar.register_path(&relative_path, &source);
         files.push(GeneratedFile {
             relative_path,
             content: emit_aggregate(model, &namespace, &aggregate_entries),
         });
     }
     if let Some(auth_file) = emit_document_auth(model, client) {
-        model.register_path(&auth_file.relative_path, &source);
+        registrar.register_path(&auth_file.relative_path, &source);
         files.push(auth_file);
     }
     // This emitter receives a client model only after resolved config enabled the client artifact.
@@ -146,6 +148,7 @@ pub(crate) fn emit_client_from_model(
     }
     files.extend(emit_runtime_files(RuntimeSelection {
         model,
+        registrar,
         helper_ids: &helper_ids,
         base_url: &base_url,
         relative_server_url: client.base_url_required,
@@ -157,7 +160,7 @@ pub(crate) fn emit_client_from_model(
 }
 
 fn emit_aggregate(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     namespace: &str,
     entries: &[(String, String)],
 ) -> String {
@@ -210,10 +213,7 @@ fn emit_aggregate(
 /// module is emitted. Client-usability reuses `build_client_model`'s planning: a scheme is usable
 /// exactly when it survives into some operation's `auth_plan`, which already drops every scheme the
 /// fetch client cannot serialize.
-fn emit_document_auth(
-    model: &EmissionModel<'_, '_>,
-    client: &ClientModel,
-) -> Option<GeneratedFile> {
+fn emit_document_auth(model: &EmissionModel<'_>, client: &ClientModel) -> Option<GeneratedFile> {
     let mut usable: HashSet<&str> = HashSet::new();
     for plan in &client.operations {
         for alternative in &plan.auth_plan {
@@ -305,7 +305,8 @@ fn document_auth_provider_type(name: &str, kind: &SecKind, client: &ClientModel)
 }
 
 fn emit_operation(
-    model: &mut EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
+    registrar: &mut Registrar<'_>,
     operation: &Operation,
     plan: &OperationPlan,
     allocated_name: &str,
@@ -497,7 +498,7 @@ fn emit_operation(
         )
     };
     for diagnostic in alias_diagnostics {
-        model.sink.push(diagnostic);
+        registrar.sink.push(diagnostic);
     }
     // The wire input names the request's wire twin for its JSON body member, so that declaration
     // has to come across with the rest of the operation's types.
@@ -969,7 +970,7 @@ pub(super) struct EntryConversion {
 /// `unconvertible_transform_diagnostics` refuses one that would have converted rather than leaving
 /// it a wire string under a type that says `Date`.
 pub(super) fn response_conversions(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     plan: &OperationPlan,
     stem: &str,
 ) -> Vec<ResponseConversion> {
@@ -1101,10 +1102,7 @@ fn event_pair_alias(conversion: Option<&ResponseConversion>, index: usize) -> Op
 /// The transform emitter reads this rather than restating it: it decides on the same condition
 /// whether to export the encoder this module imports, and two independently written answers would
 /// disagree as a compile error in the emitted code rather than as a failing test here.
-pub(super) fn request_transform_binding(
-    model: &EmissionModel<'_, '_>,
-    plan: &OperationPlan,
-) -> bool {
+pub(super) fn request_transform_binding(model: &EmissionModel<'_>, plan: &OperationPlan) -> bool {
     if !model.transform_facts().enabled() {
         return false;
     }
@@ -1115,7 +1113,7 @@ pub(super) fn request_transform_binding(
 }
 
 pub(super) fn reaches_non_integer_transform(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     schema: &SchemaNode,
 ) -> bool {
     [
@@ -1127,10 +1125,7 @@ pub(super) fn reaches_non_integer_transform(
     .any(|kind| model.transform_facts().reaches_kind(schema, kind))
 }
 
-pub(super) fn parameter_transforms(
-    model: &EmissionModel<'_, '_>,
-    parameter: &ParameterPlan,
-) -> bool {
+pub(super) fn parameter_transforms(model: &EmissionModel<'_>, parameter: &ParameterPlan) -> bool {
     if parameter.caller_serialized {
         return false;
     }
@@ -1146,10 +1141,7 @@ pub(super) fn parameter_encodes_int64(parameter: &ParameterPlan) -> bool {
 }
 
 /// Whether a request body carries an application value the operation encoder converts.
-pub(super) fn request_body_transforms(
-    model: &EmissionModel<'_, '_>,
-    plan: Option<&BodyPlan>,
-) -> bool {
+pub(super) fn request_body_transforms(model: &EmissionModel<'_>, plan: Option<&BodyPlan>) -> bool {
     match plan {
         Some(BodyPlan::Json {
             schema: Some(schema),
@@ -1168,7 +1160,7 @@ pub(super) fn request_body_transforms(
 }
 
 /// Whether one rendered form field carries its schema value rather than a binary upload handle.
-pub(super) fn form_field_transforms(model: &EmissionModel<'_, '_>, field: &FormFieldPlan) -> bool {
+pub(super) fn form_field_transforms(model: &EmissionModel<'_>, field: &FormFieldPlan) -> bool {
     if field.is_binary_upload() {
         return false;
     }
@@ -1189,7 +1181,7 @@ pub(super) fn form_field_encodes_int64(field: &FormFieldPlan) -> bool {
 }
 
 fn response_transform_bindings(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     plan: &OperationPlan,
     stem: &str,
     conversions: &[ResponseConversion],
@@ -1234,7 +1226,7 @@ fn response_transform_bindings(
     bindings
 }
 
-fn validation_flags(model: &EmissionModel<'_, '_>) -> (bool, bool) {
+fn validation_flags(model: &EmissionModel<'_>) -> (bool, bool) {
     match model.config.validation.as_ref() {
         Some(validation)
             if matches!(
@@ -1254,7 +1246,7 @@ fn validation_flags(model: &EmissionModel<'_, '_>) -> (bool, bool) {
 /// `Issue` type, so the engine selects a directory and changes nothing else about the emitted body —
 /// and because the client forwards the value it already decoded rather than the validator's return,
 /// which engine is bound is invisible in `data`.
-fn validation_artifact_dir<'model>(model: &'model EmissionModel<'_, '_>) -> &'model str {
+fn validation_artifact_dir<'model>(model: &'model EmissionModel<'_>) -> &'model str {
     match model.config.validation.as_ref() {
         Some(validation) if validation.engine == ValidationEngine::Zod => model.dirs.zod,
         _ => model.dirs.validators,
@@ -1264,7 +1256,7 @@ fn validation_artifact_dir<'model>(model: &'model EmissionModel<'_, '_>) -> &'mo
 /// The request-side checks: every parameter in declared order, then the JSON request body. Empty
 /// unless request validation is enabled.
 fn request_validation_checks(
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     operation: &Operation,
     plan: &OperationPlan,
     stem: &str,
@@ -2138,7 +2130,7 @@ fn body_uses_json_alias(plan: &BodyPlan) -> bool {
 }
 
 fn collect_body_imports(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     plan: &BodyPlan,
     axis: TypeAxis,
     imports: &mut BTreeMap<String, BTreeSet<String>>,
@@ -2170,7 +2162,7 @@ fn collect_body_imports(
 }
 
 fn collect_discriminated_body_imports(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     plan: &BodyPlan,
     axis: TypeAxis,
     inline_json: bool,
@@ -2206,7 +2198,7 @@ fn json_body_count(plan: &BodyPlan) -> usize {
 /// conversion produces and what `execute` then serializes; a position reaching no transform renders
 /// the same declaration on both, which is why only converting operations declare the second one.
 fn render_input(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     operation: &Operation,
     plan: &OperationPlan,
     stem: &str,
@@ -2346,7 +2338,7 @@ fn write_parameter_property_tsdoc(
 /// only where the request converts — so a wire-axis render for a request that converts nothing
 /// still names the application alias, the only one that exists.
 fn render_body_input(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     plan: &BodyPlan,
     stem: &str,
     indent: usize,
@@ -2396,7 +2388,7 @@ fn render_body_input(
 }
 
 fn render_discriminated_body_input(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     plan: &BodyPlan,
     stem: &str,
     indent: usize,
@@ -2416,7 +2408,7 @@ fn render_discriminated_body_input(
 }
 
 fn render_form_input(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     fields: &[FormFieldPlan],
     indent: usize,
     axis: TypeAxis,
@@ -2448,7 +2440,7 @@ pub(super) struct FormFieldRenderSchema<'a> {
 /// A wrapper belongs to each repeated item, so its `body` renders from the array item rather than
 /// the array itself. Binary uploads render an opaque handle and therefore select no schema.
 pub(super) fn form_field_render_schema<'a>(
-    model: &'a EmissionModel<'_, '_>,
+    model: &'a EmissionModel<'_>,
     field: &'a FormFieldPlan,
 ) -> FormFieldRenderSchema<'a> {
     let array_items = schema_array_items(model, &field.schema, &mut HashSet::new());
@@ -2466,7 +2458,7 @@ pub(super) fn form_field_render_schema<'a>(
 }
 
 fn render_form_field_input(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     field: &FormFieldPlan,
     indent: usize,
     axis: TypeAxis,
@@ -2543,7 +2535,7 @@ struct ResultArm {
 /// ever named by this module's own arms and by the codec that converts between them — the same
 /// reason the request surface's `{Stem}Input` pair lives here.
 fn render_entry_payload_pairs(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     plan: &OperationPlan,
     conversions: &[ResponseConversion],
 ) -> String {
@@ -2580,7 +2572,7 @@ fn render_entry_payload_pairs(
 /// hands back, where every payload the conversions name declares its wire twin instead; a payload no
 /// conversion names is the same declaration on both surfaces and renders identically either way.
 fn response_result_arms(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     plan: &OperationPlan,
     stem: &str,
     conversions: &[ResponseConversion],
@@ -2602,7 +2594,7 @@ fn response_result_arms(
 
 fn push_response_result_arms(
     arms: &mut Vec<ResultArm>,
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     response: &ResponsePlan,
     stem: &str,
     conversion: Option<&ResponseConversion>,
@@ -2724,7 +2716,7 @@ fn multipart_decoding_notes(plan: &OperationPlan) -> Vec<String> {
 /// the caller sees. Rendering both from one axis would have the conversion read an already-decoded
 /// value.
 fn response_entry_payload_type(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     entry: &ResponseMediaPlan,
     axis: TypeAxis,
     indent: usize,
@@ -2750,7 +2742,7 @@ fn response_entry_payload_type(
 /// renders as `Uint8Array` and never reaches its schema, so walking the whole entry schema would
 /// import a component nothing reads.
 fn collect_response_entry_imports(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     entry: &ResponseMediaPlan,
     axis: TypeAxis,
     imports: &mut BTreeMap<String, BTreeSet<String>>,
@@ -2783,7 +2775,7 @@ fn collect_response_entry_imports(
 /// declared property to be assignable to the index type, and a part-by-part classification routinely
 /// produces a mix (`Uint8Array` next to `string`) that no single member covers.
 fn render_multipart_response_type(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     plan: &MultipartResponsePlan,
     axis: TypeAxis,
     indent: usize,
@@ -2838,7 +2830,7 @@ fn render_multipart_response_type(
 /// so it is the only kind that overrides the schema's own rendering — matching the request side,
 /// where a binary upload field renders as `Blob | File` instead of its `type: string` schema.
 fn render_multipart_part_type(
-    renderer: &TypesEmitter<'_, '_, '_>,
+    renderer: &TypesEmitter<'_, '_>,
     shape: &MultipartResponseShape,
     axis: TypeAxis,
     indent: usize,
@@ -3004,7 +2996,7 @@ fn successful_envelope_union(arms: &[ResultArm]) -> String {
 
 fn write_descriptor(
     output: &mut String,
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     operation: &Operation,
     plan: &OperationPlan,
     allocated_name: &str,
@@ -3526,7 +3518,7 @@ fn mark_body_encoders(plan: &BodyPlan, wanted: &mut [bool; TRANSPORT_VALUE_IMPOR
 
 fn write_body_descriptor(
     output: &mut String,
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     plan: &BodyPlan,
     indent: usize,
 ) {
@@ -3647,7 +3639,7 @@ fn write_simple_body(output: &mut String, encoder: &str, media: &str) {
 
 fn write_multipart_field(
     output: &mut String,
-    model: &EmissionModel<'_, '_>,
+    model: &EmissionModel<'_>,
     field: &FormFieldPlan,
     indent: usize,
 ) {
@@ -3704,7 +3696,7 @@ fn write_multipart_field(
 }
 
 fn schema_array_items<'a>(
-    model: &'a EmissionModel<'_, '_>,
+    model: &'a EmissionModel<'_>,
     schema: &'a SchemaNode,
     visited: &mut HashSet<(String, String)>,
 ) -> Option<&'a SchemaNode> {
@@ -4159,8 +4151,9 @@ mod tests {
             analyzed_with_options(&document, false, documentation_enabled);
         let mut sink = DiagnosticSink::new();
         let client = build_client_model(&analyzed, &config, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
+        let files = emit_client_from_model(&model, &mut registrar, &client);
         drop(model);
         let content = files
             .iter()
@@ -4230,8 +4223,9 @@ mod tests {
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
         let client = build_client_model(&analyzed, &config, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
+        let files = emit_client_from_model(&model, &mut registrar, &client);
         drop(model);
         (files, sink.into_sorted_vec())
     }
@@ -5490,8 +5484,9 @@ mod tests {
         config.documentation.summary = false;
         let mut sink = DiagnosticSink::new();
         let client = build_client_model(&analyzed, &config, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
+        let files = emit_client_from_model(&model, &mut registrar, &client);
         drop(model);
         let operation = files
             .iter()
@@ -5554,9 +5549,14 @@ mod tests {
             analyzed_with_aggregate(&document, true);
         let mut sink = DiagnosticSink::new();
         let client = build_client_model(&aggregate_analyzed, &config, &mut sink);
-        let mut model =
-            EmissionModel::new(&aggregate_analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(
+            &aggregate_analyzed,
+            &config,
+            "digest".to_owned(),
+            &mut registrar,
+        );
+        let files = emit_client_from_model(&model, &mut registrar, &client);
         drop(model);
         let aggregate = files
             .iter()
@@ -5571,8 +5571,9 @@ mod tests {
         let (_temp, analyzed, config, _source_tuples) = analyzed(&document);
         let mut sink = DiagnosticSink::new();
         let client = build_client_model(&analyzed, &config, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
+        let files = emit_client_from_model(&model, &mut registrar, &client);
         assert!(
             files
                 .iter()
@@ -5588,8 +5589,9 @@ mod tests {
         let (_temp, analyzed, config, _source_tuples) = analyzed(document);
         let mut sink = DiagnosticSink::new();
         let client = build_client_model(&analyzed, &config, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
+        let files = emit_client_from_model(&model, &mut registrar, &client);
         drop(model);
         (files, sink.into_sorted_vec())
     }
@@ -6346,7 +6348,8 @@ mod tests {
         };
         let (_temporary, analyzed, config) = probe_analyzed();
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let renderer = TypesEmitter::new(&model);
         let arms = response_result_arms(&renderer, &plan, "Probe", &[], false);
         let output = render_result_type(&arms, &plan, "Probe", "");
@@ -6673,7 +6676,8 @@ mod tests {
         };
         let (_temporary, analyzed, config) = probe_analyzed();
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let renderer = TypesEmitter::new(&model);
         let actual = render_result_type(
             &response_result_arms(&renderer, &plan, "HeadHealth", &[], false),
@@ -6798,7 +6802,8 @@ mod tests {
         ];
 
         let mut sink = DiagnosticSink::new();
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         assert!(matches!(
             schema_array_items(&model, &items_ref, &mut HashSet::new()),
             Some(SchemaNode::Primitive {
@@ -7015,8 +7020,9 @@ mod tests {
         let mut sink = DiagnosticSink::new();
         let client = build_client_model(&analyzed, &config, &mut sink);
         config.emit.import_extension = "none".to_owned();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
+        let files = emit_client_from_model(&model, &mut registrar, &client);
         let operation = files
             .iter()
             .find(|file| file.relative_path.starts_with("client/operations/"))
@@ -7025,9 +7031,10 @@ mod tests {
         assert!(operation.content.contains("from \"../../runtime/result\""));
 
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         model.operation_files[0] = None;
-        let files = emit_client_from_model(&mut model, &client);
+        let files = emit_client_from_model(&model, &mut registrar, &client);
         assert!(
             files
                 .iter()
@@ -7037,8 +7044,10 @@ mod tests {
         let mut without_names = analyzed.clone();
         without_names.operation_names.clear();
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&without_names, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
+        let mut registrar = Registrar::new(&mut sink);
+        let model =
+            EmissionModel::new(&without_names, &config, "digest".to_owned(), &mut registrar);
+        let files = emit_client_from_model(&model, &mut registrar, &client);
         assert!(
             files
                 .iter()
@@ -7053,14 +7062,16 @@ mod tests {
         let (_temp, empty_analyzed, aggregate_config, _source_tuples) =
             analyzed_with_aggregate(&empty_document, true);
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(
             &empty_analyzed,
             &aggregate_config,
             "digest".to_owned(),
-            &mut sink,
+            &mut registrar,
         );
         let files = emit_client_from_model(
-            &mut model,
+            &model,
+            &mut registrar,
             &ClientModel {
                 operations: Vec::new(),
                 base_url_required: false,
@@ -7120,7 +7131,8 @@ mod tests {
                 false,
             ),
         ];
-        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let mut output = String::new();
         write_descriptor(
             &mut output,
@@ -7408,8 +7420,9 @@ mod tests {
             analyzed_with_options(&document, false, false);
         let mut sink = DiagnosticSink::new();
         let client = build_client_model(&analyzed, &config, &mut sink);
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        let files = emit_client_from_model(&mut model, &client);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
+        let files = emit_client_from_model(&model, &mut registrar, &client);
         drop(model);
         let content = files
             .iter()

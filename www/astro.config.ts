@@ -56,7 +56,9 @@ export default defineConfig({
   },
   integrations: [
     serverSourcemaps,
-    // React Compiler handles memoization, so the playground does not hand-roll it.
+    // The playground still hand-rolls useCallback/useMemo where referential
+    // identity is functionally required (effect deps, worker lifecycle) —
+    // React Compiler covers the remaining render-perf memoization on top of that.
     // Only the playground island is React; every docs page still ships zero React.
     react({ babel: { plugins: ["babel-plugin-react-compiler"] } }),
     nimbus(nimbusConfig, {

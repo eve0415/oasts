@@ -12,7 +12,7 @@ use serde_json::{Number, Value};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::filter::Filters;
 use crate::source::{DocumentSource, FsSource, is_rooted};
-use crate::syntax::parse_yaml_value;
+use crate::yaml::parse_yaml_value;
 
 const CODE_DISCOVERY: &str = "OASTS0011";
 const CODE_CONFIG_PARSE: &str = "OASTS0031";

@@ -208,9 +208,11 @@ jobs:
 
       - name: Verify frozen vectors
         run: |
-          for gate in auth filters msw streaming tanstack transform validators zod; do
-            scripts/"$gate"-gate.sh
+          for gate in auth filters streaming tanstack transform validators; do
+            scripts/entry-gate.sh "$gate"
           done
+          scripts/msw-gate.sh
+          scripts/zod-gate.sh
 
   verify-ts:
     name: consumer flag matrix on generated output

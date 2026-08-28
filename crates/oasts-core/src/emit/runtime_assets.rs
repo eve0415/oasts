@@ -5,7 +5,7 @@ use crate::config::ResolvedBaseUrl;
 use crate::ir::{ServerVariable, SourceRef};
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
-use super::model::EmissionModel;
+use super::model::{EmissionModel, Registrar};
 use super::{GeneratedFile, render_property_key, render_ts_string};
 
 const RESULT_TS: &str = include_str!("../../runtime/result.ts");
@@ -47,7 +47,8 @@ static RUNTIME_ASSETS: OnceLock<RuntimeAssets> = OnceLock::new();
 
 /// Inputs that determine the shared runtime modules emitted for one client.
 pub(crate) struct RuntimeSelection<'selection, 'input, 'sink> {
-    pub(crate) model: &'selection mut EmissionModel<'input, 'sink>,
+    pub(crate) model: &'selection EmissionModel<'input>,
+    pub(crate) registrar: &'selection mut Registrar<'sink>,
     pub(crate) helper_ids: &'selection BTreeSet<String>,
     pub(crate) base_url: &'selection ResolvedBaseUrl,
     /// Whether any server the client exposes is a relative URL, which needs the runtime transport
@@ -73,7 +74,7 @@ pub(crate) fn emit_runtime_files(selection: RuntimeSelection<'_, '_, '_>) -> Vec
 
     push_runtime_file(
         &mut files,
-        selection.model,
+        selection.registrar,
         selection.source,
         &runtime_directory,
         "result.ts",
@@ -85,7 +86,7 @@ pub(crate) fn emit_runtime_files(selection: RuntimeSelection<'_, '_, '_>) -> Vec
 
     push_runtime_file(
         &mut files,
-        selection.model,
+        selection.registrar,
         selection.source,
         &runtime_directory,
         "standard-schema.ts",
@@ -101,7 +102,7 @@ pub(crate) fn emit_runtime_files(selection: RuntimeSelection<'_, '_, '_>) -> Vec
     let serialize = render_serialize(&assets.serialize, selection.helper_ids, true);
     push_runtime_file(
         &mut files,
-        selection.model,
+        selection.registrar,
         selection.source,
         &runtime_directory,
         "serialize.ts",
@@ -115,7 +116,7 @@ pub(crate) fn emit_runtime_files(selection: RuntimeSelection<'_, '_, '_>) -> Vec
     );
     push_runtime_file(
         &mut files,
-        selection.model,
+        selection.registrar,
         selection.source,
         &runtime_directory,
         "transport.ts",
@@ -529,14 +530,14 @@ pub(super) fn rewrite_relative_ts_imports(source: &str, extension: &str) -> Stri
 
 fn push_runtime_file(
     files: &mut Vec<GeneratedFile>,
-    model: &mut EmissionModel<'_, '_>,
+    registrar: &mut Registrar<'_>,
     source: &SourceRef,
     runtime_directory: &str,
     file_name: &str,
     content: String,
 ) {
     let relative_path = format!("{runtime_directory}/{file_name}");
-    model.register_path(&relative_path, source);
+    registrar.register_path(&relative_path, source);
     files.push(GeneratedFile {
         relative_path,
         content,
@@ -610,9 +611,11 @@ mod tests {
         let helpers = helpers.into_iter().map(str::to_owned).collect();
         let source = source();
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, config, "digest".to_owned(), &mut registrar);
         let files = emit_runtime_files(RuntimeSelection {
-            model: &mut model,
+            model: &model,
+            registrar: &mut registrar,
             helper_ids: &helpers,
             base_url,
             relative_server_url: false,
@@ -745,9 +748,11 @@ mod tests {
         let helpers = BTreeSet::new();
         let base_url = ResolvedBaseUrl::Server { index: 0 };
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
         let relative = emit_runtime_files(RuntimeSelection {
-            model: &mut model,
+            model: &model,
+            registrar: &mut registrar,
             helper_ids: &helpers,
             base_url: &base_url,
             relative_server_url: true,
@@ -880,10 +885,12 @@ mod tests {
         let helpers = BTreeSet::new();
         let base_url = ResolvedBaseUrl::Server { index: 0 };
         let mut sink = DiagnosticSink::new();
-        let mut model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut sink);
-        model.register_path("RUNTIME/standard-schema.ts", &source);
+        let mut registrar = Registrar::new(&mut sink);
+        let model = EmissionModel::new(&analyzed, &config, "digest".to_owned(), &mut registrar);
+        registrar.register_path("RUNTIME/standard-schema.ts", &source);
         let files = emit_runtime_files(RuntimeSelection {
-            model: &mut model,
+            model: &model,
+            registrar: &mut registrar,
             helper_ids: &helpers,
             base_url: &base_url,
             relative_server_url: false,
