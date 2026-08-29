@@ -545,7 +545,7 @@ fn classify(code: &str) -> Outcome {
         // A config knob resolves it, and the diagnostic prints the block to paste. A public type
         // name is the user's to choose, so these stay fatal by design.
         "OASTS3002"     // a component name collision -> naming.overrides.schemas
-        | "OASTS6302"   // a path segment that is not a usable name -> naming.overrides.pathSegments
+        | "OASTS6302"   // a path segment or parameter that is not a usable name -> naming.overrides.pathSegments
         => Outcome::RefusedWithRemedy,
 
         // Constructs the project documents as out of scope.

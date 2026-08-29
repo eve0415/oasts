@@ -103,6 +103,6 @@ A local `source_id` is `workspace/<path>` relative to the workspace root, or `al
 | `OASTS4103` | error | A request/response variant's replacement is a declared component or another variant's replacement |
 | `OASTS4104` | warning | A `{Name}Wire` twin collides with a declared component — the document owns its name, so the twin is emitted as `{Name}WireValue` and generation continues |
 | `OASTS4105` | error | `{Name}WireValue` is also declared, so nothing compiler-invented is left to move |
-| `OASTS6302` | error | Two path nodes normalize to the same TanStack key-factory name, or that name shadows one of the module's imports |
+| `OASTS6302` | error | Two declared paths produce the same TanStack query key, or a path segment or parameter has no usable name — competing *names* are allocated apart instead ([details](/artifacts/tanstack#when-two-paths-would-fight-over-a-name)) |
 
 The full list is in [Diagnostics](/concepts/diagnostics#names-the-compiler-will-not-invent).

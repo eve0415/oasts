@@ -93,8 +93,12 @@ OpenAPI has no pagination vocabulary, so any such support would be a guess about
 ## When two paths would fight over a name
 
 Key bindings are derived from path text, so `/foo-bar` and `/foo_bar` want the same name — and so do `/foo/bar` and `/foo-bar`, a segment named `all`, and anything that normalizes to a name the generated module already uses.
-Every one of these is refused at generation with the two paths named, never resolved by a compiler-invented suffix that would shift under you the next time the document changes.
-`naming.overrides.pathSegments` is the way out, keyed by the raw segment text:
+The loser of each race takes the lowest free numeric suffix: `fooBar` and `fooBar2`, `all` and `all2`.
+Both paths keep a key of their own, and each key still carries its own raw segment text, so two paths never share a cache entry however they end up named.
+
+Which competitor keeps the bare name is decided by one walk — path nodes in pre-order, siblings sorted by raw segment text — so it is a property of the document rather than of the order operations appear in, and two runs over one document name everything identically.
+It is still a *derived* name: adding a path that sorts earlier can shift a suffix onto a binding that did not have one.
+Pin the names you import by hand with `naming.overrides.pathSegments`, keyed by the raw segment text:
 
 ```yaml title="oasts.yaml"
 naming:
@@ -102,3 +106,7 @@ naming:
     pathSegments:
       foo_bar: fooBarUnderscore
 ```
+
+Two things are still refused, because no name resolves them.
+Two declared paths whose key elements are identical — `/pets` and `/pets/`, where the separator-only segment contributes nothing — would share one cache entry whatever their bindings are called.
+And a segment whose text yields no identifier at all, such as one with no ASCII form, has no derived name to put a suffix on; an override is the only thing that can give it one.
