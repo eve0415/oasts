@@ -42,6 +42,7 @@ const CODE_REMOTE_UNAVAILABLE: &str = "OASTS2025";
 const CODE_LOCAL_FROM_RETRIEVED: &str = "OASTS2026";
 const CODE_ID_CLAIMS_PINNED: &str = "OASTS2027";
 const CODE_DUPLICATE_RESOURCE: &str = "OASTS2028";
+const CODE_UNUSED_PIN: &str = "OASTS2029";
 const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
 /// Percent-encoding writes uppercase hex, which is what `percent_encoding` emits.
 const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
@@ -762,6 +763,7 @@ impl<'a> GraphBuilder<'a> {
             0,
             &mut state,
         )?;
+        self.report_unused_pins();
         let documents = self
             .documents
             .into_iter()
@@ -786,6 +788,29 @@ impl<'a> GraphBuilder<'a> {
             },
             self.warnings,
         ))
+    }
+
+    /// Warns about a pin no document in the graph was retrieved from.
+    ///
+    /// A pin that nothing consults is dead configuration, and it is dead in one of two ways: the
+    /// URI is genuinely unused, or something answered a reference to it without retrieving it. The
+    /// second is the shape a substitution takes, so the warning is worth having even though the
+    /// substitutions it would have caught are now refused outright.
+    fn report_unused_pins(&mut self) {
+        for uri in self.config.remote.integrity.keys() {
+            if !self.uri_to_id.contains_key(uri) {
+                let mut warning = Diagnostic::input(
+                    CODE_UNUSED_PIN,
+                    format!(
+                        "remote.integrity pins '{uri}', which no document in this compile was retrieved from"
+                    ),
+                )
+                .with_source(uri)
+                .with_json_pointer("/remote/integrity");
+                warning.severity = Severity::Warning;
+                self.warnings.push(warning);
+            }
+        }
     }
 
     fn load_document(&mut self, requested_path: &Path) -> Result<DocId, Diagnostic> {
@@ -5870,6 +5895,35 @@ mod tests {
         // The compile fails rather than substituting, which is the whole point: before this, the
         // claim was answered from the registry and the pin was never consulted.
         assert_eq!(fetcher.requests(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_pin_nothing_was_retrieved_from_is_reported_as_dead_configuration() {
+        const UNUSED_URI: &str = "https://specs.example.test/unused.yaml";
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::new([(ENTRY_URI, body(ENTRY_DOCUMENT))]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "",
+                &[(ENTRY_URI, ENTRY_DOCUMENT), (UNUSED_URI, "const: UNUSED\n")],
+            ),
+        );
+
+        let (graph, diagnostics) = load_retrieving(&config, &fetcher);
+
+        assert!(graph.is_some());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, CODE_UNUSED_PIN);
+        assert_eq!(diagnostics[0].severity, Severity::Warning);
+        assert!(
+            diagnostics[0].message.contains(UNUSED_URI),
+            "{}",
+            diagnostics[0].message
+        );
+        assert_eq!(fetcher.requests(), [ENTRY_URI]);
     }
 
     #[test]
