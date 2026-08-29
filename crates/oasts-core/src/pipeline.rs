@@ -287,6 +287,77 @@ mod tests {
         assert_eq!(diagnostics[0].code, "OASTS0221");
     }
 
+    /// A retriever that answers one URI, so a compile can be driven without a network.
+    #[derive(Debug)]
+    struct OneDocument {
+        uri: String,
+        document: Vec<u8>,
+    }
+
+    impl crate::source::RemoteFetcher for OneDocument {
+        fn fetch_once(
+            &self,
+            url: &str,
+            _policy: &crate::source::FetchPolicy,
+        ) -> Result<crate::source::FetchStep, String> {
+            if url == self.uri {
+                Ok(crate::source::FetchStep::Body(self.document.clone()))
+            } else {
+                Err(format!("nothing is served at '{url}'"))
+            }
+        }
+    }
+
+    #[test]
+    fn compiling_a_retrieved_document_twice_emits_the_same_bytes() {
+        const URI: &str = "https://specs.example.test/openapi.yaml";
+        let document = wide_document(2, 2);
+        let digest =
+            crate::emit::lower_hex(&<sha2::Sha256 as sha2::Digest>::digest(document.as_bytes()));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("oasts.yaml"),
+            format!(
+                "schemaVersion: 1\ninput: {{ url: \"{URI}\" }}\noutput: generated\ntypescript: {{ tsconfig: \"off\" }}\nremote:\n  allowHosts: [specs.example.test]\n  integrity:\n    \"{URI}\": \"{}{digest}\"\n",
+                crate::config::INTEGRITY_PREFIX
+            ),
+        )
+        .expect("config");
+        let config = load_config(Some(&temp.path().join("oasts.yaml")), temp.path())
+            .expect("a pinned retrieval config resolves");
+
+        let compile_once = || {
+            let fetcher = FetcherHandle::from(Arc::new(OneDocument {
+                uri: URI.to_owned(),
+                document: document.as_bytes().to_vec(),
+            })
+                as Arc<dyn crate::source::RemoteFetcher>);
+            let mut sink = DiagnosticSink::new();
+            let files = compile_from(&config, SourceHandle::Fs, fetcher, true, &mut sink)
+                .expect("a retrieved document compiles");
+            assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+            files
+        };
+
+        let first = compile_once();
+        let second = compile_once();
+
+        assert_eq!(first, second);
+        // The URI is the document's identity all the way through emission, so a reader of the
+        // generated code can see which document a declaration came from.
+        assert!(
+            first
+                .iter()
+                .any(|file| file.content.contains(&format!("// Source: {URI}#"))),
+            "{:#?}",
+            first
+                .iter()
+                .map(|file| &file.relative_path)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn a_remote_block_is_refused_by_a_host_that_cannot_reach_the_network() {
         let mut raw = shared_config();
