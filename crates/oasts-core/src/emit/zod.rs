@@ -4455,10 +4455,12 @@ mod tests {
         let start = source
             .find(&declaration)
             .unwrap_or_else(|| panic!("missing const {name}"));
+        // A regex literal's character class can hold a bare `;`, so the first semicolon is not the
+        // end of the declaration; the one that ends its line is.
         let end = source[start..]
-            .find(';')
+            .find(";\n")
             .map(|offset| start + offset)
-            .expect("const terminator");
+            .unwrap_or_else(|| panic!("unterminated const {name}"));
         &source[start..=end]
     }
 
@@ -4484,6 +4486,12 @@ mod tests {
     #[should_panic(expected = "missing const ABSENT")]
     fn runtime_const_extraction_rejects_a_missing_declaration() {
         extract_const("const PRESENT = 1;", "ABSENT");
+    }
+
+    #[test]
+    #[should_panic(expected = "unterminated const BROKEN")]
+    fn runtime_const_extraction_rejects_an_unterminated_declaration() {
+        extract_const("const BROKEN = 1;", "BROKEN");
     }
 
     #[test]
