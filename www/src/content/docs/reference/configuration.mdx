@@ -62,21 +62,27 @@ input:
   path: ./openapi.yaml
 ```
 
-<Aside type="caution" title="`url` is accepted by the schema but refused at load">
-  This build does not fetch documents.
-  `input.url` — and any `$ref` that resolves to an `http(s)` target — fails with `error[OASTS9201]: remote loading is not supported in this build`.
-  The key is in the schema so configs stay forward-compatible; today, bundle or vendor the document and point `input.path` at it.
+`input.url` names a document to retrieve over HTTP(S). Naming one is not enough on its own:
 
-  `OASTS9201` is in the [provisional band](/concepts/diagnostics) — a capability gated off rather than a refusal on the merits.
-</Aside>
+```yaml title="oasts.yaml"
+schemaVersion: 1
+input:
+  url: https://api.example.com/openapi.yaml
+output: ./generated
+```
 
-An `https://` `$id` inside the document is not itself a problem: `$id` names a schema resource, it is not a request to fetch one.
-Only something that actually has to be *read* over the network is refused.
+That config is refused with `error[OASTS2021]: retrieving 'https://api.example.com/openapi.yaml' is not authorized: 'api.example.com' is not listed in remote.allowHosts`, and nothing is requested.
+Retrieval needs the host authorized and the bytes pinned, both under [`remote`](#remote).
+
+An `https://` `$id` inside the document is a different thing entirely: `$id` names a schema resource, it is not a request to retrieve one.
+A `$ref` naming a resource the document already declares is answered from the document, and no request is made.
 
 It is not inert, though.
-`$id` re-bases every relative `$ref` beneath it, so a sibling `$ref: "./tag.yaml"` that resolves to a local file today resolves to `https://…/tag.yaml` once you add an `https://` `$id` above it — and then it does have to be read, and it is an `OASTS9201`.
+`$id` re-bases every relative `$ref` beneath it, so a sibling `$ref: "./tag.yaml"` that resolves to a local file today resolves to `https://…/tag.yaml` once you add an `https://` `$id` above it — and then it does have to be retrieved.
 Same for a `#/components/…` pointer written inside an `$id`'d schema: it resolves against that resource, not the document root.
 If adding an `$id` broke a `$ref` that worked before, this is why.
+
+Such a `$ref` is refused with `OASTS2021` unless `remote` authorizes and pins it, so adding retrieval to this compiler did not make any document that used to compile offline start making requests.
 
 ## `output`, `namespace`
 
@@ -313,6 +319,46 @@ local:
 Entries are resolved relative to the config file and **must be relative** — an absolute path is an `OASTS0221`.
 The default is empty, so a document only reaches what the workspace root already covers.
 
+## `remote`
+
+The trust boundary and retrieval policy for documents read over HTTP(S), the way `local` is the boundary for documents read from disk:
+
+```yaml title="oasts.yaml"
+remote:
+  allowHosts:
+    - api.example.com
+  allowInsecure: false
+  timeoutMs: 30000
+  maxRedirects: 3
+  integrity:
+    "https://api.example.com/openapi.yaml": "sha256:8b4a7f7b1d2c0e5a9f3b6d8c1e4a7f0b3d6c9e2a5f8b1d4c7e0a3f6b9d2c5e8a"
+```
+
+Every key defaults to the conservative reading, so a config with no `remote` block retrieves nothing at all.
+
+`allowHosts` is the boundary. It defaults to empty, which authorizes no host, and each entry is a bare host name — a scheme, a port, or a path in an entry is an `OASTS0271`. Matching is on the host alone, so any port on an authorized host is admitted. A URI naming an unlisted host is an `OASTS2021` and no request is made.
+
+`integrity` maps each retrievable URI to the digest of the bytes it must serve, written as `sha256:` and 64 lowercase hex digits — the same rendering as the `Source digest` in every emitted file. There is no unpinned mode:
+
+- A URI with no entry is an `OASTS2022`, refused before anything is requested.
+- Bytes that hash to anything else are an `OASTS2023`, and the message prints the digest that *was* served so recording it is a copy rather than a transcription. Fetch once, read the digest out of the diagnostic, paste it in.
+
+That is what keeps [determinism](/concepts/determinism) byte-keyed when the bytes arrive over a network. It also means each URI is pinned on its own: a `$ref` from a retrieved document to another URI needs its own `integrity` entry.
+
+`allowInsecure` defaults to `false`, so only `https` is retrieved and a plain `http` URI is an `OASTS2021`. TLS certificates are always verified against the Mozilla root program; there is no setting that turns that off.
+
+`maxRedirects` defaults to `3` and bounds how many `3xx` hops one retrieval may take. Redirects are not delegated: the compiler resolves each `Location`, checks the host it names against `allowHosts`, and only then makes the next request — so a redirect cannot deliver a document from a host you did not list. Exceeding the budget is an `OASTS2024`.
+
+A retrieved document keeps the URI that was **requested** as its identity, not the one a redirect landed on. Relative `$ref`s inside it therefore resolve against the URI you wrote, which is what makes the compile a function of the URI plus its pinned digest rather than of wherever a redirect points today.
+
+`timeoutMs` defaults to `30000` and bounds each request. Anything the network does wrong — refused connection, DNS failure, timeout, a non-`200` status, a body over `limits.maxDocumentBytes` — is an `OASTS2024` naming the URI and what went wrong. There is no cache and no stale fallback: a build with no network fails, loudly, saying what it could not retrieve.
+
+<Aside type="caution" title="Retrieval is a host capability">
+  The [playground](/playground) compiles in your browser, in a WebAssembly module that declares no imports and so cannot make a request at all.
+  It refuses a `remote` block while reading the config, and refuses an authorized URI with `OASTS2025`.
+  The CLI and the Node package both retrieve normally.
+</Aside>
+
 ## `compat`
 
 Opt-in departures from strict OpenAPI conformance, for documents describing a server that is itself non-conformant:
@@ -332,13 +378,13 @@ compat:
 
 ## Reserved keys
 
-`specs`, `shared`, `remote`, `watch` and `ci` are accepted by the schema but not implemented in this build.
+`specs`, `shared`, `watch` and `ci` are accepted by the schema but not implemented in this build.
 They are reserved so a config written today does not have to change shape when they land, and they refuse in the [provisional band](/concepts/diagnostics) rather than as ordinary config errors:
 
 | Key | Code |
 | --- | --- |
 | `specs`, `shared` | `OASTS9002` — workspace configs |
-| `remote`, `watch`, `ci` | `OASTS9003` — the surrounding capability |
+| `watch`, `ci` | `OASTS9003` — the surrounding capability |
 
 The CLI has the same arrangement: `oasts watch` parses and then refuses with `OASTS9004`, and `--spec` refuses with the same `OASTS9002` the `specs` key does.
 Both exit `2`.

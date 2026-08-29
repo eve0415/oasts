@@ -14,7 +14,7 @@ oasts is a compiler, and three of its stages explain most of its behaviour.
   <Step title="Load">
     The document is read from `input.path`, along with everything it `$ref`s.
     Local references stay inside a trust boundary you control; the graph is bounded by `limits`.
-    (`input.url` exists in the config schema, but a remote entry point is refused at load with `OASTS9201` — see the [provisional band](/concepts/diagnostics).)
+    `input.url` reads the entry point over HTTP(S) instead, from a host [`remote.allowHosts`](/reference/configuration#remote) authorizes and a digest `remote.integrity` pins.
   </Step>
   <Step title="Model">
     One versioned model is built from the whole document: schemas, operations, parameters, media types, security requirements.

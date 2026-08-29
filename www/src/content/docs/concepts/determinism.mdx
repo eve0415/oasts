@@ -12,6 +12,10 @@ Two things in that sentence are load-bearing for every config, and a third — *
 Your `tsconfig.json` is the only consumer-side file that reaches emitted bytes: it decides whether generated code carries the `esnext.temporal` reference directive, and `typescript.tsconfig: off` drops that dependency.
 And identity is keyed to your document's bytes, not its meaning — reformatting your OpenAPI file with no semantic change shifts the recorded source digest and will drift `--check`.
 
+A document read over the network is held to the same key rather than exempted from it.
+[`remote.integrity`](/reference/configuration#remote) pins each retrievable URI to the digest of the bytes it must serve, a URI with no pin is refused, and a retrieved document is identified by the URI you wrote rather than by wherever a redirect leads — so the same config either produces the same bytes or fails, and never quietly produces different ones.
+A document reached at a URL and the same document vendored to a path are two different inputs, and their digests differ accordingly: identity includes where each document came from, not only what was in it.
+
 ## A script config is a program
 
 The `.yaml` and `.json` forms are data and cannot vary; a `.ts` or `.js` config is a module the CLI imports, so the config for a run is whatever that module returned on that run.
