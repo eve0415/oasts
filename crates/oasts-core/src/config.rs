@@ -1694,6 +1694,9 @@ fn resolve_remote(
     }
 
     let mut integrity = BTreeMap::new();
+    // Canonical URI back to the spelling that produced it, so two keys naming one document are
+    // reported as the pair they are rather than one of them quietly replacing the other.
+    let mut spelled: BTreeMap<String, &String> = BTreeMap::new();
     for (uri, digest) in &remote.integrity {
         let shown = without_credentials(uri);
         let Some(key) = retrievable_uri(uri) else {
@@ -1718,6 +1721,19 @@ fn resolve_remote(
             ));
             continue;
         }
+        if let Some(previous) = spelled.get(&key) {
+            sink.push(config_error(
+                CODE_REMOTE,
+                format!(
+                    "remote.integrity keys '{}' and '{shown}' both name '{key}'; pin each document once, or one pin silently replaces the other",
+                    without_credentials(previous)
+                ),
+                Some(source),
+                Some("/remote/integrity"),
+            ));
+            continue;
+        }
+        spelled.insert(key.clone(), uri);
         integrity.insert(key, digest.clone());
     }
     remote.integrity = integrity;
@@ -4778,6 +4794,37 @@ mod tests {
                 .integrity
                 .get("https://specs.example.test/openapi.yaml"),
             Some(&digest)
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_one_uri_are_a_conflict_rather_than_a_discarded_pin() {
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let mut value = valid_json_value();
+        value["remote"] = json!({
+            "integrity": {
+                "https://specs.example.test/a/../openapi.yaml": digest.clone(),
+                "https://specs.example.test/openapi.yaml": digest,
+            }
+        });
+
+        let diagnostics = assert_code(load_json(&value), CODE_REMOTE);
+
+        // Both spellings are named: a reviewer reading the surviving pin has to be told the other
+        // one was there, or a diff that adds a second spelling silently replaces the first.
+        let reported = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_REMOTE)
+            .expect("a conflict diagnostic");
+        assert!(
+            reported.message.contains("a/../openapi.yaml"),
+            "{}",
+            reported.message
+        );
+        assert!(
+            reported.message.contains("both name"),
+            "{}",
+            reported.message
         );
     }
 
