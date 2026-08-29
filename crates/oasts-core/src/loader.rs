@@ -39,6 +39,8 @@ const CODE_REMOTE_UNPINNED: &str = "OASTS2022";
 const CODE_REMOTE_INTEGRITY: &str = "OASTS2023";
 const CODE_REMOTE_RETRIEVAL: &str = "OASTS2024";
 const CODE_REMOTE_UNAVAILABLE: &str = "OASTS2025";
+const CODE_ID_CLAIMS_PINNED: &str = "OASTS2027";
+const CODE_DUPLICATE_RESOURCE: &str = "OASTS2028";
 const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
 /// Percent-encoding writes uppercase hex, which is what `percent_encoding` emits.
 const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
@@ -53,6 +55,20 @@ impl DocId {
     pub const fn index(self) -> usize {
         self.0
     }
+}
+
+/// What a document may claim as a schema resource identity.
+///
+/// `$id` is a claim, not a fact, and the registry answers `$ref`s from claims without reading
+/// anything. That is correct for a bundled document and catastrophic for a pinned one: a claim on
+/// a pinned URI would substitute the claimant for the document the configuration pinned, with no
+/// request made and no digest checked.
+#[derive(Clone, Copy)]
+struct ResourceClaims<'a> {
+    /// URIs `remote.integrity` pins to particular bytes.
+    pinned: &'a BTreeMap<String, String>,
+    /// The URI this document was itself retrieved from, which it may of course claim.
+    own_uri: Option<&'a str>,
 }
 
 /// Where a document came from, and the identity its references resolve against.
@@ -70,6 +86,14 @@ pub enum DocumentLocation {
 }
 
 impl DocumentLocation {
+    /// The URI this document was retrieved from, if it was.
+    fn retrieved_from(&self) -> Option<&str> {
+        match self {
+            Self::File(_) => None,
+            Self::Remote(url) => Some(url.as_str()),
+        }
+    }
+
     /// The retrieval URI relative references resolve against.
     fn retrieval_url(&self) -> Result<Url, String> {
         match self {
@@ -1011,7 +1035,11 @@ impl<'a> GraphBuilder<'a> {
             let base = location
                 .retrieval_url()
                 .expect("a loaded document's location is representable as a retrieval URI");
-            collect_anchors(&value, id, base, &source_id, &mut self.identifiers)?;
+            let claims = ResourceClaims {
+                pinned: &self.config.remote.integrity,
+                own_uri: location.retrieved_from(),
+            };
+            collect_anchors(&value, id, base, &source_id, claims, &mut self.identifiers)?;
         }
         self.documents.push(Rc::new(Document {
             id,
@@ -1583,6 +1611,7 @@ fn collect_anchors(
     doc_id: DocId,
     base: Url,
     source_id: &str,
+    claims: ResourceClaims<'_>,
     identifiers: &mut IdentifierRegistry,
 ) -> Result<(), Diagnostic> {
     let context = if value.get("openapi").is_some() {
@@ -1590,7 +1619,16 @@ fn collect_anchors(
     } else {
         WalkContext::Schema
     };
-    collect_anchors_at(value, doc_id, "", context, base, source_id, identifiers)
+    collect_anchors_at(
+        value,
+        doc_id,
+        "",
+        context,
+        base,
+        source_id,
+        claims,
+        identifiers,
+    )
 }
 
 fn collect_anchors_at(
@@ -1600,6 +1638,7 @@ fn collect_anchors_at(
     context: WalkContext,
     mut base: Url,
     source_id: &str,
+    claims: ResourceClaims<'_>,
     identifiers: &mut IdentifierRegistry,
 ) -> Result<(), Diagnostic> {
     if context == WalkContext::Skip {
@@ -1622,16 +1661,46 @@ fn collect_anchors_at(
             return Ok(());
         };
         base = resolved;
+        let resource = resource_base_uri(&base);
+        let id_pointer = append_pointer(pointer, "$id");
+        // The configuration says that URI has particular bytes; the document says it *is* that
+        // URI. Resolving that in the document's favour is what would let any document in the graph
+        // stand in for a pinned one, unrequested and unhashed, so it is refused instead.
+        if claims.pinned.contains_key(&resource) && claims.own_uri != Some(resource.as_str()) {
+            return Err(input_error(
+                CODE_ID_CLAIMS_PINNED,
+                format!(
+                    "$id claims '{resource}', which remote.integrity pins; a document may only claim the URI it was retrieved from"
+                ),
+                Some(source_id),
+                Some(&id_pointer),
+            ));
+        }
         // `$id` is what makes this subtree a schema *resource*, and resource identity is the unit
         // the dynamic-scope walk counts in. Record the root so a dynamic reference resolving to
         // this resource's URI can find the schema it names.
-        identifiers
-            .resources
-            .entry(resource_base_uri(&base))
-            .or_insert_with(|| NodeLocation {
-                doc_id,
-                json_pointer: pointer.to_owned(),
-            });
+        //
+        // A second claim on one URI is refused rather than dropped: whichever arrived first would
+        // silently answer every reference to it, and which one that is depends on load order.
+        match identifiers.resources.entry(resource) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(NodeLocation {
+                    doc_id,
+                    json_pointer: pointer.to_owned(),
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(taken) => {
+                return Err(input_error(
+                    CODE_DUPLICATE_RESOURCE,
+                    format!(
+                        "$id '{}' is already declared as a schema resource; one URI names one resource",
+                        taken.key()
+                    ),
+                    Some(source_id),
+                    Some(&id_pointer),
+                ));
+            }
+        }
     }
 
     if context == WalkContext::Schema
@@ -1691,6 +1760,7 @@ fn collect_anchors_at(
                         child_context,
                         base.clone(),
                         source_id,
+                        claims,
                         identifiers,
                     )?;
                 }
@@ -1707,6 +1777,7 @@ fn collect_anchors_at(
                         child_context,
                         base.clone(),
                         source_id,
+                        claims,
                         identifiers,
                     )?;
                 }
@@ -4019,12 +4090,14 @@ mod tests {
             ]
         });
         let mut identifiers = IdentifierRegistry::default();
+        let pins = BTreeMap::new();
 
         collect_anchors(
             &value,
             DocId(4),
             base.clone(),
             "entry.yaml",
+            unpinned_claims(&pins),
             &mut identifiers,
         )
         .expect("invalid IDs should stop only their subtrees");
@@ -4072,6 +4145,7 @@ mod tests {
             WalkContext::Skip,
             base.clone(),
             "entry.yaml",
+            unpinned_claims(&pins),
             &mut identifiers,
         )
         .expect("skipped contexts are ignored");
@@ -4082,6 +4156,7 @@ mod tests {
             WalkContext::SchemaMap,
             base.clone(),
             "entry.yaml",
+            unpinned_claims(&pins),
             &mut identifiers,
         )
         .expect("schema-map arrays are ignored");
@@ -4093,6 +4168,7 @@ mod tests {
                 WalkContext::Schema,
                 base,
                 "entry.yaml",
+                unpinned_claims(&pins),
                 &mut identifiers,
             )
             .expect_err("non-string anchor should fail")
@@ -4105,6 +4181,7 @@ mod tests {
                 DocId(4),
                 file_url(&directory.path().join("invalid.yaml")).expect("file URL"),
                 "invalid.yaml",
+                unpinned_claims(&pins),
                 &mut identifiers,
             )
             .expect_err("array child errors should propagate")
@@ -5102,6 +5179,14 @@ mod tests {
         }
     }
 
+    /// Claims for a document that was read locally, with nothing pinned.
+    fn unpinned_claims(pins: &BTreeMap<String, String>) -> ResourceClaims<'_> {
+        ResourceClaims {
+            pinned: pins,
+            own_uri: None,
+        }
+    }
+
     fn body(document: &str) -> Result<FetchStep, String> {
         Ok(FetchStep::Body(document.as_bytes().to_vec()))
     }
@@ -5648,8 +5733,8 @@ mod tests {
             "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $id: https://schemas.example.test/pet.yaml\n      type: object\n    Owner:\n      $ref: https://schemas.example.test/pet.yaml\n",
         );
         let fetcher = RecordingFetcher::silent();
-        // Authorized and pinned as generously as any config could be: the point is that a document
-        // compiling offline today keeps compiling offline, not that it is refused politely.
+        // Authorized as generously as any config could be: the point is that a document compiling
+        // offline today keeps compiling offline, not that it is refused politely.
         let config = resolved_config(
             directory.path(),
             &remote_block(&["schemas.example.test"], "", &[]),
@@ -5659,6 +5744,100 @@ mod tests {
 
         assert!(graph.is_some(), "{diagnostics:#?}");
         assert_eq!(fetcher.requests(), Vec::<String>::new());
+
+        // The same document is refused the moment the configuration pins that URI: answering the
+        // reference from the claim would substitute this schema for the pinned bytes.
+        let pinned = resolved_config(
+            directory.path(),
+            &remote_block(
+                &["schemas.example.test"],
+                "",
+                &[("https://schemas.example.test/pet.yaml", "const: GENUINE\n")],
+            ),
+        );
+
+        assert_retrieval_code(&pinned, &fetcher, CODE_ID_CLAIMS_PINNED);
+        assert_eq!(fetcher.requests(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_local_id_may_not_claim_a_pinned_uri_and_stand_in_for_it() {
+        const PINNED_URI: &str = "https://specs.example.test/pinned.yaml";
+        let directory = TempDir::new().expect("tempdir should be created");
+        // The impostor: a local schema declaring the pinned document's URI as its own identity,
+        // and a reference to that URI which the registry would answer from the claim.
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            &format!(
+                "openapi: 3.1.0\ncomponents:\n  schemas:\n    Impostor:\n      $id: {PINNED_URI}\n      const: IMPOSTOR\n    Pinned:\n      $ref: {PINNED_URI}\n"
+            ),
+        );
+        let fetcher = RecordingFetcher::new([(PINNED_URI, body("const: GENUINE\n"))]);
+        let config = resolved_config(
+            directory.path(),
+            &remote_block(
+                &["specs.example.test"],
+                "",
+                &[(PINNED_URI, "const: GENUINE\n")],
+            ),
+        );
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_ID_CLAIMS_PINNED);
+
+        assert!(
+            diagnostic.message.contains(PINNED_URI),
+            "{}",
+            diagnostic.message
+        );
+        // The compile fails rather than substituting, which is the whole point: before this, the
+        // claim was answered from the registry and the pin was never consulted.
+        assert_eq!(fetcher.requests(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_retrieved_document_may_claim_the_uri_it_came_from() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let document = format!("$id: {ENTRY_URI}\nconst: GENUINE\n");
+        let fetcher = RecordingFetcher::new([(ENTRY_URI, body(&document))]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "",
+                &[(ENTRY_URI, document.as_str())],
+            ),
+        );
+
+        let (graph, diagnostics) = load_retrieving(&config, &fetcher);
+
+        // The claim is true here, and the bytes behind it were pinned and checked.
+        assert!(graph.is_some(), "{diagnostics:#?}");
+        assert_eq!(fetcher.requests(), [ENTRY_URI]);
+    }
+
+    #[test]
+    fn one_uri_may_not_be_declared_by_two_schema_resources() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    First:\n      $id: https://schemas.example.test/thing.yaml\n      type: string\n    Second:\n      $id: https://schemas.example.test/thing.yaml\n      type: integer\n",
+        );
+        let fetcher = RecordingFetcher::silent();
+        let config = resolved_config(directory.path(), "");
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_DUPLICATE_RESOURCE);
+
+        // Which claim wins would otherwise depend on load order, silently.
+        assert!(
+            diagnostic
+                .message
+                .contains("https://schemas.example.test/thing.yaml"),
+            "{}",
+            diagnostic.message
+        );
     }
 
     #[test]
