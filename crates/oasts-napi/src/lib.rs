@@ -184,11 +184,15 @@ fn render(outcome: Outcome) -> RunResult {
     }
 }
 
-fn parse_command(name: &str, check: bool) -> Result<Command, Unsupported<'_>> {
+/// Maps the command name the host parsed onto the driver's command.
+///
+/// `generate` for anything else: the two CLI front ends both constrain the name
+/// before it gets here, so an unknown one is a host-contract error rather than
+/// a diagnostic the product declares.
+fn parse_command(name: &str, check: bool) -> Command {
     match name {
-        "generate" => Ok(Command::Generate { check }),
-        "check" => Ok(Command::Check),
-        other => Err(Unsupported::Command(other)),
+        "check" => Command::Check,
+        _ => Command::Generate { check },
     }
 }
 
@@ -209,10 +213,7 @@ pub fn run(options: RunOptions) -> RunResult {
         return render(driver::refuse(Unsupported::SpecSelection));
     }
 
-    let command = match parse_command(&options.command, options.check) {
-        Ok(command) => command,
-        Err(surface) => return render(driver::refuse(surface)),
-    };
+    let command = parse_command(&options.command, options.check);
     let config_path = Path::new(&options.config_path);
     let source = match options.config_json.as_deref() {
         Some(json) => ConfigSource::Json {

@@ -22,13 +22,7 @@ import type { FSWatcher } from "node:fs";
 import { dirname, join, sep } from "node:path";
 
 import { loadScriptConfig } from "./config/load.ts";
-import {
-  CliFailure,
-  CODE_WATCH_IO,
-  type Diagnostic,
-  fromNativeError,
-  render,
-} from "./diagnostics.ts";
+import { CliFailure, CODE_WATCH_IO, configFailure, fromNativeError } from "./diagnostics.ts";
 import type { DiscoveredConfigJs, RunOptions, RunResult } from "./native.ts";
 
 /** What one compile left behind for the next wait. */
@@ -240,12 +234,8 @@ async function waitForChange(
 
 /** The failure a session ends on: a directory it was told to watch and could not. */
 export function watchFailure(reason: string): Cycle {
-  const diagnostic: Diagnostic = {
-    code: CODE_WATCH_IO,
-    severity: "error",
-    message: `failed to watch for changes: ${reason}`,
-  };
-  return { exitCode: 2, stdout: "", stderr: render([diagnostic]), plan: null };
+  const failure = configFailure(CODE_WATCH_IO, `failed to watch for changes: ${reason}`);
+  return { exitCode: failure.exitCode, stdout: "", stderr: failure.renderedStderr, plan: null };
 }
 
 /** The `watch.debounceMs` default, for a cycle that never reached a configuration to read it. */

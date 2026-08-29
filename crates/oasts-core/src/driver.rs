@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::WatchConfig;
-use crate::config::{self, CODE_COMMAND_UNSUPPORTED, CODE_WORKSPACE_UNSUPPORTED, ResolvedConfig};
+use crate::config::{self, CODE_WORKSPACE_UNSUPPORTED, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::emit::GeneratedFile;
 use crate::inputs::{InputRecorder, WatchPlan};
@@ -30,9 +30,7 @@ pub enum Command {
 
 /// A surface this build declares but does not implement.
 #[derive(Clone, Copy, Debug)]
-pub enum Unsupported<'a> {
-    /// A command the CLI advertises without implementing it.
-    Command(&'a str),
+pub enum Unsupported {
     /// `--spec`, which selects one spec out of a workspace config.
     SpecSelection,
 }
@@ -42,12 +40,8 @@ pub enum Unsupported<'a> {
 /// Hosts ask for this instead of writing an `OASTS` code themselves, so every
 /// code in the product is declared exactly once, here in the core.
 #[must_use]
-pub fn refuse(surface: Unsupported<'_>) -> Outcome {
+pub fn refuse(surface: Unsupported) -> Outcome {
     let diagnostic = match surface {
-        Unsupported::Command(command) => Diagnostic::config(
-            CODE_COMMAND_UNSUPPORTED,
-            format!("the {command} command is not supported in this build"),
-        ),
         Unsupported::SpecSelection => Diagnostic::config(
             CODE_WORKSPACE_UNSUPPORTED,
             "--spec selects a workspace spec, and workspace configuration is not supported in this build",
