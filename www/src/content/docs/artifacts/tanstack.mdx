@@ -98,7 +98,8 @@ The loser of each race takes the lowest free numeric suffix: `fooBar` and `fooBa
 Both paths keep a key of their own, and each key still carries its own raw segment text, so two paths never share a cache entry however they end up named.
 
 Which competitor keeps the bare name is decided by one walk — configured members first, then derived ones, siblings in raw segment order, path nodes in pre-order — so it is a property of the document rather than of the order operations appear in, and two runs over one document name everything identically.
-A name you configured never moves; a derived one still can, because adding a path that sorts earlier shifts the suffix onto a binding that did not have one.
+A name you configured never moves: it is claimed before any derived name is allocated, and when one cannot be honored at all — because it names an identifier the generated modules bind, or the `all` every node spends on its own key, or a name a second entry already took — the run refuses and names the entry rather than emitting something else under it.
+A derived name still can move, because adding a path that sorts earlier shifts the suffix onto a binding that did not have one.
 That is what the warning is for, and pinning the names you import by hand is what stops it — `naming.overrides.pathSegments`, keyed by the raw segment text:
 
 ```yaml title="oasts.yaml"
@@ -108,6 +109,13 @@ naming:
       foo_bar: fooBarUnderscore
 ```
 
-Two things are still refused, because no name resolves them.
+Three things are still refused, because no name resolves them.
 Two declared paths whose key elements are identical — `/pets` and `/pets/`, where the separator-only segment contributes nothing — would share one cache entry whatever their bindings are called.
-And a segment whose text yields no identifier at all, such as one with no ASCII form, has no derived name to put a suffix on; an override is the only thing that can give it one.
+A segment whose text yields no identifier at all, such as one with no ASCII form, has no derived name to put a suffix on; an override is the only thing that can give it one.
+And a path *parameter* whose name is not an identifier has nothing that can name it: the key function takes it positionally, so it needs a real identifier, and `pathSegments` names members rather than parameters.
+
+<Aside type="note">
+  A path template naming one parameter twice — `/orders/{orderId}/lines/{orderId}` — is not refused.
+  The key function takes that parameter once and repeats it at both elements, because the client substitutes the single declared value into both occurrences; a factory taking two arguments could name a request the client cannot make.
+  Nothing is renamed, so nothing is reported.
+</Aside>
