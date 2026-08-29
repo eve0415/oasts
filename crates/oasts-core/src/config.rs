@@ -49,8 +49,9 @@ const CODE_TRUST_LIMITS: &str = "OASTS0221";
 const CODE_TYPESCRIPT: &str = "OASTS0251";
 /// The `remote` block. Sits above the highest allocated config code, which stops at 0263.
 const CODE_REMOTE: &str = "OASTS0271";
-/// The `watch` block.
-const CODE_WATCH: &str = "OASTS0261";
+/// The `watch` block. Rule 26 is the filters block and rule 27 the remote block, so this opens
+/// rule 28.
+const CODE_WATCH: &str = "OASTS0281";
 const CODE_CONFIG_READ: &str = "OASTS1001";
 pub(crate) const CODE_WORKSPACE_UNSUPPORTED: &str = "OASTS9002";
 pub(crate) const CODE_BLOCK_UNSUPPORTED: &str = "OASTS9003";
