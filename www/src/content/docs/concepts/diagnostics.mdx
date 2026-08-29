@@ -81,6 +81,7 @@ All errors, all exit `2`.
 | --- | --- |
 | `OASTS0102` | An artifact's output directory is unusable: it overlaps another enabled artifact's — equal or nested — or its own value is not a relative path of `[A-Za-z0-9_-]` segments |
 | `OASTS0221` | A `local.allowPaths` entry that is not relative, or a `limits.*` value outside its permitted range |
+| `OASTS0271` | A `remote` entry that is not a bare host name, not a retrievable URI, or not a `sha256:` digest — or a `remote` block at all, on a host with no network |
 | `OASTS0261` | A filter pattern is a regex literal whose body does not compile |
 | `OASTS0262` | A filter pattern matches no operation — or matches only callback operations, which are never filtered independently of the operation that declares them |
 | `OASTS0263` | Filters are declared and nothing survives them: no operations and no webhooks |
@@ -93,7 +94,7 @@ Every one of these is refused before a single byte of the document is trusted, a
 | --- | --- | --- |
 | `OASTS2021` | error | A URI whose host is not in `remote.allowHosts`, or a plain `http` URI without `remote.allowInsecure` — including a host reached only by following a redirect |
 | `OASTS2022` | error | An authorized URI with no `remote.integrity` entry; there is no unpinned retrieval |
-| `OASTS2025` | error | A host with no way to make a request at all, such as the WebAssembly build |
+| `OASTS2025` | error | An embedding host that seats no retriever. The CLI and the Node package always seat one, and the browser build refuses the `remote` block earlier |
 | `OASTS2023` | error | Retrieved bytes hashing to something other than the pinned digest. The message prints the digest that was served |
 | `OASTS2024` | error | The request itself failed: refused connection, DNS, TLS, timeout, a non-`200` status, a body over `limits.maxDocumentBytes`, or more redirects than `remote.maxRedirects` allows |
 

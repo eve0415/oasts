@@ -345,7 +345,7 @@ Every key defaults to the conservative reading, so a config with no `remote` blo
 
 That is what keeps [determinism](/concepts/determinism) byte-keyed when the bytes arrive over a network. It also means each URI is pinned on its own: a `$ref` from a retrieved document to another URI needs its own `integrity` entry.
 
-`allowInsecure` defaults to `false`, so only `https` is retrieved and a plain `http` URI is an `OASTS2021`. TLS certificates are always verified against the Mozilla root program; there is no setting that turns that off.
+`allowInsecure` defaults to `false`, so only `https` is retrieved and a plain `http` URI is an `OASTS2021`. TLS certificates are always verified against the Mozilla root program; there is no setting that turns that off. A URI carrying credentials is refused outright: a retrieved document's URI is its identity, and identity is written above every declaration generated from it. Proxy environment variables are ignored, because honouring one would send every request somewhere `allowHosts` never named.
 
 `maxRedirects` defaults to `3` and bounds how many `3xx` hops one retrieval may take. Redirects are not delegated: the compiler resolves each `Location`, checks the host it names against `allowHosts`, and only then makes the next request — so a redirect cannot deliver a document from a host you did not list. Exceeding the budget is an `OASTS2024`.
 
@@ -355,7 +355,7 @@ A retrieved document keeps the URI that was **requested** as its identity, not t
 
 <Aside type="caution" title="Retrieval is a host capability">
   The [playground](/playground) compiles in your browser, in a WebAssembly module that declares no imports and so cannot make a request at all.
-  It refuses a `remote` block while reading the config, and refuses an authorized URI with `OASTS2025`.
+  It refuses a `remote` block while reading the config, with `OASTS0271`, and an `input.url` it therefore never authorized with `OASTS2021`.
   The CLI and the Node package both retrieve normally.
 </Aside>
 
