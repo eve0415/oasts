@@ -336,7 +336,7 @@ function ipv6Groups(section: string): number | null {
 }
 
 // RFC 4291 §2.2 textual IPv6: eight 16-bit hexadecimal groups, at most one `::` run standing in for
-// two or more omitted zero groups, optionally ending in a dotted-quad that supplies the last two.
+// one or more omitted zero groups, optionally ending in a dotted-quad that supplies the last two.
 // Zone identifiers, CIDR suffixes and surrounding brackets are not part of the address production.
 // Each character is visited once by the split-and-test scan.
 export function isIpv6(s: string): boolean {
