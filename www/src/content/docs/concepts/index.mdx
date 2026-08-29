@@ -55,7 +55,7 @@ Each of those is a [diagnostic](/concepts/diagnostics) with a code and a source 
 
 The first two are narrower than they sound.
 A collision with the compiler's *own* emitted identifiers — `Pet` against a generated `PetRequest`, an import shadowed by a local declaration — is renamed deterministically with a warning, because nothing about your intent is ambiguous there; it refuses only when the replacement is taken too.
-And a schema oasts cannot represent does become `unknown`, with a warning naming the keyword — and an error outright under the validators or Zod artifacts, which will not emit a check they cannot back.
+And a keyword oasts cannot represent is dropped with a warning naming it, leaving the rest of the schema object standing; the type widens to `unknown` only where nothing representable was left beside it, and it is an error outright under the validators or Zod artifacts, which will not emit a check they cannot back.
 
 The reasoning is that all three failure modes are invisible at the call site if nothing says so.
 A suffix the compiler picked for whichever declaration the walk reached first would move the next time the document changes; a type widened to `unknown` type-checks and then breaks at runtime; a filter that matches nothing shrinks your client without a diff anyone reads.
