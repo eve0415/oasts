@@ -803,16 +803,6 @@ impl<'a> GraphBuilder<'a> {
         }
 
         self.authorize_remote(url, &source_id)?;
-        let Some(pinned) = self.config.remote.integrity.get(&source_id) else {
-            return Err(input_error(
-                CODE_REMOTE_UNPINNED,
-                format!(
-                    "'{source_id}' has no remote.integrity entry, and an unpinned document cannot be compiled reproducibly"
-                ),
-                Some(&source_id),
-                None,
-            ));
-        };
         let Some(fetcher) = self.fetcher.get() else {
             return Err(input_error(
                 CODE_REMOTE_UNAVAILABLE,
@@ -834,15 +824,32 @@ impl<'a> GraphBuilder<'a> {
             "{INTEGRITY_PREFIX}{}",
             crate::emit::lower_hex(&Sha256::digest(&raw))
         );
-        if observed != *pinned {
-            return Err(input_error(
-                CODE_REMOTE_INTEGRITY,
-                format!(
-                    "'{source_id}' served bytes digesting to {observed}, but remote.integrity pins {pinned}"
-                ),
-                Some(&source_id),
-                None,
-            ));
+        // Pinning is answered after retrieval so the compiler can hand back the digest it is
+        // asking for. Nothing unpinned ever compiles either way; what the request buys is that
+        // the only place to obtain the pin is the compiler itself, rather than the user hashing a
+        // URL by hand. Authorization is unaffected — `allowHosts` already admitted this host.
+        match self.config.remote.integrity.get(&source_id) {
+            Some(pinned) if *pinned == observed => {}
+            Some(pinned) => {
+                return Err(input_error(
+                    CODE_REMOTE_INTEGRITY,
+                    format!(
+                        "'{source_id}' served bytes digesting to {observed}, but remote.integrity pins {pinned}; the document changed, or the response was not the one that was pinned"
+                    ),
+                    Some(&source_id),
+                    None,
+                ));
+            }
+            None => {
+                return Err(input_error(
+                    CODE_REMOTE_UNPINNED,
+                    format!(
+                        "'{source_id}' is not pinned, and an unpinned document cannot be compiled reproducibly; record what it served by adding to remote.integrity: \"{source_id}\": \"{observed}\""
+                    ),
+                    Some(&source_id),
+                    None,
+                ));
+            }
         }
 
         let id = self.admit(
@@ -5266,7 +5273,7 @@ mod tests {
     }
 
     #[test]
-    fn an_authorized_uri_with_no_pin_is_refused() {
+    fn an_authorized_uri_with_no_pin_is_refused_and_handed_the_pin_it_wants() {
         let directory = TempDir::new().expect("tempdir should be created");
         let fetcher = RecordingFetcher::new([(ENTRY_URI, body(ENTRY_DOCUMENT))]);
         let config = retrieved_entry_config(
@@ -5277,12 +5284,38 @@ mod tests {
 
         let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_UNPINNED);
 
+        // The whole entry, key and value, so recording it is a copy out of the diagnostic rather
+        // than a transcription — and so the compiler is the only place the digest comes from.
+        let entry = format!("\"{ENTRY_URI}\": \"{}\"", pin(ENTRY_DOCUMENT));
         assert!(
-            diagnostic.message.contains("no remote.integrity entry"),
+            diagnostic.message.contains(&entry),
             "{}",
             diagnostic.message
         );
-        assert_eq!(fetcher.requests(), Vec::<String>::new());
+        // The request is what produced that digest. Authorization is untouched: this host was
+        // already on `allowHosts`, and pinning answers reproducibility rather than trust.
+        assert_eq!(fetcher.requests(), [ENTRY_URI]);
+    }
+
+    #[test]
+    fn an_unpinned_uri_the_host_cannot_reach_fails_at_the_request() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::silent();
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(&["specs.example.test"], "", &[]),
+        );
+
+        // An offline build still fails; it fails at the request rather than ahead of it, and says
+        // what it could not retrieve rather than asking for a digest it never obtained.
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_RETRIEVAL);
+
+        assert!(
+            diagnostic.message.contains("the connection was refused"),
+            "{}",
+            diagnostic.message
+        );
     }
 
     #[test]
@@ -5298,8 +5331,8 @@ mod tests {
 
         let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_INTEGRITY);
 
-        // The observed digest is printed exactly as `remote.integrity` records it, so recording it
-        // is a copy rather than a transcription.
+        // Both digests, the served one and the pinned one, so the discrepancy is legible. This
+        // reads as something to investigate; the unpinned refusal reads as a setup step.
         assert!(
             diagnostic.message.contains(&pin(served)),
             "{}",
@@ -5307,6 +5340,11 @@ mod tests {
         );
         assert!(
             diagnostic.message.contains(&pin(ENTRY_DOCUMENT)),
+            "{}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("the document changed"),
             "{}",
             diagnostic.message
         );
