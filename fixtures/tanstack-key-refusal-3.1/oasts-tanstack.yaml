@@ -1,0 +1,16 @@
+schemaVersion: 1
+input:
+  path: ./openapi.yaml
+namespace: api
+output: ./generated-tanstack
+artifacts:
+  types: true
+  client: true
+  tanstack: true
+client:
+  authEnforcement: types
+  baseUrl:
+    source: runtime
+validation:
+  engine: 'off'
+  unchecked: allow

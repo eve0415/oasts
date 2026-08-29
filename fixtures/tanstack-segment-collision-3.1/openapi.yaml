@@ -3,11 +3,21 @@ info:
   title: TanStack segment collision
   version: 1.0.0
   description: >-
-    Two path segments whose raw text differs only by a separator, so identifier normalization maps
-    both to the same key-factory binding name. The compiler refuses rather than picking a winner,
-    and names the configuration entry that resolves it.
+    Every way two path nodes can compete for one key-factory name, plus the segments whose own text
+    is not an identifier. None of them costs the document its artifact: the loser of each race takes
+    the lowest free numeric suffix, and every key still carries the raw segment text, so no two
+    paths share a cache entry.
 servers:
   - url: https://collision.example.test
+components:
+  schemas:
+    Record:
+      type: object
+      properties:
+        id:
+          type: string
+      required:
+        - id
 paths:
   /foo-bar/{id}:
     parameters:
@@ -24,7 +34,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/Record'
   /foo_bar/{id}:
     parameters:
       - name: id
@@ -40,4 +50,87 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/Record'
+  /foo/bar:
+    get:
+      operationId: readNested
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Record'
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        '200':
+          description: Every pet.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Record'
+  /pets/all:
+    get:
+      operationId: listAllPets
+      responses:
+        '200':
+          description: Every pet, including the retired ones.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Record'
+  /2010-04-01/accounts:
+    get:
+      operationId: listAccounts
+      responses:
+        '200':
+          description: Every account in the dated API version.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Record'
+  /tenants/{user_id}/sites/{userId}:
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: userId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: readSite
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Record'
+  /orders/{orderId}/lines/{orderId}:
+    parameters:
+      - name: orderId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: readLine
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Record'
