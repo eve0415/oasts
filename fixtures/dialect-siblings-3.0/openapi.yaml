@@ -1,0 +1,120 @@
+openapi: 3.0.3
+info:
+  title: Dialect Siblings
+  version: "1"
+paths:
+  /jit-access:
+    get:
+      operationId: getJitAccess
+      responses:
+        "200":
+          description: The current access state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JitAccess"
+  /api-keys/{id}:
+    get:
+      operationId: getApiKey
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The requested key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKey"
+components:
+  schemas:
+    # A discriminated union whose tag property carries `const` beside its `type`. Widening the
+    # whole branch loses the tag and every sibling property with it.
+    JitAccess:
+      oneOf:
+        - type: object
+          required:
+            - state
+          properties:
+            state:
+              type: string
+              enum:
+                - enabled
+                - disabled
+            appliedSuccessfully:
+              type: boolean
+          additionalProperties: false
+        - type: object
+          required:
+            - state
+            - unavailableReason
+          properties:
+            state:
+              type: string
+              const: unavailable
+            unavailableReason:
+              type: string
+              enum:
+                - postgres_upgrade_required
+                - temporarily_unavailable
+          additionalProperties: false
+    ApiKey:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: string
+        # propertyNames beside a declared object type.
+        jwtTemplate:
+          type: object
+          propertyNames:
+            type: string
+          additionalProperties: {}
+          nullable: true
+        # prefixItems beside `items`.
+        tags:
+          type: array
+          items:
+            type: string
+          prefixItems:
+            - type: string
+        # dependentRequired beside a full `properties` map.
+        limits:
+          type: object
+          properties:
+            rate:
+              type: integer
+            burst:
+              type: integer
+          dependentRequired:
+            burst:
+              - rate
+        # patternProperties beside a declared object type.
+        extensions:
+          type: object
+          patternProperties:
+            "^x-":
+              type: string
+        # contains/minContains beside `items`.
+        auditLog:
+          type: array
+          items:
+            type: string
+          contains:
+            type: string
+          minContains: 1
+        # Nothing representable sits beside the keyword, so the node still widens whole.
+        opaque:
+          const: opaque
+        # A `type` array is the type declaration rather than a droppable conjunct: this widens
+        # whole even though `minLength` would otherwise be a representable sibling.
+        widened:
+          type:
+            - string
+            - "null"
+          const: x
+          minLength: 3

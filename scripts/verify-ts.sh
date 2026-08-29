@@ -359,6 +359,12 @@ echo "compile-assert matrix ok: variant-position-3.1"
 generate_and_verify negation-3.1 oasts.yaml "$work/negation-3.1" types "negation-3.1"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/negation-3.1/compile-assert/cases.ts"
 echo "compile-assert matrix ok: negation-3.1"
+# A 3.1-only keyword in a 3.0 document drops its own conjunct and keeps the representable
+# siblings. The compile assertions are what pin that: a branch whose tag widened to `unknown` is
+# not a type error by itself, so only narrowing the emitted union catches the regression.
+generate_and_verify dialect-siblings-3.0 oasts.yaml "$work/dialect-siblings-3.0" types "dialect-siblings-3.0"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/dialect-siblings-3.0/compile-assert/cases.ts"
+echo "compile-assert matrix ok: dialect-siblings-3.0"
 generate_and_verify defs-entry-3.1 oasts.yaml "$work/defs-entry-3.1" types "defs-entry-3.1"
 generate_and_verify empty-enum-3.1 oasts.yaml "$work/empty-enum-3.1" types "empty-enum-3.1"
 generate_and_verify document-root-ref-3.1 oasts.yaml "$work/document-root-ref-3.1" types "document-root-ref-3.1"
