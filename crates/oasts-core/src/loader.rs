@@ -15,7 +15,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::config::{INTEGRITY_PREFIX, ResolvedConfig};
+use crate::config::{INTEGRITY_PREFIX, ResolvedConfig, without_credentials};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::source::{
     DocumentSource, FetchPolicy, FetchStep, FetcherHandle, RemoteFetcher, SourceHandle, is_rooted,
@@ -928,7 +928,10 @@ impl<'a> GraphBuilder<'a> {
                 .map_err(|message| {
                     input_error(
                         CODE_REMOTE_RETRIEVAL,
-                        format!("failed to retrieve '{current}': {message}"),
+                        format!(
+                            "failed to retrieve '{}': {message}",
+                            without_credentials(current.as_str())
+                        ),
                         Some(source_id),
                         None,
                     )
@@ -940,7 +943,9 @@ impl<'a> GraphBuilder<'a> {
                         input_error(
                             CODE_REMOTE_RETRIEVAL,
                             format!(
-                                "'{current}' redirected to '{location}', which is not a URI reference: {error}"
+                                "'{}' redirected to '{}', which is not a URI reference: {error}",
+                                without_credentials(current.as_str()),
+                                without_credentials(&location)
                             ),
                             Some(source_id),
                             None,
@@ -967,7 +972,10 @@ impl<'a> GraphBuilder<'a> {
         let unauthorized = |reason: String| {
             Err(input_error(
                 CODE_REMOTE_UNAUTHORIZED,
-                format!("retrieving '{url}' is not authorized: {reason}"),
+                format!(
+                    "retrieving '{}' is not authorized: {reason}",
+                    without_credentials(url.as_str())
+                ),
                 Some(source_id),
                 None,
             ))
@@ -5350,14 +5358,22 @@ mod tests {
     }
 
     #[test]
-    fn a_uri_carrying_credentials_is_refused_rather_than_written_into_generated_code() {
-        const CREDENTIALED_URI: &str = "https://token@specs.example.test/openapi.yaml";
+    fn a_redirect_to_a_uri_carrying_credentials_is_refused_without_echoing_them() {
         let directory = TempDir::new().expect("tempdir should be created");
-        let fetcher = RecordingFetcher::new([(CREDENTIALED_URI, body(ENTRY_DOCUMENT))]);
+        let fetcher = RecordingFetcher::new([(
+            ENTRY_URI,
+            Ok(FetchStep::Redirect(
+                "https://reader:hunter2@mirror.example.test/openapi.yaml".to_owned(),
+            )),
+        )]);
         let config = retrieved_entry_config(
             directory.path(),
-            CREDENTIALED_URI,
-            &remote_block(&["specs.example.test"], "", &[]),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test", "mirror.example.test"],
+                "",
+                &[(ENTRY_URI, ENTRY_DOCUMENT)],
+            ),
         );
 
         let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_UNAUTHORIZED);
@@ -5367,7 +5383,19 @@ mod tests {
             "{}",
             diagnostic.message
         );
-        assert_eq!(fetcher.requests(), Vec::<String>::new());
+        // A redirect target is chosen by whatever answered the request, and this message lands in
+        // a CI log.
+        assert!(
+            !diagnostic.message.contains("hunter2"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(
+            !diagnostic.message.contains("reader"),
+            "{}",
+            diagnostic.message
+        );
+        assert_eq!(fetcher.requests(), [ENTRY_URI]);
     }
 
     #[test]

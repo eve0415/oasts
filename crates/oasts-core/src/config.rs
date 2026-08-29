@@ -1,5 +1,6 @@
 //! Schema-version 1 configuration loading for the local, single-spec wedge.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -1694,11 +1695,12 @@ fn resolve_remote(
 
     let mut integrity = BTreeMap::new();
     for (uri, digest) in &remote.integrity {
+        let shown = without_credentials(uri);
         let Some(key) = retrievable_uri(uri) else {
             sink.push(config_error(
                 CODE_REMOTE,
                 format!(
-                    "remote.integrity key '{uri}' must be an absolute http(s) URI with no fragment"
+                    "remote.integrity key '{shown}' must be an absolute http(s) URI with no fragment and no credentials"
                 ),
                 Some(source),
                 Some("/remote/integrity"),
@@ -1709,7 +1711,7 @@ fn resolve_remote(
             sink.push(config_error(
                 CODE_REMOTE,
                 format!(
-                    "remote.integrity value for '{uri}' must be '{INTEGRITY_PREFIX}' followed by {INTEGRITY_HEX_LEN} lowercase hex digits"
+                    "remote.integrity value for '{shown}' must be '{INTEGRITY_PREFIX}' followed by {INTEGRITY_HEX_LEN} lowercase hex digits"
                 ),
                 Some(source),
                 Some("/remote/integrity"),
@@ -1730,6 +1732,23 @@ fn resolve_remote(
 fn normalized_host(entry: &str) -> Option<String> {
     let permitted = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.');
     (!entry.is_empty() && entry.bytes().all(permitted)).then(|| entry.to_ascii_lowercase())
+}
+
+/// `value` with any userinfo removed, so a diagnostic never echoes a credential.
+///
+/// Textual rather than parser-based: the strings this guards are a rejected config key and a
+/// redirect target chosen by whatever answered the request, neither of which is guaranteed to
+/// parse, and a diagnostic that echoes a credential lands in a CI log either way.
+#[must_use]
+pub(crate) fn without_credentials(value: &str) -> Cow<'_, str> {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return Cow::Borrowed(value);
+    };
+    let authority = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority].rfind('@') else {
+        return Cow::Borrowed(value);
+    };
+    Cow::Owned(format!("{scheme}://{}", &rest[at + 1..]))
 }
 
 /// The canonical spelling of a retrievable URI, or `None` when it is not one.
@@ -4759,6 +4778,28 @@ mod tests {
                 .integrity
                 .get("https://specs.example.test/openapi.yaml"),
             Some(&digest)
+        );
+    }
+
+    #[test]
+    fn credentials_are_stripped_from_whatever_shape_a_uri_arrives_in() {
+        assert_eq!(without_credentials("openapi.yaml"), "openapi.yaml");
+        assert_eq!(
+            without_credentials("https://specs.example.test/x"),
+            "https://specs.example.test/x"
+        );
+        assert_eq!(
+            without_credentials("https://reader:hunter2@specs.example.test/x"),
+            "https://specs.example.test/x"
+        );
+        assert_eq!(
+            without_credentials("https://reader@specs.example.test"),
+            "https://specs.example.test"
+        );
+        // A path segment carrying an `@` is not userinfo and must survive intact.
+        assert_eq!(
+            without_credentials("https://specs.example.test/@scope/openapi.yaml"),
+            "https://specs.example.test/@scope/openapi.yaml"
         );
     }
 
