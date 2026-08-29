@@ -827,7 +827,8 @@ impl<'a> GraphBuilder<'a> {
         // The policy caps the transfer, but the cap is the host's to enforce and the graph's
         // accounting is the core's; charging the bytes here keeps one document's size and the
         // graph total answerable by the same limits whichever way it arrived.
-        let next_total = self.admit_bytes(raw.len() as u64, &source_id)?;
+        let byte_len = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+        let next_total = self.admit_bytes(byte_len, &source_id)?;
 
         let observed = format!(
             "{INTEGRITY_PREFIX}{}",
@@ -917,13 +918,20 @@ impl<'a> GraphBuilder<'a> {
                 None,
             ))
         };
-        if !self.config.remote.allow_insecure && url.scheme() != "https" {
-            return unauthorized(
-                "the scheme is not https, and remote.allowInsecure is not set".to_owned(),
-            );
+        // Restated rather than inherited from the entry check: a redirect can name any scheme at
+        // all, and it is authorized here rather than where the retrieval started.
+        match url.scheme() {
+            "https" => {}
+            "http" if self.config.remote.allow_insecure => {}
+            "http" => {
+                return unauthorized(
+                    "the scheme is http, and remote.allowInsecure is not set".to_owned(),
+                );
+            }
+            scheme => return unauthorized(format!("'{scheme}' is not a retrievable scheme")),
         }
-        // A URI only reaches this point under a scheme whose parser requires a host, and an empty
-        // host is authorized by nothing: config resolution refuses an empty `allowHosts` entry.
+        // Both remaining schemes are ones whose parser requires a host, and an empty host is
+        // authorized by nothing: config resolution refuses an empty `allowHosts` entry.
         let host = url.host_str().unwrap_or_default();
         if !self.config.remote.authorizes_host(host) {
             return unauthorized(format!("'{host}' is not listed in remote.allowHosts"));
@@ -5360,6 +5368,37 @@ mod tests {
             diagnostic
                 .message
                 .contains("'mirror.example.test' is not listed"),
+            "{}",
+            diagnostic.message
+        );
+        assert_eq!(fetcher.requests(), [ENTRY_URI]);
+    }
+
+    #[test]
+    fn a_redirect_to_another_scheme_is_refused_even_where_plain_http_is_admitted() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::new([(
+            ENTRY_URI,
+            Ok(FetchStep::Redirect(
+                "ftp://specs.example.test/openapi.yaml".to_owned(),
+            )),
+        )]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "  allowInsecure: true\n",
+                &[(ENTRY_URI, ENTRY_DOCUMENT)],
+            ),
+        );
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_UNAUTHORIZED);
+
+        assert!(
+            diagnostic
+                .message
+                .contains("'ftp' is not a retrievable scheme"),
             "{}",
             diagnostic.message
         );
