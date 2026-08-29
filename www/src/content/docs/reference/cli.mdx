@@ -65,15 +65,16 @@ Everything the last compile actually read or looked for, which is wider than the
 
 - the configuration file, and every other name [discovery](#config-discovery) would have accepted in the same directory, so a second `oasts.*` appearing is noticed;
 - the entry document and every local document its `$ref`s reach;
-- the consumer's `tsconfig.json`, every file its `extends` chain reaches, and each `tsconfig.json` the [ancestor walk](/reference/configuration#typescript) looked for and did not find;
+- the consumer's `tsconfig.json`, every file its `extends` chain reaches, and each `tsconfig.json` the [ancestor walk](/reference/configuration#typescript) looked for inside the workspace and did not find;
 - the `node_modules/zod` and `node_modules/msw` manifests the peer-version warnings were read from.
 
 The set is recomputed after every compile, so adding a `$ref` starts watching the file it points at.
 Directories are watched rather than individual files, which is what makes an editor's save-and-rename visible, and events are matched against that set before any of them counts — so the artifacts a run writes never wake the next one.
 When the operating system reports that it lost events without saying which, the session recompiles rather than guessing, because the one thing a watch may not do is serve output that is out of date.
 
-<Aside type="note" title="Two things a session will not pick up">
-  A peer package **appearing** where none was installed: the manifest is watched only once one has been found, so `npm install zod` mid-session does not re-run the version check until you restart.
+<Aside type="note" title="Three things a session will not pick up">
+  A peer package **appearing** where none was installed: the manifest is watched only once one has been found, so installing `zod` mid-session does not re-run the version check until you restart.
+  A `tsconfig.json` appearing **above** the workspace root: the ancestor walk reads that far, but a project with none anywhere would otherwise have the session watching every directory up to the filesystem root, so only the probes inside the workspace are followed.
   And on the Node CLI, a module your `oasts.config.ts` **imports**: the config file itself is re-evaluated on every cycle, but modules it pulls in stay cached for the life of the process.
 </Aside>
 
@@ -81,7 +82,7 @@ When the operating system reports that it lost events without saying which, the 
 
 A compile that fails is reported and the session keeps waiting.
 A typo in a document, a config that stopped parsing, a `$ref` to a file that is not there yet — all of them print and then wait for the next edit.
-While a compile is failing the session also widens what counts as a change, so creating the file it was missing brings it straight back.
+While a compile is failing the session also widens what counts as a change, so creating the file it was missing brings it straight back — anywhere except inside the output tree, which stays filtered to what the compile read so that a run's own artifacts can never be mistaken for a fix.
 
 There is no successful exit: `oasts watch` runs until you interrupt it.
 The one thing that ends it on its own is a directory it was told to watch and could not, which exits `2` with `OASTS1031` — a watch that cannot see one of its inputs would quietly serve stale output, which is worse than stopping.

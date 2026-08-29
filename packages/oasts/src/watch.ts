@@ -18,7 +18,7 @@
  */
 
 import { statSync, watch as watchDirectory } from "node:fs";
-import { dirname, join, sep } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 
 import { loadScriptConfig } from "./config/load.ts";
 import { CliFailure, CODE_WATCH_IO, configFailure, fromNativeError } from "./diagnostics.ts";
@@ -104,10 +104,19 @@ export class FsChanges implements Changes {
       if (this.#watchers.has(directory)) {
         continue;
       }
+      const own = basename(directory);
       const watcher = this.#open(directory, (_event, filename) => {
-        if (filename !== null) {
-          this.#deliver({ kind: "changed", path: join(directory, filename) });
+        // An event naming the watched directory itself, rather than something in it, is that
+        // directory being replaced -- and a watch is bound to the directory that existed when it
+        // was registered, so it goes deaf the moment a new one takes the name. It arrives here as
+        // the directory's own name, or as no name at all. A file inside that happens to share the
+        // name costs one extra compile and one extra registration, which is the safe way to be
+        // wrong.
+        if (filename === null || filename === "" || filename === own) {
+          this.forget(directory);
+          return;
         }
+        this.#deliver({ kind: "changed", path: join(directory, filename) });
       });
       watcher.on("error", () => {
         this.forget(directory);
@@ -117,7 +126,7 @@ export class FsChanges implements Changes {
   }
 
   /**
-   * Drops a watcher that failed after it was created, and tells the session to recompile blind.
+   * Drops a watcher that can no longer be trusted, and tells the session to recompile blind.
    *
    * Whatever that watcher missed is unknowable, and the next `watch` reopens the directory — or
    * throws, which ends the session rather than leaving it watching nothing.
@@ -290,8 +299,9 @@ export async function session(
   const watched = new Watched();
   for (;;) {
     const cycle = await compile();
-    // A cycle that reported no plan leaves the previous set in place rather than clearing it,
-    // which is what keeps a session alive across a compile that never reached a config.
+    // Only a tracked run reports a plan, and every cycle asks for one — so the default here stands
+    // for a caller that asked for no plan at all, which leaves the session with nothing to watch
+    // and ends it on the next wait rather than pretending to be watching something.
     const plan = cycle.plan ?? EMPTY_PLAN;
     watched.absorb(plan, cycle.exitCode === 0);
     report(cycle);
@@ -335,9 +345,13 @@ export async function compileOnce(
   cwd: string,
 ): Promise<Cycle> {
   const explicit = args.config ?? null;
-  // Known even when discovery fails, and the only thing left to watch when it does.
+  // Discovery happens on this side, so the compiler is handed a config path it never had to look
+  // for and cannot report the names it would have accepted instead. They belong in every plan, not
+  // only the ones where discovery failed: a second `oasts.*` appearing is what turns a working run
+  // into a discovery error, and its removal is what turns one back.
+  const candidates = native.discoveryCandidates(cwd, explicit);
   const fallback: WatchPlan = {
-    inputs: native.discoveryCandidates(cwd, explicit),
+    inputs: candidates,
     outputRoot: null,
     debounceMs: DEFAULT_DEBOUNCE_MS,
   };
@@ -362,7 +376,7 @@ export async function compileOnce(
         plan === undefined
           ? fallback
           : {
-              inputs: plan.inputs,
+              inputs: [...new Set([...candidates, ...plan.inputs])],
               outputRoot: plan.outputRoot ?? null,
               debounceMs: plan.debounceMs,
             },

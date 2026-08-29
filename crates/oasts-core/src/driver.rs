@@ -485,6 +485,34 @@ validation:
     }
 
     #[test]
+    fn a_project_with_no_tsconfig_anywhere_watches_nothing_above_its_workspace() {
+        let temp = tracked_workspace();
+        let root = temp.path().canonicalize().expect("canonical root");
+        fs::remove_file(root.join("tsconfig.json")).expect("drop the consumer tsconfig");
+        let outcome = run(
+            Command::Check,
+            ConfigSource::Path {
+                explicit: None,
+                cwd: &root,
+            },
+            Tracking::Watch,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:#?}", outcome.diagnostics);
+        let plan = outcome
+            .watch_plan
+            .expect("a tracked run reports its inputs");
+        // The walk reaches the filesystem root looking for a config that is not there. Only the
+        // probes inside the workspace are reported; watching every directory up to `/` would not be.
+        assert!(plan.inputs.contains(&root.join("tsconfig.json")));
+        assert!(plan.inputs.contains(&root.join("generated/tsconfig.json")));
+        assert!(
+            plan.inputs.iter().all(|path| path.starts_with(&root)),
+            "{:#?}",
+            plan.inputs
+        );
+    }
+
+    #[test]
     fn an_untracked_run_reports_no_inputs() {
         let temp = tracked_workspace();
         let outcome = run(

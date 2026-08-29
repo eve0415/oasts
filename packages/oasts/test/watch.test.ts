@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { test } from "node:test";
@@ -285,6 +285,36 @@ test("a watcher that fails after it was opened is dropped and reported as a lost
   changes.close();
 });
 
+test("a watched directory that is replaced is registered again", async () => {
+  const root = mkdtempSync(join(tmpdir(), "oasts-watch-"));
+  const watched = join(root, "spec");
+  mkdirSync(watched);
+  const changes = new FsChanges();
+  try {
+    changes.watch([watched]);
+
+    // What the platform reports when the directory a watch is bound to goes away.
+    rmSync(watched, { recursive: true });
+    mkdirSync(watched);
+    const woke: string[] = [];
+    for (;;) {
+      const wake = await changes.wake(200);
+      if (wake.kind === "quiet" || wake.kind === "stopped") {
+        break;
+      }
+      woke.push(wake.kind);
+    }
+    assert.ok(woke.includes("desynchronized"), woke.join(", "));
+
+    // The registration is gone, so the next one reopens the directory that is there now.
+    changes.watch([watched]);
+    writeFileSync(join(watched, "api.yaml"), "openapi: 3.1.0\n");
+    assert.equal((await changes.wake(5000)).kind, "changed");
+  } finally {
+    changes.close();
+  }
+});
+
 test("the real watcher refuses a directory that is not there", () => {
   const directory = mkdtempSync(join(tmpdir(), "oasts-watch-"));
   const changes = new FsChanges();
@@ -313,12 +343,16 @@ test("one cycle compiles, reports its plan, and never throws", async () => {
   assert.ok(compiled.plan !== null);
   assert.ok(compiled.plan.inputs.includes(join(directory, "oasts.yaml")));
   assert.ok(compiled.plan.inputs.includes(join(directory, "spec/openapi.yaml")));
+  // Discovery runs on this side, so the names it would also have accepted are added here.
+  assert.ok(compiled.plan.inputs.includes(join(directory, "oasts.json")));
+  assert.ok(compiled.plan.inputs.includes(join(directory, "oasts.config.ts")));
   assert.equal(compiled.plan.outputRoot, join(directory, "generated"));
   assert.equal(compiled.plan.debounceMs, 10);
 
   // An explicit config path narrows what discovery would have considered to that one file.
   const explicit = await compileOnce(native, { config: "oasts.yaml", specs: [] }, directory);
   assert.equal(explicit.exitCode, 0, explicit.stderr);
+  assert.ok(!explicit.plan?.inputs.includes(join(directory, "oasts.json")));
 
   // A script config is re-evaluated on this side before the compiler sees anything.
   const scripted = mkdtempSync(join(tmpdir(), "oasts-watch-"));

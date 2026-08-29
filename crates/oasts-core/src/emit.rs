@@ -452,7 +452,12 @@ pub fn emit_artifacts(
     // provided", which keeps the reference directive. It is also the only filesystem read in
     // emission, which is why `inputs` reaches this far in.
     let (consumer_provides_temporal, tsconfig_diagnostics) =
-        crate::tsconfig::consumer_provides_temporal(&config.output, &config.tsconfig, inputs);
+        crate::tsconfig::consumer_provides_temporal(
+            &config.output,
+            &config.workspace_root,
+            &config.tsconfig,
+            inputs,
+        );
     sink.extend(tsconfig_diagnostics);
     let mut registrar = Registrar::new(sink);
     let mut model = EmissionModel::new(

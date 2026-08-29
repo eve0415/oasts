@@ -460,17 +460,27 @@ pub(crate) fn provides_temporal(options: &CompilerOptions) -> bool {
 /// a consumer would expect to govern that directory. Ownership (`files`/`include`/`references`)
 /// decides which *program* a file belongs to, which is a different question and a diagnostics-only
 /// one — it never changes what is emitted.
-pub(crate) fn discover(from: &Path, inputs: &mut InputRecorder) -> Option<PathBuf> {
+pub(crate) fn discover(
+    from: &Path,
+    workspace_root: &Path,
+    inputs: &mut InputRecorder,
+) -> Option<PathBuf> {
     let mut current = Some(normalize(from));
     for _ in 0..MAX_ANCESTOR_WALK {
         let directory = current?;
         let candidate = directory.join("tsconfig.json");
-        // Recorded before the test, not after: a nearer `tsconfig.json` appearing above the output
-        // directory changes which config governs the run, so the ancestors that had none are as
-        // much an input as the one that answered.
-        inputs.record(&candidate);
         if candidate.is_file() {
+            inputs.record(&candidate);
             return Some(candidate);
+        }
+        // A `tsconfig.json` appearing nearer than the one that answered changes which config
+        // governs the run, so the ancestors that had none are inputs too — but only inside the
+        // workspace. A project with no tsconfig anywhere walks to the filesystem root, and
+        // reporting every directory up to `/` as something to watch would cost far more than the
+        // answer it could change. One that appears above the workspace root is picked up on the
+        // next start.
+        if directory.starts_with(workspace_root) {
+            inputs.record(&candidate);
         }
         current = directory.parent().map(Path::to_path_buf);
     }
@@ -486,16 +496,19 @@ pub(crate) fn discover(from: &Path, inputs: &mut InputRecorder) -> Option<PathBu
 /// wrong the other way costs the consumer `TS2503: Cannot find namespace 'Temporal'`.
 pub(crate) fn consumer_provides_temporal(
     output_directory: &Path,
+    workspace_root: &Path,
     setting: &crate::config::TsconfigSource,
     inputs: &mut InputRecorder,
 ) -> (bool, Vec<Diagnostic>) {
     let path = match setting {
         crate::config::TsconfigSource::Off => return (false, Vec::new()),
         crate::config::TsconfigSource::Path(path) => path.clone(),
-        crate::config::TsconfigSource::Auto => match discover(output_directory, inputs) {
-            Some(found) => found,
-            None => return (false, Vec::new()),
-        },
+        crate::config::TsconfigSource::Auto => {
+            match discover(output_directory, workspace_root, inputs) {
+                Some(found) => found,
+                None => return (false, Vec::new()),
+            }
+        }
     };
     match read(&path, &mut ReadBudget::new(inputs)) {
         Ok(resolved) => (provides_temporal(&resolved.compiler_options), Vec::new()),
@@ -901,7 +914,10 @@ mod tests {
         }
         fs::create_dir_all(&deep).expect("deep directories");
         write(temp.path(), "tsconfig.json", "{}");
-        assert_eq!(discover(&deep, &mut InputRecorder::off()), None);
+        assert_eq!(
+            discover(&deep, temp.path(), &mut InputRecorder::off()),
+            None
+        );
     }
 
     #[test]
@@ -947,7 +963,7 @@ mod tests {
         let output = temp.path().join("packages/app/src/generated");
         fs::create_dir_all(&output).expect("output directory");
         assert_eq!(
-            discover(&output, &mut InputRecorder::off()).as_deref(),
+            discover(&output, temp.path(), &mut InputRecorder::off()).as_deref(),
             Some(nested.as_path())
         );
 
@@ -955,7 +971,7 @@ mod tests {
         let other = temp.path().join("elsewhere");
         fs::create_dir_all(&other).expect("other directory");
         assert_eq!(
-            discover(&other, &mut InputRecorder::off()).as_deref(),
+            discover(&other, temp.path(), &mut InputRecorder::off()).as_deref(),
             Some(temp.path().join("tsconfig.json").as_path())
         );
     }
@@ -968,8 +984,12 @@ mod tests {
         fs::create_dir_all(&output).expect("output directory");
 
         // Nothing to read: the directive stays, and that is not a diagnostic.
-        let (provides, diagnostics) =
-            consumer_provides_temporal(&output, &TsconfigSource::Auto, &mut InputRecorder::off());
+        let (provides, diagnostics) = consumer_provides_temporal(
+            &output,
+            temp.path(),
+            &TsconfigSource::Auto,
+            &mut InputRecorder::off(),
+        );
         assert!(!provides);
         assert!(diagnostics.is_empty());
 
@@ -978,14 +998,22 @@ mod tests {
             "tsconfig.json",
             r#"{ "compilerOptions": { "lib": ["ESNext"] } }"#,
         );
-        let (provides, diagnostics) =
-            consumer_provides_temporal(&output, &TsconfigSource::Auto, &mut InputRecorder::off());
+        let (provides, diagnostics) = consumer_provides_temporal(
+            &output,
+            temp.path(),
+            &TsconfigSource::Auto,
+            &mut InputRecorder::off(),
+        );
         assert!(provides);
         assert!(diagnostics.is_empty());
 
         // `off` reads nothing, so output stops depending on anything outside version/config/input.
-        let (provides, diagnostics) =
-            consumer_provides_temporal(&output, &TsconfigSource::Off, &mut InputRecorder::off());
+        let (provides, diagnostics) = consumer_provides_temporal(
+            &output,
+            temp.path(),
+            &TsconfigSource::Off,
+            &mut InputRecorder::off(),
+        );
         assert!(!provides);
         assert!(diagnostics.is_empty());
 
@@ -997,6 +1025,7 @@ mod tests {
         );
         let (provides, diagnostics) = consumer_provides_temporal(
             &output,
+            temp.path(),
             &TsconfigSource::Path(explicit),
             &mut InputRecorder::off(),
         );
@@ -1007,6 +1036,7 @@ mod tests {
         let broken = write(temp.path(), "broken.json", "{ nope");
         let (provides, diagnostics) = consumer_provides_temporal(
             &output,
+            temp.path(),
             &TsconfigSource::Path(broken),
             &mut InputRecorder::off(),
         );

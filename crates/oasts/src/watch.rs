@@ -146,6 +146,12 @@ impl Changes for FsChanges {
                 .map_err(|_| RecvTimeoutError::Disconnected),
         };
         match received {
+            // An event naming a watched directory itself, rather than something in it, may be that
+            // directory being replaced — and a watch is bound to the directory that existed when it
+            // was registered, so it goes deaf the moment a new one takes the name. Forgetting the
+            // registration here is what makes the next one reopen it, and nothing can be said about
+            // what the old watch missed in between.
+            Ok(Signal::Changed(path)) if self.watched.remove(&path) => Wake::Desynchronized,
             Ok(Signal::Changed(path)) => Wake::Changed(path),
             Ok(Signal::Desynchronized) => Wake::Desynchronized,
             Err(RecvTimeoutError::Timeout) => Wake::Quiet,
@@ -267,8 +273,9 @@ pub(crate) fn session(
     loop {
         let mut outcome = compile();
         let settled = outcome.exit_code == 0;
-        // A run that reported no plan leaves the previous set in place rather than clearing it,
-        // which is what keeps a session alive across a compile that never reached a config.
+        // Only a tracked run reports a plan, and `run` always tracks — so the default here stands
+        // for a caller that asked for no plan at all, which leaves the session with nothing to
+        // watch and ends it on the next wait rather than pretending to be watching something.
         let plan = outcome.watch_plan.take().unwrap_or_default();
         let quiet = Duration::from_millis(u64::from(plan.settings.debounce_ms));
         watched.absorb(&plan, settled);
@@ -658,6 +665,38 @@ mod tests {
             .watch(&[PathBuf::from("/")])
             .expect_err("no watcher, no watch");
         assert!(reason.contains("no watchers left"), "{reason}");
+    }
+
+    #[test]
+    fn a_watched_directory_that_is_replaced_is_registered_again() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let watched = temp.path().join("spec");
+        fs::create_dir_all(&watched).expect("spec directory");
+        let mut changes = FsChanges::new();
+        changes
+            .watch(std::slice::from_ref(&watched))
+            .expect("first watch");
+
+        // What the kernel reports when the directory a watch is bound to goes away.
+        fs::remove_dir_all(&watched).expect("replace the directory");
+        fs::create_dir_all(&watched).expect("recreate the directory");
+        let mut woke = Vec::new();
+        while let wake @ (Wake::Changed(_) | Wake::Desynchronized) =
+            changes.wake(Some(Duration::from_millis(200)))
+        {
+            woke.push(matches!(wake, Wake::Desynchronized));
+        }
+        assert!(woke.contains(&true), "{woke:?}");
+
+        // The registration is gone, so the next one reopens the directory that is there now.
+        changes
+            .watch(std::slice::from_ref(&watched))
+            .expect("rewatch");
+        fs::write(watched.join("api.yaml"), "openapi: 3.1.0\n").expect("write into it");
+        assert!(matches!(
+            changes.wake(Some(Duration::from_secs(5))),
+            Wake::Changed(_)
+        ));
     }
 
     #[test]
