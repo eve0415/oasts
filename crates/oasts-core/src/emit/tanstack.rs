@@ -409,9 +409,10 @@ struct BindingSink {
 /// set through every candidate.
 ///
 /// Which competitor keeps the bare name is therefore decided by insertion order, and every caller's
-/// insertion order is the key-factory walk: pre-order over path nodes whose children are sorted by
-/// raw segment text. That is a property of the document, not of the order operations were visited
-/// in, so two runs over one document allocate identically.
+/// insertion order is the key-factory walk: pre-order over path nodes, visiting a parent's
+/// configured children before its derived ones and each group in raw segment order. That is a
+/// property of the document, not of the order operations were visited in, so two runs over one
+/// document allocate identically.
 fn allocate_unique(base: &str, taken: &mut BTreeSet<String>) -> String {
     let mut candidate = base.to_owned();
     let mut suffix = 2_u32;
