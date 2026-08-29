@@ -2485,11 +2485,28 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             };
             branches.push(typed);
         } else {
-            // The split parks the rejected keywords on the typed half, which is not emitted here,
-            // so without this they leave the tree with it. They describe the whole schema object
-            // rather than one of its pieces, and dropping them is what lets the validators artifact
-            // ship a complete-looking check for a constraint it cannot express.
+            // The split parks the rejected keywords and the narrowing applicators on the typed
+            // half, which is not emitted here, so without this they leave the tree with it. Both
+            // describe the whole schema object rather than one of its pieces. Losing the rejected
+            // keywords lets the validators artifact ship a complete-looking check for a constraint
+            // it cannot express; losing the applicators drops the check the `propertyNames`
+            // diagnostic promises is emitted instead, and stops a `not` that admits everything from
+            // lowering the node to `never`.
             wrapper_meta.rejected_validation_keywords = typed_meta.rejected_validation_keywords;
+            if let Some(typed_applicators) = typed_meta.validation_applicators {
+                let mut applicators = wrapper_meta
+                    .validation_applicators
+                    .map_or_else(ValidationApplicators::default, |boxed| *boxed);
+                // The two halves carry disjoint fields: the split hands `unevaluated*` to the
+                // wrapper and everything below to the typed branch.
+                applicators.not = typed_applicators.not;
+                applicators.property_names = typed_applicators.property_names;
+                applicators.pattern_properties = typed_applicators.pattern_properties;
+                applicators.contains = typed_applicators.contains;
+                applicators.dependent_schemas = typed_applicators.dependent_schemas;
+                applicators.conditional = typed_applicators.conditional;
+                wrapper_meta.validation_applicators = box_if_populated(applicators);
+            }
         }
         SchemaNode::AllOf {
             branches,
@@ -5269,6 +5286,44 @@ mod tests {
         assert!(matches!(ir.schemas[3].schema, SchemaNode::Tuple { .. }));
         assert!(matches!(ir.schemas[4].schema, SchemaNode::Tuple { .. }));
         assert!(matches!(ir.schemas[5].schema, SchemaNode::Never { .. }));
+    }
+
+    #[test]
+    fn a_conjunction_without_a_typed_half_keeps_its_narrowing_applicators() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Named": { "type": "object", "properties": { "name": { "type": "string" } } },
+                "PropertyNames": {
+                    "propertyNames": { "pattern": "^x-" },
+                    "allOf": [{ "$ref": "#/components/schemas/Named" }],
+                    "oneOf": [{ "type": "object" }, { "type": "object" }]
+                },
+                "NegatesEverything": {
+                    "not": {},
+                    "allOf": [{ "$ref": "#/components/schemas/Named" }],
+                    "oneOf": [{ "type": "object" }, { "type": "object" }]
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        // Two applicators and no typed content emit no typed branch, so the narrowing applicators
+        // the split parks there have to travel on the wrapper or leave the tree with it. Losing
+        // `propertyNames` drops the very check its diagnostic says the validators emit instead.
+        assert!(
+            schema_named(&ir, "PropertyNames")
+                .meta()
+                .validation_applicators()
+                .property_names
+                .is_some()
+        );
+        // A `not` admitting every instance admits none, which the caller can only lower if the
+        // `not` is still on the node it reads.
+        assert!(matches!(
+            schema_named(&ir, "NegatesEverything"),
+            SchemaNode::Never { .. }
+        ));
     }
 
     #[test]
