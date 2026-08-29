@@ -4,6 +4,7 @@
 // its tag property widens to `unknown`.
 
 import type { ApiKey } from "../generated/types/components/apikey.js";
+import type { Conjoined } from "../generated/types/components/conjoined.js";
 import type { JitAccess } from "../generated/types/components/jitaccess.js";
 
 type Equal<A, B> =
@@ -33,6 +34,11 @@ type AssertUnavailableState = Expect<Equal<Unavailable["state"], string>>;
 type AssertUnavailableReason = Expect<
   Equal<Unavailable["unavailableReason"], "postgres_upgrade_required" | "temporarily_unavailable">
 >;
+
+// Two applicators and no typed content: the object lowers to a conjunction whose typed half is
+// never emitted, and both applicators survive the dropped `const`.
+type AssertConjoinedName = Expect<Equal<Conjoined["name"], string>>;
+type AssertConjoinedKind = Expect<Equal<Conjoined["kind"], "direct" | "delegated">>;
 
 // The branch is a real object type, so the union is still narrowable. Against an `unknown` branch
 // this body does not compile.

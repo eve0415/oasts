@@ -2047,6 +2047,11 @@ paths:
                 (
                     "OASTS6002",
                     "validators cannot emit a check for unsupported validation keyword 'const'",
+                    "/components/schemas/Conjoined"
+                ),
+                (
+                    "OASTS6002",
+                    "validators cannot emit a check for unsupported validation keyword 'const'",
                     "/components/schemas/JitAccess/oneOf/1/properties/state"
                 ),
                 (

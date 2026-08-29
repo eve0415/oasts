@@ -13,6 +13,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/JitAccess"
+  /conjoined:
+    get:
+      operationId: getConjoined
+      responses:
+        "200":
+          description: A node lowered to a conjunction with no typed half.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Conjoined"
   /api-keys/{id}:
     get:
       operationId: getApiKey
@@ -61,6 +71,36 @@ components:
                 - postgres_upgrade_required
                 - temporarily_unavailable
           additionalProperties: false
+    Named:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+    # Two applicators and no typed content: the object lowers to a conjunction whose typed half is
+    # never emitted, so the dropped keyword has to travel on the wrapper to keep refusing.
+    Conjoined:
+      const: x
+      allOf:
+        - $ref: "#/components/schemas/Named"
+      oneOf:
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              type: string
+              enum:
+                - direct
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              type: string
+              enum:
+                - delegated
     ApiKey:
       type: object
       required:

@@ -363,6 +363,7 @@ echo "compile-assert matrix ok: negation-3.1"
 # siblings. The compile assertions are what pin that: a branch whose tag widened to `unknown` is
 # not a type error by itself, so only narrowing the emitted union catches the regression.
 generate_and_verify dialect-siblings-3.0 oasts.yaml "$work/dialect-siblings-3.0" types "dialect-siblings-3.0"
+generate_and_verify dialect-siblings-3.0 oasts-client.yaml "$work/client-dialect-siblings-3.0" client "dialect-siblings-3.0 (client)"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext --moduleResolution bundler "$work/dialect-siblings-3.0/compile-assert/cases.ts"
 echo "compile-assert matrix ok: dialect-siblings-3.0"
 generate_and_verify defs-entry-3.1 oasts.yaml "$work/defs-entry-3.1" types "defs-entry-3.1"
