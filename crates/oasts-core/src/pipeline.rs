@@ -11,10 +11,10 @@ use crate::client_model::build_client_model;
 use crate::config::{ResolvedConfig, TsconfigSource};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::emit::{GeneratedFile, emit_artifacts};
-use crate::loader::load_graph_with_source;
+use crate::loader::load_graph_with_host;
 use crate::parse::parse;
 use crate::semantic::analyze;
-use crate::source::{MemorySource, SourceHandle};
+use crate::source::{FetcherHandle, MemorySource, SourceHandle};
 
 /// The synthetic root an in-memory compile is seated at.
 ///
@@ -29,20 +29,22 @@ const MEMORY_CONFIG_PATH: &str = "/workspace/oasts.json";
 /// `should_emit` is true; diagnostics accumulate in `sink` either way.
 pub fn compile(
     config: &ResolvedConfig,
+    fetcher: FetcherHandle,
     should_emit: bool,
     sink: &mut DiagnosticSink,
 ) -> Option<Vec<GeneratedFile>> {
-    compile_from(config, SourceHandle::Fs, should_emit, sink)
+    compile_from(config, SourceHandle::Fs, fetcher, should_emit, sink)
 }
 
-/// Compiles one resolved configuration, reading documents from `source`.
+/// Compiles one resolved configuration, reading documents from `source` and `fetcher`.
 pub fn compile_from(
     config: &ResolvedConfig,
     source: SourceHandle,
+    fetcher: FetcherHandle,
     should_emit: bool,
     sink: &mut DiagnosticSink,
 ) -> Option<Vec<GeneratedFile>> {
-    let graph = load_graph_with_source(config, source, sink)?;
+    let graph = load_graph_with_host(config, source, fetcher, sink)?;
     let ir = parse(&graph, sink)?;
     // Filtering and pruning run before analysis so name allocation, collision detection and path
     // registration see only survivors, and a filter diagnostic short-circuits here rather than
@@ -104,6 +106,7 @@ pub fn compile_in_memory(
         .map_err(|diagnostic| vec![diagnostic])?;
     crate::config::require_no_local_allow_paths(&raw, config_path)
         .map_err(|diagnostic| vec![diagnostic])?;
+    crate::config::require_no_remote(&raw, config_path).map_err(|diagnostic| vec![diagnostic])?;
 
     let mut source = MemorySource::new(MEMORY_ROOT);
     let mut config = crate::config::resolve_config(config_path.to_path_buf(), raw, &source)?;
@@ -118,6 +121,9 @@ pub fn compile_in_memory(
     let files = compile_from(
         &config,
         SourceHandle::Shared(Arc::new(source)),
+        // A host with no filesystem also has no way to reach the network from inside the module,
+        // so an `input.url` or a retrievable `$ref` is refused rather than silently resolved.
+        FetcherHandle::None,
         true,
         &mut sink,
     );
@@ -196,7 +202,7 @@ mod tests {
                 .expect("config");
 
             let mut sink = DiagnosticSink::new();
-            let from_disk = compile(&config, true, &mut sink).expect("emitted files");
+            let from_disk = compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
             assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
 
             let in_memory = compile_in_memory(&spec, &config_json).expect("emitted files");
@@ -362,7 +368,7 @@ paths:
                 .expect("rayon pool");
             pool.install(|| {
                 let mut sink = DiagnosticSink::new();
-                let files = compile(&config, true, &mut sink).expect("emitted files");
+                let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
                 assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
                 files
             })
@@ -385,12 +391,12 @@ paths:
         let config = load_config(None, temp.path()).expect("resolved config");
 
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, true, &mut sink).expect("emitted files");
+        let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
         assert!(!files.is_empty());
         assert!(!sink.has_errors());
 
         let mut sink = DiagnosticSink::new();
-        assert!(compile(&config, false, &mut sink).is_none());
+        assert!(compile(&config, FetcherHandle::None, false, &mut sink).is_none());
         assert!(!sink.has_errors());
     }
 
@@ -433,7 +439,7 @@ components:
         .expect("resolved config");
 
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, true, &mut sink).expect("emitted files");
+        let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
 
         assert!(!files.is_empty());
         assert!(
@@ -484,7 +490,7 @@ components:
         .expect("resolved config");
 
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, true, &mut sink).expect("emitted files");
+        let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
 
         assert!(!files.is_empty());
         assert!(
@@ -544,7 +550,7 @@ components:
             .expect("resolved config");
 
             let mut sink = DiagnosticSink::new();
-            let files = compile(&config, true, &mut sink).expect("emitted files");
+            let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
             let diagnostics = format!("{:#?}", sink.as_slice());
 
             assert!(!files.is_empty(), "{artifact}");
@@ -571,7 +577,7 @@ components:
         let config = load_config(None, temp.path()).expect("resolved config");
 
         let mut sink = DiagnosticSink::new();
-        assert!(compile(&config, true, &mut sink).is_none());
+        assert!(compile(&config, FetcherHandle::None, true, &mut sink).is_none());
         assert!(sink.has_errors());
     }
 
@@ -596,7 +602,7 @@ components:
         .expect("resolved config");
 
         let mut sink = DiagnosticSink::new();
-        assert!(compile(&config, true, &mut sink).is_none());
+        assert!(compile(&config, FetcherHandle::None, true, &mut sink).is_none());
         let diagnostic = sink
             .as_slice()
             .iter()
@@ -639,7 +645,7 @@ components:
         .expect("resolved config");
 
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, true, &mut sink).expect("emitted files");
+        let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
 
         assert_eq!(
             files
@@ -682,7 +688,7 @@ components:
         .expect("types resolved config");
         let mut types_sink = DiagnosticSink::new();
         let types_files =
-            compile(&types_only, true, &mut types_sink).expect("types-only emitted files");
+            compile(&types_only, FetcherHandle::None, true, &mut types_sink).expect("types-only emitted files");
         let client_types = files
             .iter()
             .filter(|file| file.relative_path.starts_with("types/"))
@@ -733,7 +739,7 @@ paths:
         };
 
         let mut types_sink = DiagnosticSink::new();
-        let types = compile(&config("types", false), true, &mut types_sink)
+        let types = compile(&config("types", false), FetcherHandle::None, true, &mut types_sink)
             .expect("types-only build emits");
         let request_types = types
             .iter()
@@ -745,7 +751,7 @@ paths:
 
         let mut client_sink = DiagnosticSink::new();
         let client =
-            compile(&config("client", true), true, &mut client_sink).expect("client build emits");
+            compile(&config("client", true), FetcherHandle::None, true, &mut client_sink).expect("client build emits");
         let request_types = client
             .iter()
             .find(|file| file.relative_path == "types/operations/listthings.ts")
@@ -793,7 +799,7 @@ paths:
 
         // The auth seam is gone: the same compile now succeeds with no diagnostics.
         let mut sink = DiagnosticSink::new();
-        assert!(compile(&config, true, &mut sink).is_some());
+        assert!(compile(&config, FetcherHandle::None, true, &mut sink).is_some());
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
 
         // Re-run the stages to inspect the planned auth for get-board, whose security is
@@ -889,7 +895,7 @@ paths:
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, should_emit, &mut sink);
+        let files = compile(&config, FetcherHandle::None, should_emit, &mut sink);
         (sink, files)
     }
 
@@ -1156,7 +1162,7 @@ webhooks:
         )
         .expect("config");
         let mut sink = DiagnosticSink::new();
-        assert!(compile(&config, true, &mut sink).is_none());
+        assert!(compile(&config, FetcherHandle::None, true, &mut sink).is_none());
         let rendered = crate::diag::render_to_string(sink.into_sorted_vec());
         assert!(rendered.contains("      'CreatedAt': 'CreatedAt_1'\n"));
         assert!(rendered.contains("      'createdAt': 'CreatedAt_2'\n"));
@@ -1189,7 +1195,7 @@ webhooks:
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, true, &mut sink).expect("suggestions resolve the collision");
+        let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("suggestions resolve the collision");
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         let paths = files
             .iter()
@@ -1671,7 +1677,7 @@ content:
         let config = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved showcase config");
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, true, &mut sink).expect("showcase emitted files");
+        let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("showcase emitted files");
 
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         assert!(
@@ -1689,7 +1695,7 @@ content:
             let config = load_config(Some(&fixture.join(config_name)), &fixture)
                 .expect("resolved response media config");
             let mut sink = DiagnosticSink::new();
-            assert!(compile(&config, false, &mut sink).is_none());
+            assert!(compile(&config, FetcherHandle::None, false, &mut sink).is_none());
             sink.into_sorted_vec()
                 .into_iter()
                 .map(|diagnostic| {
@@ -1721,7 +1727,7 @@ content:
         let config = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved fixture config");
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, true, &mut sink).expect("warnings do not block emission");
+        let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("warnings do not block emission");
 
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         assert!(sink.as_slice().iter().any(|diagnostic| {
@@ -1764,7 +1770,7 @@ content:
         let config = load_config(Some(&fixture.join(config)), &fixture)
             .expect("resolved showcase fixture config");
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, true, &mut sink);
+        let files = compile(&config, FetcherHandle::None, true, &mut sink);
         (sink, files)
     }
 
@@ -1971,7 +1977,7 @@ paths:
             Err(diagnostics) => diagnostics,
             Ok(resolved) => {
                 let mut sink = DiagnosticSink::new();
-                assert!(compile(&resolved, true, &mut sink).is_none());
+                assert!(compile(&resolved, FetcherHandle::None, true, &mut sink).is_none());
                 sink.as_slice().to_vec()
             }
         }
@@ -2126,7 +2132,7 @@ paths:
         let config = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved rejection fixture config");
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, true, &mut sink);
+        let files = compile(&config, FetcherHandle::None, true, &mut sink);
 
         assert!(files.is_none());
         assert_eq!(sink.worst_exit_code(), 1);

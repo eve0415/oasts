@@ -1,4 +1,4 @@
-//! Local OpenAPI document loading and reference resolution.
+//! OpenAPI document loading and reference resolution.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -15,9 +15,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::config::ResolvedConfig;
+use crate::config::{INTEGRITY_PREFIX, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
-use crate::source::{DocumentSource, SourceHandle, is_rooted};
+use crate::source::{
+    DocumentSource, FetchPolicy, FetchStep, FetcherHandle, RemoteFetcher, SourceHandle, is_rooted,
+};
 use crate::yaml::parse_yaml_document_value;
 
 const CODE_DOCUMENT_IO: &str = "OASTS1003";
@@ -32,7 +34,11 @@ const CODE_MAX_DOCUMENT_BYTES: &str = "OASTS2011";
 const CODE_MAX_TOTAL_BYTES: &str = "OASTS2012";
 const CODE_MAX_DOCUMENTS: &str = "OASTS2013";
 const CODE_MAX_REF_DEPTH: &str = "OASTS2014";
-const CODE_REMOTE_UNSUPPORTED: &str = "OASTS9201";
+const CODE_REMOTE_UNAUTHORIZED: &str = "OASTS2021";
+const CODE_REMOTE_UNPINNED: &str = "OASTS2022";
+const CODE_REMOTE_INTEGRITY: &str = "OASTS2023";
+const CODE_REMOTE_RETRIEVAL: &str = "OASTS2024";
+const CODE_REMOTE_UNAVAILABLE: &str = "OASTS2025";
 const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
 /// Percent-encoding writes uppercase hex, which is what `percent_encoding` emits.
 const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
@@ -49,11 +55,66 @@ impl DocId {
     }
 }
 
-/// One parsed local document and its source identity.
+/// Where a document came from, and the identity its references resolve against.
+///
+/// A retrieved document keeps the URI that was *requested*, never the one a redirect landed on.
+/// The digest in `remote.integrity` pins the bytes; pinning the base URI alongside them is what
+/// makes the compile a function of the declared input, because a base that moved under a redirect
+/// would re-point every relative reference in the document without the pinned bytes changing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DocumentLocation {
+    /// A canonical absolute path, as the document source reports it.
+    File(PathBuf),
+    /// The URI a document was retrieved from.
+    Remote(Url),
+}
+
+impl DocumentLocation {
+    /// The retrieval URI relative references resolve against.
+    fn retrieval_url(&self) -> Result<Url, String> {
+        match self {
+            Self::File(path) => file_url(path),
+            Self::Remote(url) => Ok(url.clone()),
+        }
+    }
+
+    /// The final path segment without its extension, which names things derived from a document.
+    #[must_use]
+    pub fn file_stem(&self) -> Option<&str> {
+        match self {
+            Self::File(path) => path.file_stem().and_then(OsStr::to_str),
+            Self::Remote(url) => split_extension(last_segment(url)?).0.into(),
+        }
+    }
+
+    /// The extension naming the document's serialization, if it has one.
+    fn extension(&self) -> Option<&str> {
+        match self {
+            Self::File(path) => path.extension().and_then(OsStr::to_str),
+            Self::Remote(url) => split_extension(last_segment(url)?).1,
+        }
+    }
+}
+
+/// The last non-empty path segment of `url`, which is where a file name would be.
+fn last_segment(url: &Url) -> Option<&str> {
+    url.path_segments()?.filter(|segment| !segment.is_empty()).next_back()
+}
+
+/// Splits `name` into its stem and extension the way `Path` would.
+fn split_extension(name: &str) -> (&str, Option<&str>) {
+    match name.rsplit_once('.') {
+        // A leading dot makes a hidden name, not an extension.
+        Some((stem, extension)) if !stem.is_empty() => (stem, Some(extension)),
+        _ => (name, None),
+    }
+}
+
+/// One parsed document and its source identity.
 #[derive(Clone, Debug)]
 pub struct Document {
     pub id: DocId,
-    pub canonical_path: PathBuf,
+    pub location: DocumentLocation,
     pub source_id: String,
     pub value: Value,
     /// Digest of the source bytes, taken at load; the bytes themselves are not
@@ -146,6 +207,7 @@ pub struct DocumentGraph {
     source: SourceHandle,
     documents: Vec<Document>,
     path_to_id: HashMap<PathBuf, DocId>,
+    uri_to_id: HashMap<String, DocId>,
     identifiers: IdentifierRegistry,
     entry_id: DocId,
     edges: Vec<ReferenceEdge>,
@@ -250,32 +312,38 @@ impl DocumentGraph {
         let target_id = if reference.starts_with('#') {
             base_doc
         } else {
-            let target_path =
-                local_path_from_url(&target_url, Some(&base_document.source_id), None)?;
-            let canonical = self.source.canonicalize(&target_path).map_err(|error| {
-                io_error(
-                    CODE_DOCUMENT_IO,
-                    format!("failed to canonicalize referenced document: {error}"),
-                    Some(&base_document.source_id),
-                    None,
-                )
-            })?;
-            authorize_path(&canonical, &self.workspace_root, &self.allow_roots).map_err(
-                |message| {
-                    input_error(
-                        CODE_REF_ESCAPE,
-                        message,
-                        Some(&base_document.source_id),
-                        None,
-                    )
-                },
-            )?;
-            let Some(target_id) = self.path_to_id.get(&canonical).copied() else {
+            let retrieval =
+                retrieval_from_url(&target_url, Some(&base_document.source_id), None)?;
+            let located = match &retrieval {
+                Retrieval::File(target_path) => {
+                    let canonical = self.source.canonicalize(target_path).map_err(|error| {
+                        io_error(
+                            CODE_DOCUMENT_IO,
+                            format!("failed to canonicalize referenced document: {error}"),
+                            Some(&base_document.source_id),
+                            None,
+                        )
+                    })?;
+                    authorize_path(&canonical, &self.workspace_root, &self.allow_roots).map_err(
+                        |message| {
+                            input_error(
+                                CODE_REF_ESCAPE,
+                                message,
+                                Some(&base_document.source_id),
+                                None,
+                            )
+                        },
+                    )?;
+                    self.path_to_id.get(&canonical).copied()
+                }
+                Retrieval::Remote(url) => self.uri_to_id.get(url.as_str()).copied(),
+            };
+            let Some(target_id) = located else {
                 return Err(io_error(
                     CODE_DOCUMENT_IO,
                     format!(
                         "referenced document '{}' is not part of the loaded graph",
-                        canonical.display()
+                        retrieval.display()
                     ),
                     Some(&base_document.source_id),
                     None,
@@ -393,7 +461,7 @@ impl DocumentGraph {
             // loaded document, and a second fallible lookup would only add a branch nothing can
             // reach.
             let document = &self.documents[doc_id.0];
-            return file_url(&document.canonical_path).map_err(|message| {
+            return document.location.retrieval_url().map_err(|message| {
                 input_error(
                     CODE_INVALID_REFERENCE,
                     message,
@@ -464,18 +532,19 @@ impl DocumentGraph {
     }
 }
 
-/// Loads the configured document graph from the real filesystem.
+/// Loads the configured document graph from the real filesystem, retrieving nothing.
 pub fn load_graph(config: &ResolvedConfig, sink: &mut DiagnosticSink) -> Option<DocumentGraph> {
-    load_graph_with_source(config, SourceHandle::Fs, sink)
+    load_graph_with_host(config, SourceHandle::Fs, FetcherHandle::None, sink)
 }
 
-/// Loads the configured document graph from `source`, reporting the first load failure.
-pub fn load_graph_with_source(
+/// Loads the configured document graph from `source` and `fetcher`, reporting the first failure.
+pub fn load_graph_with_host(
     config: &ResolvedConfig,
     source: SourceHandle,
+    fetcher: FetcherHandle,
     sink: &mut DiagnosticSink,
 ) -> Option<DocumentGraph> {
-    match GraphBuilder::new(config, source).and_then(GraphBuilder::build) {
+    match GraphBuilder::new(config, source, fetcher).and_then(GraphBuilder::build) {
         Ok((graph, warnings)) => {
             sink.extend(warnings);
             Some(graph)
@@ -550,8 +619,11 @@ struct ResolvedWalkNode<'value> {
 struct GraphBuilder<'a> {
     config: &'a ResolvedConfig,
     source: SourceHandle,
+    fetcher: FetcherHandle,
+    policy: FetchPolicy,
     documents: Vec<Rc<Document>>,
     path_to_id: HashMap<PathBuf, DocId>,
+    uri_to_id: HashMap<String, DocId>,
     identifiers: IdentifierRegistry,
     edges: Vec<ReferenceEdge>,
     workspace_root: PathBuf,
@@ -562,7 +634,11 @@ struct GraphBuilder<'a> {
 }
 
 impl<'a> GraphBuilder<'a> {
-    fn new(config: &'a ResolvedConfig, source: SourceHandle) -> Result<Self, Diagnostic> {
+    fn new(
+        config: &'a ResolvedConfig,
+        source: SourceHandle,
+        fetcher: FetcherHandle,
+    ) -> Result<Self, Diagnostic> {
         let workspace_root = source
             .canonicalize(&config.workspace_root)
             .map_err(|error| {
@@ -591,8 +667,14 @@ impl<'a> GraphBuilder<'a> {
         Ok(Self {
             config,
             source,
+            fetcher,
+            policy: FetchPolicy {
+                timeout_ms: config.remote.timeout_ms,
+                max_bytes: config.limits.max_document_bytes,
+            },
             documents: Vec::new(),
             path_to_id: HashMap::new(),
+            uri_to_id: HashMap::new(),
             identifiers: IdentifierRegistry::default(),
             edges: Vec::new(),
             workspace_root,
@@ -604,12 +686,16 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn build(mut self) -> Result<(DocumentGraph, Vec<Diagnostic>), Diagnostic> {
-        let entry_path = configured_entry_path(&self.config.input)?;
-        let entry_id = self.load_document(&entry_path)?;
-        let entry_path = self.documents[entry_id.0].canonical_path.clone();
-        // `load_document` stores a canonical absolute filesystem path, which `file_url` accepts.
-        let entry_base = file_url(&entry_path)
-            .expect("a canonical filesystem path is representable as a file URI");
+        let entry_id = match configured_entry_location(&self.config.input)? {
+            Retrieval::File(path) => self.load_document(&path)?,
+            Retrieval::Remote(url) => self.load_remote_document(&url)?,
+        };
+        // Every loaded document stores either a canonical absolute path or the URI it was
+        // retrieved from, and both are representable as a retrieval URI.
+        let entry_base = self.documents[entry_id.0]
+            .location
+            .retrieval_url()
+            .expect("a loaded document's location is representable as a retrieval URI");
         let mut state = TraversalState::default();
         self.walk_node(
             NodeLocation {
@@ -635,6 +721,7 @@ impl<'a> GraphBuilder<'a> {
                 source: self.source,
                 documents,
                 path_to_id: self.path_to_id,
+                uri_to_id: self.uri_to_id,
                 identifiers: self.identifiers,
                 entry_id,
                 edges: self.edges,
@@ -670,38 +757,12 @@ impl<'a> GraphBuilder<'a> {
             return Ok(*id);
         }
 
-        let next_count = u64::try_from(self.documents.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
-        if next_count > self.config.limits.max_documents {
-            return Err(limit_error(
-                CODE_MAX_DOCUMENTS,
-                "maxDocuments",
-                self.config.limits.max_documents,
-                &source_id,
-            ));
-        }
+        self.reserve_document(&source_id)?;
 
         // Size limits gate on metadata BEFORE reading, so an oversized target
         // is never buffered into memory just to be rejected.
         let byte_len = document_byte_len(&self.source, &canonical_path, &source_id)?;
-        if byte_len > self.config.limits.max_document_bytes {
-            return Err(limit_error(
-                CODE_MAX_DOCUMENT_BYTES,
-                "maxDocumentBytes",
-                self.config.limits.max_document_bytes,
-                &source_id,
-            ));
-        }
-        let next_total = self.total_bytes.saturating_add(byte_len);
-        if next_total > self.config.limits.max_total_bytes {
-            return Err(limit_error(
-                CODE_MAX_TOTAL_BYTES,
-                "maxTotalBytes",
-                self.config.limits.max_total_bytes,
-                &source_id,
-            ));
-        }
+        let next_total = self.admit_bytes(byte_len, &source_id)?;
 
         let raw = self.source.read(&canonical_path).map_err(|error| {
             io_error(
@@ -711,28 +772,220 @@ impl<'a> GraphBuilder<'a> {
                 None,
             )
         })?;
-        let contains_anchor = declares_identifier(&raw);
-        let (value, warning) = parse_document(&canonical_path, &raw, &source_id)?;
+        let id = self.admit(
+            DocumentLocation::File(canonical_path.clone()),
+            source_id,
+            &raw,
+            next_total,
+        )?;
+        self.path_to_id.insert(canonical_path, id);
+        Ok(id)
+    }
+
+    /// Loads the document `url` addresses, retrieving it through the host.
+    ///
+    /// Retrieval is refused in a fixed order, most specific first: a URI the configuration never
+    /// authorized, then one it authorized but did not pin, and only then a host with no way to
+    /// retrieve anything. That order means a configuration mistake is always reported as itself,
+    /// and the capability refusal is reached only by a request that was otherwise well-formed.
+    fn load_remote_document(&mut self, url: &Url) -> Result<DocId, Diagnostic> {
+        let source_id = url.as_str().to_owned();
+        if let Some(id) = self.uri_to_id.get(&source_id) {
+            return Ok(*id);
+        }
+
+        self.authorize_remote(url, &source_id)?;
+        let Some(pinned) = self.config.remote.integrity.get(&source_id) else {
+            return Err(input_error(
+                CODE_REMOTE_UNPINNED,
+                format!(
+                    "'{source_id}' has no remote.integrity entry, and an unpinned document cannot be compiled reproducibly"
+                ),
+                Some(&source_id),
+                None,
+            ));
+        };
+        let Some(fetcher) = self.fetcher.get() else {
+            return Err(input_error(
+                CODE_REMOTE_UNAVAILABLE,
+                format!("this host cannot retrieve documents, and '{source_id}' is not local"),
+                Some(&source_id),
+                None,
+            ));
+        };
+
+        self.reserve_document(&source_id)?;
+        let raw = self.retrieve(fetcher, url, &source_id)?;
+        // The policy caps the transfer, but the cap is the host's to enforce and the graph's
+        // accounting is the core's; charging the bytes here keeps one document's size and the
+        // graph total answerable by the same limits whichever way it arrived.
+        let next_total = self.admit_bytes(raw.len() as u64, &source_id)?;
+
+        let observed = format!("{INTEGRITY_PREFIX}{}", crate::emit::lower_hex(&Sha256::digest(&raw)));
+        if observed != *pinned {
+            return Err(input_error(
+                CODE_REMOTE_INTEGRITY,
+                format!(
+                    "'{source_id}' served bytes digesting to {observed}, but remote.integrity pins {pinned}"
+                ),
+                Some(&source_id),
+                None,
+            ));
+        }
+
+        let id = self.admit(
+            DocumentLocation::Remote(url.clone()),
+            source_id.clone(),
+            &raw,
+            next_total,
+        )?;
+        self.uri_to_id.insert(source_id, id);
+        Ok(id)
+    }
+
+    /// Retrieves `url`, authorizing every hop the answer leads to before requesting it.
+    ///
+    /// The redirect budget and the allowlist are spent here rather than inside the host, so a
+    /// redirect cannot reach a host the configuration never listed.
+    fn retrieve(
+        &self,
+        fetcher: &dyn RemoteFetcher,
+        url: &Url,
+        source_id: &str,
+    ) -> Result<Vec<u8>, Diagnostic> {
+        let mut current = url.clone();
+        // One request, plus one per redirect the budget allows.
+        for _ in 0..=self.config.remote.max_redirects {
+            self.authorize_remote(&current, source_id)?;
+            let step = fetcher
+                .fetch_once(current.as_str(), &self.policy)
+                .map_err(|message| {
+                    input_error(
+                        CODE_REMOTE_RETRIEVAL,
+                        format!("failed to retrieve '{current}': {message}"),
+                        Some(source_id),
+                        None,
+                    )
+                })?;
+            match step {
+                FetchStep::Body(bytes) => return Ok(bytes),
+                FetchStep::Redirect(location) => {
+                    let mut next = current.join(&location).map_err(|error| {
+                        input_error(
+                            CODE_REMOTE_RETRIEVAL,
+                            format!(
+                                "'{current}' redirected to '{location}', which is not a URI reference: {error}"
+                            ),
+                            Some(source_id),
+                            None,
+                        )
+                    })?;
+                    next.set_fragment(None);
+                    current = next;
+                }
+            }
+        }
+        Err(input_error(
+            CODE_REMOTE_RETRIEVAL,
+            format!(
+                "retrieving '{source_id}' took more than the {} redirects remote.maxRedirects allows",
+                self.config.remote.max_redirects
+            ),
+            Some(source_id),
+            None,
+        ))
+    }
+
+    /// Refuses a URI the `remote` block does not authorize retrieving.
+    fn authorize_remote(&self, url: &Url, source_id: &str) -> Result<(), Diagnostic> {
+        let unauthorized = |reason: String| {
+            Err(input_error(
+                CODE_REMOTE_UNAUTHORIZED,
+                format!("retrieving '{url}' is not authorized: {reason}"),
+                Some(source_id),
+                None,
+            ))
+        };
+        if !self.config.remote.allow_insecure && url.scheme() != "https" {
+            return unauthorized(
+                "the scheme is not https, and remote.allowInsecure is not set".to_owned(),
+            );
+        }
+        let Some(host) = url.host_str() else {
+            return unauthorized("the URI names no host".to_owned());
+        };
+        if !self.config.remote.authorizes_host(host) {
+            return unauthorized(format!("'{host}' is not listed in remote.allowHosts"));
+        }
+        Ok(())
+    }
+
+    /// Refuses the document that would push the graph past `maxDocuments`.
+    fn reserve_document(&self, source_id: &str) -> Result<(), Diagnostic> {
+        let next_count = u64::try_from(self.documents.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if next_count > self.config.limits.max_documents {
+            return Err(limit_error(
+                CODE_MAX_DOCUMENTS,
+                "maxDocuments",
+                self.config.limits.max_documents,
+                source_id,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Charges `byte_len` against both size limits, returning the graph total it would produce.
+    fn admit_bytes(&self, byte_len: u64, source_id: &str) -> Result<u64, Diagnostic> {
+        if byte_len > self.config.limits.max_document_bytes {
+            return Err(limit_error(
+                CODE_MAX_DOCUMENT_BYTES,
+                "maxDocumentBytes",
+                self.config.limits.max_document_bytes,
+                source_id,
+            ));
+        }
+        let next_total = self.total_bytes.saturating_add(byte_len);
+        if next_total > self.config.limits.max_total_bytes {
+            return Err(limit_error(
+                CODE_MAX_TOTAL_BYTES,
+                "maxTotalBytes",
+                self.config.limits.max_total_bytes,
+                source_id,
+            ));
+        }
+        Ok(next_total)
+    }
+
+    /// Parses `raw` and seats it in the graph, whichever way it was obtained.
+    fn admit(
+        &mut self,
+        location: DocumentLocation,
+        source_id: String,
+        raw: &[u8],
+        next_total: u64,
+    ) -> Result<DocId, Diagnostic> {
+        let contains_anchor = declares_identifier(raw);
+        let (value, warning) = parse_document(&location, raw, &source_id)?;
         if let Some(warning) = warning {
             self.warnings.push(warning);
         }
-        let sha256 = Sha256::digest(&raw).into();
-        drop(raw);
+        let sha256 = Sha256::digest(raw).into();
         let id = DocId(self.documents.len());
         if contains_anchor {
-            // `canonical_path` came from `fs::canonicalize`, so it is an absolute file path.
-            let base = file_url(&canonical_path)
-                .expect("a canonical filesystem path is representable as a file URI");
+            let base = location
+                .retrieval_url()
+                .expect("a loaded document's location is representable as a retrieval URI");
             collect_anchors(&value, id, base, &source_id, &mut self.identifiers)?;
         }
         self.documents.push(Rc::new(Document {
             id,
-            canonical_path: canonical_path.clone(),
+            location,
             source_id,
             value,
             sha256,
         }));
-        self.path_to_id.insert(canonical_path, id);
         self.total_bytes = next_total;
         Ok(id)
     }
@@ -959,9 +1212,11 @@ impl<'a> GraphBuilder<'a> {
             }
         } else {
             let source_id = self.source_id(from.doc_id);
-            let target_path =
-                local_path_from_url(&target_url, source_id, Some(&reference_pointer))?;
-            let target_id = self.load_document(&target_path).map_err(|mut diagnostic| {
+            let target_id = match retrieval_from_url(&target_url, source_id, Some(&reference_pointer))? {
+                Retrieval::File(target_path) => self.load_document(&target_path),
+                Retrieval::Remote(url) => self.load_remote_document(&url),
+            }
+            .map_err(|mut diagnostic| {
                 if diagnostic.source_id.is_none()
                     && let Some(source_id) = self.source_id(from.doc_id)
                 {
@@ -1101,7 +1356,7 @@ fn base_at_document(
     json_pointer: &str,
     expected_position: PositionKind,
 ) -> Result<Url, Diagnostic> {
-    let mut base = file_url(&document.canonical_path).map_err(|message| {
+    let mut base = document.location.retrieval_url().map_err(|message| {
         input_error(
             CODE_INVALID_REFERENCE,
             message,
@@ -1459,11 +1714,11 @@ fn document_byte_len(
 type DocumentParser = fn(&[u8], &str) -> Result<Value, Diagnostic>;
 
 fn parse_document(
-    path: &Path,
+    location: &DocumentLocation,
     raw: &[u8],
     source_id: &str,
 ) -> Result<(Value, Option<Diagnostic>), Diagnostic> {
-    match path.extension().and_then(OsStr::to_str) {
+    match location.extension() {
         // The extension names the primary parser; the other is the fallback. The warning reports the
         // format actually used, and `combined_parse_error` always receives the errors in canonical
         // (json, yaml) order with the primary parser's position.
@@ -1563,17 +1818,19 @@ fn extension_fallback_warning(source_id: &str, extension: &str, format: &str) ->
     diagnostic
 }
 
-fn configured_entry_path(path: &Path) -> Result<PathBuf, Diagnostic> {
+/// Classifies the configured entry, which config resolution left as either an absolute path or the
+/// literal URI text of `input.url`.
+fn configured_entry_location(path: &Path) -> Result<Retrieval, Diagnostic> {
     if is_rooted(path) {
-        return Ok(path.to_path_buf());
+        return Ok(Retrieval::File(path.to_path_buf()));
     }
     let Some(value) = path.to_str() else {
-        return Ok(path.to_path_buf());
+        return Ok(Retrieval::File(path.to_path_buf()));
     };
     let Ok(url) = Url::parse(value) else {
-        return Ok(path.to_path_buf());
+        return Ok(Retrieval::File(path.to_path_buf()));
     };
-    local_path_from_url(&url, None, None)
+    retrieval_from_url(&url, None, None)
 }
 
 /// Fast-reject that gates the identifier tree walk over the *raw* file bytes. It must also
@@ -2081,30 +2338,55 @@ fn percent_decode_segment(segment: &[u8], decoded: &mut Vec<u8>) {
     }
 }
 
-fn local_path_from_url(
+/// What a resolved reference URI names, once identity has failed to answer it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Retrieval {
+    /// A document the configured source reads.
+    File(PathBuf),
+    /// A document the host retrieves, addressed by the URI without its fragment.
+    Remote(Url),
+}
+
+impl Retrieval {
+    /// How the target is written in a diagnostic.
+    fn display(&self) -> Cow<'_, str> {
+        match self {
+            Self::File(path) => path.display().to_string().into(),
+            Self::Remote(url) => url.as_str().into(),
+        }
+    }
+}
+
+/// Classifies a URI that has to be read, by the only two schemes anything can read.
+fn retrieval_from_url(
     url: &Url,
     source_id: Option<&str>,
     pointer: Option<&str>,
-) -> Result<PathBuf, Diagnostic> {
-    if url.scheme() != "file" {
-        return Err(input_error(
-            CODE_REMOTE_UNSUPPORTED,
+) -> Result<Retrieval, Diagnostic> {
+    match url.scheme() {
+        "file" => file_path_from_url(url).map(Retrieval::File).ok_or_else(|| {
+            input_error(
+                CODE_INVALID_REFERENCE,
+                format!("file URI '{}' is not a local filesystem path", url.as_str()),
+                source_id,
+                pointer,
+            )
+        }),
+        "http" | "https" => {
+            let mut retrievable = url.clone();
+            retrievable.set_fragment(None);
+            Ok(Retrieval::Remote(retrievable))
+        }
+        scheme => Err(input_error(
+            CODE_INVALID_REFERENCE,
             format!(
-                "remote loading is not supported in this build: '{}'",
+                "URI scheme '{scheme}' names no document that can be read: '{}'",
                 url.as_str()
             ),
             source_id,
             pointer,
-        ));
+        )),
     }
-    file_path_from_url(url).ok_or_else(|| {
-        input_error(
-            CODE_INVALID_REFERENCE,
-            format!("file URI '{}' is not a local filesystem path", url.as_str()),
-            source_id,
-            pointer,
-        )
-    })
 }
 
 fn pointer_from_url(
@@ -2448,9 +2730,12 @@ fn to_u32(value: usize) -> u32 {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Arc;
 
     use serde_json::json;
     use tempfile::TempDir;
+
+    use crate::source::RemoteFetcher;
 
     /// A path corpus covering every rule in the encode set, plus the shapes `url`'s own conversion
     /// treats specially: a bare root, a trailing drive letter, and a component that is already an
@@ -3025,7 +3310,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_reference_is_rejected_without_fetching() {
+    fn a_retrievable_reference_is_refused_when_the_config_authorizes_no_host() {
         let directory = TempDir::new().expect("tempdir should be created");
         write(
             directory.path(),
@@ -3034,12 +3319,18 @@ mod tests {
         );
         let config = resolved_config(directory.path(), "");
 
-        let diagnostic = assert_load_code(&config, CODE_REMOTE_UNSUPPORTED);
-        assert!(diagnostic.message.contains("not supported in this build"));
+        let diagnostic = assert_load_code(&config, CODE_REMOTE_UNAUTHORIZED);
+        assert!(
+            diagnostic
+                .message
+                .contains("'example.invalid' is not listed in remote.allowHosts"),
+            "{}",
+            diagnostic.message
+        );
     }
 
     #[test]
-    fn non_file_scheme_entry_is_rejected_as_remote_input() {
+    fn a_retrievable_entry_reaches_the_loader_and_is_refused_there() {
         let directory = TempDir::new().expect("tempdir should be created");
         let config_path = write(
             directory.path(),
@@ -3049,7 +3340,7 @@ mod tests {
         let config = load_config(Some(&config_path), directory.path())
             .expect("remote input should reach the loader");
 
-        assert_load_code(&config, CODE_REMOTE_UNSUPPORTED);
+        assert_load_code(&config, CODE_REMOTE_UNAUTHORIZED);
     }
 
     #[test]
@@ -3898,10 +4189,10 @@ mod tests {
             CODE_REF_ESCAPE
         );
         for (reference, code) in [
-            (
-                "https://example.invalid/schema.yaml",
-                CODE_REMOTE_UNSUPPORTED,
-            ),
+            // Nothing loads during resolution, so a URI no document in the graph was retrieved
+            // from is a missing target rather than a retrieval that could still be attempted.
+            ("https://example.invalid/schema.yaml", CODE_DOCUMENT_IO),
+            ("urn:example:schema", CODE_INVALID_REFERENCE),
             ("#/%", CODE_INVALID_REFERENCE),
             ("#not-a-pointer", CODE_INVALID_REFERENCE),
             ("#/missing", CODE_POINTER),
@@ -4009,7 +4300,7 @@ mod tests {
             ),
             (
                 "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $ref: https://example.invalid/schema.json\n",
-                CODE_REMOTE_UNSUPPORTED,
+                CODE_REMOTE_UNAUTHORIZED,
             ),
             // Invalid $id inside an allOf element: the diagnostic propagates back
             // through the array-child walk, not the object-child walk.
@@ -4057,12 +4348,12 @@ mod tests {
             "openapi: 3.1.0\ntags:\n  - name: one\ncomponents:\n  schemas:\n    Mixed:\n      allOf:\n        - type: object\n      prefixItems:\n        - type: string\n      items:\n        - type: number\n      example:\n        $ref: missing.yaml\n",
         );
         let config = resolved_config(directory.path(), "");
-        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs).expect("builder");
+        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs, FetcherHandle::None).expect("builder");
         let entry_id = builder
             .load_document(&config.input)
             .expect("entry should load");
         let base =
-            Rc::new(file_url(&builder.documents[entry_id.0].canonical_path).expect("file URL"));
+            Rc::new(builder.documents[entry_id.0].location.retrieval_url().expect("file URL"));
         let location = NodeLocation {
             doc_id: entry_id,
             json_pointer: String::new(),
@@ -4134,12 +4425,12 @@ mod tests {
             "openapi: 3.1.0\ninfo:\n  title: Example\n  version: 1.0.0\n",
         );
         let config = resolved_config(directory.path(), "");
-        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs).expect("builder");
+        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs, FetcherHandle::None).expect("builder");
         let entry_id = builder
             .load_document(&config.input)
             .expect("entry should load");
         let base =
-            Rc::new(file_url(&builder.documents[entry_id.0].canonical_path).expect("file URL"));
+            Rc::new(builder.documents[entry_id.0].location.retrieval_url().expect("file URL"));
         builder
             .walk_node(
                 NodeLocation {
@@ -4167,9 +4458,11 @@ mod tests {
         let directory = TempDir::new().expect("tempdir should be created");
         let entry = write(directory.path(), "workspace/entry.yaml", "openapi: 3.1.0\n");
         let config = resolved_config(directory.path(), "");
-        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs).expect("builder");
+        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs, FetcherHandle::None).expect("builder");
         let id = builder.load_document(&entry).expect("entry should load");
-        let canonical_path = builder.documents[id.0].canonical_path.clone();
+        let DocumentLocation::File(canonical_path) = builder.documents[id.0].location.clone() else {
+            unreachable!("a filesystem document is located by path")
+        };
         fs::remove_file(&canonical_path).expect("cached document should be removable");
 
         assert_eq!(
@@ -4190,7 +4483,7 @@ mod tests {
         let alias = directory.path().join("workspace/alias.yaml");
         symlink(&entry, &alias).expect("fixture symlink should be created");
         let config = resolved_config(directory.path(), "");
-        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs).expect("builder");
+        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs, FetcherHandle::None).expect("builder");
         let id = builder.load_document(&entry).expect("entry should load");
 
         assert_eq!(
@@ -4204,25 +4497,25 @@ mod tests {
     #[test]
     fn document_parsers_cover_extensions_utf8_and_fallbacks() {
         assert_eq!(
-            parse_document(Path::new("value.json"), br#"{"ok":true}"#, "json")
+            parse_document(&DocumentLocation::File(PathBuf::from("value.json")), br#"{"ok":true}"#, "json")
                 .expect("JSON document")
                 .0,
             json!({ "ok": true })
         );
         assert_eq!(
-            parse_document(Path::new("value.yaml"), b"ok: true\n", "yaml")
+            parse_document(&DocumentLocation::File(PathBuf::from("value.yaml")), b"ok: true\n", "yaml")
                 .expect("YAML document")
                 .0,
             json!({ "ok": true })
         );
         assert_eq!(
-            parse_document(Path::new("value.data"), br#"[1,2]"#, "fallback-json")
+            parse_document(&DocumentLocation::File(PathBuf::from("value.data")), br#"[1,2]"#, "fallback-json")
                 .expect("fallback JSON")
                 .0,
             json!([1, 2])
         );
         assert_eq!(
-            parse_document(Path::new("value.data"), b"ok: true\n", "fallback-yaml")
+            parse_document(&DocumentLocation::File(PathBuf::from("value.data")), b"ok: true\n", "fallback-yaml")
                 .expect("fallback YAML")
                 .0,
             json!({ "ok": true })
@@ -4364,17 +4657,24 @@ mod tests {
             "https://example.invalid/x"
         );
         assert!(file_url(Path::new("relative/path")).is_err());
-        let remote = Url::parse("https://example.invalid/x").expect("remote URL");
+        // The fragment addresses a node inside the retrieved document, so it is not part of what
+        // is retrieved and never reaches the host.
+        let remote = Url::parse("https://example.invalid/x#/a").expect("remote URL");
         assert_eq!(
-            local_path_from_url(&remote, Some("source"), Some("/$ref"))
-                .expect_err("remote URL")
-                .code,
-            CODE_REMOTE_UNSUPPORTED
+            retrieval_from_url(&remote, Some("source"), Some("/$ref")).expect("remote URL"),
+            Retrieval::Remote(Url::parse("https://example.invalid/x").expect("retrievable URL"))
         );
         let nonlocal = Url::parse("file://example.invalid/path").expect("file URL");
         assert_eq!(
-            local_path_from_url(&nonlocal, Some("source"), Some("/$ref"))
+            retrieval_from_url(&nonlocal, Some("source"), Some("/$ref"))
                 .expect_err("non-local file URL")
+                .code,
+            CODE_INVALID_REFERENCE
+        );
+        let opaque = Url::parse("urn:example:schema").expect("URN");
+        assert_eq!(
+            retrieval_from_url(&opaque, Some("source"), Some("/$ref"))
+                .expect_err("unreadable scheme")
                 .code,
             CODE_INVALID_REFERENCE
         );
@@ -4549,7 +4849,7 @@ mod tests {
     fn graph_and_target_base_cover_defensive_resolution_paths() {
         let document = Document {
             id: DocId(0),
-            canonical_path: PathBuf::from("relative.yaml"),
+            location: DocumentLocation::File(PathBuf::from("relative.yaml")),
             source_id: "workspace/relative.yaml".to_owned(),
             value: json!({}),
             sha256: [0; 32],
@@ -4558,6 +4858,7 @@ mod tests {
             source: SourceHandle::Fs,
             documents: vec![document],
             path_to_id: HashMap::new(),
+            uri_to_id: HashMap::new(),
             identifiers: IdentifierRegistry::default(),
             entry_id: DocId(0),
             edges: Vec::new(),
@@ -4581,7 +4882,7 @@ mod tests {
         );
         let mut config = resolved_config(directory.path(), "");
         config.input = directory.path().join("workspace/entry.json");
-        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs).expect("builder");
+        let mut builder = GraphBuilder::new(&config, SourceHandle::Fs, FetcherHandle::None).expect("builder");
         let id = builder
             .load_document(&config.input)
             .expect("document should load");
@@ -4636,7 +4937,7 @@ mod tests {
         );
         Rc::get_mut(&mut builder.documents[id.0])
             .expect("the builder owns the only document handle")
-            .canonical_path = PathBuf::from("relative.json");
+            .location = DocumentLocation::File(PathBuf::from("relative.json"));
         assert_eq!(
             builder
                 .base_at_target(
@@ -4659,15 +4960,599 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let path = PathBuf::from(OsString::from_vec(vec![0xff]));
-        assert_eq!(configured_entry_path(&path).expect("path"), path);
         assert_eq!(
-            configured_entry_path(Path::new("relative.yaml")).expect("relative path"),
-            PathBuf::from("relative.yaml")
+            configured_entry_location(&path).expect("path"),
+            Retrieval::File(path)
+        );
+        assert_eq!(
+            configured_entry_location(Path::new("relative.yaml")).expect("relative path"),
+            Retrieval::File(PathBuf::from("relative.yaml"))
         );
         let file = Url::parse("file:///tmp/entry.yaml").expect("file URL");
         assert_eq!(
-            configured_entry_path(Path::new(file.as_str())).expect("file path"),
-            PathBuf::from("/tmp/entry.yaml")
+            configured_entry_location(Path::new(file.as_str())).expect("file path"),
+            Retrieval::File(PathBuf::from("/tmp/entry.yaml"))
         );
+        let remote = Url::parse("https://example.invalid/openapi.yaml").expect("remote URL");
+        assert_eq!(
+            configured_entry_location(Path::new(remote.as_str())).expect("retrievable entry"),
+            Retrieval::Remote(remote)
+        );
+    }
+
+    /// A retriever that answers from a fixed table and records every request it was asked for.
+    ///
+    /// Recording is what pins the properties a returned value cannot state: that authorization is
+    /// spent before a request leaves, and that an `$id` naming a URI is not a request to fetch it.
+    #[derive(Debug)]
+    struct RecordingFetcher {
+        answers: BTreeMap<String, Result<FetchStep, String>>,
+        requests: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingFetcher {
+        fn new<'a>(answers: impl IntoIterator<Item = (&'a str, Result<FetchStep, String>)>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: answers
+                    .into_iter()
+                    .map(|(url, answer)| (url.to_owned(), answer))
+                    .collect(),
+                requests: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Answers nothing, so any request at all is a failed retrieval.
+        fn silent() -> Arc<Self> {
+            Self::new([])
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().expect("no test panics while holding the lock").clone()
+        }
+    }
+
+    impl RemoteFetcher for RecordingFetcher {
+        fn fetch_once(&self, url: &str, _policy: &FetchPolicy) -> Result<FetchStep, String> {
+            self.requests
+                .lock()
+                .expect("no test panics while holding the lock")
+                .push(url.to_owned());
+            self.answers
+                .get(url)
+                .cloned()
+                .unwrap_or_else(|| Err("the connection was refused".to_owned()))
+        }
+    }
+
+    fn body(document: &str) -> Result<FetchStep, String> {
+        Ok(FetchStep::Body(document.as_bytes().to_vec()))
+    }
+
+    /// The `remote.integrity` value pinning `document`.
+    fn pin(document: &str) -> String {
+        format!(
+            "{INTEGRITY_PREFIX}{}",
+            crate::emit::lower_hex(&Sha256::digest(document.as_bytes()))
+        )
+    }
+
+    /// A `remote` block authorizing `hosts`, carrying `options`, and pinning each `(uri, body)`.
+    fn remote_block(hosts: &[&str], options: &str, pins: &[(&str, &str)]) -> String {
+        let mut block = format!("remote:\n  allowHosts: [{}]\n{options}", hosts.join(", "));
+        if !pins.is_empty() {
+            block.push_str("  integrity:\n");
+            for (uri, document) in pins {
+                block.push_str(&format!("    \"{uri}\": \"{}\"\n", pin(document)));
+            }
+        }
+        block
+    }
+
+    /// A config whose entry is retrieved rather than read.
+    fn retrieved_entry_config(root: &Path, uri: &str, extra: &str) -> ResolvedConfig {
+        fs::create_dir_all(root.join("workspace")).expect("workspace should be created");
+        let config = format!(
+            "schemaVersion: 1\nworkspaceRoot: workspace\ninput: {{ url: \"{uri}\" }}\noutput: generated\n{extra}"
+        );
+        let path = write(root, "oasts.yaml", &config);
+        load_config(Some(&path), root).expect("fixture config should resolve")
+    }
+
+    fn load_retrieving(
+        config: &ResolvedConfig,
+        fetcher: &Arc<RecordingFetcher>,
+    ) -> (Option<DocumentGraph>, Vec<Diagnostic>) {
+        let mut sink = DiagnosticSink::new();
+        let handle = FetcherHandle::from(Arc::clone(fetcher) as Arc<dyn RemoteFetcher>);
+        let graph = load_graph_with_host(config, SourceHandle::Fs, handle, &mut sink);
+        (graph, sink.into_sorted_vec())
+    }
+
+    fn assert_retrieval_code(
+        config: &ResolvedConfig,
+        fetcher: &Arc<RecordingFetcher>,
+        code: &str,
+    ) -> Diagnostic {
+        let (graph, diagnostics) = load_retrieving(config, fetcher);
+        assert!(graph.is_none());
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == code)
+            .unwrap_or_else(|| panic!("expected {code}, got {diagnostics:#?}"))
+            .clone();
+        assert_eq!(diagnostic.category, Category::Input);
+        diagnostic
+    }
+
+    const ENTRY_URI: &str = "https://specs.example.test/openapi.yaml";
+    const OTHER_URI: &str = "https://mirror.example.test/openapi.yaml";
+    const ENTRY_DOCUMENT: &str = "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      type: string\n";
+
+    #[test]
+    fn a_retrieved_entry_is_identified_by_the_uri_that_was_requested() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::new([(ENTRY_URI, body(ENTRY_DOCUMENT))]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "",
+                &[(ENTRY_URI, ENTRY_DOCUMENT)],
+            ),
+        );
+
+        let (graph, diagnostics) = load_retrieving(&config, &fetcher);
+
+        let graph = graph.expect("a pinned, authorized entry loads");
+        assert_eq!(diagnostics, Vec::new());
+        assert_eq!(graph.entry().source_id, ENTRY_URI);
+        assert_eq!(
+            graph.entry().location,
+            DocumentLocation::Remote(Url::parse(ENTRY_URI).expect("entry URI"))
+        );
+        assert_eq!(fetcher.requests(), [ENTRY_URI]);
+    }
+
+    #[test]
+    fn a_host_the_config_does_not_list_is_refused_before_anything_leaves() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::new([(ENTRY_URI, body(ENTRY_DOCUMENT))]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(&["elsewhere.example.test"], "", &[(ENTRY_URI, ENTRY_DOCUMENT)]),
+        );
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_UNAUTHORIZED);
+
+        assert!(
+            diagnostic
+                .message
+                .contains("'specs.example.test' is not listed in remote.allowHosts"),
+            "{}",
+            diagnostic.message
+        );
+        assert_eq!(fetcher.requests(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_plain_http_uri_is_refused_until_the_config_admits_one() {
+        const INSECURE_URI: &str = "http://specs.example.test/openapi.yaml";
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::new([(INSECURE_URI, body(ENTRY_DOCUMENT))]);
+        let refused = retrieved_entry_config(
+            directory.path(),
+            INSECURE_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "",
+                &[(INSECURE_URI, ENTRY_DOCUMENT)],
+            ),
+        );
+
+        let diagnostic = assert_retrieval_code(&refused, &fetcher, CODE_REMOTE_UNAUTHORIZED);
+        assert!(
+            diagnostic.message.contains("remote.allowInsecure"),
+            "{}",
+            diagnostic.message
+        );
+        assert_eq!(fetcher.requests(), Vec::<String>::new());
+
+        let admitted = retrieved_entry_config(
+            directory.path(),
+            INSECURE_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "  allowInsecure: true\n",
+                &[(INSECURE_URI, ENTRY_DOCUMENT)],
+            ),
+        );
+        let (graph, _) = load_retrieving(&admitted, &fetcher);
+        assert!(graph.is_some());
+    }
+
+    #[test]
+    fn an_authorized_uri_with_no_pin_is_refused() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::new([(ENTRY_URI, body(ENTRY_DOCUMENT))]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(&["specs.example.test"], "", &[]),
+        );
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_UNPINNED);
+
+        assert!(
+            diagnostic.message.contains("no remote.integrity entry"),
+            "{}",
+            diagnostic.message
+        );
+        assert_eq!(fetcher.requests(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_digest_mismatch_names_the_digest_that_was_served() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let served = "openapi: 3.1.0\ncomponents: {}\n";
+        let fetcher = RecordingFetcher::new([(ENTRY_URI, body(served))]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "",
+                &[(ENTRY_URI, ENTRY_DOCUMENT)],
+            ),
+        );
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_INTEGRITY);
+
+        // The observed digest is printed exactly as `remote.integrity` records it, so recording it
+        // is a copy rather than a transcription.
+        assert!(diagnostic.message.contains(&pin(served)), "{}", diagnostic.message);
+        assert!(diagnostic.message.contains(&pin(ENTRY_DOCUMENT)), "{}", diagnostic.message);
+    }
+
+    #[test]
+    fn a_host_with_no_way_to_retrieve_says_so_rather_than_failing_obscurely() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "",
+                &[(ENTRY_URI, ENTRY_DOCUMENT)],
+            ),
+        );
+
+        let diagnostic = assert_load_code(&config, CODE_REMOTE_UNAVAILABLE);
+
+        assert!(
+            diagnostic.message.contains("this host cannot retrieve documents"),
+            "{}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn a_failed_request_reports_what_the_host_said_about_it() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::silent();
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "",
+                &[(ENTRY_URI, ENTRY_DOCUMENT)],
+            ),
+        );
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_RETRIEVAL);
+
+        assert!(
+            diagnostic.message.contains("the connection was refused"),
+            "{}",
+            diagnostic.message
+        );
+        assert_eq!(fetcher.requests(), [ENTRY_URI]);
+    }
+
+    #[test]
+    fn a_redirect_is_followed_only_after_its_target_is_authorized() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::new([
+            (ENTRY_URI, Ok(FetchStep::Redirect(OTHER_URI.to_owned()))),
+            (OTHER_URI, body(ENTRY_DOCUMENT)),
+        ]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test", "mirror.example.test"],
+                "",
+                // Only the requested URI is pinned: the document keeps the identity that was
+                // asked for, so the redirect target is a retrieval detail and not a second input.
+                &[(ENTRY_URI, ENTRY_DOCUMENT)],
+            ),
+        );
+
+        let (graph, _) = load_retrieving(&config, &fetcher);
+
+        let graph = graph.expect("an authorized redirect is followed");
+        assert_eq!(graph.entry().source_id, ENTRY_URI);
+        assert_eq!(fetcher.requests(), [ENTRY_URI, OTHER_URI]);
+    }
+
+    #[test]
+    fn a_redirect_to_an_unlisted_host_is_refused_without_requesting_it() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::new([
+            (ENTRY_URI, Ok(FetchStep::Redirect(OTHER_URI.to_owned()))),
+            (OTHER_URI, body(ENTRY_DOCUMENT)),
+        ]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "",
+                &[(ENTRY_URI, ENTRY_DOCUMENT)],
+            ),
+        );
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_UNAUTHORIZED);
+
+        assert!(
+            diagnostic
+                .message
+                .contains("'mirror.example.test' is not listed"),
+            "{}",
+            diagnostic.message
+        );
+        assert_eq!(fetcher.requests(), [ENTRY_URI]);
+    }
+
+    #[test]
+    fn a_redirect_loop_is_refused_once_the_budget_is_spent() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::new([
+            (ENTRY_URI, Ok(FetchStep::Redirect(OTHER_URI.to_owned()))),
+            (OTHER_URI, Ok(FetchStep::Redirect(ENTRY_URI.to_owned()))),
+        ]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test", "mirror.example.test"],
+                "  maxRedirects: 2\n",
+                &[(ENTRY_URI, ENTRY_DOCUMENT)],
+            ),
+        );
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_RETRIEVAL);
+
+        assert!(
+            diagnostic.message.contains("more than the 2 redirects"),
+            "{}",
+            diagnostic.message
+        );
+        // The budget is a request budget: the first request plus two redirects.
+        assert_eq!(fetcher.requests(), [ENTRY_URI, OTHER_URI, ENTRY_URI]);
+    }
+
+    #[test]
+    fn a_redirect_to_something_that_is_not_a_uri_reference_is_reported() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::new([(
+            ENTRY_URI,
+            Ok(FetchStep::Redirect("http://[".to_owned())),
+        )]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "",
+                &[(ENTRY_URI, ENTRY_DOCUMENT)],
+            ),
+        );
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_RETRIEVAL);
+
+        assert!(
+            diagnostic.message.contains("is not a URI reference"),
+            "{}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn a_retrieved_document_is_charged_against_the_same_limits_a_local_one_is() {
+        for (limits, code) in [
+            ("limits:\n  maxDocumentBytes: 1024\n", CODE_MAX_DOCUMENT_BYTES),
+            ("limits:\n  maxTotalBytes: 1024\n", CODE_MAX_TOTAL_BYTES),
+        ] {
+            let directory = TempDir::new().expect("tempdir should be created");
+            let oversized = format!("openapi: 3.1.0\ninfo:\n  title: {}\n", "x".repeat(2_048));
+            let fetcher = RecordingFetcher::new([(ENTRY_URI, body(&oversized))]);
+            let config = retrieved_entry_config(
+                directory.path(),
+                ENTRY_URI,
+                &format!(
+                    "{limits}{}",
+                    remote_block(&["specs.example.test"], "", &[(ENTRY_URI, oversized.as_str())])
+                ),
+            );
+
+            assert_retrieval_code(&config, &fetcher, code);
+        }
+    }
+
+    #[test]
+    fn a_retrieved_document_counts_toward_max_documents_before_it_is_requested() {
+        const PET_URI: &str = "https://mirror.example.test/pet.yaml";
+        let directory = TempDir::new().expect("tempdir should be created");
+        let entry = format!(
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $ref: '{PET_URI}#/Pet'\n"
+        );
+        let pet = "Pet:\n  type: object\n";
+        let fetcher = RecordingFetcher::new([(ENTRY_URI, body(&entry)), (PET_URI, body(pet))]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &format!(
+                "limits:\n  maxDocuments: 1\n{}",
+                remote_block(
+                    &["specs.example.test", "mirror.example.test"],
+                    "",
+                    &[(ENTRY_URI, entry.as_str()), (PET_URI, pet)],
+                )
+            ),
+        );
+
+        assert_retrieval_code(&config, &fetcher, CODE_MAX_DOCUMENTS);
+
+        // The budget is spent before the request, so the document that would exceed it is never
+        // asked for.
+        assert_eq!(fetcher.requests(), [ENTRY_URI]);
+    }
+
+    #[test]
+    fn a_reference_crossing_to_another_origin_is_retrieved_and_pinned_on_its_own() {
+        const PET_URI: &str = "https://mirror.example.test/pet.yaml";
+        let directory = TempDir::new().expect("tempdir should be created");
+        let entry = format!(
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $ref: '{PET_URI}#/Pet'\n"
+        );
+        let pet = "Pet:\n  type: object\n";
+        let fetcher = RecordingFetcher::new([
+            (ENTRY_URI, body(&entry)),
+            (PET_URI, body(pet)),
+        ]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test", "mirror.example.test"],
+                "",
+                &[(ENTRY_URI, entry.as_str()), (PET_URI, pet)],
+            ),
+        );
+
+        let (graph, diagnostics) = load_retrieving(&config, &fetcher);
+
+        let graph = graph.expect("a pinned cross-origin reference resolves");
+        assert_eq!(diagnostics, Vec::new());
+        assert_eq!(graph.documents().len(), 2);
+        assert_eq!(fetcher.requests(), [ENTRY_URI, PET_URI]);
+        // Resolution after loading answers from the graph rather than retrieving again.
+        let resolved = graph
+            .resolve(graph.entry().id, &format!("{PET_URI}#/Pet"))
+            .expect("the retrieved document is part of the graph");
+        assert_eq!(resolved.value.get("type"), Some(&json!("object")));
+        assert_eq!(fetcher.requests().len(), 2);
+    }
+
+    #[test]
+    fn one_uri_referenced_twice_is_retrieved_once() {
+        const PET_URI: &str = "https://mirror.example.test/pet.yaml";
+        let directory = TempDir::new().expect("tempdir should be created");
+        let entry = format!(
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $ref: '{PET_URI}#/Pet'\n    Same:\n      $ref: '{PET_URI}#/Pet'\n"
+        );
+        let pet = "Pet:\n  type: object\n";
+        let fetcher = RecordingFetcher::new([(ENTRY_URI, body(&entry)), (PET_URI, body(pet))]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test", "mirror.example.test"],
+                "",
+                &[(ENTRY_URI, entry.as_str()), (PET_URI, pet)],
+            ),
+        );
+
+        let (graph, _) = load_retrieving(&config, &fetcher);
+
+        assert_eq!(graph.expect("graph loads").documents().len(), 2);
+        assert_eq!(fetcher.requests(), [ENTRY_URI, PET_URI]);
+    }
+
+    #[test]
+    fn an_absolute_id_names_a_resource_and_still_retrieves_nothing() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $id: https://schemas.example.test/pet.yaml\n      type: object\n    Owner:\n      $ref: https://schemas.example.test/pet.yaml\n",
+        );
+        let fetcher = RecordingFetcher::silent();
+        // Authorized and pinned as generously as any config could be: the point is that a document
+        // compiling offline today keeps compiling offline, not that it is refused politely.
+        let config = resolved_config(
+            directory.path(),
+            &remote_block(&["schemas.example.test"], "", &[]),
+        );
+
+        let (graph, diagnostics) = load_retrieving(&config, &fetcher);
+
+        assert!(graph.is_some(), "{diagnostics:#?}");
+        assert_eq!(fetcher.requests(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_reference_rebased_by_an_absolute_id_is_refused_rather_than_retrieved() {
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(
+            directory.path(),
+            "workspace/entry.yaml",
+            "openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $id: https://schemas.example.test/pet.yaml\n      properties:\n        tag:\n          $ref: ./tag.yaml\n",
+        );
+        write(directory.path(), "workspace/tag.yaml", "type: string\n");
+        let fetcher = RecordingFetcher::silent();
+        let config = resolved_config(directory.path(), "");
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_UNAUTHORIZED);
+
+        assert!(
+            diagnostic
+                .message
+                .contains("https://schemas.example.test/tag.yaml"),
+            "{}",
+            diagnostic.message
+        );
+        assert_eq!(fetcher.requests(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_retrieved_uri_keeps_its_extension_for_naming_and_parsing() {
+        let json = DocumentLocation::Remote(
+            Url::parse("https://specs.example.test/v1/openapi.json?ref=main")
+                .expect("URI with a query"),
+        );
+        assert_eq!(json.file_stem(), Some("openapi"));
+        assert_eq!(json.extension(), Some("json"));
+
+        let bare = DocumentLocation::Remote(
+            Url::parse("https://specs.example.test/openapi").expect("URI with no extension"),
+        );
+        assert_eq!(bare.file_stem(), Some("openapi"));
+        assert_eq!(bare.extension(), None);
+
+        let hidden = DocumentLocation::Remote(
+            Url::parse("https://specs.example.test/.spec").expect("URI naming a hidden file"),
+        );
+        assert_eq!(hidden.file_stem(), Some(".spec"));
+        assert_eq!(hidden.extension(), None);
+
+        let rooted = DocumentLocation::Remote(
+            Url::parse("https://specs.example.test/").expect("URI naming no segment"),
+        );
+        assert_eq!(rooted.file_stem(), None);
+        assert_eq!(rooted.extension(), None);
     }
 }

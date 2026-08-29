@@ -10,6 +10,7 @@ use oasts_core::ir::Ir;
 use oasts_core::loader::{DocumentGraph, load_graph as run_load_graph};
 use oasts_core::parse::parse as run_parse;
 use oasts_core::pipeline::compile as run_compile;
+use oasts_core::source::FetcherHandle;
 use oasts_core::semantic::{Analyzed, analyze as run_analyze};
 use oasts_core::writer::{check_drift as run_check_drift, write as run_write};
 
@@ -172,7 +173,7 @@ fn prepared_analysis(fixture: &Fixture) -> Analyzed {
 
 fn prepared_files(fixture: &Fixture) -> Vec<oasts_core::emit::GeneratedFile> {
     let mut sink = DiagnosticSink::new();
-    let files = run_compile(&fixture.config, true, &mut sink)
+    let files = run_compile(&fixture.config, FetcherHandle::None, true, &mut sink)
         .unwrap_or_else(|| panic!("failed to compile {}: {:#?}", fixture.name, sink.as_slice()));
     assert!(
         !sink.has_errors(),
@@ -277,7 +278,7 @@ fn compile(bencher: Bencher, fixture: &Fixture) {
     bencher
         .with_inputs(DiagnosticSink::new)
         .bench_values(|mut sink| {
-            let files = run_compile(&fixture.config, true, &mut sink);
+            let files = run_compile(&fixture.config, FetcherHandle::None, true, &mut sink);
             (files, sink)
         });
 }

@@ -10,6 +10,7 @@ use std::path::Path;
 use crate::config::{self, CODE_COMMAND_UNSUPPORTED, CODE_WORKSPACE_UNSUPPORTED, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::emit::GeneratedFile;
+use crate::source::FetcherHandle;
 use crate::writer::{DriftState, check_drift, write};
 use crate::{msw_peer, pipeline, zod_peer};
 
@@ -118,7 +119,7 @@ fn load(source: ConfigSource<'_>) -> Result<ResolvedConfig, Vec<Diagnostic>> {
 }
 
 /// Loads, compiles, and either reports drift or writes the generated files.
-pub fn run(command: Command, source: ConfigSource<'_>) -> Outcome {
+pub fn run(command: Command, source: ConfigSource<'_>, fetcher: FetcherHandle) -> Outcome {
     let mut sink = DiagnosticSink::new();
     let mut config = match load(source) {
         Ok(config) => config,
@@ -130,7 +131,7 @@ pub fn run(command: Command, source: ConfigSource<'_>) -> Outcome {
     sink.extend(std::mem::take(&mut config.diagnostics));
 
     let should_emit = matches!(command, Command::Generate { .. });
-    let files = pipeline::compile(&config, should_emit, &mut sink);
+    let files = pipeline::compile(&config, fetcher, should_emit, &mut sink);
     if sink.has_errors() {
         return Outcome::failed(sink);
     }
@@ -255,6 +256,7 @@ validation:
                     explicit: None,
                     cwd: temp.path(),
                 },
+                FetcherHandle::None,
             )
         };
 
