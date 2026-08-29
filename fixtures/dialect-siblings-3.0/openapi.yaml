@@ -115,13 +115,15 @@ components:
             type: string
           additionalProperties: {}
           nullable: true
-        # prefixItems beside `items`.
+        # `items` governs only the indices beyond the tuple prefix, so dropping `prefixItems`
+        # widens what it applies to. The differing element types are what make that visible:
+        # carrying `items` through unchanged would reject [1, "a"], which this schema admits.
         tags:
           type: array
           items:
             type: string
           prefixItems:
-            - type: string
+            - type: integer
         # dependentRequired beside a full `properties` map.
         limits:
           type: object
@@ -133,9 +135,12 @@ components:
           dependentRequired:
             burst:
               - rate
-        # patternProperties beside a declared object type.
+        # `additionalProperties` governs only the keys no pattern matched, so dropping
+        # `patternProperties` widens what it applies to. Carrying `false` through unchanged would
+        # emit an index signature of `never` and reject { "x-trace": "abc" }, which this admits.
         extensions:
           type: object
+          additionalProperties: false
           patternProperties:
             "^x-":
               type: string

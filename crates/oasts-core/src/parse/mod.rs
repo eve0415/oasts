@@ -3075,7 +3075,19 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 extra_required.push(name.to_owned());
             }
         }
-        let additional_properties = match object.get("additionalProperties") {
+        // `additionalProperties` is scoped by its siblings: it governs only the keys `properties`
+        // and `patternProperties` did not already match. Under 3.0 the dialect has no
+        // `patternProperties`, so dropping it hands `additionalProperties` a scope that just grew
+        // to cover the keys the patterns used to own — and applying it unchanged would reject the
+        // very values the patterns declare, leaving the emitted type narrower than the document.
+        // Widening it to an open index signature keeps the object shape while staying on the wide
+        // side of the truth, which whole-node widening also achieves but much less precisely.
+        let rescoped_by_a_dropped_keyword =
+            self.version == OasVersion::V3_0 && object.contains_key("patternProperties");
+        let additional_properties = match object
+            .get("additionalProperties")
+            .filter(|_| !rescoped_by_a_dropped_keyword)
+        {
             None | Some(Value::Bool(true)) => AdditionalProperties::Allowed(None),
             Some(Value::Bool(false)) => AdditionalProperties::Forbidden,
             Some(value) => {
@@ -3111,7 +3123,17 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
     ) -> SchemaNode {
         let finite = self.parse_finite_constraint(finite);
         let pointer = append_pointer(&node.pointer, "items");
-        let items = match object.get("items") {
+        // `items` is scoped by `prefixItems`: it governs only the indices beyond the tuple prefix.
+        // Under 3.0 the dialect has no `prefixItems`, so dropping it widens what `items` governs to
+        // the whole array, and carrying the element type through unchanged would both reject the
+        // values the prefix positions declare and accept arrays the prefix forbids. The element
+        // widens to `unknown`, which stays an array type and stays wider than the document.
+        let rescoped_by_a_dropped_keyword =
+            self.version == OasVersion::V3_0 && object.contains_key("prefixItems");
+        let items = match object
+            .get("items")
+            .filter(|_| !rescoped_by_a_dropped_keyword)
+        {
             None => SchemaNode::Any {
                 meta: SchemaMeta {
                     source: self.source(node.doc_id, &pointer),
@@ -5291,6 +5313,16 @@ mod tests {
                     "properties": { "a": { "type": "string" } },
                     "const": { "a": "x" }
                 },
+                "PatternPropertiesBesideAdditionalProperties": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "patternProperties": { "^x-": { "type": "string" } }
+                },
+                "PrefixItemsBesideItems": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "prefixItems": [{ "type": "integer" }]
+                },
                 "TwoApplicatorsAndNoTypedHalf": {
                     "const": "x",
                     "allOf": [{ "type": "object" }],
@@ -5343,22 +5375,47 @@ mod tests {
         ));
         // Both keywords are named, and the one that decided the widening says so: the `const` line
         // promises a preserved sibling, which is true of every node except this one.
+        let reported_pointers = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
+            .filter_map(|diagnostic| diagnostic.json_pointer.as_deref())
+            .collect::<Vec<_>>();
         for pointer in [
             "/components/schemas/ConstOnATypeArray/const",
             "/components/schemas/ConstOnATypeArray/type",
         ] {
             assert!(
-                sink.as_slice().iter().any(|diagnostic| {
-                    diagnostic.code == CODE_UNSUPPORTED
-                        && diagnostic.json_pointer.as_deref() == Some(pointer)
-                }),
-                "{pointer}: {:#?}",
-                sink.as_slice()
+                reported_pointers.contains(&pointer),
+                "{reported_pointers:#?}"
             );
         }
         assert!(matches!(
             schema_named(&ir, "TwoKeywordsOnOneNode"),
             SchemaNode::Array { .. }
+        ));
+        // Two of the dropped keywords scope a sibling rather than standing beside it:
+        // `additionalProperties` governs only the keys no pattern matched, and `items` only the
+        // indices beyond the tuple prefix. Carrying either through unchanged after its scope grew
+        // would leave the emitted type NARROWER than the document, which is the one direction a
+        // dropped keyword may never move it, so the rescoped sibling widens instead.
+        assert!(matches!(
+            schema_named(&ir, "PatternPropertiesBesideAdditionalProperties"),
+            SchemaNode::Object {
+                additional_properties: AdditionalProperties::Allowed(None),
+                ..
+            }
+        ));
+        assert!(matches!(
+            schema_named(&ir, "PrefixItemsBesideItems"),
+            SchemaNode::Array { items, .. } if matches!(**items, SchemaNode::Any { .. })
+        ));
+        // A dropped keyword that scopes nothing leaves its sibling exactly as declared: `contains`
+        // asserts that some element matches while `items` still governs every index.
+        assert!(matches!(
+            schema_named(&ir, "TwoKeywordsOnOneNode"),
+            SchemaNode::Array { items, .. }
+                if matches!(**items, SchemaNode::Primitive { ty: PrimitiveType::String, .. })
         ));
         // 3.0 has no `const`, so the object carries no finite constraint at all. A constraint
         // holding neither an enum nor a const value would assert a restriction the document did
@@ -5385,7 +5442,7 @@ mod tests {
         // One keyword per schema, except `TwoKeywordsOnOneNode` and `ConstOnATypeArray`: every
         // unsupported keyword on an object is reported, not only the first one found, and the
         // `type` array is reported beside the keyword rather than only in its absence.
-        assert_eq!(reported, 12, "{:#?}", sink.as_slice());
+        assert_eq!(reported, 14, "{:#?}", sink.as_slice());
         for name in [
             "ConstWithType",
             "PropertyNamesWithProperties",
@@ -5393,6 +5450,8 @@ mod tests {
             "DependentRequiredWithProperties",
             "ConstWithApplicatorOnly",
             "TwoKeywordsOnOneNode",
+            "PatternPropertiesBesideAdditionalProperties",
+            "PrefixItemsBesideItems",
             "ConstOnAnObject",
             "TwoApplicatorsAndNoTypedHalf",
         ] {

@@ -14,12 +14,22 @@ type Expect<T extends true> = T;
 type AssertJwtTemplate = Expect<
   Equal<ApiKey["jwtTemplate"], { [key: string]: unknown } | null | undefined>
 >;
-type AssertTags = Expect<Equal<ApiKey["tags"], string[] | undefined>>;
+// `prefixItems` and `patternProperties` rescope the sibling that survives them, so that sibling
+// widens rather than carrying through: an element type of `string` or an index signature of
+// `never` would be narrower than the document, which a dropped keyword may never make it.
+type AssertTags = Expect<Equal<ApiKey["tags"], unknown[] | undefined>>;
 type AssertLimits = Expect<
   Equal<ApiKey["limits"], { rate?: number; burst?: number } | undefined>
 >;
 type AssertExtensions = Expect<Equal<ApiKey["extensions"], { [key: string]: unknown } | undefined>>;
+// `contains` does not rescope anything — it asserts that some element matches, while `items` still
+// governs every index — so its sibling is carried through exactly.
 type AssertAuditLog = Expect<Equal<ApiKey["auditLog"], string[] | undefined>>;
+
+// Values this document admits. The emitted types have to accept them: dropping a keyword may only
+// widen, and each of these is rejected by the narrower type the sibling would otherwise carry.
+export const tuplePrefixValueAssigns: ApiKey["tags"] = [1, "a"];
+export const patternedKeyAssigns: ApiKey["extensions"] = { "x-trace": "abc" };
 // Nothing representable sits beside the keyword, so the node still widens whole.
 type AssertOpaque = Expect<Equal<ApiKey["opaque"], unknown>>;
 // A `type` array is the type declaration rather than a droppable conjunct, so this widens whole
