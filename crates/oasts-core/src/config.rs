@@ -971,7 +971,7 @@ pub struct RemoteConfig {
     pub allow_hosts: Vec<String>,
     /// Whether a plain `http` URI may be retrieved. `https` is the only scheme without it.
     pub allow_insecure: bool,
-    /// Whole-request deadline, in milliseconds.
+    /// Deadline for each request a retrieval makes, in milliseconds.
     #[cfg_attr(feature = "json-schema", schemars(range(min = 1, max = 600_000)))]
     pub timeout_ms: u64,
     /// How many `3xx` hops one retrieval may take. Every hop is authorized separately.
