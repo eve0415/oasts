@@ -351,7 +351,7 @@ jobs:
       # Labelled `main`, and it does not claim the default: a release does that, so visitors
       # keep landing on released code once one exists.
       - name: Publish
-        run: scripts/playground-wasm.sh
+        run: scripts/playground-wasm.sh --remote
         env:
           PLAYGROUND_LABEL: main
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
