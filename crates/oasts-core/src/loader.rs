@@ -39,6 +39,7 @@ const CODE_REMOTE_UNPINNED: &str = "OASTS2022";
 const CODE_REMOTE_INTEGRITY: &str = "OASTS2023";
 const CODE_REMOTE_RETRIEVAL: &str = "OASTS2024";
 const CODE_REMOTE_UNAVAILABLE: &str = "OASTS2025";
+const CODE_LOCAL_FROM_RETRIEVED: &str = "OASTS2026";
 const CODE_ID_CLAIMS_PINNED: &str = "OASTS2027";
 const CODE_DUPLICATE_RESOURCE: &str = "OASTS2028";
 const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
@@ -55,6 +56,15 @@ impl DocId {
     pub const fn index(self) -> usize {
         self.0
     }
+}
+
+/// Where a reference was written, which bounds what it is allowed to reach.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Origin {
+    /// The configured entry, or a document the document source read.
+    Local,
+    /// A document retrieved over the network.
+    Retrieved,
 }
 
 /// What a document may claim as a schema resource identity.
@@ -86,6 +96,14 @@ pub enum DocumentLocation {
 }
 
 impl DocumentLocation {
+    /// What a reference written in this document is allowed to reach.
+    const fn origin(&self) -> Origin {
+        match self {
+            Self::File(_) => Origin::Local,
+            Self::Remote(_) => Origin::Retrieved,
+        }
+    }
+
     /// The URI this document was retrieved from, if it was.
     fn retrieved_from(&self) -> Option<&str> {
         match self {
@@ -345,7 +363,12 @@ impl DocumentGraph {
         let target_id = if reference.starts_with('#') {
             base_doc
         } else {
-            let retrieval = retrieval_from_url(&target_url, Some(&base_document.source_id), None)?;
+            let retrieval = retrieval_from_url(
+                &target_url,
+                base_document.location.origin(),
+                Some(&base_document.source_id),
+                None,
+            )?;
             let located = match &retrieval {
                 Retrieval::File(target_path) => {
                     let canonical = self.source.canonicalize(target_path).map_err(|error| {
@@ -1274,8 +1297,10 @@ impl<'a> GraphBuilder<'a> {
             }
         } else {
             let source_id = self.source_id(from.doc_id);
+            let origin = self.documents[from.doc_id.0].location.origin();
             let target_id =
-                match retrieval_from_url(&target_url, source_id, Some(&reference_pointer))? {
+                match retrieval_from_url(&target_url, origin, source_id, Some(&reference_pointer))?
+                {
                     Retrieval::File(target_path) => self.load_document(&target_path),
                     Retrieval::Remote(url) => self.load_remote_document(&url),
                 }
@@ -1936,7 +1961,8 @@ fn configured_entry_location(path: &Path) -> Result<Retrieval, Diagnostic> {
     let Ok(url) = Url::parse(value) else {
         return Ok(Retrieval::File(path.to_path_buf()));
     };
-    retrieval_from_url(&url, None, None)
+    // The entry is what the person running the compiler named, so nothing narrows it.
+    retrieval_from_url(&url, Origin::Local, None, None)
 }
 
 /// Fast-reject that gates the identifier tree walk over the *raw* file bytes. It must also
@@ -2464,12 +2490,27 @@ impl Retrieval {
 }
 
 /// Classifies a URI that has to be read, by the only two schemes anything can read.
+///
+/// `origin` is the referring document's, and it narrows the set: a document retrieved over the
+/// network may reference the network, never the filesystem. Without that, a retrieved document
+/// chooses which local files are read and copied into generated code — bounded by the path
+/// authorization, but no longer directed by the person who configured it.
 fn retrieval_from_url(
     url: &Url,
+    origin: Origin,
     source_id: Option<&str>,
     pointer: Option<&str>,
 ) -> Result<Retrieval, Diagnostic> {
     match url.scheme() {
+        "file" if origin == Origin::Retrieved => Err(input_error(
+            CODE_LOCAL_FROM_RETRIEVED,
+            format!(
+                "a document retrieved over the network may not reference the local filesystem: '{}'",
+                url.as_str()
+            ),
+            source_id,
+            pointer,
+        )),
         "file" => file_path_from_url(url).map(Retrieval::File).ok_or_else(|| {
             input_error(
                 CODE_INVALID_REFERENCE,
@@ -4803,19 +4844,27 @@ mod tests {
         // is retrieved and never reaches the host.
         let remote = Url::parse("https://example.invalid/x#/a").expect("remote URL");
         assert_eq!(
-            retrieval_from_url(&remote, Some("source"), Some("/$ref")).expect("remote URL"),
+            retrieval_from_url(&remote, Origin::Local, Some("source"), Some("/$ref"))
+                .expect("remote URL"),
             Retrieval::Remote(Url::parse("https://example.invalid/x").expect("retrievable URL"))
         );
         let nonlocal = Url::parse("file://example.invalid/path").expect("file URL");
         assert_eq!(
-            retrieval_from_url(&nonlocal, Some("source"), Some("/$ref"))
+            retrieval_from_url(&nonlocal, Origin::Local, Some("source"), Some("/$ref"))
                 .expect_err("non-local file URL")
                 .code,
             CODE_INVALID_REFERENCE
         );
+        let local = Url::parse("file:///tmp/entry.yaml").expect("file URL");
+        assert_eq!(
+            retrieval_from_url(&local, Origin::Retrieved, Some("source"), Some("/$ref"))
+                .expect_err("a retrieved document may not reach the filesystem")
+                .code,
+            CODE_LOCAL_FROM_RETRIEVED
+        );
         let opaque = Url::parse("urn:example:schema").expect("URN");
         assert_eq!(
-            retrieval_from_url(&opaque, Some("source"), Some("/$ref"))
+            retrieval_from_url(&opaque, Origin::Local, Some("source"), Some("/$ref"))
                 .expect_err("unreadable scheme")
                 .code,
             CODE_INVALID_REFERENCE
@@ -5835,6 +5884,46 @@ mod tests {
             diagnostic
                 .message
                 .contains("https://schemas.example.test/thing.yaml"),
+            "{}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn a_retrieved_document_may_not_reference_a_local_file() {
+        const PET_URI: &str = "https://specs.example.test/pet.yaml";
+        let directory = TempDir::new().expect("tempdir should be created");
+        write(directory.path(), "workspace/secret.yaml", "const: SECRET\n");
+        let secret = file_url(
+            &std::fs::canonicalize(directory.path().join("workspace/secret.yaml"))
+                .expect("the secret exists"),
+        )
+        .expect("file URL");
+        let entry =
+            format!("openapi: 3.1.0\ncomponents:\n  schemas:\n    Pet:\n      $ref: '{PET_URI}'\n");
+        let pet = format!("$ref: '{secret}'\n");
+        let fetcher = RecordingFetcher::new([(ENTRY_URI, body(&entry)), (PET_URI, body(&pet))]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            ENTRY_URI,
+            &remote_block(
+                &["specs.example.test"],
+                "",
+                &[(ENTRY_URI, entry.as_str()), (PET_URI, pet.as_str())],
+            ),
+        );
+
+        let (graph, diagnostics) = load_retrieving(&config, &fetcher);
+
+        assert!(graph.is_none());
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_LOCAL_FROM_RETRIEVED)
+            .expect("a retrieved document may not reach the filesystem");
+        assert!(
+            diagnostic
+                .message
+                .contains("may not reference the local filesystem"),
             "{}",
             diagnostic.message
         );
