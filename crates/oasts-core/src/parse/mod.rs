@@ -169,7 +169,11 @@ struct ParsedFinite {
 impl ParsedFinite {
     fn from_object(object: &Map<String, Value>, version: OasVersion) -> Self {
         Self {
-            declared: object.contains_key("enum") || object.contains_key("const"),
+            // `const` is a 3.1 keyword, so under 3.0 it declares nothing: reading it here would
+            // hand the object and tuple paths a finite constraint carrying no values, which
+            // asserts a restriction the document did not make in a dialect that cannot express it.
+            declared: object.contains_key("enum")
+                || (version == OasVersion::V3_1 && object.contains_key("const")),
             enum_values: object.get("enum").and_then(Value::as_array).cloned(),
             const_value: (version == OasVersion::V3_1)
                 .then(|| object.get("const").cloned())
@@ -5276,6 +5280,11 @@ mod tests {
                     "contains": { "type": "string" },
                     "minContains": 1
                 },
+                "ConstOnAnObject": {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "const": { "a": "x" }
+                },
                 "TwoApplicatorsAndNoTypedHalf": {
                     "const": "x",
                     "allOf": [{ "type": "object" }],
@@ -5330,6 +5339,13 @@ mod tests {
             schema_named(&ir, "TwoKeywordsOnOneNode"),
             SchemaNode::Array { .. }
         ));
+        // 3.0 has no `const`, so the object carries no finite constraint at all. A constraint
+        // holding neither an enum nor a const value would assert a restriction the document did
+        // not make in a dialect that cannot express it.
+        assert!(matches!(
+            schema_named(&ir, "ConstOnAnObject"),
+            SchemaNode::Object { finite: None, .. }
+        ));
         // Two applicators and no typed content lower to a conjunction whose typed half is never
         // emitted. The rejected keyword has to travel on the wrapper, or the validators artifact
         // ships a complete-looking check for a constraint it cannot express.
@@ -5345,9 +5361,9 @@ mod tests {
             .iter()
             .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
             .count();
-        // Nine schemas, one keyword each, except `TwoKeywordsOnOneNode`: every unsupported keyword
-        // on an object is reported, not only the first one found.
-        assert_eq!(reported, 10, "{:#?}", sink.as_slice());
+        // One keyword per schema, except `TwoKeywordsOnOneNode`: every unsupported keyword on an
+        // object is reported, not only the first one found.
+        assert_eq!(reported, 11, "{:#?}", sink.as_slice());
         for name in [
             "ConstWithType",
             "PropertyNamesWithProperties",
@@ -5355,6 +5371,7 @@ mod tests {
             "DependentRequiredWithProperties",
             "ConstWithApplicatorOnly",
             "TwoKeywordsOnOneNode",
+            "ConstOnAnObject",
             "TwoApplicatorsAndNoTypedHalf",
         ] {
             assert!(
