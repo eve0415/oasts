@@ -88,15 +88,15 @@ All errors, all exit `2`.
 
 ### Retrieval
 
-Every one of these is refused before a single byte of the document is trusted, and the first three before any request is made at all. See [`remote`](/reference/configuration#remote).
+In the order they happen. The first two are refused before a request is made; the rest are what a retrieved document has to survive before any of it is trusted. See [`remote`](/reference/configuration#remote).
 
 | Code | Severity | Meaning |
 | --- | --- | --- |
-| `OASTS2021` | error | A URI whose host is not in `remote.allowHosts`, or a plain `http` URI without `remote.allowInsecure` — including a host reached only by following a redirect |
-| `OASTS2022` | error | An authorized URI with no `remote.integrity` entry; there is no unpinned retrieval |
+| `OASTS2021` | error | A URI whose host is not in `remote.allowHosts`, whose scheme is not retrievable, that carries credentials, or that is plain `http` without `remote.allowInsecure` — including a host reached only by following a redirect |
 | `OASTS2025` | error | An embedding host that seats no retriever. The CLI and the Node package always seat one, and the browser build refuses the `remote` block earlier |
-| `OASTS2023` | error | Retrieved bytes hashing to something other than the pinned digest. The message prints the digest that was served |
 | `OASTS2024` | error | The request itself failed: refused connection, DNS, TLS, timeout, a non-`200` status, a body over `limits.maxDocumentBytes`, or more redirects than `remote.maxRedirects` allows |
+| `OASTS2022` | error | An authorized URI with no `remote.integrity` entry. The document is retrieved and hashed but never compiled, and the message hands back the entry to record — this is how a pin is obtained |
+| `OASTS2023` | error | Retrieved bytes hashing to something other than the pinned digest. Unlike `OASTS2022` this is not a setup step: the document moved on, or the response was not the one that was pinned |
 
 ### Document and schema
 
