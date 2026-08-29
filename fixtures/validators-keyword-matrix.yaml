@@ -199,7 +199,7 @@ rows:
       - "3.0"
       - "3.1"
     disposition: exact
-    notes: RFC 3339 Appendix A duration on string values: unsigned integer components in nested order, or a bare week count; no fractional part.
+    notes: RFC 3339 Appendix A duration on string values; unsigned integer components in nested order, or a bare week count, with no fractional part.
   - keyword: "format:int32"
     dialects:
       - "3.0"
@@ -279,37 +279,37 @@ rows:
       - "3.0"
       - "3.1"
     disposition: exact
-    notes: RFC 5321 Mailbox on string values: a dot-atom or quoted-string local part, and either an RFC 1123 host name or a bracketed IPv4/IPv6 address literal.
+    notes: RFC 5321 Mailbox on string values; a dot-atom or quoted-string local part, and either an RFC 1123 host name or a bracketed IPv4/IPv6 address literal.
   - keyword: "format:uri"
     dialects:
       - "3.0"
       - "3.1"
     disposition: exact
-    notes: RFC 3986 URI on string values: a scheme is required, and every component is checked against its character set with complete percent-encoded triplets.
+    notes: RFC 3986 URI on string values; a scheme is required, and every component is checked against its character set with complete percent-encoded triplets.
   - keyword: "format:uri-reference"
     dialects:
       - "3.0"
       - "3.1"
     disposition: exact
-    notes: RFC 3986 URI-reference on string values: a URI, or a relative reference whose first path segment carries no colon.
+    notes: RFC 3986 URI-reference on string values; a URI, or a relative reference whose first path segment carries no colon.
   - keyword: "format:hostname"
     dialects:
       - "3.0"
       - "3.1"
     disposition: exact
-    notes: RFC 1123 host name on string values: dot-separated LDH labels of at most 63 characters with no hyphen at a label edge, at most 253 characters overall. IDNA validity of an xn-- label is not checked.
+    notes: RFC 1123 host name on string values; dot-separated LDH labels of at most 63 characters with no hyphen at a label edge, at most 253 characters overall. IDNA validity of an xn-- label is not checked.
   - keyword: "format:ipv4"
     dialects:
       - "3.0"
       - "3.1"
     disposition: exact
-    notes: RFC 2673 dotted-quad on string values: four decimal octets in 0..255, each written without a leading zero.
+    notes: RFC 2673 dotted-quad on string values; four decimal octets in 0..255, each written without a leading zero.
   - keyword: "format:ipv6"
     dialects:
       - "3.0"
       - "3.1"
     disposition: exact
-    notes: RFC 4291 textual IPv6 on string values: eight hexadecimal groups with at most one :: elision, optionally ending in a dotted-quad. Zone identifiers and CIDR suffixes are not part of the address.
+    notes: RFC 4291 textual IPv6 on string values; eight hexadecimal groups with at most one double-colon elision, optionally ending in a dotted-quad. Zone identifiers and CIDR suffixes are not part of the address.
   - keyword: "format:int64"
     dialects:
       - "3.0"
