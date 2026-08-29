@@ -458,3 +458,27 @@ components:
           type: array
           items:
             $dynamicRef: '#node'
+    StringFormats:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        hostname:
+          type: string
+          format: hostname
+        ipv4:
+          type: string
+          format: ipv4
+        ipv6:
+          type: string
+          format: ipv6
+        uri:
+          type: string
+          format: uri
+        uriReference:
+          type: string
+          format: uri-reference
+        duration:
+          type: string
+          format: duration

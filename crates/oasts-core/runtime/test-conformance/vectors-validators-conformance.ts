@@ -996,6 +996,139 @@ export const cases: readonly ConformanceCase[] = [
     },
   },
 
+  // --- format:email (stringFormatsValidator) ---
+  {
+    id: "format:email/valid",
+    matrixRow: "format:email",
+    validator: "stringFormatsValidator",
+    input: { email: "user@example.com" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "format:email/malformed",
+    matrixRow: "format:email",
+    validator: "stringFormatsValidator",
+    input: { email: "not-an-email" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "invalid email format", path: ["email"] }],
+    },
+  },
+
+  // --- format:hostname (stringFormatsValidator) ---
+  {
+    id: "format:hostname/valid",
+    matrixRow: "format:hostname",
+    validator: "stringFormatsValidator",
+    input: { hostname: "api.example.com" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "format:hostname/malformed",
+    matrixRow: "format:hostname",
+    validator: "stringFormatsValidator",
+    input: { hostname: "-leading-hyphen.example" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "invalid hostname format", path: ["hostname"] }],
+    },
+  },
+
+  // --- format:ipv4 (stringFormatsValidator) ---
+  {
+    id: "format:ipv4/valid",
+    matrixRow: "format:ipv4",
+    validator: "stringFormatsValidator",
+    input: { ipv4: "192.168.0.1" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "format:ipv4/malformed",
+    matrixRow: "format:ipv4",
+    validator: "stringFormatsValidator",
+    input: { ipv4: "192.168.0.256" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "invalid ipv4 format", path: ["ipv4"] }],
+    },
+  },
+
+  // --- format:ipv6 (stringFormatsValidator) ---
+  {
+    id: "format:ipv6/valid",
+    matrixRow: "format:ipv6",
+    validator: "stringFormatsValidator",
+    input: { ipv6: "2001:db8::1" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "format:ipv6/malformed",
+    matrixRow: "format:ipv6",
+    validator: "stringFormatsValidator",
+    input: { ipv6: "1:2:3:4:5:6:7" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "invalid ipv6 format", path: ["ipv6"] }],
+    },
+  },
+
+  // --- format:uri (stringFormatsValidator) ---
+  {
+    id: "format:uri/valid",
+    matrixRow: "format:uri",
+    validator: "stringFormatsValidator",
+    input: { uri: "https://example.com/a?b=1#c" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "format:uri/malformed",
+    matrixRow: "format:uri",
+    validator: "stringFormatsValidator",
+    input: { uri: "/relative-only" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "invalid uri format", path: ["uri"] }],
+    },
+  },
+
+  // --- format:uri-reference (stringFormatsValidator) ---
+  {
+    id: "format:uri-reference/valid",
+    matrixRow: "format:uri-reference",
+    validator: "stringFormatsValidator",
+    input: { uriReference: "../sibling/resource" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "format:uri-reference/malformed",
+    matrixRow: "format:uri-reference",
+    validator: "stringFormatsValidator",
+    input: { uriReference: "/%zz" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "invalid uri-reference format", path: ["uriReference"] }],
+    },
+  },
+
+  // --- format:duration (stringFormatsValidator) ---
+  {
+    id: "format:duration/valid",
+    matrixRow: "format:duration",
+    validator: "stringFormatsValidator",
+    input: { duration: "P1Y2M3DT4H5M6S" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "format:duration/malformed",
+    matrixRow: "format:duration",
+    validator: "stringFormatsValidator",
+    input: { duration: "P1Y2D" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "invalid duration format", path: ["duration"] }],
+    },
+  },
+
   // --- format:int32 (numericValidator) ---
   {
     id: "format:int32/max-boundary",
