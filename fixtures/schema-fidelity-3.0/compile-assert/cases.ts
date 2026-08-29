@@ -26,9 +26,10 @@ type Expect<T extends true> = T;
 
 type AssertPlainEmpty = Expect<Equal<PlainEmpty, { [key: string]: unknown }>>;
 type AssertClosedEmpty = Expect<Equal<ClosedEmpty, { [key: string]: never }>>;
-// OpenAPI 3.0 has no patternProperties keyword. OASTS2201 deliberately lowers this schema to
-// unknown; the 3.1 twin pins the pattern index signature and its rejecting assignment.
-type AssertPatternOnly = Expect<Equal<PatternOnly, unknown>>;
+// OpenAPI 3.0 has no patternProperties keyword. OASTS2201 drops that conjunct and keeps the
+// declared `type: object`, which is the closest representable widening; the 3.1 twin pins the
+// pattern index signature and its rejecting assignment.
+type AssertPatternOnly = Expect<Equal<PatternOnly, { [key: string]: unknown }>>;
 type AssertReadOnlyRequestIsEmpty = Expect<Equal<ReadOnlyOnlyRequest, { [key: string]: unknown }>>;
 type AssertNullableEmpty = Expect<Equal<MaybePlainEmpty, PlainEmpty | null>>;
 type AssertNullableDiscriminator = Expect<Equal<Extract<TaggedEvent, null>, null>>;

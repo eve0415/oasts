@@ -2188,10 +2188,26 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     "schema keyword '{display_keyword}' requires OpenAPI 3.1 and becomes unknown"
                 ),
             ));
-            return SchemaNode::Unknown {
-                reason: format!("OpenAPI 3.0 does not support {display_keyword}"),
-                meta,
-            };
+            // A 3.1-only keyword is one conjunct of the schema object like any other, so drop that
+            // conjunct and keep the representable siblings. `unknown` is the maximally imprecise
+            // widening; the siblings widen in the same direction while staying strictly closer to
+            // the declared type. Without a representable sibling there is nothing left to keep.
+            //
+            // A `type` array is the exception: it is not a droppable conjunct but the type
+            // declaration itself, so the guard below would find it and preserve a `type` no 3.0
+            // path lowers. That shape keeps widening whole.
+            if object.get("type").is_some_and(Value::is_array)
+                || (!object.contains_key("$ref")
+                    && !object.contains_key("allOf")
+                    && !object.contains_key("oneOf")
+                    && !object.contains_key("anyOf")
+                    && !has_typed_or_constraint_content(object, self.version))
+            {
+                return SchemaNode::Unknown {
+                    reason: format!("OpenAPI 3.0 does not support {display_keyword}"),
+                    meta,
+                };
+            }
         }
         if self.version == OasVersion::V3_1 {
             for keyword in [
@@ -3172,7 +3188,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 ..SchemaMeta::default()
             };
         };
-        let content = schema_meta_content(object);
+        let content = schema_meta_content(object, self.version);
         if content == SchemaMetaContent::None {
             return SchemaMeta {
                 source: self.source(node.doc_id, &node.pointer),
@@ -3438,6 +3454,11 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         meta.validation_applicators = box_if_populated(validation_applicators);
         // A dynamic reference is rejected only where it could not be pinned; `parse_dynamic_ref`
         // adds it then. Under 3.0 it is not a keyword, so it is rejected outright.
+        //
+        // `const`, `prefixItems` and `dependentRequired` are read only under 3.1, so under 3.0 they
+        // are constraints the emitted check would silently omit. They belong here for the same
+        // reason as the rest: the types artifact may keep an approximation with its warning, the
+        // validators artifact may not.
         meta.rejected_validation_keywords = object
             .keys()
             .filter(|key| {
@@ -3445,7 +3466,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     && (DYNAMIC_REF_KEYWORDS.contains(&key.as_str())
                         || matches!(
                             key.as_str(),
-                            "propertyNames"
+                            "const"
+                                | "prefixItems"
+                                | "dependentRequired"
+                                | "propertyNames"
                                 | "patternProperties"
                                 | "contains"
                                 | "minContains"
@@ -4253,9 +4277,19 @@ enum SchemaMetaContent {
 
 /// Classifies metadata in one key walk. Annotation-only schemas can skip every constraint and
 /// applicator collector, while structurally-only schemas retain the existing empty-meta reject.
-fn schema_meta_content(object: &Map<String, Value>) -> SchemaMetaContent {
+///
+/// `const`, `prefixItems` and `dependentRequired` are structural under 3.1, where the dispatch
+/// consumes them. Under 3.0 the dispatch cannot, so they are meta the validators artifact has to
+/// see — classifying them as annotations would leave the reject list empty and let a check ship
+/// that silently ignores them.
+fn schema_meta_content(object: &Map<String, Value>, version: OasVersion) -> SchemaMetaContent {
     let mut content = SchemaMetaContent::None;
     for key in object.keys() {
+        if version == OasVersion::V3_0
+            && matches!(key.as_str(), "const" | "prefixItems" | "dependentRequired")
+        {
+            return SchemaMetaContent::Complex;
+        }
         match key.as_str() {
             "minimum"
             | "maximum"
@@ -4497,7 +4531,10 @@ mod tests {
             "$ref".to_owned(),
             Value::String("#/components/schemas/X".to_owned()),
         );
-        assert_eq!(schema_meta_content(&object), SchemaMetaContent::None);
+        assert_eq!(
+            schema_meta_content(&object, OasVersion::V3_1),
+            SchemaMetaContent::None
+        );
 
         for key in [
             "example",
@@ -4521,7 +4558,7 @@ mod tests {
             let mut object = Map::new();
             object.insert(key.to_owned(), Value::Null);
             assert_eq!(
-                schema_meta_content(&object),
+                schema_meta_content(&object, OasVersion::V3_1),
                 SchemaMetaContent::Annotations,
                 "{key}"
             );
@@ -4561,7 +4598,22 @@ mod tests {
             let mut object = Map::new();
             object.insert(key.to_owned(), Value::Null);
             assert_eq!(
-                schema_meta_content(&object),
+                schema_meta_content(&object, OasVersion::V3_1),
+                SchemaMetaContent::Complex,
+                "{key}"
+            );
+        }
+        // The three keywords 3.1 consumes structurally and 3.0 can only reject.
+        for key in ["const", "prefixItems", "dependentRequired"] {
+            let mut object = Map::new();
+            object.insert(key.to_owned(), Value::Null);
+            assert_eq!(
+                schema_meta_content(&object, OasVersion::V3_1),
+                SchemaMetaContent::None,
+                "{key}"
+            );
+            assert_eq!(
+                schema_meta_content(&object, OasVersion::V3_0),
                 SchemaMetaContent::Complex,
                 "{key}"
             );
@@ -5156,6 +5208,107 @@ mod tests {
         assert!(matches!(ir.schemas[3].schema, SchemaNode::Tuple { .. }));
         assert!(matches!(ir.schemas[4].schema, SchemaNode::Tuple { .. }));
         assert!(matches!(ir.schemas[5].schema, SchemaNode::Never { .. }));
+    }
+
+    #[test]
+    fn dialect_unsupported_keywords_keep_their_representable_siblings() {
+        let document = schemas_doc(
+            "3.0.3",
+            json!({
+                "ConstWithType": { "type": "string", "const": "unavailable" },
+                "BareConst": { "const": "unavailable" },
+                "PropertyNamesWithProperties": {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "propertyNames": { "type": "string" }
+                },
+                "PrefixItemsWithItems": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "prefixItems": [{ "type": "string" }]
+                },
+                "DependentRequiredWithProperties": {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
+                    "dependentRequired": { "a": ["b"] }
+                },
+                "ConstWithApplicatorOnly": {
+                    "const": "x",
+                    "oneOf": [{ "type": "string" }, { "type": "integer" }]
+                },
+                "ConstOnATypeArray": {
+                    "type": ["string", "null"],
+                    "const": "x",
+                    "minLength": 3
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        // The sibling `type` survives, and `const` is not reinterpreted as a literal: 3.0 has no
+        // `const`, so the value is dropped rather than narrowed onto the type.
+        assert!(matches!(
+            schema_named(&ir, "ConstWithType"),
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                enum_values: None,
+                const_value: None,
+                ..
+            }
+        ));
+        // Nothing representable sits beside it, so the node still widens whole.
+        assert!(matches!(
+            schema_named(&ir, "BareConst"),
+            SchemaNode::Unknown { .. }
+        ));
+        assert!(matches!(
+            schema_named(&ir, "PropertyNamesWithProperties"),
+            SchemaNode::Object { properties, .. } if properties.len() == 1
+        ));
+        assert!(matches!(
+            schema_named(&ir, "PrefixItemsWithItems"),
+            SchemaNode::Array { .. }
+        ));
+        assert!(matches!(
+            schema_named(&ir, "DependentRequiredWithProperties"),
+            SchemaNode::Object { properties, dependent_required, .. }
+                if properties.len() == 2 && dependent_required.is_empty()
+        ));
+        // An applicator alone is a representable sibling, matching the guard the soft list uses.
+        assert!(matches!(
+            schema_named(&ir, "ConstWithApplicatorOnly"),
+            SchemaNode::OneOf { branches, .. } if branches.len() == 2
+        ));
+        // A `type` array is the type declaration rather than a droppable conjunct, so this shape
+        // keeps widening whole even though `minLength` would satisfy the sibling guard.
+        assert!(matches!(
+            schema_named(&ir, "ConstOnATypeArray"),
+            SchemaNode::Unknown { .. }
+        ));
+
+        // Every preserved node still reports the keyword, and still refuses a validator check for
+        // the constraint it dropped.
+        let reported = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
+            .count();
+        assert_eq!(reported, 7, "{:#?}", sink.as_slice());
+        for name in [
+            "ConstWithType",
+            "PropertyNamesWithProperties",
+            "PrefixItemsWithItems",
+            "DependentRequiredWithProperties",
+            "ConstWithApplicatorOnly",
+        ] {
+            assert!(
+                !schema_named(&ir, name)
+                    .meta()
+                    .rejected_validation_keywords
+                    .is_empty(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
