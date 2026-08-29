@@ -14,8 +14,9 @@ client:
 naming:
   overrides:
     pathSegments:
-      # Names /foo_bar's nodes under this fragment instead of the `fooBar2` the emitter would
-      # allocate. One entry names every node under the segment, because they all compose from it.
+      # Resolves the collision: /foo_bar's nodes bind under this fragment instead of `FooBar`,
+      # which /foo-bar keeps. One entry resolves both colliding names, because every node under
+      # the segment is renamed with it.
       foo_bar: fooBarUnderscore
       # Matches no segment in this document, so it warns rather than passing silently.
       not-a-segment: neverUsed

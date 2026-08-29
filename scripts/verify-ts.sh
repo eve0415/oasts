@@ -564,14 +564,16 @@ pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module es
   --moduleResolution bundler "$work/tanstack-showcase/compile-assert/cases.ts"
 echo "compile-assert matrix ok: tanstack-showcase-3.1"
 
-# Colliding path segments generate, end to end. The unit tests pin the allocated names; this pins
+# Colliding path segments generate, end to end. The unit tests pin the allocated names; these pin
 # that the whole tree still compiles with them, and that the compile-assert matrix agrees on which
 # path got which key.
 generate_and_verify tanstack-segment-collision-3.1 oasts-tanstack.yaml "$work/tanstack-collision" \
   tanstack "tanstack-segment-collision-3.1"
+generate_and_verify tanstack-key-disambiguation-3.1 oasts-tanstack.yaml "$work/tanstack-disambiguation" \
+  tanstack "tanstack-key-disambiguation-3.1"
 pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext \
-  --moduleResolution bundler "$work/tanstack-collision/compile-assert/cases.ts"
-echo "compile-assert matrix ok: tanstack-segment-collision-3.1"
+  --moduleResolution bundler "$work/tanstack-disambiguation/compile-assert/cases.ts"
+echo "compile-assert matrix ok: tanstack-key-disambiguation-3.1"
 
 # What no amount of renaming reaches: two declared paths whose key elements are identical, and a
 # segment whose text yields no identifier to rename. Asserted on exit code rather than only in unit

@@ -17,9 +17,10 @@
 #   - the key vectors: exact query keys and invalidation lists as data, with the input that produces
 #     each one frozen alongside it. Freezing only the key would let a runner pick whatever input made
 #     the emitter look right;
-#   - the collision and override documents and configs: one reachable input each for the
-#     segment-collision error and for the unmatched-override warning, plus the escape hatch that
-#     makes the colliding document generable again.
+#   - the collision and override documents and configs: two path segments that normalize to one
+#     member, generated once with the names the emitter allocates for them and once with a
+#     `pathSegments` override choosing those names instead. The second config also carries an
+#     override key matching no segment, which is the unmatched-override warning's reachable input.
 files:
   - path: fixtures/tanstack-showcase-3.1/openapi.yaml
     sha256: 5f057bf41da17c732ced931603da1c43173b1b41121d4327b29cc9f51fbede38

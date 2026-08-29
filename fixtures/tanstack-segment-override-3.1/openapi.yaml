@@ -3,10 +3,9 @@ info:
   title: TanStack segment override
   version: 1.0.0
   description: >-
-    Two segments normalizing to one member, named apart by a `pathSegments` override rather than by
-    the numeric suffix the emitter would otherwise allocate. The same configuration also carries one
-    override key matching no segment in this document, so the unmatched-override warning has a
-    reachable input.
+    The collision document again, generated with the path-segment override that resolves it. The
+    same configuration also carries one override key matching no segment in this document, so the
+    unmatched-override warning has a reachable input.
 servers:
   - url: https://override.example.test
 paths:
