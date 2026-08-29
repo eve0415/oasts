@@ -93,12 +93,13 @@ OpenAPI has no pagination vocabulary, so any such support would be a guess about
 ## When two paths would fight over a name
 
 Key bindings are derived from path text, so `/foo-bar` and `/foo_bar` want the same name — and so do `/foo/bar` and `/foo-bar`, a segment named `all`, and anything that normalizes to a name the generated module already uses.
+No key binding is a name your document declares — the compiler composes each one from your namespace and the path text — so the same rule that governs a generated `{Name}Wire` applies: the invented name yields, with an `OASTS6304` warning naming both, and generation continues.
 The loser of each race takes the lowest free numeric suffix: `fooBar` and `fooBar2`, `all` and `all2`.
 Both paths keep a key of their own, and each key still carries its own raw segment text, so two paths never share a cache entry however they end up named.
 
-Which competitor keeps the bare name is decided by one walk — path nodes in pre-order, siblings sorted by raw segment text — so it is a property of the document rather than of the order operations appear in, and two runs over one document name everything identically.
-It is still a *derived* name: adding a path that sorts earlier can shift a suffix onto a binding that did not have one.
-Pin the names you import by hand with `naming.overrides.pathSegments`, keyed by the raw segment text:
+Which competitor keeps the bare name is decided by one walk — configured members first, then derived ones, siblings in raw segment order, path nodes in pre-order — so it is a property of the document rather than of the order operations appear in, and two runs over one document name everything identically.
+A name you configured never moves; a derived one still can, because adding a path that sorts earlier shifts the suffix onto a binding that did not have one.
+That is what the warning is for, and pinning the names you import by hand is what stops it — `naming.overrides.pathSegments`, keyed by the raw segment text:
 
 ```yaml title="oasts.yaml"
 naming:
