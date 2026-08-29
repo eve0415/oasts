@@ -13,7 +13,7 @@ Usage: oasts <command> [options]
 Commands:
   generate           Generate configured artifacts
   check              Validate configuration and input without emitting
-  watch              (unsupported in this build)
+  watch              Watch inputs and regenerate until interrupted
 
 Options:
   --config <path>    Use an explicit configuration file
@@ -22,9 +22,9 @@ Options:
                      unsupported in this build; selecting one fails)
 ```
 
-`watch` and `--spec` are parsed but not implemented in this build.
-They are in the help text because the argument surface is fixed; using either exits `2` — `oasts watch` with `OASTS9004` ("the watch command is not supported in this build"), `--spec` with the `OASTS9002` that workspace configs refuse under.
-Both are [provisional](/concepts/diagnostics) codes, so they retire when the capability lands.
+`--spec` is parsed but not implemented in this build.
+It is in the help text because the argument surface is fixed; using it exits `2` with the `OASTS9002` that workspace configs refuse under.
+That is a [provisional](/concepts/diagnostics) code, so it retires when the capability lands.
 
 ## `oasts generate`
 
@@ -49,6 +49,47 @@ Validates the configuration and the input document, and reports every diagnostic
 <PackageManagers pkg="oasts" type="exec" args="check" />
 
 Use it to see what your document produces — including every warning about an operation an artifact had to skip — before committing to a run.
+
+## `oasts watch`
+
+Does what `generate` does, then keeps going: it watches everything the compile read and compiles again whenever any of it changes, until you interrupt it.
+
+<PackageManagers pkg="oasts" type="exec" args="watch" />
+
+A recompile is a cold compile — the whole run is redone from the configuration down, so what a watch session writes is byte for byte what `oasts generate` would have written.
+Nothing is cached and nothing is incremental.
+
+### What it watches
+
+Everything the last compile actually read or looked for, which is wider than the document graph:
+
+- the configuration file, and every other name [discovery](#config-discovery) would have accepted in the same directory, so a second `oasts.*` appearing is noticed;
+- the entry document and every local document its `$ref`s reach;
+- the consumer's `tsconfig.json`, every file its `extends` chain reaches, and each `tsconfig.json` the [ancestor walk](/reference/configuration#typescript) looked for and did not find;
+- the `node_modules/zod` and `node_modules/msw` manifests the peer-version warnings were read from.
+
+The set is recomputed after every compile, so adding a `$ref` starts watching the file it points at.
+Directories are watched rather than individual files, which is what makes an editor's save-and-rename visible, and events are matched against that set before any of them counts — so the artifacts a run writes never wake the next one.
+
+<Aside type="note" title="Two things a session will not pick up">
+  A peer package **appearing** where none was installed: the manifest is watched only once one has been found, so `npm install zod` mid-session does not re-run the version check until you restart.
+  And on the Node CLI, a module your `oasts.config.ts` **imports**: the config file itself is re-evaluated on every cycle, but modules it pulls in stay cached for the life of the process.
+</Aside>
+
+### Diagnostics do not end the session
+
+A compile that fails is reported and the session keeps waiting.
+A typo in a document, a config that stopped parsing, a `$ref` to a file that is not there yet — all of them print and then wait for the next edit.
+While a compile is failing the session also widens what counts as a change, so creating the file it was missing brings it straight back.
+
+There is no successful exit: `oasts watch` runs until you interrupt it.
+The one thing that ends it on its own is a directory it was told to watch and could not, which exits `2` with `OASTS1031` — a watch that cannot see one of its inputs would quietly serve stale output, which is worse than stopping.
+
+### Coalescing
+
+A single save is several filesystem events, and an edit that lands mid-compile queues behind it.
+Both are coalesced: the session waits for the tree to go quiet before starting a compile, so one save is one recompile.
+How long it waits is [`watch.debounceMs`](/reference/configuration#watch), 100 ms by default.
 
 ## `--config`
 

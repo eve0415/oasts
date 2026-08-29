@@ -414,16 +414,31 @@ compat:
   Each key exists because a real server disagrees with the specification, and turning one on means the generated client stops matching what your document literally says.
 </Aside>
 
+## `watch`
+
+What [`oasts watch`](/reference/cli#oasts-watch) does between recompiles:
+
+```yaml
+watch:
+  debounceMs: 100
+```
+
+`debounceMs` is how long the filesystem has to stay quiet before a change is compiled, clamped to 0–10000; a value outside that fails the build with `OASTS0281`.
+Saving one file is several syscalls, and an editor that writes through a temporary file makes it several more, so a quiet period is what turns one save into one recompile rather than three.
+`0` disables coalescing and compiles on the first event.
+
+Nothing else here is a setting.
+Which paths a session follows is not a choice — it is whatever the compile read — and a session is not allowed to end on a diagnostic, because a typo is the case a watch exists for.
+
 ## Reserved keys
 
-`specs`, `shared`, `watch` and `ci` are accepted by the schema but not implemented in this build.
+`specs`, `shared` and `ci` are accepted by the schema but not implemented in this build.
 They are reserved so a config written today does not have to change shape when they land, and they refuse in the [provisional band](/concepts/diagnostics) rather than as ordinary config errors:
 
 | Key | Code |
 | --- | --- |
 | `specs`, `shared` | `OASTS9002` — workspace configs |
-| `watch`, `ci` | `OASTS9003` — the surrounding capability |
+| `ci` | `OASTS9003` — the surrounding capability |
 
-The CLI has the same arrangement: `oasts watch` parses and then refuses with `OASTS9004`, and `--spec` refuses with the same `OASTS9002` the `specs` key does.
-Both exit `2`.
+The CLI has the same arrangement for `--spec`, which refuses with the same `OASTS9002` the `specs` key does, and exits `2`.
 See [CLI](/reference/cli).
