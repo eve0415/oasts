@@ -300,11 +300,8 @@ mod tests {
             url: &str,
             _policy: &crate::source::FetchPolicy,
         ) -> Result<crate::source::FetchStep, String> {
-            if url == self.uri {
-                Ok(crate::source::FetchStep::Body(self.document.clone()))
-            } else {
-                Err(format!("nothing is served at '{url}'"))
-            }
+            assert_eq!(url, self.uri, "only the configured URI is ever requested");
+            Ok(crate::source::FetchStep::Body(self.document.clone()))
         }
     }
 
