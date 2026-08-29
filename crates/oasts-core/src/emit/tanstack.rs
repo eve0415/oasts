@@ -353,10 +353,7 @@ pub(crate) fn build_key_factory(
     }
 
     let mut matched_overrides = Vec::new();
-    let mut sink = BindingSink {
-        bindings: BTreeMap::new(),
-        taken_names: reserved_binding_names(model),
-    };
+    let mut planned = Vec::new();
     collect_bindings(
         &root,
         &namespace,
@@ -367,11 +364,12 @@ pub(crate) fn build_key_factory(
             members: &[],
             parameters: &[],
             elements: &[KeyElement::Literal(namespace.clone())],
+            configured: None,
         },
-        &mut sink,
+        &mut planned,
         registrar,
     );
-    let bindings = sink.bindings;
+    let bindings = allocate_flat_names(&planned, reserved_binding_names(model), registrar);
 
     for key in overrides.keys() {
         if !matched_overrides.contains(key) {
@@ -389,30 +387,20 @@ pub(crate) fn build_key_factory(
 }
 
 /// The accumulators one recursive step of the walk carries down: where the node sits, what it is
-/// named, what parameters are in scope, and what key elements precede it.
+/// named, what parameters are in scope, what key elements precede it, and whether the segment that
+/// named it was named by configuration rather than derived.
 struct BindingWalk<'walk> {
     address: &'walk [String],
     members: &'walk [String],
     parameters: &'walk [KeyParameter],
     elements: &'walk [KeyElement],
-}
-
-/// What the walk writes back: the allocated bindings, and every flat name already taken.
-struct BindingSink {
-    bindings: BTreeMap<Vec<String>, KeyBinding>,
-    taken_names: BTreeSet<String>,
+    configured: Option<&'walk str>,
 }
 
 /// The lowest free name in `taken`: `base`, then `base2`, `base3`, and so on, the same allocation
 /// [`EmissionModel::reserve_names`] performs for a component name a terminal emitter's own
 /// identifier has taken. The chosen name is inserted, so a caller allocating in a loop threads one
 /// set through every candidate.
-///
-/// Which competitor keeps the bare name is therefore decided by insertion order, and every caller's
-/// insertion order is the key-factory walk: pre-order over path nodes, visiting a parent's
-/// configured children before its derived ones and each group in raw segment order. That is a
-/// property of the document, not of the order operations were visited in, so two runs over one
-/// document allocate identically.
 fn allocate_unique(base: &str, taken: &mut BTreeSet<String>) -> String {
     let mut candidate = base.to_owned();
     let mut suffix = 2_u32;
@@ -458,13 +446,199 @@ fn reserved_binding_names(model: &EmissionModel<'_>) -> BTreeSet<String> {
     reserved
 }
 
+/// One path node after the walk has named it, before flat binding names are allocated.
+///
+/// Allocation is deferred because a name a `pathSegments` entry chose must never move, and whether
+/// it would move depends on nodes the walk reaches later — a node's own flat name is composed from
+/// every member above it, so it cannot be known before its ancestors are named. Collecting the
+/// whole walk first is what lets the configured nodes claim their names before any derived one
+/// allocates.
+struct PlannedNode {
+    address: Vec<String>,
+    /// The flat name composed from the namespace and this node's members.
+    base: String,
+    /// The `pathSegments` key that named this node's own member, when one did.
+    configured: Option<String>,
+    collection: bool,
+    members: Vec<String>,
+    parameters: Vec<KeyParameter>,
+    elements: Vec<KeyElement>,
+    source: SourceRef,
+}
+
+/// Who already holds a flat name a later node wanted.
+enum NameHolder {
+    /// An identifier `keys.ts` declares or every operation module imports, whatever the document
+    /// says. Nothing about it is negotiable, so a name that lands on one always yields.
+    Artifact,
+    /// Another path node, with where the document declares it — what a reader needs to see to know
+    /// which of the two paths kept the bare name.
+    Node {
+        address: Vec<String>,
+        source: SourceRef,
+    },
+}
+
+/// The `pathSegments` entry that resolves a collision between two path nodes: the first segment
+/// where the two addresses actually diverge, not the colliding node's own.
+///
+/// For `/foo-bar/{id}` against `/foo_bar/{id}` the colliding node is `{id}`, but `{id}` is the same
+/// text in both — naming it would rename both and resolve nothing. The divergence is one level up,
+/// and that is the entry the reader has to write. Two addresses where one is a prefix of the other
+/// never diverge, and then there is no entry to suggest.
+fn divergence_remedy(address: &[String], other: &[String]) -> String {
+    match address
+        .iter()
+        .zip(other.iter())
+        .find(|(current, held)| current != held)
+    {
+        Some((raw, _)) => format!(
+            " — pin it with `naming.overrides.pathSegments: {{ \"{raw}\": \"<distinctName>\" }}`"
+        ),
+        None => String::new(),
+    }
+}
+
+/// Allocates one flat binding name per planned node, configured nodes first.
+///
+/// A name a `pathSegments` entry produced is claimed before any derived name is allocated, so it is
+/// never the one that moves: `naming.overrides` is the remedy every collision diagnostic points at,
+/// and a remedy that can itself be renamed pins nothing. When such a name cannot be honored at all
+/// the run refuses and names the entry, rather than quietly emitting something else.
+///
+/// Both passes read `planned` in walk order — pre-order over path nodes, siblings by raw segment
+/// text — so which derived competitor keeps the bare name is a property of the document rather than
+/// of the order operations were visited in.
+fn allocate_flat_names(
+    planned: &[PlannedNode],
+    reserved: BTreeSet<String>,
+    registrar: &mut Registrar<'_>,
+) -> BTreeMap<Vec<String>, KeyBinding> {
+    let mut holders: BTreeMap<String, NameHolder> = reserved
+        .into_iter()
+        .map(|name| (name, NameHolder::Artifact))
+        .collect();
+    let mut bindings = BTreeMap::new();
+    let mut claimed: BTreeMap<String, (&PlannedNode, &String)> = BTreeMap::new();
+
+    for (node, key) in planned
+        .iter()
+        .filter_map(|node| node.configured.as_ref().map(|key| (node, key)))
+    {
+        if holders.contains_key(&node.base) {
+            registrar.sink.push(source_diagnostic(
+                CODE_SEGMENT_COLLISION,
+                format!(
+                    "naming.overrides.pathSegments key '{key}' names path '/{}' '{}', which the generated modules already bind — choose another name",
+                    node.address.join("/"),
+                    node.base,
+                ),
+                &node.source,
+            ));
+            continue;
+        }
+        if let Some((other, other_key)) = claimed.get(&node.base) {
+            registrar.sink.push(source_diagnostic(
+                CODE_SEGMENT_COLLISION,
+                format!(
+                    "naming.overrides.pathSegments keys '{other_key}' and '{key}' both bind '{}', for paths '/{}' and '/{}' — one of them has to name something else",
+                    node.base,
+                    other.address.join("/"),
+                    node.address.join("/"),
+                ),
+                &node.source,
+            ));
+            continue;
+        }
+        claimed.insert(node.base.clone(), (node, key));
+        bindings.insert(node.address.clone(), node.binding(node.base.clone()));
+    }
+
+    for (name, (node, _)) in claimed {
+        holders.insert(
+            name,
+            NameHolder::Node {
+                address: node.address.clone(),
+                source: node.source.clone(),
+            },
+        );
+    }
+
+    for node in planned.iter().filter(|node| node.configured.is_none()) {
+        let mut candidate = node.base.clone();
+        let mut suffix = 2_u32;
+        while holders.contains_key(&candidate) {
+            candidate = format!("{}{suffix}", node.base);
+            suffix += 1;
+        }
+        if candidate != node.base {
+            let message = match holders.get(&node.base) {
+                Some(NameHolder::Node {
+                    address: held,
+                    source,
+                }) => format!(
+                    "key binding '{}' for path '/{}' is already bound by path '/{}' (declared at {}); emitting it as '{candidate}'{}",
+                    node.base,
+                    node.address.join("/"),
+                    held.join("/"),
+                    source.display(),
+                    divergence_remedy(&node.address, held),
+                ),
+                Some(NameHolder::Artifact) | None => format!(
+                    "key binding '{}' for path '/{}' is an identifier the generated modules already bind; emitting it as '{candidate}' — pin it with `naming.overrides.pathSegments`",
+                    node.base,
+                    node.address.join("/"),
+                ),
+            };
+            registrar.sink.push(warning_diagnostic(
+                CODE_RENAMED_KEY_NAME,
+                message,
+                &node.source,
+            ));
+        }
+        holders.insert(
+            candidate.clone(),
+            NameHolder::Node {
+                address: node.address.clone(),
+                source: node.source.clone(),
+            },
+        );
+        bindings.insert(node.address.clone(), node.binding(candidate));
+    }
+
+    bindings
+}
+
+impl PlannedNode {
+    fn binding(&self, name: String) -> KeyBinding {
+        KeyBinding {
+            name,
+            collection: self.collection,
+            members: self.members.clone(),
+            parameters: self.parameters.clone(),
+            elements: self.elements.clone(),
+            source: self.source.clone(),
+        }
+    }
+}
+
+/// One child of a path node, after the walk has decided what member names it.
+struct ResolvedChild<'tree> {
+    raw: &'tree String,
+    node: &'tree PathNode,
+    member: String,
+    /// Whether `member` came from a `pathSegments` entry rather than from the segment text.
+    configured: bool,
+    parameters: Vec<KeyParameter>,
+}
+
 fn collect_bindings(
     node: &PathNode,
     namespace: &str,
     overrides: &BTreeMap<String, String>,
     matched_overrides: &mut Vec<String>,
     walk: &BindingWalk<'_>,
-    sink: &mut BindingSink,
+    planned: &mut Vec<PlannedNode>,
     registrar: &mut Registrar<'_>,
 ) {
     let BindingWalk {
@@ -472,54 +646,29 @@ fn collect_bindings(
         members,
         parameters,
         elements,
+        configured,
     } = *walk;
     let takes_all = node.kind.takes_all_suffix();
-    let mut name = namespace.to_owned();
+    let mut base = namespace.to_owned();
     for member in members {
-        name.push_str(&uppercase_first(member));
+        base.push_str(&uppercase_first(member));
     }
     if takes_all {
-        name.push_str("All");
+        base.push_str("All");
     }
+    planned.push(PlannedNode {
+        address: address.to_vec(),
+        base,
+        configured: configured.map(str::to_owned),
+        collection: takes_all,
+        members: members.to_vec(),
+        parameters: parameters.to_vec(),
+        elements: elements.to_vec(),
+        source: node.source.clone(),
+    });
 
-    // Whatever else already binds this name — another path node, an identifier `keys.ts` declares,
-    // an identifier an operation module imports — the loser of the race takes a numeric suffix
-    // rather than costing the document its whole artifact.
-    let allocated = allocate_unique(&name, &mut sink.taken_names);
-    if allocated != name {
-        registrar.sink.push(warning_diagnostic(
-            CODE_RENAMED_KEY_NAME,
-            format!(
-                "key binding '{name}' for path '/{}' is already bound; emitting it as '{allocated}'",
-                address.join("/")
-            ),
-            &node.source,
-        ));
-    }
-    let name = allocated;
-    sink.bindings.insert(
-        address.to_vec(),
-        KeyBinding {
-            name,
-            collection: takes_all,
-            members: members.to_vec(),
-            parameters: parameters.to_vec(),
-            elements: elements.to_vec(),
-            source: node.source.clone(),
-        },
-    );
-
-    // Seeded with the composed object's own member, so a segment deriving `all` is allocated
-    // around it instead of emitting a duplicate object key — TS1117, or silently the wrong key if
-    // it compiled.
-    let mut taken_members: BTreeSet<String> = BTreeSet::from([COMPOSED_SELF_MEMBER.to_owned()]);
-    // A configured member allocates before a derived one, so it is never the sibling that moves:
-    // the document owns the name it chose, and the compiler invented the other. `children` is
-    // ordered by raw segment text and the sort is stable, so within each group that order still
-    // decides, and the whole allocation stays a property of the document.
-    let mut ordered: Vec<(&String, &PathNode)> = node.children.iter().collect();
-    ordered.sort_by_key(|(raw, _)| !overrides.contains_key(*raw));
-    for (raw, child) in ordered {
+    let mut resolved = Vec::new();
+    for (raw, child) in &node.children {
         let kind = &child.kind;
         // The override is consulted before derivation, not after: a segment whose text cannot
         // become an identifier is exactly the case the override exists for, so deriving first and
@@ -536,36 +685,83 @@ fn collect_bindings(
             };
             Ok((member, parameters))
         });
-        let (member, segment_parameters) = match naming {
-            Ok(naming) => naming,
-            Err(message) => {
-                registrar.sink.push(source_diagnostic(
-                    CODE_SEGMENT_COLLISION,
-                    format!(
-                        "{message} — name it with `naming.overrides.pathSegments: {{ \"{raw}\": \"<name>\" }}`"
-                    ),
-                    &child.source,
-                ));
-                continue;
-            }
-        };
+        match naming {
+            Ok((member, parameters)) => resolved.push(ResolvedChild {
+                raw,
+                node: child,
+                member,
+                configured: override_member.is_some(),
+                parameters,
+            }),
+            Err(message) => registrar.sink.push(source_diagnostic(
+                CODE_SEGMENT_COLLISION,
+                format!(
+                    "{message} — name it with `naming.overrides.pathSegments: {{ \"{raw}\": \"<name>\" }}`"
+                ),
+                &child.source,
+            )),
+        }
+    }
 
-        let allocated = allocate_unique(&member, &mut taken_members);
-        if allocated != member {
+    // A configured member claims its name before `all` and before any derived sibling, and is
+    // refused rather than renamed when it cannot have it — the same order the flat names follow,
+    // and for the same reason.
+    let mut taken_members: BTreeSet<String> = BTreeSet::new();
+    let mut configured_members: BTreeMap<String, &String> = BTreeMap::new();
+    let mut refused: BTreeSet<&String> = BTreeSet::new();
+    for child in resolved.iter().filter(|child| child.configured) {
+        let raw = child.raw;
+        if child.member == COMPOSED_SELF_MEMBER {
+            registrar.sink.push(source_diagnostic(
+                CODE_SEGMENT_COLLISION,
+                format!(
+                    "naming.overrides.pathSegments key '{raw}' names the member '{COMPOSED_SELF_MEMBER}', which every node of the composed key object already gives its own key — choose another name"
+                ),
+                &child.node.source,
+            ));
+            refused.insert(raw);
+            continue;
+        }
+        if let Some(other) = configured_members.get(&child.member) {
+            registrar.sink.push(source_diagnostic(
+                CODE_SEGMENT_COLLISION,
+                format!(
+                    "naming.overrides.pathSegments keys '{other}' and '{raw}' both bind the member '{}' under the same parent — one of them has to name something else",
+                    child.member
+                ),
+                &child.node.source,
+            ));
+            refused.insert(raw);
+            continue;
+        }
+        configured_members.insert(child.member.clone(), raw);
+        taken_members.insert(child.member.clone());
+    }
+    // Reserved after the configured members and before the derived ones: a segment deriving `all`
+    // is allocated around it instead of emitting a duplicate object key — TS1117, or silently the
+    // wrong key if it compiled.
+    taken_members.insert(COMPOSED_SELF_MEMBER.to_owned());
+    for child in resolved.iter_mut().filter(|child| !child.configured) {
+        let allocated = allocate_unique(&child.member, &mut taken_members);
+        if allocated != child.member {
             registrar.sink.push(warning_diagnostic(
                 CODE_RENAMED_KEY_NAME,
                 format!(
-                    "path segment '{raw}' derives the member '{member}', which is already taken under this parent; emitting it as '{allocated}' — choose the name yourself with `naming.overrides.pathSegments: {{ \"{raw}\": \"<name>\" }}`"
+                    "path segment '{raw}' derives the member '{member}', which is already taken under this parent; emitting it as '{allocated}' — choose the name yourself with `naming.overrides.pathSegments: {{ \"{raw}\": \"<name>\" }}`",
+                    raw = child.raw,
+                    member = child.member,
                 ),
-                &child.source,
+                &child.node.source,
             ));
+            child.member = allocated;
         }
-        let member = allocated;
+    }
 
+    for child in resolved.iter().filter(|child| !refused.contains(child.raw)) {
         let mut child_address = address.to_vec();
-        child_address.push(raw.clone());
+        child_address.push(child.raw.clone());
         let mut child_members = members.to_vec();
-        child_members.push(member);
+        child_members.push(child.member.clone());
         let mut child_parameters = parameters.to_vec();
         let mut child_elements = elements.to_vec();
 
@@ -573,7 +769,7 @@ fn collect_bindings(
             .iter()
             .map(|existing| existing.identifier.clone())
             .collect();
-        for parameter in segment_parameters {
+        for parameter in child.parameters.iter().cloned() {
             // A path template naming one parameter twice gets one function argument, not two: the
             // client substitutes a single declared value into every occurrence, so a key taking two
             // could name a request the client cannot make. Both elements read the one allocation
@@ -595,7 +791,7 @@ fn collect_bindings(
                         wire = parameter.wire,
                         derived = parameter.identifier,
                     ),
-                    &child.source,
+                    &child.node.source,
                 ));
             }
             child_parameters.push(KeyParameter {
@@ -603,10 +799,10 @@ fn collect_bindings(
                 identifier,
             });
         }
-        child_elements.push(key_element(kind, &child_parameters));
+        child_elements.push(key_element(&child.node.kind, &child_parameters));
 
         collect_bindings(
-            child,
+            child.node,
             namespace,
             overrides,
             matched_overrides,
@@ -615,8 +811,9 @@ fn collect_bindings(
                 members: &child_members,
                 parameters: &child_parameters,
                 elements: &child_elements,
+                configured: child.configured.then_some(child.raw.as_str()),
             },
-            sink,
+            planned,
             registrar,
         );
     }
@@ -1747,8 +1944,19 @@ paths:
         let (keys, diagnostics) = keys_for(CROSS_DEPTH, CONFIG);
         let warnings = renames(&diagnostics);
         assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        // The warning names both competitors, where the winner is declared, and the entry that
+        // pins the loser — the segment where the two addresses diverge, which is the only one a
+        // reader can act on.
         assert!(
-            warnings[0].contains("key binding 'apiFooBarAll' for path '/foo-bar' is already bound"),
+            warnings[0].contains(
+                "key binding 'apiFooBarAll' for path '/foo-bar' is already bound by path '/foo/bar' (declared at "
+            ),
+            "{warnings:#?}"
+        );
+        assert!(
+            warnings[0].contains(
+                "emitting it as 'apiFooBarAll2' — pin it with `naming.overrides.pathSegments: { \"foo-bar\": \"<distinctName>\" }`"
+            ),
             "{warnings:#?}"
         );
         // The walk is pre-order over children sorted by raw segment text, so `foo` and the node
@@ -2061,22 +2269,18 @@ paths:
     }
 
     #[test]
-    fn an_override_naming_the_composed_objects_own_member_takes_a_suffix_too() {
+    fn an_override_naming_the_composed_objects_own_member_is_refused_too() {
         // An override value is arbitrary text, so it reaches the reserved member by a route the
-        // derived grammar cannot. It is allocated like any other candidate rather than refused.
+        // derived grammar cannot. A configured name is never renamed, and `all` is the one member
+        // every node already spends on its own key, so there is nothing to do but refuse.
         let config = format!("{CONFIG}naming:\n  overrides:\n    pathSegments:\n      pets: all\n");
         let (keys, diagnostics) = keys_for(SHOWCASE, &config);
-        assert!(
-            !diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == CODE_SEGMENT_COLLISION),
-            "{diagnostics:#?}"
-        );
-        assert!(keys.contains("  all2: {\n"), "{keys}");
-        assert!(
-            keys.contains("export const apiAll2All = [\"api\", \"pets\"] as const;\n"),
-            "{keys}"
-        );
+        let refusal = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SEGMENT_COLLISION)
+            .expect("reserved member reported");
+        assert!(refusal.message.contains("'pets'"), "{refusal:?}");
+        assert!(!keys.contains("  all2: {\n"), "{keys}");
     }
 
     #[test]
@@ -2252,9 +2456,10 @@ paths:
     }
 
     #[test]
-    fn a_binding_shadowing_the_key_factorys_own_import_is_disambiguated() {
+    fn a_binding_shadowing_the_key_factorys_own_import_is_refused() {
         // `keys.ts` type-imports `ParamValue`; a binding of that name would shadow it in the same
-        // file (TS2395, then TS1361 when the signature reaches for the type).
+        // file (TS2395, then TS1361 when the signature reaches for the type). Only an override can
+        // reach one of these names, and an override is never renamed, so the run refuses instead.
         const ROOT_PARAM: &str = r#"
 openapi: 3.1.0
 info:
@@ -2276,13 +2481,17 @@ paths:
 "#;
         let config = "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\nnamespace: Param\noutput: ./generated\nartifacts:\n  types: true\nnaming:\n  overrides:\n    pathSegments:\n      \"{id}\": Value\n";
         let (keys, diagnostics) = keys_for(ROOT_PARAM, config);
-        assert!(!renames(&diagnostics).is_empty(), "{diagnostics:#?}");
-        assert!(keys.contains("import type { ParamValue } from"), "{keys}");
-        assert!(keys.contains("export const ParamValue2 = ("), "{keys}");
+        let refusal = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SEGMENT_COLLISION)
+            .expect("ParamValue shadowing reported");
+        assert_eq!(refusal.severity, Severity::Error);
+        assert!(refusal.message.contains("'ParamValue'"), "{refusal:?}");
+        assert!(!keys.contains("export const ParamValue"), "{keys}");
     }
 
     #[test]
-    fn a_binding_shadowing_an_operations_own_import_is_disambiguated() {
+    fn a_binding_shadowing_an_operations_own_import_is_refused() {
         const TWO_PARAMS: &str = r#"
 openapi: 3.1.0
 info:
@@ -2312,34 +2521,25 @@ paths:
                 type: object
 "#;
         // Would bind `readThingOrThrow`, which is exactly what the module imports from the client.
-        // Those names are reserved before the walk, so the binding takes the next free one and the
-        // operation still gets a module.
+        // Those names are reserved before the walk, and the entry that reached one is named back
+        // rather than renamed: a configured name never moves.
         let config = "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\nnamespace: read\noutput: ./generated\nartifacts:\n  types: true\n  client: true\n  tanstack: true\nclient:\n  authEnforcement: types\n  baseUrl:\n    source: runtime\nnaming:\n  overrides:\n    pathSegments:\n      \"{a}\": thing\n      \"{b}\": orThrow\nvalidation:\n  engine: 'off'\n  unchecked: allow\n";
         let (files, diagnostics) = emit(TWO_PARAMS, config);
+        let refusal = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SEGMENT_COLLISION)
+            .expect("operation-import shadowing reported");
+        assert!(refusal.message.contains("'{b}'"), "{refusal:?}");
+        assert!(refusal.message.contains("readThingOrThrow"), "{refusal:?}");
         assert!(
-            !diagnostics
+            !files
                 .iter()
-                .any(|diagnostic| diagnostic.code == CODE_SEGMENT_COLLISION),
-            "{diagnostics:#?}"
-        );
-        let keys = emitted(&files, "tanstack/keys.ts");
-        assert!(
-            keys.contains("export const readThingOrThrow2 = ("),
-            "{keys}"
-        );
-        let module = emitted(&files, "tanstack/operations/readthing.ts");
-        assert!(
-            module.contains("import { readThingOrThrow2 } from \"../keys.js\";"),
-            "{module}"
-        );
-        assert!(
-            module.contains("import { readThingOrThrow, type ReadThingCallArgs"),
-            "{module}"
+                .any(|file| file.relative_path.starts_with("tanstack/operations/"))
         );
     }
 
     #[test]
-    fn a_binding_shadowing_a_module_import_is_disambiguated() {
+    fn a_binding_shadowing_a_module_import_is_refused() {
         const ROOT_PARAM: &str = r#"
 openapi: 3.1.0
 info:
@@ -2361,8 +2561,12 @@ paths:
 "#;
         let config = "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\nnamespace: with\noutput: ./generated\nartifacts:\n  types: true\nnaming:\n  overrides:\n    pathSegments:\n      \"{thing}\": input\n";
         let (keys, diagnostics) = keys_for(ROOT_PARAM, config);
-        assert!(!renames(&diagnostics).is_empty(), "{diagnostics:#?}");
-        assert!(keys.contains("export const withInput2 = ("), "{keys}");
+        let refusal = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SEGMENT_COLLISION)
+            .expect("import shadowing reported");
+        assert!(refusal.message.contains("'withInput'"), "{refusal:?}");
+        assert!(!keys.contains("export const withInput"), "{keys}");
     }
 
     #[test]
@@ -2686,7 +2890,7 @@ paths:
     }
 
     #[test]
-    fn a_binding_colliding_with_the_modules_own_factory_is_disambiguated() {
+    fn a_binding_colliding_with_the_modules_own_factory_is_refused() {
         const ROOT_PARAM: &str = r#"
 openapi: 3.1.0
 info:
@@ -2710,22 +2914,20 @@ paths:
               schema:
                 type: object
 "#;
-        // The module declares `fooQuery` and would import a key binding of the same name. The
-        // declaration wins the name; the binding takes the next free one.
+        // The module declares `fooQuery` and would import a key binding of the same name.
         let config = "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\nnamespace: foo\noutput: ./generated\nartifacts:\n  types: true\n  client: true\n  tanstack: true\nclient:\n  authEnforcement: types\n  baseUrl:\n    source: runtime\nnaming:\n  overrides:\n    pathSegments:\n      \"{id}\": Query\nvalidation:\n  engine: 'off'\n  unchecked: allow\n";
         let (files, diagnostics) = emit(ROOT_PARAM, config);
         assert!(
-            !diagnostics
+            diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == CODE_SEGMENT_COLLISION),
+                .any(|diagnostic| diagnostic.message.contains("fooQuery")),
             "{diagnostics:#?}"
         );
-        let module = emitted(&files, "tanstack/operations/foo.ts");
         assert!(
-            module.contains("import { fooQuery2 } from \"../keys.js\";"),
-            "{module}"
+            !files
+                .iter()
+                .any(|file| file.relative_path.starts_with("tanstack/operations/"))
         );
-        assert!(module.contains("export function fooQuery<"), "{module}");
     }
 
     #[test]
@@ -3152,6 +3354,128 @@ paths:
     }
 
     #[test]
+    fn two_configured_members_under_one_parent_are_refused() {
+        // Neither is compiler-invented, so neither yields — this is a collision between two things
+        // the configuration declares, and the diagnostic names both entries.
+        const SIBLINGS: &str = r#"
+openapi: 3.1.0
+info:
+  title: Two entries
+  version: 1.0.0
+paths:
+  /alpha:
+    get:
+      operationId: readAlpha
+      responses:
+        '200':
+          description: ok
+  /beta:
+    get:
+      operationId: readBeta
+      responses:
+        '200':
+          description: ok
+"#;
+        let config = format!(
+            "{CONFIG}naming:\n  overrides:\n    pathSegments:\n      alpha: same\n      beta: same\n"
+        );
+        let (keys, diagnostics) = keys_for(SIBLINGS, &config);
+        let refusal = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SEGMENT_COLLISION)
+            .expect("two entries binding one member reported");
+        assert_eq!(refusal.severity, Severity::Error);
+        assert!(
+            refusal.message.contains("'alpha' and 'beta'") && refusal.message.contains("'same'"),
+            "{refusal:?}"
+        );
+        // The first entry keeps what it asked for; the second names nothing at all.
+        assert_eq!(keys.matches("same: {").count(), 1, "{keys}");
+    }
+
+    #[test]
+    fn two_configured_nodes_composing_one_binding_name_are_refused() {
+        // The members differ and sit under different parents, so the member layer cannot see this.
+        // `/p/q` composes `apiPRAll` from two members and `/pq` composes it from one.
+        const CROSS_DEPTH: &str = r#"
+openapi: 3.1.0
+info:
+  title: Two entries, one binding
+  version: 1.0.0
+paths:
+  /p/q:
+    get:
+      operationId: readNested
+      responses:
+        '200':
+          description: ok
+  /pq:
+    get:
+      operationId: readFlat
+      responses:
+        '200':
+          description: ok
+"#;
+        let config =
+            format!("{CONFIG}naming:\n  overrides:\n    pathSegments:\n      q: r\n      pq: pR\n");
+        let (keys, diagnostics) = keys_for(CROSS_DEPTH, &config);
+        let refusal = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SEGMENT_COLLISION)
+            .expect("two entries binding one name reported");
+        assert!(
+            refusal.message.contains("'q' and 'pq'") && refusal.message.contains("'apiPRAll'"),
+            "{refusal:?}"
+        );
+        assert_eq!(keys.matches("export const apiPRAll").count(), 1, "{keys}");
+    }
+
+    #[test]
+    fn a_derived_binding_landing_on_an_operations_own_import_yields() {
+        // No override is involved: `/foo/{query}` composes `apiFooByQuery`, and an operation whose
+        // allocated name is `apiFooBy` makes its module declare that exact identifier. The derived
+        // binding is compiler-invented on both sides of the race, so it moves and warns.
+        const RESERVED: &str = r#"
+openapi: 3.1.0
+info:
+  title: Derived onto a module name
+  version: 1.0.0
+paths:
+  /foo/{query}:
+    parameters:
+      - name: query
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: readFoo
+      responses:
+        '200':
+          description: ok
+  /other:
+    get:
+      operationId: apiFooBy
+      responses:
+        '200':
+          description: ok
+"#;
+        let (keys, diagnostics) = keys_for(RESERVED, CONFIG);
+        let warnings = renames(&diagnostics);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains(
+                "key binding 'apiFooByQuery' for path '/foo/{query}' is an identifier the generated modules already bind"
+            ),
+            "{warnings:#?}"
+        );
+        assert!(
+            keys.contains("export const apiFooByQuery2 = (query: KeyValue | undefined)"),
+            "{keys}"
+        );
+    }
+
+    #[test]
     fn a_configured_member_never_yields_to_a_derived_sibling() {
         // `/foo-bar` derives `fooBar`, and the override asks for `fooBar` on `/foo_bar`. The
         // document owns the name it chose, so the derived sibling is the one that moves.
@@ -3260,9 +3584,10 @@ paths:
     #[test]
     fn an_override_can_make_a_child_take_its_own_ancestors_name() {
         // `/foo` binds `apiFooAll`. `/foo/{x}` normally binds `apiFooByX`, but an override naming
-        // the parameter segment `all` makes it bind `apiFooAll` too — a collision where neither
-        // address diverges from the other, because one is a prefix of it. The suggestion has
-        // nothing to point at, and must not claim otherwise.
+        // the parameter segment `all` makes it bind `apiFooAll` too. The configured descendant
+        // claims the name and the derived ancestor is what moves. Neither address diverges from the
+        // other — one is a prefix of it — so there is no entry to suggest, and the message must not
+        // invent one.
         const NESTED: &str = r#"
 openapi: 3.1.0
 info:
@@ -3291,13 +3616,26 @@ paths:
         let config =
             format!("{CONFIG}naming:\n  overrides:\n    pathSegments:\n      \"{{x}}\": All\n");
         let (keys, diagnostics) = keys_for(NESTED, &config);
-        assert!(!renames(&diagnostics).is_empty(), "{diagnostics:#?}");
-        // The ancestor is reached first, so the descendant is the one that takes the suffix.
-        assert!(keys.contains("export const apiFooAll = [\"api\", \"foo\"] as const;\n"));
+        let warnings = renames(&diagnostics);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains(
+                "key binding 'apiFooAll' for path '/foo' is already bound by path '/foo/{x}'"
+            ),
+            "{warnings:#?}"
+        );
+        assert!(
+            !warnings[0].contains("naming.overrides.pathSegments:"),
+            "{warnings:#?}"
+        );
         assert!(
             keys.contains(
-                "export const apiFooAll2 = (x: KeyValue | undefined) => [\"api\", \"foo\", x === undefined ? [] : { x }] as const;\n"
+                "export const apiFooAll = (x: KeyValue | undefined) => [\"api\", \"foo\", x === undefined ? [] : { x }] as const;\n"
             ),
+            "{keys}"
+        );
+        assert!(
+            keys.contains("export const apiFooAll2 = [\"api\", \"foo\"] as const;\n"),
             "{keys}"
         );
     }
