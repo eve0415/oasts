@@ -3174,6 +3174,44 @@ paths:
     }
 
     #[test]
+    fn a_digit_led_member_that_erases_its_own_boundary_still_gets_a_name() {
+        // `uppercase_first` uppercases the first ASCII letter anywhere in the member, so a member
+        // that begins with digits leaves no boundary in the concatenation: `/v2/foo` and `/v/2foo`
+        // both compose `apiV2FooAll`. Reachable only because a digit-led member is nameable at all,
+        // and answered by the same allocation as any other flat-name race.
+        const ERASED: &str = r#"
+openapi: 3.1.0
+info:
+  title: Erased boundary
+  version: 1.0.0
+paths:
+  /v2/foo:
+    get:
+      operationId: readVersioned
+      responses:
+        '200':
+          description: ok
+  /v/2foo:
+    get:
+      operationId: readSplit
+      responses:
+        '200':
+          description: ok
+"#;
+        let (keys, diagnostics) = keys_for(ERASED, CONFIG);
+        let warnings = renames(&diagnostics);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            keys.contains("export const apiV2FooAll = [\"api\", \"v\", \"2foo\"] as const;\n"),
+            "{keys}"
+        );
+        assert!(
+            keys.contains("export const apiV2FooAll2 = [\"api\", \"v2\", \"foo\"] as const;\n"),
+            "{keys}"
+        );
+    }
+
+    #[test]
     fn two_parameters_normalizing_to_one_argument_name_stay_two_arguments() {
         // `{user_id}` and `{userId}` are two declared parameters that derive one identifier. Unlike
         // a repeated parameter they cannot share an argument, so the second takes a suffix — and
