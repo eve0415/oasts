@@ -1798,6 +1798,17 @@ fn resolve_input(
         return None;
     };
     match (input.path.as_deref(), input.url.as_deref()) {
+        // Which key a document is named under decides whether the compile touches the network, so
+        // the two keys are held apart: a reader of a diff can tell from the key alone.
+        (Some(path), None) if retrievable_uri(path).is_some() => {
+            sink.push(config_error(
+                CODE_INPUT_PATH,
+                "input.path names a document to retrieve over the network; write it under input.url",
+                Some(source),
+                Some("/input/path"),
+            ));
+            None
+        }
         (Some(path), None) if is_uri(path) => Some(PathBuf::from(path)),
         (Some(path), None) => match resolve_below(workspace_root, Path::new(path), true) {
             Ok(resolved) => Some(resolved),
@@ -1811,16 +1822,22 @@ fn resolve_input(
                 None
             }
         },
-        (None, Some(url)) if is_uri(url) => Some(PathBuf::from(url)),
-        (None, Some(_)) => {
-            sink.push(config_error(
-                CODE_INPUT_PATH,
-                "input.url must be an absolute URI",
-                Some(source),
-                Some("/input/url"),
-            ));
-            None
-        }
+        // Recorded canonicalized, so the loader and `remote.integrity` agree on one spelling.
+        (None, Some(url)) => match retrievable_uri(url) {
+            Some(canonical) => Some(PathBuf::from(canonical)),
+            None => {
+                sink.push(config_error(
+                    CODE_INPUT_PATH,
+                    format!(
+                        "input.url must be an absolute http(s) URI with no fragment and no credentials, not '{}'",
+                        without_credentials(url)
+                    ),
+                    Some(source),
+                    Some("/input/url"),
+                ));
+                None
+            }
+        },
         _ => {
             sink.push(config_error(
                 CODE_INPUT_SHAPE,
@@ -4823,6 +4840,70 @@ mod tests {
         );
         assert!(
             reported.message.contains("both name"),
+            "{}",
+            reported.message
+        );
+    }
+
+    #[test]
+    fn input_keys_say_whether_a_compile_touches_the_network() {
+        for (input, pointer) in [
+            (
+                json!({ "path": "https://specs.example.test/openapi.yaml" }),
+                "/input/path",
+            ),
+            (json!({ "url": "file:///tmp/openapi.yaml" }), "/input/url"),
+            (json!({ "url": "./openapi.yaml" }), "/input/url"),
+            (
+                json!({ "url": "https://specs.example.test/openapi.yaml#/components" }),
+                "/input/url",
+            ),
+        ] {
+            let mut value = valid_json_value();
+            value["input"] = input;
+            let diagnostics = assert_code(load_json(&value), CODE_INPUT_PATH);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.json_pointer.as_deref() == Some(pointer)),
+                "{diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retrievable_entry_is_recorded_in_its_canonical_spelling() {
+        let mut value = valid_json_value();
+        value["input"] = json!({ "url": "https://Specs.Example.Test/a/../openapi.yaml" });
+
+        let resolved = load_json(&value).expect("a retrievable entry resolves");
+
+        // One spelling, so the entry and its `remote.integrity` key cannot disagree.
+        assert_eq!(
+            resolved.input,
+            PathBuf::from("https://specs.example.test/openapi.yaml")
+        );
+    }
+
+    #[test]
+    fn a_rejected_uri_is_reported_without_its_credentials() {
+        let mut value = valid_json_value();
+        value["input"] = json!({ "url": "ftp://reader:hunter2@specs.example.test/openapi.yaml" });
+
+        let diagnostics = assert_code(load_json(&value), CODE_INPUT_PATH);
+
+        let reported = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_INPUT_PATH)
+            .expect("a rejected input URI");
+        assert!(
+            !reported.message.contains("hunter2"),
+            "{}",
+            reported.message
+        );
+        assert!(!reported.message.contains("reader"), "{}", reported.message);
+        assert!(
+            reported.message.contains("specs.example.test"),
             "{}",
             reported.message
         );
