@@ -4,6 +4,8 @@ import { describe, test } from "node:test";
 import { z } from "zod";
 
 import {
+  pattern,
+  patternProperties,
   bigintMaximum,
   bigintMinimum,
   bigintMultipleOf,
@@ -16,35 +18,40 @@ import {
   deepEqual,
   dependentRequired,
   dependentSchemas,
-  enumValues,
   headers,
   int32,
   int64Wire,
   int64WireValue,
   integer,
+  isBigIntMultipleOf,
   isDate,
   isDateTime,
-  isBigIntMultipleOf,
+  isDuration,
+  isEmail,
+  isHostname,
   isInt32,
+  isIpv4,
+  isIpv6,
   isMultipleOf,
-  isTime,
-  isUuid,
   type Issue,
+  isTime,
+  isUri,
+  isUriReference,
+  isUuid,
+  type ItemScope,
   maxLength,
   minLength,
   multipleOf,
   not,
+  enumValues,
   oneOf,
-  pattern,
-  patternProperties,
+  type PropertyScope,
   propertyCount,
   propertyNames,
   stringFormat,
   unevaluatedItems,
   unevaluatedProperties,
   uniqueItems,
-  type ItemScope,
-  type PropertyScope,
 } from "../zod-runtime.ts";
 
 function issues<T>(result: z.ZodSafeParseResult<T>): readonly z.core.$ZodIssue[] {
@@ -779,5 +786,221 @@ describe("headers", () => {
       schema.safeParse(new Headers({ "X-Opaque": "x", "X-Opaque-Optional": "" })).success,
       true,
     );
+  });
+});
+
+describe("isIpv4", () => {
+  test("accepts four decimal octets in range", () => {
+    assert.equal(isIpv4("0.0.0.0"), true);
+    assert.equal(isIpv4("255.255.255.255"), true);
+    assert.equal(isIpv4("10.20.30.40"), true);
+    assert.equal(isIpv4("200.0.0.0"), true);
+  });
+
+  test("rejects wrong component counts, leading zeros and out-of-range octets", () => {
+    assert.equal(isIpv4("127.0.0"), false);
+    assert.equal(isIpv4("127.0.0.0.1"), false);
+    assert.equal(isIpv4("256.0.0.1"), false);
+    assert.equal(isIpv4("192.168.0.256"), false);
+    assert.equal(isIpv4("01.2.3.4"), false);
+    assert.equal(isIpv4("192.168.a.1"), false);
+    assert.equal(isIpv4("+1.2.3.4"), false);
+    assert.equal(isIpv4("192.168..1"), false);
+    assert.equal(isIpv4("1২7.0.0.1"), false);
+    assert.equal(isIpv4(""), false);
+  });
+});
+
+describe("isIpv6", () => {
+  test("accepts the full, elided and IPv4-tailed forms", () => {
+    assert.equal(isIpv6("1:2:3:4:5:6:7:8"), true);
+    assert.equal(isIpv6("2001:0db8:0000:0000:0000:0000:0000:0001"), true);
+    assert.equal(isIpv6("2001:DB8::1"), true);
+    assert.equal(isIpv6("::"), true);
+    assert.equal(isIpv6("::1"), true);
+    assert.equal(isIpv6("d6::"), true);
+    assert.equal(isIpv6("1:d6::42"), true);
+    assert.equal(isIpv6("::ffff:192.168.0.1"), true);
+    assert.equal(isIpv6("1000:1000:1000:1000:1000:1000:255.255.255.255"), true);
+  });
+
+  test("rejects malformed groups, repeated elisions and stray suffixes", () => {
+    assert.equal(isIpv6("1:2:3:4:5:6:7"), false);
+    assert.equal(isIpv6("1:1:1:1:1:1:1:1:1"), false);
+    assert.equal(isIpv6("1:2:3:4:5:6:7:8::"), false);
+    assert.equal(isIpv6("12345::"), false);
+    assert.equal(isIpv6("::abcef"), false);
+    assert.equal(isIpv6("::laptop"), false);
+    assert.equal(isIpv6("1::d6::42"), false);
+    assert.equal(isIpv6("1:2:3:4:5:::8"), false);
+    assert.equal(isIpv6(":2:3:4:5:6:7:8"), false);
+    assert.equal(isIpv6("1:2:3:4:5:6:7:"), false);
+    assert.equal(isIpv6("1:2:3:4:1.2.3"), false);
+    assert.equal(isIpv6("::ffff:192.168.0.01"), false);
+    assert.equal(isIpv6("fe80::a%eth1"), false);
+    assert.equal(isIpv6("[::1]"), false);
+    assert.equal(isIpv6("127.0.0.1"), false);
+    assert.equal(isIpv6("1"), false);
+  });
+});
+
+describe("isHostname", () => {
+  test("accepts RFC 1123 label sequences", () => {
+    assert.equal(isHostname("www.example.com"), true);
+    assert.equal(isHostname("hostname"), true);
+    assert.equal(isHostname("1host"), true);
+    assert.equal(isHostname("host-name"), true);
+    assert.equal(isHostname("a--b.com"), true);
+    assert.equal(isHostname(`${"a".repeat(63)}.com`), true);
+  });
+
+  test("rejects empty, over-long, hyphen-edged and non-ASCII labels", () => {
+    assert.equal(isHostname(""), false);
+    assert.equal(isHostname("."), false);
+    assert.equal(isHostname(".example"), false);
+    assert.equal(isHostname("example."), false);
+    assert.equal(isHostname("-hostname"), false);
+    assert.equal(isHostname("hostname-"), false);
+    assert.equal(isHostname("host_name"), false);
+    assert.equal(isHostname("example．com"), false);
+    assert.equal(isHostname(`${"a".repeat(64)}.com`), false);
+    assert.equal(isHostname(`${`${"a".repeat(63)}.`.repeat(4)}com`), false);
+  });
+});
+
+describe("isEmail", () => {
+  test("accepts dot-atom and quoted local parts", () => {
+    assert.equal(isEmail("joe.bloggs@example.com"), true);
+    assert.equal(isEmail("te~st@example.com"), true);
+    assert.equal(isEmail("test@io"), true);
+    assert.equal(isEmail("test@123.com"), true);
+    assert.equal(isEmail('"joe bloggs"@example.com'), true);
+    assert.equal(isEmail('"joe@bloggs"@example.com'), true);
+    assert.equal(isEmail('""@iana.org'), true);
+    assert.equal(isEmail('"\\""@iana.org'), true);
+  });
+
+  test("accepts bracketed address literals after the at-sign", () => {
+    assert.equal(isEmail("joe.bloggs@[127.0.0.1]"), true);
+    assert.equal(isEmail("joe.bloggs@[IPv6:::1]"), true);
+    assert.equal(isEmail("a@[ipv6:::1]"), true);
+  });
+
+  test("rejects malformed local parts, domains and literals", () => {
+    assert.equal(isEmail("2962"), false);
+    assert.equal(isEmail("@example.com"), false);
+    assert.equal(isEmail("joe.bloggs@"), false);
+    assert.equal(isEmail(".test@example.com"), false);
+    assert.equal(isEmail("te..st@example.com"), false);
+    assert.equal(isEmail("joe bloggs@example.com"), false);
+    assert.equal(isEmail('"test"test@iana.org'), false);
+    assert.equal(isEmail("a@b@c.org"), false);
+    assert.equal(isEmail("aé@iana.org"), false);
+    assert.equal(isEmail("test@-iana.org"), false);
+    assert.equal(isEmail("test@[1.2.3.4"), false);
+    assert.equal(isEmail("a@[1.2.3]"), false);
+    assert.equal(isEmail("test@[RFC-5322-domain-literal]"), false);
+    assert.equal(isEmail("joe.bloggs@[127.0.0.300]"), false);
+    assert.equal(isEmail(""), false);
+  });
+});
+
+describe("isUri", () => {
+  test("accepts absolute URIs with and without an authority", () => {
+    assert.equal(isUri("http://foo.bar/?baz=qux#quux"), true);
+    assert.equal(isUri("http://foo.com/blah_(wikipedia)_blah#cite-1"), true);
+    assert.equal(isUri("http://foo.bar/?q=Test%20URL-encoded%20stuff"), true);
+    assert.equal(isUri("http://-.~_!$&'()*+,;=:%40:80%2f::::::@example.com"), true);
+    assert.equal(isUri("ldap://[2001:db8::7]/c=GB?objectClass?one"), true);
+    assert.equal(isUri("mailto:John.Doe@example.com"), true);
+    assert.equal(isUri("tel:+1-816-555-1212"), true);
+    assert.equal(isUri("urn:oasis:names:specification:docbook:dtd:xml:4.1.2"), true);
+    assert.equal(isUri("http://999.999.999.999/"), true);
+  });
+
+  test("rejects relative references, bad schemes, hosts and escapes", () => {
+    assert.equal(isUri("//foo.bar/?baz=qux#quux"), false);
+    assert.equal(isUri("/abc"), false);
+    assert.equal(isUri("abc"), false);
+    assert.equal(isUri("1http://example.com"), false);
+    assert.equal(isUri("ht_tp://example.com"), false);
+    assert.equal(isUri("bar,baz:foo"), false);
+    assert.equal(isUri("http:// shouldfail.com"), false);
+    assert.equal(isUri("https://[@example.org/test.txt"), false);
+    assert.equal(isUri("http://example.com:abc/path"), false);
+    assert.equal(isUri("http://[::ffff:01.2.3.4]"), false);
+    assert.equal(isUri("http:/[::1]"), false);
+    assert.equal(isUri("http://example.com/%6G"), false);
+    assert.equal(isUri("http://example.com/%"), false);
+    assert.equal(isUri("https://example.org/foobar®.txt"), false);
+    assert.equal(isUri("https://example.org/foo bar.txt"), false);
+    assert.equal(isUri("\\\\WINDOWS\\fileshare"), false);
+  });
+});
+
+describe("isUriReference", () => {
+  test("accepts relative, network-path and empty references", () => {
+    assert.equal(isUriReference("http://foo.bar/?baz=qux#quux"), true);
+    assert.equal(isUriReference("//foo.bar/?baz=qux#quux"), true);
+    assert.equal(isUriReference("/abc"), true);
+    assert.equal(isUriReference("abc"), true);
+    assert.equal(isUriReference("#fragment"), true);
+    assert.equal(isUriReference("?query=1"), true);
+    assert.equal(isUriReference(""), true);
+    assert.equal(isUriReference("//"), true);
+    assert.equal(isUriReference("./this:that"), true);
+    assert.equal(isUriReference("//[V1.fe]/p"), true);
+  });
+
+  test("rejects a colon in the first relative segment and bad components", () => {
+    assert.equal(isUriReference("1:b"), false);
+    assert.equal(isUriReference("#frag\\ment"), false);
+    assert.equal(isUriReference("/%zz"), false);
+    assert.equal(isUriReference('/a"b'), false);
+    assert.equal(isUriReference("/[::1]"), false);
+    assert.equal(isUriReference("//[::1/p"), false);
+    assert.equal(isUriReference("//example.com:abc/p"), false);
+    assert.equal(isUriReference("//a@b@example.com/"), false);
+    assert.equal(isUriReference("//[::ffff:192.168.0.01]/p"), false);
+    assert.equal(isUriReference("/foobar®.txt"), false);
+    assert.equal(isUriReference("/p\n"), false);
+  });
+});
+
+describe("isDuration", () => {
+  test("accepts nested date and time runs and a bare week count", () => {
+    assert.equal(isDuration("P4DT12H30M5S"), true);
+    assert.equal(isDuration("P4Y"), true);
+    assert.equal(isDuration("P1Y2M3DT4H5M6S"), true);
+    assert.equal(isDuration("P1Y2M"), true);
+    assert.equal(isDuration("P1M2D"), true);
+    assert.equal(isDuration("PT0S"), true);
+    assert.equal(isDuration("PT1H2M"), true);
+    assert.equal(isDuration("PT1M2S"), true);
+    assert.equal(isDuration("P2W"), true);
+    assert.equal(isDuration("P01D"), true);
+  });
+
+  test("rejects skipped, reordered, unsigned-violating and fractional runs", () => {
+    assert.equal(isDuration("P"), false);
+    assert.equal(isDuration("PT"), false);
+    assert.equal(isDuration("P1YT"), false);
+    assert.equal(isDuration("PT1D"), false);
+    assert.equal(isDuration("P2S"), false);
+    assert.equal(isDuration("P1"), false);
+    assert.equal(isDuration("P1Y2D"), false);
+    assert.equal(isDuration("PT1H2S"), false);
+    assert.equal(isDuration("P2D1Y"), false);
+    assert.equal(isDuration("P1D2H"), false);
+    assert.equal(isDuration("P1D2T3H"), false);
+    assert.equal(isDuration("P1Y2W"), false);
+    assert.equal(isDuration("P1WT1H"), false);
+    assert.equal(isDuration("PT0.5S"), false);
+    assert.equal(isDuration("P-1D"), false);
+    assert.equal(isDuration("-P1D"), false);
+    assert.equal(isDuration("P1e2D"), false);
+    assert.equal(isDuration("P২Y"), false);
+    assert.equal(isDuration("P1D "), false);
+    assert.equal(isDuration(""), false);
   });
 });
