@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/oasts-core", "crates/oasts", "crates/oasts-napi", "crates/oasts-wasm", "crates/oasts-gen", "crates/oasts-bench"]
+members = ["crates/oasts-core", "crates/oasts", "crates/oasts-fetch", "crates/oasts-napi", "crates/oasts-wasm", "crates/oasts-gen", "crates/oasts-bench"]
 
 [workspace.package]
 version = "0.0.4"
