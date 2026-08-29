@@ -930,6 +930,14 @@ impl<'a> GraphBuilder<'a> {
             }
             scheme => return unauthorized(format!("'{scheme}' is not a retrievable scheme")),
         }
+        // A retrieved document's URI is its identity, and identity is written into the generated
+        // code. Refusing credentials here catches the redirect that config validation cannot see.
+        if !url.username().is_empty() || url.password().is_some() {
+            return unauthorized(
+                "the URI carries credentials, which would be written into generated code"
+                    .to_owned(),
+            );
+        }
         // Both remaining schemes are ones whose parser requires a host, and an empty host is
         // authorized by nothing: config resolution refuses an empty `allowHosts` entry.
         let host = url.host_str().unwrap_or_default();
@@ -2163,8 +2171,8 @@ fn encode_relative_path(path: &Path) -> Result<String, String> {
 ///
 /// `$id` names a schema resource; it is not a request to fetch one. A bundled document that
 /// identifies its resources with `https://` URIs resolves entirely in memory, so the scheme check
-/// belongs at the point something is actually read — `local_path_from_url`, which every path that
-/// reaches the filesystem goes through, and which is where OASTS9201 now comes from.
+/// belongs at the point something is actually read — `retrieval_from_url`, which every path that
+/// reaches a document goes through.
 fn resolve_identity_uri(
     base: &Url,
     reference: &str,
@@ -5201,6 +5209,27 @@ mod tests {
     }
 
     #[test]
+    fn a_uri_carrying_credentials_is_refused_rather_than_written_into_generated_code() {
+        const CREDENTIALED_URI: &str = "https://token@specs.example.test/openapi.yaml";
+        let directory = TempDir::new().expect("tempdir should be created");
+        let fetcher = RecordingFetcher::new([(CREDENTIALED_URI, body(ENTRY_DOCUMENT))]);
+        let config = retrieved_entry_config(
+            directory.path(),
+            CREDENTIALED_URI,
+            &remote_block(&["specs.example.test"], "", &[]),
+        );
+
+        let diagnostic = assert_retrieval_code(&config, &fetcher, CODE_REMOTE_UNAUTHORIZED);
+
+        assert!(
+            diagnostic.message.contains("carries credentials"),
+            "{}",
+            diagnostic.message
+        );
+        assert_eq!(fetcher.requests(), Vec::<String>::new());
+    }
+
+    #[test]
     fn a_plain_http_uri_is_refused_until_the_config_admits_one() {
         const INSECURE_URI: &str = "http://specs.example.test/openapi.yaml";
         let directory = TempDir::new().expect("tempdir should be created");
@@ -5455,6 +5484,9 @@ mod tests {
 
     #[test]
     fn a_retrieved_document_is_charged_against_the_same_limits_a_local_one_is() {
+        // The fake ignores the policy it is handed, which is the point: a host that honours
+        // `max_bytes` abandons the transfer and the user sees a retrieval failure instead. This
+        // pins the core's own accounting, which is what answers for a host that does not.
         for (limits, code) in [
             (
                 "limits:\n  maxDocumentBytes: 1024\n",

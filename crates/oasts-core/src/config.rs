@@ -1733,10 +1733,18 @@ fn normalized_host(entry: &str) -> Option<String> {
 }
 
 /// The canonical spelling of a retrievable URI, or `None` when it is not one.
+///
+/// Credentials are refused for the same reason `client.baseUrl` refuses them, and one more: a
+/// retrieved document's URI is its identity, and identity is written above every declaration
+/// generated from it — into code the project tells you to commit.
 fn retrievable_uri(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
-    (matches!(url.scheme(), "http" | "https") && url.has_host() && url.fragment().is_none())
-        .then(|| url.into())
+    (matches!(url.scheme(), "http" | "https")
+        && url.has_host()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then(|| url.into())
 }
 
 fn resolve_input(
@@ -4706,6 +4714,8 @@ mod tests {
             "file:///tmp/openapi.yaml",
             "https://specs.example.test/openapi.yaml#/components",
             "https://",
+            "https://token@specs.example.test/openapi.yaml",
+            "https://user:token@specs.example.test/openapi.yaml",
         ] {
             let mut value = valid_json_value();
             value["remote"] = json!({ "integrity": { key: format!("sha256:{}", "0".repeat(64)) } });

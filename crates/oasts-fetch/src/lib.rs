@@ -38,6 +38,10 @@ impl RemoteFetcher for HttpFetcher {
         let agent: Agent = Agent::config_builder()
             // The compiler follows redirects itself, one authorized hop at a time.
             .max_redirects(0)
+            // The client reads proxy settings out of the environment by default, which would send
+            // every request to a host `remote.allowHosts` never named and make that list a claim
+            // this build could not keep.
+            .proxy(None)
             // A `404` is an answer about the document, reported as one rather than as a transport
             // failure, so the diagnostic says what the server said.
             .http_status_as_error(false)
