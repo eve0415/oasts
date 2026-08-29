@@ -12,6 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::config::WatchConfig;
+
 /// Accumulates the paths a run depended on, or discards them when no host asked.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct InputRecorder {
@@ -67,17 +69,23 @@ impl InputRecorder {
     }
 }
 
-/// What a watching host needs to know about one compile's filesystem footprint.
+/// Everything a watching host needs in order to keep going after one compile.
+///
+/// Reported by the compile rather than assembled by the host: the paths are only knowable from
+/// inside the run that read them, and the settings come from the same load, so a host that read
+/// the configuration separately could be watching for a compile that never happened.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CompileInputs {
+pub struct WatchPlan {
     /// Every path the run read or probed for, sorted and deduplicated. A path that does not exist
     /// is still listed whenever its appearance would change the result.
-    pub paths: Vec<PathBuf>,
+    pub inputs: Vec<PathBuf>,
     /// The tree the run writes into, when the configuration resolved far enough to name one.
     ///
     /// Never an input. A watcher is told about it so it can tell its own writes apart from a
     /// change worth recompiling for.
     pub output_root: Option<PathBuf>,
+    /// The `watch` block the run resolved, or its defaults when no configuration was read.
+    pub settings: WatchConfig,
 }
 
 #[cfg(test)]
@@ -106,12 +114,13 @@ mod tests {
     }
 
     #[test]
-    fn compile_inputs_default_to_empty() {
+    fn a_watch_plan_defaults_to_watching_nothing() {
         assert_eq!(
-            CompileInputs::default(),
-            CompileInputs {
-                paths: Vec::new(),
+            WatchPlan::default(),
+            WatchPlan {
+                inputs: Vec::new(),
                 output_root: None,
+                settings: WatchConfig::default(),
             }
         );
     }

@@ -924,7 +924,7 @@ mod tests {
     fn outcome_rendering_is_deterministic() {
         let outcome = Outcome {
             exit_code: 2,
-            inputs: None,
+            watch_plan: None,
             stdout_summary: Some("check ok".to_owned()),
             diagnostics: vec![
                 Diagnostic::input("OASTS9903", "input")

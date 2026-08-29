@@ -7,10 +7,11 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::config::WatchConfig;
 use crate::config::{self, CODE_COMMAND_UNSUPPORTED, CODE_WORKSPACE_UNSUPPORTED, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::emit::GeneratedFile;
-use crate::inputs::{CompileInputs, InputRecorder};
+use crate::inputs::{InputRecorder, WatchPlan};
 use crate::source::FetcherHandle;
 use crate::writer::{DriftState, check_drift, write};
 use crate::{msw_peer, pipeline, zod_peer};
@@ -63,8 +64,8 @@ pub enum Tracking {
     /// Report the outcome only.
     #[default]
     Off,
-    /// Also report every filesystem path the run depended on, for a host that watches them.
-    Inputs,
+    /// Also report what a watching host needs to wait for the next change.
+    Watch,
 }
 
 /// Where the configuration comes from.
@@ -97,11 +98,11 @@ pub struct Outcome {
     pub diagnostics: Vec<Diagnostic>,
     /// `state: path` drift lines for stderr, when `--check` found drift.
     pub drift_lines: Vec<String>,
-    /// Every filesystem path the run depended on, when the host asked for [`Tracking::Inputs`].
+    /// What to keep watching, when the host asked for [`Tracking::Watch`].
     ///
     /// Carried on the outcome rather than fetched separately: a second pass would re-read a tree
     /// that has already moved on, and would answer for a compile nobody ran.
-    pub inputs: Option<CompileInputs>,
+    pub watch_plan: Option<WatchPlan>,
 }
 
 impl Outcome {
@@ -111,7 +112,7 @@ impl Outcome {
             stdout_summary: None,
             diagnostics: sink.into_sorted_vec(),
             drift_lines: Vec::new(),
-            inputs: None,
+            watch_plan: None,
         }
     }
 
@@ -122,15 +123,21 @@ impl Outcome {
             stdout_summary: Some(summary.to_owned()),
             diagnostics,
             drift_lines: Vec::new(),
-            inputs: None,
+            watch_plan: None,
         }
     }
 
-    fn with_inputs(mut self, recorder: InputRecorder, output_root: Option<PathBuf>) -> Self {
+    fn with_watch_plan(
+        mut self,
+        recorder: InputRecorder,
+        output_root: Option<PathBuf>,
+        settings: WatchConfig,
+    ) -> Self {
         if recorder.is_recording() {
-            self.inputs = Some(CompileInputs {
-                paths: recorder.into_paths(),
+            self.watch_plan = Some(WatchPlan {
+                inputs: recorder.into_paths(),
                 output_root,
+                settings,
             });
         }
         self
@@ -155,11 +162,19 @@ pub fn run(
 ) -> Outcome {
     let mut inputs = match tracking {
         Tracking::Off => InputRecorder::off(),
-        Tracking::Inputs => InputRecorder::on(),
+        Tracking::Watch => InputRecorder::on(),
     };
     let mut output_root = None;
-    let outcome = compile(command, source, fetcher, &mut inputs, &mut output_root);
-    outcome.with_inputs(inputs, output_root)
+    let mut settings = WatchConfig::default();
+    let outcome = compile(
+        command,
+        source,
+        fetcher,
+        &mut inputs,
+        &mut output_root,
+        &mut settings,
+    );
+    outcome.with_watch_plan(inputs, output_root, settings)
 }
 
 fn compile(
@@ -168,6 +183,7 @@ fn compile(
     fetcher: FetcherHandle,
     inputs: &mut InputRecorder,
     output_root: &mut Option<PathBuf>,
+    settings: &mut WatchConfig,
 ) -> Outcome {
     // Seeded before the load, so a run that never reaches a config still says which paths decide
     // whether the next one will. A watcher that gave up here could not see the config appear.
@@ -185,6 +201,7 @@ fn compile(
     // document it opened, which is the same file by another name — but only once it opens.
     inputs.record(&config.input);
     *output_root = Some(config.output.clone());
+    *settings = config.watch;
     sink.extend(std::mem::take(&mut config.diagnostics));
 
     let should_emit = matches!(command, Command::Generate { .. });
@@ -237,7 +254,7 @@ fn drift(config: &ResolvedConfig, files: Vec<GeneratedFile>, warnings: Vec<Diagn
         exit_code: 1,
         stdout_summary: None,
         diagnostics: warnings,
-        inputs: None,
+        watch_plan: None,
         drift_lines: report
             .entries
             .iter()
@@ -438,13 +455,15 @@ validation:
                 cwd: &root,
             },
             FetcherHandle::None,
-            Tracking::Inputs,
+            Tracking::Watch,
         );
         assert_eq!(outcome.exit_code, 0, "{:#?}", outcome.diagnostics);
-        let inputs = outcome.inputs.expect("a tracked run reports its inputs");
-        assert_eq!(inputs.output_root, Some(root.join("generated")));
+        let plan = outcome
+            .watch_plan
+            .expect("a tracked run reports its inputs");
+        assert_eq!(plan.output_root, Some(root.join("generated")));
 
-        let has = |path: PathBuf| inputs.paths.contains(&path);
+        let has = |path: PathBuf| plan.inputs.contains(&path);
         // Every discovery candidate, not only the one that exists: a second name appearing is what
         // turns a working run into a discovery failure.
         assert!(has(root.join("oasts.yaml")));
@@ -462,14 +481,13 @@ validation:
         // Nothing the run wrote is an input. The output root holds exactly one watched path — the
         // `tsconfig.json` the ancestor walk looked for there and did not find.
         assert_eq!(
-            inputs
-                .paths
+            plan.inputs
                 .iter()
                 .filter(|path| path.starts_with(root.join("generated")))
                 .collect::<Vec<_>>(),
             vec![&root.join("generated/tsconfig.json")]
         );
-        assert!(inputs.paths.is_sorted());
+        assert!(plan.inputs.is_sorted());
     }
 
     #[test]
@@ -485,7 +503,7 @@ validation:
             Tracking::Off,
         );
         assert_eq!(outcome.exit_code, 0, "{:#?}", outcome.diagnostics);
-        assert!(outcome.inputs.is_none());
+        assert!(outcome.watch_plan.is_none());
     }
 
     #[test]
@@ -498,12 +516,14 @@ validation:
                 cwd: temp.path(),
             },
             FetcherHandle::None,
-            Tracking::Inputs,
+            Tracking::Watch,
         );
         assert_eq!(outcome.exit_code, 2);
-        let inputs = outcome.inputs.expect("inputs survive a failed discovery");
-        assert_eq!(inputs.output_root, None);
-        assert_eq!(inputs.paths.len(), 8);
+        let plan = outcome
+            .watch_plan
+            .expect("inputs survive a failed discovery");
+        assert_eq!(plan.output_root, None);
+        assert_eq!(plan.inputs.len(), 8);
     }
 
     #[test]
@@ -517,12 +537,14 @@ validation:
                 cwd: &root,
             },
             FetcherHandle::None,
-            Tracking::Inputs,
+            Tracking::Watch,
         );
         assert_eq!(outcome.exit_code, 0, "{:#?}", outcome.diagnostics);
-        let inputs = outcome.inputs.expect("a tracked run reports its inputs");
-        assert!(inputs.paths.contains(&root.join("oasts.yaml")));
-        assert!(!inputs.paths.contains(&root.join("oasts.json")));
+        let plan = outcome
+            .watch_plan
+            .expect("a tracked run reports its inputs");
+        assert!(plan.inputs.contains(&root.join("oasts.yaml")));
+        assert!(!plan.inputs.contains(&root.join("oasts.json")));
     }
 
     #[test]
@@ -538,10 +560,12 @@ validation:
                     "output": "./generated", "artifacts": {"types": true}}"#,
             },
             FetcherHandle::None,
-            Tracking::Inputs,
+            Tracking::Watch,
         );
         assert_eq!(outcome.exit_code, 0, "{:#?}", outcome.diagnostics);
-        let inputs = outcome.inputs.expect("a tracked run reports its inputs");
-        assert!(inputs.paths.contains(&config_path));
+        let plan = outcome
+            .watch_plan
+            .expect("a tracked run reports its inputs");
+        assert!(plan.inputs.contains(&config_path));
     }
 }
