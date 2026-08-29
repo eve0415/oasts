@@ -57,6 +57,15 @@ pub(crate) const CODE_SEGMENT_COLLISION: &str = "OASTS6302";
 /// A `naming.overrides.pathSegments` entry matched no path segment in the document.
 pub(crate) const CODE_UNMATCHED_SEGMENT_OVERRIDE: &str = "OASTS6303";
 
+/// A name the key factory derived was already taken, so it was emitted with a numeric suffix.
+///
+/// Every name this reports is one the compiler composed — a flat binding, a member of the composed
+/// object, a key function's argument — never one the document declares, which is why it yields
+/// rather than refusing. It is a warning for the same reason OASTS4104 is: nothing about the
+/// author's intent is ambiguous, but a derived name that moved is invisible at the call site unless
+/// something says so.
+pub(crate) const CODE_RENAMED_KEY_NAME: &str = "OASTS6304";
+
 /// What one URL path segment contributes to a query key.
 ///
 /// The three cases are exactly the three the key contract distinguishes, and they are distinguished
@@ -475,7 +484,18 @@ fn collect_bindings(
     // Whatever else already binds this name — another path node, an identifier `keys.ts` declares,
     // an identifier an operation module imports — the loser of the race takes a numeric suffix
     // rather than costing the document its whole artifact.
-    let name = allocate_unique(&name, &mut sink.taken_names);
+    let allocated = allocate_unique(&name, &mut sink.taken_names);
+    if allocated != name {
+        registrar.sink.push(warning_diagnostic(
+            CODE_RENAMED_KEY_NAME,
+            format!(
+                "key binding '{name}' for path '/{}' is already bound; emitting it as '{allocated}'",
+                address.join("/")
+            ),
+            &node.source,
+        ));
+    }
+    let name = allocated;
     sink.bindings.insert(
         address.to_vec(),
         KeyBinding {
@@ -492,7 +512,13 @@ fn collect_bindings(
     // around it instead of emitting a duplicate object key — TS1117, or silently the wrong key if
     // it compiled.
     let mut taken_members: BTreeSet<String> = BTreeSet::from([COMPOSED_SELF_MEMBER.to_owned()]);
-    for (raw, child) in &node.children {
+    // A configured member allocates before a derived one, so it is never the sibling that moves:
+    // the document owns the name it chose, and the compiler invented the other. `children` is
+    // ordered by raw segment text and the sort is stable, so within each group that order still
+    // decides, and the whole allocation stays a property of the document.
+    let mut ordered: Vec<(&String, &PathNode)> = node.children.iter().collect();
+    ordered.sort_by_key(|(raw, _)| !overrides.contains_key(*raw));
+    for (raw, child) in ordered {
         let kind = &child.kind;
         // The override is consulted before derivation, not after: a segment whose text cannot
         // become an identifier is exactly the case the override exists for, so deriving first and
@@ -523,7 +549,17 @@ fn collect_bindings(
             }
         };
 
-        let member = allocate_unique(&member, &mut taken_members);
+        let allocated = allocate_unique(&member, &mut taken_members);
+        if allocated != member {
+            registrar.sink.push(warning_diagnostic(
+                CODE_RENAMED_KEY_NAME,
+                format!(
+                    "path segment '{raw}' derives the member '{member}', which is already taken under this parent; emitting it as '{allocated}' — choose the name yourself with `naming.overrides.pathSegments: {{ \"{raw}\": \"<name>\" }}`"
+                ),
+                &child.source,
+            ));
+        }
+        let member = allocated;
 
         let mut child_address = address.to_vec();
         child_address.push(raw.clone());
@@ -550,6 +586,17 @@ fn collect_bindings(
             // Two *different* wire names can still normalize to one identifier — `{user_id}` beside
             // `{userId}` — and those are two parameters, so they take two arguments.
             let identifier = allocate_unique(&parameter.identifier, &mut taken_identifiers);
+            if identifier != parameter.identifier {
+                registrar.sink.push(warning_diagnostic(
+                    CODE_RENAMED_KEY_NAME,
+                    format!(
+                        "path parameter '{wire}' derives the argument name '{derived}', which another parameter on this path already takes; emitting it as '{identifier}'",
+                        wire = parameter.wire,
+                        derived = parameter.identifier,
+                    ),
+                    &child.source,
+                ));
+            }
             child_parameters.push(KeyParameter {
                 wire: parameter.wire,
                 identifier,
@@ -1519,6 +1566,21 @@ paths:
           description: ok
 "#;
 
+    /// Asserts the run refused nothing, and returns the rename warnings it did raise.
+    fn renames(diagnostics: &[crate::diag::Diagnostic]) -> Vec<&str> {
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == Severity::Error),
+            "{diagnostics:#?}"
+        );
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_RENAMED_KEY_NAME)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect()
+    }
+
     #[test]
     fn every_path_node_gets_a_flat_binding_including_undeclared_intermediates() {
         let (keys, diagnostics) = keys_for(SHOWCASE, CONFIG);
@@ -1638,7 +1700,13 @@ paths:
     #[test]
     fn two_segments_normalizing_to_one_member_take_the_lowest_free_suffix() {
         let (keys, diagnostics) = keys_for(COLLIDING, CONFIG);
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let warnings = renames(&diagnostics);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains("path segment 'foo_bar' derives the member 'fooBar'")
+                && warnings[0].contains("emitting it as 'fooBar2'"),
+            "{warnings:#?}"
+        );
         // Children are walked in raw-segment order, so `foo-bar` sorts first and keeps the bare
         // member; `foo_bar` takes the suffix. Both keys still carry their own raw text, so the two
         // paths never share a cache entry however they are named.
@@ -1676,7 +1744,12 @@ paths:
           description: ok
 "#;
         let (keys, diagnostics) = keys_for(CROSS_DEPTH, CONFIG);
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let warnings = renames(&diagnostics);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains("key binding 'apiFooBarAll' for path '/foo-bar' is already bound"),
+            "{warnings:#?}"
+        );
         // The walk is pre-order over children sorted by raw segment text, so `foo` and the node
         // beneath it are reached before `foo-bar`: the deeper node keeps the bare name.
         assert!(
@@ -1972,7 +2045,12 @@ paths:
         // seeded into the allocation, so the segment gets the next free name and the key it
         // produces still carries the raw text `all`.
         let (keys, diagnostics) = keys_for(ALL, CONFIG);
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let warnings = renames(&diagnostics);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains("emitting it as 'all2'"),
+            "{warnings:#?}"
+        );
         assert!(
             keys.contains("export const apiPetsAll2All = [\"api\", \"pets\", \"all\"] as const;\n"),
             "{keys}"
@@ -2197,7 +2275,7 @@ paths:
 "#;
         let config = "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\nnamespace: Param\noutput: ./generated\nartifacts:\n  types: true\nnaming:\n  overrides:\n    pathSegments:\n      \"{id}\": Value\n";
         let (keys, diagnostics) = keys_for(ROOT_PARAM, config);
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(!renames(&diagnostics).is_empty(), "{diagnostics:#?}");
         assert!(keys.contains("import type { ParamValue } from"), "{keys}");
         assert!(keys.contains("export const ParamValue2 = ("), "{keys}");
     }
@@ -2282,7 +2360,7 @@ paths:
 "#;
         let config = "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\nnamespace: with\noutput: ./generated\nartifacts:\n  types: true\nnaming:\n  overrides:\n    pathSegments:\n      \"{thing}\": input\n";
         let (keys, diagnostics) = keys_for(ROOT_PARAM, config);
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(!renames(&diagnostics).is_empty(), "{diagnostics:#?}");
         assert!(keys.contains("export const withInput2 = ("), "{keys}");
     }
 
@@ -2594,7 +2672,7 @@ paths:
           description: ok
 "#;
         let (keys, diagnostics) = keys_for(SIBLINGS, CONFIG);
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(!renames(&diagnostics).is_empty(), "{diagnostics:#?}");
         assert_eq!(keys.matches("byId: {").count(), 1, "{keys}");
         assert_eq!(keys.matches("byId2: {").count(), 1, "{keys}");
         // The literal sorts before the template, so it is the one that keeps the bare member.
@@ -3073,6 +3151,74 @@ paths:
     }
 
     #[test]
+    fn a_configured_member_never_yields_to_a_derived_sibling() {
+        // `/foo-bar` derives `fooBar`, and the override asks for `fooBar` on `/foo_bar`. The
+        // document owns the name it chose, so the derived sibling is the one that moves.
+        let config =
+            format!("{CONFIG}naming:\n  overrides:\n    pathSegments:\n      foo_bar: fooBar\n");
+        let (keys, diagnostics) = keys_for(COLLIDING, &config);
+        let warnings = renames(&diagnostics);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains("path segment 'foo-bar'"),
+            "{warnings:#?}"
+        );
+        assert!(
+            keys.contains("export const apiFooBarAll = [\"api\", \"foo_bar\"] as const;\n"),
+            "{keys}"
+        );
+        assert!(
+            keys.contains("export const apiFooBar2All = [\"api\", \"foo-bar\"] as const;\n"),
+            "{keys}"
+        );
+    }
+
+    #[test]
+    fn two_parameters_normalizing_to_one_argument_name_stay_two_arguments() {
+        // `{user_id}` and `{userId}` are two declared parameters that derive one identifier. Unlike
+        // a repeated parameter they cannot share an argument, so the second takes a suffix — and
+        // each element still keys under its own wire name.
+        const TWO_WIRES: &str = r#"
+openapi: 3.1.0
+info:
+  title: Two wires
+  version: 1.0.0
+paths:
+  /tenants/{user_id}/sites/{userId}:
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: userId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: readSite
+      responses:
+        '200':
+          description: ok
+"#;
+        let (keys, diagnostics) = keys_for(TWO_WIRES, CONFIG);
+        let warnings = renames(&diagnostics);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains("path parameter 'userId' derives the argument name 'userId'")
+                && warnings[0].contains("emitting it as 'userId2'"),
+            "{warnings:#?}"
+        );
+        assert!(
+            keys.contains(
+                "export const apiTenantsByUserIdSitesByUserId = (userId: KeyValue | undefined, userId2: KeyValue | undefined) => [\"api\", \"tenants\", userId === undefined ? [] : { user_id: userId }, \"sites\", userId2 === undefined ? [] : { userId: userId2 }] as const;\n"
+            ),
+            "{keys}"
+        );
+    }
+
+    #[test]
     fn an_override_can_make_a_child_take_its_own_ancestors_name() {
         // `/foo` binds `apiFooAll`. `/foo/{x}` normally binds `apiFooByX`, but an override naming
         // the parameter segment `all` makes it bind `apiFooAll` too — a collision where neither
@@ -3106,7 +3252,7 @@ paths:
         let config =
             format!("{CONFIG}naming:\n  overrides:\n    pathSegments:\n      \"{{x}}\": All\n");
         let (keys, diagnostics) = keys_for(NESTED, &config);
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(!renames(&diagnostics).is_empty(), "{diagnostics:#?}");
         // The ancestor is reached first, so the descendant is the one that takes the suffix.
         assert!(keys.contains("export const apiFooAll = [\"api\", \"foo\"] as const;\n"));
         assert!(
