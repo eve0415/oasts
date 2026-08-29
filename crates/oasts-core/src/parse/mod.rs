@@ -4589,6 +4589,7 @@ fn string_array_field(object: &Map<String, Value>, key: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::path::{Path, PathBuf};
 
     use serde_json::json;
@@ -5115,7 +5116,13 @@ mod tests {
         let resolved =
             load_config(Some(Path::new("oasts.json")), temp.path()).expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let files = compile_pipeline(&resolved, FetcherHandle::None, true, &mut sink);
+        let files = compile_pipeline(
+            &resolved,
+            FetcherHandle::None,
+            true,
+            &mut InputRecorder::off(),
+            &mut sink,
+        );
         (temp, files, sink)
     }
 
@@ -9177,8 +9184,14 @@ mod tests {
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let files = compile_pipeline(&resolved, FetcherHandle::None, true, &mut sink)
-            .expect("generated files");
+        let files = compile_pipeline(
+            &resolved,
+            FetcherHandle::None,
+            true,
+            &mut InputRecorder::off(),
+            &mut sink,
+        )
+        .expect("generated files");
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         let client = files
             .iter()

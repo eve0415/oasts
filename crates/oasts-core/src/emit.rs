@@ -42,6 +42,7 @@ use crate::config::{
     EnumRepresentation, FileCase, ResolvedConfig, TypesConfig,
 };
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
+use crate::inputs::InputRecorder;
 use crate::ir::{
     AdditionalProperties, Body, Discriminator, Ir, MediaType, Operation, Param, ParamLocation,
     PatternProperty, PatternPropertyKey, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader,
@@ -442,14 +443,16 @@ pub fn emit_artifacts(
     config: &ResolvedConfig,
     source_tuples: &[(String, [u8; 32])],
     client_model: Option<&ClientModel>,
+    inputs: &mut InputRecorder,
     sink: &mut DiagnosticSink,
 ) -> Vec<GeneratedFile> {
     // The consumer's own compiler options, read once per run. This is the single point at which
     // anything outside version, config and input reaches emitted bytes, so it is resolved here
     // rather than deep in an emitter — and it fails safe: anything unreadable answers "not
-    // provided", which keeps the reference directive.
+    // provided", which keeps the reference directive. It is also the only filesystem read in
+    // emission, which is why `inputs` reaches this far in.
     let (consumer_provides_temporal, tsconfig_diagnostics) =
-        crate::tsconfig::consumer_provides_temporal(&config.output, &config.tsconfig);
+        crate::tsconfig::consumer_provides_temporal(&config.output, &config.tsconfig, inputs);
     sink.extend(tsconfig_diagnostics);
     let mut registrar = Registrar::new(sink);
     let mut model = EmissionModel::new(
@@ -5840,6 +5843,7 @@ mod tests {
             &resolved,
             &graph.source_tuples(),
             Some(&client),
+            &mut InputRecorder::off(),
             &mut sink,
         );
         (files, sink.into_sorted_vec())
@@ -11299,8 +11303,14 @@ mod tests {
             let analyzed = analyze(ir, &config, &mut sink);
             let first = emit_types(&analyzed, &config, &graph.source_tuples(), &mut sink);
             let second = emit_types(&analyzed, &config, &graph.source_tuples(), &mut sink);
-            let aliased =
-                emit_artifacts(&analyzed, &config, &graph.source_tuples(), None, &mut sink);
+            let aliased = emit_artifacts(
+                &analyzed,
+                &config,
+                &graph.source_tuples(),
+                None,
+                &mut InputRecorder::off(),
+                &mut sink,
+            );
             assert!(!first.is_empty());
             assert_eq!(first, second);
             assert_eq!(first, aliased);

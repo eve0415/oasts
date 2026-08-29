@@ -5,11 +5,12 @@
 //! 0/1/2 exit codes out of it. Keeping that sequence here means a host only
 //! decides how to render the [`Outcome`], never what the outcome is.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::{self, CODE_COMMAND_UNSUPPORTED, CODE_WORKSPACE_UNSUPPORTED, ResolvedConfig};
 use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::emit::GeneratedFile;
+use crate::inputs::{CompileInputs, InputRecorder};
 use crate::source::FetcherHandle;
 use crate::writer::{DriftState, check_drift, write};
 use crate::{msw_peer, pipeline, zod_peer};
@@ -56,6 +57,16 @@ pub fn refuse(surface: Unsupported<'_>) -> Outcome {
     Outcome::failed(sink)
 }
 
+/// What a run reports besides its result.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Tracking {
+    /// Report the outcome only.
+    #[default]
+    Off,
+    /// Also report every filesystem path the run depended on, for a host that watches them.
+    Inputs,
+}
+
 /// Where the configuration comes from.
 #[derive(Clone, Copy, Debug)]
 pub enum ConfigSource<'a> {
@@ -86,6 +97,11 @@ pub struct Outcome {
     pub diagnostics: Vec<Diagnostic>,
     /// `state: path` drift lines for stderr, when `--check` found drift.
     pub drift_lines: Vec<String>,
+    /// Every filesystem path the run depended on, when the host asked for [`Tracking::Inputs`].
+    ///
+    /// Carried on the outcome rather than fetched separately: a second pass would re-read a tree
+    /// that has already moved on, and would answer for a compile nobody ran.
+    pub inputs: Option<CompileInputs>,
 }
 
 impl Outcome {
@@ -95,6 +111,7 @@ impl Outcome {
             stdout_summary: None,
             diagnostics: sink.into_sorted_vec(),
             drift_lines: Vec::new(),
+            inputs: None,
         }
     }
 
@@ -105,7 +122,18 @@ impl Outcome {
             stdout_summary: Some(summary.to_owned()),
             diagnostics,
             drift_lines: Vec::new(),
+            inputs: None,
         }
+    }
+
+    fn with_inputs(mut self, recorder: InputRecorder, output_root: Option<PathBuf>) -> Self {
+        if recorder.is_recording() {
+            self.inputs = Some(CompileInputs {
+                paths: recorder.into_paths(),
+                output_root,
+            });
+        }
+        self
     }
 }
 
@@ -119,7 +147,31 @@ fn load(source: ConfigSource<'_>) -> Result<ResolvedConfig, Vec<Diagnostic>> {
 }
 
 /// Loads, compiles, and either reports drift or writes the generated files.
-pub fn run(command: Command, source: ConfigSource<'_>, fetcher: FetcherHandle) -> Outcome {
+pub fn run(
+    command: Command,
+    source: ConfigSource<'_>,
+    fetcher: FetcherHandle,
+    tracking: Tracking,
+) -> Outcome {
+    let mut inputs = match tracking {
+        Tracking::Off => InputRecorder::off(),
+        Tracking::Inputs => InputRecorder::on(),
+    };
+    let mut output_root = None;
+    let outcome = compile(command, source, fetcher, &mut inputs, &mut output_root);
+    outcome.with_inputs(inputs, output_root)
+}
+
+fn compile(
+    command: Command,
+    source: ConfigSource<'_>,
+    fetcher: FetcherHandle,
+    inputs: &mut InputRecorder,
+    output_root: &mut Option<PathBuf>,
+) -> Outcome {
+    // Seeded before the load, so a run that never reaches a config still says which paths decide
+    // whether the next one will. A watcher that gave up here could not see the config appear.
+    record_config_candidates(source, inputs);
     let mut sink = DiagnosticSink::new();
     let mut config = match load(source) {
         Ok(config) => config,
@@ -128,10 +180,15 @@ pub fn run(command: Command, source: ConfigSource<'_>, fetcher: FetcherHandle) -
             return Outcome::failed(sink);
         }
     };
+    inputs.record(&config.config_path);
+    // The entry document as the config names it. The graph reports canonical paths for every
+    // document it opened, which is the same file by another name — but only once it opens.
+    inputs.record(&config.input);
+    *output_root = Some(config.output.clone());
     sink.extend(std::mem::take(&mut config.diagnostics));
 
     let should_emit = matches!(command, Command::Generate { .. });
-    let files = pipeline::compile(&config, fetcher, should_emit, &mut sink);
+    let files = pipeline::compile(&config, fetcher, should_emit, inputs, &mut sink);
     if sink.has_errors() {
         return Outcome::failed(sink);
     }
@@ -147,7 +204,22 @@ pub fn run(command: Command, source: ConfigSource<'_>, fetcher: FetcherHandle) -
     if check {
         return drift(&config, files, warnings);
     }
-    emit(&config, files, warnings)
+    emit(&config, files, inputs, warnings)
+}
+
+fn record_config_candidates(source: ConfigSource<'_>, inputs: &mut InputRecorder) {
+    match source {
+        ConfigSource::Path { explicit, cwd } => {
+            inputs.record_all(
+                config::discovery_candidates(cwd, explicit)
+                    .iter()
+                    .map(PathBuf::as_path),
+            );
+        }
+        // A host that evaluated the config itself already knows where it came from, and the bytes
+        // at that path were never read here — but it is still the file the run depends on.
+        ConfigSource::Json { config_path, .. } => inputs.record(config_path),
+    }
 }
 
 fn drift(config: &ResolvedConfig, files: Vec<GeneratedFile>, warnings: Vec<Diagnostic>) -> Outcome {
@@ -165,6 +237,7 @@ fn drift(config: &ResolvedConfig, files: Vec<GeneratedFile>, warnings: Vec<Diagn
         exit_code: 1,
         stdout_summary: None,
         diagnostics: warnings,
+        inputs: None,
         drift_lines: report
             .entries
             .iter()
@@ -177,17 +250,18 @@ fn drift(config: &ResolvedConfig, files: Vec<GeneratedFile>, warnings: Vec<Diagn
 fn emit(
     config: &ResolvedConfig,
     files: Vec<GeneratedFile>,
+    inputs: &mut InputRecorder,
     mut warnings: Vec<Diagnostic>,
 ) -> Outcome {
     // Only on the write path: `--check` compares bytes for CI, where the consumer's node_modules
     // is neither inspected nor relevant.
     if config.artifacts.zod.enabled
-        && let Some(diagnostic) = zod_peer::diagnose(&config.output)
+        && let Some(diagnostic) = zod_peer::diagnose(&config.output, inputs)
     {
         warnings.push(diagnostic);
     }
     if config.artifacts.msw.enabled
-        && let Some(diagnostic) = msw_peer::diagnose(&config.output)
+        && let Some(diagnostic) = msw_peer::diagnose(&config.output, inputs)
     {
         warnings.push(diagnostic);
     }
@@ -257,6 +331,7 @@ validation:
                     cwd: temp.path(),
                 },
                 FetcherHandle::None,
+                Tracking::Off,
             )
         };
 
@@ -284,5 +359,189 @@ validation:
             render_to_string(first.diagnostics),
             render_to_string(second.diagnostics)
         );
+    }
+    /// One tree exercising every family of input a compile can depend on.
+    fn tracked_workspace() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        fs::create_dir_all(root.join("generated")).expect("output directory");
+        fs::create_dir_all(root.join("node_modules/zod")).expect("peer directory");
+        fs::write(
+            root.join("node_modules/zod/package.json"),
+            r#"{"version": "1.0.0"}"#,
+        )
+        .expect("peer manifest");
+        fs::write(
+            root.join("components.yaml"),
+            r#"Thing: {type: object, properties: {id: {type: string}}}
+"#,
+        )
+        .expect("referenced document");
+        fs::write(
+            root.join("openapi.yaml"),
+            r#"openapi: 3.1.0
+info: {title: test, version: 1.0.0}
+paths:
+  /things:
+    get:
+      operationId: listThings
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: {$ref: './components.yaml#/Thing'}
+"#,
+        )
+        .expect("entry document");
+        fs::write(
+            root.join("base.json"),
+            r#"{ "compilerOptions": { "lib": ["ESNext"] } }"#,
+        )
+        .expect("extends base");
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "extends": "./base.json" }"#,
+        )
+        .expect("consumer tsconfig");
+        fs::write(
+            root.join("oasts.yaml"),
+            r#"schemaVersion: 1
+input:
+  path: ./openapi.yaml
+output: ./generated
+artifacts:
+  types: true
+  client: true
+  zod: true
+client:
+  authEnforcement: types
+validation:
+  engine: zod
+  request: true
+  response: true
+  unchecked: allow
+"#,
+        )
+        .expect("config");
+        temp
+    }
+
+    #[test]
+    fn a_tracked_run_reports_every_family_of_input_it_depended_on() {
+        let temp = tracked_workspace();
+        let root = temp.path().canonicalize().expect("canonical root");
+        let outcome = run(
+            Command::Generate { check: false },
+            ConfigSource::Path {
+                explicit: None,
+                cwd: &root,
+            },
+            FetcherHandle::None,
+            Tracking::Inputs,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:#?}", outcome.diagnostics);
+        let inputs = outcome.inputs.expect("a tracked run reports its inputs");
+        assert_eq!(inputs.output_root, Some(root.join("generated")));
+
+        let has = |path: PathBuf| inputs.paths.contains(&path);
+        // Every discovery candidate, not only the one that exists: a second name appearing is what
+        // turns a working run into a discovery failure.
+        assert!(has(root.join("oasts.yaml")));
+        assert!(has(root.join("oasts.json")));
+        assert!(has(root.join("oasts.config.ts")));
+        // The document graph, entry and reference alike.
+        assert!(has(root.join("openapi.yaml")));
+        assert!(has(root.join("components.yaml")));
+        // The consumer tsconfig, its `extends` target, and the ancestor probe that found nothing.
+        assert!(has(root.join("tsconfig.json")));
+        assert!(has(root.join("base.json")));
+        assert!(has(root.join("generated/tsconfig.json")));
+        // The peer manifest the version warning was judged against.
+        assert!(has(root.join("node_modules/zod/package.json")));
+        // Nothing the run wrote is an input. The output root holds exactly one watched path — the
+        // `tsconfig.json` the ancestor walk looked for there and did not find.
+        assert_eq!(
+            inputs
+                .paths
+                .iter()
+                .filter(|path| path.starts_with(root.join("generated")))
+                .collect::<Vec<_>>(),
+            vec![&root.join("generated/tsconfig.json")]
+        );
+        assert!(inputs.paths.is_sorted());
+    }
+
+    #[test]
+    fn an_untracked_run_reports_no_inputs() {
+        let temp = tracked_workspace();
+        let outcome = run(
+            Command::Check,
+            ConfigSource::Path {
+                explicit: None,
+                cwd: temp.path(),
+            },
+            FetcherHandle::None,
+            Tracking::Off,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:#?}", outcome.diagnostics);
+        assert!(outcome.inputs.is_none());
+    }
+
+    #[test]
+    fn a_run_that_never_found_a_config_still_reports_what_to_watch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outcome = run(
+            Command::Check,
+            ConfigSource::Path {
+                explicit: None,
+                cwd: temp.path(),
+            },
+            FetcherHandle::None,
+            Tracking::Inputs,
+        );
+        assert_eq!(outcome.exit_code, 2);
+        let inputs = outcome.inputs.expect("inputs survive a failed discovery");
+        assert_eq!(inputs.output_root, None);
+        assert_eq!(inputs.paths.len(), 8);
+    }
+
+    #[test]
+    fn an_explicit_config_path_is_the_only_candidate_watched() {
+        let temp = tracked_workspace();
+        let root = temp.path().canonicalize().expect("canonical root");
+        let outcome = run(
+            Command::Check,
+            ConfigSource::Path {
+                explicit: Some(Path::new("oasts.yaml")),
+                cwd: &root,
+            },
+            FetcherHandle::None,
+            Tracking::Inputs,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:#?}", outcome.diagnostics);
+        let inputs = outcome.inputs.expect("a tracked run reports its inputs");
+        assert!(inputs.paths.contains(&root.join("oasts.yaml")));
+        assert!(!inputs.paths.contains(&root.join("oasts.json")));
+    }
+
+    #[test]
+    fn an_evaluated_config_is_tracked_at_the_path_it_came_from() {
+        let temp = tracked_workspace();
+        let root = temp.path().canonicalize().expect("canonical root");
+        let config_path = root.join("oasts.config.ts");
+        let outcome = run(
+            Command::Check,
+            ConfigSource::Json {
+                config_path: &config_path,
+                json: br#"{"schemaVersion": 1, "input": {"path": "./openapi.yaml"},
+                    "output": "./generated", "artifacts": {"types": true}}"#,
+            },
+            FetcherHandle::None,
+            Tracking::Inputs,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:#?}", outcome.diagnostics);
+        let inputs = outcome.inputs.expect("a tracked run reports its inputs");
+        assert!(inputs.paths.contains(&config_path));
     }
 }

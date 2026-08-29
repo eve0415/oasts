@@ -2973,6 +2973,7 @@ fn property_access(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::fs;
 
     use serde_json::{Value, json};
@@ -3032,6 +3033,7 @@ mod tests {
             &resolved,
             &graph.source_tuples(),
             Some(&client),
+            &mut InputRecorder::off(),
             &mut sink,
         );
         let has_errors = sink.has_errors();
@@ -3858,6 +3860,7 @@ mod tests {
             &resolved,
             &graph.source_tuples(),
             Some(&client),
+            &mut InputRecorder::off(),
             &mut sink,
         );
         assert!(!sink.has_errors());

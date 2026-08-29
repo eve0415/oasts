@@ -2182,6 +2182,7 @@ fn assemble_file(
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::fs;
 
     use serde_json::{Value, json};
@@ -2241,6 +2242,7 @@ mod tests {
             &resolved,
             &source_tuples,
             client.as_ref(),
+            &mut InputRecorder::off(),
             &mut sink,
         );
         (files, sink.into_sorted_vec())

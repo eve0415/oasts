@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use napi_derive::napi;
 use oasts_core::config;
 use oasts_core::diag::{Diagnostic, Severity};
-use oasts_core::driver::{self, Command, ConfigSource, Outcome, Unsupported};
+use oasts_core::driver::{self, Command, ConfigSource, Outcome, Tracking, Unsupported};
 
 /// A config discovery result exposed to the Node CLI.
 #[napi(object)]
@@ -144,11 +144,11 @@ fn render(outcome: Outcome) -> RunResult {
     }
 }
 
-fn parse_command(name: &str, check: bool) -> Result<Command, Outcome> {
+fn parse_command(name: &str, check: bool) -> Result<Command, Unsupported<'_>> {
     match name {
         "generate" => Ok(Command::Generate { check }),
         "check" => Ok(Command::Check),
-        other => Err(driver::refuse(Unsupported::Command(other))),
+        other => Err(Unsupported::Command(other)),
     }
 }
 
@@ -159,7 +159,9 @@ fn parse_command(name: &str, check: bool) -> Result<Command, Outcome> {
 /// `OASTS` code in the core.
 #[napi]
 pub fn command_refusal(command: String) -> Option<RunResult> {
-    parse_command(&command, false).err().map(render)
+    parse_command(&command, false)
+        .err()
+        .map(|surface| render(driver::refuse(surface)))
 }
 
 /// Runs `generate` or `check` for one already-discovered config.
@@ -171,7 +173,7 @@ pub fn run(options: RunOptions) -> RunResult {
 
     let command = match parse_command(&options.command, options.check) {
         Ok(command) => command,
-        Err(refusal) => return render(refusal),
+        Err(surface) => return render(driver::refuse(surface)),
     };
     let config_path = Path::new(&options.config_path);
     let source = match options.config_json.as_deref() {
@@ -184,7 +186,12 @@ pub fn run(options: RunOptions) -> RunResult {
             cwd: Path::new(&options.cwd),
         },
     };
-    render(driver::run(command, source, oasts_fetch::handle()))
+    render(driver::run(
+        command,
+        source,
+        oasts_fetch::handle(),
+        Tracking::Off,
+    ))
 }
 
 #[cfg(test)]

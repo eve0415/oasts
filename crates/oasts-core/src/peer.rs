@@ -6,12 +6,13 @@
 //! same walk every time and lives here.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A peer package manifest reachable from the emitted files, and the version it declares.
 pub(crate) struct InstalledPeer {
     pub(crate) version: String,
-    pub(crate) manifest: String,
+    /// The manifest the version was read from — named in the warning, and watched by `oasts watch`.
+    pub(crate) manifest: PathBuf,
 }
 
 /// Walks up from the emitted-file root for the `node_modules/{package}` that Node would resolve.
@@ -33,10 +34,7 @@ pub(crate) fn installed_version(output: &Path, package: &str) -> Option<Installe
         };
         let parsed = serde_json::from_str::<serde_json::Value>(&text).ok()?;
         let version = parsed.get("version")?.as_str()?.to_owned();
-        return Some(InstalledPeer {
-            version,
-            manifest: manifest.display().to_string(),
-        });
+        return Some(InstalledPeer { version, manifest });
     }
     None
 }

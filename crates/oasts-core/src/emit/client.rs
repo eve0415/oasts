@@ -4070,6 +4070,7 @@ fn helper_export_name(helper: HelperId) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::fs;
 
     use serde_json::{Value, json};
@@ -7797,7 +7798,14 @@ mod tests {
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
         let client = build_client_model(&analyzed, &config, &mut sink);
-        let files = emit_artifacts(&analyzed, &config, &source_tuples, Some(&client), &mut sink);
+        let files = emit_artifacts(
+            &analyzed,
+            &config,
+            &source_tuples,
+            Some(&client),
+            &mut InputRecorder::off(),
+            &mut sink,
+        );
         (files, sink.into_sorted_vec())
     }
 

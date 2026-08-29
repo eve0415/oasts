@@ -27,6 +27,7 @@ use oasts_core::config::load_config;
 use oasts_core::diag::{self, DiagnosticSink};
 use oasts_core::emit::emit_artifacts;
 use oasts_core::filter;
+use oasts_core::inputs::InputRecorder;
 use oasts_core::loader::load_graph;
 use oasts_core::parse::parse;
 use oasts_core::semantic::analyze;
@@ -364,6 +365,7 @@ fn measure_key(entry: &FixtureEntry, fixture_dir: &Path) -> Result<KeySnapshot, 
             &config,
             &source_tuples,
             client_model.as_ref(),
+            &mut InputRecorder::off(),
             &mut sink,
         )
     });

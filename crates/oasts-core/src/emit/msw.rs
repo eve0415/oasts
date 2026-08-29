@@ -2367,6 +2367,7 @@ mod tests {
         CODE_IMPORT_ALIAS, CODE_PATH_COLLISION, PARALLEL_EMIT_MIN_ITEMS, emit_artifacts,
         source_digest,
     };
+    use crate::inputs::InputRecorder;
     use crate::ir::{PropMeta, SchemaMeta, SchemaRef};
     use crate::loader::load_graph;
     use crate::parse::parse;
@@ -2390,7 +2391,14 @@ mod tests {
         drop(graph);
         let analyzed = analyze(ir, &resolved, &mut sink);
         assert!(!sink.has_errors(), "unexpected diagnostics");
-        let files = emit_artifacts(&analyzed, &resolved, &source_tuples, None, &mut sink);
+        let files = emit_artifacts(
+            &analyzed,
+            &resolved,
+            &source_tuples,
+            None,
+            &mut InputRecorder::off(),
+            &mut sink,
+        );
         (files, sink.into_sorted_vec())
     }
 
@@ -2419,7 +2427,14 @@ mod tests {
         drop(graph);
         let analyzed = analyze(ir, &resolved, &mut sink);
         assert!(!sink.has_errors(), "unexpected diagnostics");
-        let files = emit_artifacts(&analyzed, &resolved, &source_tuples, None, &mut sink);
+        let files = emit_artifacts(
+            &analyzed,
+            &resolved,
+            &source_tuples,
+            None,
+            &mut InputRecorder::off(),
+            &mut sink,
+        );
         (files, sink.into_sorted_vec())
     }
 

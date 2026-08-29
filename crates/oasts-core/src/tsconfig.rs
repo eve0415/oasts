@@ -18,6 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 
 use crate::diag::Diagnostic;
+use crate::inputs::InputRecorder;
 
 /// How deep an `extends` chain may go before the reader gives up.
 ///
@@ -170,14 +171,30 @@ impl TsconfigError {
     }
 }
 
-/// Counts files across one run so a fan-out of `extends` arrays cannot read the disk unbounded.
-#[derive(Debug, Default)]
-pub(crate) struct ReadBudget {
+/// Counts files across one run so a fan-out of `extends` arrays cannot read the disk unbounded,
+/// and reports every path the run touched to the watcher's recorder.
+///
+/// The two live together because they answer for the same events: a file that was read, and a
+/// candidate that was probed and rejected. A watcher needs both — creating the `base.json` that an
+/// `extends` looked for and did not find changes the next run's answer.
+#[derive(Debug)]
+pub(crate) struct ReadBudget<'a> {
     spent: usize,
+    inputs: &'a mut InputRecorder,
 }
 
-impl ReadBudget {
+impl<'a> ReadBudget<'a> {
+    pub(crate) fn new(inputs: &'a mut InputRecorder) -> Self {
+        Self { spent: 0, inputs }
+    }
+
+    /// Notes a path that was looked for, whether or not it was there.
+    fn probe(&mut self, path: &Path) {
+        self.inputs.record(path);
+    }
+
     fn take(&mut self, path: &Path) -> Result<(), TsconfigError> {
+        self.probe(path);
         if self.spent >= MAX_TSCONFIG_FILES {
             return Err(TsconfigError::TooManyFiles {
                 path: path.to_path_buf(),
@@ -239,7 +256,12 @@ fn resolve_against(base_dir: &Path, value: &str, config_dir: &Path) -> PathBuf {
 /// finally the path as a directory holding `tsconfig.json`. A bare specifier would be a package
 /// lookup, which this reader does not do — it reports the target as unresolved rather than guessing
 /// at a `node_modules` layout it cannot verify.
-fn resolve_extends_target(base_dir: &Path, target: &str, config_dir: &Path) -> Option<PathBuf> {
+fn resolve_extends_target(
+    base_dir: &Path,
+    target: &str,
+    config_dir: &Path,
+    budget: &mut ReadBudget<'_>,
+) -> Option<PathBuf> {
     let substituted = substitute_config_dir(target, config_dir);
     let looks_relative = substituted.starts_with('.')
         || substituted.starts_with('/')
@@ -254,7 +276,10 @@ fn resolve_extends_target(base_dir: &Path, target: &str, config_dir: &Path) -> O
         direct.join("tsconfig.json"),
     ]
     .into_iter()
-    .find(|candidate| candidate.is_file())
+    .find(|candidate| {
+        budget.probe(candidate);
+        candidate.is_file()
+    })
 }
 
 /// Later options win. Only fields the caller left unset are taken from the base, which is what
@@ -281,7 +306,7 @@ fn merge_options(base: CompilerOptions, over: CompilerOptions) -> CompilerOption
     }
 }
 
-fn read_raw(path: &Path, budget: &mut ReadBudget) -> Result<RawTsconfig, TsconfigError> {
+fn read_raw(path: &Path, budget: &mut ReadBudget<'_>) -> Result<RawTsconfig, TsconfigError> {
     budget.take(path)?;
     let metadata = std::fs::metadata(path).map_err(|error| TsconfigError::Unreadable {
         path: path.to_path_buf(),
@@ -311,7 +336,7 @@ fn read_raw(path: &Path, budget: &mut ReadBudget) -> Result<RawTsconfig, Tsconfi
 /// Reads one tsconfig with its whole `extends` chain folded in.
 pub(crate) fn read(
     path: &Path,
-    budget: &mut ReadBudget,
+    budget: &mut ReadBudget<'_>,
 ) -> Result<ResolvedTsconfig, TsconfigError> {
     let start = normalize(path);
     // `unwrap_or` over `map_or_else`: the fallback arm is a closure llvm-cov instantiates and no
@@ -331,7 +356,7 @@ fn fold(
     config_dir: &Path,
     seen: &mut BTreeSet<PathBuf>,
     depth: usize,
-    budget: &mut ReadBudget,
+    budget: &mut ReadBudget<'_>,
 ) -> Result<ResolvedTsconfig, TsconfigError> {
     if depth > MAX_EXTENDS_DEPTH {
         return Err(TsconfigError::ExtendsTooDeep {
@@ -352,7 +377,8 @@ fn fold(
         references: Vec::new(),
     };
     for target in raw.extends.iter().flat_map(ExtendsField::targets) {
-        let Some(resolved_target) = resolve_extends_target(&base_dir, &target, config_dir) else {
+        let Some(resolved_target) = resolve_extends_target(&base_dir, &target, config_dir, budget)
+        else {
             return Err(TsconfigError::ExtendsUnresolved {
                 path: path.to_path_buf(),
                 target,
@@ -434,11 +460,15 @@ pub(crate) fn provides_temporal(options: &CompilerOptions) -> bool {
 /// a consumer would expect to govern that directory. Ownership (`files`/`include`/`references`)
 /// decides which *program* a file belongs to, which is a different question and a diagnostics-only
 /// one — it never changes what is emitted.
-pub(crate) fn discover(from: &Path) -> Option<PathBuf> {
+pub(crate) fn discover(from: &Path, inputs: &mut InputRecorder) -> Option<PathBuf> {
     let mut current = Some(normalize(from));
     for _ in 0..MAX_ANCESTOR_WALK {
         let directory = current?;
         let candidate = directory.join("tsconfig.json");
+        // Recorded before the test, not after: a nearer `tsconfig.json` appearing above the output
+        // directory changes which config governs the run, so the ancestors that had none are as
+        // much an input as the one that answered.
+        inputs.record(&candidate);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -457,16 +487,17 @@ pub(crate) fn discover(from: &Path) -> Option<PathBuf> {
 pub(crate) fn consumer_provides_temporal(
     output_directory: &Path,
     setting: &crate::config::TsconfigSource,
+    inputs: &mut InputRecorder,
 ) -> (bool, Vec<Diagnostic>) {
     let path = match setting {
         crate::config::TsconfigSource::Off => return (false, Vec::new()),
         crate::config::TsconfigSource::Path(path) => path.clone(),
-        crate::config::TsconfigSource::Auto => match discover(output_directory) {
+        crate::config::TsconfigSource::Auto => match discover(output_directory, inputs) {
             Some(found) => found,
             None => return (false, Vec::new()),
         },
     };
-    match read(&path, &mut ReadBudget::default()) {
+    match read(&path, &mut ReadBudget::new(inputs)) {
         Ok(resolved) => (provides_temporal(&resolved.compiler_options), Vec::new()),
         Err(error) => (false, vec![error.into_diagnostic()]),
     }
@@ -488,11 +519,12 @@ mod tests {
     }
 
     fn read_ok(path: &Path) -> ResolvedTsconfig {
-        read(path, &mut ReadBudget::default()).expect("tsconfig resolves")
+        read(path, &mut ReadBudget::new(&mut InputRecorder::off())).expect("tsconfig resolves")
     }
 
     fn read_err(path: &Path) -> TsconfigError {
-        read(path, &mut ReadBudget::default()).expect_err("tsconfig is rejected")
+        read(path, &mut ReadBudget::new(&mut InputRecorder::off()))
+            .expect_err("tsconfig is rejected")
     }
 
     #[test]
@@ -766,8 +798,10 @@ mod tests {
     fn the_per_run_file_budget_is_enforced_across_one_chain() {
         let temp = TempDir::new().expect("temp");
         let path = write(temp.path(), "tsconfig.json", "{}");
+        let mut recorder = InputRecorder::off();
         let mut budget = ReadBudget {
             spent: MAX_TSCONFIG_FILES,
+            inputs: &mut recorder,
         };
         let error = read(&path, &mut budget).expect_err("budget is spent");
         assert!(
@@ -867,7 +901,7 @@ mod tests {
         }
         fs::create_dir_all(&deep).expect("deep directories");
         write(temp.path(), "tsconfig.json", "{}");
-        assert_eq!(discover(&deep), None);
+        assert_eq!(discover(&deep, &mut InputRecorder::off()), None);
     }
 
     #[test]
@@ -912,13 +946,16 @@ mod tests {
         );
         let output = temp.path().join("packages/app/src/generated");
         fs::create_dir_all(&output).expect("output directory");
-        assert_eq!(discover(&output).as_deref(), Some(nested.as_path()));
+        assert_eq!(
+            discover(&output, &mut InputRecorder::off()).as_deref(),
+            Some(nested.as_path())
+        );
 
         // A directory under the root but outside the nested package falls through to the root.
         let other = temp.path().join("elsewhere");
         fs::create_dir_all(&other).expect("other directory");
         assert_eq!(
-            discover(&other).as_deref(),
+            discover(&other, &mut InputRecorder::off()).as_deref(),
             Some(temp.path().join("tsconfig.json").as_path())
         );
     }
@@ -931,7 +968,8 @@ mod tests {
         fs::create_dir_all(&output).expect("output directory");
 
         // Nothing to read: the directive stays, and that is not a diagnostic.
-        let (provides, diagnostics) = consumer_provides_temporal(&output, &TsconfigSource::Auto);
+        let (provides, diagnostics) =
+            consumer_provides_temporal(&output, &TsconfigSource::Auto, &mut InputRecorder::off());
         assert!(!provides);
         assert!(diagnostics.is_empty());
 
@@ -940,12 +978,14 @@ mod tests {
             "tsconfig.json",
             r#"{ "compilerOptions": { "lib": ["ESNext"] } }"#,
         );
-        let (provides, diagnostics) = consumer_provides_temporal(&output, &TsconfigSource::Auto);
+        let (provides, diagnostics) =
+            consumer_provides_temporal(&output, &TsconfigSource::Auto, &mut InputRecorder::off());
         assert!(provides);
         assert!(diagnostics.is_empty());
 
         // `off` reads nothing, so output stops depending on anything outside version/config/input.
-        let (provides, diagnostics) = consumer_provides_temporal(&output, &TsconfigSource::Off);
+        let (provides, diagnostics) =
+            consumer_provides_temporal(&output, &TsconfigSource::Off, &mut InputRecorder::off());
         assert!(!provides);
         assert!(diagnostics.is_empty());
 
@@ -955,15 +995,21 @@ mod tests {
             "tsconfig.build.json",
             r#"{ "compilerOptions": {} }"#,
         );
-        let (provides, diagnostics) =
-            consumer_provides_temporal(&output, &TsconfigSource::Path(explicit));
+        let (provides, diagnostics) = consumer_provides_temporal(
+            &output,
+            &TsconfigSource::Path(explicit),
+            &mut InputRecorder::off(),
+        );
         assert!(!provides);
         assert!(diagnostics.is_empty());
 
         // A malformed config answers "not provided" and says why, rather than guessing.
         let broken = write(temp.path(), "broken.json", "{ nope");
-        let (provides, diagnostics) =
-            consumer_provides_temporal(&output, &TsconfigSource::Path(broken));
+        let (provides, diagnostics) = consumer_provides_temporal(
+            &output,
+            &TsconfigSource::Path(broken),
+            &mut InputRecorder::off(),
+        );
         assert!(!provides);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, "OASTS1002");

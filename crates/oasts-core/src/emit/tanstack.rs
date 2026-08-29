@@ -1541,6 +1541,7 @@ mod tests {
     use crate::config::load_config;
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
     use crate::emit::emit_artifacts;
+    use crate::inputs::InputRecorder;
     use crate::loader::load_graph;
     use crate::parse::parse;
     use crate::semantic::analyze;
@@ -1563,7 +1564,14 @@ mod tests {
         drop(graph);
         let analyzed = analyze(ir, &resolved, &mut sink);
         let client = build_client_model(&analyzed, &resolved, &mut sink);
-        let files = emit_artifacts(&analyzed, &resolved, &tuples, Some(&client), &mut sink);
+        let files = emit_artifacts(
+            &analyzed,
+            &resolved,
+            &tuples,
+            Some(&client),
+            &mut InputRecorder::off(),
+            &mut sink,
+        );
         (files, sink.into_sorted_vec())
     }
 

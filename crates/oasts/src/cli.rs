@@ -10,7 +10,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use oasts_core::diag::{self, Diagnostic};
-use oasts_core::driver::{self, Command as DriverCommand, ConfigSource, Outcome, Unsupported};
+use oasts_core::driver::{
+    self, Command as DriverCommand, ConfigSource, Outcome, Tracking, Unsupported,
+};
 
 const CODE_CURRENT_DIR: &str = "OASTS1021";
 
@@ -180,6 +182,7 @@ fn dispatch(
             cwd,
         },
         oasts_fetch::handle(),
+        Tracking::Off,
     );
     report(outcome, stdout, stderr)
 }
@@ -921,6 +924,7 @@ mod tests {
     fn outcome_rendering_is_deterministic() {
         let outcome = Outcome {
             exit_code: 2,
+            inputs: None,
             stdout_summary: Some("check ok".to_owned()),
             diagnostics: vec![
                 Diagnostic::input("OASTS9903", "input")

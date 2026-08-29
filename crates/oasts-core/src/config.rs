@@ -1187,6 +1187,27 @@ pub struct DiscoveredConfig {
     pub is_script: bool,
 }
 
+/// Every path discovery would consider, whether or not it exists.
+///
+/// Anchored the same way [`discover_candidate`] anchors, and purely lexical, so a watching host can
+/// be told what to watch before — and after — a discovery that failed. With no `--config`,
+/// discovery insists on exactly one candidate, which makes the *appearance* of a second name as
+/// consequential as an edit to the one that is there.
+#[must_use]
+pub fn discovery_candidates(cwd: &Path, explicit: Option<&Path>) -> Vec<PathBuf> {
+    match explicit {
+        Some(path) => vec![normalize_config_path(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        })],
+        None => DISCOVERY_NAMES
+            .iter()
+            .map(|name| normalize_config_path(cwd.join(name)))
+            .collect(),
+    }
+}
+
 /// Discovers a supported configuration file, rejecting script configs.
 pub fn discover(cwd: &Path, explicit: Option<&Path>) -> Result<PathBuf, Diagnostic> {
     let candidate = discover_candidate(cwd, explicit)?;
