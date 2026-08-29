@@ -2010,6 +2010,37 @@ paths:
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         let paths = emitted_paths(&files);
         assert!(paths.contains("types/components/apikey.ts"), "{paths:#?}");
+        // `widened` carries a `type` array beside a `const`. Both are named, and the array — the
+        // one that actually widened the node — is not left out because the other was found first.
+        let mut warned = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.json_pointer.as_deref().is_some_and(|pointer| {
+                    pointer.starts_with("/components/schemas/ApiKey/properties/widened/")
+                })
+            })
+            .map(|diagnostic| {
+                (
+                    diagnostic.code,
+                    diagnostic.json_pointer.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        warned.sort_unstable();
+        assert_eq!(
+            warned,
+            vec![
+                (
+                    "OASTS2201",
+                    "/components/schemas/ApiKey/properties/widened/const"
+                ),
+                (
+                    "OASTS2201",
+                    "/components/schemas/ApiKey/properties/widened/type"
+                ),
+            ]
+        );
 
         // The validators artifact refuses each dropped keyword by name at the node that carried
         // it, so a preserved node never ships a check that ignores the constraint it dropped.

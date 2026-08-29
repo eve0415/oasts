@@ -2189,7 +2189,11 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     dialect_unsupported.get_or_insert(keyword);
                 }
             }
-            if dialect_unsupported.is_none() && object.get("type").is_some_and(Value::is_array) {
+            // Reported alongside whatever the loop found rather than only in its absence. A `type`
+            // array is what decides the widening, so a schema carrying both would otherwise name
+            // the other keyword as the sole cause and carry its promise that a representable
+            // sibling is kept — while this node widened whole, and because of the array.
+            if object.get("type").is_some_and(Value::is_array) {
                 self.sink.push(
                     self.unsupported_diagnostic(
                         node.doc_id,
@@ -2199,7 +2203,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                             .to_owned(),
                     ),
                 );
-                dialect_unsupported = Some("type array");
+                dialect_unsupported.get_or_insert("type array");
             }
         }
         if let Some(keyword) = dialect_unsupported {
@@ -5337,6 +5341,21 @@ mod tests {
             schema_named(&ir, "ConstOnATypeArray"),
             SchemaNode::Unknown { reason, .. } if reason == "OpenAPI 3.0 does not support type array"
         ));
+        // Both keywords are named, and the one that decided the widening says so: the `const` line
+        // promises a preserved sibling, which is true of every node except this one.
+        for pointer in [
+            "/components/schemas/ConstOnATypeArray/const",
+            "/components/schemas/ConstOnATypeArray/type",
+        ] {
+            assert!(
+                sink.as_slice().iter().any(|diagnostic| {
+                    diagnostic.code == CODE_UNSUPPORTED
+                        && diagnostic.json_pointer.as_deref() == Some(pointer)
+                }),
+                "{pointer}: {:#?}",
+                sink.as_slice()
+            );
+        }
         assert!(matches!(
             schema_named(&ir, "TwoKeywordsOnOneNode"),
             SchemaNode::Array { .. }
@@ -5363,9 +5382,10 @@ mod tests {
             .iter()
             .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
             .count();
-        // One keyword per schema, except `TwoKeywordsOnOneNode`: every unsupported keyword on an
-        // object is reported, not only the first one found.
-        assert_eq!(reported, 11, "{:#?}", sink.as_slice());
+        // One keyword per schema, except `TwoKeywordsOnOneNode` and `ConstOnATypeArray`: every
+        // unsupported keyword on an object is reported, not only the first one found, and the
+        // `type` array is reported beside the keyword rather than only in its absence.
+        assert_eq!(reported, 12, "{:#?}", sink.as_slice());
         for name in [
             "ConstWithType",
             "PropertyNamesWithProperties",
