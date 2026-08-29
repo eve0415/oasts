@@ -55,6 +55,11 @@ test("reports import failures", async () => {
     "OASTS0012",
     /failed to import config module: boom at import/,
   );
+  await expectFailure(
+    loadScriptConfig(writeConfig("throw 'a bare string';\n", "oasts.config.mjs")),
+    "OASTS0012",
+    /failed to import config module: a bare string/,
+  );
 });
 
 test("rejects missing, function, non-object, and promise defaults", async () => {
