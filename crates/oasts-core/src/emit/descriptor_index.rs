@@ -59,11 +59,12 @@ pub(super) fn collect_rejects(
     out: &mut Vec<Diagnostic>,
 ) {
     let meta = schema.meta();
-    // One rejected keyword is one root cause: it drives the rejected-keyword diagnostic, and the
-    // same parse degrades the node to an unknown leaf. Reporting the unknown leaf as well would
-    // double-report it against the frozen matrix's single-diagnostic contract, so the unknown-leaf
-    // reject fires only for nodes that reached Unknown without carrying a rejected keyword (e.g. an
-    // unknown `type`).
+    // One rejected keyword is one root cause, and naming the keyword says strictly more than
+    // reporting the leaf it produced. A node can carry both — it reached Unknown *and* holds a
+    // rejected keyword — and reporting each would double-report against the frozen matrix's
+    // single-diagnostic contract, so the unknown-leaf reject fires only for nodes that reached
+    // Unknown without carrying one (e.g. an unknown `type`). A node that kept its representable
+    // siblings carries the keyword without being Unknown, and is reported by the same first arm.
     if meta.rejected_validation_keywords.is_empty() {
         if let SchemaNode::Unknown { reason, meta } = schema {
             out.push(diagnostic(Reject::UnknownLeaf(reason), &meta.source));

@@ -2400,7 +2400,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         has_typed: bool,
         dynamic: Option<(&'static str, &'graph Value)>,
     ) -> SchemaNode {
-        let (wrapper_meta, typed_meta) = meta.split_for_conjunction();
+        let (mut wrapper_meta, typed_meta) = meta.split_for_conjunction();
         let mut branches = Vec::new();
         if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
             branches.push(self.parse_schema_ref(
@@ -2452,6 +2452,12 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 self.parse_typed_schema(node, object, typed_meta)
             };
             branches.push(typed);
+        } else {
+            // The split parks the rejected keywords on the typed half, which is not emitted here,
+            // so without this they leave the tree with it. They describe the whole schema object
+            // rather than one of its pieces, and dropping them is what lets the validators artifact
+            // ship a complete-looking check for a constraint it cannot express.
+            wrapper_meta.rejected_validation_keywords = typed_meta.rejected_validation_keywords;
         }
         SchemaNode::AllOf {
             branches,
@@ -5240,6 +5246,11 @@ mod tests {
                     "type": ["string", "null"],
                     "const": "x",
                     "minLength": 3
+                },
+                "TwoApplicatorsAndNoTypedHalf": {
+                    "const": "x",
+                    "allOf": [{ "type": "object" }],
+                    "oneOf": [{ "type": "string" }, { "type": "integer" }]
                 }
             }),
         );
@@ -5285,6 +5296,13 @@ mod tests {
             schema_named(&ir, "ConstOnATypeArray"),
             SchemaNode::Unknown { .. }
         ));
+        // Two applicators and no typed content lower to a conjunction whose typed half is never
+        // emitted. The rejected keyword has to travel on the wrapper, or the validators artifact
+        // ships a complete-looking check for a constraint it cannot express.
+        assert!(matches!(
+            schema_named(&ir, "TwoApplicatorsAndNoTypedHalf"),
+            SchemaNode::AllOf { .. }
+        ));
 
         // Every preserved node still reports the keyword, and still refuses a validator check for
         // the constraint it dropped.
@@ -5293,13 +5311,14 @@ mod tests {
             .iter()
             .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
             .count();
-        assert_eq!(reported, 7, "{:#?}", sink.as_slice());
+        assert_eq!(reported, 8, "{:#?}", sink.as_slice());
         for name in [
             "ConstWithType",
             "PropertyNamesWithProperties",
             "PrefixItemsWithItems",
             "DependentRequiredWithProperties",
             "ConstWithApplicatorOnly",
+            "TwoApplicatorsAndNoTypedHalf",
         ] {
             assert!(
                 !schema_named(&ir, name)
