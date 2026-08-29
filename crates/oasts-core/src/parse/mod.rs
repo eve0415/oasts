@@ -2246,7 +2246,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                         node.doc_id,
                         &append_pointer(&node.pointer, keyword),
                         format!(
-                            "schema keyword '{keyword}' has no faithful TypeScript representation and becomes unknown on the types surface"
+                            "schema keyword '{keyword}' has no faithful TypeScript representation \
+                             and is dropped from the emitted type; the schema widens to unknown \
+                             only where no representable sibling remains"
                         ),
                     ));
                 }
