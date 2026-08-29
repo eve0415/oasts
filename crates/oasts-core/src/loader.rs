@@ -68,6 +68,17 @@ enum Origin {
     Retrieved,
 }
 
+/// The document an identifier scan is walking, and what it may claim.
+///
+/// Bundled because every field is invariant across the whole recursion: only the value, the
+/// pointer, the walk context and the base URI change as it descends.
+#[derive(Clone, Copy)]
+struct AnchorScan<'a> {
+    doc_id: DocId,
+    source_id: &'a str,
+    claims: ResourceClaims<'a>,
+}
+
 /// What a document may claim as a schema resource identity.
 ///
 /// `$id` is a claim, not a fact, and the registry answers `$ref`s from claims without reading
@@ -1091,11 +1102,15 @@ impl<'a> GraphBuilder<'a> {
             let base = location
                 .retrieval_url()
                 .expect("a loaded document's location is representable as a retrieval URI");
-            let claims = ResourceClaims {
-                pinned: &self.config.remote.integrity,
-                own_uri: location.retrieved_from(),
+            let scan = AnchorScan {
+                doc_id: id,
+                source_id: &source_id,
+                claims: ResourceClaims {
+                    pinned: &self.config.remote.integrity,
+                    own_uri: location.retrieved_from(),
+                },
             };
-            collect_anchors(&value, id, base, &source_id, claims, &mut self.identifiers)?;
+            collect_anchors(&value, base, scan, &mut self.identifiers)?;
         }
         self.documents.push(Rc::new(Document {
             id,
@@ -1666,10 +1681,8 @@ fn collect_dynamic_identifiers(
 
 fn collect_anchors(
     value: &Value,
-    doc_id: DocId,
     base: Url,
-    source_id: &str,
-    claims: ResourceClaims<'_>,
+    scan: AnchorScan<'_>,
     identifiers: &mut IdentifierRegistry,
 ) -> Result<(), Diagnostic> {
     let context = if value.get("openapi").is_some() {
@@ -1677,26 +1690,15 @@ fn collect_anchors(
     } else {
         WalkContext::Schema
     };
-    collect_anchors_at(
-        value,
-        doc_id,
-        "",
-        context,
-        base,
-        source_id,
-        claims,
-        identifiers,
-    )
+    collect_anchors_at(value, "", context, base, scan, identifiers)
 }
 
 fn collect_anchors_at(
     value: &Value,
-    doc_id: DocId,
     pointer: &str,
     context: WalkContext,
     mut base: Url,
-    source_id: &str,
-    claims: ResourceClaims<'_>,
+    scan: AnchorScan<'_>,
     identifiers: &mut IdentifierRegistry,
 ) -> Result<(), Diagnostic> {
     if context == WalkContext::Skip {
@@ -1713,7 +1715,7 @@ fn collect_anchors_at(
         let Ok(resolved) = resolve_identity_uri(
             &base,
             id,
-            Some(source_id),
+            Some(scan.source_id),
             Some(&append_pointer(pointer, "$id")),
         ) else {
             return Ok(());
@@ -1724,13 +1726,15 @@ fn collect_anchors_at(
         // The configuration says that URI has particular bytes; the document says it *is* that
         // URI. Resolving that in the document's favour is what would let any document in the graph
         // stand in for a pinned one, unrequested and unhashed, so it is refused instead.
-        if claims.pinned.contains_key(&resource) && claims.own_uri != Some(resource.as_str()) {
+        if scan.claims.pinned.contains_key(&resource)
+            && scan.claims.own_uri != Some(resource.as_str())
+        {
             return Err(input_error(
                 CODE_ID_CLAIMS_PINNED,
                 format!(
                     "$id claims '{resource}', which remote.integrity pins; a document may only claim the URI it was retrieved from"
                 ),
-                Some(source_id),
+                Some(scan.source_id),
                 Some(&id_pointer),
             ));
         }
@@ -1743,7 +1747,7 @@ fn collect_anchors_at(
         match identifiers.resources.entry(resource) {
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(NodeLocation {
-                    doc_id,
+                    doc_id: scan.doc_id,
                     json_pointer: pointer.to_owned(),
                 });
             }
@@ -1754,7 +1758,7 @@ fn collect_anchors_at(
                         "$id '{}' is already declared as a schema resource; one URI names one resource",
                         taken.key()
                     ),
-                    Some(source_id),
+                    Some(scan.source_id),
                     Some(&id_pointer),
                 ));
             }
@@ -1764,7 +1768,14 @@ fn collect_anchors_at(
     if context == WalkContext::Schema
         && let Value::Object(object) = value
     {
-        collect_dynamic_identifiers(object, doc_id, pointer, &base, source_id, identifiers)?;
+        collect_dynamic_identifiers(
+            object,
+            scan.doc_id,
+            pointer,
+            &base,
+            scan.source_id,
+            identifiers,
+        )?;
     }
 
     if context == WalkContext::Schema
@@ -1776,7 +1787,7 @@ fn collect_anchors_at(
             return Err(input_error(
                 CODE_INVALID_REFERENCE,
                 "Schema Object $anchor must be a valid plain name",
-                Some(source_id),
+                Some(scan.source_id),
                 Some(&anchor_pointer),
             ));
         };
@@ -1784,7 +1795,7 @@ fn collect_anchors_at(
             return Err(input_error(
                 CODE_INVALID_REFERENCE,
                 format!("Schema Object $anchor '{name}' is not a valid plain name"),
-                Some(source_id),
+                Some(scan.source_id),
                 Some(&anchor_pointer),
             ));
         }
@@ -1793,14 +1804,14 @@ fn collect_anchors_at(
             return Err(input_error(
                 CODE_INVALID_REFERENCE,
                 format!("duplicate $anchor '{name}' in the same schema resource"),
-                Some(source_id),
+                Some(scan.source_id),
                 Some(&anchor_pointer),
             ));
         }
         identifiers.anchors.insert(
             key,
             NodeLocation {
-                doc_id,
+                doc_id: scan.doc_id,
                 json_pointer: pointer.to_owned(),
             },
         );
@@ -1813,12 +1824,10 @@ fn collect_anchors_at(
                 if child_context != WalkContext::Skip {
                     collect_anchors_at(
                         child,
-                        doc_id,
                         &append_pointer(pointer, name),
                         child_context,
                         base.clone(),
-                        source_id,
-                        claims,
+                        scan,
                         identifiers,
                     )?;
                 }
@@ -1830,12 +1839,10 @@ fn collect_anchors_at(
                 for (index, child) in array.iter().enumerate() {
                     collect_anchors_at(
                         child,
-                        doc_id,
                         &append_pointer_index(pointer, index),
                         child_context,
                         base.clone(),
-                        source_id,
-                        claims,
+                        scan,
                         identifiers,
                     )?;
                 }
@@ -4168,10 +4175,8 @@ mod tests {
 
         collect_anchors(
             &value,
-            DocId(4),
             base.clone(),
-            "entry.yaml",
-            unpinned_claims(&pins),
+            unpinned_scan("entry.yaml", &pins),
             &mut identifiers,
         )
         .expect("invalid IDs should stop only their subtrees");
@@ -4214,35 +4219,29 @@ mod tests {
         );
         collect_anchors_at(
             &json!({ "$anchor": 5 }),
-            DocId(4),
             "",
             WalkContext::Skip,
             base.clone(),
-            "entry.yaml",
-            unpinned_claims(&pins),
+            unpinned_scan("entry.yaml", &pins),
             &mut identifiers,
         )
         .expect("skipped contexts are ignored");
         collect_anchors_at(
             &json!([]),
-            DocId(4),
             "",
             WalkContext::SchemaMap,
             base.clone(),
-            "entry.yaml",
-            unpinned_claims(&pins),
+            unpinned_scan("entry.yaml", &pins),
             &mut identifiers,
         )
         .expect("schema-map arrays are ignored");
         assert_eq!(
             collect_anchors_at(
                 &json!({ "$anchor": 5 }),
-                DocId(4),
                 "",
                 WalkContext::Schema,
                 base,
-                "entry.yaml",
-                unpinned_claims(&pins),
+                unpinned_scan("entry.yaml", &pins),
                 &mut identifiers,
             )
             .expect_err("non-string anchor should fail")
@@ -4252,10 +4251,8 @@ mod tests {
         assert_eq!(
             collect_anchors(
                 &json!({ "allOf": [{ "$anchor": "9bad" }] }),
-                DocId(4),
                 file_url(&directory.path().join("invalid.yaml")).expect("file URL"),
-                "invalid.yaml",
-                unpinned_claims(&pins),
+                unpinned_scan("invalid.yaml", &pins),
                 &mut identifiers,
             )
             .expect_err("array child errors should propagate")
@@ -5261,11 +5258,15 @@ mod tests {
         }
     }
 
-    /// Claims for a document that was read locally, with nothing pinned.
-    fn unpinned_claims(pins: &BTreeMap<String, String>) -> ResourceClaims<'_> {
-        ResourceClaims {
-            pinned: pins,
-            own_uri: None,
+    /// A scan of a locally read document, with nothing pinned.
+    fn unpinned_scan<'a>(source_id: &'a str, pins: &'a BTreeMap<String, String>) -> AnchorScan<'a> {
+        AnchorScan {
+            doc_id: DocId(4),
+            source_id,
+            claims: ResourceClaims {
+                pinned: pins,
+                own_uri: None,
+            },
         }
     }
 
@@ -5916,12 +5917,15 @@ mod tests {
 
         assert!(graph.is_some());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-        assert_eq!(diagnostics[0].code, CODE_UNUSED_PIN);
-        assert_eq!(diagnostics[0].severity, Severity::Warning);
+        // Bound before the assert: indexing inside a message only formatted on failure is a
+        // region the coverage gate counts and no passing run reaches.
+        let reported = &diagnostics[0];
+        assert_eq!(reported.code, CODE_UNUSED_PIN);
+        assert_eq!(reported.severity, Severity::Warning);
         assert!(
-            diagnostics[0].message.contains(UNUSED_URI),
+            reported.message.contains(UNUSED_URI),
             "{}",
-            diagnostics[0].message
+            reported.message
         );
         assert_eq!(fetcher.requests(), [ENTRY_URI]);
     }
