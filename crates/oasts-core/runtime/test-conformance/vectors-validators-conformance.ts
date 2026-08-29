@@ -1072,6 +1072,61 @@ export const cases: readonly ConformanceCase[] = [
     },
   },
 
+  {
+    id: "format:ipv6/dotted-tail",
+    matrixRow: "format:ipv6",
+    validator: "stringFormatsValidator",
+    input: { ipv6: "1:2:3:4:5:6:1.2.3.4" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "format:ipv6/elided-dotted-tail",
+    matrixRow: "format:ipv6",
+    validator: "stringFormatsValidator",
+    input: { ipv6: "::ffff:192.168.0.1" },
+    expected: { verdict: "pass" },
+  },
+  {
+    id: "format:ipv6/dotted-before-elision",
+    matrixRow: "format:ipv6",
+    validator: "stringFormatsValidator",
+    input: { ipv6: "1.2.3.4::1" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "invalid ipv6 format", path: ["ipv6"] }],
+    },
+  },
+  {
+    id: "format:ipv6/dotted-both-sides",
+    matrixRow: "format:ipv6",
+    validator: "stringFormatsValidator",
+    input: { ipv6: "1.2.3.4::5.6.7.8" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "invalid ipv6 format", path: ["ipv6"] }],
+    },
+  },
+  {
+    id: "format:ipv6/dotted-tail-too-many-groups",
+    matrixRow: "format:ipv6",
+    validator: "stringFormatsValidator",
+    input: { ipv6: "1:2:3:4:5:6:7:1.2.3.4" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "invalid ipv6 format", path: ["ipv6"] }],
+    },
+  },
+  {
+    id: "format:ipv6/dotted-quad-alone",
+    matrixRow: "format:ipv6",
+    validator: "stringFormatsValidator",
+    input: { ipv6: "1.2.3.4" },
+    expected: {
+      verdict: "fail",
+      issues: [{ message: "invalid ipv6 format", path: ["ipv6"] }],
+    },
+  },
+
   // --- format:uri (stringFormatsValidator) ---
   {
     id: "format:uri/valid",

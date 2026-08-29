@@ -14,7 +14,7 @@ files:
   - path: fixtures/validators-keyword-matrix.yaml
     sha256: a9e9e23023dd4dbbb1cf127d40cbc1408f6d9ca7df894a4f1820af2c9424153d
   - path: crates/oasts-core/runtime/test-conformance/vectors-validators-conformance.ts
-    sha256: ebe0c29f8c8e4bdc67f6dbe29fa300f4183f9bdbdb959b94f45e2f17a959922a
+    sha256: b70de2e6308b38875d3f186039e9e107cc4eba7e4a9332ccea0ac7c5ed4030c4
   - path: crates/oasts-core/runtime/test-conformance/vectors-zod-conformance.ts
     sha256: 9da25181475b4aff87594e5cc6700f1b2c2925130038177e7291f94079cd8f37
   - path: fixtures/validators-showcase-3.1/openapi.yaml
