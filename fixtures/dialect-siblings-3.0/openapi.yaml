@@ -41,8 +41,9 @@ paths:
                 $ref: "#/components/schemas/ApiKey"
 components:
   schemas:
-    # A discriminated union whose tag property carries `const` beside its `type`. Widening the
-    # whole branch loses the tag and every sibling property with it.
+    # A discriminated union whose tag property carries `const` beside its `type`. It is the tag
+    # property that widens, not the branch around it, and a tag of `unknown` cannot be read at all
+    # — which is what makes the union unusable while every sibling property still looks fine.
     JitAccess:
       oneOf:
         - type: object

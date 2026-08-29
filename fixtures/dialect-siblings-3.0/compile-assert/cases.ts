@@ -40,7 +40,8 @@ type Unavailable = Extract<JitAccess, { unavailableReason: string }>;
 // `const` is dropped rather than reinterpreted: the declared `type: string` is what remains, and
 // it is not the literal the document asked for.
 type AssertUnavailableState = Expect<Equal<Unavailable["state"], string>>;
-// The sibling the whole-object widening used to erase along with the tag.
+// A regression guard rather than a demonstration: the widening never reached this property, and
+// this pins that dropping the tag's `const` does not start reaching it.
 type AssertUnavailableReason = Expect<
   Equal<Unavailable["unavailableReason"], "postgres_upgrade_required" | "temporarily_unavailable">
 >;
@@ -50,8 +51,9 @@ type AssertUnavailableReason = Expect<
 type AssertConjoinedName = Expect<Equal<Conjoined["name"], string>>;
 type AssertConjoinedKind = Expect<Equal<Conjoined["kind"], "direct" | "delegated">>;
 
-// The branch is a real object type, so the union is still narrowable. Against an `unknown` branch
-// this body does not compile.
+// Presence-narrowing over the union, which holds either way because only the tag property widened.
+// The assertion that separates this branch from a whole-node widening is `AssertUnavailableState`
+// above: a tag of `unknown` is a tag no caller can compare, match, or switch on.
 export function unavailableReason(access: JitAccess): string | undefined {
   return "unavailableReason" in access ? access.unavailableReason : undefined;
 }
