@@ -2178,7 +2178,8 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                         node.doc_id,
                         &append_pointer(&node.pointer, keyword),
                         format!(
-                            "schema keyword '{keyword}' requires OpenAPI 3.1 and becomes unknown"
+                            "schema keyword '{keyword}' requires OpenAPI 3.1 and is dropped from \
+                             the emitted type; the schema widens to unknown only where no representable sibling remains"
                         ),
                     ));
                     dialect_unsupported.get_or_insert(keyword);
@@ -2189,7 +2190,8 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     self.unsupported_diagnostic(
                         node.doc_id,
                         &append_pointer(&node.pointer, "type"),
-                        "schema keyword 'type array' requires OpenAPI 3.1 and becomes unknown"
+                        "schema keyword 'type array' requires OpenAPI 3.1 and widens the schema \
+                         to unknown"
                             .to_owned(),
                     ),
                 );
@@ -2261,7 +2263,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             self.sink.push(self.unsupported_diagnostic(
                 node.doc_id,
                 &append_pointer(&node.pointer, keyword),
-                format!("unsupported schema keyword '{keyword}' becomes unknown"),
+                format!(
+                    "unsupported schema keyword '{keyword}' is dropped from the emitted type; \
+                     the schema widens to unknown only where no representable sibling remains"
+                ),
             ));
             if !object.contains_key("$ref")
                 && !object.contains_key("allOf")
@@ -2296,7 +2301,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             self.sink.push(self.unsupported_diagnostic(
                 node.doc_id,
                 &append_pointer(&node.pointer, keyword),
-                format!("unsupported schema keyword '{keyword}' becomes unknown"),
+                format!(
+                    "unsupported schema keyword '{keyword}' is dropped from the emitted type; \
+                     the schema widens to unknown only where no representable sibling remains"
+                ),
             ));
             if !object.contains_key("$ref")
                 && !object.contains_key("allOf")
