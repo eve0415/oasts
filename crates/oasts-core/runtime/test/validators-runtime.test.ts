@@ -340,6 +340,17 @@ describe("isIpv6", () => {
     assert.equal(isIpv6("127.0.0.1"), false);
     assert.equal(isIpv6("1"), false);
   });
+
+  test("accepts a dotted-quad only as the low-order tail", () => {
+    assert.equal(isIpv6("1:2:3:4:5:6:1.2.3.4"), true);
+    assert.equal(isIpv6("::1.2.3.4"), true);
+    assert.equal(isIpv6("1:2::192.168.0.1"), true);
+    assert.equal(isIpv6("1.2.3.4::1"), false);
+    assert.equal(isIpv6("1.2.3.4::"), false);
+    assert.equal(isIpv6("1.2.3.4::2:3"), false);
+    assert.equal(isIpv6("1.2.3.4::5.6.7.8"), false);
+    assert.equal(isIpv6("1:2:3:4:5:6:7:1.2.3.4"), false);
+  });
 });
 
 describe("isHostname", () => {

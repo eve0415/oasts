@@ -246,13 +246,15 @@ export function isIpv4(s: string): boolean {
 const IPV6_GROUP = /^[0-9A-Fa-f]{1,4}$/u;
 
 // Counts the 16-bit groups a colon-separated IPv6 section contributes, or `null` when the section
-// is malformed. A trailing dotted-quad counts as the two groups it encodes (RFC 4291 §2.2 form 3).
-function ipv6Groups(section: string): number | null {
+// is malformed. `dottedTail` admits a closing dotted-quad, counted as the two groups it encodes
+// (RFC 4291 §2.2 form 3). It supplies the low-order 32 bits, so only the section that ends the
+// address may carry one: a dotted-quad ahead of a `::` run is malformed, not relocatable.
+function ipv6Groups(section: string, dottedTail: boolean): number | null {
   const parts = section.split(":");
   let count = 0;
   for (const [index, part] of parts.entries()) {
     if (index === parts.length - 1 && part.includes(".")) {
-      if (!isIpv4(part)) {
+      if (!dottedTail || !isIpv4(part)) {
         return null;
       }
       count += 2;
@@ -273,15 +275,15 @@ function ipv6Groups(section: string): number | null {
 export function isIpv6(s: string): boolean {
   const elision = s.indexOf("::");
   if (elision === -1) {
-    return ipv6Groups(s) === 8;
+    return ipv6Groups(s, true) === 8;
   }
   if (elision !== s.lastIndexOf("::")) {
     return false;
   }
   const head = s.slice(0, elision);
   const tail = s.slice(elision + 2);
-  const headGroups = head === "" ? 0 : ipv6Groups(head);
-  const tailGroups = tail === "" ? 0 : ipv6Groups(tail);
+  const headGroups = head === "" ? 0 : ipv6Groups(head, false);
+  const tailGroups = tail === "" ? 0 : ipv6Groups(tail, true);
   if (headGroups === null || tailGroups === null) {
     return false;
   }
