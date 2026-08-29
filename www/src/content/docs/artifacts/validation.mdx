@@ -117,7 +117,7 @@ Three consequences are worth knowing: a `hostname` label beginning `xn--` passes
 No other string `format` is asserted — `password`, `byte`, `binary` and the `idn-` and `iri-` families are carried as annotations, and reach the generated code only as a doc comment.
 `regex` is among them on purpose: deciding it means compiling a caller-supplied pattern at validation time, which hands untrusted input to the host regular-expression engine, and the verdict would then follow whichever JavaScript engine happens to run the check.
 
-A `format` is asserted only where the schema also declares `type: string`, which is where the emitted narrowing puts the value in a string branch to begin with.
+A `format` is asserted only where `string` is among the schema's declared types, and the check sits inside the string branch of the emitted narrowing — so a nullable string is checked when it holds a string and left alone when it holds `null`, while a schema with no declared type is not checked at all.
 
 ## Discriminators are annotations
 
