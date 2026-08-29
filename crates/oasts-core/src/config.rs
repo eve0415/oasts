@@ -49,6 +49,8 @@ const CODE_TRUST_LIMITS: &str = "OASTS0221";
 const CODE_TYPESCRIPT: &str = "OASTS0251";
 /// The `remote` block. Sits above the highest allocated config code, which stops at 0263.
 const CODE_REMOTE: &str = "OASTS0271";
+/// The `watch` block.
+const CODE_WATCH: &str = "OASTS0261";
 const CODE_CONFIG_READ: &str = "OASTS1001";
 pub(crate) const CODE_WORKSPACE_UNSUPPORTED: &str = "OASTS9002";
 pub(crate) const CODE_BLOCK_UNSUPPORTED: &str = "OASTS9003";
@@ -154,7 +156,7 @@ pub struct RawConfig {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub compat: Option<CompatConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    pub watch: Option<Value>,
+    pub watch: Option<WatchConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub ci: Option<Value>,
 }
@@ -1090,6 +1092,38 @@ pub struct CompatConfig {
     pub deep_object_encoding: DeepObjectEncoding,
 }
 
+/// How `oasts watch` coalesces filesystem events between recompiles.
+///
+/// One key, because one is what the loop has a decision to make about. Everything else a watcher
+/// could expose — which paths it follows, whether a diagnostic ends the session — is answered by
+/// the compiler rather than by the user: the input set is whatever the compile read, and a session
+/// that a typo could end would be worse than no session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "How `oasts watch` coalesces filesystem events between recompiles."
+    )
+)]
+pub struct WatchConfig {
+    /// How long the filesystem must stay quiet before a change is compiled.
+    ///
+    /// Saving one file is several syscalls, and an editor that writes through a temporary file
+    /// makes it several more; without a quiet period each one would start its own compile. Zero
+    /// disables coalescing and compiles on the first event.
+    #[cfg_attr(feature = "json-schema", schemars(range(min = 0, max = 10_000)))]
+    pub debounce_ms: u64,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self { debounce_ms: 100 }
+    }
+}
+
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
@@ -1175,6 +1209,7 @@ pub struct ResolvedConfig {
     pub remote: RemoteConfig,
     pub limits: LimitsConfig,
     pub compat: CompatConfig,
+    pub watch: WatchConfig,
     pub tsconfig: TsconfigSource,
 }
 
@@ -1595,11 +1630,10 @@ pub fn resolve_config(
     let compat = raw.compat.unwrap_or_default();
 
     let remote = resolve_remote(raw.remote, source_path, &mut sink);
+    let watch = raw.watch.unwrap_or_default();
+    validate_watch(&watch, source_path, &mut sink);
 
-    for (present, pointer, name) in [
-        (raw.watch.is_some(), "/watch", "watch"),
-        (raw.ci.is_some(), "/ci", "ci"),
-    ] {
+    for (present, pointer, name) in [(raw.ci.is_some(), "/ci", "ci")] {
         if present {
             sink.push(config_error(
                 CODE_BLOCK_UNSUPPORTED,
@@ -1655,6 +1689,7 @@ pub fn resolve_config(
         remote,
         limits,
         compat,
+        watch,
         tsconfig,
     })
 }
@@ -2590,6 +2625,22 @@ fn validate_limits(limits: &LimitsConfig, source: &Path, sink: &mut DiagnosticSi
                 Some("/limits"),
             ));
         }
+    }
+}
+
+const WATCH_DEBOUNCE_MAX_MS: u64 = 10_000;
+
+fn validate_watch(watch: &WatchConfig, source: &Path, sink: &mut DiagnosticSink) {
+    if watch.debounce_ms > WATCH_DEBOUNCE_MAX_MS {
+        sink.push(config_error(
+            CODE_WATCH,
+            format!(
+                "watch.debounceMs value {} is outside 0..={WATCH_DEBOUNCE_MAX_MS}",
+                watch.debounce_ms
+            ),
+            Some(source),
+            Some("/watch"),
+        ));
     }
 }
 
@@ -4713,7 +4764,7 @@ mod tests {
 
     #[test]
     fn schema_known_unavailable_blocks_report_named_errors() {
-        for name in ["watch", "ci"] {
+        for name in ["ci"] {
             let mut value = valid_json_value();
             value[name] = json!({});
             let diagnostics = assert_code(load_json(&value), CODE_BLOCK_UNSUPPORTED);
@@ -4721,6 +4772,28 @@ mod tests {
                 diagnostic.code == CODE_BLOCK_UNSUPPORTED && diagnostic.message.contains(name)
             }));
         }
+    }
+
+    #[test]
+    fn the_watch_block_defaults_and_bounds_its_debounce() {
+        let resolved = load_json(&valid_json_value()).expect("config resolves");
+        assert_eq!(resolved.watch, WatchConfig::default());
+        assert_eq!(resolved.watch.debounce_ms, 100);
+
+        for debounce in [0, WATCH_DEBOUNCE_MAX_MS] {
+            let mut value = valid_json_value();
+            value["watch"] = json!({ "debounceMs": debounce });
+            let resolved = load_json(&value).expect("boundary debounce resolves");
+            assert_eq!(resolved.watch.debounce_ms, debounce);
+        }
+
+        let mut value = valid_json_value();
+        value["watch"] = json!({ "debounceMs": WATCH_DEBOUNCE_MAX_MS + 1 });
+        assert_code(load_json(&value), CODE_WATCH);
+
+        let mut value = valid_json_value();
+        value["watch"] = json!({ "debounce": 1 });
+        assert_code(load_json(&value), CODE_CONFIG_PARSE);
     }
 
     #[test]
