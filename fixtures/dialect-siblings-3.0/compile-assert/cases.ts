@@ -46,5 +46,7 @@ export function unavailableReason(access: JitAccess): string | undefined {
   return "unavailableReason" in access ? access.unavailableReason : undefined;
 }
 
-// @ts-expect-error a widened node is `unknown`, not `any`: it does not assign without a check.
-export const opaqueDoesNotAssign: string = ({} as ApiKey).opaque;
+export function opaqueDoesNotAssign(key: ApiKey): string {
+  // @ts-expect-error a widened node is `unknown`, not `any`: it does not assign without a check.
+  return key.opaque;
+}
