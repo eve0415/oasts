@@ -70,6 +70,7 @@ Everything the last compile actually read or looked for, which is wider than the
 
 The set is recomputed after every compile, so adding a `$ref` starts watching the file it points at.
 Directories are watched rather than individual files, which is what makes an editor's save-and-rename visible, and events are matched against that set before any of them counts — so the artifacts a run writes never wake the next one.
+When the operating system reports that it lost events without saying which, the session recompiles rather than guessing, because the one thing a watch may not do is serve output that is out of date.
 
 <Aside type="note" title="Two things a session will not pick up">
   A peer package **appearing** where none was installed: the manifest is watched only once one has been found, so `npm install zod` mid-session does not re-run the version check until you restart.
