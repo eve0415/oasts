@@ -149,6 +149,24 @@ pub fn normalize_identifier(input: &str, case: TargetCase) -> Result<String, Nor
     normalize_identifier_allocation(input, case).map(|allocation| allocation.name)
 }
 
+/// Normalizes text for a position that never begins an identifier: an object member always written
+/// through a property-key renderer, or a name fragment another identifier always precedes.
+///
+/// A leading digit is what separates this from [`normalize_identifier`], and only that: `'20100401'`
+/// is a legal property key and `api20100401All` a legal binding, while `20100401` alone is neither.
+/// Every other rejection still applies, and a digit-led identifier can never be a reserved word, so
+/// nothing is left to escape on that branch.
+pub fn normalize_interior_identifier(
+    input: &str,
+    case: TargetCase,
+) -> Result<String, NormalizeError> {
+    match normalize_identifier_allocation(input, case) {
+        Ok(allocation) => Ok(allocation.name),
+        Err(NormalizeError::LeadingDigit) => Ok(transform_tokens(&identifier_tokens(input)?, case)),
+        Err(error) => Err(error),
+    }
+}
+
 fn normalize_identifier_allocation(
     input: &str,
     case: TargetCase,
@@ -3190,6 +3208,31 @@ mod tests {
         assert_eq!(
             normalize_identifier("2fast", TargetCase::Pascal),
             Err(NormalizeError::LeadingDigit)
+        );
+        // The interior variant differs from the one above in exactly one rejection.
+        assert_eq!(
+            normalize_interior_identifier("2fast", TargetCase::Pascal),
+            Ok("2Fast".to_owned())
+        );
+        assert_eq!(
+            normalize_interior_identifier("2010-04-01", TargetCase::Camel),
+            Ok("20100401".to_owned())
+        );
+        assert_eq!(
+            normalize_interior_identifier("pet_status", TargetCase::Camel),
+            Ok("petStatus".to_owned())
+        );
+        assert_eq!(
+            normalize_interior_identifier("class", TargetCase::Camel),
+            Ok("class_".to_owned())
+        );
+        assert_eq!(
+            normalize_interior_identifier("---", TargetCase::Camel),
+            Err(NormalizeError::Empty)
+        );
+        assert_eq!(
+            normalize_interior_identifier("漢字", TargetCase::Camel),
+            Err(NormalizeError::NonAscii('漢'))
         );
         assert_eq!(
             normalize_identifier("class", TargetCase::Camel),
