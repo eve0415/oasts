@@ -12,6 +12,14 @@ Two things in that sentence are load-bearing.
 Your `tsconfig.json` is the only consumer-side file that reaches emitted bytes: it decides whether generated code carries the `esnext.temporal` reference directive, and `typescript.tsconfig: off` drops that dependency.
 And identity is keyed to your document's bytes, not its meaning — reformatting your OpenAPI file with no semantic change shifts the recorded source digest and will drift `--check`.
 
+## A script config is a program
+
+*The same config* is a stronger assumption for `oasts.config.ts` than for `oasts.yaml`.
+The `.yaml` and `.json` forms are data and cannot vary; a `.ts` or `.js` config is a module the CLI imports, so the config for a run is whatever that module returned on that run.
+The CLI imports it exactly once per invocation, so one run is always internally consistent — nothing in the pipeline re-evaluates the module and gets a second answer.
+Across runs it is exactly as stable as what you wrote: a config that reads `Date.now()`, `process.env`, or the network can hand the compiler different values each time, and the output moves with it.
+That is a choice the config makes, not a hole in the contract — determinism is over the config the compiler is given.
+
 ## Commit the output
 
 Generated code is a build artifact you can review in a pull request.
