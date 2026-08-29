@@ -234,6 +234,57 @@ test("the real watcher reports writes, drops directories, and stops on close", a
   assert.deepEqual(await changes.wake(null), { kind: "stopped" });
 });
 
+test("a desynchronized watcher recompiles without a path to blame", async () => {
+  const changes = new Scripted([
+    { kind: "desynchronized" },
+    { kind: "desynchronized" },
+    { kind: "quiet" },
+    { kind: "stopped" },
+  ]);
+  let compiles = 0;
+  const code = await session(
+    changes,
+    () => {
+      compiles += 1;
+      return Promise.resolve(cycle(0, plan(["/w/oasts.yaml"], "/w/out")));
+    },
+    (finished) => finished.exitCode,
+  );
+  assert.equal(code, 0);
+  assert.equal(compiles, 2);
+});
+
+test("a watcher that fails after it was opened is dropped and reported as a lost event", async () => {
+  const opened: Array<{ directory: string; fail: (() => void) | null; closed: boolean }> = [];
+  const changes = new FsChanges((directory) => {
+    const entry = { directory, fail: null as (() => void) | null, closed: false };
+    opened.push(entry);
+    return {
+      on(_event: "error", listener: (error: unknown) => void) {
+        entry.fail = () => {
+          listener(new Error("watcher died"));
+        };
+        return undefined;
+      },
+      close() {
+        entry.closed = true;
+      },
+    };
+  });
+
+  const directory = mkdtempSync(join(tmpdir(), "oasts-watch-"));
+  changes.watch([directory]);
+  assert.equal(opened.length, 1);
+  opened[0]?.fail?.();
+  assert.deepEqual(await changes.wake(null), { kind: "desynchronized" });
+  assert.equal(opened[0]?.closed, true);
+
+  // The directory is no longer watched, so the next registration reopens it.
+  changes.watch([directory]);
+  assert.equal(opened.length, 2);
+  changes.close();
+});
+
 test("the real watcher refuses a directory that is not there", () => {
   const directory = mkdtempSync(join(tmpdir(), "oasts-watch-"));
   const changes = new FsChanges();

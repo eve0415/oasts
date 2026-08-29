@@ -186,13 +186,17 @@ fn render(outcome: Outcome) -> RunResult {
 
 /// Maps the command name the host parsed onto the driver's command.
 ///
-/// `generate` for anything else: the two CLI front ends both constrain the name
-/// before it gets here, so an unknown one is a host-contract error rather than
-/// a diagnostic the product declares.
-fn parse_command(name: &str, check: bool) -> Command {
+/// An unknown name is a broken caller rather than anything a user did, so it
+/// throws instead of becoming an `OASTS` diagnostic: both CLI front ends
+/// constrain the name before it gets here. It must never fall through to
+/// `generate`, which writes.
+fn parse_command(name: &str, check: bool) -> napi::Result<Command> {
     match name {
-        "check" => Command::Check,
-        _ => Command::Generate { check },
+        "generate" => Ok(Command::Generate { check }),
+        "check" => Ok(Command::Check),
+        other => Err(napi::Error::from_reason(format!(
+            "unknown command '{other}'"
+        ))),
     }
 }
 
@@ -207,13 +211,15 @@ pub fn spec_refusal() -> RunResult {
 }
 
 /// Runs `generate` or `check` for one already-discovered config.
+///
+/// Throws for a command name neither front end can produce.
 #[napi]
-pub fn run(options: RunOptions) -> RunResult {
+pub fn run(options: RunOptions) -> napi::Result<RunResult> {
     if !options.specs.is_empty() {
-        return render(driver::refuse(Unsupported::SpecSelection));
+        return Ok(render(driver::refuse(Unsupported::SpecSelection)));
     }
 
-    let command = parse_command(&options.command, options.check);
+    let command = parse_command(&options.command, options.check)?;
     let config_path = Path::new(&options.config_path);
     let source = match options.config_json.as_deref() {
         Some(json) => ConfigSource::Json {
@@ -230,12 +236,12 @@ pub fn run(options: RunOptions) -> RunResult {
     } else {
         Tracking::Off
     };
-    render(driver::run(
+    Ok(render(driver::run(
         command,
         source,
         oasts_fetch::handle(),
         tracking,
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -306,7 +312,7 @@ mod tests {
     fn run_generates_checks_and_reports_drift() {
         let temp = copy_fixture("petstore-3.0");
 
-        let generated = run(options(&temp, "generate", false));
+        let generated = run(options(&temp, "generate", false)).expect("a known command");
         assert_eq!(generated.exit_code, 0, "{}", generated.rendered_stderr);
         assert!(
             generated
@@ -315,11 +321,11 @@ mod tests {
                 .starts_with("generated ")
         );
 
-        let clean = run(options(&temp, "generate", true));
+        let clean = run(options(&temp, "generate", true)).expect("a known command");
         assert_eq!(clean.exit_code, 0, "{}", clean.rendered_stderr);
         assert_eq!(clean.stdout_summary.as_deref(), Some("check ok"));
 
-        let checked = run(options(&temp, "check", false));
+        let checked = run(options(&temp, "check", false)).expect("a known command");
         assert_eq!(checked.exit_code, 0, "{}", checked.rendered_stderr);
         assert_eq!(checked.stdout_summary.as_deref(), Some("check ok"));
 
@@ -329,7 +335,7 @@ mod tests {
         .expect("manifest JSON");
         let edited = manifest["files"][0].as_str().expect("generated path");
         fs::write(temp.path().join("generated").join(edited), "edited\n").expect("edit output");
-        let drifted = run(options(&temp, "generate", true));
+        let drifted = run(options(&temp, "generate", true)).expect("a known command");
         assert_eq!(drifted.exit_code, 1);
         assert!(drifted.stdout_summary.is_none());
         assert!(drifted.rendered_stderr.contains("edited:"));
@@ -339,7 +345,7 @@ mod tests {
             "not JSON\n",
         )
         .expect("invalid manifest");
-        let invalid_manifest = run(options(&temp, "generate", true));
+        let invalid_manifest = run(options(&temp, "generate", true)).expect("a known command");
         assert_eq!(invalid_manifest.exit_code, 2);
         assert!(invalid_manifest.rendered_stderr.contains("OASTS1011"));
     }
@@ -363,7 +369,7 @@ mod tests {
             r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated","filters":{"orphans":true}}"#
                 .to_owned(),
         );
-        let result = run(options);
+        let result = run(options).expect("a known command");
         assert_eq!(result.exit_code, 0, "{}", result.rendered_stderr);
         assert!(result.rendered_stderr.contains("warning[OASTS4202]"));
         assert_eq!(result.diagnostics[0].severity, "warning");
@@ -373,14 +379,14 @@ mod tests {
     #[test]
     fn run_reports_load_spec_and_write_failures() {
         let missing = tempfile::tempdir().expect("tempdir");
-        let load_failure = run(options(&missing, "generate", false));
+        let load_failure = run(options(&missing, "generate", false)).expect("a known command");
         assert_eq!(load_failure.exit_code, 2);
         assert_eq!(load_failure.diagnostics[0].code, "OASTS0011");
 
         let temp = copy_fixture("petstore-3.0");
         let mut with_spec = options(&temp, "generate", false);
         with_spec.specs = vec!["petstore".to_owned()];
-        let spec_failure = run(with_spec);
+        let spec_failure = run(with_spec).expect("a known command");
         assert_eq!(spec_failure.exit_code, 2);
         assert_eq!(spec_failure.diagnostics[0].code, "OASTS9002");
 
@@ -390,12 +396,18 @@ mod tests {
             "openapi: '2.0'\ninfo: { title: Invalid, version: 1.0.0 }\npaths: {}\n",
         )
         .expect("invalid input");
-        let input_failure = run(options(&compile_failure, "generate", false));
+        let input_failure =
+            run(options(&compile_failure, "generate", false)).expect("a known command");
         assert_eq!(input_failure.exit_code, 1);
         assert!(input_failure.rendered_stderr.contains("OASTS2101"));
 
         let hostile = copy_fixture("petstore-3.0");
-        assert_eq!(run(options(&hostile, "generate", false)).exit_code, 0);
+        assert_eq!(
+            run(options(&hostile, "generate", false))
+                .expect("a known command")
+                .exit_code,
+            0
+        );
         let output = hostile.path().join("generated");
         let manifest: serde_json::Value = serde_json::from_slice(
             &fs::read(output.join(".oasts-manifest.json")).expect("manifest"),
@@ -408,7 +420,7 @@ mod tests {
             r#"{"manifestVersion":1,"files":["../victim.ts"]}"#,
         )
         .expect("hostile manifest");
-        let write_failure = run(options(&hostile, "generate", false));
+        let write_failure = run(options(&hostile, "generate", false)).expect("a known command");
         assert_eq!(write_failure.exit_code, 2);
         assert!(write_failure.rendered_stderr.contains("error["));
     }
@@ -420,6 +432,16 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(&failure_reason(0, &[warning])).expect("JSON reason");
         assert_eq!(payload["diagnostics"][0]["severity"], "warning");
+    }
+
+    #[test]
+    fn an_unknown_command_throws_rather_than_writing() {
+        let temp = copy_fixture("petstore-3.0");
+        let Err(error) = run(options(&temp, "chekc", false)) else {
+            panic!("a misspelled command must not run");
+        };
+        assert!(error.reason.contains("unknown command 'chekc'"), "{error}");
+        assert!(!temp.path().join("generated").exists());
     }
 
     #[test]
@@ -476,7 +498,7 @@ mod tests {
     #[test]
     fn run_surfaces_the_zod_peer_warning_on_the_write_path() {
         let temp = project_with_outdated_zod();
-        let generated = run(options(&temp, "generate", false));
+        let generated = run(options(&temp, "generate", false)).expect("a known command");
         assert_eq!(generated.exit_code, 0, "{}", generated.rendered_stderr);
         assert!(
             generated
@@ -492,7 +514,7 @@ mod tests {
     #[test]
     fn successful_generate_keeps_structured_and_rendered_warning_order_aligned() {
         let temp = project_with_outdated_zod();
-        let generated = run(options(&temp, "generate", false));
+        let generated = run(options(&temp, "generate", false)).expect("a known command");
         assert_eq!(generated.exit_code, 0, "{}", generated.rendered_stderr);
 
         let structured_codes = generated
@@ -516,14 +538,19 @@ mod tests {
     #[test]
     fn run_keeps_the_zod_peer_warning_when_the_write_fails() {
         let temp = project_with_outdated_zod();
-        assert_eq!(run(options(&temp, "generate", false)).exit_code, 0);
+        assert_eq!(
+            run(options(&temp, "generate", false))
+                .expect("a known command")
+                .exit_code,
+            0
+        );
         fs::write(
             temp.path().join("generated/.oasts-manifest.json"),
             r#"{"manifestVersion":2,"files":[]}"#,
         )
         .expect("unsupported manifest");
 
-        let failed = run(options(&temp, "generate", false));
+        let failed = run(options(&temp, "generate", false)).expect("a known command");
 
         assert_eq!(failed.exit_code, 2, "{}", failed.rendered_stderr);
         for code in ["OASTS1011", "OASTS0241"] {
@@ -541,9 +568,14 @@ mod tests {
     #[test]
     fn run_omits_the_zod_peer_warning_in_check_mode() {
         let temp = project_with_outdated_zod();
-        assert_eq!(run(options(&temp, "generate", false)).exit_code, 0);
+        assert_eq!(
+            run(options(&temp, "generate", false))
+                .expect("a known command")
+                .exit_code,
+            0
+        );
 
-        let checked = run(options(&temp, "generate", true));
+        let checked = run(options(&temp, "generate", true)).expect("a known command");
         assert_eq!(checked.exit_code, 0, "{}", checked.rendered_stderr);
         assert!(
             !checked

@@ -18,7 +18,6 @@
  */
 
 import { statSync, watch as watchDirectory } from "node:fs";
-import type { FSWatcher } from "node:fs";
 import { dirname, join, sep } from "node:path";
 
 import { loadScriptConfig } from "./config/load.ts";
@@ -43,8 +42,22 @@ export interface Cycle {
 /** What a change source reported. */
 export type Wake =
   | { readonly kind: "changed"; readonly path: string }
+  /** Events were lost and the watcher cannot say which. Everything it was watching is suspect. */
+  | { readonly kind: "desynchronized" }
   | { readonly kind: "quiet" }
   | { readonly kind: "stopped" };
+
+/** The part of a directory watcher this module uses. */
+export interface Watcher {
+  on(event: "error", listener: (error: unknown) => void): unknown;
+  close(): void;
+}
+
+/** Opens one non-recursive directory watcher, or throws if it cannot. */
+export type OpenWatcher = (
+  directory: string,
+  listener: (event: string, filename: string | null) => void,
+) => Watcher;
 
 /**
  * Where a session's change notifications come from.
@@ -62,12 +75,22 @@ export interface Changes {
   close(): void;
 }
 
-/** The real filesystem, through one non-recursive watcher per directory. */
+/**
+ * The real filesystem, through one non-recursive watcher per directory.
+ *
+ * `open` exists because a watcher that fails *after* it was created reports through an event, and
+ * an event no test can raise is a recovery path no test can check.
+ */
 export class FsChanges implements Changes {
-  #watchers = new Map<string, FSWatcher>();
-  #pending: string[] = [];
+  #open: OpenWatcher;
+  #watchers = new Map<string, Watcher>();
+  #pending: Wake[] = [];
   #waiting: ((wake: Wake) => void) | null = null;
   #stopped = false;
+
+  constructor(open: OpenWatcher = watchDirectory) {
+    this.#open = open;
+  }
 
   watch(directories: readonly string[]): void {
     const wanted = new Set(directories);
@@ -81,13 +104,28 @@ export class FsChanges implements Changes {
       if (this.#watchers.has(directory)) {
         continue;
       }
-      const watcher = watchDirectory(directory, (_event, filename) => {
+      const watcher = this.#open(directory, (_event, filename) => {
         if (filename !== null) {
-          this.#deliver(join(directory, filename));
+          this.#deliver({ kind: "changed", path: join(directory, filename) });
         }
+      });
+      watcher.on("error", () => {
+        this.forget(directory);
       });
       this.#watchers.set(directory, watcher);
     }
+  }
+
+  /**
+   * Drops a watcher that failed after it was created, and tells the session to recompile blind.
+   *
+   * Whatever that watcher missed is unknowable, and the next `watch` reopens the directory — or
+   * throws, which ends the session rather than leaving it watching nothing.
+   */
+  forget(directory: string): void {
+    this.#watchers.get(directory)?.close();
+    this.#watchers.delete(directory);
+    this.#deliver({ kind: "desynchronized" });
   }
 
   wake(quietMs: number | null): Promise<Wake> {
@@ -96,7 +134,7 @@ export class FsChanges implements Changes {
     }
     const next = this.#pending.shift();
     if (next !== undefined) {
-      return Promise.resolve({ kind: "changed", path: next });
+      return Promise.resolve(next);
     }
     return new Promise<Wake>((resolve) => {
       const timer =
@@ -126,13 +164,13 @@ export class FsChanges implements Changes {
     this.#waiting?.({ kind: "stopped" });
   }
 
-  #deliver(path: string): void {
+  #deliver(wake: Wake): void {
     const waiting = this.#waiting;
     if (waiting === null) {
-      this.#pending.push(path);
+      this.#pending.push(wake);
       return;
     }
-    waiting({ kind: "changed", path });
+    waiting(wake);
   }
 }
 
@@ -217,7 +255,7 @@ async function waitForChange(
     if (wake.kind === "stopped") {
       return false;
     }
-    if (wake.kind === "quiet" || !watched.triggers(wake.path)) {
+    if (wake.kind === "quiet" || (wake.kind === "changed" && !watched.triggers(wake.path))) {
       continue;
     }
     for (;;) {

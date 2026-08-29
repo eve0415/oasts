@@ -32,6 +32,8 @@ const CODE_WATCH_IO: &str = "OASTS1031";
 pub(crate) enum Wake {
     /// One path the filesystem reported an event for.
     Changed(PathBuf),
+    /// Events were lost and the watcher cannot say which. Everything it was watching is suspect.
+    Desynchronized,
     /// Nothing arrived. Asked with a deadline this means the tree went quiet; asked without one it
     /// only means the source has nothing yet and should be asked again.
     Quiet,
@@ -61,13 +63,40 @@ const fn changes_content(kind: EventKind) -> bool {
     !matches!(kind, EventKind::Access(_))
 }
 
+/// What one raw watcher event means to a session.
+///
+/// The two failure shapes both mean the same thing here. A kernel queue that overflowed arrives as
+/// an event flagged for rescan and carrying no paths at all, and a watcher that could not read its
+/// own queue arrives as an error; either way some change happened and nobody can say which file it
+/// was. Dropping those would be the one outcome a watch may not have — silently serving output
+/// that is out of date — so both recompile blind.
+fn signals(event: notify::Result<notify::Event>) -> Vec<Signal> {
+    let Ok(event) = event else {
+        return vec![Signal::Desynchronized];
+    };
+    if event.need_rescan() {
+        return vec![Signal::Desynchronized];
+    }
+    if !changes_content(event.kind) {
+        return Vec::new();
+    }
+    event.paths.into_iter().map(Signal::Changed).collect()
+}
+
+/// One thing the watcher told the session.
+#[derive(Debug)]
+enum Signal {
+    Changed(PathBuf),
+    Desynchronized,
+}
+
 /// The real filesystem, through one recursive-off watcher per session.
 pub(crate) struct FsChanges {
     /// Kept as the result it came back as, rather than reported at construction: a watcher that
     /// could not be created and a directory that cannot be watched are the same failure to the
     /// session, and answering both from [`Changes::watch`] leaves it one way to fail.
     watcher: notify::Result<RecommendedWatcher>,
-    events: Receiver<PathBuf>,
+    events: Receiver<Signal>,
     watched: BTreeSet<PathBuf>,
 }
 
@@ -75,13 +104,9 @@ impl FsChanges {
     fn new() -> Self {
         let (sender, events) = mpsc::channel();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            // A dropped receiver means the session is over; there is nothing to report it to.
-            if let Ok(event) = event
-                && changes_content(event.kind)
-            {
-                for path in event.paths {
-                    let _ = sender.send(path);
-                }
+            for signal in signals(event) {
+                // A dropped receiver means the session is over; there is nothing to report it to.
+                let _ = sender.send(signal);
             }
         });
         Self {
@@ -121,7 +146,8 @@ impl Changes for FsChanges {
                 .map_err(|_| RecvTimeoutError::Disconnected),
         };
         match received {
-            Ok(path) => Wake::Changed(path),
+            Ok(Signal::Changed(path)) => Wake::Changed(path),
+            Ok(Signal::Desynchronized) => Wake::Desynchronized,
             Err(RecvTimeoutError::Timeout) => Wake::Quiet,
             Err(RecvTimeoutError::Disconnected) => Wake::Stopped,
         }
@@ -199,20 +225,20 @@ fn nearest_existing_directory(from: &Path) -> Option<PathBuf> {
 /// edit landing while a compile runs queues behind it rather than starting a second one.
 fn wait(watched: &Watched, changes: &mut dyn Changes, quiet: Duration) -> bool {
     loop {
-        match changes.wake(None) {
+        let triggered = match changes.wake(None) {
             Wake::Stopped => return false,
-            Wake::Quiet => {}
-            Wake::Changed(path) => {
-                if !watched.triggers(&path) {
-                    continue;
-                }
-                loop {
-                    match changes.wake(Some(quiet)) {
-                        Wake::Changed(_) => {}
-                        Wake::Quiet => return true,
-                        Wake::Stopped => return false,
-                    }
-                }
+            Wake::Quiet => false,
+            Wake::Desynchronized => true,
+            Wake::Changed(path) => watched.triggers(&path),
+        };
+        if !triggered {
+            continue;
+        }
+        loop {
+            match changes.wake(Some(quiet)) {
+                Wake::Changed(_) | Wake::Desynchronized => {}
+                Wake::Quiet => return true,
+                Wake::Stopped => return false,
             }
         }
     }
@@ -533,6 +559,48 @@ mod tests {
     }
 
     #[test]
+    fn lost_events_and_watcher_errors_both_mean_recompile_blind() {
+        let modified = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(PathBuf::from("/w/oasts.yaml"));
+        assert!(matches!(
+            signals(Ok(modified)).as_slice(),
+            [Signal::Changed(path)] if path == Path::new("/w/oasts.yaml")
+        ));
+
+        let read = notify::Event::new(EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(PathBuf::from("/w/oasts.yaml"));
+        assert!(signals(Ok(read)).is_empty());
+
+        // What the kernel sends when its queue overflowed: no paths, and a flag saying so.
+        let overflowed = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        assert!(matches!(
+            signals(Ok(overflowed)).as_slice(),
+            [Signal::Desynchronized]
+        ));
+
+        assert!(matches!(
+            signals(Err(notify::Error::generic("queue read failed"))).as_slice(),
+            [Signal::Desynchronized]
+        ));
+    }
+
+    #[test]
+    fn a_desynchronized_watcher_recompiles_without_a_path_to_blame() {
+        let mut watched = Watched::default();
+        watched.absorb(&plan(&["/w/oasts.yaml"], Some("/w/out"), 5), true);
+        let mut changes = Scripted {
+            wakes: VecDeque::from(vec![
+                Wake::Desynchronized,
+                Wake::Desynchronized,
+                Wake::Quiet,
+            ]),
+            ..Scripted::default()
+        };
+        assert!(wait(&watched, &mut changes, Duration::from_millis(5)));
+        assert!(changes.wakes.is_empty());
+    }
+
+    #[test]
     fn the_real_watcher_refuses_a_directory_that_is_not_there() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut changes = FsChanges::new();
@@ -565,7 +633,7 @@ mod tests {
 
     #[test]
     fn a_disconnected_source_stops_the_session() {
-        let (sender, events) = mpsc::channel::<PathBuf>();
+        let (sender, events) = mpsc::channel::<Signal>();
         drop(sender);
         let mut changes = FsChanges {
             // Waking never touches the watcher, and a real one here would be an event handler no
@@ -580,7 +648,7 @@ mod tests {
 
     #[test]
     fn a_watcher_that_could_not_be_created_is_reported_as_a_watch_failure() {
-        let (_sender, events) = mpsc::channel::<PathBuf>();
+        let (_sender, events) = mpsc::channel::<Signal>();
         let mut changes = FsChanges {
             watcher: Err(notify::Error::generic("no watchers left")),
             events,
@@ -590,6 +658,18 @@ mod tests {
             .watch(&[PathBuf::from("/")])
             .expect_err("no watcher, no watch");
         assert!(reason.contains("no watchers left"), "{reason}");
+    }
+
+    #[test]
+    fn a_lost_event_reaches_the_session_through_the_real_source() {
+        let (sender, events) = mpsc::channel::<Signal>();
+        sender.send(Signal::Desynchronized).expect("queued signal");
+        let mut changes = FsChanges {
+            watcher: Err(notify::Error::generic("unused")),
+            events,
+            watched: BTreeSet::new(),
+        };
+        assert!(matches!(changes.wake(None), Wake::Desynchronized));
     }
 
     #[test]
