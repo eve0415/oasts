@@ -112,10 +112,11 @@ test("native module load failure exits 2 through the spawned bin", () => {
   assert.match(result.stderr, /error\[OASTS1023\]: native module load failed:/);
 });
 
-test("the standalone Rust binary still rejects script configs with OASTS9001", () => {
+test("the standalone Rust binary refuses script configs and points at the Node CLI", () => {
   const directory = mkdtempSync(join(tmpdir(), "oasts-e2e-rust-script-"));
   writeFileSync(join(directory, "oasts.config.ts"), "export default {};\n");
   const result = spawnSync(RUST_BIN, ["generate"], { cwd: directory, encoding: "utf8" });
   assert.equal(result.status, 2);
-  assert.match(result.stderr, /error\[OASTS9001\]/);
+  assert.match(result.stderr, /error\[OASTS0011\]: evaluating a TypeScript\/JavaScript config/);
+  assert.match(result.stderr, /run the oasts Node CLI/);
 });
