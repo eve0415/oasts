@@ -541,14 +541,30 @@ fn allocate_flat_names(
             continue;
         }
         if let Some((other, other_key)) = claimed.get(&node.base) {
-            registrar.sink.push(source_diagnostic(
-                CODE_SEGMENT_COLLISION,
+            // One entry reaching both branches is not two names fighting: `pathSegments` is keyed
+            // by raw segment text globally, so a single `x` entry renames every `x` in the document
+            // and cannot separate two of them. Telling the reader to rename one of the two would be
+            // an instruction nothing can carry out — the segment that can separate the paths is the
+            // one above, where their addresses diverge.
+            let message = if other_key == &key {
+                format!(
+                    "naming.overrides.pathSegments key '{key}' names the segment in both '/{}' and '/{}', and both compose the binding '{}' — one entry renames every segment with that text, so the two paths have to be told apart above it{}",
+                    other.address.join("/"),
+                    node.address.join("/"),
+                    node.base,
+                    divergence_remedy(&node.address, &other.address),
+                )
+            } else {
                 format!(
                     "naming.overrides.pathSegments keys '{other_key}' and '{key}' both bind '{}', for paths '/{}' and '/{}' — one of them has to name something else",
                     node.base,
                     other.address.join("/"),
                     node.address.join("/"),
-                ),
+                )
+            };
+            registrar.sink.push(source_diagnostic(
+                CODE_SEGMENT_COLLISION,
+                message,
                 &node.source,
             ));
             continue;
@@ -3431,6 +3447,60 @@ paths:
             "{refusal:?}"
         );
         assert_eq!(keys.matches("export const apiPRAll").count(), 1, "{keys}");
+    }
+
+    #[test]
+    fn one_entry_reaching_two_branches_names_the_segment_that_separates_them() {
+        // `pathSegments` is keyed by raw segment text globally, so the single `x` entry names the
+        // last segment of both paths and cannot rename one of them. The refusal has to point at
+        // the segment where the two addresses diverge, which is the only one that tells them apart.
+        const SHARED: &str = r#"
+openapi: 3.1.0
+info:
+  title: One entry, two branches
+  version: 1.0.0
+paths:
+  /foo/bar/x:
+    get:
+      operationId: readNested
+      responses:
+        '200':
+          description: ok
+  /foo-bar/x:
+    get:
+      operationId: readFlat
+      responses:
+        '200':
+          description: ok
+"#;
+        let config = format!("{CONFIG}naming:\n  overrides:\n    pathSegments:\n      x: common\n");
+        let (keys, diagnostics) = keys_for(SHARED, &config);
+        let refusal = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_SEGMENT_COLLISION)
+            .expect("one entry reaching two branches reported");
+        assert_eq!(refusal.severity, Severity::Error);
+        assert!(
+            refusal.message.contains(
+                "naming.overrides.pathSegments key 'x' names the segment in both '/foo/bar/x' and '/foo-bar/x'"
+            ),
+            "{refusal:?}"
+        );
+        // The entry that cannot separate them must not be the one the message asks the reader to
+        // change; the divergent segment is.
+        assert!(
+            refusal
+                .message
+                .contains("`naming.overrides.pathSegments: { \"foo-bar\": \"<distinctName>\" }`"),
+            "{refusal:?}"
+        );
+        assert!(!refusal.message.contains("keys 'x' and 'x'"), "{refusal:?}");
+        // The first branch keeps the name it asked for; the second binds nothing.
+        assert_eq!(
+            keys.matches("export const apiFooBarCommonAll").count(),
+            1,
+            "{keys}"
+        );
     }
 
     #[test]
