@@ -160,8 +160,11 @@ impl SegmentKind {
 
     /// The member name this segment contributes, before any override is applied.
     ///
-    /// Derived from the parameter's allocated identifier rather than from the wire name again, so
-    /// the two cannot drift.
+    /// A parameter's member is spelled from the identifier [`KeyParameter::allocate`] derives
+    /// rather than from the wire name again, so the two agree on how the name is normalized. They
+    /// are still separate allocations and can end up spelled differently: `/tenants/{user_id}/
+    /// sites/{userId}` gives the second segment the member `byUserId` while its argument, which
+    /// competes with the first segment's, becomes `userId2`.
     fn derived_member(&self) -> Result<String, String> {
         match self {
             Self::Literal(text) => normalize_interior_identifier(text, TargetCase::Camel)
