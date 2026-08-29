@@ -91,7 +91,7 @@ All errors, all exit `2`.
 | `OASTS2105` | warning | A lowercase status range (`4xx`) — canonicalized and reported, not rejected |
 | `OASTS2106` | error | Two keys in one responses object naming the same status once canonicalized |
 | `OASTS2107` | warning | Pruning removed every component schema and no operation survived either |
-| `OASTS2201` | warning | A schema construct this OpenAPI version does not define — a 3.1-only keyword in a 3.0 document, a boolean schema in 3.0, a parameter with neither `schema` nor `content`. The type widens to `unknown` |
+| `OASTS2201` | warning | A schema construct this OpenAPI version does not define — a 3.1-only keyword in a 3.0 document, a boolean schema in 3.0, a parameter with neither `schema` nor `content`. The construct is dropped; the type widens to `unknown` only where no representable sibling remains |
 | `OASTS2205` | warning | A narrowing keyword the emitted TypeScript cannot apply, where the leaf does *not* widen to `unknown`. The validators artifact enforces it instead |
 | `OASTS2215` | error | A `$recursiveRef` written with a value other than `"#"` |
 | `OASTS2216` | warning | A `$dynamicRef` or `$recursiveRef` whose target genuinely depends on the path evaluation took to reach it |
