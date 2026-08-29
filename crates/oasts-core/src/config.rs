@@ -1697,7 +1697,9 @@ fn resolve_remote(
         let Some(key) = retrievable_uri(uri) else {
             sink.push(config_error(
                 CODE_REMOTE,
-                format!("remote.integrity key '{uri}' must be an absolute http(s) URI with no fragment"),
+                format!(
+                    "remote.integrity key '{uri}' must be an absolute http(s) URI with no fragment"
+                ),
                 Some(source),
                 Some("/remote/integrity"),
             ));
@@ -4658,7 +4660,8 @@ mod tests {
 
         let mut declared = valid_json_value();
         declared["remote"] = json!({});
-        let resolved = load_json(&declared).expect("an empty remote block resolves to the defaults");
+        let resolved =
+            load_json(&declared).expect("an empty remote block resolves to the defaults");
         assert_eq!(resolved.remote, RemoteConfig::default());
     }
 
@@ -4741,7 +4744,10 @@ mod tests {
         let resolved = load_json(&value).expect("integrity entries resolve");
 
         assert_eq!(
-            resolved.remote.integrity.get("https://specs.example.test/openapi.yaml"),
+            resolved
+                .remote
+                .integrity
+                .get("https://specs.example.test/openapi.yaml"),
             Some(&digest)
         );
     }
@@ -4772,8 +4778,11 @@ mod tests {
         let mut value = valid_json_value();
         assert!(
             require_no_remote(
-                &parse_config_json(Path::new("/workspace/oasts.json"), value.to_string().as_bytes())
-                    .expect("config parses"),
+                &parse_config_json(
+                    Path::new("/workspace/oasts.json"),
+                    value.to_string().as_bytes()
+                )
+                .expect("config parses"),
                 Path::new("/workspace/oasts.json"),
             )
             .is_ok()
@@ -4781,8 +4790,11 @@ mod tests {
 
         value["remote"] = json!({ "allowHosts": ["specs.example.test"] });
         let diagnostic = require_no_remote(
-            &parse_config_json(Path::new("/workspace/oasts.json"), value.to_string().as_bytes())
-                .expect("config parses"),
+            &parse_config_json(
+                Path::new("/workspace/oasts.json"),
+                value.to_string().as_bytes(),
+            )
+            .expect("config parses"),
             Path::new("/workspace/oasts.json"),
         )
         .expect_err("a host with no network refuses the block");

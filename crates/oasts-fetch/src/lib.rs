@@ -88,28 +88,27 @@ mod tests {
     /// produce — a redirect with no `Location`, a header value that is not text — and they must
     /// never reach a network. `127.0.0.1:0` also puts every test on an ephemeral port, which is
     /// what proves the allowlist matches on the host and admits any port on it.
-    fn serving(response: &'static [u8], connections: usize) -> String {
+    fn serving(response: &'static [u8], connections: usize) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral loopback port");
         let address = listener.local_addr().expect("the bound address");
-        thread::spawn(move || {
+        let server = thread::spawn(move || {
             for _ in 0..connections {
                 let (mut stream, _) = listener.accept().expect("a client connects");
                 drain_request(&mut stream);
                 let _ = stream.write_all(response);
             }
         });
-        format!("http://{address}/openapi.yaml")
+        // Handed back so every test joins its server: a thread still running at process exit has
+        // not flushed its coverage counters, which is what makes a 100% line gate flap.
+        (format!("http://{address}/openapi.yaml"), server)
     }
 
     /// Reads the request head so the client is not answered before it has finished asking.
     fn drain_request(stream: &mut TcpStream) {
         let mut head = Vec::new();
         let mut byte = [0_u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            match stream.read(&mut byte) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => head.push(byte[0]),
-            }
+        while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+            head.push(byte[0]);
         }
     }
 
@@ -122,7 +121,7 @@ mod tests {
 
     #[test]
     fn a_two_hundred_answers_with_the_body() {
-        let url = serving(
+        let (url, server) = serving(
             b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\nopenapi: 3.1.1\n",
             1,
         );
@@ -131,11 +130,12 @@ mod tests {
             HttpFetcher.fetch_once(&url, &policy(1 << 20)),
             Ok(FetchStep::Body(b"openapi: 3.1.1\n".to_vec()))
         );
+        server.join().expect("the server thread finishes");
     }
 
     #[test]
     fn a_redirect_is_reported_rather_than_followed() {
-        let url = serving(
+        let (url, server) = serving(
             b"HTTP/1.1 302 Found\r\nLocation: /moved.yaml\r\nContent-Length: 0\r\n\r\n",
             1,
         );
@@ -144,11 +144,12 @@ mod tests {
             HttpFetcher.fetch_once(&url, &policy(1 << 20)),
             Ok(FetchStep::Redirect("/moved.yaml".to_owned()))
         );
+        server.join().expect("the server thread finishes");
     }
 
     #[test]
     fn a_redirect_with_no_location_is_a_failure_naming_the_status() {
-        let url = serving(b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n", 1);
+        let (url, server) = serving(b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n", 1);
 
         let error = HttpFetcher
             .fetch_once(&url, &policy(1 << 20))
@@ -156,11 +157,12 @@ mod tests {
 
         assert!(error.contains("302"), "{error}");
         assert!(error.contains("no Location header"), "{error}");
+        server.join().expect("the server thread finishes");
     }
 
     #[test]
     fn a_location_that_is_not_text_is_reported() {
-        let url = serving(
+        let (url, server) = serving(
             b"HTTP/1.1 302 Found\r\nLocation: \xff\xfe\r\nContent-Length: 0\r\n\r\n",
             1,
         );
@@ -170,22 +172,24 @@ mod tests {
             .expect_err("a Location that is not text");
 
         assert!(error.contains("Location header is not text"), "{error}");
+        server.join().expect("the server thread finishes");
     }
 
     #[test]
     fn a_status_that_is_not_two_hundred_is_reported_as_the_server_wrote_it() {
-        let url = serving(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n", 1);
+        let (url, server) = serving(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n", 1);
 
         let error = HttpFetcher
             .fetch_once(&url, &policy(1 << 20))
             .expect_err("a document that is not there");
 
         assert!(error.contains("404"), "{error}");
+        server.join().expect("the server thread finishes");
     }
 
     #[test]
     fn a_body_over_the_cap_is_abandoned() {
-        let url = serving(
+        let (url, server) = serving(
             b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\nopenapi: 3.1.1\n",
             1,
         );
@@ -195,6 +199,7 @@ mod tests {
             .expect_err("a body larger than the cap");
 
         assert!(error.contains("body could not be read"), "{error}");
+        server.join().expect("the server thread finishes");
     }
 
     #[test]
@@ -214,7 +219,7 @@ mod tests {
     fn a_server_that_never_answers_hits_the_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral loopback port");
         let address = listener.local_addr().expect("the bound address");
-        thread::spawn(move || {
+        let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("a client connects");
             // Held open, unanswered, until the process exits.
             std::mem::forget(stream);
@@ -231,6 +236,7 @@ mod tests {
             .expect_err("a server that never answers");
 
         assert!(error.contains("the request failed"), "{error}");
+        server.join().expect("the server thread finishes");
     }
 
     #[test]

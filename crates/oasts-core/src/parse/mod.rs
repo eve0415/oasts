@@ -4599,8 +4599,8 @@ mod tests {
     use crate::ir::{ParamStyle, SecKind};
     use crate::loader::load_graph;
     use crate::pipeline::compile as compile_pipeline;
-    use crate::source::FetcherHandle;
     use crate::semantic::{TargetCase, normalize_identifier};
+    use crate::source::FetcherHandle;
 
     #[test]
     fn schema_meta_fast_reject_distinguishes_structural_and_metadata_keys() {
@@ -9177,7 +9177,8 @@ mod tests {
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let files = compile_pipeline(&resolved, FetcherHandle::None, true, &mut sink).expect("generated files");
+        let files = compile_pipeline(&resolved, FetcherHandle::None, true, &mut sink)
+            .expect("generated files");
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         let client = files
             .iter()

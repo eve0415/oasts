@@ -10,8 +10,8 @@ use oasts_core::ir::Ir;
 use oasts_core::loader::{DocumentGraph, load_graph as run_load_graph};
 use oasts_core::parse::parse as run_parse;
 use oasts_core::pipeline::compile as run_compile;
-use oasts_core::source::FetcherHandle;
 use oasts_core::semantic::{Analyzed, analyze as run_analyze};
+use oasts_core::source::FetcherHandle;
 use oasts_core::writer::{check_drift as run_check_drift, write as run_write};
 
 const SAMPLE_COUNT: u32 = 10;

@@ -202,7 +202,8 @@ mod tests {
                 .expect("config");
 
             let mut sink = DiagnosticSink::new();
-            let from_disk = compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
+            let from_disk =
+                compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
             assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
 
             let in_memory = compile_in_memory(&spec, &config_json).expect("emitted files");
@@ -287,6 +288,34 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_block_is_refused_by_a_host_that_cannot_reach_the_network() {
+        let mut raw = shared_config();
+        raw["remote"] = json!({ "allowHosts": ["specs.example.test"] });
+        let config_json = serde_json::to_vec(&raw).expect("config JSON");
+
+        let diagnostics = compile_in_memory(b"openapi: 3.1.1\n", &config_json)
+            .expect_err("retrieval this host cannot perform is refused");
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, "OASTS0271");
+    }
+
+    #[test]
+    fn a_retrievable_entry_is_refused_by_a_host_that_cannot_reach_the_network() {
+        let mut raw = shared_config();
+        raw["input"] = json!({ "url": "https://specs.example.test/openapi.yaml" });
+        let config_json = serde_json::to_vec(&raw).expect("config JSON");
+
+        let diagnostics = compile_in_memory(b"openapi: 3.1.1\n", &config_json)
+            .expect_err("a retrievable entry is refused");
+
+        // Nothing authorizes the host, so the refusal is about authorization rather than about
+        // the capability: the more specific answer wins wherever both are true.
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, "OASTS2021");
+    }
+
+    #[test]
     fn config_bytes_that_are_not_json_come_back_as_one_diagnostic() {
         let diagnostics = compile_in_memory(b"openapi: 3.1.1\n", b"{not json")
             .expect_err("config bytes that are not JSON fail");
@@ -368,7 +397,8 @@ paths:
                 .expect("rayon pool");
             pool.install(|| {
                 let mut sink = DiagnosticSink::new();
-                let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
+                let files =
+                    compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
                 assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
                 files
             })
@@ -550,7 +580,8 @@ components:
             .expect("resolved config");
 
             let mut sink = DiagnosticSink::new();
-            let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
+            let files =
+                compile(&config, FetcherHandle::None, true, &mut sink).expect("emitted files");
             let diagnostics = format!("{:#?}", sink.as_slice());
 
             assert!(!files.is_empty(), "{artifact}");
@@ -687,8 +718,8 @@ components:
         )
         .expect("types resolved config");
         let mut types_sink = DiagnosticSink::new();
-        let types_files =
-            compile(&types_only, FetcherHandle::None, true, &mut types_sink).expect("types-only emitted files");
+        let types_files = compile(&types_only, FetcherHandle::None, true, &mut types_sink)
+            .expect("types-only emitted files");
         let client_types = files
             .iter()
             .filter(|file| file.relative_path.starts_with("types/"))
@@ -739,8 +770,13 @@ paths:
         };
 
         let mut types_sink = DiagnosticSink::new();
-        let types = compile(&config("types", false), FetcherHandle::None, true, &mut types_sink)
-            .expect("types-only build emits");
+        let types = compile(
+            &config("types", false),
+            FetcherHandle::None,
+            true,
+            &mut types_sink,
+        )
+        .expect("types-only build emits");
         let request_types = types
             .iter()
             .find(|file| file.relative_path == "types/operations/listthings.ts")
@@ -750,8 +786,13 @@ paths:
         assert!(types_sink.as_slice().is_empty());
 
         let mut client_sink = DiagnosticSink::new();
-        let client =
-            compile(&config("client", true), FetcherHandle::None, true, &mut client_sink).expect("client build emits");
+        let client = compile(
+            &config("client", true),
+            FetcherHandle::None,
+            true,
+            &mut client_sink,
+        )
+        .expect("client build emits");
         let request_types = client
             .iter()
             .find(|file| file.relative_path == "types/operations/listthings.ts")
@@ -1195,7 +1236,8 @@ webhooks:
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("suggestions resolve the collision");
+        let files = compile(&config, FetcherHandle::None, true, &mut sink)
+            .expect("suggestions resolve the collision");
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         let paths = files
             .iter()
@@ -1677,7 +1719,8 @@ content:
         let config = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved showcase config");
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("showcase emitted files");
+        let files =
+            compile(&config, FetcherHandle::None, true, &mut sink).expect("showcase emitted files");
 
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         assert!(
@@ -1727,7 +1770,8 @@ content:
         let config = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved fixture config");
         let mut sink = DiagnosticSink::new();
-        let files = compile(&config, FetcherHandle::None, true, &mut sink).expect("warnings do not block emission");
+        let files = compile(&config, FetcherHandle::None, true, &mut sink)
+            .expect("warnings do not block emission");
 
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         assert!(sink.as_slice().iter().any(|diagnostic| {
