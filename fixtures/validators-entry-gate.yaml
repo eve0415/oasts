@@ -1,4 +1,4 @@
-# SHA-256 manifest of the generated-validators frozen entry-gate files; scripts/validators-gate.sh verifies it.
+# SHA-256 manifest of the generated-validators frozen entry-gate files; scripts/entry-gate.sh verifies it.
 # These files were authored from the pinned validator contract before any implementation existed
 # and are never edited afterward — the implementation is written to satisfy them.
 files:
