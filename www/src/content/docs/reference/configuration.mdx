@@ -377,6 +377,10 @@ Repeat step 2 whenever you intend to take a new version of the document: the pin
 
 That is what keeps [determinism](/concepts/determinism) byte-keyed when the bytes arrive over a network. It also means each URI is pinned on its own: a `$ref` from a retrieved document to another URI needs its own `integrity` entry, and the first run reports each one as you reach it.
 
+A pin is a claim about a URI, so nothing else in the compile may claim it. A document declaring `$id: "https://…"` for a URI you pin is an `OASTS2027` — otherwise the `$id` would answer every reference to that URI out of the claiming document and the pin would never be consulted. Two documents declaring the same `$id` are an `OASTS2028` for the same reason, pinned or not. And a pin nothing was retrieved from is an `OASTS2029` warning: it is dead configuration, and it is also what a substitution would look like.
+
+Pinning is per URI, not per host, and it is the half of the boundary that says *what*. A retrieved document is also held to where it came from: a `$ref` from it to a `file:` URI is an `OASTS2026`. A document that arrived over the network does not get to choose which local files are read into your generated code, whatever `local.allowPaths` would otherwise permit.
+
 `allowInsecure` defaults to `false`, so only `https` is retrieved and a plain `http` URI is an `OASTS2021`. TLS certificates are always verified against the Mozilla root program; there is no setting that turns that off. A URI carrying credentials is refused outright: a retrieved document's URI is its identity, and identity is written above every declaration generated from it. Proxy environment variables are ignored, because honouring one would send every request somewhere `allowHosts` never named.
 
 `maxRedirects` defaults to `3` and bounds how many `3xx` hops one retrieval may take. Redirects are not delegated: the compiler resolves each `Location`, checks the host *and* the scheme it names, and only then makes the next request — so a redirect cannot deliver a document from a host you did not list. Exceeding the budget is an `OASTS2024`.

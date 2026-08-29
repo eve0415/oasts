@@ -97,6 +97,10 @@ In the order they happen. The first two are refused before a request is made; th
 | `OASTS2024` | error | The request itself failed: refused connection, DNS, TLS, timeout, a non-`200` status, a body over `limits.maxDocumentBytes`, or more redirects than `remote.maxRedirects` allows |
 | `OASTS2022` | error | An authorized URI with no `remote.integrity` entry. The document is retrieved and hashed but never compiled, and the message hands back the entry to record — this is how a pin is obtained |
 | `OASTS2023` | error | Retrieved bytes hashing to something other than the pinned digest. Unlike `OASTS2022` this is not a setup step: the document moved on, or the response was not the one that was pinned |
+| `OASTS2027` | error | A document declaring an `$id` equal to a URI `remote.integrity` pins. Only the document actually retrieved from a URI may claim it — otherwise a claim would answer references to a pinned document without ever retrieving it |
+| `OASTS2028` | error | Two schema resources declaring the same `$id`. One URI names one resource, and which claim won would otherwise depend on load order |
+| `OASTS2026` | error | A `$ref` from a retrieved document to a `file:` URI. A document that arrived over the network does not get to choose which local files are read |
+| `OASTS2029` | warning | A `remote.integrity` pin that no document in the compile was retrieved from — dead configuration, and the shape a substitution would take |
 
 ### Document and schema
 
