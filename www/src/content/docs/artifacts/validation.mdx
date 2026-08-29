@@ -105,14 +105,16 @@ Each one is named against the specification it implements, because "a valid emai
 | `email` | RFC 5321 `Mailbox`: a dot-atom or quoted-string local part, and either a host name or a bracketed IPv4/IPv6 address literal |
 | `hostname` | RFC 1123 host name: dot-separated letter-digit-hyphen labels of at most 63 characters, at most 253 overall |
 | `ipv4` | Four decimal octets in 0..255, each written without a leading zero |
-| `ipv6` | RFC 4291 §2.2, including the `::` elision and the trailing dotted-quad form |
+| `ipv6` | RFC 4291 §2.2, including the `::` elision and a dotted-quad supplying the low-order 32 bits, which only the end of the address may carry |
 | `uri` | RFC 3986 §3 URI: a scheme is required, and every component is checked against its character set |
 | `uri-reference` | RFC 3986 §4.1 URI-reference: a URI, or a relative reference |
 
 `int32` is asserted too, on integer schemas, as the signed 32-bit range.
 
 The checks are deliberately syntactic and deliberately permissive, because a validator that rejects a legitimate value is the worse failure.
-Three consequences are worth knowing: a `hostname` label beginning `xn--` passes as ordinary letter-digit-hyphen text, since IDNA validity would need the Unicode tables that this runtime does not ship; an `email` address is checked as ASCII, so SMTPUTF8 addresses and RFC 5322 comments are rejected; and an IPv6 zone identifier such as `%eth0` is not part of the address production, so it is rejected.
+One deviation is deliberate and worth recording. An `ipv4` octet written with a leading zero, such as `010.0.0.1`, is rejected, even though RFC 2673 §3.2 defines an octet as `1*3DIGIT` and so permits it. A leading zero is read as octal by some resolvers and as decimal by others, so `010.0.0.1` and `10.0.0.1` can name different hosts to different readers, which turns any allowlist built on this check into a bypass. The same string is rejected wherever it appears as the dotted tail of an IPv6 literal, and there RFC 3986's `dec-octet` production forbids it outright.
+
+Three further consequences are worth knowing: a `hostname` label beginning `xn--` passes as ordinary letter-digit-hyphen text, since IDNA validity would need the Unicode tables that this runtime does not ship; an `email` address is checked as ASCII, so SMTPUTF8 addresses and RFC 5322 comments are rejected; and an IPv6 zone identifier such as `%eth0` is not part of the address production, so it is rejected.
 
 No other string `format` is asserted — `password`, `byte`, `binary` and the `idn-` and `iri-` families are carried as annotations, and reach the generated code only as a doc comment.
 `regex` is among them on purpose: deciding it means compiling a caller-supplied pattern at validation time, which hands untrusted input to the host regular-expression engine, and the verdict would then follow whichever JavaScript engine happens to run the check.
