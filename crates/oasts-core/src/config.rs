@@ -1115,7 +1115,7 @@ pub struct WatchConfig {
     /// makes it several more; without a quiet period each one would start its own compile. Zero
     /// disables coalescing and compiles on the first event.
     #[cfg_attr(feature = "json-schema", schemars(range(min = 0, max = 10_000)))]
-    pub debounce_ms: u64,
+    pub debounce_ms: u32,
 }
 
 impl Default for WatchConfig {
@@ -2628,7 +2628,7 @@ fn validate_limits(limits: &LimitsConfig, source: &Path, sink: &mut DiagnosticSi
     }
 }
 
-const WATCH_DEBOUNCE_MAX_MS: u64 = 10_000;
+const WATCH_DEBOUNCE_MAX_MS: u32 = 10_000;
 
 fn validate_watch(watch: &WatchConfig, source: &Path, sink: &mut DiagnosticSink) {
     if watch.debounce_ms > WATCH_DEBOUNCE_MAX_MS {

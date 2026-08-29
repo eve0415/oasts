@@ -43,6 +43,17 @@ pub struct DiagnosticJs {
     pub json_pointer: Option<String>,
 }
 
+/// What one compile left behind for a host that watches its inputs.
+#[napi(object)]
+pub struct WatchPlanJs {
+    /// Every path the run read or probed for, sorted and deduplicated.
+    pub inputs: Vec<String>,
+    /// The tree the run writes into; never an input.
+    pub output_root: Option<String>,
+    /// How long the filesystem must stay quiet before a change is compiled.
+    pub debounce_ms: u32,
+}
+
 /// Options for one compiler invocation.
 #[napi(object)]
 pub struct RunOptions {
@@ -58,6 +69,8 @@ pub struct RunOptions {
     pub check: bool,
     /// `--spec` selections; non-empty selections are unsupported locally.
     pub specs: Vec<String>,
+    /// Whether the run reports what a watching host would need to wait on.
+    pub track_inputs: bool,
 }
 
 /// Outcome of one compiler invocation.
@@ -71,6 +84,8 @@ pub struct RunResult {
     pub rendered_stderr: String,
     /// Structured diagnostics mirroring `rendered_stderr`.
     pub diagnostics: Vec<DiagnosticJs>,
+    /// What to keep watching, when the run was asked to track its inputs.
+    pub watch_plan: Option<WatchPlanJs>,
 }
 
 fn to_diagnostic_js(diagnostic: &Diagnostic) -> DiagnosticJs {
@@ -111,6 +126,20 @@ fn failure_reason(exit_code: u8, diagnostics: &[Diagnostic]) -> String {
     .to_string()
 }
 
+/// Every path config discovery would consider, whether or not it exists.
+///
+/// A watching host needs these even when discovery failed: a second `oasts.*`
+/// name appearing is what turns a working run into a discovery error, and its
+/// removal is what turns one back.
+#[napi]
+pub fn discovery_candidates(cwd: String, explicit_path: Option<String>) -> Vec<String> {
+    let explicit = explicit_path.map(PathBuf::from);
+    config::discovery_candidates(Path::new(&cwd), explicit.as_deref())
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Runs config discovery without script rejection.
 ///
 /// Errors carry a JSON reason of shape
@@ -141,6 +170,17 @@ fn render(outcome: Outcome) -> RunResult {
         stdout_summary: outcome.stdout_summary,
         rendered_stderr,
         diagnostics: outcome.diagnostics.iter().map(to_diagnostic_js).collect(),
+        watch_plan: outcome.watch_plan.map(|plan| WatchPlanJs {
+            inputs: plan
+                .inputs
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            output_root: plan
+                .output_root
+                .map(|root| root.to_string_lossy().into_owned()),
+            debounce_ms: plan.settings.debounce_ms,
+        }),
     }
 }
 
@@ -152,16 +192,14 @@ fn parse_command(name: &str, check: bool) -> Result<Command, Unsupported<'_>> {
     }
 }
 
-/// Refusal for a declared command this build does not implement, else `None`.
+/// The refusal for `--spec`, which selects a spec out of a workspace config.
 ///
-/// The Node CLI asks before discovering a config, so an unimplemented command
-/// never fails on a missing config file first. Answering here keeps every
-/// `OASTS` code in the core.
+/// The Node CLI asks before discovering a config, so selecting a spec never
+/// fails on a missing config file first. Answering here keeps every `OASTS`
+/// code in the core.
 #[napi]
-pub fn command_refusal(command: String) -> Option<RunResult> {
-    parse_command(&command, false)
-        .err()
-        .map(|surface| render(driver::refuse(surface)))
+pub fn spec_refusal() -> RunResult {
+    render(driver::refuse(Unsupported::SpecSelection))
 }
 
 /// Runs `generate` or `check` for one already-discovered config.
@@ -186,11 +224,16 @@ pub fn run(options: RunOptions) -> RunResult {
             cwd: Path::new(&options.cwd),
         },
     };
+    let tracking = if options.track_inputs {
+        Tracking::Watch
+    } else {
+        Tracking::Off
+    };
     render(driver::run(
         command,
         source,
         oasts_fetch::handle(),
-        Tracking::Off,
+        tracking,
     ))
 }
 
@@ -223,6 +266,7 @@ mod tests {
             command: command.to_owned(),
             check,
             specs: Vec::new(),
+            track_inputs: false,
         }
     }
 
@@ -378,17 +422,14 @@ mod tests {
     }
 
     #[test]
-    fn command_refusal_names_only_unimplemented_commands() {
-        assert!(command_refusal("generate".to_owned()).is_none());
-        assert!(command_refusal("check".to_owned()).is_none());
-
-        let refusal = command_refusal("watch".to_owned()).expect("watch is unimplemented");
+    fn spec_refusal_is_the_workspace_code() {
+        let refusal = spec_refusal();
         assert_eq!(refusal.exit_code, 2);
-        assert_eq!(refusal.diagnostics[0].code, "OASTS9004");
+        assert_eq!(refusal.diagnostics[0].code, "OASTS9002");
         assert!(
             refusal
                 .rendered_stderr
-                .contains("the watch command is not supported in this build"),
+                .contains("--spec selects a workspace spec"),
             "{}",
             refusal.rendered_stderr
         );

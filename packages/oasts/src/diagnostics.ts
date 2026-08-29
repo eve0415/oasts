@@ -3,8 +3,9 @@
  *
  * These cover only what the Rust core cannot see: evaluating the config
  * module (OASTS0012), validating its export is plain JSON data (OASTS0013),
- * a native call that failed without a structured reason (OASTS1022), and a
- * native module load failure (OASTS1023).
+ * a native call that failed without a structured reason (OASTS1022), a
+ * native module load failure (OASTS1023), and a directory `oasts watch`
+ * cannot watch (OASTS1031, the same code the standalone binary reports).
  * `render()` covers a single Node-owned diagnostic at a time — every call site
  * here passes exactly one. It never sorts (Rust's `render_to_string` always
  * does) and never prints a line/col (this `Diagnostic` carries none, so the
@@ -20,6 +21,8 @@ export const CODE_CONFIG_NOT_SERIALIZABLE = "OASTS0013";
 export const CODE_NATIVE_INVOCATION = "OASTS1022";
 /** The native module could not be loaded by this Node host. */
 export const CODE_NATIVE_LOAD = "OASTS1023";
+/** A directory `oasts watch` was told to watch could not be watched. */
+export const CODE_WATCH_IO = "OASTS1031";
 
 /** A Node-side diagnostic in the shared cross-host shape. */
 export interface Diagnostic {

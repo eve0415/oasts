@@ -244,7 +244,7 @@ pub(crate) fn session(
         // A run that reported no plan leaves the previous set in place rather than clearing it,
         // which is what keeps a session alive across a compile that never reached a config.
         let plan = outcome.watch_plan.take().unwrap_or_default();
-        let quiet = Duration::from_millis(plan.settings.debounce_ms);
+        let quiet = Duration::from_millis(u64::from(plan.settings.debounce_ms));
         watched.absorb(&plan, settled);
         report(outcome);
 
@@ -319,7 +319,7 @@ mod tests {
         }
     }
 
-    fn plan(inputs: &[&str], output_root: Option<&str>, debounce_ms: u64) -> WatchPlan {
+    fn plan(inputs: &[&str], output_root: Option<&str>, debounce_ms: u32) -> WatchPlan {
         WatchPlan {
             inputs: inputs.iter().map(PathBuf::from).collect(),
             output_root: output_root.map(PathBuf::from),
