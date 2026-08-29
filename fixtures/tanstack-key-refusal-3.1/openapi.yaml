@@ -7,7 +7,9 @@ info:
     OpenAPI paths the client requests separately, but a segment carrying only the separator
     contributes nothing to a key, so the two would share one cache entry however the nodes are
     named. A segment whose text yields no identifier at all has no name to disambiguate; the
-    override is the only thing that can give it one.
+    override is the only thing that can give it one. The colliding pair alongside them is what
+    separates the two: it is refused by nothing, so a run that reported three errors here would be
+    one that had stopped telling a name apart from a key.
 servers:
   - url: https://refusal.example.test
 paths:
@@ -34,6 +36,26 @@ paths:
   /日本:
     get:
       operationId: readUnnameable
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                type: object
+  /foo-bar:
+    get:
+      operationId: readHyphenated
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                type: object
+  /foo_bar:
+    get:
+      operationId: readUnderscored
       responses:
         '200':
           description: A record.
