@@ -1570,6 +1570,13 @@ fn string_format(format: &str) -> Option<(&'static str, &'static str)> {
         "date" => Some(("isDate", "date")),
         "time" => Some(("isTime", "time")),
         "uuid" => Some(("isUuid", "uuid")),
+        "email" => Some(("isEmail", "email")),
+        "hostname" => Some(("isHostname", "hostname")),
+        "ipv4" => Some(("isIpv4", "ipv4")),
+        "ipv6" => Some(("isIpv6", "ipv6")),
+        "uri" => Some(("isUri", "uri")),
+        "uri-reference" => Some(("isUriReference", "uri-reference")),
+        "duration" => Some(("isDuration", "duration")),
         _ => None,
     }
 }
@@ -2983,7 +2990,14 @@ mod tests {
                     "date": { "type": "string", "format": "date" },
                     "time": { "type": "string", "format": "time" },
                     "uuid": { "type": "string", "format": "uuid" },
-                    "annotationOnly": { "type": "string", "format": "email" },
+                    "email": { "type": "string", "format": "email" },
+                    "hostname": { "type": "string", "format": "hostname" },
+                    "ipv4": { "type": "string", "format": "ipv4" },
+                    "ipv6": { "type": "string", "format": "ipv6" },
+                    "uri": { "type": "string", "format": "uri" },
+                    "uriReference": { "type": "string", "format": "uri-reference" },
+                    "duration": { "type": "string", "format": "duration" },
+                    "annotationOnly": { "type": "string", "format": "idn-email" },
                     "int64Annotation": { "type": "integer", "format": "int64" },
                     "count": {
                         "type": "integer",
@@ -3015,6 +3029,13 @@ mod tests {
             "stringFormat(isDate,\"date\")",
             "stringFormat(isTime,\"time\")",
             "stringFormat(isUuid,\"uuid\")",
+            "stringFormat(isEmail,\"email\")",
+            "stringFormat(isHostname,\"hostname\")",
+            "stringFormat(isIpv4,\"ipv4\")",
+            "stringFormat(isIpv6,\"ipv6\")",
+            "stringFormat(isUri,\"uri\")",
+            "stringFormat(isUriReference,\"uri-reference\")",
+            "stringFormat(isDuration,\"duration\")",
             "z.number().check(integer()).check(z.gte(0)).check(z.lte(10)).check(multipleOf(2)).check(int32())",
             "z.number().check(z.gt(2)).check(z.gte(0)).check(z.lt(8)).check(z.lte(10)).check(multipleOf(0.1))",
             "z.boolean()",
@@ -3027,7 +3048,8 @@ mod tests {
         }
         assert!(content.contains("\"annotationOnly\":z.optional(z.string())"));
         assert!(content.contains("\"int64Annotation\":z.optional(z.number().check(integer()))"));
-        assert!(!content.contains("isEmail"));
+        // Exactly the asserted formats attach a check; the annotation-only one attaches none.
+        assert_eq!(content.matches("stringFormat(").count(), 11);
         assert!(!content.contains("int64()"));
     }
 

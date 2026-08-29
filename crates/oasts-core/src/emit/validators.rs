@@ -3644,6 +3644,13 @@ fn string_format_predicate(format: &str) -> Option<(&'static str, &'static str)>
         "date" => Some(("isDate", "invalid date format")),
         "time" => Some(("isTime", "invalid time format")),
         "uuid" => Some(("isUuid", "invalid uuid format")),
+        "email" => Some(("isEmail", "invalid email format")),
+        "hostname" => Some(("isHostname", "invalid hostname format")),
+        "ipv4" => Some(("isIpv4", "invalid ipv4 format")),
+        "ipv6" => Some(("isIpv6", "invalid ipv6 format")),
+        "uri" => Some(("isUri", "invalid uri format")),
+        "uri-reference" => Some(("isUriReference", "invalid uri-reference format")),
+        "duration" => Some(("isDuration", "invalid duration format")),
         _ => None,
     }
 }
@@ -5564,7 +5571,14 @@ mod tests {
                     "b": { "type": "string", "format": "date" },
                     "c": { "type": "string", "format": "time" },
                     "d": { "type": "string", "format": "uuid" },
-                    "e": { "type": "integer", "format": "int32" }
+                    "e": { "type": "string", "format": "email" },
+                    "f": { "type": "string", "format": "hostname" },
+                    "g": { "type": "string", "format": "ipv4" },
+                    "h": { "type": "string", "format": "ipv6" },
+                    "i": { "type": "string", "format": "uri" },
+                    "j": { "type": "string", "format": "uri-reference" },
+                    "k": { "type": "string", "format": "duration" },
+                    "l": { "type": "integer", "format": "int32" }
                 }
             }
         })));
@@ -5578,7 +5592,21 @@ mod tests {
         assert!(content.contains("\"invalid time format\""));
         assert!(content.contains("if (!isUuid(value3)) {"));
         assert!(content.contains("\"invalid uuid format\""));
-        assert!(content.contains("if (!isInt32(value4)) {"));
+        assert!(content.contains("if (!isEmail(value4)) {"));
+        assert!(content.contains("\"invalid email format\""));
+        assert!(content.contains("if (!isHostname(value5)) {"));
+        assert!(content.contains("\"invalid hostname format\""));
+        assert!(content.contains("if (!isIpv4(value6)) {"));
+        assert!(content.contains("\"invalid ipv4 format\""));
+        assert!(content.contains("if (!isIpv6(value7)) {"));
+        assert!(content.contains("\"invalid ipv6 format\""));
+        assert!(content.contains("if (!isUri(value8)) {"));
+        assert!(content.contains("\"invalid uri format\""));
+        assert!(content.contains("if (!isUriReference(value9)) {"));
+        assert!(content.contains("\"invalid uri-reference format\""));
+        assert!(content.contains("if (!isDuration(value10)) {"));
+        assert!(content.contains("\"invalid duration format\""));
+        assert!(content.contains("if (!isInt32(value11)) {"));
         assert!(content.contains("\"out of int32 range\""));
     }
 
@@ -5654,8 +5682,7 @@ mod tests {
             "Thing": {
                 "type": "object",
                 "properties": {
-                    "e": { "type": "string", "format": "email" },
-                    "u": { "type": "string", "format": "uri" },
+                    "e": { "type": "string", "format": "password" },
                     "id": { "type": "integer", "format": "int64" }
                 }
             }
@@ -5664,9 +5691,9 @@ mod tests {
         let content = component(&files, "thing");
         assert!(!content.contains("isEmail"));
         assert!(!content.contains("format"));
-        // Both string properties and the integer still type-check but carry no format assertion.
-        assert_eq!(content.matches("=== \"string\"").count(), 2);
-        assert!(content.contains("Number.isInteger(value2)"), "{content}");
+        // The string and the integer still type-check but carry no format assertion.
+        assert_eq!(content.matches("=== \"string\"").count(), 1);
+        assert!(content.contains("Number.isInteger(value1)"), "{content}");
     }
 
     #[test]
@@ -6291,7 +6318,7 @@ mod tests {
     #[test]
     fn incomplete_not_is_diagnosed_and_the_negation_is_not_emitted() {
         for inner in [
-            json!({ "type": "string", "format": "email" }),
+            json!({ "type": "string", "format": "idn-email" }),
             json!({ "type": "number", "format": "float" }),
             json!({ "type": "integer", "format": "int64" }),
             json!({ "type": "boolean", "format": "custom" }),
@@ -6318,7 +6345,7 @@ mod tests {
     #[test]
     fn incomplete_not_follows_refs_with_the_real_emitter() {
         let (files, diagnostics) = compile(doc_31(json!({
-            "Email": { "type": "string", "format": "email" },
+            "Email": { "type": "string", "format": "idn-email" },
             "Incomplete": {
                 "not": { "$ref": "#/components/schemas/Email" }
             }
@@ -6338,7 +6365,7 @@ mod tests {
         let (files, diagnostics) = compile(doc_31(json!({
             "Incomplete": {
                 "not": {
-                    "propertyNames": { "type": "string", "format": "email" }
+                    "propertyNames": { "type": "string", "format": "idn-email" }
                 }
             }
         })));
@@ -6376,7 +6403,7 @@ mod tests {
 
         let (files, diagnostics) = compile(doc_31(json!({
             "Incomplete": {
-                "propertyNames": { "type": "string", "format": "email" }
+                "propertyNames": { "type": "string", "format": "idn-email" }
             }
         })));
         assert!(
@@ -6565,7 +6592,7 @@ mod tests {
             (
                 "if",
                 json!({
-                    "if": { "type": "string", "format": "email" },
+                    "if": { "type": "string", "format": "idn-email" },
                     "then": false
                 }),
             ),
@@ -6573,14 +6600,14 @@ mod tests {
                 "then",
                 json!({
                     "if": true,
-                    "then": { "type": "string", "format": "email" }
+                    "then": { "type": "string", "format": "idn-email" }
                 }),
             ),
             (
                 "else",
                 json!({
                     "if": false,
-                    "else": { "type": "string", "format": "email" }
+                    "else": { "type": "string", "format": "idn-email" }
                 }),
             ),
         ] {
@@ -6740,11 +6767,11 @@ mod tests {
         for (keyword, value) in [
             (
                 "unevaluatedProperties",
-                json!({ "type": "string", "format": "email" }),
+                json!({ "type": "string", "format": "idn-email" }),
             ),
             (
                 "unevaluatedItems",
-                json!({ "type": "string", "format": "email" }),
+                json!({ "type": "string", "format": "idn-email" }),
             ),
         ] {
             let (files, diagnostics) = compile(doc_31(json!({
@@ -6766,7 +6793,7 @@ mod tests {
                 "unevaluatedProperties",
                 json!({
                     "properties": {
-                        "known": { "type": "string", "format": "email" }
+                        "known": { "type": "string", "format": "idn-email" }
                     },
                     "unevaluatedProperties": false
                 }),
@@ -6774,7 +6801,7 @@ mod tests {
             (
                 "unevaluatedItems",
                 json!({
-                    "items": { "type": "string", "format": "email" },
+                    "items": { "type": "string", "format": "idn-email" },
                     "unevaluatedItems": false
                 }),
             ),
@@ -6857,12 +6884,15 @@ mod tests {
         for (keyword, value) in [
             (
                 "patternProperties",
-                json!({ "^x": { "type": "string", "format": "email" } }),
+                json!({ "^x": { "type": "string", "format": "idn-email" } }),
             ),
-            ("contains", json!({ "type": "string", "format": "email" })),
+            (
+                "contains",
+                json!({ "type": "string", "format": "idn-email" }),
+            ),
             (
                 "dependentSchemas",
-                json!({ "trigger": { "type": "string", "format": "email" } }),
+                json!({ "trigger": { "type": "string", "format": "idn-email" } }),
             ),
         ] {
             let (files, diagnostics) = compile(doc_31(json!({
