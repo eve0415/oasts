@@ -2156,8 +2156,13 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             // instances a schema admits, not a licence to stop reading the document.
             self.admits_no_instance = true;
         }
-        let dialect_unsupported = if self.version == OasVersion::V3_0 {
-            [
+        // Every 3.1-only keyword on the object is reported, not just the first one found. Each is
+        // an independent constraint the emitted type drops, and on a node that keeps its siblings
+        // an unreported keyword leaves no trace at all on the types surface. This mirrors the 3.1
+        // loop below, which already reports each of its keywords.
+        let mut dialect_unsupported = None;
+        if self.version == OasVersion::V3_0 {
+            for keyword in [
                 "const",
                 "prefixItems",
                 "dependentRequired",
@@ -2167,44 +2172,53 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 "minContains",
                 "maxContains",
                 "dependentSchemas",
-            ]
-            .into_iter()
-            .find(|keyword| object.contains_key(*keyword))
-            .map(|keyword| (keyword, keyword))
-            .or_else(|| {
-                object
-                    .get("type")
-                    .is_some_and(Value::is_array)
-                    .then_some(("type", "type array"))
-            })
-        } else {
-            None
-        };
-        if let Some((pointer_keyword, display_keyword)) = dialect_unsupported {
-            self.sink.push(self.unsupported_diagnostic(
-                node.doc_id,
-                &append_pointer(&node.pointer, pointer_keyword),
-                format!(
-                    "schema keyword '{display_keyword}' requires OpenAPI 3.1 and becomes unknown"
-                ),
-            ));
+            ] {
+                if object.contains_key(keyword) {
+                    self.sink.push(self.unsupported_diagnostic(
+                        node.doc_id,
+                        &append_pointer(&node.pointer, keyword),
+                        format!(
+                            "schema keyword '{keyword}' requires OpenAPI 3.1 and becomes unknown"
+                        ),
+                    ));
+                    dialect_unsupported.get_or_insert(keyword);
+                }
+            }
+            if dialect_unsupported.is_none() && object.get("type").is_some_and(Value::is_array) {
+                self.sink.push(
+                    self.unsupported_diagnostic(
+                        node.doc_id,
+                        &append_pointer(&node.pointer, "type"),
+                        "schema keyword 'type array' requires OpenAPI 3.1 and becomes unknown"
+                            .to_owned(),
+                    ),
+                );
+                dialect_unsupported = Some("type array");
+            }
+        }
+        if let Some(keyword) = dialect_unsupported {
+            // A `type` array is not a droppable conjunct but the type declaration itself, so the
+            // sibling guard below would find it and preserve a `type` no 3.0 path lowers. That
+            // shape keeps widening whole, and names the array rather than whichever keyword
+            // happened to be found first.
+            if object.get("type").is_some_and(Value::is_array) {
+                return SchemaNode::Unknown {
+                    reason: "OpenAPI 3.0 does not support type array".to_owned(),
+                    meta,
+                };
+            }
             // A 3.1-only keyword is one conjunct of the schema object like any other, so drop that
             // conjunct and keep the representable siblings. `unknown` is the maximally imprecise
             // widening; the siblings widen in the same direction while staying strictly closer to
             // the declared type. Without a representable sibling there is nothing left to keep.
-            //
-            // A `type` array is the exception: it is not a droppable conjunct but the type
-            // declaration itself, so the guard below would find it and preserve a `type` no 3.0
-            // path lowers. That shape keeps widening whole.
-            if object.get("type").is_some_and(Value::is_array)
-                || (!object.contains_key("$ref")
-                    && !object.contains_key("allOf")
-                    && !object.contains_key("oneOf")
-                    && !object.contains_key("anyOf")
-                    && !has_typed_or_constraint_content(object, self.version))
+            if !object.contains_key("$ref")
+                && !object.contains_key("allOf")
+                && !object.contains_key("oneOf")
+                && !object.contains_key("anyOf")
+                && !has_typed_or_constraint_content(object, self.version)
             {
                 return SchemaNode::Unknown {
-                    reason: format!("OpenAPI 3.0 does not support {display_keyword}"),
+                    reason: format!("OpenAPI 3.0 does not support {keyword}"),
                     meta,
                 };
             }
@@ -4354,8 +4368,9 @@ fn schema_meta_content(object: &Map<String, Value>, version: OasVersion) -> Sche
 /// conjunction lowering must preserve as a real branch. Pure annotations (title, description,
 /// default, example(s), deprecated, readOnly, writeOnly, nullable, `x-*`) are not pieces. The
 /// version gate mirrors the dispatch: `prefixItems`, `const`, `dependentRequired`, and
-/// `contentEncoding` are OpenAPI 3.1 only, so in 3.0 they do not count (and, being early-rejected
-/// dialect keywords, never reach here anyway).
+/// `contentEncoding` are OpenAPI 3.1 only, so in 3.0 they do not count. A 3.0 object carrying one
+/// of them does reach here — that is exactly the sibling question this answers — and the keyword
+/// must not be the sibling that keeps the node alive, because 3.0 has no lowering for it.
 fn has_typed_or_constraint_content(object: &Map<String, Value>, version: OasVersion) -> bool {
     const BOTH_VERSIONS: [&str; 20] = [
         "type",
@@ -5247,6 +5262,12 @@ mod tests {
                     "const": "x",
                     "minLength": 3
                 },
+                "TwoKeywordsOnOneNode": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "contains": { "type": "string" },
+                    "minContains": 1
+                },
                 "TwoApplicatorsAndNoTypedHalf": {
                     "const": "x",
                     "allOf": [{ "type": "object" }],
@@ -5291,10 +5312,15 @@ mod tests {
             SchemaNode::OneOf { branches, .. } if branches.len() == 2
         ));
         // A `type` array is the type declaration rather than a droppable conjunct, so this shape
-        // keeps widening whole even though `minLength` would satisfy the sibling guard.
+        // keeps widening whole even though `minLength` would satisfy the sibling guard. The array
+        // is what it names, not whichever keyword was found first.
         assert!(matches!(
             schema_named(&ir, "ConstOnATypeArray"),
-            SchemaNode::Unknown { .. }
+            SchemaNode::Unknown { reason, .. } if reason == "OpenAPI 3.0 does not support type array"
+        ));
+        assert!(matches!(
+            schema_named(&ir, "TwoKeywordsOnOneNode"),
+            SchemaNode::Array { .. }
         ));
         // Two applicators and no typed content lower to a conjunction whose typed half is never
         // emitted. The rejected keyword has to travel on the wrapper, or the validators artifact
@@ -5311,13 +5337,16 @@ mod tests {
             .iter()
             .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
             .count();
-        assert_eq!(reported, 8, "{:#?}", sink.as_slice());
+        // Nine schemas, one keyword each, except `TwoKeywordsOnOneNode`: every unsupported keyword
+        // on an object is reported, not only the first one found.
+        assert_eq!(reported, 10, "{:#?}", sink.as_slice());
         for name in [
             "ConstWithType",
             "PropertyNamesWithProperties",
             "PrefixItemsWithItems",
             "DependentRequiredWithProperties",
             "ConstWithApplicatorOnly",
+            "TwoKeywordsOnOneNode",
             "TwoApplicatorsAndNoTypedHalf",
         ] {
             assert!(
