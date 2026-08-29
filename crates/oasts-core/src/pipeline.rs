@@ -343,15 +343,17 @@ mod tests {
         assert_eq!(first, second);
         // The URI is the document's identity all the way through emission, so a reader of the
         // generated code can see which document a declaration came from.
+        // The label is built before the assert: a call evaluated only on failure is a region the
+        // coverage gate counts and no passing run reaches.
+        let paths = first
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect::<Vec<_>>();
         assert!(
             first
                 .iter()
                 .any(|file| file.content.contains(&format!("// Source: {URI}#"))),
-            "{:#?}",
-            first
-                .iter()
-                .map(|file| &file.relative_path)
-                .collect::<Vec<_>>()
+            "{paths:?}"
         );
     }
 
