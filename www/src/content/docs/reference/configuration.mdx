@@ -423,9 +423,14 @@ watch:
   debounceMs: 100
 ```
 
-`debounceMs` is how long the filesystem has to stay quiet before a change is compiled, clamped to 0–10000; a value outside that fails the build with `OASTS0281`.
+`debounceMs` is how long the filesystem has to stay quiet before a change is compiled.
 Saving one file is several syscalls, and an editor that writes through a temporary file makes it several more, so a quiet period is what turns one save into one recompile rather than three.
 `0` disables coalescing and compiles on the first event.
+
+Nothing is clamped.
+A whole number from `0` to `10000` is accepted; anything above that range fails the build with `OASTS0281`, and a value that is not a non-negative whole number — `-1`, `1.5`, `"100"` — fails as an ordinary parse error with `OASTS0031`, the same way a mistyped value fails anywhere else in the file.
+
+Churn can delay a recompile but never cancel one: if a directory never goes quiet, the compile runs a second after the change that started the wait, whatever `debounceMs` says.
 
 Nothing else here is a setting.
 Which paths a session follows is not a choice — it is whatever the compile read — and a session is not allowed to end on a diagnostic, because a typo is the case a watch exists for.
