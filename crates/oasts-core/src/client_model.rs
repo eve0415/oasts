@@ -7486,6 +7486,56 @@ mod tests {
     }
 
     #[test]
+    fn a_30_content_disposition_const_falls_back_to_its_declared_string_type() {
+        // OpenAPI 3.0 has no `const`, so the keyword is dropped and the declared `type: string` is
+        // the whole schema — which admits the encoder-owned value, and refusing it would refuse a
+        // header the document never actually constrained. The 3.1 row is the contrast: there the
+        // same document really does pin the header to a value the encoder never writes.
+        let document = |version: &str| {
+            json!({
+                "openapi": version,
+                "paths": {
+                    "/disposition": {
+                        "post": {
+                            "requestBody": {
+                                "content": {
+                                    "multipart/form-data": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": { "file": { "type": "string" } }
+                                        },
+                                        "encoding": {
+                                            "file": {
+                                                "headers": {
+                                                    "Content-Disposition": {
+                                                        "schema": {
+                                                            "type": "string",
+                                                            "const": "attachment"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            "responses": { "204": { "description": "ok" } }
+                        }
+                    }
+                }
+            })
+        };
+        let refused = |version: &str| {
+            client_diagnostics(&document(version))
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "OASTS5103")
+                .count()
+        };
+        assert_eq!(refused("3.0.3"), 0);
+        assert_eq!(refused("3.1.0"), 1);
+    }
+
+    #[test]
     fn oasts1417_warns_for_headers_outside_rfc7578_set() {
         let document = json!({
             "openapi": "3.1.0",

@@ -169,7 +169,11 @@ struct ParsedFinite {
 impl ParsedFinite {
     fn from_object(object: &Map<String, Value>, version: OasVersion) -> Self {
         Self {
-            declared: object.contains_key("enum") || object.contains_key("const"),
+            // `const` is a 3.1 keyword, so under 3.0 it declares nothing: reading it here would
+            // hand the object and tuple paths a finite constraint carrying no values, which
+            // asserts a restriction the document did not make in a dialect that cannot express it.
+            declared: object.contains_key("enum")
+                || (version == OasVersion::V3_1 && object.contains_key("const")),
             enum_values: object.get("enum").and_then(Value::as_array).cloned(),
             const_value: (version == OasVersion::V3_1)
                 .then(|| object.get("const").cloned())
@@ -2156,8 +2160,13 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             // instances a schema admits, not a licence to stop reading the document.
             self.admits_no_instance = true;
         }
-        let dialect_unsupported = if self.version == OasVersion::V3_0 {
-            [
+        // Every 3.1-only keyword on the object is reported, not just the first one found. Each is
+        // an independent constraint the emitted type drops, and on a node that keeps its siblings
+        // an unreported keyword leaves no trace at all on the types surface. This mirrors the 3.1
+        // loop below, which already reports each of its keywords.
+        let mut dialect_unsupported = None;
+        if self.version == OasVersion::V3_0 {
+            for keyword in [
                 "const",
                 "prefixItems",
                 "dependentRequired",
@@ -2167,31 +2176,62 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 "minContains",
                 "maxContains",
                 "dependentSchemas",
-            ]
-            .into_iter()
-            .find(|keyword| object.contains_key(*keyword))
-            .map(|keyword| (keyword, keyword))
-            .or_else(|| {
-                object
-                    .get("type")
-                    .is_some_and(Value::is_array)
-                    .then_some(("type", "type array"))
-            })
-        } else {
-            None
-        };
-        if let Some((pointer_keyword, display_keyword)) = dialect_unsupported {
-            self.sink.push(self.unsupported_diagnostic(
-                node.doc_id,
-                &append_pointer(&node.pointer, pointer_keyword),
-                format!(
-                    "schema keyword '{display_keyword}' requires OpenAPI 3.1 and becomes unknown"
-                ),
-            ));
-            return SchemaNode::Unknown {
-                reason: format!("OpenAPI 3.0 does not support {display_keyword}"),
-                meta,
-            };
+            ] {
+                if object.contains_key(keyword) {
+                    self.sink.push(self.unsupported_diagnostic(
+                        node.doc_id,
+                        &append_pointer(&node.pointer, keyword),
+                        format!(
+                            "schema keyword '{keyword}' requires OpenAPI 3.1 and is dropped from \
+                             the emitted type; the schema widens to unknown only where no representable sibling remains"
+                        ),
+                    ));
+                    dialect_unsupported.get_or_insert(keyword);
+                }
+            }
+            // Reported alongside whatever the loop found rather than only in its absence. A `type`
+            // array is what decides the widening, so a schema carrying both would otherwise name
+            // the other keyword as the sole cause and carry its promise that a representable
+            // sibling is kept — while this node widened whole, and because of the array.
+            if object.get("type").is_some_and(Value::is_array) {
+                self.sink.push(
+                    self.unsupported_diagnostic(
+                        node.doc_id,
+                        &append_pointer(&node.pointer, "type"),
+                        "schema keyword 'type array' requires OpenAPI 3.1 and widens the schema \
+                         to unknown"
+                            .to_owned(),
+                    ),
+                );
+                dialect_unsupported.get_or_insert("type array");
+            }
+        }
+        if let Some(keyword) = dialect_unsupported {
+            // A `type` array is not a droppable conjunct but the type declaration itself, so the
+            // sibling guard below would find it and preserve a `type` no 3.0 path lowers. That
+            // shape keeps widening whole, and names the array rather than whichever keyword
+            // happened to be found first.
+            if object.get("type").is_some_and(Value::is_array) {
+                return SchemaNode::Unknown {
+                    reason: "OpenAPI 3.0 does not support type array".to_owned(),
+                    meta,
+                };
+            }
+            // A 3.1-only keyword is one conjunct of the schema object like any other, so drop that
+            // conjunct and keep the representable siblings. `unknown` is the maximally imprecise
+            // widening; the siblings widen in the same direction while staying strictly closer to
+            // the declared type. Without a representable sibling there is nothing left to keep.
+            if !object.contains_key("$ref")
+                && !object.contains_key("allOf")
+                && !object.contains_key("oneOf")
+                && !object.contains_key("anyOf")
+                && !has_typed_or_constraint_content(object, self.version)
+            {
+                return SchemaNode::Unknown {
+                    reason: format!("OpenAPI 3.0 does not support {keyword}"),
+                    meta,
+                };
+            }
         }
         if self.version == OasVersion::V3_1 {
             for keyword in [
@@ -2210,7 +2250,9 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                         node.doc_id,
                         &append_pointer(&node.pointer, keyword),
                         format!(
-                            "schema keyword '{keyword}' has no faithful TypeScript representation and becomes unknown on the types surface"
+                            "schema keyword '{keyword}' has no faithful TypeScript representation \
+                             and is dropped from the emitted type; the schema widens to unknown \
+                             only where no representable sibling remains"
                         ),
                     ));
                 }
@@ -2231,7 +2273,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             self.sink.push(self.unsupported_diagnostic(
                 node.doc_id,
                 &append_pointer(&node.pointer, keyword),
-                format!("unsupported schema keyword '{keyword}' becomes unknown"),
+                format!(
+                    "unsupported schema keyword '{keyword}' is dropped from the emitted type; \
+                     the schema widens to unknown only where no representable sibling remains"
+                ),
             ));
             if !object.contains_key("$ref")
                 && !object.contains_key("allOf")
@@ -2266,7 +2311,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             self.sink.push(self.unsupported_diagnostic(
                 node.doc_id,
                 &append_pointer(&node.pointer, keyword),
-                format!("unsupported schema keyword '{keyword}' becomes unknown"),
+                format!(
+                    "unsupported schema keyword '{keyword}' is dropped from the emitted type; \
+                     the schema widens to unknown only where no representable sibling remains"
+                ),
             ));
             if !object.contains_key("$ref")
                 && !object.contains_key("allOf")
@@ -2384,7 +2432,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         has_typed: bool,
         dynamic: Option<(&'static str, &'graph Value)>,
     ) -> SchemaNode {
-        let (wrapper_meta, typed_meta) = meta.split_for_conjunction();
+        let (mut wrapper_meta, typed_meta) = meta.split_for_conjunction();
         let mut branches = Vec::new();
         if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
             branches.push(self.parse_schema_ref(
@@ -2436,6 +2484,29 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 self.parse_typed_schema(node, object, typed_meta)
             };
             branches.push(typed);
+        } else {
+            // The split parks the rejected keywords and the narrowing applicators on the typed
+            // half, which is not emitted here, so without this they leave the tree with it. Both
+            // describe the whole schema object rather than one of its pieces. Losing the rejected
+            // keywords lets the validators artifact ship a complete-looking check for a constraint
+            // it cannot express; losing the applicators drops the check the `propertyNames`
+            // diagnostic promises is emitted instead, and stops a `not` that admits everything from
+            // lowering the node to `never`.
+            wrapper_meta.rejected_validation_keywords = typed_meta.rejected_validation_keywords;
+            if let Some(typed_applicators) = typed_meta.validation_applicators {
+                let mut applicators = wrapper_meta
+                    .validation_applicators
+                    .map_or_else(ValidationApplicators::default, |boxed| *boxed);
+                // The two halves carry disjoint fields: the split hands `unevaluated*` to the
+                // wrapper and everything below to the typed branch.
+                applicators.not = typed_applicators.not;
+                applicators.property_names = typed_applicators.property_names;
+                applicators.pattern_properties = typed_applicators.pattern_properties;
+                applicators.contains = typed_applicators.contains;
+                applicators.dependent_schemas = typed_applicators.dependent_schemas;
+                applicators.conditional = typed_applicators.conditional;
+                wrapper_meta.validation_applicators = box_if_populated(applicators);
+            }
         }
         SchemaNode::AllOf {
             branches,
@@ -3021,7 +3092,19 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 extra_required.push(name.to_owned());
             }
         }
-        let additional_properties = match object.get("additionalProperties") {
+        // `additionalProperties` is scoped by its siblings: it governs only the keys `properties`
+        // and `patternProperties` did not already match. Under 3.0 the dialect has no
+        // `patternProperties`, so dropping it hands `additionalProperties` a scope that just grew
+        // to cover the keys the patterns used to own — and applying it unchanged would reject the
+        // very values the patterns declare, leaving the emitted type narrower than the document.
+        // Widening it to an open index signature keeps the object shape while staying on the wide
+        // side of the truth, which whole-node widening also achieves but much less precisely.
+        let rescoped_by_a_dropped_keyword =
+            self.version == OasVersion::V3_0 && object.contains_key("patternProperties");
+        let additional_properties = match object
+            .get("additionalProperties")
+            .filter(|_| !rescoped_by_a_dropped_keyword)
+        {
             None | Some(Value::Bool(true)) => AdditionalProperties::Allowed(None),
             Some(Value::Bool(false)) => AdditionalProperties::Forbidden,
             Some(value) => {
@@ -3057,7 +3140,17 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
     ) -> SchemaNode {
         let finite = self.parse_finite_constraint(finite);
         let pointer = append_pointer(&node.pointer, "items");
-        let items = match object.get("items") {
+        // `items` is scoped by `prefixItems`: it governs only the indices beyond the tuple prefix.
+        // Under 3.0 the dialect has no `prefixItems`, so dropping it widens what `items` governs to
+        // the whole array, and carrying the element type through unchanged would both reject the
+        // values the prefix positions declare and accept arrays the prefix forbids. The element
+        // widens to `unknown`, which stays an array type and stays wider than the document.
+        let rescoped_by_a_dropped_keyword =
+            self.version == OasVersion::V3_0 && object.contains_key("prefixItems");
+        let items = match object
+            .get("items")
+            .filter(|_| !rescoped_by_a_dropped_keyword)
+        {
             None => SchemaNode::Any {
                 meta: SchemaMeta {
                     source: self.source(node.doc_id, &pointer),
@@ -3172,7 +3265,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                 ..SchemaMeta::default()
             };
         };
-        let content = schema_meta_content(object);
+        let content = schema_meta_content(object, self.version);
         if content == SchemaMetaContent::None {
             return SchemaMeta {
                 source: self.source(node.doc_id, &node.pointer),
@@ -3438,6 +3531,11 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
         meta.validation_applicators = box_if_populated(validation_applicators);
         // A dynamic reference is rejected only where it could not be pinned; `parse_dynamic_ref`
         // adds it then. Under 3.0 it is not a keyword, so it is rejected outright.
+        //
+        // `const`, `prefixItems` and `dependentRequired` are read only under 3.1, so under 3.0 they
+        // are constraints the emitted check would silently omit. They belong here for the same
+        // reason as the rest: the types artifact may keep an approximation with its warning, the
+        // validators artifact may not.
         meta.rejected_validation_keywords = object
             .keys()
             .filter(|key| {
@@ -3445,7 +3543,10 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
                     && (DYNAMIC_REF_KEYWORDS.contains(&key.as_str())
                         || matches!(
                             key.as_str(),
-                            "propertyNames"
+                            "const"
+                                | "prefixItems"
+                                | "dependentRequired"
+                                | "propertyNames"
                                 | "patternProperties"
                                 | "contains"
                                 | "minContains"
@@ -4253,9 +4354,19 @@ enum SchemaMetaContent {
 
 /// Classifies metadata in one key walk. Annotation-only schemas can skip every constraint and
 /// applicator collector, while structurally-only schemas retain the existing empty-meta reject.
-fn schema_meta_content(object: &Map<String, Value>) -> SchemaMetaContent {
+///
+/// `const`, `prefixItems` and `dependentRequired` are structural under 3.1, where the dispatch
+/// consumes them. Under 3.0 the dispatch cannot, so they are meta the validators artifact has to
+/// see — classifying them as annotations would leave the reject list empty and let a check ship
+/// that silently ignores them.
+fn schema_meta_content(object: &Map<String, Value>, version: OasVersion) -> SchemaMetaContent {
     let mut content = SchemaMetaContent::None;
     for key in object.keys() {
+        if version == OasVersion::V3_0
+            && matches!(key.as_str(), "const" | "prefixItems" | "dependentRequired")
+        {
+            return SchemaMetaContent::Complex;
+        }
         match key.as_str() {
             "minimum"
             | "maximum"
@@ -4314,8 +4425,9 @@ fn schema_meta_content(object: &Map<String, Value>) -> SchemaMetaContent {
 /// conjunction lowering must preserve as a real branch. Pure annotations (title, description,
 /// default, example(s), deprecated, readOnly, writeOnly, nullable, `x-*`) are not pieces. The
 /// version gate mirrors the dispatch: `prefixItems`, `const`, `dependentRequired`, and
-/// `contentEncoding` are OpenAPI 3.1 only, so in 3.0 they do not count (and, being early-rejected
-/// dialect keywords, never reach here anyway).
+/// `contentEncoding` are OpenAPI 3.1 only, so in 3.0 they do not count. A 3.0 object carrying one
+/// of them does reach here — that is exactly the sibling question this answers — and the keyword
+/// must not be the sibling that keeps the node alive, because 3.0 has no lowering for it.
 fn has_typed_or_constraint_content(object: &Map<String, Value>, version: OasVersion) -> bool {
     const BOTH_VERSIONS: [&str; 20] = [
         "type",
@@ -4497,7 +4609,10 @@ mod tests {
             "$ref".to_owned(),
             Value::String("#/components/schemas/X".to_owned()),
         );
-        assert_eq!(schema_meta_content(&object), SchemaMetaContent::None);
+        assert_eq!(
+            schema_meta_content(&object, OasVersion::V3_1),
+            SchemaMetaContent::None
+        );
 
         for key in [
             "example",
@@ -4521,7 +4636,7 @@ mod tests {
             let mut object = Map::new();
             object.insert(key.to_owned(), Value::Null);
             assert_eq!(
-                schema_meta_content(&object),
+                schema_meta_content(&object, OasVersion::V3_1),
                 SchemaMetaContent::Annotations,
                 "{key}"
             );
@@ -4561,7 +4676,22 @@ mod tests {
             let mut object = Map::new();
             object.insert(key.to_owned(), Value::Null);
             assert_eq!(
-                schema_meta_content(&object),
+                schema_meta_content(&object, OasVersion::V3_1),
+                SchemaMetaContent::Complex,
+                "{key}"
+            );
+        }
+        // The three keywords 3.1 consumes structurally and 3.0 can only reject.
+        for key in ["const", "prefixItems", "dependentRequired"] {
+            let mut object = Map::new();
+            object.insert(key.to_owned(), Value::Null);
+            assert_eq!(
+                schema_meta_content(&object, OasVersion::V3_1),
+                SchemaMetaContent::None,
+                "{key}"
+            );
+            assert_eq!(
+                schema_meta_content(&object, OasVersion::V3_0),
                 SchemaMetaContent::Complex,
                 "{key}"
             );
@@ -5156,6 +5286,238 @@ mod tests {
         assert!(matches!(ir.schemas[3].schema, SchemaNode::Tuple { .. }));
         assert!(matches!(ir.schemas[4].schema, SchemaNode::Tuple { .. }));
         assert!(matches!(ir.schemas[5].schema, SchemaNode::Never { .. }));
+    }
+
+    #[test]
+    fn a_conjunction_without_a_typed_half_keeps_its_narrowing_applicators() {
+        let document = schemas_doc(
+            "3.1.0",
+            json!({
+                "Named": { "type": "object", "properties": { "name": { "type": "string" } } },
+                "PropertyNames": {
+                    "propertyNames": { "pattern": "^x-" },
+                    "allOf": [{ "$ref": "#/components/schemas/Named" }],
+                    "oneOf": [{ "type": "object" }, { "type": "object" }]
+                },
+                "NegatesEverything": {
+                    "not": {},
+                    "allOf": [{ "$ref": "#/components/schemas/Named" }],
+                    "oneOf": [{ "type": "object" }, { "type": "object" }]
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        // Two applicators and no typed content emit no typed branch, so the narrowing applicators
+        // the split parks there have to travel on the wrapper or leave the tree with it. Losing
+        // `propertyNames` drops the very check its diagnostic says the validators emit instead.
+        assert!(
+            schema_named(&ir, "PropertyNames")
+                .meta()
+                .validation_applicators()
+                .property_names
+                .is_some()
+        );
+        // A `not` admitting every instance admits none, which the caller can only lower if the
+        // `not` is still on the node it reads.
+        assert!(matches!(
+            schema_named(&ir, "NegatesEverything"),
+            SchemaNode::Never { .. }
+        ));
+    }
+
+    #[test]
+    fn dialect_unsupported_keywords_keep_their_representable_siblings() {
+        let document = schemas_doc(
+            "3.0.3",
+            json!({
+                "ConstWithType": { "type": "string", "const": "unavailable" },
+                "BareConst": { "const": "unavailable" },
+                "PropertyNamesWithProperties": {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "propertyNames": { "type": "string" }
+                },
+                "PrefixItemsWithItems": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "prefixItems": [{ "type": "string" }]
+                },
+                "DependentRequiredWithProperties": {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
+                    "dependentRequired": { "a": ["b"] }
+                },
+                "ConstWithApplicatorOnly": {
+                    "const": "x",
+                    "oneOf": [{ "type": "string" }, { "type": "integer" }]
+                },
+                "ConstOnATypeArray": {
+                    "type": ["string", "null"],
+                    "const": "x",
+                    "minLength": 3
+                },
+                "TwoKeywordsOnOneNode": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "contains": { "type": "string" },
+                    "minContains": 1
+                },
+                "ConstOnAnObject": {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "const": { "a": "x" }
+                },
+                "PatternPropertiesBesideAdditionalProperties": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "patternProperties": { "^x-": { "type": "string" } }
+                },
+                "PrefixItemsBesideItems": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "prefixItems": [{ "type": "integer" }]
+                },
+                "TwoApplicatorsAndNoTypedHalf": {
+                    "const": "x",
+                    "allOf": [{ "type": "object" }],
+                    "oneOf": [{ "type": "string" }, { "type": "integer" }]
+                }
+            }),
+        );
+        let (_temp, ir, sink) = parse_value(&document);
+
+        // The sibling `type` survives, and `const` is not reinterpreted as a literal: 3.0 has no
+        // `const`, so the value is dropped rather than narrowed onto the type.
+        assert!(matches!(
+            schema_named(&ir, "ConstWithType"),
+            SchemaNode::Primitive {
+                ty: PrimitiveType::String,
+                enum_values: None,
+                const_value: None,
+                ..
+            }
+        ));
+        // Nothing representable sits beside it, so the node still widens whole.
+        assert!(matches!(
+            schema_named(&ir, "BareConst"),
+            SchemaNode::Unknown { .. }
+        ));
+        assert!(matches!(
+            schema_named(&ir, "PropertyNamesWithProperties"),
+            SchemaNode::Object { properties, .. } if properties.len() == 1
+        ));
+        assert!(matches!(
+            schema_named(&ir, "PrefixItemsWithItems"),
+            SchemaNode::Array { .. }
+        ));
+        assert!(matches!(
+            schema_named(&ir, "DependentRequiredWithProperties"),
+            SchemaNode::Object { properties, dependent_required, .. }
+                if properties.len() == 2 && dependent_required.is_empty()
+        ));
+        // An applicator alone is a representable sibling, matching the guard the soft list uses.
+        assert!(matches!(
+            schema_named(&ir, "ConstWithApplicatorOnly"),
+            SchemaNode::OneOf { branches, .. } if branches.len() == 2
+        ));
+        // A `type` array is the type declaration rather than a droppable conjunct, so this shape
+        // keeps widening whole even though `minLength` would satisfy the sibling guard. The array
+        // is what it names, not whichever keyword was found first.
+        assert!(matches!(
+            schema_named(&ir, "ConstOnATypeArray"),
+            SchemaNode::Unknown { reason, .. } if reason == "OpenAPI 3.0 does not support type array"
+        ));
+        // Both keywords are named, and the one that decided the widening says so: the `const` line
+        // promises a preserved sibling, which is true of every node except this one.
+        let reported_pointers = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
+            .filter_map(|diagnostic| diagnostic.json_pointer.as_deref())
+            .collect::<Vec<_>>();
+        for pointer in [
+            "/components/schemas/ConstOnATypeArray/const",
+            "/components/schemas/ConstOnATypeArray/type",
+        ] {
+            assert!(
+                reported_pointers.contains(&pointer),
+                "{reported_pointers:#?}"
+            );
+        }
+        assert!(matches!(
+            schema_named(&ir, "TwoKeywordsOnOneNode"),
+            SchemaNode::Array { .. }
+        ));
+        // Two of the dropped keywords scope a sibling rather than standing beside it:
+        // `additionalProperties` governs only the keys no pattern matched, and `items` only the
+        // indices beyond the tuple prefix. Carrying either through unchanged after its scope grew
+        // would leave the emitted type NARROWER than the document, which is the one direction a
+        // dropped keyword may never move it, so the rescoped sibling widens instead.
+        assert!(matches!(
+            schema_named(&ir, "PatternPropertiesBesideAdditionalProperties"),
+            SchemaNode::Object {
+                additional_properties: AdditionalProperties::Allowed(None),
+                ..
+            }
+        ));
+        assert!(matches!(
+            schema_named(&ir, "PrefixItemsBesideItems"),
+            SchemaNode::Array { items, .. } if matches!(**items, SchemaNode::Any { .. })
+        ));
+        // A dropped keyword that scopes nothing leaves its sibling exactly as declared: `contains`
+        // asserts that some element matches while `items` still governs every index.
+        assert!(matches!(
+            schema_named(&ir, "TwoKeywordsOnOneNode"),
+            SchemaNode::Array { items, .. }
+                if matches!(**items, SchemaNode::Primitive { ty: PrimitiveType::String, .. })
+        ));
+        // 3.0 has no `const`, so the object carries no finite constraint at all. A constraint
+        // holding neither an enum nor a const value would assert a restriction the document did
+        // not make in a dialect that cannot express it.
+        assert!(matches!(
+            schema_named(&ir, "ConstOnAnObject"),
+            SchemaNode::Object { finite: None, .. }
+        ));
+        // Two applicators and no typed content lower to a conjunction whose typed half is never
+        // emitted. The rejected keyword has to travel on the wrapper, or the validators artifact
+        // ships a complete-looking check for a constraint it cannot express.
+        assert!(matches!(
+            schema_named(&ir, "TwoApplicatorsAndNoTypedHalf"),
+            SchemaNode::AllOf { .. }
+        ));
+
+        // Every preserved node still reports the keyword, and still refuses a validator check for
+        // the constraint it dropped.
+        let reported = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == CODE_UNSUPPORTED)
+            .count();
+        // One keyword per schema, except `TwoKeywordsOnOneNode` and `ConstOnATypeArray`: every
+        // unsupported keyword on an object is reported, not only the first one found, and the
+        // `type` array is reported beside the keyword rather than only in its absence.
+        assert_eq!(reported, 14, "{:#?}", sink.as_slice());
+        for name in [
+            "ConstWithType",
+            "PropertyNamesWithProperties",
+            "PrefixItemsWithItems",
+            "DependentRequiredWithProperties",
+            "ConstWithApplicatorOnly",
+            "TwoKeywordsOnOneNode",
+            "PatternPropertiesBesideAdditionalProperties",
+            "PrefixItemsBesideItems",
+            "ConstOnAnObject",
+            "TwoApplicatorsAndNoTypedHalf",
+        ] {
+            assert!(
+                !schema_named(&ir, name)
+                    .meta()
+                    .rejected_validation_keywords
+                    .is_empty(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

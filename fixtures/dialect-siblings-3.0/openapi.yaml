@@ -1,0 +1,166 @@
+openapi: 3.0.3
+info:
+  title: Dialect Siblings
+  version: "1"
+paths:
+  /jit-access:
+    get:
+      operationId: getJitAccess
+      responses:
+        "200":
+          description: The current access state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JitAccess"
+  /conjoined:
+    get:
+      operationId: getConjoined
+      responses:
+        "200":
+          description: A node lowered to a conjunction with no typed half.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Conjoined"
+  /api-keys/{id}:
+    get:
+      operationId: getApiKey
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The requested key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKey"
+components:
+  schemas:
+    # A discriminated union whose tag property carries `const` beside its `type`. It is the tag
+    # property that widens, not the branch around it, and a tag of `unknown` cannot be read at all
+    # — which is what makes the union unusable while every sibling property still looks fine.
+    JitAccess:
+      oneOf:
+        - type: object
+          required:
+            - state
+          properties:
+            state:
+              type: string
+              enum:
+                - enabled
+                - disabled
+            appliedSuccessfully:
+              type: boolean
+          additionalProperties: false
+        - type: object
+          required:
+            - state
+            - unavailableReason
+          properties:
+            state:
+              type: string
+              const: unavailable
+            unavailableReason:
+              type: string
+              enum:
+                - postgres_upgrade_required
+                - temporarily_unavailable
+          additionalProperties: false
+    Named:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+    # Two applicators and no typed content: the object lowers to a conjunction whose typed half is
+    # never emitted, so the dropped keyword has to travel on the wrapper to keep refusing.
+    Conjoined:
+      const: x
+      allOf:
+        - $ref: "#/components/schemas/Named"
+      oneOf:
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              type: string
+              enum:
+                - direct
+        - type: object
+          required:
+            - kind
+          properties:
+            kind:
+              type: string
+              enum:
+                - delegated
+    ApiKey:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: string
+        # propertyNames beside a declared object type.
+        jwtTemplate:
+          type: object
+          propertyNames:
+            type: string
+          additionalProperties: {}
+          nullable: true
+        # `items` governs only the indices beyond the tuple prefix, so dropping `prefixItems`
+        # widens what it applies to. The differing element types are what make that visible:
+        # carrying `items` through unchanged would reject [1, "a"], which this schema admits.
+        tags:
+          type: array
+          items:
+            type: string
+          prefixItems:
+            - type: integer
+        # dependentRequired beside a full `properties` map.
+        limits:
+          type: object
+          properties:
+            rate:
+              type: integer
+            burst:
+              type: integer
+          dependentRequired:
+            burst:
+              - rate
+        # `additionalProperties` governs only the keys no pattern matched, so dropping
+        # `patternProperties` widens what it applies to. Carrying `false` through unchanged would
+        # emit an index signature of `never` and reject { "x-trace": "abc" }, which this admits.
+        extensions:
+          type: object
+          additionalProperties: false
+          patternProperties:
+            "^x-":
+              type: string
+        # contains/minContains beside `items`.
+        auditLog:
+          type: array
+          items:
+            type: string
+          contains:
+            type: string
+          minContains: 1
+        # Nothing representable sits beside the keyword, so the node still widens whole.
+        opaque:
+          const: opaque
+        # A `type` array is the type declaration rather than a droppable conjunct: this widens
+        # whole even though `minLength` would otherwise be a representable sibling.
+        widened:
+          type:
+            - string
+            - "null"
+          const: x
+          minLength: 3

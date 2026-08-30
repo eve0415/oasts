@@ -1998,6 +1998,128 @@ paths:
     }
 
     #[test]
+    fn dialect_sibling_fixture_keeps_types_and_still_refuses_validators() {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/dialect-siblings-3.0");
+
+        // The types artifact drops only the unrepresentable conjunct, so it warns and generates.
+        let types = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+            .expect("resolved dialect-siblings types config");
+        let mut sink = DiagnosticSink::new();
+        let files = compile(&types, true, &mut sink).expect("types artifact generates");
+        assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
+        let paths = emitted_paths(&files);
+        assert!(paths.contains("types/components/apikey.ts"), "{paths:#?}");
+        // `widened` carries a `type` array beside a `const`. Both are named, and the array — the
+        // one that actually widened the node — is not left out because the other was found first.
+        let mut warned = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.json_pointer.as_deref().is_some_and(|pointer| {
+                    pointer.starts_with("/components/schemas/ApiKey/properties/widened/")
+                })
+            })
+            .map(|diagnostic| {
+                (
+                    diagnostic.code,
+                    diagnostic.json_pointer.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        warned.sort_unstable();
+        assert_eq!(
+            warned,
+            vec![
+                (
+                    "OASTS2201",
+                    "/components/schemas/ApiKey/properties/widened/const"
+                ),
+                (
+                    "OASTS2201",
+                    "/components/schemas/ApiKey/properties/widened/type"
+                ),
+            ]
+        );
+
+        // The validators artifact refuses each dropped keyword by name at the node that carried
+        // it, so a preserved node never ships a check that ignores the constraint it dropped.
+        let validators = load_config(Some(&fixture.join("oasts-validators.yaml")), &fixture)
+            .expect("resolved dialect-siblings validators config");
+        let mut sink = DiagnosticSink::new();
+        assert!(compile(&validators, true, &mut sink).is_none());
+        assert_eq!(sink.worst_exit_code(), 1);
+        let mut refused = sink
+            .as_slice()
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == crate::diag::Severity::Error)
+            .map(|diagnostic| {
+                (
+                    diagnostic.code,
+                    diagnostic.message.as_str(),
+                    diagnostic.json_pointer.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        refused.sort_unstable();
+        assert_eq!(
+            refused,
+            vec![
+                (
+                    "OASTS6002",
+                    "validators cannot emit a check for unsupported validation keyword 'const'",
+                    "/components/schemas/ApiKey/properties/opaque"
+                ),
+                (
+                    "OASTS6002",
+                    "validators cannot emit a check for unsupported validation keyword 'const'",
+                    "/components/schemas/ApiKey/properties/widened"
+                ),
+                (
+                    "OASTS6002",
+                    "validators cannot emit a check for unsupported validation keyword 'const'",
+                    "/components/schemas/Conjoined"
+                ),
+                (
+                    "OASTS6002",
+                    "validators cannot emit a check for unsupported validation keyword 'const'",
+                    "/components/schemas/JitAccess/oneOf/1/properties/state"
+                ),
+                (
+                    "OASTS6002",
+                    "validators cannot emit a check for unsupported validation keyword 'contains'",
+                    "/components/schemas/ApiKey/properties/auditLog"
+                ),
+                (
+                    "OASTS6002",
+                    "validators cannot emit a check for unsupported validation keyword 'dependentRequired'",
+                    "/components/schemas/ApiKey/properties/limits"
+                ),
+                (
+                    "OASTS6002",
+                    "validators cannot emit a check for unsupported validation keyword 'minContains'",
+                    "/components/schemas/ApiKey/properties/auditLog"
+                ),
+                (
+                    "OASTS6002",
+                    "validators cannot emit a check for unsupported validation keyword 'patternProperties'",
+                    "/components/schemas/ApiKey/properties/extensions"
+                ),
+                (
+                    "OASTS6002",
+                    "validators cannot emit a check for unsupported validation keyword 'prefixItems'",
+                    "/components/schemas/ApiKey/properties/tags"
+                ),
+                (
+                    "OASTS6002",
+                    "validators cannot emit a check for unsupported validation keyword 'propertyNames'",
+                    "/components/schemas/ApiKey/properties/jwtTemplate"
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn operation_ref_rejection_fixture_emits_only_the_cause_and_no_files() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/operation-ref-rejection-3.0");

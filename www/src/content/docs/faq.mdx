@@ -21,13 +21,15 @@ A 3.0 document using a 3.1-only keyword is never silently reinterpreted.
 It is diagnosed at the exact node, and what happens next depends on the artifact:
 
 ```text
-warning[OASTS2201]: schema keyword 'const' requires OpenAPI 3.1 and becomes unknown
+warning[OASTS2201]: schema keyword 'const' requires OpenAPI 3.1 and is dropped from the emitted type; the schema widens to unknown only where no representable sibling remains
   --> workspace/openapi.yaml:1:1 /components/schemas/T/properties/k/const
-error[OASTS6003]: validators cannot emit a check for an unsupported schema (OpenAPI 3.0 does not support const)
+error[OASTS6002]: validators cannot emit a check for unsupported validation keyword 'const'
   --> workspace/openapi.yaml:1:1 /components/schemas/T/properties/k
 ```
 
-The type widens to `unknown` with a warning naming the keyword; the validators and Zod artifacts refuse outright, because a check they cannot express would be a check you would trust and not get.
+The keyword is dropped with a warning naming it, and the rest of the schema object is kept: `k` above is emitted as `string`, because `type: string` is a sibling the 3.0 dialect does admit.
+A node with nothing representable beside the keyword — a bare `const`, with no `type` and no applicator — has nothing to keep and widens to `unknown`.
+Either way the validators and Zod artifacts refuse outright, because a check they cannot express would be a check you would trust and not get.
 
 3.2 is not supported.
 
