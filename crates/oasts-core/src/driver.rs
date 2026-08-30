@@ -513,9 +513,10 @@ fn emit(
                 // same as every other diagnostic here; some of them carry no path of their own,
                 // and would otherwise name nothing at all in a run with several output roots.
                 attribute(&spec, &mut diagnostics);
-                // Only the I/O of the commit itself reaches here — the preflight above answered
-                // everything that could be known in advance. Specs already written stay written,
-                // and the summary of what did land is reported beside the failure.
+                // What reaches here is the I/O of the commit itself, plus the one thing the
+                // preflight leaves it: an output root that is not there yet, whose parent may
+                // refuse to let it be created. Specs already written stay written, and the
+                // summary of what did land is reported beside the failure.
                 let mut sink = DiagnosticSink::new();
                 sink.extend(warnings);
                 sink.extend(diagnostics);

@@ -290,8 +290,10 @@ fn prune_emptied_directories(output_root: &Path, emptied: Vec<PathBuf>) {
 /// A run with several output roots asks this of all of them before committing any, so a refusal
 /// one root could have predicted does not arrive after another root has already been rewritten.
 /// What it cannot answer is the I/O the commit itself does: a disk that fills, a permission that
-/// changes under the run, a rename that fails. Those stay where they are, behind the transaction
-/// that rolls each root back on its own.
+/// changes under the run, a rename that fails. Nor can it answer for a root that is not there yet
+/// beyond its own shape — whether the tree above it will let the commit create it is asked when
+/// the commit asks for it. Those stay where they are, behind the transaction that rolls each root
+/// back on its own.
 pub fn preflight(output_dir: &Path, files: &[GeneratedFile]) -> Result<(), Vec<Diagnostic>> {
     validate_generated_paths(files)?;
     validate_output_path(output_dir)?;

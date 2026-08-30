@@ -111,7 +111,7 @@ Every selected output root is then checked before the first of them is written: 
 A refusal any of those could have predicted leaves the whole workspace untouched, whichever spec it belongs to.
 
 What is left is the write itself, which is per output root.
-If the I/O of one spec's commit fails — a disk that fills, a permission that changes under the run — that root rolls back on its own, the run stops there, exits `2`, and reports which specs were written before it.
+If the I/O of one spec's commit fails — a disk that fills, a permission that changes under the run, a parent directory that will not let a not-yet-existing root be created — that root rolls back on its own, the run stops there, exits `2`, and reports which specs were written before it.
 
 ## Watching a workspace
 
