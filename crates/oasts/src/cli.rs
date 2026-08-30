@@ -1206,6 +1206,51 @@ mod tests {
         assert!(parent.join("billing/types").is_dir());
     }
 
+    /// Drives the `watch` command through the real session, from argv down.
+    ///
+    /// It terminates because the session cannot register a watch on the unreadable directory the
+    /// entry document lives in — the one failure the loop is allowed to end on. The thread and
+    /// deadline only turn a session that refuses to end into a failure rather than a hang.
+    #[cfg(unix)]
+    #[test]
+    fn watch_runs_a_session_and_ends_on_a_directory_it_cannot_watch() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let documents = root.join("spec");
+        fs::create_dir_all(&documents).expect("document directory");
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/petstore-3.0/openapi.yaml"),
+            documents.join("openapi.yaml"),
+        )
+        .expect("copy document");
+        fs::write(
+            root.join("oasts.yaml"),
+            "schemaVersion: 1\ninput: {path: ./spec/openapi.yaml}\noutput: ./generated\nartifacts: {types: true}\n",
+        )
+        .expect("config");
+        fs::set_permissions(&documents, fs::Permissions::from_mode(0o000))
+            .expect("seal the directory");
+
+        let (finished, reader) = mpsc::channel();
+        let session_root = root.clone();
+        std::thread::spawn(move || {
+            let outcome = invoke(&["oasts", "watch"], &session_root);
+            let _ = finished.send(outcome);
+        });
+        let (code, _, stderr) = reader
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the session ends on a directory it cannot watch");
+        fs::set_permissions(&documents, fs::Permissions::from_mode(0o755)).expect("unseal");
+
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stderr.contains("error[OASTS1031]"), "{stderr}");
+    }
+
     #[test]
     fn two_specs_writing_into_one_tree_are_refused_before_any_write() {
         let temp = workspace_fixture();
