@@ -269,8 +269,10 @@ describe("scalar checks", () => {
 
     assert.equal(minimum.safeParse("ab").success, true);
     assert.equal(minimum.safeParse("a").success, false);
+    // One code point, two UTF-16 units: passing a max of 1 is what proves the unit is the code point.
+    // These stay independent of zod's own `.min()`/`.max()`, which counted UTF-16 units through 4.4 and code points from 4.5, because the peer range spans both.
     assert.equal(maximum.safeParse("\u{1f600}").success, true);
-    assert.equal(z.string().max(1).safeParse("\u{1f600}").success, false);
+    assert.equal(minimum.safeParse("\u{1f600}").success, false);
     assert.equal(maximum.safeParse("ab").success, false);
   });
 
