@@ -117,6 +117,27 @@ impl InputRecorder {
     }
 }
 
+/// What one spec of a run depended on, and where it writes.
+///
+/// One of these per spec rather than one merged set for the run: two specs read different
+/// documents into different output roots, and a host that could not tell them apart would have to
+/// treat every spec's output tree as every other spec's, which is how a run's own writes start
+/// looking like a change worth recompiling for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpecWatchPlan {
+    /// The `specs` key this plan answers for; `None` for a configuration with one spec at the
+    /// root, which is the shape every single-spec run keeps.
+    pub name: Option<String>,
+    /// Every path this spec read or probed for, sorted and deduplicated. A path that does not
+    /// exist is still listed whenever its appearance would change the result.
+    pub inputs: Vec<WatchInput>,
+    /// The tree this spec writes into.
+    ///
+    /// Never an input. A watcher is told about it so it can tell its own writes apart from a
+    /// change worth recompiling for.
+    pub output_root: PathBuf,
+}
+
 /// Everything a watching host needs in order to keep going after one compile.
 ///
 /// Reported by the compile rather than assembled by the host: the paths are only knowable from
@@ -124,16 +145,48 @@ impl InputRecorder {
 /// the configuration separately could be watching for a compile that never happened.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WatchPlan {
-    /// Every path the run read or probed for, sorted and deduplicated. A path that does not exist
-    /// is still listed whenever its appearance would change the result.
+    /// The paths the configuration file itself decides, whichever spec is being built: every name
+    /// discovery would accept, and the file it found. Held once beside the specs rather than
+    /// copied into each, because the workspace shape is a property of the whole file.
     pub inputs: Vec<WatchInput>,
-    /// The tree the run writes into, when the configuration resolved far enough to name one.
-    ///
-    /// Never an input. A watcher is told about it so it can tell its own writes apart from a
-    /// change worth recompiling for.
-    pub output_root: Option<PathBuf>,
+    /// One plan per spec the run attempted, in the order the workspace declares them. A run that
+    /// never reached a spec reports none, and a single-spec run reports exactly one.
+    pub specs: Vec<SpecWatchPlan>,
     /// The `watch` block the run resolved, or its defaults when no configuration was read.
     pub settings: WatchConfig,
+}
+
+impl WatchPlan {
+    /// Every path any part of the run depended on, sorted and deduplicated.
+    ///
+    /// Two specs sharing a document legitimately report it twice, and a host watches one path for
+    /// it. Deduplication keeps the wider registration for the same reason a recorder does: a path
+    /// one spec named as a directory is watched as a directory.
+    #[must_use]
+    pub fn watched_inputs(&self) -> Vec<WatchInput> {
+        let mut inputs = self
+            .inputs
+            .iter()
+            .chain(self.specs.iter().flat_map(|spec| spec.inputs.iter()))
+            .cloned()
+            .collect::<Vec<_>>();
+        inputs.sort();
+        inputs.dedup_by(|left, right| left.path == right.path);
+        inputs
+    }
+
+    /// The output trees this run writes into, sorted and deduplicated.
+    #[must_use]
+    pub fn output_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self
+            .specs
+            .iter()
+            .map(|spec| spec.output_root.clone())
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
 }
 
 #[cfg(test)]
@@ -199,9 +252,45 @@ mod tests {
             WatchPlan::default(),
             WatchPlan {
                 inputs: Vec::new(),
-                output_root: None,
+                specs: Vec::new(),
                 settings: WatchConfig::default(),
             }
+        );
+        assert!(WatchPlan::default().watched_inputs().is_empty());
+        assert!(WatchPlan::default().output_roots().is_empty());
+    }
+
+    #[test]
+    fn a_plan_unions_its_specs_and_keeps_the_wider_registration() {
+        let plan = WatchPlan {
+            inputs: vec![file("/oasts.yaml")],
+            specs: vec![
+                SpecWatchPlan {
+                    name: Some("billing".to_owned()),
+                    inputs: vec![file("/shared.yaml"), directory("/root")],
+                    output_root: PathBuf::from("/out/billing"),
+                },
+                SpecWatchPlan {
+                    name: Some("users".to_owned()),
+                    // The same document, and the same root by the narrower name.
+                    inputs: vec![file("/root"), file("/shared.yaml")],
+                    output_root: PathBuf::from("/out/users"),
+                },
+            ],
+            settings: WatchConfig::default(),
+        };
+
+        assert_eq!(
+            plan.watched_inputs(),
+            vec![
+                file("/oasts.yaml"),
+                directory("/root"),
+                file("/shared.yaml")
+            ]
+        );
+        assert_eq!(
+            plan.output_roots(),
+            vec![PathBuf::from("/out/billing"), PathBuf::from("/out/users")]
         );
     }
 }

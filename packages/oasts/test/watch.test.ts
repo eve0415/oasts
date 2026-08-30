@@ -18,6 +18,7 @@ import {
   compileOnce,
   session,
   watchFailure,
+  watchedInputs,
 } from "../src/watch.ts";
 
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "../../../fixtures/petstore-3.0");
@@ -35,19 +36,20 @@ function planWithRoots(
   outputRoot: string | null,
   debounceMs = 5,
 ): WatchPlan {
-  return {
-    inputs: [
-      ...files.map((path) => ({ path, directory: false })),
-      ...directories.map((path) => ({ path, directory: true })),
-    ],
-    outputRoot,
-    debounceMs,
-  };
+  const inputs = [
+    ...files.map((path) => ({ path, directory: false })),
+    ...directories.map((path) => ({ path, directory: true })),
+  ];
+  // Everything a spec read is reported under the spec that read it, and a run that never got as
+  // far as a spec reports what the configuration file alone decided.
+  return outputRoot === null
+    ? { inputs, specs: [], debounceMs }
+    : { inputs: [], specs: [{ name: null, inputs, outputRoot }], debounceMs };
 }
 
 /** Whether the plan reports `path`, whatever kind it was recorded as. */
 function hasInput(reported: WatchPlan, path: string): boolean {
-  return reported.inputs.some((input) => input.path === path);
+  return watchedInputs(reported).some((input) => input.path === path);
 }
 
 function cycle(exitCode: number, watchPlan: WatchPlan | null): Cycle {
@@ -461,7 +463,10 @@ test("one cycle compiles, reports its plan, and never throws", async () => {
   // Discovery runs on this side, so the names it would also have accepted are added here.
   assert.ok(hasInput(compiled.plan, join(directory, "oasts.json")));
   assert.ok(hasInput(compiled.plan, join(directory, "oasts.config.ts")));
-  assert.equal(compiled.plan.outputRoot, join(directory, "generated"));
+  assert.deepEqual(
+    compiled.plan.specs.map((spec) => spec.outputRoot),
+    [join(directory, "generated")],
+  );
   assert.equal(compiled.plan.debounceMs, 10);
 
   // An explicit config path narrows what discovery would have considered to that one file.
@@ -488,7 +493,7 @@ test("a cycle that never reaches a config still says what to watch", async () =>
   assert.equal(failed.exitCode, 2);
   assert.match(failed.stderr, /error\[OASTS0011\]/);
   assert.equal(failed.plan?.inputs.length, 8);
-  assert.equal(failed.plan?.outputRoot, null);
+  assert.equal(failed.plan?.specs.length, 0);
 
   // A config the compiler refuses outright is reported the same way.
   const broken = mkdtempSync(join(tmpdir(), "oasts-watch-"));
@@ -503,7 +508,7 @@ test("a cycle that never reaches a config still says what to watch", async () =>
   writeFileSync(join(invalid, "oasts.yaml"), "schemaVersion: 2\n");
   const rejected = await compileOnce(native, { specs: [] }, invalid);
   assert.equal(rejected.exitCode, 2);
-  assert.equal(rejected.plan?.outputRoot, null);
+  assert.equal(rejected.plan?.specs.length, 0);
   assert.ok(rejected.plan !== null);
   assert.ok(hasInput(rejected.plan, join(invalid, "oasts.yaml")));
 });

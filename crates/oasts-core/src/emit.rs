@@ -5584,7 +5584,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::config::load_config;
+    use crate::config::load_single;
     use crate::ir::{Body, Discriminator, Ir, MediaType, NamedSchema, SchemaMeta, SchemaRef};
     use crate::loader::load_graph;
     use crate::parse::parse;
@@ -5836,7 +5836,7 @@ mod tests {
             .expect("config JSON"),
         )
         .expect("write config");
-        let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let mut resolved = load_single(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
         let graph =
@@ -5947,7 +5947,7 @@ mod tests {
             serde_json::to_vec_pretty(&config).expect("config JSON"),
         )
         .expect("write config");
-        let resolved = load_config(Some(&config_path), temp.path()).expect("valid config");
+        let resolved = load_single(Some(&config_path), temp.path()).expect("valid config");
         let mut sink = DiagnosticSink::new();
         let graph =
             load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("loaded graph");
@@ -6038,7 +6038,7 @@ mod tests {
             serde_json::to_vec(&config).expect("config JSON"),
         )
         .expect("write config");
-        let resolved = load_config(Some(&config_path), temp.path()).expect("valid config");
+        let resolved = load_single(Some(&config_path), temp.path()).expect("valid config");
         (temp, resolved)
     }
 
@@ -7287,7 +7287,7 @@ mod tests {
             let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../fixtures")
                 .join(fixture_name);
-            let config = crate::config::load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+            let config = crate::config::load_single(Some(&fixture.join("oasts.yaml")), &fixture)
                 .expect("fixture config loads");
             let mut sink = DiagnosticSink::new();
             let graph = crate::loader::load_graph(&config, &mut InputRecorder::off(), &mut sink)
@@ -11303,7 +11303,7 @@ mod tests {
         let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         for name in ["petstore-3.0", "tictactoe-3.1"] {
             let directory = fixture_root.join(name);
-            let config = load_config(Some(&directory.join("oasts.yaml")), &directory)
+            let config = load_single(Some(&directory.join("oasts.yaml")), &directory)
                 .expect("fixture config");
             let mut sink = DiagnosticSink::new();
             let graph =
@@ -11622,7 +11622,7 @@ mod tests {
             .expect("config JSON"),
         )
         .expect("write config");
-        let config = load_config(Some(&config_path), temp.path()).expect("valid config");
+        let config = load_single(Some(&config_path), temp.path()).expect("valid config");
         let mut preparation_sink = DiagnosticSink::new();
         let graph = load_graph(&config, &mut InputRecorder::off(), &mut preparation_sink)
             .expect("loaded graph");

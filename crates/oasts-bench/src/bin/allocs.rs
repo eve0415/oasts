@@ -305,12 +305,15 @@ fn measure_key(entry: &FixtureEntry, fixture_dir: &Path) -> Result<KeySnapshot, 
 
     // Config loading is not measured: it is host setup, not a pipeline stage.
     let config_path = fixture_dir.join(&entry.config);
-    let config = load_config(Some(&config_path), fixture_dir).map_err(|diagnostics| {
-        Error::new(format!(
-            "{key_label}: config load failed:\n{}",
-            diag::render_to_string(diagnostics)
-        ))
-    })?;
+    let config = load_config(Some(&config_path), fixture_dir)
+        .map_err(|diagnostics| {
+            Error::new(format!(
+                "{key_label}: config load failed:\n{}",
+                diag::render_to_string(diagnostics)
+            ))
+        })?
+        .into_single()
+        .ok_or_else(|| Error::new(format!("{key_label}: config declares several specs")))?;
 
     reset_live_tracking();
     let mut sink = DiagnosticSink::new();

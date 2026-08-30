@@ -808,7 +808,7 @@ mod tests {
             .expect("write document");
         }
         let resolved =
-            crate::config::load_config(Some(std::path::Path::new("oasts.json")), temp.path())
+            crate::config::load_single(Some(std::path::Path::new("oasts.json")), temp.path())
                 .expect("resolved config");
         let mut sink = DiagnosticSink::new();
         let graph = crate::loader::load_graph(&resolved, &mut InputRecorder::off(), &mut sink)

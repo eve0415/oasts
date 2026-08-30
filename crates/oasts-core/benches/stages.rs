@@ -77,10 +77,12 @@ fn fixtures() -> Vec<Fixture> {
             if spec.fetched && !dir.join("openapi.json").is_file() {
                 return None;
             }
-            let config =
-                load_config(Some(&dir.join("oasts.yaml")), &dir).unwrap_or_else(|diagnostics| {
+            let config = load_config(Some(&dir.join("oasts.yaml")), &dir)
+                .unwrap_or_else(|diagnostics| {
                     panic!("failed to load {}: {diagnostics:#?}", spec.name)
-                });
+                })
+                .into_single()
+                .expect("bench fixtures declare one target at the root");
             Some(Fixture {
                 name: spec.name,
                 config,
@@ -115,7 +117,9 @@ fn artifact_fixtures() -> Vec<Fixture> {
                 return None;
             }
             let config = load_config(Some(&dir.join(config_file)), &dir)
-                .unwrap_or_else(|diagnostics| panic!("failed to load {name}: {diagnostics:#?}"));
+                .unwrap_or_else(|diagnostics| panic!("failed to load {name}: {diagnostics:#?}"))
+                .into_single()
+                .expect("bench fixtures declare one target at the root");
             Some(Fixture { name, config })
         })
         .collect()

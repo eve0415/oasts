@@ -2798,7 +2798,7 @@ mod tests {
         )
         .expect("config JSON");
         let config =
-            crate::config::load_config(Some(&config_path), temp.path()).expect("valid config");
+            crate::config::load_single(Some(&config_path), temp.path()).expect("valid config");
         let mut sink = DiagnosticSink::new();
         let graph =
             load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("loaded graph");
@@ -4503,7 +4503,7 @@ mod tests {
     fn schema_overrides_can_address_duplicate_names_by_source() {
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/schemas-by-source-collision-3.1");
-        let config = crate::config::load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+        let config = crate::config::load_single(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved fixture config");
         let mut sink = DiagnosticSink::new();
         let files = crate::pipeline::compile(

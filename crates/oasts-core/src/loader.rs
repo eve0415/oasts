@@ -3065,7 +3065,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::config::{ResolvedConfig, load_config};
+    use crate::config::{ResolvedConfig, load_single};
     use crate::diag::{Category, Severity};
 
     fn write(root: &Path, relative: &str, contents: &str) -> PathBuf {
@@ -3084,7 +3084,7 @@ mod tests {
             "schemaVersion: 1\nworkspaceRoot: workspace\ninput: {{ path: entry.yaml }}\noutput: generated\n{extra}"
         );
         let path = write(root, "oasts.yaml", &config);
-        load_config(Some(&path), root).expect("fixture config should resolve")
+        load_single(Some(&path), root).expect("fixture config should resolve")
     }
 
     fn resolved_json_config(root: &Path) -> ResolvedConfig {
@@ -3094,7 +3094,7 @@ mod tests {
             "oasts.yaml",
             "schemaVersion: 1\nworkspaceRoot: workspace\ninput: { path: entry.json }\noutput: generated\n",
         );
-        load_config(Some(&path), root).expect("fixture config should resolve")
+        load_single(Some(&path), root).expect("fixture config should resolve")
     }
 
     fn load_ok(config: &ResolvedConfig) -> DocumentGraph {
@@ -3550,7 +3550,7 @@ mod tests {
             "oasts.yaml",
             "schemaVersion: 1\ninput: { url: https://example.invalid/openapi.yaml }\noutput: generated\n",
         );
-        let config = load_config(Some(&config_path), directory.path())
+        let config = load_single(Some(&config_path), directory.path())
             .expect("remote input should reach the loader");
 
         assert_load_code(&config, CODE_REMOTE_UNAUTHORIZED);
@@ -5359,7 +5359,7 @@ mod tests {
             "schemaVersion: 1\nworkspaceRoot: workspace\ninput: {{ url: \"{uri}\" }}\noutput: generated\n{extra}"
         );
         let path = write(root, "oasts.yaml", &config);
-        load_config(Some(&path), root).expect("fixture config should resolve")
+        load_single(Some(&path), root).expect("fixture config should resolve")
     }
 
     fn load_retrieving(

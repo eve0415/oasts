@@ -3019,7 +3019,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::config::{ResolvedConfig, load_config_from_json};
+    use crate::config::{ResolvedConfig, load_single_from_json};
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
     use crate::ir::{
         AdditionalProperties, ConditionalApplicator, ContainsApplicator, Discriminator, Ir,
@@ -3083,7 +3083,7 @@ mod tests {
             "validation": validation
                 .unwrap_or_else(|| json!({ "engine": "off", "unchecked": "allow" }))
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&config).expect("config JSON"),
         )

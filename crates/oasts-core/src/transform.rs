@@ -846,7 +846,7 @@ mod tests {
     use super::*;
     use crate::config::{
         DateRepresentation, DateTimeRepresentation, IntegerRepresentation, ResolvedConfig,
-        TypesConfig, load_config,
+        TypesConfig, load_single,
     };
     use crate::diag::DiagnosticSink;
     use crate::ir::Ir;
@@ -894,7 +894,7 @@ mod tests {
         )
         .expect("write config");
         let mut config: ResolvedConfig =
-            load_config(Some(&config_path), temp.path()).expect("config resolves");
+            load_single(Some(&config_path), temp.path()).expect("config resolves");
         config.types = types;
         let mut sink = DiagnosticSink::new();
         let graph = load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("graph loads");

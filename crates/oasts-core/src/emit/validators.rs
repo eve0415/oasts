@@ -4337,7 +4337,7 @@ mod tests {
 
     use super::*;
     use crate::client_model::build_client_model;
-    use crate::config::load_config;
+    use crate::config::load_single;
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
     use crate::emit::emit_artifacts;
     use crate::ir::SchemaRef;
@@ -4376,7 +4376,7 @@ mod tests {
             serde_json::to_vec(&config).expect("config JSON"),
         )
         .expect("write config");
-        let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let resolved = load_single(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
         let graph =
             load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
@@ -7055,7 +7055,7 @@ mod tests {
             serde_json::to_vec(&config).expect("config JSON"),
         )
         .expect("write");
-        let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let resolved = load_single(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
         let graph = load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph");
         let ir = parse(&graph, &mut sink).expect("ir");
@@ -7955,7 +7955,7 @@ mod tests {
         )
         .expect("write config");
         let resolved =
-            load_config(Some(&temp.path().join("oasts.json")), temp.path()).expect("config");
+            load_single(Some(&temp.path().join("oasts.json")), temp.path()).expect("config");
         let analyzed = crate::semantic::Analyzed {
             ir: crate::ir::Ir::default(),
             operation_names: Vec::new(),
@@ -8002,7 +8002,7 @@ mod tests {
         )
         .expect("write config");
         let resolved =
-            load_config(Some(&temp.path().join("oasts.json")), temp.path()).expect("config");
+            load_single(Some(&temp.path().join("oasts.json")), temp.path()).expect("config");
         let analyzed = crate::semantic::Analyzed {
             ir: crate::ir::Ir::default(),
             operation_names: Vec::new(),
@@ -8193,7 +8193,7 @@ mod tests {
             serde_json::to_vec(&config).expect("config JSON"),
         )
         .expect("write");
-        let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let resolved = load_single(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
         let graph = load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph");
         let ir = parse(&graph, &mut sink).expect("ir");

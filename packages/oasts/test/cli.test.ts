@@ -142,10 +142,10 @@ test("usage, discovery, spec, and config failures exit 2", async () => {
   assert.equal(undiscovered.code, 2);
   assert.match(undiscovered.stderr, /error\[OASTS0011\]/);
 
-  for (const command of ["generate", "check", "watch"]) {
+  for (const command of ["generate", "check"]) {
     const spec = await invoke([command, "--spec", "petstore"], scriptFixture());
     assert.equal(spec.code, 2);
-    assert.match(spec.stderr, /error\[OASTS9002\]/);
+    assert.match(spec.stderr, /error\[OASTS0295\]/);
   }
 
   const ambiguous = scriptFixture();

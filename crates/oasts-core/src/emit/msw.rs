@@ -2360,7 +2360,7 @@ fn embedded_assets(model: &EmissionModel<'_>, registrar: &mut Registrar<'_>) -> 
 mod tests {
     use super::*;
     use crate::config::{
-        DateTimeRepresentation, IntegerRepresentation, ResolvedConfig, load_config,
+        DateTimeRepresentation, IntegerRepresentation, ResolvedConfig, load_single,
     };
     use crate::diag::{DiagnosticSink, Severity};
     use crate::emit::{
@@ -2384,7 +2384,7 @@ mod tests {
         fs::write(temp.path().join("openapi.yaml"), document).expect("write document");
         fs::write(temp.path().join("oasts.yaml"), config).expect("write config");
         let mut sink = DiagnosticSink::new();
-        let resolved = load_config(None, temp.path()).expect("config loads");
+        let resolved = load_single(None, temp.path()).expect("config loads");
         let graph =
             load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let source_tuples = graph.source_tuples();
@@ -2420,7 +2420,7 @@ mod tests {
         fs::write(temp.path().join("openapi.yaml"), document).expect("write document");
         fs::write(temp.path().join("oasts.yaml"), MSW_CONFIG).expect("write config");
         let mut sink = DiagnosticSink::new();
-        let mut resolved = load_config(None, temp.path()).expect("config loads");
+        let mut resolved = load_single(None, temp.path()).expect("config loads");
         configure(&mut resolved);
         let graph =
             load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
@@ -2532,7 +2532,7 @@ validation:
         let temp = TempDir::new().expect("temp dir");
         fs::write(temp.path().join("openapi.yaml"), wide_document(40)).expect("write document");
         fs::write(temp.path().join("oasts.yaml"), MSW_CONFIG).expect("write config");
-        let resolved = load_config(None, temp.path()).expect("config loads");
+        let resolved = load_single(None, temp.path()).expect("config loads");
         let mut prepared = DiagnosticSink::new();
         let graph =
             load_graph(&resolved, &mut InputRecorder::off(), &mut prepared).expect("graph loads");
@@ -3407,7 +3407,7 @@ paths:
         fs::write(temp.path().join("openapi.yaml"), MINIMAL).expect("write document");
         fs::write(temp.path().join("oasts.yaml"), MSW_CONFIG).expect("write config");
         let mut sink = DiagnosticSink::new();
-        let resolved = load_config(None, temp.path()).expect("config loads");
+        let resolved = load_single(None, temp.path()).expect("config loads");
         let graph =
             load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("document parses");
@@ -3546,7 +3546,7 @@ paths:
         fs::write(temp.path().join("openapi.yaml"), document).expect("write document");
         fs::write(temp.path().join("oasts.yaml"), MSW_CONFIG).expect("write config");
         let mut sink = DiagnosticSink::new();
-        let resolved = load_config(None, temp.path()).expect("config loads");
+        let resolved = load_single(None, temp.path()).expect("config loads");
         let graph =
             load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("document parses");
@@ -4472,7 +4472,7 @@ paths:
         fs::write(temp.path().join("openapi.yaml"), MINIMAL).expect("write document");
         fs::write(temp.path().join("oasts.yaml"), MSW_CONFIG).expect("write config");
         let mut sink = DiagnosticSink::new();
-        let resolved = load_config(None, temp.path()).expect("config loads");
+        let resolved = load_single(None, temp.path()).expect("config loads");
         let graph =
             load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("document parses");
@@ -4847,7 +4847,7 @@ components:
         fs::write(temp.path().join("openapi.yaml"), MINIMAL).expect("write document");
         fs::write(temp.path().join("oasts.yaml"), MSW_CONFIG).expect("write config");
         let mut sink = DiagnosticSink::new();
-        let resolved = load_config(None, temp.path()).expect("config loads");
+        let resolved = load_single(None, temp.path()).expect("config loads");
         let graph =
             load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("document parses");

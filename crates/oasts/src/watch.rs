@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use oasts_core::diag::Diagnostic;
-use oasts_core::driver::{self, Command, ConfigSource, Outcome, Tracking, Unsupported};
+use oasts_core::driver::{self, Command, ConfigSource, Outcome, Tracking};
 use oasts_core::inputs::{InputKind, WatchPlan};
 
 /// Failure to register a filesystem watch, which is the only way a session ends unasked.
@@ -185,7 +185,8 @@ impl Changes for FsChanges {
 struct Watched {
     /// Every path the compile depended on, and whether it names a directory.
     inputs: BTreeMap<PathBuf, InputKind>,
-    output_root: Option<PathBuf>,
+    /// The trees this run writes into, one per spec it compiled.
+    output_roots: BTreeSet<PathBuf>,
     /// Whether the last compile succeeded. A failed one widens what counts as a change, because
     /// the file that would fix it may be one the failed run never got far enough to read.
     settled: bool,
@@ -193,10 +194,13 @@ struct Watched {
 
 impl Watched {
     fn absorb(&mut self, plan: &WatchPlan, settled: bool) {
+        // One session watches every spec the run compiled, so the plans are read as a union: a
+        // document two specs share is one path to watch, and each spec's own inputs are as much a
+        // reason to recompile as the configuration they were selected by.
         let reported = plan
-            .inputs
-            .iter()
-            .map(|input| (input.path.clone(), input.kind));
+            .watched_inputs()
+            .into_iter()
+            .map(|input| (input.path, input.kind));
         if settled {
             self.inputs = reported.collect();
         } else {
@@ -204,8 +208,9 @@ impl Watched {
             // one before it, and dropping the rest would strand the session.
             self.inputs.extend(reported);
         }
-        if plan.output_root.is_some() {
-            self.output_root.clone_from(&plan.output_root);
+        let roots = plan.output_roots();
+        if !roots.is_empty() {
+            self.output_roots = roots.into_iter().collect();
         }
         self.settled = settled;
     }
@@ -239,11 +244,7 @@ impl Watched {
 
     /// Whether an event on `path` is worth a recompile.
     fn triggers(&self, path: &Path) -> bool {
-        if self
-            .output_root
-            .as_ref()
-            .is_some_and(|root| path.starts_with(root))
-        {
+        if self.output_roots.iter().any(|root| path.starts_with(root)) {
             // Our own writes land here every successful cycle, so nothing under the output tree
             // counts unless the compile itself read it — which one path does, the `tsconfig.json`
             // the ancestor walk looks for beside the emitted files.
@@ -372,10 +373,6 @@ pub(crate) fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
-    // Refused before any watcher exists, matching where the other commands answer it.
-    if !specs.is_empty() {
-        return crate::cli::report(driver::refuse(Unsupported::SpecSelection), stdout, stderr);
-    }
     let mut changes = FsChanges::new();
     session(
         &mut changes,
@@ -386,6 +383,7 @@ pub(crate) fn run(
                     explicit: config_path,
                     cwd,
                 },
+                specs,
                 oasts_fetch::handle(),
                 Tracking::Watch,
             )
@@ -435,7 +433,7 @@ mod tests {
         }
     }
 
-    use oasts_core::inputs::WatchInput;
+    use oasts_core::inputs::{SpecWatchPlan, WatchInput};
 
     fn plan(inputs: &[&str], output_root: Option<&str>, debounce_ms: u32) -> WatchPlan {
         plan_with_roots(inputs, &[], output_root, debounce_ms)
@@ -451,18 +449,33 @@ mod tests {
             path: PathBuf::from(path),
             kind,
         };
-        WatchPlan {
-            inputs: files
-                .iter()
-                .map(|path| input(path, InputKind::File))
-                .chain(
-                    directories
-                        .iter()
-                        .map(|path| input(path, InputKind::Directory)),
-                )
-                .collect(),
-            output_root: output_root.map(PathBuf::from),
-            settings: WatchConfig { debounce_ms },
+        let inputs = files
+            .iter()
+            .map(|path| input(path, InputKind::File))
+            .chain(
+                directories
+                    .iter()
+                    .map(|path| input(path, InputKind::Directory)),
+            )
+            .collect();
+        let settings = WatchConfig { debounce_ms };
+        // Everything a spec read is reported under the spec that read it, and a run that never got
+        // as far as a spec reports what the configuration file alone decided.
+        match output_root {
+            Some(root) => WatchPlan {
+                inputs: Vec::new(),
+                specs: vec![SpecWatchPlan {
+                    name: None,
+                    inputs,
+                    output_root: PathBuf::from(root),
+                }],
+                settings,
+            },
+            None => WatchPlan {
+                inputs,
+                specs: Vec::new(),
+                settings,
+            },
         }
     }
 
@@ -538,7 +551,10 @@ mod tests {
         watched.absorb(&plan(&["/w/oasts.yaml"], None, 5), false);
         assert!(watched.inputs.contains_key(Path::new("/w/a.yaml")));
         assert!(watched.inputs.contains_key(Path::new("/w/oasts.yaml")));
-        assert_eq!(watched.output_root, Some(PathBuf::from("/w/out")));
+        assert_eq!(
+            watched.output_roots,
+            BTreeSet::from([PathBuf::from("/w/out")])
+        );
 
         // The next success is authoritative again, so a dropped reference stops being watched.
         watched.absorb(&plan(&["/w/oasts.yaml"], Some("/w/out"), 5), true);
@@ -1140,6 +1156,7 @@ mod tests {
                                 explicit: None,
                                 cwd: &session_root,
                             },
+                            &[],
                             oasts_fetch::handle(),
                             Tracking::Watch,
                         )
@@ -1234,6 +1251,7 @@ mod tests {
                                 explicit: None,
                                 cwd: &session_root,
                             },
+                            &[],
                             oasts_fetch::handle(),
                             Tracking::Watch,
                         )
@@ -1321,6 +1339,7 @@ mod tests {
                                 explicit: None,
                                 cwd: &session_root,
                             },
+                            &[],
                             oasts_fetch::handle(),
                             Tracking::Watch,
                         )
@@ -1390,21 +1409,5 @@ mod tests {
 
         assert_eq!(code, 2, "{stderr}");
         assert!(stderr.contains("error[OASTS1031]"), "{stderr}");
-    }
-
-    #[test]
-    fn run_refuses_a_spec_selection_before_it_watches_anything() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let code = run(
-            None,
-            &["petstore".to_owned()],
-            temp.path(),
-            &mut stdout,
-            &mut stderr,
-        );
-        assert_eq!(code, 2);
-        assert!(String::from_utf8_lossy(&stderr).contains("OASTS9002"));
     }
 }

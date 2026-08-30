@@ -4080,7 +4080,7 @@ mod tests {
     use crate::client_model::{
         FieldWrapperPlan, PayloadKind, ResponseMediaPlan, build_client_model,
     };
-    use crate::config::{ResolvedConfig, load_config_from_json};
+    use crate::config::{ResolvedConfig, load_single_from_json};
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
     use crate::emit::emit_artifacts;
     use crate::ir::{
@@ -4125,7 +4125,7 @@ mod tests {
             "validation": { "engine": "off", "unchecked": "allow" },
             "documentation": { "enabled": documentation_enabled }
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&config).expect("config JSON"),
         )
@@ -4214,7 +4214,7 @@ mod tests {
                 json!({ "engine": "off", "unchecked": "allow" })
             }
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&config).expect("config JSON"),
         )
@@ -7787,7 +7787,7 @@ mod tests {
                 "unchecked": "allow"
             }
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&config).expect("config JSON"),
         )
