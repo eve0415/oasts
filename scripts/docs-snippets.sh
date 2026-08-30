@@ -143,7 +143,7 @@ fi
 # Entries are "source:line OASTSnnnn". An expected refusal passes only when it emits that error
 # code and no other error code; line-keying keeps the exception tied to one exact fence.
 expected_refusals=(
-  "www/src/content/docs/reference/configuration.mdx:67 OASTS2021"
+  "www/src/content/docs/reference/configuration.mdx:68 OASTS2021"
 )
 declare -A expected_by_block=()
 declare -A seen_expected=()
