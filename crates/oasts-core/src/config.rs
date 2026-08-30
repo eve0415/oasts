@@ -2013,11 +2013,12 @@ fn check_output_overlap(specs: &[ResolvedSpec], source_path: &Path) -> Result<()
 /// Whether `inner` is `outer`, or sits inside it, comparing components without ASCII case.
 ///
 /// The guarantee this serves is about physical directories, not about path strings, and the two
-/// diverge in two ways. A symlink alias is already gone by the time a root gets here: every path
-/// resolves through whatever of it exists, so two names for one existing directory arrive equal.
-/// Case is what canonicalization cannot answer. A filesystem that ignores it — Windows, and a
-/// macOS volume by default — makes `Users` and `users` one directory, and a component that does
-/// not exist yet has no name on disk to ask about at all.
+/// diverge. A symlink is resolved before a root gets here when it can be — a live link, whatever
+/// it points at, arrives as the directory it names — and refused when it cannot: a link whose
+/// target does not exist yet fails to canonicalize rather than being guessed at lexically. What
+/// no amount of resolving answers is case. A filesystem that ignores it — Windows, and a macOS
+/// volume by default — makes `Users` and `users` one directory, and a component that does not
+/// exist yet has no name on disk to ask about at all.
 ///
 /// So case is decided conservatively, the same way wherever the run happens: two roots that
 /// differ only in case are treated as one. On a case-sensitive filesystem that refuses a
@@ -3372,10 +3373,17 @@ fn normalize_config_path(path: PathBuf) -> PathBuf {
     }
 }
 
+/// The longest prefix of `path` that names something on disk.
+///
+/// Existence is asked of the name itself, not of what it points at: `Path::exists` follows a
+/// symlink, so a link whose target has not been created yet answers "absent" and the walk steps
+/// straight past the one component that decides where the path really goes. Stopping at the link
+/// instead makes canonicalizing it fail, which is the honest answer — this path cannot be placed
+/// yet — rather than a lexical guess that turns out wrong the moment something creates the target.
 fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let mut candidate = path.to_path_buf();
     loop {
-        if candidate.exists() {
+        if fs::symlink_metadata(&candidate).is_ok() {
             return Some(candidate);
         }
         if !candidate.pop() {
@@ -6149,56 +6157,108 @@ specs:
         );
     }
 
+    /// Builds a two-spec workspace whose roots are `first` and `second`, and reports whether the
+    /// pair was refused as one output root.
+    fn roots_overlap(prepare: fn(&Path), first: &str, second: &str) -> bool {
+        let directory = TestDirectory::new();
+        prepare(directory.path());
+        directory.write("a.yaml", "");
+        directory.write("b.yaml", "");
+        let path = directory.write(
+            "config.yaml",
+            &format!(
+                "schemaVersion: 1\nspecs:\n  aaa:\n    input: {{path: ./a.yaml}}\n    output: {first}\n  zzz:\n    input: {{path: ./b.yaml}}\n    output: {second}\n"
+            ),
+        );
+        match load_config(Some(&path), directory.path()) {
+            Ok(_) => false,
+            Err(diagnostics) => {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == CODE_OUTPUT_OVERLAP),
+                    "{first} vs {second}: {diagnostics:#?}"
+                );
+                true
+            }
+        }
+    }
+
+    fn no_setup(_root: &Path) {}
+
+    #[test]
+    fn output_roots_that_name_one_directory_are_refused() {
+        // Spellings of one path, and nesting in both directions.
+        for (first, second) in [
+            ("./generated", "./generated"),
+            ("./generated/", "./generated"),
+            ("./generated/./inner", "./generated/inner"),
+            ("./generated", "./generated/inner"),
+            ("./generated/inner", "./generated"),
+            ("./generated/Inner", "./generated/inner"),
+            ("./Generated/inner", "./generated/inner"),
+        ] {
+            assert!(
+                roots_overlap(no_setup, first, second),
+                "{first} and {second} name one directory"
+            );
+        }
+    }
+
+    #[test]
+    fn output_roots_that_name_different_directories_are_kept() {
+        for (first, second) in [
+            ("./generated/aaa", "./generated/zzz"),
+            ("./generated", "./generated-zzz"),
+            ("./generated/inner", "./generated-inner"),
+        ] {
+            assert!(
+                !roots_overlap(no_setup, first, second),
+                "{first} and {second} are separate directories"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn two_names_for_one_directory_are_one_output_root() {
+    fn an_aliased_output_root_is_refused_however_the_alias_is_spelled() {
+        use std::os::unix::fs::symlink;
+
+        fn live(root: &Path) {
+            fs::create_dir(root.join("real")).expect("alias target");
+            symlink("real", root.join("link")).expect("live symlink");
+        }
+
+        // A live alias, and a live alias standing in for a parent of the other root.
+        assert!(roots_overlap(live, "./real/out", "./link/out"));
+        assert!(roots_overlap(live, "./real", "./link/out"));
+        assert!(roots_overlap(live, "./link", "./real/out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_alias_is_refused_rather_than_resolved_lexically() {
         use std::os::unix::fs::symlink;
 
         let directory = TestDirectory::new();
-        fs::create_dir(directory.path().join("real")).expect("output parent");
-        symlink("real", directory.path().join("link")).expect("aliasing symlink");
-        directory.write("a.yaml", "");
-        directory.write("b.yaml", "");
-        // Neither output root exists yet, which is what a first run looks like.
-        let path = directory.write(
-            "config.yaml",
-            "schemaVersion: 1\nspecs:\n  users:\n    input: {path: ./a.yaml}\n    output: ./real/out\n  billing:\n    input: {path: ./b.yaml}\n    output: ./link/out\n",
-        );
-
-        assert_workspace_code(
-            load_config(Some(&path), directory.path()),
-            CODE_OUTPUT_OVERLAP,
-        );
-    }
-
-    #[test]
-    fn output_roots_that_differ_only_in_case_are_one_output_root() {
-        let directory = TestDirectory::new();
+        // The alias target does not exist yet, which is what a fresh checkout looks like: the
+        // generated tree is absent, so a committed alias pointing into it is dangling. Resolving
+        // this lexically would call it a second root, and the first spec's run would make the
+        // alias live under the second.
+        symlink("generated", directory.path().join("alias")).expect("dangling symlink");
         directory.write("a.yaml", "");
         directory.write("b.yaml", "");
         let path = directory.write(
             "config.yaml",
-            "schemaVersion: 1\nspecs:\n  users:\n    input: {path: ./a.yaml}\n    output: ./generated/Users\n  billing:\n    input: {path: ./b.yaml}\n    output: ./generated/users\n",
+            "schemaVersion: 1\nspecs:\n  aaa:\n    input: {path: ./a.yaml}\n    output: ./generated/users\n  zzz:\n    input: {path: ./b.yaml}\n    output: ./alias/users\n",
         );
 
-        assert_workspace_code(
-            load_config(Some(&path), directory.path()),
-            CODE_OUTPUT_OVERLAP,
+        let diagnostics =
+            assert_workspace_code(load_config(Some(&path), directory.path()), CODE_OUTPUT);
+        assert!(
+            diagnostics[0].message.contains("failed to canonicalize"),
+            "{diagnostics:#?}"
         );
-    }
-
-    #[test]
-    fn nesting_is_judged_by_whole_components() {
-        let directory = TestDirectory::new();
-        directory.write("a.yaml", "");
-        directory.write("b.yaml", "");
-        // `generated-users` starts with the same characters as `generated` and is not inside it.
-        let path = directory.write(
-            "config.yaml",
-            "schemaVersion: 1\nspecs:\n  users:\n    input: {path: ./a.yaml}\n    output: ./generated\n  billing:\n    input: {path: ./b.yaml}\n    output: ./generated-users\n",
-        );
-
-        load_config(Some(&path), directory.path()).expect("sibling roots resolve");
     }
 
     #[test]
