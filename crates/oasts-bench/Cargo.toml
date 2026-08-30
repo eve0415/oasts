@@ -17,9 +17,9 @@ categories.workspace = true
 clap = { version = "=4.6.6", features = ["derive"] }
 dhat = { version = "=0.3.3", optional = true }
 libc = "=0.2.189"
-oxc_allocator = "=0.142.0"
-oxc_parser = "=0.142.0"
-oxc_span = "=0.142.0"
+oxc_allocator = "=0.147.0"
+oxc_parser = "=0.147.0"
+oxc_span = "=0.147.0"
 oasts-core = { path = "../oasts-core" }
 pprof = { version = "=0.15.0", default-features = false, features = ["flamegraph"], optional = true }
 serde_json = { version = "=1.0.151", optional = true }
