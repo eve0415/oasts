@@ -1,10 +1,11 @@
 //! The `watch` command: compile once, then compile again whenever an input changes.
 //!
-//! A session never exits on its own. Diagnostics are reported and the loop keeps going, because a
-//! typo in a document is the ordinary case a watch exists for — ending the session there would
-//! make the command useless exactly when it is wanted. The only exits are the interrupt that
-//! stops the process and a failure to register the watch at all, which is the one condition under
-//! which no promise about freshness can be kept.
+//! A session never exits on its own over a diagnostic. Those are reported and the loop keeps
+//! going, because a typo in a document is the ordinary case a watch exists for — ending the
+//! session there would make the command useless exactly when it is wanted. Besides the interrupt
+//! that stops the process, it exits only where it can no longer promise freshness: a compile that
+//! reported nothing to watch, a directory it could not register, and a watcher that stopped
+//! reporting underneath it. All three report `OASTS1031`.
 //!
 //! What gets watched is the *directory* holding each input rather than the input itself. Editors
 //! save through a temporary file and rename over the target, which replaces the inode a per-file

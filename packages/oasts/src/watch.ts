@@ -11,10 +11,10 @@
  * notice a second `oasts.*` name appearing. Events are filtered against the paths the compile
  * actually read before any of them counts as a change, so the run's own output never wakes it.
  *
- * A session never ends on its own. Diagnostics are reported and the loop continues, because a typo
- * in a document is the ordinary case a watch exists for. The one exception is a directory that
- * cannot be watched at all, which is the only condition under which no promise about freshness can
- * be kept.
+ * A session never ends on its own over a diagnostic. Those are reported and the loop continues,
+ * because a typo in a document is the ordinary case a watch exists for. It ends only where it can
+ * no longer promise freshness: a compile that reported nothing to watch, a directory it could not
+ * register, and a watcher that stopped reporting underneath it. All three report `OASTS1031`.
  */
 
 import { statSync, watch as watchDirectory } from "node:fs";
