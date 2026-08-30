@@ -459,6 +459,12 @@ jobs:
     needs:
       - plan
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    # Shared with CI's `main` publish, whose workflow-level group is a different one: both
+    # rewrite the archive's single index object, and `git push --follow-tags` starts them at
+    # once. Queue rather than cancel, so this still publishes after the `main` build.
+    concurrency:
+      group: playground-archive
+      cancel-in-progress: false
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
@@ -488,9 +494,14 @@ jobs:
 
       # The site ships no compiler; the playground reads every version from this archive, so a
       # release reaches it without the docs being rebuilt or redeployed.
+      # --remote is the opt-in that lets anything reach the shared archive; without it the
+      # script only seeds a local bucket.
       - name: Publish the browser compiler to the archive
-        run: scripts/playground-wasm.sh
+        run: scripts/playground-wasm.sh --remote
         env:
+          # The version `plan` validated against the tag, rather than one re-read from the
+          # checkout, so the archive can never label a build with a version the tag disowns.
+          PLAYGROUND_LABEL: ${{ needs.plan.outputs.version }}
           # A release is the only thing that claims the playground's default version.
           PLAYGROUND_CURRENT: "1"
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
