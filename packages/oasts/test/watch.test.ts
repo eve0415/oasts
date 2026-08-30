@@ -159,6 +159,50 @@ test("only inputs trigger once a compile has settled", () => {
   assert.ok(!watched.triggers("/w/out/types/index.ts"));
 });
 
+test("a workspace session watches every spec and ignores every output tree", () => {
+  const root = mkdtempSync(join(tmpdir(), "oasts-watch-"));
+  mkdirSync(join(root, "spec"));
+  const watched = new Watched();
+  watched.absorb(
+    {
+      inputs: [{ path: join(root, "oasts.yaml"), directory: false }],
+      specs: [
+        {
+          name: "billing",
+          inputs: [
+            { path: join(root, "spec/shared.yaml"), directory: false },
+            { path: join(root, "spec/billing.yaml"), directory: false },
+            { path: root, directory: true },
+          ],
+          outputRoot: join(root, "out/billing"),
+        },
+        {
+          name: "users",
+          // The same document again, and the same workspace root by the narrower name.
+          inputs: [
+            { path: join(root, "spec/shared.yaml"), directory: false },
+            { path: root, directory: false },
+          ],
+          outputRoot: join(root, "out/users"),
+        },
+      ],
+      debounceMs: 5,
+    },
+    true,
+  );
+
+  // The document two specs share is one path, and each spec's own entry is watched too.
+  assert.ok(watched.triggers(join(root, "spec/shared.yaml")));
+  assert.ok(watched.triggers(join(root, "spec/billing.yaml")));
+  assert.ok(watched.triggers(join(root, "oasts.yaml")));
+  // The workspace root is a directory to one spec and a file to the other; the wider registration
+  // is the one that cannot be wrong, so it is watched as itself rather than through its parent.
+  assert.deepEqual(watched.directories(), [root, join(root, "spec")].toSorted());
+  // Neither spec's artifacts wake the session — including the other spec's.
+  assert.ok(!watched.triggers(join(root, "out/billing/types/index.ts")));
+  assert.ok(!watched.triggers(join(root, "out/users/types/index.ts")));
+});
+
 test("an output root with a trailing separator still contains its own writes", () => {
   const watched = new Watched();
   watched.absorb(plan(["/w/oasts.yaml"], "/w/out/"), true);

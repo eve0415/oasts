@@ -270,14 +270,6 @@ export class Watched {
  * A path either side calls a directory stays a directory: that is the wider registration and it
  * cannot be wrong, and it matches how the compiler deduplicates the same collision.
  */
-/** Every path the run depended on, the workspace's and every spec's alike. */
-export function watchedInputs(plan: WatchPlan): readonly WatchInput[] {
-  return plan.specs.reduce<readonly WatchInput[]>(
-    (merged, spec) => mergeInputs(merged, spec.inputs),
-    plan.inputs,
-  );
-}
-
 function mergeInputs(
   left: readonly WatchInput[],
   right: readonly WatchInput[],
@@ -287,6 +279,14 @@ function mergeInputs(
     merged.set(input.path, (merged.get(input.path) ?? false) || input.directory);
   }
   return [...merged].map(([path, directory]) => ({ path, directory }));
+}
+
+/** Every path the run depended on, the workspace's and every spec's alike. */
+export function watchedInputs(plan: WatchPlan): readonly WatchInput[] {
+  return plan.specs.reduce<readonly WatchInput[]>(
+    (merged, spec) => mergeInputs(merged, spec.inputs),
+    plan.inputs,
+  );
 }
 
 function nearestExistingDirectory(from: string): string {
