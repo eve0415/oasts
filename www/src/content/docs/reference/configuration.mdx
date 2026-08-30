@@ -262,6 +262,7 @@ documentation:
 ```
 
 `constraints` is the one worth knowing about: validation-only keywords that cannot appear in the TypeScript type — ranges, patterns, length bounds — are carried into the doc comment instead, so the information is at your cursor even where the type cannot express it.
+A `format` the validation artifacts [assert](/artifacts/validation#string-formats) is left out of that list, since the check itself is the record of it.
 
 ## `emit`
 

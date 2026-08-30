@@ -92,6 +92,13 @@ const ZOD_RESERVED_NAMES: &[&str] = &[
     "isDate",
     "isTime",
     "isUuid",
+    "isEmail",
+    "isHostname",
+    "isIpv4",
+    "isIpv6",
+    "isUri",
+    "isUriReference",
+    "isDuration",
     // Injected by every module's `validate{Name}` entry point. A component named `Issue` would
     // otherwise shadow the imported type (TS2440) — GitHub declares exactly that one.
     "Issue",
@@ -1563,6 +1570,13 @@ fn string_format(format: &str) -> Option<(&'static str, &'static str)> {
         "date" => Some(("isDate", "date")),
         "time" => Some(("isTime", "time")),
         "uuid" => Some(("isUuid", "uuid")),
+        "email" => Some(("isEmail", "email")),
+        "hostname" => Some(("isHostname", "hostname")),
+        "ipv4" => Some(("isIpv4", "ipv4")),
+        "ipv6" => Some(("isIpv6", "ipv6")),
+        "uri" => Some(("isUri", "uri")),
+        "uri-reference" => Some(("isUriReference", "uri-reference")),
+        "duration" => Some(("isDuration", "duration")),
         _ => None,
     }
 }
@@ -2976,7 +2990,14 @@ mod tests {
                     "date": { "type": "string", "format": "date" },
                     "time": { "type": "string", "format": "time" },
                     "uuid": { "type": "string", "format": "uuid" },
-                    "annotationOnly": { "type": "string", "format": "email" },
+                    "email": { "type": "string", "format": "email" },
+                    "hostname": { "type": "string", "format": "hostname" },
+                    "ipv4": { "type": "string", "format": "ipv4" },
+                    "ipv6": { "type": "string", "format": "ipv6" },
+                    "uri": { "type": "string", "format": "uri" },
+                    "uriReference": { "type": "string", "format": "uri-reference" },
+                    "duration": { "type": "string", "format": "duration" },
+                    "annotationOnly": { "type": "string", "format": "idn-email" },
                     "int64Annotation": { "type": "integer", "format": "int64" },
                     "count": {
                         "type": "integer",
@@ -3008,6 +3029,13 @@ mod tests {
             "stringFormat(isDate,\"date\")",
             "stringFormat(isTime,\"time\")",
             "stringFormat(isUuid,\"uuid\")",
+            "stringFormat(isEmail,\"email\")",
+            "stringFormat(isHostname,\"hostname\")",
+            "stringFormat(isIpv4,\"ipv4\")",
+            "stringFormat(isIpv6,\"ipv6\")",
+            "stringFormat(isUri,\"uri\")",
+            "stringFormat(isUriReference,\"uri-reference\")",
+            "stringFormat(isDuration,\"duration\")",
             "z.number().check(integer()).check(z.gte(0)).check(z.lte(10)).check(multipleOf(2)).check(int32())",
             "z.number().check(z.gt(2)).check(z.gte(0)).check(z.lt(8)).check(z.lte(10)).check(multipleOf(0.1))",
             "z.boolean()",
@@ -3020,7 +3048,8 @@ mod tests {
         }
         assert!(content.contains("\"annotationOnly\":z.optional(z.string())"));
         assert!(content.contains("\"int64Annotation\":z.optional(z.number().check(integer()))"));
-        assert!(!content.contains("isEmail"));
+        // Exactly the asserted formats attach a check; the annotation-only one attaches none.
+        assert_eq!(content.matches("stringFormat(").count(), 11);
         assert!(!content.contains("int64()"));
     }
 
@@ -4426,10 +4455,12 @@ mod tests {
         let start = source
             .find(&declaration)
             .unwrap_or_else(|| panic!("missing const {name}"));
+        // A regex literal's character class can hold a bare `;`, so the first semicolon is not the
+        // end of the declaration; the one that ends its line is.
         let end = source[start..]
-            .find(';')
+            .find(";\n")
             .map(|offset| start + offset)
-            .expect("const terminator");
+            .unwrap_or_else(|| panic!("unterminated const {name}"));
         &source[start..=end]
     }
 
@@ -4458,6 +4489,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "unterminated const BROKEN")]
+    fn runtime_const_extraction_rejects_an_unterminated_declaration() {
+        extract_const("const BROKEN = 1;", "BROKEN");
+    }
+
+    #[test]
     fn zod_and_validators_runtimes_share_their_predicates() {
         for name in [
             "deepEqual",
@@ -4472,6 +4509,24 @@ mod tests {
             "isDate",
             "isTime",
             "isUuid",
+            "isIpv4",
+            "ipv6Groups",
+            "isIpv6",
+            "isHostnameLabel",
+            "isHostname",
+            "isEmailLocalPart",
+            "isEmailDomain",
+            "isEmail",
+            "percentEncodingIsWellFormed",
+            "isUriComponent",
+            "isUriHost",
+            "isUriAuthority",
+            "isUriShaped",
+            "isUri",
+            "isUriReference",
+            "scanDigits",
+            "scanDurationRun",
+            "isDuration",
             "isInt32",
             "int64WireValue",
         ] {
@@ -4487,6 +4542,19 @@ mod tests {
             "TIME_PATTERN",
             "DATE_TIME_PATTERN",
             "UUID_PATTERN",
+            "IPV4_OCTET",
+            "IPV6_GROUP",
+            "HOSTNAME_LABEL",
+            "EMAIL_ATOM",
+            "EMAIL_QUOTED",
+            "URI_USERINFO",
+            "URI_REG_NAME",
+            "URI_PATH",
+            "URI_QUERY",
+            "URI_SCHEME",
+            "URI_PORT",
+            "URI_IPVFUTURE",
+            "HEX_PAIR",
             "INT64_WIRE_INTEGER",
         ] {
             assert_eq!(

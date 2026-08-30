@@ -4552,6 +4552,8 @@ fn is_consumed_format(ty: &str, format: &str) -> bool {
                 | "hostname"
                 | "ipv4"
                 | "ipv6"
+                | "uri-reference"
+                | "duration"
         ),
         "number" => matches!(format, "float" | "double"),
         "integer" => matches!(format, "int32" | "int64"),
@@ -10687,6 +10689,8 @@ mod tests {
             "hostname",
             "ipv4",
             "ipv6",
+            "uri-reference",
+            "duration",
         ] {
             assert!(is_consumed_format("string", format));
         }

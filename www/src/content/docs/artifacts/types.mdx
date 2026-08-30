@@ -24,7 +24,7 @@ export interface Pet {
 ```
 
 Supported keywords are the ones TypeScript can represent soundly: primitive and aggregate types, `properties`, `required`, `additionalProperties`, `enum`, `const`, nullable forms, `allOf`, `oneOf`, `anyOf`, tuple and array forms, and references — local, or into other local files (remote `http(s)` `$ref`s are refused).
-Validation-only constraints — numeric ranges, string patterns, length bounds — do not change the TypeScript output; they compile into the [Zod and validators artifacts](/artifacts/validation) instead.
+Validation-only constraints — numeric ranges, string patterns, length bounds, [string formats](/artifacts/validation#string-formats) — do not change the TypeScript output; they compile into the [Zod and validators artifacts](/artifacts/validation) instead.
 
 A keyword the document's dialect does not define is dropped rather than reinterpreted, and the supported keywords beside it are kept.
 Two of them are read in the scope their neighbours leave: `additionalProperties` applies to the keys `patternProperties` did not match, and `items` to the indices past `prefixItems`.
