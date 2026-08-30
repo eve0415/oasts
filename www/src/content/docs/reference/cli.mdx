@@ -64,6 +64,9 @@ Everything the last compile actually read or looked for, which is wider than the
 - the consumer's `tsconfig.json`, every file its `extends` chain reaches, and each `tsconfig.json` the [ancestor walk](/reference/configuration#typescript) looked for inside the workspace and did not find;
 - the `node_modules/zod` and `node_modules/msw` manifests the peer-version warnings were read from.
 
+A [workspace](/guides/workspaces) reports that set once per spec, and the session watches the union of them: a document two specs share is one path, and each spec's own output tree is filtered out of what counts as a change.
+Selecting specs with `--spec` narrows both — a session compiles what you selected and watches what those compiles read, and nothing else.
+
 The set is recomputed after every compile, so adding a `$ref` starts watching the file it points at.
 Directories are watched rather than individual files, which is what makes an editor's save-and-rename visible, and events are matched against that set before any of them counts — so the artifacts a run writes never wake the next one.
 When the operating system reports that it lost events without saying which, the session recompiles rather than guessing, because the one thing a watch may not do is serve output that is out of date.

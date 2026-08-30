@@ -112,6 +112,11 @@ A refusal any of those could have predicted leaves the whole workspace untouched
 What is left is the write itself, which is per output root.
 If the I/O of one spec's commit fails — a disk that fills, a permission that changes under the run — that root rolls back on its own, the run stops there, exits `2`, and reports which specs were written before it.
 
+## Watching a workspace
+
+[`oasts watch`](/reference/cli#oasts-watch) compiles the specs you selected and then watches everything those compiles read, across every one of them.
+Each spec's output tree is filtered out of what counts as a change, so one spec's artifacts never wake a recompile of another.
+
 ## Checking committed output
 
 `generate --check` compares every selected spec against what is on disk.
