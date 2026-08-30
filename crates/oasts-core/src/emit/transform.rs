@@ -2973,6 +2973,7 @@ fn property_access(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::fs;
 
     use serde_json::{Value, json};
@@ -3023,7 +3024,8 @@ mod tests {
         let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let client = build_client_model(&analyzed, &resolved, &mut sink);
@@ -3032,6 +3034,7 @@ mod tests {
             &resolved,
             &graph.source_tuples(),
             Some(&client),
+            &mut InputRecorder::off(),
             &mut sink,
         );
         let has_errors = sink.has_errors();
@@ -3125,7 +3128,8 @@ mod tests {
         let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let facts = TransformFacts::compute(&analyzed.ir, &resolved);
@@ -3849,7 +3853,8 @@ mod tests {
         let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let client = build_client_model(&analyzed, &resolved, &mut sink);
@@ -3858,6 +3863,7 @@ mod tests {
             &resolved,
             &graph.source_tuples(),
             Some(&client),
+            &mut InputRecorder::off(),
             &mut sink,
         );
         assert!(!sink.has_errors());

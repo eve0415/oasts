@@ -11,6 +11,7 @@ import { ArgsError, USAGE, parse } from "./args.ts";
 import { loadScriptConfig } from "./config/load.ts";
 import { CliFailure, fromNativeError } from "./diagnostics.ts";
 import { loadNative } from "./native.ts";
+import { compileOnce, FsChanges, session } from "./watch.ts";
 
 /** Byte sinks for CLI output; `process.stdout`/`process.stderr` in the shim. */
 export interface OutputStreams {
@@ -24,13 +25,29 @@ async function dispatch(
   stderr: OutputStreams,
 ): Promise<number> {
   const args = parse(argv);
-  const { commandRefusal, discoverConfig, run: nativeRun } = await loadNative();
-  // Asked before discovery so an unimplemented command never fails on a missing config first.
-  const refusal = commandRefusal(args.command);
-  if (refusal !== null) {
+  const native = await loadNative();
+  // `--spec` is refused before the config is read, matching where the standalone binary answers it.
+  if (args.specs.length > 0) {
+    const refusal = native.specRefusal();
     throw new CliFailure(refusal.exitCode, refusal.renderedStderr);
   }
+  if (args.command === "watch") {
+    return await session(
+      new FsChanges(),
+      () => compileOnce(native, args, cwd),
+      (cycle) => {
+        if (cycle.stderr !== "") {
+          stderr.write(cycle.stderr);
+        }
+        if (cycle.stdout !== "") {
+          stdout.write(cycle.stdout);
+        }
+        return cycle.exitCode;
+      },
+    );
+  }
 
+  const { discoverConfig, run: nativeRun } = native;
   let discovered;
   try {
     discovered = discoverConfig(cwd, args.config ?? null);
@@ -47,6 +64,7 @@ async function dispatch(
     command: args.command,
     check: args.check,
     specs: args.specs,
+    trackInputs: false,
   });
 
   if (result.renderedStderr !== "") {

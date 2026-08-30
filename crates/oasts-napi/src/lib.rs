@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use napi_derive::napi;
 use oasts_core::config;
 use oasts_core::diag::{Diagnostic, Severity};
-use oasts_core::driver::{self, Command, ConfigSource, Outcome, Unsupported};
+use oasts_core::driver::{self, Command, ConfigSource, Outcome, Tracking, Unsupported};
+use oasts_core::inputs::InputKind;
 
 /// A config discovery result exposed to the Node CLI.
 #[napi(object)]
@@ -43,6 +44,44 @@ pub struct DiagnosticJs {
     pub json_pointer: Option<String>,
 }
 
+/// One path a run depended on, and how a host should watch it.
+#[napi(object)]
+pub struct WatchInputJs {
+    pub path: String,
+    /// Whether the path names a directory, which a host registers as itself rather than through
+    /// its parent. Decided by the compile that recorded it, never by asking the filesystem.
+    pub directory: bool,
+}
+
+/// What one compile left behind for a host that watches its inputs.
+#[napi(object)]
+pub struct WatchPlanJs {
+    /// Every path the run read or probed for, sorted and deduplicated.
+    pub inputs: Vec<WatchInputJs>,
+    /// The tree the run writes into; never an input.
+    pub output_root: Option<String>,
+    /// How long the filesystem must stay quiet before a change is compiled.
+    pub debounce_ms: u32,
+}
+
+/// The `watch` block's defaults, for a host that must act before it has read a configuration.
+#[napi(object)]
+pub struct WatchDefaultsJs {
+    /// How long the filesystem must stay quiet before a change is compiled.
+    pub debounce_ms: u32,
+}
+
+/// The `watch` settings a run falls back to when no configuration was read.
+///
+/// Asked for rather than copied: a second written-down default is one that can
+/// disagree with the one the compiler actually applies.
+#[napi]
+pub fn watch_defaults() -> WatchDefaultsJs {
+    WatchDefaultsJs {
+        debounce_ms: config::WatchConfig::default().debounce_ms,
+    }
+}
+
 /// Options for one compiler invocation.
 #[napi(object)]
 pub struct RunOptions {
@@ -58,6 +97,8 @@ pub struct RunOptions {
     pub check: bool,
     /// `--spec` selections; non-empty selections are unsupported locally.
     pub specs: Vec<String>,
+    /// Whether the run reports what a watching host would need to wait on.
+    pub track_inputs: bool,
 }
 
 /// Outcome of one compiler invocation.
@@ -71,6 +112,8 @@ pub struct RunResult {
     pub rendered_stderr: String,
     /// Structured diagnostics mirroring `rendered_stderr`.
     pub diagnostics: Vec<DiagnosticJs>,
+    /// What to keep watching, when the run was asked to track its inputs.
+    pub watch_plan: Option<WatchPlanJs>,
 }
 
 fn to_diagnostic_js(diagnostic: &Diagnostic) -> DiagnosticJs {
@@ -111,6 +154,20 @@ fn failure_reason(exit_code: u8, diagnostics: &[Diagnostic]) -> String {
     .to_string()
 }
 
+/// Every path config discovery would consider, whether or not it exists.
+///
+/// A watching host needs these even when discovery failed: a second `oasts.*`
+/// name appearing is what turns a working run into a discovery error, and its
+/// removal is what turns one back.
+#[napi]
+pub fn discovery_candidates(cwd: String, explicit_path: Option<String>) -> Vec<String> {
+    let explicit = explicit_path.map(PathBuf::from);
+    config::discovery_candidates(Path::new(&cwd), explicit.as_deref())
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Runs config discovery without script rejection.
 ///
 /// Errors carry a JSON reason of shape
@@ -141,38 +198,59 @@ fn render(outcome: Outcome) -> RunResult {
         stdout_summary: outcome.stdout_summary,
         rendered_stderr,
         diagnostics: outcome.diagnostics.iter().map(to_diagnostic_js).collect(),
+        watch_plan: outcome.watch_plan.map(|plan| WatchPlanJs {
+            inputs: plan
+                .inputs
+                .iter()
+                .map(|input| WatchInputJs {
+                    path: input.path.to_string_lossy().into_owned(),
+                    directory: input.kind == InputKind::Directory,
+                })
+                .collect(),
+            output_root: plan
+                .output_root
+                .map(|root| root.to_string_lossy().into_owned()),
+            debounce_ms: plan.settings.debounce_ms,
+        }),
     }
 }
 
-fn parse_command(name: &str, check: bool) -> Result<Command, Outcome> {
+/// Maps the command name the host parsed onto the driver's command.
+///
+/// An unknown name is a broken caller rather than anything a user did, so it
+/// throws instead of becoming an `OASTS` diagnostic: both CLI front ends
+/// constrain the name before it gets here. It must never fall through to
+/// `generate`, which writes.
+fn parse_command(name: &str, check: bool) -> napi::Result<Command> {
     match name {
         "generate" => Ok(Command::Generate { check }),
         "check" => Ok(Command::Check),
-        other => Err(driver::refuse(Unsupported::Command(other))),
+        other => Err(napi::Error::from_reason(format!(
+            "unknown command '{other}'"
+        ))),
     }
 }
 
-/// Refusal for a declared command this build does not implement, else `None`.
+/// The refusal for `--spec`, which selects a spec out of a workspace config.
 ///
-/// The Node CLI asks before discovering a config, so an unimplemented command
-/// never fails on a missing config file first. Answering here keeps every
-/// `OASTS` code in the core.
+/// The Node CLI asks before discovering a config, so selecting a spec never
+/// fails on a missing config file first. Answering here keeps every `OASTS`
+/// code in the core.
 #[napi]
-pub fn command_refusal(command: String) -> Option<RunResult> {
-    parse_command(&command, false).err().map(render)
+pub fn spec_refusal() -> RunResult {
+    render(driver::refuse(Unsupported::SpecSelection))
 }
 
 /// Runs `generate` or `check` for one already-discovered config.
+///
+/// Throws for a command name neither front end can produce.
 #[napi]
-pub fn run(options: RunOptions) -> RunResult {
+pub fn run(options: RunOptions) -> napi::Result<RunResult> {
     if !options.specs.is_empty() {
-        return render(driver::refuse(Unsupported::SpecSelection));
+        return Ok(render(driver::refuse(Unsupported::SpecSelection)));
     }
 
-    let command = match parse_command(&options.command, options.check) {
-        Ok(command) => command,
-        Err(refusal) => return render(refusal),
-    };
+    let command = parse_command(&options.command, options.check)?;
     let config_path = Path::new(&options.config_path);
     let source = match options.config_json.as_deref() {
         Some(json) => ConfigSource::Json {
@@ -184,7 +262,17 @@ pub fn run(options: RunOptions) -> RunResult {
             cwd: Path::new(&options.cwd),
         },
     };
-    render(driver::run(command, source, oasts_fetch::handle()))
+    let tracking = if options.track_inputs {
+        Tracking::Watch
+    } else {
+        Tracking::Off
+    };
+    Ok(render(driver::run(
+        command,
+        source,
+        oasts_fetch::handle(),
+        tracking,
+    )))
 }
 
 #[cfg(test)]
@@ -216,6 +304,7 @@ mod tests {
             command: command.to_owned(),
             check,
             specs: Vec::new(),
+            track_inputs: false,
         }
     }
 
@@ -254,7 +343,7 @@ mod tests {
     fn run_generates_checks_and_reports_drift() {
         let temp = copy_fixture("petstore-3.0");
 
-        let generated = run(options(&temp, "generate", false));
+        let generated = run(options(&temp, "generate", false)).expect("a known command");
         assert_eq!(generated.exit_code, 0, "{}", generated.rendered_stderr);
         assert!(
             generated
@@ -263,11 +352,11 @@ mod tests {
                 .starts_with("generated ")
         );
 
-        let clean = run(options(&temp, "generate", true));
+        let clean = run(options(&temp, "generate", true)).expect("a known command");
         assert_eq!(clean.exit_code, 0, "{}", clean.rendered_stderr);
         assert_eq!(clean.stdout_summary.as_deref(), Some("check ok"));
 
-        let checked = run(options(&temp, "check", false));
+        let checked = run(options(&temp, "check", false)).expect("a known command");
         assert_eq!(checked.exit_code, 0, "{}", checked.rendered_stderr);
         assert_eq!(checked.stdout_summary.as_deref(), Some("check ok"));
 
@@ -277,7 +366,7 @@ mod tests {
         .expect("manifest JSON");
         let edited = manifest["files"][0].as_str().expect("generated path");
         fs::write(temp.path().join("generated").join(edited), "edited\n").expect("edit output");
-        let drifted = run(options(&temp, "generate", true));
+        let drifted = run(options(&temp, "generate", true)).expect("a known command");
         assert_eq!(drifted.exit_code, 1);
         assert!(drifted.stdout_summary.is_none());
         assert!(drifted.rendered_stderr.contains("edited:"));
@@ -287,7 +376,7 @@ mod tests {
             "not JSON\n",
         )
         .expect("invalid manifest");
-        let invalid_manifest = run(options(&temp, "generate", true));
+        let invalid_manifest = run(options(&temp, "generate", true)).expect("a known command");
         assert_eq!(invalid_manifest.exit_code, 2);
         assert!(invalid_manifest.rendered_stderr.contains("OASTS1011"));
     }
@@ -311,7 +400,7 @@ mod tests {
             r#"{"schemaVersion":1,"input":{"path":"./openapi.json"},"output":"./generated","filters":{"orphans":true}}"#
                 .to_owned(),
         );
-        let result = run(options);
+        let result = run(options).expect("a known command");
         assert_eq!(result.exit_code, 0, "{}", result.rendered_stderr);
         assert!(result.rendered_stderr.contains("warning[OASTS4202]"));
         assert_eq!(result.diagnostics[0].severity, "warning");
@@ -321,14 +410,14 @@ mod tests {
     #[test]
     fn run_reports_load_spec_and_write_failures() {
         let missing = tempfile::tempdir().expect("tempdir");
-        let load_failure = run(options(&missing, "generate", false));
+        let load_failure = run(options(&missing, "generate", false)).expect("a known command");
         assert_eq!(load_failure.exit_code, 2);
         assert_eq!(load_failure.diagnostics[0].code, "OASTS0011");
 
         let temp = copy_fixture("petstore-3.0");
         let mut with_spec = options(&temp, "generate", false);
         with_spec.specs = vec!["petstore".to_owned()];
-        let spec_failure = run(with_spec);
+        let spec_failure = run(with_spec).expect("a known command");
         assert_eq!(spec_failure.exit_code, 2);
         assert_eq!(spec_failure.diagnostics[0].code, "OASTS9002");
 
@@ -338,12 +427,18 @@ mod tests {
             "openapi: '2.0'\ninfo: { title: Invalid, version: 1.0.0 }\npaths: {}\n",
         )
         .expect("invalid input");
-        let input_failure = run(options(&compile_failure, "generate", false));
+        let input_failure =
+            run(options(&compile_failure, "generate", false)).expect("a known command");
         assert_eq!(input_failure.exit_code, 1);
         assert!(input_failure.rendered_stderr.contains("OASTS2101"));
 
         let hostile = copy_fixture("petstore-3.0");
-        assert_eq!(run(options(&hostile, "generate", false)).exit_code, 0);
+        assert_eq!(
+            run(options(&hostile, "generate", false))
+                .expect("a known command")
+                .exit_code,
+            0
+        );
         let output = hostile.path().join("generated");
         let manifest: serde_json::Value = serde_json::from_slice(
             &fs::read(output.join(".oasts-manifest.json")).expect("manifest"),
@@ -356,7 +451,7 @@ mod tests {
             r#"{"manifestVersion":1,"files":["../victim.ts"]}"#,
         )
         .expect("hostile manifest");
-        let write_failure = run(options(&hostile, "generate", false));
+        let write_failure = run(options(&hostile, "generate", false)).expect("a known command");
         assert_eq!(write_failure.exit_code, 2);
         assert!(write_failure.rendered_stderr.contains("error["));
     }
@@ -371,17 +466,24 @@ mod tests {
     }
 
     #[test]
-    fn command_refusal_names_only_unimplemented_commands() {
-        assert!(command_refusal("generate".to_owned()).is_none());
-        assert!(command_refusal("check".to_owned()).is_none());
+    fn an_unknown_command_throws_rather_than_writing() {
+        let temp = copy_fixture("petstore-3.0");
+        let Err(error) = run(options(&temp, "chekc", false)) else {
+            panic!("a misspelled command must not run");
+        };
+        assert!(error.reason.contains("unknown command 'chekc'"), "{error}");
+        assert!(!temp.path().join("generated").exists());
+    }
 
-        let refusal = command_refusal("watch".to_owned()).expect("watch is unimplemented");
+    #[test]
+    fn spec_refusal_is_the_workspace_code() {
+        let refusal = spec_refusal();
         assert_eq!(refusal.exit_code, 2);
-        assert_eq!(refusal.diagnostics[0].code, "OASTS9004");
+        assert_eq!(refusal.diagnostics[0].code, "OASTS9002");
         assert!(
             refusal
                 .rendered_stderr
-                .contains("the watch command is not supported in this build"),
+                .contains("--spec selects a workspace spec"),
             "{}",
             refusal.rendered_stderr
         );
@@ -427,7 +529,7 @@ mod tests {
     #[test]
     fn run_surfaces_the_zod_peer_warning_on_the_write_path() {
         let temp = project_with_outdated_zod();
-        let generated = run(options(&temp, "generate", false));
+        let generated = run(options(&temp, "generate", false)).expect("a known command");
         assert_eq!(generated.exit_code, 0, "{}", generated.rendered_stderr);
         assert!(
             generated
@@ -443,7 +545,7 @@ mod tests {
     #[test]
     fn successful_generate_keeps_structured_and_rendered_warning_order_aligned() {
         let temp = project_with_outdated_zod();
-        let generated = run(options(&temp, "generate", false));
+        let generated = run(options(&temp, "generate", false)).expect("a known command");
         assert_eq!(generated.exit_code, 0, "{}", generated.rendered_stderr);
 
         let structured_codes = generated
@@ -467,14 +569,19 @@ mod tests {
     #[test]
     fn run_keeps_the_zod_peer_warning_when_the_write_fails() {
         let temp = project_with_outdated_zod();
-        assert_eq!(run(options(&temp, "generate", false)).exit_code, 0);
+        assert_eq!(
+            run(options(&temp, "generate", false))
+                .expect("a known command")
+                .exit_code,
+            0
+        );
         fs::write(
             temp.path().join("generated/.oasts-manifest.json"),
             r#"{"manifestVersion":2,"files":[]}"#,
         )
         .expect("unsupported manifest");
 
-        let failed = run(options(&temp, "generate", false));
+        let failed = run(options(&temp, "generate", false)).expect("a known command");
 
         assert_eq!(failed.exit_code, 2, "{}", failed.rendered_stderr);
         for code in ["OASTS1011", "OASTS0241"] {
@@ -492,9 +599,14 @@ mod tests {
     #[test]
     fn run_omits_the_zod_peer_warning_in_check_mode() {
         let temp = project_with_outdated_zod();
-        assert_eq!(run(options(&temp, "generate", false)).exit_code, 0);
+        assert_eq!(
+            run(options(&temp, "generate", false))
+                .expect("a known command")
+                .exit_code,
+            0
+        );
 
-        let checked = run(options(&temp, "generate", true));
+        let checked = run(options(&temp, "generate", true)).expect("a known command");
         assert_eq!(checked.exit_code, 0, "{}", checked.rendered_stderr);
         assert!(
             !checked

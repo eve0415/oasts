@@ -87,6 +87,36 @@ fn every_production_diagnostic_matches_its_stage_category() {
     }
 }
 
+/// A code that both hosts emit must be spelled the same in both.
+///
+/// `oasts watch` is implemented once per host, so the failure a session ends on is declared in
+/// Rust and again in TypeScript. Two written-down spellings of one code can drift; this is what
+/// stops them, since neither host can see the other's constant.
+#[test]
+fn a_code_both_hosts_emit_is_spelled_the_same_in_both() {
+    let shared = [("CODE_WATCH_IO", "crates/oasts/src/watch.rs")];
+    let node = node_sources();
+    let rust = rust_sources();
+    for (name, rust_path) in shared {
+        let in_rust = rust
+            .iter()
+            .find(|source| source.path.ends_with(rust_path))
+            .and_then(|source| source.constants.get(name).cloned())
+            .unwrap_or_else(|| panic!("{name} should be declared in {rust_path}"));
+        let in_node = node
+            .iter()
+            .find_map(|source| {
+                source
+                    .constants
+                    .iter()
+                    .find(|(constant, _)| *constant == name)
+                    .map(|(_, code)| code.clone())
+            })
+            .unwrap_or_else(|| panic!("{name} should be declared on the Node side"));
+        assert_eq!(in_rust, in_node, "{name} disagrees across the two hosts");
+    }
+}
+
 #[test]
 fn diagnostic_category_has_only_its_two_constructor_writes() {
     let sources = rust_sources();

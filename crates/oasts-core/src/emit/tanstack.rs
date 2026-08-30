@@ -1541,6 +1541,7 @@ mod tests {
     use crate::config::load_config;
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
     use crate::emit::emit_artifacts;
+    use crate::inputs::InputRecorder;
     use crate::loader::load_graph;
     use crate::parse::parse;
     use crate::semantic::analyze;
@@ -1557,13 +1558,21 @@ mod tests {
         fs::write(temp.path().join("oasts.yaml"), config).expect("write config");
         let mut sink = DiagnosticSink::new();
         let resolved = load_config(None, temp.path()).expect("config loads");
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("document parses");
         drop(graph);
         let analyzed = analyze(ir, &resolved, &mut sink);
         let client = build_client_model(&analyzed, &resolved, &mut sink);
-        let files = emit_artifacts(&analyzed, &resolved, &tuples, Some(&client), &mut sink);
+        let files = emit_artifacts(
+            &analyzed,
+            &resolved,
+            &tuples,
+            Some(&client),
+            &mut InputRecorder::off(),
+            &mut sink,
+        );
         (files, sink.into_sorted_vec())
     }
 
@@ -1699,7 +1708,8 @@ mod tests {
         fs::write(temp.path().join("oasts.yaml"), config).expect("write config");
         let mut sink = DiagnosticSink::new();
         let resolved = load_config(None, temp.path()).expect("config loads");
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("document parses");
         drop(graph);
         let analyzed = analyze(ir, &resolved, &mut sink);

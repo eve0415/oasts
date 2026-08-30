@@ -4329,6 +4329,7 @@ fn assemble_file(
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::fs;
 
     use serde_json::{Map, Value, json};
@@ -4377,7 +4378,8 @@ mod tests {
         .expect("write config");
         let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let source_tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
@@ -4391,6 +4393,7 @@ mod tests {
             &resolved,
             &source_tuples,
             client.as_ref(),
+            &mut InputRecorder::off(),
             &mut sink,
         );
         (files, sink.into_sorted_vec())
@@ -7054,7 +7057,7 @@ mod tests {
         .expect("write");
         let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph");
+        let graph = load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph");
         let ir = parse(&graph, &mut sink).expect("ir");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let files = emit_artifacts(
@@ -7062,6 +7065,7 @@ mod tests {
             &resolved,
             &graph.source_tuples(),
             None,
+            &mut InputRecorder::off(),
             &mut sink,
         );
         assert!(
@@ -8191,7 +8195,7 @@ mod tests {
         .expect("write");
         let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph");
+        let graph = load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph");
         let ir = parse(&graph, &mut sink).expect("ir");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let files = emit_artifacts(
@@ -8199,6 +8203,7 @@ mod tests {
             &resolved,
             &graph.source_tuples(),
             None,
+            &mut InputRecorder::off(),
             &mut sink,
         );
         assert_clean(&sink.into_sorted_vec());

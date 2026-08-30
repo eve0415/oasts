@@ -6,12 +6,15 @@
 //! same walk every time and lives here.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::inputs::InputRecorder;
 
 /// A peer package manifest reachable from the emitted files, and the version it declares.
 pub(crate) struct InstalledPeer {
     pub(crate) version: String,
-    pub(crate) manifest: String,
+    /// The manifest the version was read from — named in the warning, and watched by `oasts watch`.
+    pub(crate) manifest: PathBuf,
 }
 
 /// Walks up from the emitted-file root for the `node_modules/{package}` that Node would resolve.
@@ -22,7 +25,11 @@ pub(crate) struct InstalledPeer {
 ///
 /// `read_to_string` follows symlinks, which is what pnpm's layout needs: `node_modules/{package}`
 /// there is a link into the content-addressed store rather than a real directory.
-pub(crate) fn installed_version(output: &Path, package: &str) -> Option<InstalledPeer> {
+pub(crate) fn installed_version(
+    output: &Path,
+    package: &str,
+    inputs: &mut InputRecorder,
+) -> Option<InstalledPeer> {
     for ancestor in output.ancestors() {
         let manifest = ancestor
             .join("node_modules")
@@ -31,12 +38,13 @@ pub(crate) fn installed_version(output: &Path, package: &str) -> Option<Installe
         let Ok(text) = fs::read_to_string(&manifest) else {
             continue;
         };
+        // Recorded on the read, not on the answer. A manifest that is present and unreadable as
+        // JSON produces no version and no warning, and is exactly the one a consumer is most
+        // likely to be in the middle of fixing.
+        inputs.record(&manifest);
         let parsed = serde_json::from_str::<serde_json::Value>(&text).ok()?;
         let version = parsed.get("version")?.as_str()?.to_owned();
-        return Some(InstalledPeer {
-            version,
-            manifest: manifest.display().to_string(),
-        });
+        return Some(InstalledPeer { version, manifest });
     }
     None
 }
@@ -56,6 +64,8 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    use crate::inputs::{InputKind, WatchInput};
+
     fn install(root: &Path, package: &str, version: &str) {
         let dir = root.join("node_modules").join(package);
         fs::create_dir_all(&dir).expect("create package dir");
@@ -72,7 +82,8 @@ mod tests {
         install(temp.path(), "msw", "2.15.0");
         let output = temp.path().join("packages").join("app").join("generated");
         fs::create_dir_all(&output).expect("create output");
-        let found = installed_version(&output, "msw").expect("install is reachable");
+        let found = installed_version(&output, "msw", &mut InputRecorder::off())
+            .expect("install is reachable");
         assert_eq!(found.version, "2.15.0");
     }
 
@@ -86,7 +97,7 @@ mod tests {
         let output = nested.join("generated");
         fs::create_dir_all(&output).expect("create output");
         assert_eq!(
-            installed_version(&output, "msw")
+            installed_version(&output, "msw", &mut InputRecorder::off())
                 .expect("install is reachable")
                 .version,
             "2.15.0"
@@ -94,9 +105,26 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_that_cannot_be_parsed_is_still_reported_as_an_input() {
+        let temp = TempDir::new().expect("temp dir");
+        let manifest = temp.path().join("node_modules/msw/package.json");
+        fs::create_dir_all(manifest.parent().expect("parent")).expect("create package");
+        fs::write(&manifest, "{ not json").expect("write manifest");
+        let mut recorder = InputRecorder::on();
+        assert!(installed_version(temp.path(), "msw", &mut recorder).is_none());
+        assert_eq!(
+            recorder.into_inputs(),
+            vec![WatchInput {
+                path: manifest,
+                kind: InputKind::File,
+            }]
+        );
+    }
+
+    #[test]
     fn an_absent_install_is_not_an_error() {
         let temp = TempDir::new().expect("temp dir");
-        assert!(installed_version(temp.path(), "msw").is_none());
+        assert!(installed_version(temp.path(), "msw", &mut InputRecorder::off()).is_none());
     }
 
     #[test]

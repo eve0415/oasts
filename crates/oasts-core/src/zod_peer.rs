@@ -17,6 +17,7 @@
 use std::path::Path;
 
 use crate::diag::{Diagnostic, Severity};
+use crate::inputs::InputRecorder;
 use crate::peer::{installed_version, major_minor};
 
 const CODE_ZOD_PEER: &str = "OASTS0241";
@@ -38,8 +39,11 @@ fn supported_range() -> String {
 /// `import * as z from "zod"` resolves relative to the file that contains it, so a monorepo
 /// generating into a sibling package must be judged against that package's `node_modules`.
 #[must_use]
-pub fn diagnose(output: &Path) -> Option<Diagnostic> {
-    let installed = installed_version(output, "zod")?;
+pub fn diagnose(output: &Path, inputs: &mut InputRecorder) -> Option<Diagnostic> {
+    // Only the manifest that answered. The ancestors that had no install were probed too, but
+    // watching every `node_modules` above the output tree to catch an install appearing would
+    // cost far more than the warning it could refresh.
+    let installed = installed_version(output, "zod", inputs)?;
     let (major, minor) = major_minor(&installed.version)?;
     if major == SUPPORTED_MAJOR && minor >= MINIMUM_MINOR {
         return None;
@@ -51,7 +55,7 @@ pub fn diagnose(output: &Path) -> Option<Diagnostic> {
              an out-of-range zod still typechecks and then disagrees on required keys nested \
              under not/if/then/else",
             installed.version,
-            installed.manifest,
+            installed.manifest.display(),
             supported_range(),
         ),
     );
@@ -80,21 +84,22 @@ mod tests {
     fn a_supported_zod_produces_no_diagnostic() {
         let temp = tempfile::tempdir().expect("temp dir");
         install_zod(temp.path(), "4.4.3");
-        assert!(diagnose(&temp.path().join("generated")).is_none());
+        assert!(diagnose(&temp.path().join("generated"), &mut InputRecorder::off()).is_none());
     }
 
     #[test]
     fn the_lowest_supported_zod_produces_no_diagnostic() {
         let temp = tempfile::tempdir().expect("temp dir");
         install_zod(temp.path(), "4.4.0");
-        assert!(diagnose(&temp.path().join("generated")).is_none());
+        assert!(diagnose(&temp.path().join("generated"), &mut InputRecorder::off()).is_none());
     }
 
     #[test]
     fn an_older_minor_warns_and_names_the_range() {
         let temp = tempfile::tempdir().expect("temp dir");
         install_zod(temp.path(), "4.3.0");
-        let diagnostic = diagnose(&temp.path().join("generated")).expect("diagnostic");
+        let diagnostic = diagnose(&temp.path().join("generated"), &mut InputRecorder::off())
+            .expect("diagnostic");
         assert_eq!(diagnostic.code, CODE_ZOD_PEER);
         assert_eq!(diagnostic.severity, Severity::Warning);
         assert!(diagnostic.message.contains("zod 4.3.0 is installed"));
@@ -105,7 +110,8 @@ mod tests {
     fn a_future_major_warns_because_the_emitted_code_targets_zod_4() {
         let temp = tempfile::tempdir().expect("temp dir");
         install_zod(temp.path(), "5.0.0");
-        let diagnostic = diagnose(&temp.path().join("generated")).expect("diagnostic");
+        let diagnostic = diagnose(&temp.path().join("generated"), &mut InputRecorder::off())
+            .expect("diagnostic");
         assert_eq!(diagnostic.code, CODE_ZOD_PEER);
     }
 
@@ -113,7 +119,7 @@ mod tests {
     fn a_prerelease_is_judged_by_its_major_and_minor() {
         let temp = tempfile::tempdir().expect("temp dir");
         install_zod(temp.path(), "4.4.0-beta.1");
-        assert!(diagnose(&temp.path().join("generated")).is_none());
+        assert!(diagnose(&temp.path().join("generated"), &mut InputRecorder::off()).is_none());
     }
 
     #[test]
@@ -122,7 +128,7 @@ mod tests {
         install_zod(temp.path(), "4.1.0");
         let nested = temp.path().join("packages").join("api").join("generated");
         fs::create_dir_all(&nested).expect("nested output");
-        assert!(diagnose(&nested).is_some());
+        assert!(diagnose(&nested, &mut InputRecorder::off()).is_some());
     }
 
     #[test]
@@ -132,19 +138,19 @@ mod tests {
         let package = temp.path().join("packages").join("api");
         fs::create_dir_all(&package).expect("package directory");
         install_zod(&package, "4.4.3");
-        assert!(diagnose(&package.join("generated")).is_none());
+        assert!(diagnose(&package.join("generated"), &mut InputRecorder::off()).is_none());
     }
 
     #[test]
     fn no_reachable_zod_stays_silent() {
         let temp = tempfile::tempdir().expect("temp dir");
-        assert!(diagnose(&temp.path().join("generated")).is_none());
+        assert!(diagnose(&temp.path().join("generated"), &mut InputRecorder::off()).is_none());
     }
 
     #[test]
     fn an_unreadable_version_stays_silent() {
         let temp = tempfile::tempdir().expect("temp dir");
         install_zod(temp.path(), "not-a-version");
-        assert!(diagnose(&temp.path().join("generated")).is_none());
+        assert!(diagnose(&temp.path().join("generated"), &mut InputRecorder::off()).is_none());
     }
 }

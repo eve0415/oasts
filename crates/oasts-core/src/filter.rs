@@ -779,6 +779,7 @@ fn exact(pattern: &str) -> Pattern {
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
@@ -810,7 +811,8 @@ mod tests {
             crate::config::load_config(Some(std::path::Path::new("oasts.json")), temp.path())
                 .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let graph = crate::loader::load_graph(&resolved, &mut sink).expect("graph");
+        let graph = crate::loader::load_graph(&resolved, &mut InputRecorder::off(), &mut sink)
+            .expect("graph");
         let ir = crate::parse::parse(&graph, &mut sink).expect("supported version");
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         (temp, ir)

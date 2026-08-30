@@ -2667,6 +2667,7 @@ fn source_diagnostic(
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::fs;
 
     use serde_json::json;
@@ -2799,7 +2800,8 @@ mod tests {
         let config =
             crate::config::load_config(Some(&config_path), temp.path()).expect("valid config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("loaded graph");
+        let graph =
+            load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("loaded graph");
         let ir = parse(&graph, &mut sink).expect("supported OpenAPI");
         let _analyzed = analyze(ir, &config, &mut sink);
         sink.into_sorted_vec()
@@ -4504,8 +4506,13 @@ mod tests {
         let config = crate::config::load_config(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved fixture config");
         let mut sink = DiagnosticSink::new();
-        let files =
-            crate::pipeline::compile(&config, crate::source::FetcherHandle::None, true, &mut sink);
+        let files = crate::pipeline::compile(
+            &config,
+            crate::source::FetcherHandle::None,
+            true,
+            &mut InputRecorder::off(),
+            &mut sink,
+        );
         let rendered = crate::diag::render_to_string(sink.as_slice().to_vec());
 
         assert!(!sink.has_errors(), "{rendered}");

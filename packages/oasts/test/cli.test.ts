@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { copyFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -108,23 +115,38 @@ test("warnings reach stderr on successful runs", async () => {
   assert.match(generated.stderr, /warning\[OASTS4202\]/);
 });
 
-test("usage, watch, discovery, spec, and config failures exit 2", async () => {
+test("watch compiles, reports, and ends on a directory it cannot watch", async () => {
+  // The session ends because the directory holding the entry document cannot be watched -- the one
+  // failure the loop is allowed to end on, reached the way a person would reach it.
+  const directory = yamlFixture();
+  // Writable and searchable but not readable: the compile writes into it, and the tsconfig probe
+  // beside the emitted files makes it a directory the session then has to watch and cannot.
+  mkdirSync(join(directory, "generated"), { mode: 0o333 });
+  try {
+    const watched = await invoke(["watch"], directory);
+    assert.equal(watched.code, 2, watched.stderr);
+    assert.match(watched.stdout, /^generated \d+ files\n$/);
+    assert.match(watched.stderr, /error\[OASTS1031\]: failed to watch for changes:/);
+  } finally {
+    chmodSync(join(directory, "generated"), 0o755);
+  }
+});
+
+test("usage, discovery, spec, and config failures exit 2", async () => {
   const empty = mkdtempSync(join(tmpdir(), "oasts-cli-"));
   const usage = await invoke(["generate", "--unknown"], empty);
   assert.equal(usage.code, 2);
   assert.match(usage.stderr, /Usage: oasts/);
 
-  const watch = await invoke(["watch"], empty);
-  assert.equal(watch.code, 2);
-  assert.match(watch.stderr, /error\[OASTS9004\]: the watch command is not supported/);
-
   const undiscovered = await invoke(["check"], empty);
   assert.equal(undiscovered.code, 2);
   assert.match(undiscovered.stderr, /error\[OASTS0011\]/);
 
-  const spec = await invoke(["generate", "--spec", "petstore"], scriptFixture());
-  assert.equal(spec.code, 2);
-  assert.match(spec.stderr, /error\[OASTS9002\]/);
+  for (const command of ["generate", "check", "watch"]) {
+    const spec = await invoke([command, "--spec", "petstore"], scriptFixture());
+    assert.equal(spec.code, 2);
+    assert.match(spec.stderr, /error\[OASTS9002\]/);
+  }
 
   const ambiguous = scriptFixture();
   copyFileSync(join(FIXTURE, "oasts.yaml"), join(ambiguous, "oasts.yaml"));

@@ -4589,6 +4589,7 @@ fn string_array_field(object: &Map<String, Value>, key: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::path::{Path, PathBuf};
 
     use serde_json::json;
@@ -4954,7 +4955,8 @@ mod tests {
         .expect("write last");
         let resolved = load_config(Some(Path::new("oasts.json")), temp.path()).expect("config");
         let mut load_sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut load_sink).expect("graph");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut load_sink).expect("graph");
         assert!(!load_sink.has_errors(), "{:#?}", load_sink.as_slice());
         std::fs::remove_file(temp.path().join("last.json")).expect("remove last hop");
 
@@ -5052,7 +5054,8 @@ mod tests {
         let config_path = directory.join("oasts.yaml");
         let config = load_config(Some(&config_path), &directory).expect("fixture config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("fixture graph");
+        let graph =
+            load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("fixture graph");
         assert!(!sink.has_errors(), "{:?}", sink.as_slice());
         (config, graph)
     }
@@ -5077,7 +5080,7 @@ mod tests {
         let resolved =
             load_config(Some(Path::new("oasts.json")), temp.path()).expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph");
+        let graph = load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph");
         assert!(!sink.has_errors());
         (temp, graph)
     }
@@ -5115,7 +5118,13 @@ mod tests {
         let resolved =
             load_config(Some(Path::new("oasts.json")), temp.path()).expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let files = compile_pipeline(&resolved, FetcherHandle::None, true, &mut sink);
+        let files = compile_pipeline(
+            &resolved,
+            FetcherHandle::None,
+            true,
+            &mut InputRecorder::off(),
+            &mut sink,
+        );
         (temp, files, sink)
     }
 
@@ -6302,7 +6311,8 @@ mod tests {
         let resolved =
             load_config(Some(Path::new("oasts.json")), temp.path()).expect("resolved config");
         let mut load_sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut load_sink).expect("graph");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut load_sink).expect("graph");
         assert!(!load_sink.has_errors(), "{:#?}", load_sink.as_slice());
         let mut sink = DiagnosticSink::new();
         let ir = parse(&graph, &mut sink).expect("IR");
@@ -8426,7 +8436,8 @@ mod tests {
         let resolved =
             load_config(Some(Path::new("oasts.json")), temp.path()).expect("resolved config");
         let mut load_sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut load_sink).expect("graph");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut load_sink).expect("graph");
         assert!(!load_sink.has_errors(), "{:#?}", load_sink.as_slice());
         let mut sink = DiagnosticSink::new();
         let ir = parse(&graph, &mut sink).expect("IR");
@@ -9177,8 +9188,14 @@ mod tests {
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let files = compile_pipeline(&resolved, FetcherHandle::None, true, &mut sink)
-            .expect("generated files");
+        let files = compile_pipeline(
+            &resolved,
+            FetcherHandle::None,
+            true,
+            &mut InputRecorder::off(),
+            &mut sink,
+        )
+        .expect("generated files");
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         let client = files
             .iter()
@@ -10601,7 +10618,8 @@ mod tests {
         .expect("write target");
         let resolved = load_config(Some(Path::new("oasts.json")), temp.path()).expect("config");
         let mut load_sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut load_sink).expect("graph");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut load_sink).expect("graph");
         std::fs::remove_file(temp.path().join("other.json")).expect("remove target");
 
         let mut sink = DiagnosticSink::new();
@@ -10814,7 +10832,8 @@ mod tests {
             let config = crate::config::load_config(Some(&fixture.join("oasts.yaml")), &fixture)
                 .expect("fixture config loads");
             let mut sink = DiagnosticSink::new();
-            let graph = crate::loader::load_graph(&config, &mut sink).expect("fixture graph loads");
+            let graph = crate::loader::load_graph(&config, &mut InputRecorder::off(), &mut sink)
+                .expect("fixture graph loads");
             let ir = parse(&graph, &mut sink).expect("fixture parses");
             assert!(!sink.has_errors(), "{fixture_name}: {:#?}", sink.as_slice());
             for schema in &ir.schemas {

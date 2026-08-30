@@ -4070,6 +4070,7 @@ fn helper_export_name(helper: HelperId) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::fs;
 
     use serde_json::{Value, json};
@@ -4130,7 +4131,7 @@ mod tests {
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("graph");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("graph");
         let source_tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
@@ -4219,7 +4220,7 @@ mod tests {
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("graph");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("graph");
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
         let client = build_client_model(&analyzed, &config, &mut sink);
@@ -7792,12 +7793,19 @@ mod tests {
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("graph");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("graph");
         let source_tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
         let client = build_client_model(&analyzed, &config, &mut sink);
-        let files = emit_artifacts(&analyzed, &config, &source_tuples, Some(&client), &mut sink);
+        let files = emit_artifacts(
+            &analyzed,
+            &config,
+            &source_tuples,
+            Some(&client),
+            &mut InputRecorder::off(),
+            &mut sink,
+        );
         (files, sink.into_sorted_vec())
     }
 

@@ -10,7 +10,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use oasts_core::diag::{self, Diagnostic};
-use oasts_core::driver::{self, Command as DriverCommand, ConfigSource, Outcome, Unsupported};
+use oasts_core::driver::{
+    self, Command as DriverCommand, ConfigSource, Outcome, Tracking, Unsupported,
+};
 
 const CODE_CURRENT_DIR: &str = "OASTS1021";
 
@@ -44,7 +46,7 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         spec: Vec<String>,
     },
-    /// Watch inputs and regenerate (unsupported in this build).
+    /// Watch inputs and regenerate until interrupted.
     Watch {
         /// Use an explicit configuration file.
         #[arg(long, value_name = "PATH")]
@@ -128,13 +130,9 @@ fn run_os_with_io(
         }
     };
     match cli.command {
-        // The refusal for an unimplemented command is answered before anything else, so `watch`
-        // never fails on a missing config first — the order the Node CLI also runs in.
-        Command::Watch { .. } => report(
-            driver::refuse(Unsupported::Command("watch")),
-            stdout,
-            stderr,
-        ),
+        Command::Watch { config, spec } => {
+            crate::watch::run(config.as_deref(), &spec, cwd, stdout, stderr)
+        }
         Command::Generate {
             check,
             config,
@@ -180,11 +178,12 @@ fn dispatch(
             cwd,
         },
         oasts_fetch::handle(),
+        Tracking::Off,
     );
     report(outcome, stdout, stderr)
 }
 
-fn report(outcome: Outcome, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+pub(crate) fn report(outcome: Outcome, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     let _ = render_diagnostics(outcome.diagnostics, stderr);
     for line in &outcome.drift_lines {
         let _ = writeln!(stderr, "{line}");
@@ -805,27 +804,12 @@ mod tests {
 
     #[test]
     fn unimplemented_surfaces_refuse_with_the_core_diagnostics() {
-        let empty = tempfile::tempdir().expect("tempdir");
-        for args in [
-            vec!["oasts", "watch"],
-            vec!["watch"],
-            vec!["oasts", "watch", "--config", "oasts.yaml"],
-            vec!["oasts", "watch", "--spec", "petstore"],
-        ] {
-            let (code, stdout, stderr) = invoke(&args, empty.path());
-            assert_eq!(code, 2, "{args:?}: {stderr}");
-            assert!(stdout.is_empty(), "{args:?}: {stdout}");
-            assert!(
-                stderr.contains("error[OASTS9004]: the watch command is not supported"),
-                "{args:?}: {stderr}"
-            );
-        }
-
         let configured = copy_fixture("petstore-3.0");
         for args in [
             vec!["oasts", "generate", "--spec", "petstore"],
             vec!["oasts", "check", "--spec", "petstore"],
             vec!["oasts", "generate", "--spec", "petstore", "--spec", "other"],
+            vec!["oasts", "watch", "--spec", "petstore"],
         ] {
             let (code, stdout, stderr) = invoke(&args, configured.path());
             assert_eq!(code, 2, "{args:?}: {stderr}");
@@ -921,6 +905,7 @@ mod tests {
     fn outcome_rendering_is_deterministic() {
         let outcome = Outcome {
             exit_code: 2,
+            watch_plan: None,
             stdout_summary: Some("check ok".to_owned()),
             diagnostics: vec![
                 Diagnostic::input("OASTS9903", "input")

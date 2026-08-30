@@ -646,7 +646,7 @@ mod tests {
     fn deferred_blocks_are_unknown() {
         let schema = crate::schema::config_schema();
         let ts = emit_config_ts(&schema).unwrap();
-        for key in ["specs", "shared", "watch", "ci"] {
+        for key in ["specs", "shared", "ci"] {
             assert!(
                 ts.contains(&format!("{key}?: unknown")),
                 "deferred block {key} should be optional unknown"
@@ -661,6 +661,14 @@ mod tests {
         assert!(ts.contains("remote?: RemoteConfig;"));
         assert!(ts.contains("allowHosts?: string[];"));
         assert!(ts.contains("integrity?: Record<string, string>;"));
+    }
+
+    #[test]
+    fn the_watch_block_is_typed() {
+        let schema = crate::schema::config_schema();
+        let ts = emit_config_ts(&schema).unwrap();
+        assert!(ts.contains("watch?: WatchConfig;"));
+        assert!(ts.contains("debounceMs?: number;"));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use oasts_core::client_model::build_client_model as run_build_client_model;
 use oasts_core::config::{ResolvedConfig, load_config};
 use oasts_core::diag::DiagnosticSink;
 use oasts_core::emit::emit_artifacts as run_emit_artifacts;
+use oasts_core::inputs::InputRecorder;
 use oasts_core::ir::Ir;
 use oasts_core::loader::{DocumentGraph, load_graph as run_load_graph};
 use oasts_core::parse::parse as run_parse;
@@ -129,13 +130,14 @@ fn client_fixtures() -> Vec<Fixture> {
 
 fn prepared_graph(fixture: &Fixture) -> DocumentGraph {
     let mut sink = DiagnosticSink::new();
-    let graph = run_load_graph(&fixture.config, &mut sink).unwrap_or_else(|| {
-        panic!(
-            "failed to load graph for {}: {:#?}",
-            fixture.name,
-            sink.as_slice()
-        )
-    });
+    let graph = run_load_graph(&fixture.config, &mut InputRecorder::off(), &mut sink)
+        .unwrap_or_else(|| {
+            panic!(
+                "failed to load graph for {}: {:#?}",
+                fixture.name,
+                sink.as_slice()
+            )
+        });
     assert!(
         !sink.has_errors(),
         "graph diagnostics for {}: {:#?}",
@@ -173,8 +175,14 @@ fn prepared_analysis(fixture: &Fixture) -> Analyzed {
 
 fn prepared_files(fixture: &Fixture) -> Vec<oasts_core::emit::GeneratedFile> {
     let mut sink = DiagnosticSink::new();
-    let files = run_compile(&fixture.config, FetcherHandle::None, true, &mut sink)
-        .unwrap_or_else(|| panic!("failed to compile {}: {:#?}", fixture.name, sink.as_slice()));
+    let files = run_compile(
+        &fixture.config,
+        FetcherHandle::None,
+        true,
+        &mut InputRecorder::off(),
+        &mut sink,
+    )
+    .unwrap_or_else(|| panic!("failed to compile {}: {:#?}", fixture.name, sink.as_slice()));
     assert!(
         !sink.has_errors(),
         "compile diagnostics for {}: {:#?}",
@@ -189,7 +197,7 @@ fn load_graph(bencher: Bencher, fixture: &Fixture) {
     bencher
         .with_inputs(DiagnosticSink::new)
         .bench_values(|mut sink| {
-            let graph = run_load_graph(&fixture.config, &mut sink);
+            let graph = run_load_graph(&fixture.config, &mut InputRecorder::off(), &mut sink);
             (graph, sink)
         });
 }
@@ -267,6 +275,7 @@ fn bench_emit(bencher: Bencher, fixture: &Fixture) {
                 &fixture.config,
                 &source_tuples,
                 client_model.as_ref(),
+                &mut InputRecorder::off(),
                 &mut sink,
             );
             (files, sink)
@@ -278,7 +287,13 @@ fn compile(bencher: Bencher, fixture: &Fixture) {
     bencher
         .with_inputs(DiagnosticSink::new)
         .bench_values(|mut sink| {
-            let files = run_compile(&fixture.config, FetcherHandle::None, true, &mut sink);
+            let files = run_compile(
+                &fixture.config,
+                FetcherHandle::None,
+                true,
+                &mut InputRecorder::off(),
+                &mut sink,
+            );
             (files, sink)
         });
 }

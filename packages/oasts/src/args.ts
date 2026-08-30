@@ -22,7 +22,7 @@ export const USAGE = `Usage: oasts <command> [options]
 Commands:
   generate           Generate configured artifacts
   check              Validate configuration and input without emitting
-  watch              (unsupported in this build)
+  watch              Watch inputs and regenerate until interrupted
 
 Options:
   --config <path>    Use an explicit configuration file

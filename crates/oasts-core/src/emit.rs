@@ -42,6 +42,7 @@ use crate::config::{
     EnumRepresentation, FileCase, ResolvedConfig, TypesConfig,
 };
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
+use crate::inputs::InputRecorder;
 use crate::ir::{
     AdditionalProperties, Body, Discriminator, Ir, MediaType, Operation, Param, ParamLocation,
     PatternProperty, PatternPropertyKey, PrimitiveType, PropMeta, ResponseEntry, ResponseHeader,
@@ -442,14 +443,21 @@ pub fn emit_artifacts(
     config: &ResolvedConfig,
     source_tuples: &[(String, [u8; 32])],
     client_model: Option<&ClientModel>,
+    inputs: &mut InputRecorder,
     sink: &mut DiagnosticSink,
 ) -> Vec<GeneratedFile> {
     // The consumer's own compiler options, read once per run. This is the single point at which
     // anything outside version, config and input reaches emitted bytes, so it is resolved here
     // rather than deep in an emitter — and it fails safe: anything unreadable answers "not
-    // provided", which keeps the reference directive.
+    // provided", which keeps the reference directive. It is also the only filesystem read in
+    // emission, which is why `inputs` reaches this far in.
     let (consumer_provides_temporal, tsconfig_diagnostics) =
-        crate::tsconfig::consumer_provides_temporal(&config.output, &config.tsconfig);
+        crate::tsconfig::consumer_provides_temporal(
+            &config.output,
+            &config.workspace_root,
+            &config.tsconfig,
+            inputs,
+        );
     sink.extend(tsconfig_diagnostics);
     let mut registrar = Registrar::new(sink);
     let mut model = EmissionModel::new(
@@ -5831,7 +5839,8 @@ mod tests {
         let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let client = crate::client_model::build_client_model(&analyzed, &resolved, &mut sink);
@@ -5840,6 +5849,7 @@ mod tests {
             &resolved,
             &graph.source_tuples(),
             Some(&client),
+            &mut InputRecorder::off(),
             &mut sink,
         );
         (files, sink.into_sorted_vec())
@@ -5939,7 +5949,8 @@ mod tests {
         .expect("write config");
         let resolved = load_config(Some(&config_path), temp.path()).expect("valid config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("loaded graph");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("loaded graph");
         let ir = parse(&graph, &mut sink).expect("supported OpenAPI");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let files = emit_types(&analyzed, &resolved, &graph.source_tuples(), &mut sink);
@@ -7279,7 +7290,8 @@ mod tests {
             let config = crate::config::load_config(Some(&fixture.join("oasts.yaml")), &fixture)
                 .expect("fixture config loads");
             let mut sink = DiagnosticSink::new();
-            let graph = crate::loader::load_graph(&config, &mut sink).expect("fixture graph loads");
+            let graph = crate::loader::load_graph(&config, &mut InputRecorder::off(), &mut sink)
+                .expect("fixture graph loads");
             let ir = crate::parse::parse(&graph, &mut sink).expect("fixture parses");
             let analyzed = crate::semantic::analyze(ir, &config, &mut sink);
             assert!(!sink.has_errors(), "{fixture_name}: {:#?}", sink.as_slice());
@@ -11294,13 +11306,20 @@ mod tests {
             let config = load_config(Some(&directory.join("oasts.yaml")), &directory)
                 .expect("fixture config");
             let mut sink = DiagnosticSink::new();
-            let graph = load_graph(&config, &mut sink).expect("fixture graph");
+            let graph =
+                load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("fixture graph");
             let ir = parse(&graph, &mut sink).expect("fixture IR");
             let analyzed = analyze(ir, &config, &mut sink);
             let first = emit_types(&analyzed, &config, &graph.source_tuples(), &mut sink);
             let second = emit_types(&analyzed, &config, &graph.source_tuples(), &mut sink);
-            let aliased =
-                emit_artifacts(&analyzed, &config, &graph.source_tuples(), None, &mut sink);
+            let aliased = emit_artifacts(
+                &analyzed,
+                &config,
+                &graph.source_tuples(),
+                None,
+                &mut InputRecorder::off(),
+                &mut sink,
+            );
             assert!(!first.is_empty());
             assert_eq!(first, second);
             assert_eq!(first, aliased);
@@ -11605,7 +11624,8 @@ mod tests {
         .expect("write config");
         let config = load_config(Some(&config_path), temp.path()).expect("valid config");
         let mut preparation_sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut preparation_sink).expect("loaded graph");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut preparation_sink)
+            .expect("loaded graph");
         let ir = parse(&graph, &mut preparation_sink).expect("supported OpenAPI");
         let analyzed = analyze(ir, &config, &mut preparation_sink);
         assert!(preparation_sink.as_slice().is_empty());

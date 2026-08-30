@@ -3012,6 +3012,7 @@ fn intersect_projection(left: Projection, right: Projection) -> Projection {
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::fs;
 
     use serde_json::{Value, json};
@@ -3088,7 +3089,7 @@ mod tests {
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("graph");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("graph");
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
         (temp, analyzed, config, sink)

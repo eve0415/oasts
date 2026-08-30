@@ -2182,6 +2182,7 @@ fn assemble_file(
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::fs;
 
     use serde_json::{Value, json};
@@ -2227,7 +2228,8 @@ mod tests {
         .expect("write config");
         let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let source_tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
@@ -2241,6 +2243,7 @@ mod tests {
             &resolved,
             &source_tuples,
             client.as_ref(),
+            &mut InputRecorder::off(),
             &mut sink,
         );
         (files, sink.into_sorted_vec())
@@ -2297,7 +2300,8 @@ mod tests {
         .expect("write config");
         let resolved = load_config(None, temp.path()).expect("config resolves");
         let mut prepared = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut prepared).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut prepared).expect("graph loads");
         let source_tuples = graph.source_tuples();
         let ir = parse(&graph, &mut prepared).expect("document parses");
         drop(graph);
