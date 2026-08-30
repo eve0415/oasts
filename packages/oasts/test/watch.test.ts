@@ -46,8 +46,8 @@ function planWithRoots(
 }
 
 /** Whether the plan reports `path`, whatever kind it was recorded as. */
-function hasInput(plan: WatchPlan, path: string): boolean {
-  return plan.inputs.some((input) => input.path === path);
+function hasInput(reported: WatchPlan, path: string): boolean {
+  return reported.inputs.some((input) => input.path === path);
 }
 
 function cycle(exitCode: number, watchPlan: WatchPlan | null): Cycle {
