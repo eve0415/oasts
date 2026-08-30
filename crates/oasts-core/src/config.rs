@@ -4764,14 +4764,13 @@ mod tests {
 
     #[test]
     fn schema_known_unavailable_blocks_report_named_errors() {
-        for name in ["ci"] {
-            let mut value = valid_json_value();
-            value[name] = json!({});
-            let diagnostics = assert_code(load_json(&value), CODE_BLOCK_UNSUPPORTED);
-            assert!(diagnostics.iter().any(|diagnostic| {
-                diagnostic.code == CODE_BLOCK_UNSUPPORTED && diagnostic.message.contains(name)
-            }));
-        }
+        let name = "ci";
+        let mut value = valid_json_value();
+        value[name] = json!({});
+        let diagnostics = assert_code(load_json(&value), CODE_BLOCK_UNSUPPORTED);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CODE_BLOCK_UNSUPPORTED && diagnostic.message.contains(name)
+        }));
     }
 
     #[test]
