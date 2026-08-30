@@ -20,6 +20,13 @@ scope=--local
 # The local bucket belongs to the built worker config, which is what `wrangler dev` runs.
 config=(-c dist/server/wrangler.json)
 
+if (($# > 1)); then
+  # Only the first argument is read, so `--remote --local` would publish remotely while the
+  # operator believes the trailing --local won.
+  echo "playground-wasm: expected at most one argument, got $#" >&2
+  exit 1
+fi
+
 case ${1:-} in
   "" | --local) ;;
   --remote)
