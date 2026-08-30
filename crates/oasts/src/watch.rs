@@ -562,6 +562,54 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_session_watches_every_spec_and_ignores_every_output_tree() {
+        let mut watched = Watched::default();
+        watched.absorb(
+            &WatchPlan {
+                inputs: vec![WatchInput {
+                    path: PathBuf::from("/w/oasts.yaml"),
+                    kind: InputKind::File,
+                }],
+                specs: vec![
+                    SpecWatchPlan {
+                        name: Some("billing".to_owned()),
+                        inputs: vec![
+                            WatchInput {
+                                path: PathBuf::from("/w/shared.yaml"),
+                                kind: InputKind::File,
+                            },
+                            WatchInput {
+                                path: PathBuf::from("/w/billing.yaml"),
+                                kind: InputKind::File,
+                            },
+                        ],
+                        output_root: PathBuf::from("/w/out/billing"),
+                    },
+                    SpecWatchPlan {
+                        name: Some("users".to_owned()),
+                        inputs: vec![WatchInput {
+                            path: PathBuf::from("/w/shared.yaml"),
+                            kind: InputKind::File,
+                        }],
+                        output_root: PathBuf::from("/w/out/users"),
+                    },
+                ],
+                settings: WatchConfig { debounce_ms: 5 },
+            },
+            true,
+        );
+
+        // The document two specs share is one path, and each spec's own entry is watched too.
+        assert_eq!(watched.inputs.len(), 3);
+        assert!(watched.triggers(Path::new("/w/shared.yaml")));
+        assert!(watched.triggers(Path::new("/w/billing.yaml")));
+        assert!(watched.triggers(Path::new("/w/oasts.yaml")));
+        // Neither spec's artifacts wake the session — including the other spec's.
+        assert!(!watched.triggers(Path::new("/w/out/billing/types/index.ts")));
+        assert!(!watched.triggers(Path::new("/w/out/users/types/index.ts")));
+    }
+
+    #[test]
     fn only_inputs_trigger_once_a_compile_has_settled() {
         let mut watched = Watched::default();
         watched.absorb(
