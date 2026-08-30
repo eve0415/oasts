@@ -2800,7 +2800,8 @@ mod tests {
         let config =
             crate::config::load_config(Some(&config_path), temp.path()).expect("valid config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("loaded graph");
+        let graph =
+            load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("loaded graph");
         let ir = parse(&graph, &mut sink).expect("supported OpenAPI");
         let _analyzed = analyze(ir, &config, &mut sink);
         sink.into_sorted_vec()

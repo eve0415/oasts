@@ -36,11 +36,10 @@ fn supported_range() -> String {
 /// Warns when the reachable `msw` install falls outside the supported range.
 #[must_use]
 pub fn diagnose(output: &Path, inputs: &mut InputRecorder) -> Option<Diagnostic> {
-    let installed = installed_version(output, "msw")?;
     // Only the manifest that answered. The ancestors that had no install were probed too, but
     // watching every `node_modules` above the output tree to catch an install appearing would
     // cost far more than the warning it could refresh.
-    inputs.record(&installed.manifest);
+    let installed = installed_version(output, "msw", inputs)?;
     let (major, minor) = major_minor(&installed.version)?;
     if major == SUPPORTED_MAJOR && minor >= MINIMUM_MINOR {
         return None;

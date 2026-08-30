@@ -17,6 +17,7 @@ use url::Url;
 
 use crate::config::{INTEGRITY_PREFIX, ResolvedConfig, without_credentials};
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
+use crate::inputs::InputRecorder;
 use crate::source::{
     DocumentSource, FetchPolicy, FetchStep, FetcherHandle, RemoteFetcher, SourceHandle, is_rooted,
 };
@@ -600,18 +601,28 @@ impl DocumentGraph {
 }
 
 /// Loads the configured document graph from the real filesystem, retrieving nothing.
-pub fn load_graph(config: &ResolvedConfig, sink: &mut DiagnosticSink) -> Option<DocumentGraph> {
-    load_graph_with_host(config, SourceHandle::Fs, FetcherHandle::None, sink)
+pub fn load_graph(
+    config: &ResolvedConfig,
+    inputs: &mut InputRecorder,
+    sink: &mut DiagnosticSink,
+) -> Option<DocumentGraph> {
+    load_graph_with_host(config, SourceHandle::Fs, FetcherHandle::None, inputs, sink)
 }
 
 /// Loads the configured document graph from `source` and `fetcher`, reporting the first failure.
+///
+/// Every path is reported to `inputs` as it is reached rather than at the end, because a load that
+/// fails still says what it depended on — the documents it had already opened, and the one it
+/// could not. A watcher handed only the successful runs' paths would stop watching the directory
+/// it is waiting for a fix in.
 pub fn load_graph_with_host(
     config: &ResolvedConfig,
     source: SourceHandle,
     fetcher: FetcherHandle,
+    inputs: &mut InputRecorder,
     sink: &mut DiagnosticSink,
 ) -> Option<DocumentGraph> {
-    match GraphBuilder::new(config, source, fetcher).and_then(GraphBuilder::build) {
+    match GraphBuilder::new(config, source, fetcher, inputs).and_then(GraphBuilder::build) {
         Ok((graph, warnings)) => {
             sink.extend(warnings);
             Some(graph)
@@ -688,6 +699,7 @@ struct GraphBuilder<'a> {
     source: SourceHandle,
     fetcher: FetcherHandle,
     policy: FetchPolicy,
+    inputs: &'a mut InputRecorder,
     documents: Vec<Rc<Document>>,
     path_to_id: HashMap<PathBuf, DocId>,
     uri_to_id: HashMap<String, DocId>,
@@ -705,7 +717,13 @@ impl<'a> GraphBuilder<'a> {
         config: &'a ResolvedConfig,
         source: SourceHandle,
         fetcher: FetcherHandle,
+        inputs: &'a mut InputRecorder,
     ) -> Result<Self, Diagnostic> {
+        // The trust roots decide what a `$ref` may reach and how every source id is spelled, so
+        // repointing one changes emitted bytes. Recorded before they are resolved, because a root
+        // that does not exist yet is exactly the one whose appearance changes the answer.
+        inputs.record(&config.workspace_root);
+        inputs.record_all(config.local_allow_paths.iter().map(PathBuf::as_path));
         let workspace_root = source
             .canonicalize(&config.workspace_root)
             .map_err(|error| {
@@ -729,8 +747,10 @@ impl<'a> GraphBuilder<'a> {
                     Some("/local/allowPaths"),
                 )
             })?;
+            inputs.record(&canonical_path);
             allow_roots.push(AllowRoot { canonical_path });
         }
+        inputs.record(&workspace_root);
         Ok(Self {
             config,
             source,
@@ -739,6 +759,7 @@ impl<'a> GraphBuilder<'a> {
                 timeout_ms: config.remote.timeout_ms,
                 max_bytes: config.limits.max_document_bytes,
             },
+            inputs,
             documents: Vec::new(),
             path_to_id: HashMap::new(),
             uri_to_id: HashMap::new(),
@@ -830,6 +851,9 @@ impl<'a> GraphBuilder<'a> {
         if let Some(id) = self.path_to_id.get(requested_path) {
             return Ok(*id);
         }
+        // Recorded before the file is known to exist. A `$ref` naming a document nobody has
+        // written yet fails here, and the path it named is the one whose appearance fixes it.
+        self.inputs.record(requested_path);
         let canonical_path = self.source.canonicalize(requested_path).map_err(|error| {
             io_error(
                 CODE_DOCUMENT_IO,
@@ -841,6 +865,7 @@ impl<'a> GraphBuilder<'a> {
                 None,
             )
         })?;
+        self.inputs.record(&canonical_path);
         let source_id =
             logical_source_id(&canonical_path, &self.workspace_root, &self.allow_roots)?;
 
@@ -3074,14 +3099,15 @@ mod tests {
 
     fn load_ok(config: &ResolvedConfig) -> DocumentGraph {
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(config, &mut sink).expect("graph should load");
+        let graph =
+            load_graph(config, &mut InputRecorder::off(), &mut sink).expect("graph should load");
         assert!(sink.as_slice().is_empty(), "{:#?}", sink.as_slice());
         graph
     }
 
     fn assert_load_code(config: &ResolvedConfig, code: &str) -> Diagnostic {
         let mut sink = DiagnosticSink::new();
-        assert!(load_graph(config, &mut sink).is_none());
+        assert!(load_graph(config, &mut InputRecorder::off(), &mut sink).is_none());
         let diagnostic = sink
             .as_slice()
             .iter()
@@ -3204,7 +3230,7 @@ mod tests {
         let config = resolved_json_config(directory.path());
         let mut sink = DiagnosticSink::new();
 
-        assert!(load_graph(&config, &mut sink).is_none());
+        assert!(load_graph(&config, &mut InputRecorder::off(), &mut sink).is_none());
         assert_eq!(sink.as_slice().len(), 1);
         let diagnostic = &sink.as_slice()[0];
         assert_eq!(diagnostic.code, CODE_DOCUMENT_PARSE);
@@ -4398,19 +4424,19 @@ mod tests {
 
         config.workspace_root = directory.path().join("missing-workspace");
         let mut sink = DiagnosticSink::new();
-        assert!(load_graph(&config, &mut sink).is_none());
+        assert!(load_graph(&config, &mut InputRecorder::off(), &mut sink).is_none());
         assert_eq!(sink.as_slice()[0].code, CODE_DOCUMENT_IO);
 
         config = resolved_config(directory.path(), "");
         config.local_allow_paths = vec![directory.path().join("missing-allow-root")];
         let mut sink = DiagnosticSink::new();
-        assert!(load_graph(&config, &mut sink).is_none());
+        assert!(load_graph(&config, &mut InputRecorder::off(), &mut sink).is_none());
         assert_eq!(sink.as_slice()[0].code, CODE_DOCUMENT_IO);
 
         config = resolved_config(directory.path(), "");
         config.input = directory.path().join("workspace/missing.yaml");
         let mut sink = DiagnosticSink::new();
-        assert!(load_graph(&config, &mut sink).is_none());
+        assert!(load_graph(&config, &mut InputRecorder::off(), &mut sink).is_none());
         assert_eq!(sink.as_slice()[0].code, CODE_DOCUMENT_IO);
 
         for (name, contents) in [
@@ -4448,7 +4474,7 @@ mod tests {
         fs::set_permissions(&entry, fs::Permissions::from_mode(0o000))
             .expect("permissions should change");
         let mut sink = DiagnosticSink::new();
-        assert!(load_graph(&config, &mut sink).is_none());
+        assert!(load_graph(&config, &mut InputRecorder::off(), &mut sink).is_none());
         fs::set_permissions(&entry, fs::Permissions::from_mode(0o600))
             .expect("permissions should be restored");
         assert_eq!(sink.as_slice()[0].code, CODE_DOCUMENT_IO);
@@ -4509,7 +4535,7 @@ mod tests {
         );
         let config = resolved_config(directory.path(), "");
         let mut sink = DiagnosticSink::new();
-        assert!(load_graph(&config, &mut sink).is_none());
+        assert!(load_graph(&config, &mut InputRecorder::off(), &mut sink).is_none());
         let diagnostic = &sink.as_slice()[0];
         assert_eq!(diagnostic.code, CODE_DOCUMENT_IO);
         assert_eq!(
@@ -4531,8 +4557,14 @@ mod tests {
             "openapi: 3.1.0\ntags:\n  - name: one\ncomponents:\n  schemas:\n    Mixed:\n      allOf:\n        - type: object\n      prefixItems:\n        - type: string\n      items:\n        - type: number\n      example:\n        $ref: missing.yaml\n",
         );
         let config = resolved_config(directory.path(), "");
-        let mut builder =
-            GraphBuilder::new(&config, SourceHandle::Fs, FetcherHandle::None).expect("builder");
+        let mut recorder = InputRecorder::off();
+        let mut builder = GraphBuilder::new(
+            &config,
+            SourceHandle::Fs,
+            FetcherHandle::None,
+            &mut recorder,
+        )
+        .expect("builder");
         let entry_id = builder
             .load_document(&config.input)
             .expect("entry should load");
@@ -4613,8 +4645,14 @@ mod tests {
             "openapi: 3.1.0\ninfo:\n  title: Example\n  version: 1.0.0\n",
         );
         let config = resolved_config(directory.path(), "");
-        let mut builder =
-            GraphBuilder::new(&config, SourceHandle::Fs, FetcherHandle::None).expect("builder");
+        let mut recorder = InputRecorder::off();
+        let mut builder = GraphBuilder::new(
+            &config,
+            SourceHandle::Fs,
+            FetcherHandle::None,
+            &mut recorder,
+        )
+        .expect("builder");
         let entry_id = builder
             .load_document(&config.input)
             .expect("entry should load");
@@ -4651,8 +4689,14 @@ mod tests {
         let directory = TempDir::new().expect("tempdir should be created");
         let entry = write(directory.path(), "workspace/entry.yaml", "openapi: 3.1.0\n");
         let config = resolved_config(directory.path(), "");
-        let mut builder =
-            GraphBuilder::new(&config, SourceHandle::Fs, FetcherHandle::None).expect("builder");
+        let mut recorder = InputRecorder::off();
+        let mut builder = GraphBuilder::new(
+            &config,
+            SourceHandle::Fs,
+            FetcherHandle::None,
+            &mut recorder,
+        )
+        .expect("builder");
         let id = builder.load_document(&entry).expect("entry should load");
         let canonical_path = builder.documents[id.0]
             .location
@@ -4679,8 +4723,14 @@ mod tests {
         let alias = directory.path().join("workspace/alias.yaml");
         symlink(&entry, &alias).expect("fixture symlink should be created");
         let config = resolved_config(directory.path(), "");
-        let mut builder =
-            GraphBuilder::new(&config, SourceHandle::Fs, FetcherHandle::None).expect("builder");
+        let mut recorder = InputRecorder::off();
+        let mut builder = GraphBuilder::new(
+            &config,
+            SourceHandle::Fs,
+            FetcherHandle::None,
+            &mut recorder,
+        )
+        .expect("builder");
         let id = builder.load_document(&entry).expect("entry should load");
 
         assert_eq!(
@@ -4770,7 +4820,8 @@ mod tests {
         );
         let mut sink = DiagnosticSink::new();
 
-        let graph = load_graph(&config, &mut sink).expect("YAML fallback should load");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut sink)
+            .expect("YAML fallback should load");
 
         assert_eq!(graph.entry().value["openapi"], "3.1.0");
         assert_eq!(sink.as_slice().len(), 1);
@@ -4796,7 +4847,8 @@ mod tests {
         );
         let mut sink = DiagnosticSink::new();
 
-        let graph = load_graph(&config, &mut sink).expect("JSON fallback should load");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut sink)
+            .expect("JSON fallback should load");
 
         assert_eq!(graph.entry().value["info"]["title"], "𝄞");
         assert_eq!(sink.as_slice().len(), 1);
@@ -5103,8 +5155,14 @@ mod tests {
         );
         let mut config = resolved_config(directory.path(), "");
         config.input = directory.path().join("workspace/entry.json");
-        let mut builder =
-            GraphBuilder::new(&config, SourceHandle::Fs, FetcherHandle::None).expect("builder");
+        let mut recorder = InputRecorder::off();
+        let mut builder = GraphBuilder::new(
+            &config,
+            SourceHandle::Fs,
+            FetcherHandle::None,
+            &mut recorder,
+        )
+        .expect("builder");
         let id = builder
             .load_document(&config.input)
             .expect("document should load");
@@ -5310,7 +5368,13 @@ mod tests {
     ) -> (Option<DocumentGraph>, Vec<Diagnostic>) {
         let mut sink = DiagnosticSink::new();
         let handle = FetcherHandle::from(Arc::clone(fetcher) as Arc<dyn RemoteFetcher>);
-        let graph = load_graph_with_host(config, SourceHandle::Fs, handle, &mut sink);
+        let graph = load_graph_with_host(
+            config,
+            SourceHandle::Fs,
+            handle,
+            &mut InputRecorder::off(),
+            &mut sink,
+        );
         (graph, sink.into_sorted_vec())
     }
 

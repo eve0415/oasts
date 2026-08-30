@@ -130,13 +130,14 @@ fn client_fixtures() -> Vec<Fixture> {
 
 fn prepared_graph(fixture: &Fixture) -> DocumentGraph {
     let mut sink = DiagnosticSink::new();
-    let graph = run_load_graph(&fixture.config, &mut sink).unwrap_or_else(|| {
-        panic!(
-            "failed to load graph for {}: {:#?}",
-            fixture.name,
-            sink.as_slice()
-        )
-    });
+    let graph = run_load_graph(&fixture.config, &mut InputRecorder::off(), &mut sink)
+        .unwrap_or_else(|| {
+            panic!(
+                "failed to load graph for {}: {:#?}",
+                fixture.name,
+                sink.as_slice()
+            )
+        });
     assert!(
         !sink.has_errors(),
         "graph diagnostics for {}: {:#?}",
@@ -196,7 +197,7 @@ fn load_graph(bencher: Bencher, fixture: &Fixture) {
     bencher
         .with_inputs(DiagnosticSink::new)
         .bench_values(|mut sink| {
-            let graph = run_load_graph(&fixture.config, &mut sink);
+            let graph = run_load_graph(&fixture.config, &mut InputRecorder::off(), &mut sink);
             (graph, sink)
         });
 }

@@ -5839,7 +5839,8 @@ mod tests {
         let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let client = crate::client_model::build_client_model(&analyzed, &resolved, &mut sink);
@@ -5948,7 +5949,8 @@ mod tests {
         .expect("write config");
         let resolved = load_config(Some(&config_path), temp.path()).expect("valid config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("loaded graph");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("loaded graph");
         let ir = parse(&graph, &mut sink).expect("supported OpenAPI");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let files = emit_types(&analyzed, &resolved, &graph.source_tuples(), &mut sink);
@@ -7288,7 +7290,8 @@ mod tests {
             let config = crate::config::load_config(Some(&fixture.join("oasts.yaml")), &fixture)
                 .expect("fixture config loads");
             let mut sink = DiagnosticSink::new();
-            let graph = crate::loader::load_graph(&config, &mut sink).expect("fixture graph loads");
+            let graph = crate::loader::load_graph(&config, &mut InputRecorder::off(), &mut sink)
+                .expect("fixture graph loads");
             let ir = crate::parse::parse(&graph, &mut sink).expect("fixture parses");
             let analyzed = crate::semantic::analyze(ir, &config, &mut sink);
             assert!(!sink.has_errors(), "{fixture_name}: {:#?}", sink.as_slice());
@@ -11303,7 +11306,8 @@ mod tests {
             let config = load_config(Some(&directory.join("oasts.yaml")), &directory)
                 .expect("fixture config");
             let mut sink = DiagnosticSink::new();
-            let graph = load_graph(&config, &mut sink).expect("fixture graph");
+            let graph =
+                load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("fixture graph");
             let ir = parse(&graph, &mut sink).expect("fixture IR");
             let analyzed = analyze(ir, &config, &mut sink);
             let first = emit_types(&analyzed, &config, &graph.source_tuples(), &mut sink);
@@ -11620,7 +11624,8 @@ mod tests {
         .expect("write config");
         let config = load_config(Some(&config_path), temp.path()).expect("valid config");
         let mut preparation_sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut preparation_sink).expect("loaded graph");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut preparation_sink)
+            .expect("loaded graph");
         let ir = parse(&graph, &mut preparation_sink).expect("supported OpenAPI");
         let analyzed = analyze(ir, &config, &mut preparation_sink);
         assert!(preparation_sink.as_slice().is_empty());

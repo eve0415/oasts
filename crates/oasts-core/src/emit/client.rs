@@ -4131,7 +4131,7 @@ mod tests {
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("graph");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("graph");
         let source_tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
@@ -4220,7 +4220,7 @@ mod tests {
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("graph");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("graph");
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
         let client = build_client_model(&analyzed, &config, &mut sink);
@@ -7793,7 +7793,7 @@ mod tests {
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("graph");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("graph");
         let source_tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);

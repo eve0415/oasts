@@ -4378,7 +4378,8 @@ mod tests {
         .expect("write config");
         let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let source_tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
@@ -7056,7 +7057,7 @@ mod tests {
         .expect("write");
         let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph");
+        let graph = load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph");
         let ir = parse(&graph, &mut sink).expect("ir");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let files = emit_artifacts(
@@ -8194,7 +8195,7 @@ mod tests {
         .expect("write");
         let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph");
+        let graph = load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph");
         let ir = parse(&graph, &mut sink).expect("ir");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let files = emit_artifacts(

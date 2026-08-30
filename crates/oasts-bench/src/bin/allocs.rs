@@ -316,7 +316,9 @@ fn measure_key(entry: &FixtureEntry, fixture_dir: &Path) -> Result<KeySnapshot, 
     let mut sink = DiagnosticSink::new();
     let mut stages = Vec::new();
 
-    let graph = run_stage(&mut stages, "loadGraph", || load_graph(&config, &mut sink));
+    let graph = run_stage(&mut stages, "loadGraph", || {
+        load_graph(&config, &mut InputRecorder::off(), &mut sink)
+    });
     let Some(graph) = graph else {
         return Err(stage_failure(&key_label, "loadGraph", sink));
     };

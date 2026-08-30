@@ -907,6 +907,7 @@ impl<'input> EmissionModel<'input> {
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::fs;
 
     use serde_json::{Value, json};
@@ -979,7 +980,8 @@ mod tests {
         let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let digest = source_digest(&graph.source_tuples());
@@ -2348,6 +2350,7 @@ mod wire_declaration_tests {
 
         use crate::config::load_config;
         use crate::emit::source_digest;
+        use crate::inputs::InputRecorder;
         use crate::loader::load_graph;
         use crate::parse::parse;
         use crate::semantic::analyze;
@@ -2379,7 +2382,8 @@ mod wire_declaration_tests {
         let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let digest = source_digest(&graph.source_tuples());

@@ -47,18 +47,9 @@ pub fn compile_from(
     inputs: &mut InputRecorder,
     sink: &mut DiagnosticSink,
 ) -> Option<Vec<GeneratedFile>> {
-    let graph = load_graph_with_host(config, source, fetcher, sink)?;
-    // Recorded before anything can fail downstream, and before the graph is released below: this
-    // is the only place the set of documents a run actually opened is still in hand. A retrieved
-    // document has no path to watch, so only the local ones are recorded.
-    if inputs.is_recording() {
-        inputs.record_all(
-            graph
-                .documents()
-                .iter()
-                .filter_map(|document| document.location.as_path()),
-        );
-    }
+    // The loader records each document as it opens it, so a load that fails part way still reports
+    // what it had reached and the path it choked on.
+    let graph = load_graph_with_host(config, source, fetcher, inputs, sink)?;
     let ir = parse(&graph, sink)?;
     // Filtering and pruning run before analysis so name allocation, collision detection and path
     // registration see only survivors, and a filter diagnostic short-circuits here rather than
@@ -1029,7 +1020,8 @@ paths:
         // Re-run the stages to inspect the planned auth for get-board, whose security is
         // `[{ defaultApiKey: [] }, { app2AppOauth: [board:read] }]` in the fixture.
         let mut sink = DiagnosticSink::new();
-        let graph = crate::loader::load_graph(&config, &mut sink).expect("graph");
+        let graph = crate::loader::load_graph(&config, &mut InputRecorder::off(), &mut sink)
+            .expect("graph");
         let ir = parse(&graph, &mut sink).expect("IR");
         let analyzed = analyze(ir, &config, &mut sink);
         let model = build_client_model(&analyzed, &config, &mut sink);

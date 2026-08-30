@@ -3024,7 +3024,8 @@ mod tests {
         let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let client = build_client_model(&analyzed, &resolved, &mut sink);
@@ -3127,7 +3128,8 @@ mod tests {
         let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let facts = TransformFacts::compute(&analyzed.ir, &resolved);
@@ -3851,7 +3853,8 @@ mod tests {
         let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
         let analyzed = analyze(ir, &resolved, &mut sink);
         let client = build_client_model(&analyzed, &resolved, &mut sink);

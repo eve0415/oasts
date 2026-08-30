@@ -1558,7 +1558,8 @@ mod tests {
         fs::write(temp.path().join("oasts.yaml"), config).expect("write config");
         let mut sink = DiagnosticSink::new();
         let resolved = load_config(None, temp.path()).expect("config loads");
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let tuples = graph.source_tuples();
         let ir = parse(&graph, &mut sink).expect("document parses");
         drop(graph);
@@ -1707,7 +1708,8 @@ mod tests {
         fs::write(temp.path().join("oasts.yaml"), config).expect("write config");
         let mut sink = DiagnosticSink::new();
         let resolved = load_config(None, temp.path()).expect("config loads");
-        let graph = load_graph(&resolved, &mut sink).expect("graph loads");
+        let graph =
+            load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("document parses");
         drop(graph);
         let analyzed = analyze(ir, &resolved, &mut sink);

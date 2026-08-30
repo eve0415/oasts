@@ -837,6 +837,7 @@ fn finite_kinds(enum_values: Option<&[Value]>, const_value: Option<&Value>) -> J
 
 #[cfg(test)]
 mod tests {
+    use crate::inputs::InputRecorder;
     use std::fs;
 
     use serde_json::{Map, Value, json};
@@ -896,7 +897,7 @@ mod tests {
             load_config(Some(&config_path), temp.path()).expect("config resolves");
         config.types = types;
         let mut sink = DiagnosticSink::new();
-        let graph = load_graph(&config, &mut sink).expect("graph loads");
+        let graph = load_graph(&config, &mut InputRecorder::off(), &mut sink).expect("graph loads");
         let ir = parse(&graph, &mut sink).expect("input parses");
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         Fixture {
