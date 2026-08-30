@@ -2010,8 +2010,33 @@ fn check_output_overlap(specs: &[ResolvedSpec], source_path: &Path) -> Result<()
     Err(diagnostics)
 }
 
+/// Whether `inner` is `outer`, or sits inside it, comparing components without ASCII case.
+///
+/// The guarantee this serves is about physical directories, not about path strings, and the two
+/// diverge in two ways. A symlink alias is already gone by the time a root gets here: every path
+/// resolves through whatever of it exists, so two names for one existing directory arrive equal.
+/// Case is what canonicalization cannot answer. A filesystem that ignores it — Windows, and a
+/// macOS volume by default — makes `Users` and `users` one directory, and a component that does
+/// not exist yet has no name on disk to ask about at all.
+///
+/// So case is decided conservatively, the same way wherever the run happens: two roots that
+/// differ only in case are treated as one. On a case-sensitive filesystem that refuses a
+/// workspace which would have worked, and the fix is a rename. Deciding it the other way costs
+/// one spec its output, silently, on the platforms where the two names really are one directory.
 fn contains_or_equals(outer: &Path, inner: &Path) -> bool {
-    inner.starts_with(outer)
+    let mut outer = outer.components();
+    let mut inner = inner.components();
+    loop {
+        match (outer.next(), inner.next()) {
+            (None, _) => return true,
+            (Some(_), None) => return false,
+            (Some(left), Some(right)) => {
+                if !left.as_os_str().eq_ignore_ascii_case(right.as_os_str()) {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// Whether `name` is usable as a spec name, on the command line and in a JSON pointer.
@@ -6144,6 +6169,36 @@ specs:
             load_config(Some(&path), directory.path()),
             CODE_OUTPUT_OVERLAP,
         );
+    }
+
+    #[test]
+    fn output_roots_that_differ_only_in_case_are_one_output_root() {
+        let directory = TestDirectory::new();
+        directory.write("a.yaml", "");
+        directory.write("b.yaml", "");
+        let path = directory.write(
+            "config.yaml",
+            "schemaVersion: 1\nspecs:\n  users:\n    input: {path: ./a.yaml}\n    output: ./generated/Users\n  billing:\n    input: {path: ./b.yaml}\n    output: ./generated/users\n",
+        );
+
+        assert_workspace_code(
+            load_config(Some(&path), directory.path()),
+            CODE_OUTPUT_OVERLAP,
+        );
+    }
+
+    #[test]
+    fn nesting_is_judged_by_whole_components() {
+        let directory = TestDirectory::new();
+        directory.write("a.yaml", "");
+        directory.write("b.yaml", "");
+        // `generated-users` starts with the same characters as `generated` and is not inside it.
+        let path = directory.write(
+            "config.yaml",
+            "schemaVersion: 1\nspecs:\n  users:\n    input: {path: ./a.yaml}\n    output: ./generated\n  billing:\n    input: {path: ./b.yaml}\n    output: ./generated-users\n",
+        );
+
+        load_config(Some(&path), directory.path()).expect("sibling roots resolve");
     }
 
     #[test]
