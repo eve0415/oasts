@@ -62,21 +62,27 @@ input:
   path: ./openapi.yaml
 ```
 
-<Aside type="caution" title="`url` is accepted by the schema but refused at load">
-  This build does not fetch documents.
-  `input.url` — and any `$ref` that resolves to an `http(s)` target — fails with `error[OASTS9201]: remote loading is not supported in this build`.
-  The key is in the schema so configs stay forward-compatible; today, bundle or vendor the document and point `input.path` at it.
+`input.url` names a document to retrieve over HTTP(S). Naming one is not enough on its own:
 
-  `OASTS9201` is in the [provisional band](/concepts/diagnostics) — a capability gated off rather than a refusal on the merits.
-</Aside>
+```yaml title="oasts.yaml"
+schemaVersion: 1
+input:
+  url: https://api.example.com/openapi.yaml
+output: ./generated
+```
 
-An `https://` `$id` inside the document is not itself a problem: `$id` names a schema resource, it is not a request to fetch one.
-Only something that actually has to be *read* over the network is refused.
+That config is refused with `error[OASTS2021]: retrieving 'https://api.example.com/openapi.yaml' is not authorized: 'api.example.com' is not listed in remote.allowHosts`, and nothing is requested.
+Retrieval needs the host authorized and the bytes pinned, both under [`remote`](#remote).
+
+An `https://` `$id` inside the document is a different thing entirely: `$id` names a schema resource, it is not a request to retrieve one.
+A `$ref` naming a resource the document already declares is answered from the document, and no request is made.
 
 It is not inert, though.
-`$id` re-bases every relative `$ref` beneath it, so a sibling `$ref: "./tag.yaml"` that resolves to a local file today resolves to `https://…/tag.yaml` once you add an `https://` `$id` above it — and then it does have to be read, and it is an `OASTS9201`.
+`$id` re-bases every relative `$ref` beneath it, so a sibling `$ref: "./tag.yaml"` that resolves to a local file today resolves to `https://…/tag.yaml` once you add an `https://` `$id` above it — and then it does have to be retrieved.
 Same for a `#/components/…` pointer written inside an `$id`'d schema: it resolves against that resource, not the document root.
 If adding an `$id` broke a `$ref` that worked before, this is why.
+
+Such a `$ref` is refused with `OASTS2021` unless `remote` authorizes and pins it, so adding retrieval to this compiler did not make any document that used to compile offline start making requests.
 
 ## `output`, `namespace`
 
@@ -313,6 +319,84 @@ local:
 Entries are resolved relative to the config file and **must be relative** — an absolute path is an `OASTS0221`.
 The default is empty, so a document only reaches what the workspace root already covers.
 
+## `remote`
+
+The trust boundary and retrieval policy for documents read over HTTP(S), the way `local` is the boundary for documents read from disk:
+
+```yaml title="oasts.yaml"
+remote:
+  allowHosts:
+    - api.example.com
+  allowInsecure: false
+  timeoutMs: 30000
+  maxRedirects: 3
+  integrity:
+    "https://api.example.com/openapi.yaml": "sha256:8b4a7f7b1d2c0e5a9f3b6d8c1e4a7f0b3d6c9e2a5f8b1d4c7e0a3f6b9d2c5e8a"
+```
+
+Every key defaults to the conservative reading, so a config with no `remote` block retrieves nothing at all.
+
+### Setting one up
+
+Retrieval takes two steps, and the second one is a copy-paste out of a diagnostic.
+
+<Steps>
+  <Step title="Authorize the host">
+    Add it to `allowHosts` and point `input.url` at the document. Nothing else is needed yet.
+  </Step>
+
+  <Step title="Run once, and record the pin it hands you">
+    The compile fails with `OASTS2022`, because the document is not pinned — and the message ends with the exact line to add:
+
+    ```
+    error[OASTS2022]: 'https://api.example.com/openapi.yaml' is not pinned, and an unpinned document cannot be compiled reproducibly; record what it served by adding to remote.integrity: "https://api.example.com/openapi.yaml": "sha256:8b4a7f…"
+    ```
+
+    Paste that under `integrity` and run again.
+  </Step>
+</Steps>
+
+Repeat step 2 whenever you intend to take a new version of the document: the pin is what makes "the same config" mean "the same bytes", so moving to new bytes is an edit you make on purpose.
+
+### The trust boundary
+
+`allowHosts` is the boundary. It defaults to empty, which authorizes no host, and each entry is a bare host name — a scheme, a port, a path, or credentials in an entry is an `OASTS0271`. A URI naming an unlisted host is an `OASTS2021`, and no request is made.
+
+<Aside type="caution" title="What the boundary does and does not cover">
+  Matching is on the **host alone**. `api.example.com` therefore authorizes *any port* on that host, and every path and query under it — it is a statement about who you are willing to talk to, not about what you will accept from them. What you accept is `integrity`'s job, and it is per-URI.
+
+  A redirect is authorized like any other request, hop by hop, so a listed host cannot hand a retrieval off to an unlisted one. Proxy environment variables are ignored for the same reason: honouring one would send every request somewhere `allowHosts` never named.
+</Aside>
+
+### Pinning
+
+`integrity` maps each retrievable URI to the digest of the bytes it must serve, written as `sha256:` and 64 lowercase hex digits — the same rendering as the `Source digest` in every emitted file. There is no unpinned mode, and the two ways it can fail are different situations:
+
+- **`OASTS2022` — not pinned.** The document was retrieved, hashed, and refused, and the message hands you the entry to record. This is the setup step above, and it is the only place the digest comes from.
+- **`OASTS2023` — pinned, but something else was served.** The bytes at that URI are not the bytes you recorded. Either the document moved on without you, or the response was not the one you pinned. The message prints both digests. This one is worth looking into rather than pasting over.
+
+That is what keeps [determinism](/concepts/determinism) byte-keyed when the bytes arrive over a network. It also means each URI is pinned on its own: a `$ref` from a retrieved document to another URI needs its own `integrity` entry, and the first run reports each one as you reach it.
+
+A pin is a claim about a URI, so nothing else in the compile may claim it. A document declaring `$id: "https://…"` for a URI you pin is an `OASTS2027` — otherwise the `$id` would answer every reference to that URI out of the claiming document and the pin would never be consulted. Two documents declaring the same `$id` are an `OASTS2028` for the same reason, pinned or not. And a pin nothing was retrieved from is an `OASTS2029` warning: it is dead configuration, and it is also what a substitution would look like.
+
+Pinning is per URI, not per host, and it is the half of the boundary that says *what*. A retrieved document is also held to where it came from: a `$ref` from it to a `file:` URI is an `OASTS2026`. A document that arrived over the network does not get to choose which local files are read into your generated code, whatever `local.allowPaths` would otherwise permit.
+
+`allowInsecure` defaults to `false`, so only `https` is retrieved and a plain `http` URI is an `OASTS2021`. TLS certificates are always verified against the Mozilla root program; there is no setting that turns that off. A URI carrying credentials is refused outright: a retrieved document's URI is its identity, and identity is written above every declaration generated from it. Proxy environment variables are ignored, because honouring one would send every request somewhere `allowHosts` never named.
+
+`maxRedirects` defaults to `3` and bounds how many `3xx` hops one retrieval may take. Redirects are not delegated: the compiler resolves each `Location`, checks the host *and* the scheme it names, and only then makes the next request — so a redirect cannot deliver a document from a host you did not list. Exceeding the budget is an `OASTS2024`.
+
+A retrieved document keeps the URI that was **requested** as its identity, not the one a redirect landed on. Relative `$ref`s inside it therefore resolve against the URI you wrote, which is what makes the compile a function of the URI plus its pinned digest rather than of wherever a redirect points today.
+
+`timeoutMs` defaults to `30000` and bounds each request; a retrieval that follows redirects makes one request per hop, and each hop gets the whole budget. Anything the network does wrong — refused connection, DNS failure, timeout, a non-`200` status, a body over `limits.maxDocumentBytes` — is an `OASTS2024` naming the URI and what went wrong.
+
+There is **no cache**. Every build retrieves, which is the honest behaviour when the bytes are pinned: the pin is what makes the result reproducible, not a copy on disk that could quietly age. A build with no network fails, loudly, naming what it could not retrieve — it never falls back to something stale.
+
+<Aside type="caution" title="Retrieval is a host capability">
+  The [playground](/playground) compiles in your browser, in a WebAssembly module that declares no imports and so cannot make a request at all.
+  It refuses a `remote` block while reading the config, with `OASTS0271`, and an `input.url` it therefore never authorized with `OASTS2021`.
+  The CLI and the Node package both retrieve normally.
+</Aside>
+
 ## `compat`
 
 Opt-in departures from strict OpenAPI conformance, for documents describing a server that is itself non-conformant:
@@ -332,13 +416,13 @@ compat:
 
 ## Reserved keys
 
-`specs`, `shared`, `remote`, `watch` and `ci` are accepted by the schema but not implemented in this build.
+`specs`, `shared`, `watch` and `ci` are accepted by the schema but not implemented in this build.
 They are reserved so a config written today does not have to change shape when they land, and they refuse in the [provisional band](/concepts/diagnostics) rather than as ordinary config errors:
 
 | Key | Code |
 | --- | --- |
 | `specs`, `shared` | `OASTS9002` — workspace configs |
-| `remote`, `watch`, `ci` | `OASTS9003` — the surrounding capability |
+| `watch`, `ci` | `OASTS9003` — the surrounding capability |
 
 The CLI has the same arrangement: `oasts watch` parses and then refuses with `OASTS9004`, and `--spec` refuses with the same `OASTS9002` the `specs` key does.
 Both exit `2`.

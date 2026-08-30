@@ -1,5 +1,5 @@
 [package]
-name = "oasts"
+name = "oasts-fetch"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,12 +11,5 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-clap = { version = "=4.6.4", features = ["derive"] }
-mimalloc = "=0.1.52"
 oasts-core = { path = "../oasts-core" }
-oasts-fetch = { path = "../oasts-fetch" }
-
-[dev-dependencies]
-serde_json = { version = "=1.0.151", features = ["arbitrary_precision", "preserve_order"] }
-sha2 = "=0.11.0"
-tempfile = "=3.27.0"
+ureq = { version = "=3.4.0", default-features = false, features = ["rustls"] }

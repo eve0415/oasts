@@ -1,5 +1,6 @@
 //! Schema-version 1 configuration loading for the local, single-spec wedge.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -8,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Deserializer};
 use serde_json::{Number, Value};
+use url::Url;
 
 use crate::diag::{Diagnostic, DiagnosticSink, Severity};
 use crate::filter::Filters;
@@ -44,8 +46,9 @@ const CODE_BASE_URL: &str = "OASTS0181";
 const CODE_NAMING: &str = "OASTS0201";
 const CODE_EMIT: &str = "OASTS0211";
 const CODE_TRUST_LIMITS: &str = "OASTS0221";
-/// The `typescript` block. Sits above the highest allocated config code, which stops at 0242.
 const CODE_TYPESCRIPT: &str = "OASTS0251";
+/// The `remote` block. Sits above the highest allocated config code, which stops at 0263.
+const CODE_REMOTE: &str = "OASTS0271";
 const CODE_CONFIG_READ: &str = "OASTS1001";
 pub(crate) const CODE_WORKSPACE_UNSUPPORTED: &str = "OASTS9002";
 pub(crate) const CODE_BLOCK_UNSUPPORTED: &str = "OASTS9003";
@@ -143,7 +146,7 @@ pub struct RawConfig {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub local: Option<LocalTrustConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    pub remote: Option<Value>,
+    pub remote: Option<RemoteConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub limits: Option<LimitsConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
@@ -943,6 +946,82 @@ pub struct LocalTrustConfig {
     pub allow_paths: Vec<String>,
 }
 
+/// Remote document trust boundary and retrieval policy.
+///
+/// Every key is default-deny or conservative, so a configuration that declares the block without
+/// filling it in fetches nothing. `allowHosts` is the trust boundary the way `local.allowPaths` is
+/// for the filesystem: an empty list authorizes no host, and widening it is always explicit.
+///
+/// `integrity` is what makes a compile that reads the network reproducible. It maps each
+/// retrievable URI to the digest of the bytes that URI is expected to serve, and a fetch whose
+/// bytes hash to anything else is refused rather than compiled. There is no unpinned mode: an
+/// authorized URI with no entry here is refused too, and the refusal prints the digest actually
+/// served so it can be recorded.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "json-schema",
+    schemars(
+        rename_all = "camelCase",
+        description = "Remote document trust boundary and retrieval policy."
+    )
+)]
+pub struct RemoteConfig {
+    /// Host names authorized for retrieval. Empty authorizes none.
+    pub allow_hosts: Vec<String>,
+    /// Whether a plain `http` URI may be retrieved. `https` is the only scheme without it.
+    pub allow_insecure: bool,
+    /// Deadline for each request a retrieval makes, in milliseconds.
+    #[cfg_attr(feature = "json-schema", schemars(range(min = 1, max = 600_000)))]
+    pub timeout_ms: u64,
+    /// How many `3xx` hops one retrieval may take. Every hop is authorized separately.
+    #[cfg_attr(feature = "json-schema", schemars(range(min = 0, max = 10)))]
+    pub max_redirects: u32,
+    /// Retrievable URI to the `sha256:<64 lowercase hex>` digest of the bytes it must serve.
+    pub integrity: BTreeMap<String, String>,
+}
+
+impl RemoteConfig {
+    /// Whether `host` is authorized. Resolution lowercases and sorts the list, so this is a binary
+    /// search over a canonical form rather than a scan.
+    #[must_use]
+    pub fn authorizes_host(&self, host: &str) -> bool {
+        self.allow_hosts
+            .binary_search_by(|entry| entry.as_str().cmp(host))
+            .is_ok()
+    }
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            allow_hosts: Vec::new(),
+            allow_insecure: false,
+            timeout_ms: 30_000,
+            max_redirects: 3,
+            integrity: BTreeMap::new(),
+        }
+    }
+}
+
+/// The `sha256:` prefix every `remote.integrity` value carries, matching how this compiler renders
+/// every other digest it publishes.
+pub const INTEGRITY_PREFIX: &str = "sha256:";
+/// Length of the lowercase hex body after [`INTEGRITY_PREFIX`].
+const INTEGRITY_HEX_LEN: usize = 64;
+
+/// Whether `value` is a `sha256:` digest this compiler would itself have written.
+#[must_use]
+pub fn is_integrity_digest(value: &str) -> bool {
+    value.strip_prefix(INTEGRITY_PREFIX).is_some_and(|hex| {
+        hex.len() == INTEGRITY_HEX_LEN
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 /// Document graph bounds.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -1092,6 +1171,8 @@ pub struct ResolvedConfig {
     pub documentation: DocumentationConfig,
     pub emit: EmitConfig,
     pub local_allow_paths: Vec<PathBuf>,
+    /// Remote retrieval policy; defaults authorize no host, so an absent block never fetches.
+    pub remote: RemoteConfig,
     pub limits: LimitsConfig,
     pub compat: CompatConfig,
     pub tsconfig: TsconfigSource,
@@ -1492,8 +1573,9 @@ pub fn resolve_config(
     validate_limits(&limits, source_path, &mut sink);
     let compat = raw.compat.unwrap_or_default();
 
+    let remote = resolve_remote(raw.remote, source_path, &mut sink);
+
     for (present, pointer, name) in [
-        (raw.remote.is_some(), "/remote", "remote"),
         (raw.watch.is_some(), "/watch", "watch"),
         (raw.ci.is_some(), "/ci", "ci"),
     ] {
@@ -1549,10 +1631,155 @@ pub fn resolve_config(
         documentation,
         emit,
         local_allow_paths,
+        remote,
         limits,
         compat,
         tsconfig,
     })
+}
+
+/// Resolves and validates the `remote` block, normalizing what the loader matches against.
+///
+/// Hosts are lowercased and sorted so authorization is a binary search over a canonical list, and
+/// integrity keys are re-serialized through the URI parser so a config and a `$ref` that name the
+/// same document agree on one spelling.
+fn resolve_remote(
+    remote: Option<RemoteConfig>,
+    source: &Path,
+    sink: &mut DiagnosticSink,
+) -> RemoteConfig {
+    let Some(mut remote) = remote else {
+        return RemoteConfig::default();
+    };
+    let mut hosts = Vec::with_capacity(remote.allow_hosts.len());
+    for entry in &remote.allow_hosts {
+        if let Some(host) = normalized_host(entry) {
+            hosts.push(host);
+        } else {
+            sink.push(config_error(
+                CODE_REMOTE,
+                format!(
+                    "remote.allowHosts entry '{entry}' must be a bare host name; a scheme, port, or path is not part of the trust boundary"
+                ),
+                Some(source),
+                Some("/remote/allowHosts"),
+            ));
+        }
+    }
+    hosts.sort_unstable();
+    hosts.dedup();
+    remote.allow_hosts = hosts;
+
+    if !(1..=600_000).contains(&remote.timeout_ms) {
+        sink.push(config_error(
+            CODE_REMOTE,
+            format!(
+                "remote.timeoutMs value {} is outside 1..=600000",
+                remote.timeout_ms
+            ),
+            Some(source),
+            Some("/remote/timeoutMs"),
+        ));
+    }
+    if remote.max_redirects > 10 {
+        sink.push(config_error(
+            CODE_REMOTE,
+            format!(
+                "remote.maxRedirects value {} is outside 0..=10",
+                remote.max_redirects
+            ),
+            Some(source),
+            Some("/remote/maxRedirects"),
+        ));
+    }
+
+    let mut integrity = BTreeMap::new();
+    // Canonical URI back to the spelling that produced it, so two keys naming one document are
+    // reported as the pair they are rather than one of them quietly replacing the other.
+    let mut spelled: BTreeMap<String, &String> = BTreeMap::new();
+    for (uri, digest) in &remote.integrity {
+        let shown = without_credentials(uri);
+        let Some(key) = retrievable_uri(uri) else {
+            sink.push(config_error(
+                CODE_REMOTE,
+                format!(
+                    "remote.integrity key '{shown}' must be an absolute http(s) URI with no fragment and no credentials"
+                ),
+                Some(source),
+                Some("/remote/integrity"),
+            ));
+            continue;
+        };
+        if !is_integrity_digest(digest) {
+            sink.push(config_error(
+                CODE_REMOTE,
+                format!(
+                    "remote.integrity value for '{shown}' must be '{INTEGRITY_PREFIX}' followed by {INTEGRITY_HEX_LEN} lowercase hex digits"
+                ),
+                Some(source),
+                Some("/remote/integrity"),
+            ));
+            continue;
+        }
+        if let Some(previous) = spelled.get(&key) {
+            sink.push(config_error(
+                CODE_REMOTE,
+                format!(
+                    "remote.integrity keys '{}' and '{shown}' both name '{key}'; pin each document once, or one pin silently replaces the other",
+                    without_credentials(previous)
+                ),
+                Some(source),
+                Some("/remote/integrity"),
+            ));
+            continue;
+        }
+        spelled.insert(key.clone(), uri);
+        integrity.insert(key, digest.clone());
+    }
+    remote.integrity = integrity;
+    remote
+}
+
+/// The lowercase form of a bare host name, or `None` when the entry carries anything else.
+///
+/// Deliberately narrow: only the characters a DNS name or an IPv4 literal is written with, so a
+/// scheme, a port, a path, userinfo, whitespace, or a bracketed IPv6 literal is rejected with a
+/// message rather than silently authorizing more than it appears to.
+fn normalized_host(entry: &str) -> Option<String> {
+    let permitted = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.');
+    (!entry.is_empty() && entry.bytes().all(permitted)).then(|| entry.to_ascii_lowercase())
+}
+
+/// `value` with any userinfo removed, so a diagnostic never echoes a credential.
+///
+/// Textual rather than parser-based: the strings this guards are a rejected config key and a
+/// redirect target chosen by whatever answered the request, neither of which is guaranteed to
+/// parse, and a diagnostic that echoes a credential lands in a CI log either way.
+#[must_use]
+pub(crate) fn without_credentials(value: &str) -> Cow<'_, str> {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return Cow::Borrowed(value);
+    };
+    let authority = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority].rfind('@') else {
+        return Cow::Borrowed(value);
+    };
+    Cow::Owned(format!("{scheme}://{}", &rest[at + 1..]))
+}
+
+/// The canonical spelling of a retrievable URI, or `None` when it is not one.
+///
+/// Credentials are refused for the same reason `client.baseUrl` refuses them, and one more: a
+/// retrieved document's URI is its identity, and identity is written above every declaration
+/// generated from it — into code the project tells you to commit.
+fn retrievable_uri(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.has_host()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then(|| url.into())
 }
 
 fn resolve_input(
@@ -1571,6 +1798,17 @@ fn resolve_input(
         return None;
     };
     match (input.path.as_deref(), input.url.as_deref()) {
+        // Which key a document is named under decides whether the compile touches the network, so
+        // the two keys are held apart: a reader of a diff can tell from the key alone.
+        (Some(path), None) if retrievable_uri(path).is_some() => {
+            sink.push(config_error(
+                CODE_INPUT_PATH,
+                "input.path names a document to retrieve over the network; write it under input.url",
+                Some(source),
+                Some("/input/path"),
+            ));
+            None
+        }
         (Some(path), None) if is_uri(path) => Some(PathBuf::from(path)),
         (Some(path), None) => match resolve_below(workspace_root, Path::new(path), true) {
             Ok(resolved) => Some(resolved),
@@ -1584,16 +1822,22 @@ fn resolve_input(
                 None
             }
         },
-        (None, Some(url)) if is_uri(url) => Some(PathBuf::from(url)),
-        (None, Some(_)) => {
-            sink.push(config_error(
-                CODE_INPUT_PATH,
-                "input.url must be an absolute URI",
-                Some(source),
-                Some("/input/url"),
-            ));
-            None
-        }
+        // Recorded canonicalized, so the loader and `remote.integrity` agree on one spelling.
+        (None, Some(url)) => match retrievable_uri(url) {
+            Some(canonical) => Some(PathBuf::from(canonical)),
+            None => {
+                sink.push(config_error(
+                    CODE_INPUT_PATH,
+                    format!(
+                        "input.url must be an absolute http(s) URI with no fragment and no credentials, not '{}'",
+                        without_credentials(url)
+                    ),
+                    Some(source),
+                    Some("/input/url"),
+                ));
+                None
+            }
+        },
         _ => {
             sink.push(config_error(
                 CODE_INPUT_SHAPE,
@@ -1671,6 +1915,23 @@ pub fn require_no_local_allow_paths(raw: &RawConfig, config_path: &Path) -> Resu
             Some("/local/allowPaths"),
         )),
         _ => Ok(()),
+    }
+}
+
+/// Refuses `remote`, which authorizes retrieval a host with no network cannot perform.
+///
+/// Left to run, the block resolves, the loader reaches a document nothing can retrieve, and the
+/// caller reads a load-time refusal about a capability their configuration was never going to get.
+/// Saying so while reading the configuration puts the refusal where the mistake is.
+pub fn require_no_remote(raw: &RawConfig, config_path: &Path) -> Result<(), Diagnostic> {
+    match raw.remote.as_ref() {
+        Some(_) => Err(config_error(
+            CODE_REMOTE,
+            "remote authorizes document retrieval, and this host cannot reach the network",
+            Some(config_path),
+            Some("/remote"),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -4431,7 +4692,7 @@ mod tests {
 
     #[test]
     fn schema_known_unavailable_blocks_report_named_errors() {
-        for name in ["remote", "watch", "ci"] {
+        for name in ["watch", "ci"] {
             let mut value = valid_json_value();
             value[name] = json!({});
             let diagnostics = assert_code(load_json(&value), CODE_BLOCK_UNSUPPORTED);
@@ -4444,8 +4705,281 @@ mod tests {
     #[test]
     fn schema_known_unavailable_null_block_is_still_present() {
         let mut value = valid_json_value();
-        value["remote"] = Value::Null;
+        value["watch"] = Value::Null;
         assert_code(load_json(&value), CODE_BLOCK_UNSUPPORTED);
+    }
+
+    #[test]
+    fn remote_defaults_authorize_nothing_and_pin_nothing() {
+        let resolved = load_json(&valid_json_value()).expect("a config with no remote block");
+        assert_eq!(resolved.remote, RemoteConfig::default());
+        assert!(resolved.remote.allow_hosts.is_empty());
+        assert!(resolved.remote.integrity.is_empty());
+        assert!(!resolved.remote.allow_insecure);
+        assert!(!resolved.remote.authorizes_host("specs.example.test"));
+
+        let mut declared = valid_json_value();
+        declared["remote"] = json!({});
+        let resolved =
+            load_json(&declared).expect("an empty remote block resolves to the defaults");
+        assert_eq!(resolved.remote, RemoteConfig::default());
+    }
+
+    #[test]
+    fn remote_hosts_are_lowercased_sorted_and_deduplicated() {
+        let mut value = valid_json_value();
+        value["remote"] = json!({
+            "allowHosts": ["Mirror.Example.Test", "specs.example.test", "mirror.example.test"]
+        });
+
+        let resolved = load_json(&value).expect("host entries resolve");
+
+        assert_eq!(
+            resolved.remote.allow_hosts,
+            ["mirror.example.test", "specs.example.test"]
+        );
+        assert!(resolved.remote.authorizes_host("mirror.example.test"));
+        assert!(!resolved.remote.authorizes_host("Mirror.Example.Test"));
+    }
+
+    #[test]
+    fn remote_rejects_a_host_entry_that_is_not_a_bare_host() {
+        for entry in [
+            "",
+            "https://specs.example.test",
+            "specs.example.test:443",
+            "specs.example.test/v1",
+            "user@specs.example.test",
+            "[::1]",
+            "specs example test",
+        ] {
+            let mut value = valid_json_value();
+            value["remote"] = json!({ "allowHosts": [entry] });
+            assert_code(load_json(&value), CODE_REMOTE);
+        }
+    }
+
+    #[test]
+    fn remote_rejects_an_integrity_key_that_names_no_retrievable_document() {
+        for key in [
+            "openapi.yaml",
+            "file:///tmp/openapi.yaml",
+            "https://specs.example.test/openapi.yaml#/components",
+            "https://",
+            "https://token@specs.example.test/openapi.yaml",
+            "https://user:token@specs.example.test/openapi.yaml",
+        ] {
+            let mut value = valid_json_value();
+            value["remote"] = json!({ "integrity": { key: format!("sha256:{}", "0".repeat(64)) } });
+            assert_code(load_json(&value), CODE_REMOTE);
+        }
+    }
+
+    #[test]
+    fn remote_rejects_a_digest_this_compiler_would_not_have_written() {
+        for digest in [
+            "",
+            "sha256:",
+            &"0".repeat(64),
+            &format!("sha256:{}", "0".repeat(63)),
+            &format!("sha256:{}", "0".repeat(65)),
+            &format!("sha256:{}", "A".repeat(64)),
+            &format!("sha256:{}", "g".repeat(64)),
+            &format!("sha512:{}", "0".repeat(64)),
+        ] {
+            let mut value = valid_json_value();
+            value["remote"] = json!({
+                "integrity": { "https://specs.example.test/openapi.yaml": digest }
+            });
+            assert_code(load_json(&value), CODE_REMOTE);
+        }
+    }
+
+    #[test]
+    fn remote_integrity_keys_are_recorded_in_their_canonical_spelling() {
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let mut value = valid_json_value();
+        value["remote"] = json!({
+            "integrity": { "https://Specs.Example.Test/openapi.yaml": digest.clone() }
+        });
+
+        let resolved = load_json(&value).expect("integrity entries resolve");
+
+        assert_eq!(
+            resolved
+                .remote
+                .integrity
+                .get("https://specs.example.test/openapi.yaml"),
+            Some(&digest)
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_one_uri_are_a_conflict_rather_than_a_discarded_pin() {
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let mut value = valid_json_value();
+        value["remote"] = json!({
+            "integrity": {
+                "https://specs.example.test/a/../openapi.yaml": digest.clone(),
+                "https://specs.example.test/openapi.yaml": digest,
+            }
+        });
+
+        let diagnostics = assert_code(load_json(&value), CODE_REMOTE);
+
+        // Both spellings are named: a reviewer reading the surviving pin has to be told the other
+        // one was there, or a diff that adds a second spelling silently replaces the first.
+        let reported = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_REMOTE)
+            .expect("a conflict diagnostic");
+        assert!(
+            reported.message.contains("a/../openapi.yaml"),
+            "{}",
+            reported.message
+        );
+        assert!(
+            reported.message.contains("both name"),
+            "{}",
+            reported.message
+        );
+    }
+
+    #[test]
+    fn input_keys_say_whether_a_compile_touches_the_network() {
+        for (input, pointer) in [
+            (
+                json!({ "path": "https://specs.example.test/openapi.yaml" }),
+                "/input/path",
+            ),
+            (json!({ "url": "file:///tmp/openapi.yaml" }), "/input/url"),
+            (json!({ "url": "./openapi.yaml" }), "/input/url"),
+            (
+                json!({ "url": "https://specs.example.test/openapi.yaml#/components" }),
+                "/input/url",
+            ),
+        ] {
+            let mut value = valid_json_value();
+            value["input"] = input;
+            let diagnostics = assert_code(load_json(&value), CODE_INPUT_PATH);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.json_pointer.as_deref() == Some(pointer)),
+                "{diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retrievable_entry_is_recorded_in_its_canonical_spelling() {
+        let mut value = valid_json_value();
+        value["input"] = json!({ "url": "https://Specs.Example.Test/a/../openapi.yaml" });
+
+        let resolved = load_json(&value).expect("a retrievable entry resolves");
+
+        // One spelling, so the entry and its `remote.integrity` key cannot disagree.
+        assert_eq!(
+            resolved.input,
+            PathBuf::from("https://specs.example.test/openapi.yaml")
+        );
+    }
+
+    #[test]
+    fn a_rejected_uri_is_reported_without_its_credentials() {
+        let mut value = valid_json_value();
+        value["input"] = json!({ "url": "ftp://reader:hunter2@specs.example.test/openapi.yaml" });
+
+        let diagnostics = assert_code(load_json(&value), CODE_INPUT_PATH);
+
+        let reported = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CODE_INPUT_PATH)
+            .expect("a rejected input URI");
+        assert!(
+            !reported.message.contains("hunter2"),
+            "{}",
+            reported.message
+        );
+        assert!(!reported.message.contains("reader"), "{}", reported.message);
+        assert!(
+            reported.message.contains("specs.example.test"),
+            "{}",
+            reported.message
+        );
+    }
+
+    #[test]
+    fn credentials_are_stripped_from_whatever_shape_a_uri_arrives_in() {
+        assert_eq!(without_credentials("openapi.yaml"), "openapi.yaml");
+        assert_eq!(
+            without_credentials("https://specs.example.test/x"),
+            "https://specs.example.test/x"
+        );
+        assert_eq!(
+            without_credentials("https://reader:hunter2@specs.example.test/x"),
+            "https://specs.example.test/x"
+        );
+        assert_eq!(
+            without_credentials("https://reader@specs.example.test"),
+            "https://specs.example.test"
+        );
+        // A path segment carrying an `@` is not userinfo and must survive intact.
+        assert_eq!(
+            without_credentials("https://specs.example.test/@scope/openapi.yaml"),
+            "https://specs.example.test/@scope/openapi.yaml"
+        );
+    }
+
+    #[test]
+    fn remote_timeout_and_redirect_budget_are_bounded() {
+        for (block, accepted) in [
+            (json!({ "timeoutMs": 0 }), false),
+            (json!({ "timeoutMs": 600_001 }), false),
+            (json!({ "timeoutMs": 1 }), true),
+            (json!({ "timeoutMs": 600_000 }), true),
+            (json!({ "maxRedirects": 11 }), false),
+            (json!({ "maxRedirects": 0 }), true),
+            (json!({ "maxRedirects": 10 }), true),
+        ] {
+            let mut value = valid_json_value();
+            value["remote"] = block;
+            if accepted {
+                load_json(&value).expect("a bounded remote setting resolves");
+            } else {
+                assert_code(load_json(&value), CODE_REMOTE);
+            }
+        }
+    }
+
+    #[test]
+    fn a_host_that_cannot_reach_the_network_refuses_the_remote_block_while_reading_it() {
+        let mut value = valid_json_value();
+        assert!(
+            require_no_remote(
+                &parse_config_json(
+                    Path::new("/workspace/oasts.json"),
+                    value.to_string().as_bytes()
+                )
+                .expect("config parses"),
+                Path::new("/workspace/oasts.json"),
+            )
+            .is_ok()
+        );
+
+        value["remote"] = json!({ "allowHosts": ["specs.example.test"] });
+        let diagnostic = require_no_remote(
+            &parse_config_json(
+                Path::new("/workspace/oasts.json"),
+                value.to_string().as_bytes(),
+            )
+            .expect("config parses"),
+            Path::new("/workspace/oasts.json"),
+        )
+        .expect_err("a host with no network refuses the block");
+
+        assert_eq!(diagnostic.code, CODE_REMOTE);
+        assert_eq!(diagnostic.json_pointer.as_deref(), Some("/remote"));
     }
 
     #[test]

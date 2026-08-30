@@ -486,8 +486,7 @@ impl<'graph, 'sink> Parser<'graph, 'sink> {
             let document_stem = self
                 .graph
                 .document(doc_id)
-                .and_then(|document| document.canonical_path.file_stem())
-                .and_then(|stem| stem.to_str())
+                .and_then(|document| document.location.file_stem())
                 .unwrap_or_default();
             let name = external_schema_name(&key.1, document_stem);
             let source = self.source(doc_id, &key.1);
@@ -4601,6 +4600,7 @@ mod tests {
     use crate::loader::load_graph;
     use crate::pipeline::compile as compile_pipeline;
     use crate::semantic::{TargetCase, normalize_identifier};
+    use crate::source::FetcherHandle;
 
     #[test]
     fn schema_meta_fast_reject_distinguishes_structural_and_metadata_keys() {
@@ -5115,7 +5115,7 @@ mod tests {
         let resolved =
             load_config(Some(Path::new("oasts.json")), temp.path()).expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let files = compile_pipeline(&resolved, true, &mut sink);
+        let files = compile_pipeline(&resolved, FetcherHandle::None, true, &mut sink);
         (temp, files, sink)
     }
 
@@ -9177,7 +9177,8 @@ mod tests {
         )
         .expect("resolved config");
         let mut sink = DiagnosticSink::new();
-        let files = compile_pipeline(&resolved, true, &mut sink).expect("generated files");
+        let files = compile_pipeline(&resolved, FetcherHandle::None, true, &mut sink)
+            .expect("generated files");
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         let client = files
             .iter()

@@ -179,6 +179,7 @@ fn dispatch(
             explicit: config_path,
             cwd,
         },
+        oasts_fetch::handle(),
     );
     report(outcome, stdout, stderr)
 }
@@ -874,10 +875,23 @@ mod tests {
         let unsupported_json = tempfile::tempdir().expect("tempdir");
         fs::write(
             unsupported_json.path().join("oasts.json"),
-            r#"{"schemaVersion":1,"input":{"url":"https://example.test/openapi.json"},"output":"./generated","remote":{}}"#,
+            r#"{"schemaVersion":1,"input":{"path":"./openapi.yaml"},"output":"./generated","watch":{}}"#,
         )
         .expect("unsupported JSON config");
         assert_eq!(invoke(&["oasts", "check"], unsupported_json.path()).0, 2);
+
+        // A retrievable input the configuration never authorized is a fact about the input, not
+        // about the configuration's shape, so it exits 1 like any other document failure — and it
+        // does so without the seated retriever ever being asked for anything.
+        let unauthorized = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            unauthorized.path().join("oasts.json"),
+            r#"{"schemaVersion":1,"input":{"url":"https://example.invalid/openapi.json"},"output":"./generated"}"#,
+        )
+        .expect("unauthorized JSON config");
+        let (code, _, stderr) = invoke(&["oasts", "check"], unauthorized.path());
+        assert_eq!(code, 1);
+        assert!(stderr.contains("OASTS2021"), "{stderr}");
 
         let missing_input = copy_fixture("petstore-3.0");
         fs::remove_file(missing_input.path().join("openapi.yaml")).expect("remove input");

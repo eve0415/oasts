@@ -41,12 +41,12 @@ The **thousands** digit is the stage that refused, and every code in a stage sha
 | --- | --- | --- | --- |
 | `0xxx` | **Config validation.** The file parsed, but something in it is not a usable instruction. | `2` | `OASTS0101` no artifact is enabled · `OASTS0111` the client artifact needs types on · `OASTS0262` a filter pattern matches nothing |
 | `1xxx` | **I/O.** A file oasts had to read or write did not cooperate. | `2` | `OASTS1001` the config could not be read · `OASTS1002` your tsconfig is unreadable or is not valid JSONC · `OASTS1013` writing an output file failed |
-| `2xxx` | **Document loading and structure.** The document, its `$ref` graph, or a schema keyword. | `1` | `OASTS2003` the document is not valid YAML or JSON · `OASTS2013` the `limits.maxDocuments` bound was exceeded · `OASTS2201` a construct this OpenAPI version does not define |
+| `2xxx` | **Document loading and structure.** The document, its `$ref` graph, or a schema keyword. | `1` | `OASTS2003` the document is not valid YAML or JSON · `OASTS2013` the `limits.maxDocuments` bound was exceeded · `OASTS2021` a URI `remote.allowHosts` does not authorize · `OASTS2201` a construct this OpenAPI version does not define |
 | `3xxx` | **Semantics.** Names, value domains, links. | `1` | `OASTS3001` two operations want the same identifier · `OASTS3002` two schemas want the same type name · `OASTS3201` a Link Object's `operationId` names no operation |
 | `4xxx` | **Type emission.** Turning the model into TypeScript. | `1` | `OASTS4105` a compiler-invented name has nowhere left to move · `OASTS4201` an `allOf` proven empty, lowered to `never` |
 | `5xxx` | **Client model.** Projecting operations into the request and response pipeline. | `1` | `OASTS5201` an XML response media · `OASTS5403` an OAuth2 scheme declaring no flows |
 | `6xxx` | **Artifacts.** One sub-band per artifact. | `1` | `OASTS6002` validators cannot check a keyword · `OASTS6201` a path literal MSW's matcher cannot match |
-| `9xxx` | **Provisional.** A capability this build gates off rather than refuses. | varies | `OASTS9003` a reserved config block · `OASTS9201` a remote `$ref` |
+| `9xxx` | **Provisional.** A capability this build gates off rather than refuses. | varies | `OASTS9002` a workspace config · `OASTS9003` a reserved config block |
 
 The **hundreds** digit sub-divides a stage: `62xx` is MSW's corner of the artifact stage, `22xx` is the schema-keyword corner of document loading.
 Sub-bands are kept sparse deliberately, so a new code joins its siblings instead of landing at the end of a run.
@@ -63,8 +63,9 @@ Codes sharing an `rr` are different ways of failing the same rule, so `0261`, `0
 ### The provisional band
 
 `9xxx` is not a stage.
-It holds capabilities this build gates off rather than refuses on the merits — `OASTS9201` for a remote `$ref`, `OASTS9003` for a config block that is accepted by the schema but not implemented.
+It holds capabilities this build gates off rather than refuses on the merits — `OASTS9003`, for instance, for a config block that is accepted by the schema but not implemented.
 A provisional code **retires when its capability lands**, so the band is expected to develop holes, and nothing is renumbered to close them.
+`OASTS9201`, which used to refuse every `http(s)` `$ref`, is the first such hole: retrieval landed, and it is now answered by `OASTS2021`–`OASTS2025` in the loading stage.
 
 The second digit tells you which stage the code would otherwise have sat in.
 Treat it as a hint about where the refusal came from, not as a way to work out the exit code — read that off the category the diagnostic carries.
@@ -80,9 +81,26 @@ All errors, all exit `2`.
 | --- | --- |
 | `OASTS0102` | An artifact's output directory is unusable: it overlaps another enabled artifact's — equal or nested — or its own value is not a relative path of `[A-Za-z0-9_-]` segments |
 | `OASTS0221` | A `local.allowPaths` entry that is not relative, or a `limits.*` value outside its permitted range |
+| `OASTS0271` | A `remote` entry that is not a bare host name, not a retrievable URI, or not a `sha256:` digest — or a `remote` block at all, on a host with no network |
 | `OASTS0261` | A filter pattern is a regex literal whose body does not compile |
 | `OASTS0262` | A filter pattern matches no operation — or matches only callback operations, which are never filtered independently of the operation that declares them |
 | `OASTS0263` | Filters are declared and nothing survives them: no operations and no webhooks |
+
+### Retrieval
+
+In the order they happen. The first two are refused before a request is made; the rest are what a retrieved document has to survive before any of it is trusted. See [`remote`](/reference/configuration#remote).
+
+| Code | Severity | Meaning |
+| --- | --- | --- |
+| `OASTS2021` | error | A URI whose host is not in `remote.allowHosts`, whose scheme is not retrievable, that carries credentials, or that is plain `http` without `remote.allowInsecure` — including a host reached only by following a redirect |
+| `OASTS2025` | error | An embedding host that seats no retriever. The CLI and the Node package always seat one, and the browser build refuses the `remote` block earlier |
+| `OASTS2024` | error | The request itself failed: refused connection, DNS, TLS, timeout, a non-`200` status, a body over `limits.maxDocumentBytes`, or more redirects than `remote.maxRedirects` allows |
+| `OASTS2022` | error | An authorized URI with no `remote.integrity` entry. The document is retrieved and hashed but never compiled, and the message hands back the entry to record — this is how a pin is obtained |
+| `OASTS2023` | error | Retrieved bytes hashing to something other than the pinned digest. Unlike `OASTS2022` this is not a setup step: the document moved on, or the response was not the one that was pinned |
+| `OASTS2027` | error | A document declaring an `$id` equal to a URI `remote.integrity` pins. Only the document actually retrieved from a URI may claim it — otherwise a claim would answer references to a pinned document without ever retrieving it |
+| `OASTS2028` | error | Two schema resources declaring the same `$id`. One URI names one resource, and which claim won would otherwise depend on load order |
+| `OASTS2026` | error | A `$ref` from a retrieved document to a `file:` URI. A document that arrived over the network does not get to choose which local files are read |
+| `OASTS2029` | warning | A `remote.integrity` pin that no document in the compile was retrieved from — dead configuration, and the shape a substitution would take |
 
 ### Document and schema
 

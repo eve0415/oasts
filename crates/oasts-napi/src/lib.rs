@@ -184,7 +184,7 @@ pub fn run(options: RunOptions) -> RunResult {
             cwd: Path::new(&options.cwd),
         },
     };
-    render(driver::run(command, source))
+    render(driver::run(command, source, oasts_fetch::handle()))
 }
 
 #[cfg(test)]

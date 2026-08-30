@@ -96,6 +96,72 @@ impl DocumentSource for SourceHandle {
     }
 }
 
+/// What one request is permitted to do.
+///
+/// Only the two limits a host is the sole enforcer of. Authorization and redirect budget are not
+/// here because they are not delegated: the core decides, hop by hop, which URI is requested next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FetchPolicy {
+    /// Deadline for this one request, in milliseconds.
+    pub timeout_ms: u64,
+    /// Hard cap on the body, to be abandoned rather than buffered past.
+    pub max_bytes: u64,
+}
+
+/// What one request answered with.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FetchStep {
+    /// The document's bytes.
+    Body(Vec<u8>),
+    /// A redirect, carrying the location as the response wrote it.
+    Redirect(String),
+}
+
+/// Performs the individual requests the compiler cannot perform itself.
+///
+/// The core never links an HTTP client. Retrieval is a host capability so that a front-end with no
+/// way to make a request — the WebAssembly build, whose module declares no imports at all — stays
+/// buildable and simply seats nothing here.
+///
+/// One call is one request. A redirect is *reported*, never followed: the core resolves the
+/// location, authorizes the host it names, and counts it against the redirect budget before asking
+/// for it. Delegating that loop would make `remote.allowHosts` a request rather than a boundary,
+/// because a redirect is how a retrieval reaches a host nobody listed.
+///
+/// The error is the message a diagnostic will print, so an implementation reports what failed in
+/// its own vocabulary and the core never has to enumerate transport failures.
+pub trait RemoteFetcher: Debug + Send + Sync {
+    /// Performs exactly one request for `url`, without following what it answers.
+    fn fetch_once(&self, url: &str, policy: &FetchPolicy) -> Result<FetchStep, String>;
+}
+
+/// A shared handle to the host's retrieval capability, if it has one.
+#[derive(Clone, Debug, Default)]
+pub enum FetcherHandle {
+    /// The host cannot retrieve documents at all.
+    #[default]
+    None,
+    /// The host's retriever, shared across the graph.
+    Shared(Arc<dyn RemoteFetcher>),
+}
+
+impl FetcherHandle {
+    /// The retriever, or `None` when this host has none.
+    #[must_use]
+    pub fn get(&self) -> Option<&dyn RemoteFetcher> {
+        match self {
+            Self::None => None,
+            Self::Shared(fetcher) => Some(fetcher.as_ref()),
+        }
+    }
+}
+
+impl From<Arc<dyn RemoteFetcher>> for FetcherHandle {
+    fn from(fetcher: Arc<dyn RemoteFetcher>) -> Self {
+        Self::Shared(fetcher)
+    }
+}
+
 /// Documents held in memory, rooted at a synthetic workspace.
 ///
 /// A host with no filesystem still needs identities to deduplicate documents by and to resolve
