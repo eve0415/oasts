@@ -5,7 +5,7 @@
 //! a workspace is validated exactly as the same keys written on their own would be.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -253,6 +253,10 @@ const TARGET_KEYS: [TargetKey; 16] = [
     ("typescript", |spec| spec.typescript.is_some()),
     ("compat", |spec| spec.compat.is_some()),
 ];
+
+/// The pointer at the `shared` block, and the prefix of a pointer inside it.
+const SHARED_POINTER: &str = "/shared";
+const SHARED_PREFIX: &str = "/shared/";
 
 /// The two keys that name one spec's document and output root, and so cannot be shared.
 const SPEC_ONLY_KEYS: [TargetKey; 2] = [
@@ -1739,7 +1743,8 @@ pub fn resolve_config(
     let mut diagnostics = sink.into_vec();
 
     let mut specs = Vec::new();
-    let mut failures = Vec::new();
+    let mut reports = Vec::new();
+    let mut failed = false;
     for WorkspaceTarget {
         name,
         target,
@@ -1757,9 +1762,11 @@ pub fn resolve_config(
         );
         match resolved {
             Ok(mut config) => {
+                let mut report = std::mem::take(&mut config.diagnostics);
                 if let Some(name) = name.as_deref() {
-                    attribute(&mut config.diagnostics, name, &origins, &config_path);
+                    attribute(&mut report, name, &origins, &config_path);
                 }
+                reports.push(report);
                 specs.push(ResolvedSpec {
                     name,
                     origins,
@@ -1770,14 +1777,22 @@ pub fn resolve_config(
                 if let Some(name) = name.as_deref() {
                     attribute(&mut errors, name, &origins, &config_path);
                 }
-                failures.append(&mut errors);
+                reports.push(errors);
+                failed = true;
             }
         }
     }
-    if !failures.is_empty() {
-        diagnostics.append(&mut failures);
+    diagnostics.append(&mut fold_shared(&mut reports));
+    if failed {
+        for report in reports {
+            diagnostics.extend(report);
+        }
         diagnostics.sort();
         return Err(diagnostics);
+    }
+    // Every target resolved, so the reports line up with the specs they came from.
+    for (spec, report) in specs.iter_mut().zip(reports) {
+        spec.config.diagnostics = report;
     }
     if let Err(mut overlaps) = check_output_overlap(&specs, source_path) {
         diagnostics.append(&mut overlaps);
@@ -1904,7 +1919,7 @@ fn workspace_targets(
             let origin = if own || !declared(&shared) {
                 prefix.clone()
             } else {
-                "/shared".to_owned()
+                SHARED_POINTER.to_owned()
             };
             origins.insert(key, origin);
         }
@@ -1970,6 +1985,51 @@ pub(crate) fn attribute(
             }
         }
     }
+}
+
+/// Folds a mistake in `shared` back into the one diagnostic it is.
+///
+/// Every spec resolves the shared block for itself, so a mistake there is reported once per spec,
+/// identical but for the name — one authoring mistake, N reports of it. Its pointer already says
+/// where it lives, so the folded copy needs no spec at all. A diagnostic only some specs produced
+/// is left as it is: a shared block can be wrong only in combination with what one spec adds to
+/// it, and that is that spec's report to make.
+fn fold_shared(reports: &mut [Vec<Diagnostic>]) -> Vec<Diagnostic> {
+    let target_count = reports.len();
+    let mut counts = BTreeMap::<Diagnostic, usize>::new();
+    for report in reports.iter() {
+        let mut seen = BTreeSet::new();
+        for diagnostic in report {
+            if let Some(key) = shared_key(diagnostic)
+                && seen.insert(key.clone())
+            {
+                *counts.entry(key).or_default() += 1;
+            }
+        }
+    }
+    let folded = counts
+        .into_iter()
+        .filter(|(_, seen)| *seen == target_count)
+        .map(|(key, _)| key)
+        .collect::<BTreeSet<_>>();
+    if folded.is_empty() {
+        return Vec::new();
+    }
+    for report in reports.iter_mut() {
+        report.retain(|diagnostic| shared_key(diagnostic).is_none_or(|key| !folded.contains(&key)));
+    }
+    folded.into_iter().collect()
+}
+
+/// The unattributed form of a diagnostic anchored in `shared`, or `None` for anything else.
+fn shared_key(diagnostic: &Diagnostic) -> Option<Diagnostic> {
+    let pointer = diagnostic.json_pointer.as_deref()?;
+    if pointer != SHARED_POINTER && !pointer.starts_with(SHARED_PREFIX) {
+        return None;
+    }
+    let mut key = diagnostic.clone();
+    key.spec = None;
+    Some(key)
 }
 
 /// Refuses two specs that would write into the same tree.
@@ -3406,7 +3466,6 @@ fn to_u32(value: usize) -> u32 {
 mod tests {
     use crate::filter::{CODE_FILTER_PATTERN, PatternKind};
 
-    use std::collections::BTreeSet;
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -6277,19 +6336,47 @@ specs:
     }
 
     #[test]
-    fn a_shared_blocks_diagnostic_points_at_shared() {
+    fn a_mistake_in_shared_is_reported_once() {
         let diagnostics = assert_workspace_code(
             load_workspace_yaml(&format!(
                 "{TWO_SPECS}shared:\n  namespace: 'not an identifier'\n"
             )),
             CODE_NAMESPACE,
         );
+
         assert_eq!(
             diagnostics
                 .iter()
-                .map(|diagnostic| diagnostic.json_pointer.as_deref())
+                .map(|diagnostic| (
+                    diagnostic.spec.as_deref(),
+                    diagnostic.json_pointer.as_deref()
+                ))
                 .collect::<Vec<_>>(),
-            [Some("/shared/namespace"), Some("/shared/namespace")]
+            [(None, Some("/shared/namespace"))],
+            "one authoring mistake is one diagnostic, and its pointer says where"
+        );
+    }
+
+    #[test]
+    fn a_shared_block_wrong_for_only_one_spec_stays_that_specs_report() {
+        // `validation` needs the client artifact, which only one of the two specs turns on.
+        let diagnostics = assert_workspace_code(
+            load_workspace_yaml(
+                "schemaVersion: 1\nshared:\n  validation: {engine: \"off\", unchecked: allow}\nspecs:\n  aaa:\n    input: {path: ./a.yaml}\n    output: ./generated/aaa\n    artifacts: {types: true, client: true}\n    client: {authEnforcement: types}\n  zzz:\n    input: {path: ./b.yaml}\n    output: ./generated/zzz\n",
+            ),
+            CODE_VALIDATION_WITHOUT_CLIENT,
+        );
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_VALIDATION_WITHOUT_CLIENT)
+                .map(|diagnostic| (
+                    diagnostic.spec.as_deref(),
+                    diagnostic.json_pointer.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [(Some("zzz"), Some("/shared/validation"))]
         );
     }
 
