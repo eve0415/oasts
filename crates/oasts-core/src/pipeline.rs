@@ -198,6 +198,28 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_config_needs_a_host_with_a_filesystem() {
+        for block in ["specs", "shared"] {
+            let config = json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.yaml" },
+                "output": "./generated",
+                "typescript": { "tsconfig": "off" },
+                block: json!({}),
+            });
+            let diagnostics = compile_in_memory(b"", &serde_json::to_vec(&config).expect("config"))
+                .expect_err("a workspace needs several documents and several output roots");
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                ["OASTS0296"]
+            );
+        }
+    }
+
+    #[test]
     fn compiling_in_memory_emits_the_bytes_the_filesystem_path_emits() {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         let documents = [

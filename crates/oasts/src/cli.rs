@@ -1096,4 +1096,111 @@ mod tests {
         assert!(stderr.contains("OASTS0242"), "{stderr}");
         assert!(stderr.contains("^2.8.0"), "{stderr}");
     }
+
+    fn workspace_fixture() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/petstore-3.0/openapi.yaml");
+        for name in ["billing.yaml", "users.yaml"] {
+            fs::copy(&source, temp.path().join(name)).expect("copy document");
+        }
+        fs::write(
+            temp.path().join("oasts.yaml"),
+            "schemaVersion: 1\nshared:\n  artifacts: {types: true}\nspecs:\n  \
+             users:\n    input: {path: ./users.yaml}\n    output: ./generated/users\n  \
+             billing:\n    input: {path: ./billing.yaml}\n    output: ./generated/billing\n",
+        )
+        .expect("workspace config");
+        temp
+    }
+
+    #[test]
+    fn a_workspace_builds_every_spec_and_selects_one() {
+        let temp = workspace_fixture();
+
+        let (code, stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
+        assert_eq!(code, 0, "{stderr}");
+        let lines = stdout.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "{stdout}");
+        assert!(lines[0].starts_with("billing: generated "), "{stdout}");
+        assert!(lines[1].starts_with("users: generated "), "{stdout}");
+
+        let (clean, _, stderr) = invoke(&["oasts", "generate", "--check"], temp.path());
+        assert_eq!(clean, 0, "{stderr}");
+
+        fs::write(
+            temp.path().join("generated/users/types/headers.ts"),
+            "// edited\n",
+        )
+        .expect("edit an owned file");
+        let (drifted, _, stderr) = invoke(&["oasts", "generate", "--check"], temp.path());
+        assert_eq!(drifted, 1);
+        assert!(
+            stderr.contains("edited: generated/users/types/headers.ts"),
+            "{stderr}"
+        );
+
+        let (selected, stdout, stderr) =
+            invoke(&["oasts", "generate", "--spec", "users"], temp.path());
+        assert_eq!(selected, 0, "{stderr}");
+        assert!(stdout.starts_with("users: generated "), "{stdout}");
+
+        let (unknown, _, stderr) = invoke(&["oasts", "check", "--spec", "nope"], temp.path());
+        assert_eq!(unknown, 2);
+        assert!(
+            stderr.contains(
+                "error[OASTS0294]: no spec named 'nope'; this workspace declares billing, users"
+            ),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn a_workspace_that_cannot_compile_one_spec_writes_nothing() {
+        let temp = workspace_fixture();
+        fs::write(
+            temp.path().join("users.yaml"),
+            "openapi: '2.0'\ninfo: {title: Invalid, version: 1.0.0}\npaths: {}\n",
+        )
+        .expect("broken document");
+
+        let (code, stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
+
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("spec 'users':"), "{stderr}");
+        assert!(!temp.path().join("generated").exists());
+    }
+
+    #[test]
+    fn a_workspace_write_failure_reports_the_specs_that_did_land() {
+        let temp = workspace_fixture();
+        fs::create_dir_all(temp.path().join("generated")).expect("output parent");
+        fs::write(temp.path().join("generated/users"), "not a directory").expect("blocking file");
+
+        let (code, stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
+
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stdout.starts_with("billing: generated "), "{stdout}");
+        assert!(temp.path().join("generated/billing").is_dir());
+    }
+
+    #[test]
+    fn two_specs_writing_into_one_tree_are_refused_before_any_write() {
+        let temp = workspace_fixture();
+        fs::write(
+            temp.path().join("oasts.yaml"),
+            "schemaVersion: 1\nspecs:\n  \
+             users:\n    input: {path: ./users.yaml}\n    output: ./generated\n  \
+             billing:\n    input: {path: ./billing.yaml}\n    output: ./generated/billing\n",
+        )
+        .expect("colliding config");
+
+        let (code, stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
+
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("error[OASTS0082]"), "{stderr}");
+        assert!(!temp.path().join("generated").exists());
+    }
 }

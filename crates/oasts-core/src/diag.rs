@@ -140,13 +140,6 @@ impl Diagnostic {
         }
     }
 
-    /// Attaches the workspace spec this diagnostic belongs to.
-    #[must_use]
-    pub fn with_spec(mut self, spec: impl Into<String>) -> Self {
-        self.spec = Some(spec.into().into_boxed_str());
-        self
-    }
-
     /// Attaches a source ID to this diagnostic.
     #[must_use]
     pub fn with_source(mut self, source_id: impl Into<String>) -> Self {
@@ -403,6 +396,24 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn attributed_diagnostics_name_their_spec_and_sort_by_it() {
+        let mut users = diagnostic(Some("openapi.yaml"), None, None, "OASTS2101", "second");
+        users.spec = Some("users".into());
+        let mut billing = diagnostic(Some("openapi.yaml"), None, None, "OASTS2101", "first");
+        billing.spec = Some("billing".into());
+        let unattributed = diagnostic(None, None, None, "OASTS0011", "no spec");
+
+        let rendered = render_to_string(vec![users, billing, unattributed]);
+
+        assert_eq!(
+            rendered,
+            "error[OASTS0011]: no spec\n\
+             error[OASTS2101]: spec 'billing': first\n  --> openapi.yaml:1:1\n\
+             error[OASTS2101]: spec 'users': second\n  --> openapi.yaml:1:1\n"
+        );
     }
 
     #[test]

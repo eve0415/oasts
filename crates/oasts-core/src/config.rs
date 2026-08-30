@@ -1941,13 +1941,12 @@ fn merge_target(entry: SpecConfig, shared: &SpecConfig) -> SpecConfig {
 fn attribute(diagnostics: &mut [Diagnostic], spec: &str, origins: &BTreeMap<&'static str, String>) {
     for diagnostic in diagnostics {
         diagnostic.spec = Some(Box::from(spec));
-        let Some(pointer) = diagnostic.json_pointer.as_deref() else {
-            continue;
-        };
-        let head = pointer.trim_start_matches('/');
-        let key = head.split_once('/').map_or(head, |(key, _)| key);
-        if let Some(prefix) = origins.get(key) {
-            diagnostic.json_pointer = Some(format!("{prefix}{pointer}").into_boxed_str());
+        if let Some(pointer) = diagnostic.json_pointer.as_deref() {
+            let head = pointer.trim_start_matches('/');
+            let key = head.split_once('/').map_or(head, |(key, _)| key);
+            if let Some(prefix) = origins.get(key) {
+                diagnostic.json_pointer = Some(format!("{prefix}{pointer}").into_boxed_str());
+            }
         }
     }
 }
@@ -1968,19 +1967,20 @@ fn check_output_overlap(specs: &[ResolvedSpec], source_path: &Path) -> Result<()
             {
                 continue;
             }
-            let (Some(name), Some(earlier_name)) = (spec.name.as_deref(), earlier.name.as_deref())
-            else {
-                continue;
-            };
-            diagnostics.push(config_error(
-                CODE_OUTPUT_OVERLAP,
-                format!(
-                    "spec '{name}' writes into the same tree as spec '{earlier_name}'; every \
+            // The inner loop only runs past the first spec, and only a workspace has a second.
+            if let (Some(name), Some(earlier_name)) =
+                (spec.name.as_deref(), earlier.name.as_deref())
+            {
+                diagnostics.push(config_error(
+                    CODE_OUTPUT_OVERLAP,
+                    format!(
+                        "spec '{name}' writes into the same tree as spec '{earlier_name}'; every \
                      spec needs an output root of its own"
-                ),
-                Some(source_path),
-                Some(&format!("/specs/{name}/output")),
-            ));
+                    ),
+                    Some(source_path),
+                    Some(&format!("/specs/{name}/output")),
+                ));
+            }
         }
     }
     if diagnostics.is_empty() {
@@ -6046,6 +6046,40 @@ specs:
                 Some("/specs/zzz/output")
             );
         }
+    }
+
+    #[test]
+    fn attribution_leaves_a_pointer_it_cannot_place_alone() {
+        let origins = BTreeMap::from([("naming", "/shared".to_owned())]);
+        let mut diagnostics = vec![
+            config_error(CODE_NAMING, "no pointer", None, None),
+            config_error(
+                CODE_SCHEMA_VERSION,
+                "root key",
+                None,
+                Some("/schemaVersion"),
+            ),
+            config_error(CODE_NAMING, "shared block", None, Some("/naming/typeCase")),
+        ];
+
+        attribute(&mut diagnostics, "billing", &origins);
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.spec.as_deref() == Some("billing"))
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.json_pointer.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                None,
+                Some("/schemaVersion"),
+                Some("/shared/naming/typeCase")
+            ]
+        );
     }
 
     #[test]

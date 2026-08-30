@@ -269,11 +269,7 @@ fn compile(
             &mut spec_sink,
         );
         let mut diagnostics = spec_sink.into_vec();
-        if let Some(name) = spec.name.as_deref() {
-            for diagnostic in &mut diagnostics {
-                diagnostic.spec = Some(Box::from(name));
-            }
-        }
+        attribute(&spec, &mut diagnostics);
         sink.extend(diagnostics);
         compiled.push(Compiled {
             spec,
@@ -338,40 +334,51 @@ fn select(
             .with_source(config_path),
         ]);
     }
-    let known = workspace
-        .specs
-        .iter()
-        .filter_map(|spec| spec.name.as_deref())
-        .collect::<BTreeSet<_>>();
-    let requested = selection
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let unknown = requested.difference(&known).collect::<Vec<_>>();
+
+    // Past the check above every spec is named, and the empty string an unnamed one would
+    // contribute is not a spec name, so it can never answer a selection either way.
+    let mut known = BTreeSet::new();
+    for spec in &workspace.specs {
+        known.insert(spec.name.as_deref().unwrap_or_default());
+    }
+    let mut unknown = BTreeSet::new();
+    for name in selection {
+        if !known.contains(name.as_str()) {
+            unknown.insert(name.as_str());
+        }
+    }
     if !unknown.is_empty() {
         let declared = known.iter().copied().collect::<Vec<_>>().join(", ");
-        return Err(unknown
-            .into_iter()
-            .map(|name| {
+        let mut diagnostics = Vec::new();
+        for name in unknown {
+            diagnostics.push(
                 Diagnostic::config(
                     CODE_SPEC_UNKNOWN,
                     format!("no spec named '{name}'; this workspace declares {declared}"),
                 )
-                .with_source(config_path.clone())
-            })
-            .collect());
+                .with_source(config_path.clone()),
+            );
+        }
+        return Err(diagnostics);
     }
-    Ok(workspace
-        .specs
-        .iter()
-        .enumerate()
-        .filter(|(_, spec)| {
-            spec.name
-                .as_deref()
-                .is_some_and(|name| requested.contains(name))
-        })
-        .map(|(index, _)| index)
-        .collect())
+
+    let mut chosen = BTreeSet::new();
+    for (index, spec) in workspace.specs.iter().enumerate() {
+        let name = spec.name.as_deref().unwrap_or_default();
+        if selection.iter().any(|requested| requested == name) {
+            chosen.insert(index);
+        }
+    }
+    Ok(chosen)
+}
+
+/// Names the spec every diagnostic in `diagnostics` came from, when the run is a workspace.
+fn attribute(spec: &ResolvedSpec, diagnostics: &mut [Diagnostic]) {
+    if let Some(name) = spec.name.as_deref() {
+        for diagnostic in diagnostics {
+            diagnostic.spec = Some(Box::from(name));
+        }
+    }
 }
 
 /// The path prefix a drift line carries, so two specs' identically named files stay apart.
@@ -405,11 +412,7 @@ fn drift(
             .expect("successful emitting compilation returns generated files");
         let prefix = drift_prefix(&entry.spec, workspace_root, is_workspace);
         let mut report = check_drift(&entry.spec.config.output, files);
-        if let Some(name) = entry.spec.name.as_deref() {
-            for diagnostic in &mut report.diagnostics {
-                diagnostic.spec = Some(Box::from(name));
-            }
-        }
+        attribute(&entry.spec, &mut report.diagnostics);
         diagnostics.append(&mut report.diagnostics);
         drift_lines.extend(
             report
@@ -460,11 +463,7 @@ fn emit(compiled: Vec<Compiled>, mut warnings: Vec<Diagnostic>, tracked: &mut Tr
             {
                 peers.push(diagnostic);
             }
-            if let Some(name) = entry.spec.name.as_deref() {
-                for diagnostic in &mut peers {
-                    diagnostic.spec = Some(Box::from(name));
-                }
-            }
+            attribute(&entry.spec, &mut peers);
             warnings.append(&mut peers);
         }
         tracked.absorb(&entry.spec, inputs);
@@ -495,7 +494,9 @@ fn emit(compiled: Vec<Compiled>, mut warnings: Vec<Diagnostic>, tracked: &mut Tr
     sink.extend(warnings);
     sink.extend(diagnostics);
     let mut outcome = Outcome::failed(sink);
-    outcome.stdout_summary = (!summary.is_empty()).then(|| summary.join("\n"));
+    if !summary.is_empty() {
+        outcome.stdout_summary = Some(summary.join("\n"));
+    }
     outcome
 }
 
@@ -1042,6 +1043,28 @@ specs:
     }
 
     #[test]
+    fn a_single_spec_names_drift_from_its_own_output_root() {
+        let temp = workspace("schemaVersion: 1\ninput: {path: ./a.yaml}\noutput: ./generated\n");
+        assert_eq!(
+            invoke(&temp, Command::Generate { check: false }, &[]).exit_code,
+            0
+        );
+        fs::write(
+            temp.path().join("generated/types/operations/listthings.ts"),
+            "// edited\n",
+        )
+        .expect("edit an owned file");
+
+        let outcome = invoke(&temp, Command::Generate { check: true }, &[]);
+
+        assert_eq!(outcome.exit_code, 1);
+        assert_eq!(
+            outcome.drift_lines,
+            ["edited: types/operations/listthings.ts"]
+        );
+    }
+
+    #[test]
     fn a_clean_workspace_reports_no_drift() {
         let temp = workspace(TWO_SPECS);
         assert_eq!(
@@ -1071,5 +1094,18 @@ specs:
                 .starts_with("billing: generated ")
         );
         assert!(temp.path().join("generated/billing").is_dir());
+    }
+
+    #[test]
+    fn a_first_spec_that_cannot_be_written_summarizes_nothing() {
+        let temp = workspace(TWO_SPECS);
+        fs::create_dir_all(temp.path().join("generated")).expect("output parent");
+        fs::write(temp.path().join("generated/billing"), "not a directory").expect("blocking file");
+
+        let outcome = invoke(&temp, Command::Generate { check: false }, &[]);
+
+        assert_eq!(outcome.exit_code, 2, "{:#?}", outcome.diagnostics);
+        assert_eq!(outcome.stdout_summary, None);
+        assert!(!temp.path().join("generated/users").exists());
     }
 }
