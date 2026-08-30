@@ -126,6 +126,21 @@ test("usage, watch, discovery, spec, and config failures exit 2", async () => {
   assert.equal(spec.code, 2);
   assert.match(spec.stderr, /error\[OASTS9002\]/);
 
+  const ambiguous = scriptFixture();
+  copyFileSync(join(FIXTURE, "oasts.yaml"), join(ambiguous, "oasts.yaml"));
+  const twoCandidates = await invoke(["generate"], ambiguous);
+  assert.equal(twoCandidates.code, 2);
+  assert.match(
+    twoCandidates.stderr,
+    /error\[OASTS0011\]: config discovery expected exactly one candidate, found 2/,
+  );
+
+  const throwing = scriptFixture();
+  writeFileSync(join(throwing, "oasts.config.ts"), "throw new Error('boom at import');\n");
+  const threw = await invoke(["generate"], throwing);
+  assert.equal(threw.code, 2);
+  assert.match(threw.stderr, /error\[OASTS0012\]: failed to import config module: boom at import/);
+
   const invalid = scriptFixture();
   writeFileSync(join(invalid, "oasts.config.ts"), "export default Promise.resolve({});\n");
   const asyncConfig = await invoke(["generate"], invalid);

@@ -47,7 +47,6 @@ const CODE_TRUST_LIMITS: &str = "OASTS0221";
 /// The `typescript` block. Sits above the highest allocated config code, which stops at 0242.
 const CODE_TYPESCRIPT: &str = "OASTS0251";
 const CODE_CONFIG_READ: &str = "OASTS1001";
-const CODE_SCRIPT_CONFIG_UNSUPPORTED: &str = "OASTS9001";
 pub(crate) const CODE_WORKSPACE_UNSUPPORTED: &str = "OASTS9002";
 pub(crate) const CODE_BLOCK_UNSUPPORTED: &str = "OASTS9003";
 pub(crate) const CODE_COMMAND_UNSUPPORTED: &str = "OASTS9004";
@@ -1188,11 +1187,17 @@ fn is_script_path(path: &Path) -> bool {
         .is_some_and(|candidate| SCRIPT_EXTENSIONS.contains(&candidate))
 }
 
+/// Refuses a script config, which only a host with a JavaScript runtime can evaluate.
+///
+/// This is a refusal on the merits, not a gated-off capability: the standalone binary embeds no
+/// JavaScript runtime, so it can never read one. The Node CLI evaluates the module itself and
+/// hands the result to [`load_config_from_json`].
 fn reject_script_extension(path: &Path) -> Result<(), Diagnostic> {
     if is_script_path(path) {
         return Err(config_error(
-            CODE_SCRIPT_CONFIG_UNSUPPORTED,
-            "TypeScript/JavaScript config is not supported in this build",
+            CODE_DISCOVERY,
+            "evaluating a TypeScript/JavaScript config needs a JavaScript runtime, and this binary \
+             embeds none; run the oasts Node CLI, or write oasts.yaml or oasts.json",
             Some(path),
             None,
         ));
@@ -2918,23 +2923,23 @@ mod tests {
     }
 
     #[test]
-    fn discovery_reports_script_config_as_unsupported() {
+    fn discovery_refuses_script_config_without_a_javascript_runtime() {
         let directory = TestDirectory::new();
         directory.write("oasts.config.ts", "export default {};");
-        assert_discovery_code(
-            discover(directory.path(), None),
-            CODE_SCRIPT_CONFIG_UNSUPPORTED,
+        let diagnostic = discover(directory.path(), None).expect_err("script config is refused");
+        assert_eq!(diagnostic.code, CODE_DISCOVERY);
+        assert!(
+            diagnostic.message.contains("JavaScript runtime"),
+            "{diagnostic:?}"
         );
+        assert!(diagnostic.message.contains("Node CLI"), "{diagnostic:?}");
     }
 
     #[test]
-    fn explicit_script_config_is_also_unsupported() {
+    fn explicit_script_config_is_also_refused() {
         let directory = TestDirectory::new();
         let script = directory.write("custom.mjs", "export default {};");
-        assert_discovery_code(
-            discover(directory.path(), Some(&script)),
-            CODE_SCRIPT_CONFIG_UNSUPPORTED,
-        );
+        assert_discovery_code(discover(directory.path(), Some(&script)), CODE_DISCOVERY);
     }
 
     #[test]

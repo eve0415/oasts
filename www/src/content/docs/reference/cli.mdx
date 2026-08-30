@@ -75,7 +75,8 @@ oasts.yaml        oasts.json
   Note also that `oasts.yml` is **not** in the list; the spelling is `oasts.yaml`.
 </Aside>
 
-A `oasts.config.ts` is evaluated as a module.
+A `oasts.config.ts` is evaluated as a module, which means discovering one and running it executes whatever code it contains — the same trust you extend to any `*.config.ts` in your toolchain, and the one real difference from `oasts.yaml`, which is only ever read as data.
+It is imported exactly once per invocation; see [Determinism](/concepts/determinism) for what that means for output stability.
 Import `defineConfig` from the package for editor completion and a compile-time check of the whole config:
 
 ```ts title="oasts.config.ts"
