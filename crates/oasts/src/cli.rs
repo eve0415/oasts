@@ -1186,6 +1186,26 @@ mod tests {
         assert!(!temp.path().join("generated/billing").exists());
     }
 
+    /// Only the commit's own I/O reaches the write failure path, so this makes some.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_fails_mid_run_reports_the_specs_that_did_land() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = workspace_fixture();
+        let parent = temp.path().join("generated");
+        fs::create_dir_all(parent.join("billing")).expect("the first spec's root");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).expect("read-only parent");
+
+        let (code, stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("restore");
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stdout.starts_with("billing: generated "), "{stdout}");
+        assert!(stderr.contains("spec 'users':"), "{stderr}");
+        assert!(parent.join("billing/types").is_dir());
+    }
+
     #[test]
     fn two_specs_writing_into_one_tree_are_refused_before_any_write() {
         let temp = workspace_fixture();

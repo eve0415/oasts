@@ -1147,31 +1147,43 @@ specs:
     fn a_write_that_fails_mid_run_reports_the_specs_that_did_land() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = workspace(TWO_SPECS);
-        let parent = temp.path().join("generated");
-        fs::create_dir_all(parent.join("billing")).expect("the first spec's root");
-        // Both roots preflight clean: one exists and is empty, the other does not exist yet. The
-        // second spec then fails creating its own root, after the first has been committed.
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).expect("read-only parent");
+        // Every root preflights clean either way: one that exists and is empty, and one that does
+        // not exist yet. Creating a root the run has to make then fails, on the second spec when
+        // the first already has a root of its own, and on the first when neither does.
+        for (prepared, landed) in [(true, Some("billing")), (false, None)] {
+            let temp = workspace(TWO_SPECS);
+            let parent = temp.path().join("generated");
+            if prepared {
+                fs::create_dir_all(parent.join("billing")).expect("the first spec's root");
+            } else {
+                fs::create_dir_all(&parent).expect("output parent");
+            }
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o555))
+                .expect("read-only parent");
 
-        let outcome = invoke(&temp, Command::Generate { check: false }, &[]);
+            let outcome = invoke(&temp, Command::Generate { check: false }, &[]);
 
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("restore");
-        assert_eq!(outcome.exit_code, 2, "{:#?}", outcome.diagnostics);
-        assert!(
-            outcome
-                .stdout_summary
-                .expect("the specs that were written are reported")
-                .starts_with("billing: generated ")
-        );
-        assert!(
-            outcome
-                .diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.spec.as_deref() == Some("users")),
-            "{:#?}",
-            outcome.diagnostics
-        );
-        assert!(parent.join("billing/types").is_dir());
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("restore");
+            assert_eq!(outcome.exit_code, 2, "{:#?}", outcome.diagnostics);
+            match landed {
+                Some(name) => assert!(
+                    outcome
+                        .stdout_summary
+                        .expect("the specs that were written are reported")
+                        .starts_with(&format!("{name}: generated ")),
+                    "{prepared}"
+                ),
+                None => assert_eq!(outcome.stdout_summary, None),
+            }
+            let failing = if prepared { "users" } else { "billing" };
+            assert!(
+                outcome
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.spec.as_deref() == Some(failing)),
+                "{:#?}",
+                outcome.diagnostics
+            );
+        }
     }
 }
