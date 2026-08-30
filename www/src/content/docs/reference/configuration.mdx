@@ -417,7 +417,7 @@ compat:
 
 ## `specs`
 
-Several APIs in one configuration. Each key names a spec, and each spec takes the sixteen keys that configure one compile target: `input`, `output`, `namespace`, `filters`, `artifacts`, `types`, `zod`, `client`, `validation`, `naming`, `documentation`, `emit`, `local`, `limits`, `typescript`, `compat`. Anything else is rejected as an unknown key with `OASTS0031` — `$schema`, `schemaVersion` and `workspaceRoot` describe the file, and `remote`, `watch` and `ci` are [reserved](#reserved-keys), so all six stay at the root:
+Several APIs in one configuration. Each key names a spec, and each spec takes the sixteen keys that configure one compile target: `input`, `output`, `namespace`, `filters`, `artifacts`, `types`, `zod`, `client`, `validation`, `naming`, `documentation`, `emit`, `local`, `limits`, `typescript`, `compat`. Anything else is rejected as an unknown key with `OASTS0031` — `$schema`, `schemaVersion` and `workspaceRoot` describe the file, [`remote`](#remote) and [`watch`](#watch) answer for the whole run, and `ci` is [reserved](#reserved-keys), so all six stay at the root:
 
 ```yaml title="oasts.yaml"
 schemaVersion: 1
@@ -439,7 +439,7 @@ Every spec needs an output root of its own. Two roots that are equal, or one ins
 
 `oasts generate` builds every spec; `--spec <name>` builds one. See [Several APIs in one project](/guides/workspaces) for the whole surface.
 
-The browser playground compiles one document against one configuration, so it refuses a workspace with `OASTS0277`.
+The browser playground compiles one document against one configuration, so it refuses a workspace with `OASTS0297`.
 
 ## `shared`
 
