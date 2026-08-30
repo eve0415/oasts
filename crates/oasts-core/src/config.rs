@@ -1340,7 +1340,7 @@ impl ResolvedWorkspace {
         self.specs.first().is_some_and(|spec| spec.name.is_some())
     }
 
-    /// The single target of a single-spec configuration.
+    /// The only compile target, when the configuration declares exactly one.
     #[must_use]
     pub fn into_single(mut self) -> Option<ResolvedConfig> {
         match self.specs.len() {
