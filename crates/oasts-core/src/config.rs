@@ -6124,6 +6124,7 @@ specs:
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn two_names_for_one_directory_are_one_output_root() {
         use std::os::unix::fs::symlink;
