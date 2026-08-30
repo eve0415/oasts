@@ -1,7 +1,11 @@
-//! Schema-version 1 configuration loading for the local, single-spec wedge.
+//! Schema-version 1 configuration loading.
+//!
+//! A configuration describes either one compile target directly, or a workspace of several
+//! named ones under `specs`. Both shapes resolve through the same target resolver, so a spec in
+//! a workspace is validated exactly as the same keys written on their own would be.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -21,10 +25,13 @@ const CODE_CONFIG_PARSE: &str = "OASTS0031";
 const CODE_SCHEMA_VERSION: &str = "OASTS0041";
 const CODE_SCHEMA_URI: &str = "OASTS0042";
 const CODE_WORKSPACE_ROOT: &str = "OASTS0051";
-const CODE_SINGLE_SHAPE: &str = "OASTS0061";
+const CODE_TARGET_SHAPE: &str = "OASTS0061";
+const CODE_SHAPE_CONFLICT: &str = "OASTS0062";
+const CODE_SHARED_WITHOUT_SPECS: &str = "OASTS0063";
 const CODE_INPUT_SHAPE: &str = "OASTS0071";
 const CODE_INPUT_PATH: &str = "OASTS0072";
 const CODE_OUTPUT: &str = "OASTS0081";
+const CODE_OUTPUT_OVERLAP: &str = "OASTS0082";
 const CODE_NAMESPACE: &str = "OASTS0091";
 const CODE_NO_ARTIFACT: &str = "OASTS0101";
 const CODE_ARTIFACT_DIRECTORY: &str = "OASTS0102";
@@ -47,13 +54,19 @@ const CODE_NAMING: &str = "OASTS0201";
 const CODE_EMIT: &str = "OASTS0211";
 const CODE_TRUST_LIMITS: &str = "OASTS0221";
 const CODE_TYPESCRIPT: &str = "OASTS0251";
-/// The `remote` block. Sits above the highest allocated config code, which stops at 0263.
+/// The `remote` block. Rule 26 is the filters block, so this opens rule 27.
 const CODE_REMOTE: &str = "OASTS0271";
-/// The `watch` block. Rule 26 is the filters block and rule 27 the remote block, so this opens
-/// rule 28.
+/// The `watch` block, opening rule 28 above the remote block.
 const CODE_WATCH: &str = "OASTS0281";
+/// The `specs` block, opening rule 29 above the watch block.
+const CODE_SPEC_EMPTY: &str = "OASTS0291";
+const CODE_SPEC_NAME: &str = "OASTS0292";
+const CODE_SPEC_POSITION: &str = "OASTS0293";
+const CODE_SPEC_CONFLICT: &str = "OASTS0294";
+pub(crate) const CODE_SPEC_UNKNOWN: &str = "OASTS0295";
+pub(crate) const CODE_SPEC_SELECTION: &str = "OASTS0296";
+const CODE_SPEC_HOST: &str = "OASTS0297";
 const CODE_CONFIG_READ: &str = "OASTS1001";
-pub(crate) const CODE_WORKSPACE_UNSUPPORTED: &str = "OASTS9002";
 pub(crate) const CODE_BLOCK_UNSUPPORTED: &str = "OASTS9003";
 
 const DISCOVERY_NAMES: [&str; 8] = [
@@ -98,7 +111,7 @@ pub fn config_json_schema() -> serde_json::Value {
     schemars(
         rename = "UserConfig",
         rename_all = "camelCase",
-        description = "The schema-version-1 single-spec configuration."
+        description = "A schema-version-1 configuration: one spec at the root, or a workspace of several under specs."
     )
 )]
 pub struct RawConfig {
@@ -124,9 +137,9 @@ pub struct RawConfig {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub namespace: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    pub specs: Option<Value>,
+    pub specs: Option<BTreeMap<String, SpecConfig>>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
-    pub shared: Option<Value>,
+    pub shared: Option<SpecConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub filters: Option<FiltersConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
@@ -160,6 +173,96 @@ pub struct RawConfig {
     #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     pub ci: Option<Value>,
 }
+
+/// Every key that configures one compile target.
+///
+/// A workspace declares these once per spec under `specs`, and once more under `shared` for the
+/// settings every spec agrees on. A single-spec config writes the same keys at the root. `input`
+/// and `output` name one document and one output root, so they belong to a spec and are refused
+/// under `shared`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "json-schema",
+    derive(schemars::JsonSchema),
+    schemars(
+        rename = "SpecConfig",
+        rename_all = "camelCase",
+        description = "One compile target: a document, an output root, and the settings that shape what is emitted."
+    )
+)]
+pub struct SpecConfig {
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub input: Option<Input>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub output: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub namespace: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub filters: Option<FiltersConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub artifacts: Option<ArtifactsConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub types: Option<TypesConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub zod: Option<ZodConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub client: Option<RawClient>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub validation: Option<RawValidation>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub naming: Option<NamingConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub documentation: Option<DocumentationConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub emit: Option<EmitConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub local: Option<LocalTrustConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub limits: Option<LimitsConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub typescript: Option<RawTypescript>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    pub compat: Option<CompatConfig>,
+}
+
+/// One target key, paired with the test for whether a [`SpecConfig`] declares it.
+type TargetKey = (&'static str, fn(&SpecConfig) -> bool);
+
+/// Every target key, in the order a diagnostic reports them.
+///
+/// Three rules read this one list: a workspace refuses a target key written at the root, a spec
+/// refuses a block `shared` already declares, and the merge below takes each block from exactly
+/// one of the two. Adding a key to [`SpecConfig`] without adding it here would let it slip past
+/// all three, which is what `target_keys_cover_spec_config` pins.
+const TARGET_KEYS: [TargetKey; 16] = [
+    ("input", |spec| spec.input.is_some()),
+    ("output", |spec| spec.output.is_some()),
+    ("namespace", |spec| spec.namespace.is_some()),
+    ("filters", |spec| spec.filters.is_some()),
+    ("artifacts", |spec| spec.artifacts.is_some()),
+    ("types", |spec| spec.types.is_some()),
+    ("zod", |spec| spec.zod.is_some()),
+    ("client", |spec| spec.client.is_some()),
+    ("validation", |spec| spec.validation.is_some()),
+    ("naming", |spec| spec.naming.is_some()),
+    ("documentation", |spec| spec.documentation.is_some()),
+    ("emit", |spec| spec.emit.is_some()),
+    ("local", |spec| spec.local.is_some()),
+    ("limits", |spec| spec.limits.is_some()),
+    ("typescript", |spec| spec.typescript.is_some()),
+    ("compat", |spec| spec.compat.is_some()),
+];
+
+/// The pointer at the `shared` block, and the prefix of a pointer inside it.
+const SHARED_POINTER: &str = "/shared";
+const SHARED_PREFIX: &str = "/shared/";
+
+/// The two keys that name one spec's document and output root, and so cannot be shared.
+const SPEC_ONLY_KEYS: [TargetKey; 2] = [
+    ("input", |spec| spec.input.is_some()),
+    ("output", |spec| spec.output.is_some()),
+];
 
 /// A single input selector. Cross-field validation enforces exactly one field.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1213,6 +1316,50 @@ pub struct ResolvedConfig {
     pub tsconfig: TsconfigSource,
 }
 
+/// One compile target of a workspace, with the name a workspace gave it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedSpec {
+    /// The `specs` key this target was declared under; `None` for a single-spec config.
+    pub name: Option<String>,
+    /// Where each target key was written, for [`attribute`]; empty for a single-spec config.
+    pub origins: SpecOrigins,
+    pub config: ResolvedConfig,
+}
+
+/// Each target key's pointer prefix: `/shared` or `/specs/<name>`.
+pub type SpecOrigins = BTreeMap<&'static str, String>;
+
+/// Every compile target one configuration file declares.
+///
+/// A single-spec config resolves to exactly one unnamed spec, so a host walks this the same way
+/// whichever shape it loaded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedWorkspace {
+    pub config_path: PathBuf,
+    pub workspace_root: PathBuf,
+    /// Warnings about the configuration file itself, belonging to no single spec.
+    pub diagnostics: Vec<Diagnostic>,
+    /// The declared specs, ordered by name.
+    pub specs: Vec<ResolvedSpec>,
+}
+
+impl ResolvedWorkspace {
+    /// Whether this configuration declares named specs rather than one target at the root.
+    #[must_use]
+    pub fn is_workspace(&self) -> bool {
+        self.specs.first().is_some_and(|spec| spec.name.is_some())
+    }
+
+    /// The only compile target, when the configuration declares exactly one.
+    #[must_use]
+    pub fn into_single(mut self) -> Option<ResolvedConfig> {
+        match self.specs.len() {
+            1 => self.specs.pop().map(|spec| spec.config),
+            _ => None,
+        }
+    }
+}
+
 /// A discovered configuration candidate before script-support policy is applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredConfig {
@@ -1343,7 +1490,10 @@ fn reject_script_extension(path: &Path) -> Result<(), Diagnostic> {
 }
 
 /// Discovers, parses, validates, and resolves one configuration file.
-pub fn load_config(explicit: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+pub fn load_config(
+    explicit: Option<&Path>,
+    cwd: &Path,
+) -> Result<ResolvedWorkspace, Vec<Diagnostic>> {
     let discovered = discover(cwd, explicit).map_err(|diagnostic| vec![diagnostic])?;
     let config_path = if discovered.is_absolute() {
         discovered
@@ -1371,7 +1521,7 @@ pub fn load_config(explicit: Option<&Path>, cwd: &Path) -> Result<ResolvedConfig
 pub fn load_config_from_json(
     config_path: &Path,
     json: &[u8],
-) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+) -> Result<ResolvedWorkspace, Vec<Diagnostic>> {
     load_config_from_json_with_source(config_path, json, &FsSource)
 }
 
@@ -1383,7 +1533,7 @@ pub fn load_config_from_json_with_source(
     config_path: &Path,
     json: &[u8],
     source: &dyn DocumentSource,
-) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+) -> Result<ResolvedWorkspace, Vec<Diagnostic>> {
     let config_path = if config_path.is_absolute() {
         normalize_config_path(config_path.to_path_buf())
     } else {
@@ -1391,6 +1541,34 @@ pub fn load_config_from_json_with_source(
     };
     let raw = parse_config_json(&config_path, json).map_err(|diagnostic| vec![diagnostic])?;
     resolve_config(config_path, raw, source)
+}
+
+/// Loads a configuration that declares one target at the root.
+///
+/// Everything below the target resolver is per target, so its tests name one directly rather
+/// than walking a workspace of exactly one.
+#[cfg(test)]
+pub(crate) fn load_single(
+    explicit: Option<&Path>,
+    cwd: &Path,
+) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+    load_config(explicit, cwd).map(expect_single)
+}
+
+/// [`load_single`] for a configuration already serialized to JSON.
+#[cfg(test)]
+pub(crate) fn load_single_from_json(
+    config_path: &Path,
+    json: &[u8],
+) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+    load_config_from_json(config_path, json).map(expect_single)
+}
+
+#[cfg(test)]
+fn expect_single(workspace: ResolvedWorkspace) -> ResolvedConfig {
+    workspace
+        .into_single()
+        .expect("configuration declares one target at the root")
 }
 
 /// Parses in-memory JSON config bytes into an unvalidated [`RawConfig`].
@@ -1452,9 +1630,9 @@ fn parse_config(path: &Path, source: &str) -> Result<RawConfig, Diagnostic> {
 /// Validates and resolves a parsed configuration anchored at `config_path`.
 pub fn resolve_config(
     config_path: PathBuf,
-    raw: RawConfig,
+    mut raw: RawConfig,
     source: &dyn DocumentSource,
-) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+) -> Result<ResolvedWorkspace, Vec<Diagnostic>> {
     let mut sink = DiagnosticSink::new();
     let source_path = config_path.as_path();
     let Some(config_parent) = config_path
@@ -1513,124 +1691,11 @@ pub fn resolve_config(
         }
     };
 
-    let workspace_shape = raw.specs.is_some() || raw.shared.is_some();
-    if workspace_shape {
-        sink.push(config_error(
-            CODE_WORKSPACE_UNSUPPORTED,
-            "multi-spec workspace config is not supported in this build",
-            Some(source_path),
-            raw.specs.as_ref().map(|_| "/specs").or(Some("/shared")),
-        ));
-    }
-
-    let input = if workspace_shape {
-        None
-    } else {
-        resolve_input(raw.input.as_ref(), &workspace_root, source_path, &mut sink)
-    };
-    let output = if workspace_shape {
-        None
-    } else {
-        resolve_output(
-            raw.output.as_deref(),
-            &workspace_root,
-            source_path,
-            &mut sink,
-        )
-    };
-
-    let namespace = raw.namespace.unwrap_or_else(|| "api".to_owned());
-    if !is_ts_identifier(&namespace) {
-        sink.push(config_error(
-            CODE_NAMESPACE,
-            format!("namespace '{namespace}' is not a valid TypeScript identifier"),
-            Some(source_path),
-            Some("/namespace"),
-        ));
-    }
-
-    let raw_artifacts = raw.artifacts.unwrap_or_default();
-    let artifact_states = resolve_artifacts(raw_artifacts, source_path, &mut sink);
-    if raw.types.is_some() && !artifact_states.types.enabled {
-        sink.push(config_error(
-            CODE_DISABLED_OPTIONS,
-            "types options are invalid while the types artifact is disabled",
-            Some(source_path),
-            Some("/types"),
-        ));
-    }
-    if raw.zod.is_some() && !artifact_states.zod.enabled {
-        sink.push(config_error(
-            CODE_DISABLED_OPTIONS,
-            "zod options are invalid while the zod artifact is disabled",
-            Some(source_path),
-            Some("/zod"),
-        ));
-    }
-    if raw.client.is_some() && !artifact_states.client.enabled {
-        sink.push(config_error(
-            CODE_DISABLED_OPTIONS,
-            "client options are invalid while the client artifact is disabled",
-            Some(source_path),
-            Some("/client"),
-        ));
-    }
-    if raw.validation.is_some() && !artifact_states.client.enabled {
-        sink.push(config_error(
-            CODE_VALIDATION_WITHOUT_CLIENT,
-            "validation options require the client artifact to be enabled",
-            Some(source_path),
-            Some("/validation"),
-        ));
-    }
-    validate_client_combinations(
-        &artifact_states,
-        raw.client.as_ref(),
-        raw.validation.as_ref(),
-        source_path,
-        &mut sink,
-    );
-
-    let types = raw.types.unwrap_or_default();
-    // The codecs are emitted under the client artifact and only run at client pipeline positions,
-    // so a transforming representation without the client artifact has nowhere to bind.
-    if (types.date_time != DateTimeRepresentation::String
-        || types.date != DateRepresentation::String
-        || types.integer != IntegerRepresentation::Number)
-        && !artifact_states.client.enabled
-    {
-        sink.push(config_error(
-            CODE_DATE_REPRESENTATION,
-            "non-string dateTime/date and bigint integer representations require the client artifact",
-            Some(source_path),
-            Some("/types"),
-        ));
-    }
-    if types.integer == IntegerRepresentation::Bigint && artifact_states.tanstack.enabled {
-        sink.push(config_error(
-            CODE_DATE_REPRESENTATION,
-            "types.integer 'bigint' is incompatible with TanStack query keys because their default JSON serialization rejects bigint values",
-            Some(source_path),
-            Some("/types/integer"),
-        ));
-    }
-
-    let naming = raw.naming.unwrap_or_default();
-    validate_naming(&naming, source_path, &mut sink);
-    let documentation = raw.documentation.unwrap_or_default();
-    let mut emit = raw.emit.unwrap_or_default();
-    validate_emit(&emit, source_path, &mut sink);
-    emit.runtime_directory = normalize_directory(&emit.runtime_directory);
-    validate_directory_overlaps(&artifact_states, &emit, source_path, &mut sink);
-
-    let local = raw.local.unwrap_or_default();
-    let local_allow_paths = resolve_local_paths(&local, &config_dir, source_path, &mut sink);
-    let limits = raw.limits.unwrap_or_default();
-    validate_limits(&limits, source_path, &mut sink);
-    let compat = raw.compat.unwrap_or_default();
-
-    let remote = resolve_remote(raw.remote, source_path, &mut sink);
-    let watch = raw.watch.unwrap_or_default();
+    // `remote` and `watch` are root-only keys. Retrieval policy and the watch loop answer for the
+    // whole file rather than for one target, so they are resolved once here and every spec the
+    // file declares carries the same answer.
+    let remote = resolve_remote(raw.remote.take(), source_path, &mut sink);
+    let watch = raw.watch.take().unwrap_or_default();
     validate_watch(&watch, source_path, &mut sink);
 
     for (present, pointer, name) in [(raw.ci.is_some(), "/ci", "ci")] {
@@ -1644,13 +1709,535 @@ pub fn resolve_config(
         }
     }
 
-    let tsconfig = resolve_tsconfig_source(
-        raw.typescript.as_ref(),
-        &workspace_root,
-        source_path,
+    let specs = raw.specs.take();
+    let shared = raw.shared.take();
+    let schema = raw.schema.take();
+    let root_target = take_root_target(&mut raw);
+
+    let targets = match specs {
+        Some(specs) => workspace_targets(&root_target, shared, specs, source_path, &mut sink),
+        None => {
+            if shared.is_some() {
+                sink.push(config_error(
+                    CODE_SHARED_WITHOUT_SPECS,
+                    "shared holds the settings every spec inherits, so it needs a specs block to \
+                     inherit them",
+                    Some(source_path),
+                    Some("/shared"),
+                ));
+            }
+            vec![WorkspaceTarget {
+                name: None,
+                target: root_target,
+                origins: BTreeMap::new(),
+            }]
+        }
+    };
+
+    // The shape has to hold before a target means anything, so a root error returns without
+    // resolving any of them; past this point every target is resolved and every one's errors are
+    // reported together, so one broken spec does not hide the next.
+    if sink.has_errors() {
+        return Err(sink.into_sorted_vec());
+    }
+    let mut diagnostics = sink.into_vec();
+
+    let mut specs = Vec::new();
+    let mut reports = Vec::new();
+    let mut failed = false;
+    for WorkspaceTarget {
+        name,
+        target,
+        origins,
+    } in targets
+    {
+        let resolved = resolve_target(
+            &config_path,
+            &config_dir,
+            &workspace_root,
+            schema.clone(),
+            remote.clone(),
+            watch,
+            target,
+        );
+        match resolved {
+            Ok(mut config) => {
+                let mut report = std::mem::take(&mut config.diagnostics);
+                if let Some(name) = name.as_deref() {
+                    attribute(&mut report, name, &origins, &config_path);
+                }
+                reports.push(report);
+                specs.push(ResolvedSpec {
+                    name,
+                    origins,
+                    config,
+                });
+            }
+            Err(mut errors) => {
+                if let Some(name) = name.as_deref() {
+                    attribute(&mut errors, name, &origins, &config_path);
+                }
+                reports.push(errors);
+                failed = true;
+            }
+        }
+    }
+    diagnostics.append(&mut fold_shared(&mut reports));
+    if failed {
+        for report in reports {
+            diagnostics.extend(report);
+        }
+        diagnostics.sort();
+        return Err(diagnostics);
+    }
+    // Every target resolved, so the reports line up with the specs they came from.
+    for (spec, report) in specs.iter_mut().zip(reports) {
+        spec.config.diagnostics = report;
+    }
+    if let Err(mut overlaps) = check_output_overlap(&specs, source_path) {
+        diagnostics.append(&mut overlaps);
+        diagnostics.sort();
+        return Err(diagnostics);
+    }
+
+    diagnostics.sort();
+    Ok(ResolvedWorkspace {
+        config_path,
+        workspace_root,
+        diagnostics,
+        specs,
+    })
+}
+
+/// One compile target waiting to be resolved, with where its keys were written.
+struct WorkspaceTarget {
+    name: Option<String>,
+    target: SpecConfig,
+    origins: SpecOrigins,
+}
+
+/// Moves the target keys out of the root object.
+fn take_root_target(raw: &mut RawConfig) -> SpecConfig {
+    SpecConfig {
+        input: raw.input.take(),
+        output: raw.output.take(),
+        namespace: raw.namespace.take(),
+        filters: raw.filters.take(),
+        artifacts: raw.artifacts.take(),
+        types: raw.types.take(),
+        zod: raw.zod.take(),
+        client: raw.client.take(),
+        validation: raw.validation.take(),
+        naming: raw.naming.take(),
+        documentation: raw.documentation.take(),
+        emit: raw.emit.take(),
+        local: raw.local.take(),
+        limits: raw.limits.take(),
+        typescript: raw.typescript.take(),
+        compat: raw.compat.take(),
+    }
+}
+
+/// Builds one target per declared spec, refusing every way a workspace can say a thing twice.
+///
+/// A workspace has two places to write a target key and the root is neither of them, so a key at
+/// the root is refused rather than treated as a third source of defaults. Between the two real
+/// places the rule is the same one the rest of this config follows for options that cannot apply:
+/// declaring a block in both is an error, not a silent precedence.
+fn workspace_targets(
+    root: &SpecConfig,
+    shared: Option<SpecConfig>,
+    specs: BTreeMap<String, SpecConfig>,
+    source_path: &Path,
+    sink: &mut DiagnosticSink,
+) -> Vec<WorkspaceTarget> {
+    for (key, declared) in TARGET_KEYS {
+        if declared(root) {
+            sink.push(config_error(
+                CODE_SHAPE_CONFLICT,
+                format!(
+                    "{key} configures one spec, so a workspace declares it under shared or under \
+                     a spec, never at the root"
+                ),
+                Some(source_path),
+                Some(&format!("/{key}")),
+            ));
+        }
+    }
+    let shared = shared.unwrap_or_default();
+    for (key, declared) in SPEC_ONLY_KEYS {
+        if declared(&shared) {
+            sink.push(config_error(
+                CODE_SPEC_POSITION,
+                format!(
+                    "{key} names one spec's own document or output root, so it cannot be shared"
+                ),
+                Some(source_path),
+                Some(&format!("/shared/{key}")),
+            ));
+        }
+    }
+    if specs.is_empty() {
+        sink.push(config_error(
+            CODE_SPEC_EMPTY,
+            "specs must declare at least one spec",
+            Some(source_path),
+            Some("/specs"),
+        ));
+    }
+
+    let mut targets = Vec::new();
+    for (name, entry) in specs {
+        if !is_spec_name(&name) {
+            sink.push(config_error(
+                CODE_SPEC_NAME,
+                format!(
+                    "spec name '{name}' must be one or more ASCII letters, digits, '-', '_' or '.'"
+                ),
+                Some(source_path),
+                Some("/specs"),
+            ));
+        }
+        let prefix = format!("/specs/{name}");
+        let mut origins = BTreeMap::new();
+        for (key, declared) in TARGET_KEYS {
+            let own = declared(&entry);
+            // A spec-only key under `shared` was already refused above, and telling the reader to
+            // pick one of the two places would point at a place that is never right.
+            let shareable = !SPEC_ONLY_KEYS.iter().any(|(only, _)| *only == key);
+            if own && declared(&shared) && shareable {
+                sink.push(config_error(
+                    CODE_SPEC_CONFLICT,
+                    format!(
+                        "{key} is declared by both shared and spec '{name}'; declare it in exactly \
+                         one of them"
+                    ),
+                    Some(source_path),
+                    Some(&format!("{prefix}/{key}")),
+                ));
+            }
+            let origin = if own || !declared(&shared) {
+                prefix.clone()
+            } else {
+                SHARED_POINTER.to_owned()
+            };
+            origins.insert(key, origin);
+        }
+        targets.push(WorkspaceTarget {
+            name: Some(name),
+            target: merge_target(entry, &shared),
+            origins,
+        });
+    }
+    targets
+}
+
+/// Takes each block from the spec that declares it, falling back to `shared`.
+///
+/// Blocks are taken whole. A spec that declares `client` gets its own `client` and none of the
+/// shared one's keys, which is why declaring the same block in both places is refused above
+/// rather than merged key by key.
+fn merge_target(entry: SpecConfig, shared: &SpecConfig) -> SpecConfig {
+    SpecConfig {
+        input: entry.input.or_else(|| shared.input.clone()),
+        output: entry.output.or_else(|| shared.output.clone()),
+        namespace: entry.namespace.or_else(|| shared.namespace.clone()),
+        filters: entry.filters.or_else(|| shared.filters.clone()),
+        artifacts: entry.artifacts.or_else(|| shared.artifacts.clone()),
+        types: entry.types.or_else(|| shared.types.clone()),
+        zod: entry.zod.or(shared.zod),
+        client: entry.client.or_else(|| shared.client.clone()),
+        validation: entry.validation.or_else(|| shared.validation.clone()),
+        naming: entry.naming.or_else(|| shared.naming.clone()),
+        documentation: entry.documentation.or_else(|| shared.documentation.clone()),
+        emit: entry.emit.or_else(|| shared.emit.clone()),
+        local: entry.local.or_else(|| shared.local.clone()),
+        limits: entry.limits.or_else(|| shared.limits.clone()),
+        typescript: entry.typescript.or_else(|| shared.typescript.clone()),
+        compat: entry.compat.or(shared.compat),
+    }
+}
+
+/// Names a diagnostic's spec and re-anchors its pointer at the key's real position.
+///
+/// A target resolves against root-shaped pointers whichever shape it came from, so a workspace
+/// rewrites `/client` into `/shared/client` or `/specs/<name>/client` afterwards — whichever of
+/// the two the block was actually written in. Only a pointer into the configuration file is
+/// re-anchored: a document pointer names a place in the OpenAPI document, where `specs` does not
+/// reach.
+pub(crate) fn attribute(
+    diagnostics: &mut [Diagnostic],
+    spec: &str,
+    origins: &SpecOrigins,
+    config_path: &Path,
+) {
+    let config_source = config_path.to_string_lossy();
+    for diagnostic in diagnostics {
+        diagnostic.spec = Some(Box::from(spec));
+        if diagnostic.source_id.as_deref() != Some(config_source.as_ref()) {
+            continue;
+        }
+        if let Some(pointer) = diagnostic.json_pointer.as_deref() {
+            let head = pointer.trim_start_matches('/');
+            let key = head.split_once('/').map_or(head, |(key, _)| key);
+            if let Some(prefix) = origins.get(key) {
+                diagnostic.json_pointer = Some(format!("{prefix}{pointer}").into_boxed_str());
+            }
+        }
+    }
+}
+
+/// Folds a mistake in `shared` back into the one diagnostic it is.
+///
+/// Every spec resolves the shared block for itself, so a mistake there is reported once per spec,
+/// identical but for the name — one authoring mistake, N reports of it. Its pointer already says
+/// where it lives, so the folded copy needs no spec at all. A diagnostic only some specs produced
+/// is left as it is: a shared block can be wrong only in combination with what one spec adds to
+/// it, and that is that spec's report to make.
+fn fold_shared(reports: &mut [Vec<Diagnostic>]) -> Vec<Diagnostic> {
+    let target_count = reports.len();
+    let mut counts = BTreeMap::<Diagnostic, usize>::new();
+    for report in reports.iter() {
+        let mut seen = BTreeSet::new();
+        for diagnostic in report {
+            if let Some(key) = shared_key(diagnostic)
+                && seen.insert(key.clone())
+            {
+                *counts.entry(key).or_default() += 1;
+            }
+        }
+    }
+    let folded = counts
+        .into_iter()
+        .filter(|(_, seen)| *seen == target_count)
+        .map(|(key, _)| key)
+        .collect::<BTreeSet<_>>();
+    if folded.is_empty() {
+        return Vec::new();
+    }
+    for report in reports.iter_mut() {
+        report.retain(|diagnostic| shared_key(diagnostic).is_none_or(|key| !folded.contains(&key)));
+    }
+    folded.into_iter().collect()
+}
+
+/// The unattributed form of a diagnostic anchored in `shared`, or `None` for anything else.
+fn shared_key(diagnostic: &Diagnostic) -> Option<Diagnostic> {
+    let pointer = diagnostic.json_pointer.as_deref()?;
+    if pointer != SHARED_POINTER && !pointer.starts_with(SHARED_PREFIX) {
+        return None;
+    }
+    let mut key = diagnostic.clone();
+    key.spec = None;
+    Some(key)
+}
+
+/// Refuses two specs that would write into the same tree.
+///
+/// Each output root carries one ownership manifest naming every file the run owns there, and a
+/// write deletes the files the previous manifest listed and this one does not. Two specs seated
+/// at one root would take turns deleting each other's output even with disjoint file names, and a
+/// root nested inside another leaves the outer spec's stale-file pruning blind to the inner one.
+/// Roots that merely share a parent are untouched by this: nothing writes above its own root.
+fn check_output_overlap(specs: &[ResolvedSpec], source_path: &Path) -> Result<(), Vec<Diagnostic>> {
+    let mut diagnostics = Vec::new();
+    for (index, spec) in specs.iter().enumerate() {
+        for earlier in &specs[..index] {
+            let earlier_holds = contains_or_equals(&earlier.config.output, &spec.config.output);
+            let spec_holds = contains_or_equals(&spec.config.output, &earlier.config.output);
+            if !earlier_holds && !spec_holds {
+                continue;
+            }
+            // The nested root is the one to move, so it is the one named. Equal roots are held by
+            // each other, and the later-sorted spec answers for them.
+            let (offender, host) = if spec_holds && !earlier_holds {
+                (earlier, spec)
+            } else {
+                (spec, earlier)
+            };
+            // The inner loop only runs past the first spec, and only a workspace has a second.
+            if let (Some(name), Some(host_name)) = (offender.name.as_deref(), host.name.as_deref())
+            {
+                diagnostics.push(config_error(
+                    CODE_OUTPUT_OVERLAP,
+                    format!(
+                        "spec '{name}' writes into the tree spec '{host_name}' owns; every spec \
+                         needs an output root of its own"
+                    ),
+                    Some(source_path),
+                    Some(&format!("/specs/{name}/output")),
+                ));
+            }
+        }
+    }
+    if diagnostics.is_empty() {
+        return Ok(());
+    }
+    Err(diagnostics)
+}
+
+/// Whether `inner` is `outer`, or sits inside it, comparing components without ASCII case.
+///
+/// The guarantee this serves is about physical directories, not about path strings, and the two
+/// diverge. A symlink is resolved before a root gets here when it can be — a live link, whatever
+/// it points at, arrives as the directory it names — and refused when it cannot: a link whose
+/// target does not exist yet fails to canonicalize rather than being guessed at lexically. What
+/// no amount of resolving answers is case. A filesystem that ignores it — Windows, and a macOS
+/// volume by default — makes `Users` and `users` one directory, and a component that does not
+/// exist yet has no name on disk to ask about at all.
+///
+/// So case is decided conservatively, the same way wherever the run happens: two roots that
+/// differ only in case are treated as one. On a case-sensitive filesystem that refuses a
+/// workspace which would have worked, and the fix is a rename. Deciding it the other way costs
+/// one spec its output, silently, on the platforms where the two names really are one directory.
+fn contains_or_equals(outer: &Path, inner: &Path) -> bool {
+    let mut outer = outer.components();
+    let mut inner = inner.components();
+    loop {
+        match (outer.next(), inner.next()) {
+            (None, _) => return true,
+            (Some(_), None) => return false,
+            (Some(left), Some(right)) => {
+                if !left.as_os_str().eq_ignore_ascii_case(right.as_os_str()) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+/// Whether `name` is usable as a spec name, on the command line and in a JSON pointer.
+fn is_spec_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+/// Validates and resolves the keys that configure one compile target.
+///
+/// A single-spec config brings one of these, written at the root; a workspace brings one per
+/// spec, already merged with `shared`. Both arrive here, so the two shapes cannot drift apart.
+fn resolve_target(
+    config_path: &Path,
+    config_dir: &Path,
+    workspace_root: &Path,
+    schema: Option<String>,
+    remote: RemoteConfig,
+    watch: WatchConfig,
+    target: SpecConfig,
+) -> Result<ResolvedConfig, Vec<Diagnostic>> {
+    let mut sink = DiagnosticSink::new();
+    let input = resolve_input(
+        target.input.as_ref(),
+        workspace_root,
+        config_path,
         &mut sink,
     );
-    let filters = crate::filter::resolve(raw.filters.as_ref(), source_path, &mut sink);
+    let output = resolve_output(
+        target.output.as_deref(),
+        workspace_root,
+        config_path,
+        &mut sink,
+    );
+
+    let namespace = target.namespace.unwrap_or_else(|| "api".to_owned());
+    if !is_ts_identifier(&namespace) {
+        sink.push(config_error(
+            CODE_NAMESPACE,
+            format!("namespace '{namespace}' is not a valid TypeScript identifier"),
+            Some(config_path),
+            Some("/namespace"),
+        ));
+    }
+
+    let raw_artifacts = target.artifacts.unwrap_or_default();
+    let artifact_states = resolve_artifacts(raw_artifacts, config_path, &mut sink);
+    if target.types.is_some() && !artifact_states.types.enabled {
+        sink.push(config_error(
+            CODE_DISABLED_OPTIONS,
+            "types options are invalid while the types artifact is disabled",
+            Some(config_path),
+            Some("/types"),
+        ));
+    }
+    if target.zod.is_some() && !artifact_states.zod.enabled {
+        sink.push(config_error(
+            CODE_DISABLED_OPTIONS,
+            "zod options are invalid while the zod artifact is disabled",
+            Some(config_path),
+            Some("/zod"),
+        ));
+    }
+    if target.client.is_some() && !artifact_states.client.enabled {
+        sink.push(config_error(
+            CODE_DISABLED_OPTIONS,
+            "client options are invalid while the client artifact is disabled",
+            Some(config_path),
+            Some("/client"),
+        ));
+    }
+    if target.validation.is_some() && !artifact_states.client.enabled {
+        sink.push(config_error(
+            CODE_VALIDATION_WITHOUT_CLIENT,
+            "validation options require the client artifact to be enabled",
+            Some(config_path),
+            Some("/validation"),
+        ));
+    }
+    validate_client_combinations(
+        &artifact_states,
+        target.client.as_ref(),
+        target.validation.as_ref(),
+        config_path,
+        &mut sink,
+    );
+
+    let types = target.types.unwrap_or_default();
+    // The codecs are emitted under the client artifact and only run at client pipeline positions,
+    // so a transforming representation without the client artifact has nowhere to bind.
+    if (types.date_time != DateTimeRepresentation::String
+        || types.date != DateRepresentation::String
+        || types.integer != IntegerRepresentation::Number)
+        && !artifact_states.client.enabled
+    {
+        sink.push(config_error(
+            CODE_DATE_REPRESENTATION,
+            "non-string dateTime/date and bigint integer representations require the client artifact",
+            Some(config_path),
+            Some("/types"),
+        ));
+    }
+    if types.integer == IntegerRepresentation::Bigint && artifact_states.tanstack.enabled {
+        sink.push(config_error(
+            CODE_DATE_REPRESENTATION,
+            "types.integer 'bigint' is incompatible with TanStack query keys because their default JSON serialization rejects bigint values",
+            Some(config_path),
+            Some("/types/integer"),
+        ));
+    }
+
+    let naming = target.naming.unwrap_or_default();
+    validate_naming(&naming, config_path, &mut sink);
+    let documentation = target.documentation.unwrap_or_default();
+    let mut emit = target.emit.unwrap_or_default();
+    validate_emit(&emit, config_path, &mut sink);
+    emit.runtime_directory = normalize_directory(&emit.runtime_directory);
+    validate_directory_overlaps(&artifact_states, &emit, config_path, &mut sink);
+
+    let local = target.local.unwrap_or_default();
+    let local_allow_paths = resolve_local_paths(&local, config_dir, config_path, &mut sink);
+    let limits = target.limits.unwrap_or_default();
+    validate_limits(&limits, config_path, &mut sink);
+    let compat = target.compat.unwrap_or_default();
+
+    let tsconfig = resolve_tsconfig_source(
+        target.typescript.as_ref(),
+        workspace_root,
+        config_path,
+        &mut sink,
+    );
+    let filters = crate::filter::resolve(target.filters.as_ref(), config_path, &mut sink);
 
     let has_errors = sink.has_errors();
     let diagnostics = sink.into_sorted_vec();
@@ -1661,25 +2248,25 @@ pub fn resolve_config(
     // Both resolvers emit an error whenever they return `None`, and that path returned above.
     let input = input.expect("an unresolved input always emits a diagnostic");
     let output = output.expect("an unresolved output always emits a diagnostic");
-    let client = resolve_client_config(raw.client.as_ref(), artifact_states.client.enabled);
+    let client = resolve_client_config(target.client.as_ref(), artifact_states.client.enabled);
     let validation =
-        resolve_validation_config(raw.validation.as_ref(), artifact_states.client.enabled);
+        resolve_validation_config(target.validation.as_ref(), artifact_states.client.enabled);
     let artifacts = artifact_states.resolve();
 
     Ok(ResolvedConfig {
         diagnostics,
-        config_path,
-        config_dir,
-        schema: raw.schema,
+        config_path: config_path.to_path_buf(),
+        config_dir: config_dir.to_path_buf(),
+        schema,
         schema_version: 1,
-        workspace_root,
+        workspace_root: workspace_root.to_path_buf(),
         input,
         output,
         namespace,
         filters,
         artifacts,
         types,
-        zod: raw.zod.unwrap_or_default(),
+        zod: target.zod.unwrap_or_default(),
         client,
         validation,
         naming,
@@ -1846,8 +2433,8 @@ fn resolve_input(
 ) -> Option<PathBuf> {
     let Some(input) = input else {
         sink.push(config_error(
-            CODE_SINGLE_SHAPE,
-            "single-spec config requires input",
+            CODE_TARGET_SHAPE,
+            "input is required",
             Some(source),
             Some("/input"),
         ));
@@ -1957,6 +2544,29 @@ pub fn require_tsconfig_off(
     }
 }
 
+/// Refuses a workspace config on a host that seats exactly one document.
+///
+/// An in-memory host is handed one OpenAPI document and one config, and a workspace names several
+/// documents and several output roots. Left to run, every spec would be answered by the one
+/// document supplied, which is not what the config asked for.
+pub fn require_single_spec(raw: &RawConfig, config_path: &Path) -> Result<(), Diagnostic> {
+    for (present, pointer) in [
+        (raw.specs.is_some(), "/specs"),
+        (raw.shared.is_some(), "/shared"),
+    ] {
+        if present {
+            return Err(config_error(
+                CODE_SPEC_HOST,
+                "a workspace of several specs needs a host that can read several documents and \
+                 write several output roots",
+                Some(config_path),
+                Some(pointer),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Refuses `local.allowPaths`, which widens a trust boundary that has nothing behind it.
 ///
 /// Every entry names a directory outside the workspace root, and a host with no filesystem has no
@@ -2026,8 +2636,8 @@ fn resolve_output(
 ) -> Option<PathBuf> {
     let Some(output) = output else {
         sink.push(config_error(
-            CODE_SINGLE_SHAPE,
-            "single-spec config requires output",
+            CODE_TARGET_SHAPE,
+            "output is required",
             Some(source),
             Some("/output"),
         ));
@@ -2764,6 +3374,14 @@ fn resolve_below(base: &Path, relative: &Path, allow_equal: bool) -> Result<Path
         if candidate.exists() {
             return canonicalize_result(fs::canonicalize(&candidate), "path");
         }
+        // A path that does not exist yet still resolves through whatever of it does. Returning the
+        // lexical join instead would let two names for one directory — say a symlinked parent —
+        // look like two directories to anything that compares resolved paths, right up until the
+        // first run creates them and they turn out to be one.
+        let tail = candidate
+            .strip_prefix(&existing_ancestor)
+            .expect("the nearest existing ancestor is a prefix of the path");
+        return Ok(canonical_ancestor.join(tail));
     }
     Ok(candidate)
 }
@@ -2821,10 +3439,17 @@ fn normalize_config_path(path: PathBuf) -> PathBuf {
     }
 }
 
+/// The longest prefix of `path` that names something on disk.
+///
+/// Existence is asked of the name itself, not of what it points at: `Path::exists` follows a
+/// symlink, so a link whose target has not been created yet answers "absent" and the walk steps
+/// straight past the one component that decides where the path really goes. Stopping at the link
+/// instead makes canonicalizing it fail, which is the honest answer — this path cannot be placed
+/// yet — rather than a lexical guess that turns out wrong the moment something creates the target.
 fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let mut candidate = path.to_path_buf();
     loop {
-        if candidate.exists() {
+        if fs::symlink_metadata(&candidate).is_ok() {
             return Some(candidate);
         }
         if !candidate.pop() {
@@ -2876,7 +3501,9 @@ mod tests {
         let json = serde_json::to_vec(&valid_json_value()).expect("config JSON");
 
         let resolved = load_config_from_json_with_source(config_path, &json, &IdentitySource)
-            .expect("config resolves against a source with no filesystem");
+            .expect("config resolves against a source with no filesystem")
+            .into_single()
+            .expect("one target at the root");
 
         assert_eq!(resolved.config_dir, PathBuf::from("/workspace"));
         assert_eq!(resolved.config_path, PathBuf::from("/workspace/oasts.json"));
@@ -2958,15 +3585,45 @@ mod tests {
     fn load_yaml(contents: &str) -> Result<ResolvedConfig, Vec<Diagnostic>> {
         let directory = TestDirectory::new();
         let path = directory.write("config.yaml", contents);
-        load_config(Some(&path), directory.path())
+        load_single(Some(&path), directory.path())
     }
 
     fn load_json(value: &Value) -> Result<ResolvedConfig, Vec<Diagnostic>> {
         let directory = TestDirectory::new();
         let contents = serde_json::to_string(value).expect("test JSON should serialize");
         let path = directory.write("config.json", &contents);
+        load_single(Some(&path), directory.path())
+    }
+
+    fn load_workspace_yaml(contents: &str) -> Result<ResolvedWorkspace, Vec<Diagnostic>> {
+        let directory = TestDirectory::new();
+        let path = directory.write("config.yaml", contents);
+        directory.write("a.yaml", "");
+        directory.write("b.yaml", "");
         load_config(Some(&path), directory.path())
     }
+
+    fn assert_workspace_code(
+        result: Result<ResolvedWorkspace, Vec<Diagnostic>>,
+        code: &'static str,
+    ) -> Vec<Diagnostic> {
+        let diagnostics = result.expect_err("workspace config should be rejected");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "expected {code} in {diagnostics:#?}"
+        );
+        diagnostics
+    }
+
+    const TWO_SPECS: &str = r#"schemaVersion: 1
+specs:
+  users:
+    input: {path: ./b.yaml}
+    output: ./generated/users
+  billing:
+    input: {path: ./a.yaml}
+    output: ./generated/billing
+"#;
 
     fn assert_code(
         result: Result<ResolvedConfig, Vec<Diagnostic>>,
@@ -2995,7 +3652,7 @@ mod tests {
         let path = directory.write("config.yaml", valid_yaml());
 
         let resolved =
-            load_config(Some(&path), directory.path()).expect("valid config should resolve");
+            load_single(Some(&path), directory.path()).expect("valid config should resolve");
 
         assert_eq!(resolved.schema_version, 1);
         assert_eq!(resolved.config_dir, directory.path());
@@ -3049,9 +3706,9 @@ mod tests {
         let file = directory.write("oasts.json", std::str::from_utf8(json).expect("UTF-8"));
 
         let from_bytes =
-            load_config_from_json(&file, json).expect("JSON bytes config should resolve");
+            load_single_from_json(&file, json).expect("JSON bytes config should resolve");
         let from_file =
-            load_config(Some(&file), directory.path()).expect("file config should resolve");
+            load_single(Some(&file), directory.path()).expect("file config should resolve");
         assert_eq!(from_bytes.input, from_file.input);
         assert_eq!(from_bytes.output, from_file.output);
         assert_eq!(from_bytes.namespace, from_file.namespace);
@@ -3066,7 +3723,7 @@ mod tests {
         let relative = PathBuf::from("../../target")
             .join(relative_temp.path().file_name().expect("tempdir name"))
             .join("oasts.json");
-        let resolved = load_config_from_json(&relative, json).expect("relative path resolves");
+        let resolved = load_single_from_json(&relative, json).expect("relative path resolves");
         assert!(resolved.input.is_absolute());
     }
 
@@ -3081,7 +3738,7 @@ mod tests {
         file.write_all(&json).expect("config contents");
         let bare_path = PathBuf::from(file.path().file_name().expect("config file name"));
 
-        let resolved = load_config(Some(&bare_path), Path::new(""))
+        let resolved = load_single(Some(&bare_path), Path::new(""))
             .expect("bare relative config path should load");
 
         assert_eq!(
@@ -3106,8 +3763,8 @@ mod tests {
             .join(".")
             .join("oasts.json");
 
-        let direct = load_config_from_json(&canonical, json).expect("direct config path");
-        let normalized = load_config_from_json(&equivalent, json).expect("equivalent config path");
+        let direct = load_single_from_json(&canonical, json).expect("direct config path");
+        let normalized = load_single_from_json(&equivalent, json).expect("equivalent config path");
         assert_eq!(direct, normalized);
         assert_eq!(
             discover_candidate(directory.path(), Some(&equivalent))
@@ -3116,7 +3773,7 @@ mod tests {
             canonical
         );
 
-        let diagnostics = load_config_from_json(&equivalent, b"{").expect_err("malformed config");
+        let diagnostics = load_single_from_json(&equivalent, b"{").expect_err("malformed config");
         let rendered = crate::diag::render_to_string(diagnostics);
         assert!(rendered.contains(&canonical.to_string_lossy().into_owned()));
         assert!(!rendered.contains("/nested/../"));
@@ -3144,7 +3801,7 @@ mod tests {
             fs::canonicalize(config).expect("expected config should exist")
         );
 
-        let resolved = load_config_from_json(&through_symlink, json)
+        let resolved = load_single_from_json(&through_symlink, json)
             .expect("in-memory config path through symlink should resolve");
         let target = fs::canonicalize(target.path()).expect("target directory should exist");
         assert_eq!(resolved.config_dir, target);
@@ -3155,7 +3812,7 @@ mod tests {
     fn config_path_that_lexically_collapses_to_root_is_diagnosed() {
         let json = serde_json::to_vec(&valid_json_value()).expect("valid config JSON");
         for path in [Path::new("/missing/.."), Path::new("/")] {
-            assert_code(load_config_from_json(path, &json), CODE_CONFIG_READ);
+            assert_code(load_single_from_json(path, &json), CODE_CONFIG_READ);
         }
     }
 
@@ -3168,8 +3825,8 @@ mod tests {
         let file = directory.write("oasts.json", std::str::from_utf8(invalid).expect("UTF-8"));
 
         let from_bytes =
-            load_config_from_json(&file, invalid).expect_err("schemaVersion 2 is invalid");
-        let from_file = load_config(Some(&file), directory.path())
+            load_single_from_json(&file, invalid).expect_err("schemaVersion 2 is invalid");
+        let from_file = load_single(Some(&file), directory.path())
             .expect_err("file twin reports the same failure");
         let codes = |diagnostics: &[Diagnostic]| {
             diagnostics
@@ -3180,7 +3837,7 @@ mod tests {
         assert_eq!(codes(&from_bytes), codes(&from_file));
         assert!(codes(&from_bytes).contains(&CODE_SCHEMA_VERSION));
 
-        let malformed = load_config_from_json(&file, b"{").expect_err("malformed JSON");
+        let malformed = load_single_from_json(&file, b"{").expect_err("malformed JSON");
         assert_eq!(malformed.len(), 1);
         assert_eq!(malformed[0].code, CODE_CONFIG_PARSE);
         assert!(malformed[0].line.is_some());
@@ -3280,7 +3937,7 @@ mod tests {
         let directory = TestDirectory::new_relative();
         directory.write("oasts.yaml", valid_yaml());
 
-        let resolved = load_config(None, directory.path()).expect("relative config should load");
+        let resolved = load_single(None, directory.path()).expect("relative config should load");
         assert!(resolved.config_path.is_absolute());
     }
 
@@ -3304,7 +3961,7 @@ mod tests {
         let path = directory.write("config.yaml", valid_yaml());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
             .expect("config permissions should change");
-        let result = load_config(Some(&path), directory.path());
+        let result = load_single(Some(&path), directory.path());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
             .expect("config permissions should be restored");
         assert_code(result, CODE_CONFIG_READ);
@@ -3475,21 +4132,8 @@ mod tests {
     }
 
     #[test]
-    fn workspace_shape_reports_named_unsupported_feature() {
-        let value = json!({ "schemaVersion": 1, "specs": {} });
-        let diagnostics = assert_code(load_json(&value), CODE_WORKSPACE_UNSUPPORTED);
-        assert_eq!(
-            diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.code == CODE_SINGLE_SHAPE)
-                .count(),
-            0
-        );
-    }
-
-    #[test]
     fn missing_single_spec_fields_are_rule_6() {
-        assert_code(load_yaml("schemaVersion: 1\n"), CODE_SINGLE_SHAPE);
+        assert_code(load_yaml("schemaVersion: 1\n"), CODE_TARGET_SHAPE);
     }
 
     #[test]
@@ -3563,7 +4207,7 @@ mod tests {
             "schemaVersion: 1\nworkspaceRoot: escape\ninput: { path: openapi.yaml }\noutput: generated\n",
         );
         assert_code(
-            load_config(Some(&path), directory.path()),
+            load_single(Some(&path), directory.path()),
             CODE_WORKSPACE_ROOT,
         );
     }
@@ -3578,7 +4222,7 @@ mod tests {
             "schemaVersion: 1\nworkspaceRoot: workspace\ninput: { path: openapi.yaml }\noutput: generated\n",
         );
         let resolved =
-            load_config(Some(&path), directory.path()).expect("workspace should resolve");
+            load_single(Some(&path), directory.path()).expect("workspace should resolve");
         assert_eq!(resolved.workspace_root, directory.path().join("workspace"));
         assert_eq!(
             resolved.output,
@@ -3638,7 +4282,7 @@ mod tests {
         symlink(outside.path(), directory.path().join("generated"))
             .expect("test symlink should be created");
         let path = directory.write("config.yaml", valid_yaml());
-        assert_code(load_config(Some(&path), directory.path()), CODE_OUTPUT);
+        assert_code(load_single(Some(&path), directory.path()), CODE_OUTPUT);
     }
 
     #[test]
@@ -5324,6 +5968,448 @@ mod tests {
             matches!(paths.include[0].kind(), PatternKind::Exact),
             "a path-shaped string with no closing slash is exact"
         );
+    }
+
+    #[test]
+    fn target_keys_name_every_spec_config_field() {
+        let error = serde_json::from_value::<SpecConfig>(json!({ "notAKey": true }))
+            .expect_err("an unknown key is refused");
+        let message = error.to_string();
+        let listed = message
+            .split_once("expected one of ")
+            .expect("serde names the fields it expected")
+            .1;
+        let listed = listed
+            .split_once(" at line")
+            .map_or(listed, |(head, _)| head);
+        let fields = listed
+            .split(", ")
+            .map(|field| field.trim().trim_matches('`').to_owned())
+            .collect::<BTreeSet<_>>();
+        let table = TARGET_KEYS
+            .iter()
+            .map(|(key, _)| (*key).to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(fields, table);
+
+        let spec_only = SPEC_ONLY_KEYS
+            .iter()
+            .map(|(key, _)| (*key).to_owned())
+            .collect::<BTreeSet<_>>();
+        assert!(spec_only.is_subset(&table));
+    }
+
+    #[test]
+    fn a_workspace_resolves_every_spec_in_name_order() {
+        let workspace = load_workspace_yaml(&format!(
+            "{TWO_SPECS}shared:\n  namespace: shared\n  artifacts: {{types: true}}\n"
+        ))
+        .expect("workspace resolves");
+
+        assert!(workspace.is_workspace());
+        assert!(workspace.into_single().is_none());
+        let workspace = load_workspace_yaml(&format!(
+            "{TWO_SPECS}shared:\n  namespace: shared\n  artifacts: {{types: true}}\n"
+        ))
+        .expect("workspace resolves");
+        assert_eq!(
+            workspace
+                .specs
+                .iter()
+                .map(|spec| spec.name.as_deref().expect("named spec"))
+                .collect::<Vec<_>>(),
+            ["billing", "users"]
+        );
+        for spec in &workspace.specs {
+            assert_eq!(spec.config.namespace, "shared");
+            assert!(spec.config.artifacts.types.enabled);
+        }
+        assert!(
+            workspace.specs[0]
+                .config
+                .output
+                .ends_with("generated/billing")
+        );
+    }
+
+    #[test]
+    fn a_single_spec_config_resolves_to_one_unnamed_spec() {
+        let workspace =
+            load_workspace_yaml("schemaVersion: 1\ninput: {path: ./a.yaml}\noutput: ./generated\n")
+                .expect("single-spec config resolves");
+        assert!(!workspace.is_workspace());
+        assert_eq!(workspace.specs.len(), 1);
+        assert_eq!(workspace.specs[0].name, None);
+        assert!(workspace.diagnostics.is_empty());
+        assert!(workspace.into_single().is_some());
+    }
+
+    #[test]
+    fn a_target_key_at_the_root_of_a_workspace_is_refused() {
+        let diagnostics = assert_workspace_code(
+            load_workspace_yaml(&format!("{TWO_SPECS}namespace: api\n")),
+            CODE_SHAPE_CONFLICT,
+        );
+        assert_eq!(
+            diagnostics[0].json_pointer.as_deref(),
+            Some("/namespace"),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn shared_without_specs_is_refused() {
+        assert_workspace_code(
+            load_workspace_yaml(
+                "schemaVersion: 1\ninput: {path: ./a.yaml}\noutput: ./generated\nshared: {}\n",
+            ),
+            CODE_SHARED_WITHOUT_SPECS,
+        );
+    }
+
+    #[test]
+    fn input_and_output_cannot_be_shared() {
+        let diagnostics = assert_workspace_code(
+            load_workspace_yaml(&format!(
+                "{TWO_SPECS}shared:\n  input: {{path: ./a.yaml}}\n  output: ./generated/shared\n"
+            )),
+            CODE_SPEC_POSITION,
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_SPEC_POSITION)
+                .count(),
+            2
+        );
+        // The keys `shared` can never hold are refused once, not once more as a conflict.
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == CODE_SPEC_CONFLICT)
+        );
+    }
+
+    #[test]
+    fn a_block_declared_by_both_shared_and_a_spec_is_refused() {
+        let diagnostics = assert_workspace_code(
+            load_workspace_yaml(
+                "schemaVersion: 1\nshared:\n  naming: {}\nspecs:\n  billing:\n    input: {path: ./a.yaml}\n    output: ./generated/billing\n    naming: {}\n",
+            ),
+            CODE_SPEC_CONFLICT,
+        );
+        assert_eq!(
+            diagnostics[0].json_pointer.as_deref(),
+            Some("/specs/billing/naming")
+        );
+    }
+
+    #[test]
+    fn an_empty_or_badly_named_specs_block_is_refused() {
+        assert_workspace_code(
+            load_workspace_yaml("schemaVersion: 1\nspecs: {}\n"),
+            CODE_SPEC_EMPTY,
+        );
+        assert_workspace_code(
+            load_workspace_yaml(
+                "schemaVersion: 1\nspecs:\n  'a/b':\n    input: {path: ./a.yaml}\n    output: ./generated\n",
+            ),
+            CODE_SPEC_NAME,
+        );
+    }
+
+    #[test]
+    fn a_spec_missing_input_or_output_is_refused_where_it_was_written() {
+        let diagnostics = assert_workspace_code(
+            load_workspace_yaml("schemaVersion: 1\nspecs:\n  billing: {}\n"),
+            CODE_TARGET_SHAPE,
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.json_pointer.as_deref())
+                .collect::<Vec<_>>(),
+            ["/specs/billing/input", "/specs/billing/output"]
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.spec.as_deref() == Some("billing"))
+        );
+    }
+
+    #[test]
+    fn every_broken_spec_is_reported_in_one_run() {
+        let diagnostics = assert_workspace_code(
+            load_workspace_yaml(
+                "schemaVersion: 1\nspecs:\n  aaa: {output: ./generated/a}\n  zzz: {output: ./generated/z}\n",
+            ),
+            CODE_TARGET_SHAPE,
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.spec.as_deref())
+                .collect::<Vec<_>>(),
+            ["aaa", "zzz"]
+        );
+    }
+
+    #[test]
+    fn the_nested_output_root_is_the_one_named() {
+        // `aaa` sorts first either way, so the offender is decided by nesting, not by order.
+        for (first, second, offender, host) in [
+            ("./out/aaa", "./out/aaa/inner", "zzz", "aaa"),
+            ("./out/zzz/inner", "./out/zzz", "aaa", "zzz"),
+            ("./out/same", "./out/same", "zzz", "aaa"),
+        ] {
+            let diagnostics = assert_workspace_code(
+                load_workspace_yaml(&format!(
+                    "schemaVersion: 1\nspecs:\n  aaa:\n    input: {{path: ./a.yaml}}\n    output: {first}\n  zzz:\n    input: {{path: ./b.yaml}}\n    output: {second}\n"
+                )),
+                CODE_OUTPUT_OVERLAP,
+            );
+            assert_eq!(
+                diagnostics[0].json_pointer.as_deref(),
+                Some(&format!("/specs/{offender}/output")[..]),
+                "{first} vs {second}"
+            );
+            assert_eq!(
+                diagnostics[0].message,
+                format!(
+                    "spec '{offender}' writes into the tree spec '{host}' owns; every spec needs \
+                     an output root of its own"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn attribution_re_anchors_only_a_pointer_into_the_configuration() {
+        let config = Path::new("/workspace/oasts.yaml");
+        let origins = SpecOrigins::from([("naming", "/shared".to_owned())]);
+        let mut diagnostics = vec![
+            config_error(CODE_NAMING, "no pointer", Some(config), None),
+            config_error(
+                CODE_SCHEMA_VERSION,
+                "root key",
+                Some(config),
+                Some("/schemaVersion"),
+            ),
+            config_error(
+                CODE_NAMING,
+                "shared block",
+                Some(config),
+                Some("/naming/typeCase"),
+            ),
+            config_error(
+                CODE_NAMING,
+                "a document, not the config",
+                Some(Path::new("workspace/openapi.yaml")),
+                Some("/naming/typeCase"),
+            ),
+        ];
+
+        attribute(&mut diagnostics, "billing", &origins, config);
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.spec.as_deref() == Some("billing"))
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.json_pointer.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                None,
+                Some("/schemaVersion"),
+                Some("/shared/naming/typeCase"),
+                Some("/naming/typeCase"),
+            ]
+        );
+    }
+
+    /// Builds a two-spec workspace whose roots are `first` and `second`, and reports whether the
+    /// pair was refused as one output root.
+    fn roots_overlap(prepare: fn(&Path), first: &str, second: &str) -> bool {
+        let directory = TestDirectory::new();
+        prepare(directory.path());
+        directory.write("a.yaml", "");
+        directory.write("b.yaml", "");
+        let path = directory.write(
+            "config.yaml",
+            &format!(
+                "schemaVersion: 1\nspecs:\n  aaa:\n    input: {{path: ./a.yaml}}\n    output: {first}\n  zzz:\n    input: {{path: ./b.yaml}}\n    output: {second}\n"
+            ),
+        );
+        match load_config(Some(&path), directory.path()) {
+            Ok(_) => false,
+            Err(diagnostics) => {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == CODE_OUTPUT_OVERLAP),
+                    "{first} vs {second}: {diagnostics:#?}"
+                );
+                true
+            }
+        }
+    }
+
+    fn no_setup(_root: &Path) {}
+
+    #[test]
+    fn output_roots_that_name_one_directory_are_refused() {
+        // Spellings of one path, and nesting in both directions.
+        for (first, second) in [
+            ("./generated", "./generated"),
+            ("./generated/", "./generated"),
+            ("./generated/./inner", "./generated/inner"),
+            ("./generated", "./generated/inner"),
+            ("./generated/inner", "./generated"),
+            ("./generated/Inner", "./generated/inner"),
+            ("./Generated/inner", "./generated/inner"),
+        ] {
+            assert!(
+                roots_overlap(no_setup, first, second),
+                "{first} and {second} name one directory"
+            );
+        }
+    }
+
+    #[test]
+    fn output_roots_that_name_different_directories_are_kept() {
+        for (first, second) in [
+            ("./generated/aaa", "./generated/zzz"),
+            ("./generated", "./generated-zzz"),
+            ("./generated/inner", "./generated-inner"),
+        ] {
+            assert!(
+                !roots_overlap(no_setup, first, second),
+                "{first} and {second} are separate directories"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_aliased_output_root_is_refused_however_the_alias_is_spelled() {
+        use std::os::unix::fs::symlink;
+
+        fn live(root: &Path) {
+            fs::create_dir(root.join("real")).expect("alias target");
+            symlink("real", root.join("link")).expect("live symlink");
+        }
+
+        // A live alias, and a live alias standing in for a parent of the other root.
+        assert!(roots_overlap(live, "./real/out", "./link/out"));
+        assert!(roots_overlap(live, "./real", "./link/out"));
+        assert!(roots_overlap(live, "./link", "./real/out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_alias_is_refused_rather_than_resolved_lexically() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        // The alias target does not exist yet, which is what a fresh checkout looks like: the
+        // generated tree is absent, so a committed alias pointing into it is dangling. Resolving
+        // this lexically would call it a second root, and the first spec's run would make the
+        // alias live under the second.
+        symlink("generated", directory.path().join("alias")).expect("dangling symlink");
+        directory.write("a.yaml", "");
+        directory.write("b.yaml", "");
+        let path = directory.write(
+            "config.yaml",
+            "schemaVersion: 1\nspecs:\n  aaa:\n    input: {path: ./a.yaml}\n    output: ./generated/users\n  zzz:\n    input: {path: ./b.yaml}\n    output: ./alias/users\n",
+        );
+
+        let diagnostics =
+            assert_workspace_code(load_config(Some(&path), directory.path()), CODE_OUTPUT);
+        assert!(
+            diagnostics[0].message.contains("failed to canonicalize"),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn a_mistake_in_shared_is_reported_once() {
+        let diagnostics = assert_workspace_code(
+            load_workspace_yaml(&format!(
+                "{TWO_SPECS}shared:\n  namespace: 'not an identifier'\n"
+            )),
+            CODE_NAMESPACE,
+        );
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| (
+                    diagnostic.spec.as_deref(),
+                    diagnostic.json_pointer.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [(None, Some("/shared/namespace"))],
+            "one authoring mistake is one diagnostic, and its pointer says where"
+        );
+    }
+
+    #[test]
+    fn a_shared_block_wrong_for_only_one_spec_stays_that_specs_report() {
+        // `validation` needs the client artifact, which only one of the two specs turns on.
+        let diagnostics = assert_workspace_code(
+            load_workspace_yaml(
+                "schemaVersion: 1\nshared:\n  validation: {engine: \"off\", unchecked: allow}\nspecs:\n  aaa:\n    input: {path: ./a.yaml}\n    output: ./generated/aaa\n    artifacts: {types: true, client: true}\n    client: {authEnforcement: types}\n  zzz:\n    input: {path: ./b.yaml}\n    output: ./generated/zzz\n",
+            ),
+            CODE_VALIDATION_WITHOUT_CLIENT,
+        );
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == CODE_VALIDATION_WITHOUT_CLIENT)
+                .map(|diagnostic| (
+                    diagnostic.spec.as_deref(),
+                    diagnostic.json_pointer.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [(Some("zzz"), Some("/shared/validation"))]
+        );
+    }
+
+    #[test]
+    fn duplicate_spec_names_are_a_parse_error() {
+        assert_workspace_code(
+            load_workspace_yaml(
+                "schemaVersion: 1\nspecs:\n  billing:\n    input: {path: ./a.yaml}\n    output: ./x\n  billing:\n    input: {path: ./b.yaml}\n    output: ./y\n",
+            ),
+            CODE_CONFIG_PARSE,
+        );
+    }
+
+    #[test]
+    fn a_filesystem_free_host_refuses_a_workspace() {
+        for key in ["specs", "shared"] {
+            let raw = serde_json::from_value::<RawConfig>(json!({
+                "schemaVersion": 1,
+                key: json!({}),
+            }))
+            .expect("raw config parses");
+            let diagnostic = require_single_spec(&raw, Path::new("/workspace/oasts.json"))
+                .expect_err("a workspace needs a filesystem");
+            assert_eq!(diagnostic.code, CODE_SPEC_HOST);
+            assert_eq!(
+                diagnostic.json_pointer.as_deref(),
+                Some(&format!("/{key}")[..])
+            );
+        }
+        let raw = serde_json::from_value::<RawConfig>(json!({ "schemaVersion": 1 }))
+            .expect("raw config parses");
+        require_single_spec(&raw, Path::new("/workspace/oasts.json"))
+            .expect("a single-spec config is accepted");
     }
 }
 

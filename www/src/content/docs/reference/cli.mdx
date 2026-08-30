@@ -18,13 +18,9 @@ Commands:
 Options:
   --config <path>    Use an explicit configuration file
   --check            With generate: check committed output without writing
-  --spec <name>      Select a workspace spec (workspace configs are
-                     unsupported in this build; selecting one fails)
+  --spec <name>      Build only the named workspace spec; repeatable.
+                     Omit it to build every spec the configuration declares
 ```
-
-`--spec` is parsed but not implemented in this build.
-It is in the help text because the argument surface is fixed; using it exits `2` with the `OASTS9002` that workspace configs refuse under.
-That is a [provisional](/concepts/diagnostics) code, so it retires when the capability lands.
 
 ## `oasts generate`
 
@@ -68,6 +64,9 @@ Everything the last compile actually read or looked for, which is wider than the
 - the consumer's `tsconfig.json`, every file its `extends` chain reaches, and each `tsconfig.json` the [ancestor walk](/reference/configuration#typescript) looked for inside the workspace and did not find;
 - the `node_modules/zod` and `node_modules/msw` manifests the peer-version warnings were read from.
 
+A [workspace](/guides/workspaces) reports that set once per spec, and the session watches the union of them: a document two specs share is one path, and each spec's own output tree is filtered out of what counts as a change.
+Selecting specs with `--spec` narrows both — a session compiles what you selected and watches what those compiles read, and nothing else.
+
 The set is recomputed after every compile, so adding a `$ref` starts watching the file it points at.
 Directories are watched rather than individual files, which is what makes an editor's save-and-rename visible, and events are matched against that set before any of them counts — so the artifacts a run writes never wake the next one.
 When the operating system reports that it lost events without saying which, the session recompiles rather than guessing, because the one thing a watch may not do is serve output that is out of date.
@@ -102,6 +101,19 @@ How long it waits is [`watch.debounceMs`](/reference/configuration#watch), 100 m
 
 Only events that would themselves have started a compile keep that wait open, so a bundler writing into your output tree cannot postpone a recompile it is not part of.
 And the wait is capped at a second regardless: churn can delay a compile, but nothing can cancel one.
+
+## `--spec`
+
+Builds only the named spec of a [workspace configuration](/guides/workspaces), and repeats:
+
+<PackageManagers pkg="oasts" type="exec" args="generate --spec billing --spec users" />
+
+Omitting it builds every spec the configuration declares, in lexicographic name order.
+A name the configuration does not declare exits `2` with `OASTS0295`, which lists the names it does.
+Against a configuration that declares a single spec at the root, `--spec` exits `2` with `OASTS0296`.
+
+`watch` takes it too: a session compiles the specs you selected and watches exactly what those compiles read.
+Both selection refusals reach a session as [diagnostics like any other](#diagnostics-do-not-end-the-session) — reported, and then waited on, because adding the spec to the configuration is an edit the session is there to notice.
 
 ## `--config`
 

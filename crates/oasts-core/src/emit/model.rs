@@ -914,7 +914,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::config::load_config;
+    use crate::config::load_single;
     use crate::emit::source_digest;
     use crate::ir::{SchemaMeta, SchemaRef};
     use crate::loader::load_graph;
@@ -977,7 +977,7 @@ mod tests {
             serde_json::to_vec(&config).expect("config JSON"),
         )
         .expect("write config");
-        let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let mut resolved = load_single(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
         let graph =
@@ -2348,7 +2348,7 @@ mod wire_declaration_tests {
         use std::fs;
         use tempfile::TempDir;
 
-        use crate::config::load_config;
+        use crate::config::load_single;
         use crate::emit::source_digest;
         use crate::inputs::InputRecorder;
         use crate::loader::load_graph;
@@ -2379,7 +2379,7 @@ mod wire_declaration_tests {
             .expect("config JSON"),
         )
         .expect("write config");
-        let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let mut resolved = load_single(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
         let graph =

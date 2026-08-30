@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use napi_derive::napi;
 use oasts_core::config;
 use oasts_core::diag::{Diagnostic, Severity};
-use oasts_core::driver::{self, Command, ConfigSource, Outcome, Tracking, Unsupported};
-use oasts_core::inputs::InputKind;
+use oasts_core::driver::{self, Command, ConfigSource, Outcome, Tracking};
+use oasts_core::inputs::{InputKind, WatchInput};
 
 /// A config discovery result exposed to the Node CLI.
 #[napi(object)]
@@ -34,6 +34,8 @@ pub struct DiagnosticJs {
     pub severity: String,
     /// Human-readable message.
     pub message: String,
+    /// The workspace spec this diagnostic belongs to, when the run built one.
+    pub spec: Option<String>,
     /// Source file the diagnostic points at, when known.
     pub source_id: Option<String>,
     /// 1-based line, when known.
@@ -53,13 +55,24 @@ pub struct WatchInputJs {
     pub directory: bool,
 }
 
+/// What one spec of a compile read, and where it writes.
+#[napi(object)]
+pub struct SpecWatchPlanJs {
+    /// The `specs` key this plan answers for; absent for a config with one spec at the root.
+    pub name: Option<String>,
+    /// Every path this spec read or probed for, sorted and deduplicated.
+    pub inputs: Vec<WatchInputJs>,
+    /// The tree this spec writes into; never an input.
+    pub output_root: String,
+}
+
 /// What one compile left behind for a host that watches its inputs.
 #[napi(object)]
 pub struct WatchPlanJs {
-    /// Every path the run read or probed for, sorted and deduplicated.
+    /// The paths the configuration file itself decides, whichever spec is being built.
     pub inputs: Vec<WatchInputJs>,
-    /// The tree the run writes into; never an input.
-    pub output_root: Option<String>,
+    /// One plan per spec the run attempted, in the order the workspace declares them.
+    pub specs: Vec<SpecWatchPlanJs>,
     /// How long the filesystem must stay quiet before a change is compiled.
     pub debounce_ms: u32,
 }
@@ -95,7 +108,7 @@ pub struct RunOptions {
     pub command: String,
     /// Whether `generate` runs in `--check` drift mode.
     pub check: bool,
-    /// `--spec` selections; non-empty selections are unsupported locally.
+    /// `--spec` selections; empty builds every spec the configuration declares.
     pub specs: Vec<String>,
     /// Whether the run reports what a watching host would need to wait on.
     pub track_inputs: bool,
@@ -116,6 +129,13 @@ pub struct RunResult {
     pub watch_plan: Option<WatchPlanJs>,
 }
 
+fn to_watch_input_js(input: &WatchInput) -> WatchInputJs {
+    WatchInputJs {
+        path: input.path.to_string_lossy().into_owned(),
+        directory: input.kind == InputKind::Directory,
+    }
+}
+
 fn to_diagnostic_js(diagnostic: &Diagnostic) -> DiagnosticJs {
     DiagnosticJs {
         code: diagnostic.code.to_owned(),
@@ -124,10 +144,11 @@ fn to_diagnostic_js(diagnostic: &Diagnostic) -> DiagnosticJs {
             Severity::Warning => "warning".to_owned(),
         },
         message: diagnostic.message.clone(),
-        source_id: diagnostic.source_id.clone(),
+        spec: diagnostic.spec.as_deref().map(str::to_owned),
+        source_id: diagnostic.source_id.as_deref().map(str::to_owned),
         line: diagnostic.line,
         col: diagnostic.col,
-        json_pointer: diagnostic.json_pointer.clone(),
+        json_pointer: diagnostic.json_pointer.as_deref().map(str::to_owned),
     }
 }
 
@@ -199,17 +220,16 @@ fn render(outcome: Outcome) -> RunResult {
         rendered_stderr,
         diagnostics: outcome.diagnostics.iter().map(to_diagnostic_js).collect(),
         watch_plan: outcome.watch_plan.map(|plan| WatchPlanJs {
-            inputs: plan
-                .inputs
+            inputs: plan.inputs.iter().map(to_watch_input_js).collect(),
+            specs: plan
+                .specs
                 .iter()
-                .map(|input| WatchInputJs {
-                    path: input.path.to_string_lossy().into_owned(),
-                    directory: input.kind == InputKind::Directory,
+                .map(|spec| SpecWatchPlanJs {
+                    name: spec.name.clone(),
+                    inputs: spec.inputs.iter().map(to_watch_input_js).collect(),
+                    output_root: spec.output_root.to_string_lossy().into_owned(),
                 })
                 .collect(),
-            output_root: plan
-                .output_root
-                .map(|root| root.to_string_lossy().into_owned()),
             debounce_ms: plan.settings.debounce_ms,
         }),
     }
@@ -231,25 +251,11 @@ fn parse_command(name: &str, check: bool) -> napi::Result<Command> {
     }
 }
 
-/// The refusal for `--spec`, which selects a spec out of a workspace config.
-///
-/// The Node CLI asks before discovering a config, so selecting a spec never
-/// fails on a missing config file first. Answering here keeps every `OASTS`
-/// code in the core.
-#[napi]
-pub fn spec_refusal() -> RunResult {
-    render(driver::refuse(Unsupported::SpecSelection))
-}
-
 /// Runs `generate` or `check` for one already-discovered config.
 ///
 /// Throws for a command name neither front end can produce.
 #[napi]
 pub fn run(options: RunOptions) -> napi::Result<RunResult> {
-    if !options.specs.is_empty() {
-        return Ok(render(driver::refuse(Unsupported::SpecSelection)));
-    }
-
     let command = parse_command(&options.command, options.check)?;
     let config_path = Path::new(&options.config_path);
     let source = match options.config_json.as_deref() {
@@ -270,6 +276,7 @@ pub fn run(options: RunOptions) -> napi::Result<RunResult> {
     Ok(render(driver::run(
         command,
         source,
+        &options.specs,
         oasts_fetch::handle(),
         tracking,
     )))
@@ -419,7 +426,8 @@ mod tests {
         with_spec.specs = vec!["petstore".to_owned()];
         let spec_failure = run(with_spec).expect("a known command");
         assert_eq!(spec_failure.exit_code, 2);
-        assert_eq!(spec_failure.diagnostics[0].code, "OASTS9002");
+        assert_eq!(spec_failure.diagnostics[0].code, "OASTS0296");
+        assert_eq!(spec_failure.diagnostics[0].spec, None);
 
         let compile_failure = copy_fixture("petstore-3.0");
         fs::write(
@@ -473,20 +481,6 @@ mod tests {
         };
         assert!(error.reason.contains("unknown command 'chekc'"), "{error}");
         assert!(!temp.path().join("generated").exists());
-    }
-
-    #[test]
-    fn spec_refusal_is_the_workspace_code() {
-        let refusal = spec_refusal();
-        assert_eq!(refusal.exit_code, 2);
-        assert_eq!(refusal.diagnostics[0].code, "OASTS9002");
-        assert!(
-            refusal
-                .rendered_stderr
-                .contains("--spec selects a workspace spec"),
-            "{}",
-            refusal.rendered_stderr
-        );
     }
 
     #[test]

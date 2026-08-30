@@ -10,9 +10,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use oasts_core::diag::{self, Diagnostic};
-use oasts_core::driver::{
-    self, Command as DriverCommand, ConfigSource, Outcome, Tracking, Unsupported,
-};
+use oasts_core::driver::{self, Command as DriverCommand, ConfigSource, Outcome, Tracking};
 
 const CODE_CURRENT_DIR: &str = "OASTS1021";
 
@@ -33,7 +31,7 @@ enum Command {
         /// Use an explicit configuration file.
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
-        /// Select a workspace spec (unsupported in this build).
+        /// Build only the named workspace spec; repeatable.
         #[arg(long, value_name = "NAME")]
         spec: Vec<String>,
     },
@@ -42,7 +40,7 @@ enum Command {
         /// Use an explicit configuration file.
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
-        /// Select a workspace spec (unsupported in this build).
+        /// Build only the named workspace spec; repeatable.
         #[arg(long, value_name = "NAME")]
         spec: Vec<String>,
     },
@@ -51,7 +49,7 @@ enum Command {
         /// Use an explicit configuration file.
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
-        /// Select a workspace spec (unsupported in this build).
+        /// Build only the named workspace spec; repeatable.
         #[arg(long, value_name = "NAME")]
         spec: Vec<String>,
     },
@@ -164,19 +162,13 @@ fn dispatch(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
-    // `--spec` is refused before the config is read, matching where the napi host answers it.
-    // The Node CLI discovers the config in its own layer first, so an undiscoverable config
-    // reports the discovery failure there instead — same exit category either way, and only
-    // reachable on a run that was going to fail regardless.
-    if !specs.is_empty() {
-        return report(driver::refuse(Unsupported::SpecSelection), stdout, stderr);
-    }
     let outcome = driver::run(
         command,
         ConfigSource::Path {
             explicit: config_path,
             cwd,
         },
+        specs,
         oasts_fetch::handle(),
         Tracking::Off,
     );
@@ -803,18 +795,17 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_surfaces_refuse_with_the_core_diagnostics() {
+    fn selecting_a_spec_from_a_single_spec_config_refuses() {
         let configured = copy_fixture("petstore-3.0");
         for args in [
             vec!["oasts", "generate", "--spec", "petstore"],
             vec!["oasts", "check", "--spec", "petstore"],
             vec!["oasts", "generate", "--spec", "petstore", "--spec", "other"],
-            vec!["oasts", "watch", "--spec", "petstore"],
         ] {
             let (code, stdout, stderr) = invoke(&args, configured.path());
             assert_eq!(code, 2, "{args:?}: {stderr}");
             assert!(stdout.is_empty(), "{args:?}: {stdout}");
-            assert!(stderr.contains("error[OASTS9002]"), "{args:?}: {stderr}");
+            assert!(stderr.contains("error[OASTS0296]"), "{args:?}: {stderr}");
         }
     }
 
@@ -1104,5 +1095,178 @@ mod tests {
         assert_eq!(code, 0, "{stderr}");
         assert!(stderr.contains("OASTS0242"), "{stderr}");
         assert!(stderr.contains("^2.8.0"), "{stderr}");
+    }
+
+    fn workspace_fixture() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/petstore-3.0/openapi.yaml");
+        for name in ["billing.yaml", "users.yaml"] {
+            fs::copy(&source, temp.path().join(name)).expect("copy document");
+        }
+        fs::write(
+            temp.path().join("oasts.yaml"),
+            "schemaVersion: 1\nshared:\n  artifacts: {types: true}\nspecs:\n  \
+             users:\n    input: {path: ./users.yaml}\n    output: ./generated/users\n  \
+             billing:\n    input: {path: ./billing.yaml}\n    output: ./generated/billing\n",
+        )
+        .expect("workspace config");
+        temp
+    }
+
+    #[test]
+    fn a_workspace_builds_every_spec_and_selects_one() {
+        let temp = workspace_fixture();
+
+        let (code, stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
+        assert_eq!(code, 0, "{stderr}");
+        let lines = stdout.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "{stdout}");
+        assert!(lines[0].starts_with("billing: generated "), "{stdout}");
+        assert!(lines[1].starts_with("users: generated "), "{stdout}");
+
+        let (clean, _, stderr) = invoke(&["oasts", "generate", "--check"], temp.path());
+        assert_eq!(clean, 0, "{stderr}");
+
+        fs::write(
+            temp.path().join("generated/users/types/headers.ts"),
+            "// edited\n",
+        )
+        .expect("edit an owned file");
+        let (drifted, _, stderr) = invoke(&["oasts", "generate", "--check"], temp.path());
+        assert_eq!(drifted, 1);
+        assert!(
+            stderr.contains("edited: generated/users/types/headers.ts"),
+            "{stderr}"
+        );
+
+        let (selected, stdout, stderr) =
+            invoke(&["oasts", "generate", "--spec", "users"], temp.path());
+        assert_eq!(selected, 0, "{stderr}");
+        assert!(stdout.starts_with("users: generated "), "{stdout}");
+
+        let (unknown, _, stderr) = invoke(&["oasts", "check", "--spec", "nope"], temp.path());
+        assert_eq!(unknown, 2);
+        assert!(
+            stderr.contains(
+                "error[OASTS0295]: no spec named 'nope'; this workspace declares billing, users"
+            ),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn a_workspace_that_cannot_compile_one_spec_writes_nothing() {
+        let temp = workspace_fixture();
+        fs::write(
+            temp.path().join("users.yaml"),
+            "openapi: '2.0'\ninfo: {title: Invalid, version: 1.0.0}\npaths: {}\n",
+        )
+        .expect("broken document");
+
+        let (code, stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
+
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("spec 'users':"), "{stderr}");
+        assert!(!temp.path().join("generated").exists());
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_written_is_refused_before_any_root_is_written() {
+        let temp = workspace_fixture();
+        fs::create_dir_all(temp.path().join("generated")).expect("output parent");
+        fs::write(temp.path().join("generated/users"), "not a directory").expect("blocking file");
+
+        let (code, stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
+
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("spec 'users':"), "{stderr}");
+        assert!(!temp.path().join("generated/billing").exists());
+    }
+
+    /// Only the commit's own I/O reaches the write failure path, so this makes some.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_fails_mid_run_reports_the_specs_that_did_land() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = workspace_fixture();
+        let parent = temp.path().join("generated");
+        fs::create_dir_all(parent.join("billing")).expect("the first spec's root");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).expect("read-only parent");
+
+        let (code, stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("restore");
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stdout.starts_with("billing: generated "), "{stdout}");
+        assert!(stderr.contains("spec 'users':"), "{stderr}");
+        assert!(parent.join("billing/types").is_dir());
+    }
+
+    /// Drives the `watch` command through the real session, from argv down.
+    ///
+    /// It terminates because the session cannot register a watch on the unreadable directory the
+    /// entry document lives in — the one failure the loop is allowed to end on. The thread and
+    /// deadline only turn a session that refuses to end into a failure rather than a hang.
+    #[cfg(unix)]
+    #[test]
+    fn watch_runs_a_session_and_ends_on_a_directory_it_cannot_watch() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let documents = root.join("spec");
+        fs::create_dir_all(&documents).expect("document directory");
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/petstore-3.0/openapi.yaml"),
+            documents.join("openapi.yaml"),
+        )
+        .expect("copy document");
+        fs::write(
+            root.join("oasts.yaml"),
+            "schemaVersion: 1\ninput: {path: ./spec/openapi.yaml}\noutput: ./generated\nartifacts: {types: true}\n",
+        )
+        .expect("config");
+        fs::set_permissions(&documents, fs::Permissions::from_mode(0o000))
+            .expect("seal the directory");
+
+        let (finished, reader) = mpsc::channel();
+        let session_root = root.clone();
+        std::thread::spawn(move || {
+            let outcome = invoke(&["oasts", "watch"], &session_root);
+            let _ = finished.send(outcome);
+        });
+        let (code, _, stderr) = reader
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the session ends on a directory it cannot watch");
+        fs::set_permissions(&documents, fs::Permissions::from_mode(0o755)).expect("unseal");
+
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stderr.contains("error[OASTS1031]"), "{stderr}");
+    }
+
+    #[test]
+    fn two_specs_writing_into_one_tree_are_refused_before_any_write() {
+        let temp = workspace_fixture();
+        fs::write(
+            temp.path().join("oasts.yaml"),
+            "schemaVersion: 1\nspecs:\n  \
+             users:\n    input: {path: ./users.yaml}\n    output: ./generated\n  \
+             billing:\n    input: {path: ./billing.yaml}\n    output: ./generated/billing\n",
+        )
+        .expect("colliding config");
+
+        let (code, stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
+
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("error[OASTS0082]"), "{stderr}");
+        assert!(!temp.path().join("generated").exists());
     }
 }

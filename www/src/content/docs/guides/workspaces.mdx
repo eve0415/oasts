@@ -1,0 +1,134 @@
+---
+title: Several APIs in one project
+description: Declare several specs in one configuration, give each its own output root, and build one of them or all of them.
+sidebar:
+  order: 7
+---
+
+A project that consumes more than one API does not need more than one configuration file.
+A `specs` block names each one, and each spec gets its own document and its own output root:
+
+```yaml title="oasts.yaml"
+schemaVersion: 1
+specs:
+  billing:
+    input:
+      path: ./openapi.yaml
+    output: ./generated/billing
+    namespace: billing
+  users:
+    input:
+      path: ./openapi.yaml
+    output: ./generated/users
+    namespace: users
+```
+
+`oasts generate` builds every spec:
+
+```text
+billing: generated 42 files
+users: generated 18 files
+```
+
+A configuration takes one shape or the other.
+A root-level `input` and `output` describe a single spec; a `specs` block describes several, and then the root carries no spec keys at all.
+Writing `naming` beside `specs` is refused with `OASTS0062` rather than being read as a default, because a workspace already has a place for defaults.
+
+## Settings every spec shares
+
+That place is `shared`.
+Anything a spec would declare for itself can be declared there once, and every spec inherits it:
+
+```yaml title="oasts.yaml"
+schemaVersion: 1
+shared:
+  artifacts:
+    types: true
+    client: true
+  validation:
+    engine: off
+    unchecked: allow
+specs:
+  billing:
+    input:
+      path: ./openapi.yaml
+    output: ./generated/billing
+  users:
+    input:
+      path: ./openapi.yaml
+    output: ./generated/users
+    filters:
+      tags:
+        include: [pets]
+```
+
+`input` and `output` name one document and one output root, so they belong to a spec and are refused under `shared` with `OASTS0293`.
+Everything else may go in either place.
+
+Blocks are inherited whole, never merged key by key.
+A spec that declares `client` gets its own `client` and none of the shared one's keys — so declaring the same block in both places is refused with `OASTS0294` instead of one silently winning.
+To vary one setting across specs, take the block out of `shared` and write it in each spec.
+
+## Output roots
+
+Every spec owns its output root: the generated files there, and the manifest that records which files the compiler owns.
+A run deletes the files that manifest lists and this one no longer produces, so two specs seated at one root would take turns deleting each other's output even with completely different file names.
+
+Two specs whose output roots are the same, or where one is inside the other, are refused with `OASTS0082` — before any spec is compiled, and so before anything is written.
+Sharing a *parent* is fine and is what the examples above do: `./generated/billing` and `./generated/users` never touch each other.
+
+## Building one spec
+
+`--spec` names a spec to build, and repeats:
+
+<PackageManagers pkg="oasts" type="exec" args="generate --spec billing" />
+
+Only the named specs are compiled and written; the rest of the workspace is left alone.
+A name that matches nothing exits `2` with `OASTS0295`, which lists the specs the workspace does declare.
+Used against a single-spec configuration, `--spec` exits `2` with `OASTS0296` — there is nothing to select.
+Under [`oasts watch`](/reference/cli#oasts-watch) both are reported and waited on rather than exited, the same as every other diagnostic a session meets.
+
+The configuration file is validated as a whole whatever you select, so a broken spec elsewhere in the file still fails the run.
+Documents are only read for the specs being built.
+
+## When one spec fails
+
+Every selected spec compiles before anything is written.
+If any of them reports an error, nothing is written at all — the workspace is left exactly as the run found it, and you fix one report rather than discovering the next failure on the next run.
+
+Diagnostics are attributed to the spec they came from and grouped by it:
+
+```text
+error[OASTS2101]: spec 'users': unsupported OpenAPI version '2.0'; expected 3.0.x or 3.1.x
+  --> workspace/users.yaml:1:1 /openapi
+```
+
+Two specs that read the same document each report its diagnostics under their own name, because each is a separate compile with its own settings.
+
+A diagnostic about a configuration key points at where the key was actually written — `/shared/validation` when the block came from `shared`, `/specs/users/validation` when the spec declared it. A diagnostic about the document keeps its own pointer into the document.
+
+Every selected output root is then checked before the first of them is written: its root is free, its ownership manifest is readable, and every file it is about to produce lands inside it.
+A refusal any of those could have predicted leaves the whole workspace untouched, whichever spec it belongs to.
+
+What is left is the write itself, which is per output root.
+If the I/O of one spec's commit fails — a disk that fills, a permission that changes under the run, a parent directory that will not let a not-yet-existing root be created — that root rolls back on its own, the run stops there, exits `2`, and reports which specs were written before it.
+
+## Watching a workspace
+
+[`oasts watch`](/reference/cli#oasts-watch) compiles the specs you selected and then watches everything those compiles read, across every one of them.
+Each spec's output tree is filtered out of what counts as a change, so one spec's artifacts never wake a recompile of another.
+
+## Checking committed output
+
+`generate --check` compares every selected spec against what is on disk.
+In a workspace, drift lines name each file from the workspace root, so two specs' identically named files stay apart:
+
+```text
+missing: generated/billing/types/headers.ts
+edited: generated/users/types/operations/listusers.ts
+```
+
+## Order
+
+Specs build in name order — lexicographic by byte, so an uppercase name sorts before a lowercase one — and diagnostics are grouped in that same order.
+The same workspace produces the same bytes and the same report every time, which is what makes `--check` a gate rather than a heuristic — see [Determinism](/concepts/determinism).

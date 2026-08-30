@@ -20,12 +20,15 @@ pub fn load_fixture(fixture: &str) -> Result<ResolvedConfig, Error> {
             directory.display()
         )));
     }
-    load_config(Some(&config_path), &directory).map_err(|diagnostics| {
-        Error::new(format!(
-            "loading {fixture} config failed:\n{}",
-            diag::render_to_string(diagnostics)
-        ))
-    })
+    load_config(Some(&config_path), &directory)
+        .map_err(|diagnostics| {
+            Error::new(format!(
+                "loading {fixture} config failed:\n{}",
+                diag::render_to_string(diagnostics)
+            ))
+        })?
+        .into_single()
+        .ok_or_else(|| Error::new(format!("fixture '{fixture}' declares several specs")))
 }
 
 /// Runs the full in-process compile and retains the generated files until the caller has sampled

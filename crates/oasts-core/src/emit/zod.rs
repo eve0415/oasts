@@ -2190,7 +2190,7 @@ mod tests {
 
     use super::*;
     use crate::client_model::build_client_model;
-    use crate::config::load_config;
+    use crate::config::load_single;
     use crate::diag::{Diagnostic, DiagnosticSink, Severity};
     use crate::emit::{PARALLEL_EMIT_MIN_ITEMS, emit_artifacts, source_digest};
     use crate::loader::load_graph;
@@ -2226,7 +2226,7 @@ mod tests {
             serde_json::to_vec(&config).expect("config JSON"),
         )
         .expect("write config");
-        let resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let resolved = load_single(Some(&config_path), temp.path()).expect("config resolves");
         let mut sink = DiagnosticSink::new();
         let graph =
             load_graph(&resolved, &mut InputRecorder::off(), &mut sink).expect("graph loads");
@@ -2298,7 +2298,7 @@ mod tests {
             "schemaVersion: 1\ninput:\n  path: ./openapi.yaml\noutput: ./generated\nartifacts:\n  types: true\n  zod: true\n",
         )
         .expect("write config");
-        let resolved = load_config(None, temp.path()).expect("config resolves");
+        let resolved = load_single(None, temp.path()).expect("config resolves");
         let mut prepared = DiagnosticSink::new();
         let graph =
             load_graph(&resolved, &mut InputRecorder::off(), &mut prepared).expect("graph loads");
@@ -4141,7 +4141,7 @@ mod tests {
             .expect("config JSON"),
         )
         .expect("write config");
-        let resolved = load_config(Some(&temp.path().join("oasts.json")), temp.path())
+        let resolved = load_single(Some(&temp.path().join("oasts.json")), temp.path())
             .expect("config resolves");
         let analyzed = Analyzed {
             ir: crate::ir::Ir::default(),

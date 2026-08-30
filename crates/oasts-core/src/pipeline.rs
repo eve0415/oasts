@@ -113,9 +113,14 @@ pub fn compile_in_memory(
     crate::config::require_no_local_allow_paths(&raw, config_path)
         .map_err(|diagnostic| vec![diagnostic])?;
     crate::config::require_no_remote(&raw, config_path).map_err(|diagnostic| vec![diagnostic])?;
+    crate::config::require_single_spec(&raw, config_path).map_err(|diagnostic| vec![diagnostic])?;
 
     let mut source = MemorySource::new(MEMORY_ROOT);
-    let mut config = crate::config::resolve_config(config_path.to_path_buf(), raw, &source)?;
+    let workspace = crate::config::resolve_config(config_path.to_path_buf(), raw, &source)?;
+    // `require_single_spec` refused every workspace shape above, so exactly one target survives.
+    let mut config = workspace
+        .into_single()
+        .expect("a config without specs resolves to exactly one target");
     // Stated rather than inherited: `require_tsconfig_off` has already refused every config that
     // asked for anything else, so this only closes the gap left by an absent key.
     config.tsconfig = TsconfigSource::Off;
@@ -150,7 +155,7 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
-    use crate::config::{load_config, load_config_from_json};
+    use crate::config::{load_single, load_single_from_json};
 
     /// Builds a document wide enough to cross `PARALLEL_PARSE_MIN_ITEMS`, which no fixture in the
     /// repository does, so parse takes its rayon branch rather than the sequential fallback.
@@ -193,6 +198,28 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_config_needs_a_host_with_a_filesystem() {
+        for block in ["specs", "shared"] {
+            let config = json!({
+                "schemaVersion": 1,
+                "input": { "path": "./openapi.yaml" },
+                "output": "./generated",
+                "typescript": { "tsconfig": "off" },
+                block: json!({}),
+            });
+            let diagnostics = compile_in_memory(b"", &serde_json::to_vec(&config).expect("config"))
+                .expect_err("a workspace needs several documents and several output roots");
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                ["OASTS0297"]
+            );
+        }
+    }
+
+    #[test]
     fn compiling_in_memory_emits_the_bytes_the_filesystem_path_emits() {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         let documents = [
@@ -205,7 +232,7 @@ mod tests {
         for spec in documents {
             let temp = tempfile::tempdir().expect("tempdir");
             fs::write(temp.path().join("openapi.yaml"), &spec).expect("OpenAPI document");
-            let config = load_config_from_json(&temp.path().join("oasts.json"), &config_json)
+            let config = load_single_from_json(&temp.path().join("oasts.json"), &config_json)
                 .expect("config");
 
             let mut sink = DiagnosticSink::new();
@@ -334,7 +361,7 @@ mod tests {
             ),
         )
         .expect("config");
-        let config = load_config(Some(&temp.path().join("oasts.yaml")), temp.path())
+        let config = load_single(Some(&temp.path().join("oasts.yaml")), temp.path())
             .expect("a pinned retrieval config resolves");
 
         let compile_once = || {
@@ -474,7 +501,7 @@ paths:
             },
             "validation": { "engine": "generated", "request": true, "response": true }
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&raw).expect("config JSON"),
         )
@@ -514,7 +541,7 @@ paths:
         for file_name in ["openapi.yaml", "oasts.yaml"] {
             fs::copy(source.join(file_name), temp.path().join(file_name)).expect("copy fixture");
         }
-        let config = load_config(None, temp.path()).expect("resolved config");
+        let config = load_single(None, temp.path()).expect("resolved config");
 
         let mut sink = DiagnosticSink::new();
         let files = compile(
@@ -574,7 +601,7 @@ components:
                 "validators": { "directory": "types" }
             }
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&raw).expect("config JSON"),
         )
@@ -632,7 +659,7 @@ components:
                 "zod": { "directory": "types" }
             }
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&raw).expect("config JSON"),
         )
@@ -699,7 +726,7 @@ components:
                 "output": "generated",
                 "artifacts": artifacts
             });
-            let config = load_config_from_json(
+            let config = load_single_from_json(
                 &temp.path().join("oasts.json"),
                 &serde_json::to_vec(&raw).expect("config JSON"),
             )
@@ -737,7 +764,7 @@ components:
             "schemaVersion: 1\ninput: { path: ./missing.yaml }\noutput: ./generated\n",
         )
         .expect("config");
-        let config = load_config(None, temp.path()).expect("resolved config");
+        let config = load_single(None, temp.path()).expect("resolved config");
 
         let mut sink = DiagnosticSink::new();
         assert!(
@@ -767,7 +794,7 @@ components:
             "output": "generated",
             "naming": { "overrides": { "schemas": { "Missing": "Missing" } } }
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&raw).expect("config JSON"),
         )
@@ -819,7 +846,7 @@ components:
             "client": { "authEnforcement": "types" },
             "validation": { "engine": "off", "unchecked": "allow" }
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&raw).expect("config JSON"),
         )
@@ -869,7 +896,7 @@ components:
             "input": { "path": "openapi.yaml" },
             "output": "generated-types"
         });
-        let types_only = load_config_from_json(
+        let types_only = load_single_from_json(
             &temp.path().join("oasts-types.json"),
             &serde_json::to_vec(&types_only).expect("types config JSON"),
         )
@@ -925,7 +952,7 @@ paths:
                 raw["client"] = json!({ "authEnforcement": "types" });
                 raw["validation"] = json!({ "engine": "off", "unchecked": "allow" });
             }
-            load_config_from_json(
+            load_single_from_json(
                 &temp.path().join(format!("oasts-{name}.json")),
                 &serde_json::to_vec(&raw).expect("config JSON"),
             )
@@ -997,7 +1024,7 @@ paths:
             "client": { "authEnforcement": "types" },
             "validation": { "engine": "off", "unchecked": "allow" }
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&raw).expect("config JSON"),
         )
@@ -1105,7 +1132,7 @@ paths:
         if let Some(filters) = filters {
             raw["filters"] = filters;
         }
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&raw).expect("config JSON"),
         )
@@ -1378,7 +1405,7 @@ webhooks:
             "input": { "path": "openapi.yaml" },
             "output": "generated"
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&base).expect("config JSON"),
         )
@@ -1420,7 +1447,7 @@ webhooks:
                 }
             }
         });
-        let config = load_config_from_json(
+        let config = load_single_from_json(
             &temp.path().join("oasts.json"),
             &serde_json::to_vec(&resolved).expect("config JSON"),
         )
@@ -1912,7 +1939,7 @@ content:
     fn client_showcase_fixture_compiles_with_aggregate() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/client-showcase-3.1");
-        let config = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+        let config = load_single(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved showcase config");
         let mut sink = DiagnosticSink::new();
         let files = compile(
@@ -1937,7 +1964,7 @@ content:
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/msw-response-media-parity-3.1");
         let diagnostics = |config_name: &str| {
-            let config = load_config(Some(&fixture.join(config_name)), &fixture)
+            let config = load_single(Some(&fixture.join(config_name)), &fixture)
                 .expect("resolved response media config");
             let mut sink = DiagnosticSink::new();
             assert!(
@@ -1978,7 +2005,7 @@ content:
     fn uninhabitable_allof_fixture_emits_every_artifact() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/uninhabitable-allof-3.0");
-        let config = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+        let config = load_single(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved fixture config");
         let mut sink = DiagnosticSink::new();
         let files = compile(
@@ -2028,7 +2055,7 @@ content:
     fn filters_showcase(config: &str) -> (DiagnosticSink, Option<Vec<crate::emit::GeneratedFile>>) {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/filters-showcase-3.1");
-        let config = load_config(Some(&fixture.join(config)), &fixture)
+        let config = load_single(Some(&fixture.join(config)), &fixture)
             .expect("resolved showcase fixture config");
         let mut sink = DiagnosticSink::new();
         let files = compile(
@@ -2239,7 +2266,7 @@ paths:
     fn filters_rejection(config: &str) -> Vec<crate::diag::Diagnostic> {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/filters-rejection-3.1");
-        match load_config(Some(&fixture.join(config)), &fixture) {
+        match load_single(Some(&fixture.join(config)), &fixture) {
             // A malformed pattern fails before any document is loaded.
             Err(diagnostics) => diagnostics,
             Ok(resolved) => {
@@ -2285,7 +2312,7 @@ paths:
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/dialect-siblings-3.0");
 
         // The types artifact drops only the unrepresentable conjunct, so it warns and generates.
-        let types = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+        let types = load_single(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved dialect-siblings types config");
         let mut sink = DiagnosticSink::new();
         let files = compile(
@@ -2333,7 +2360,7 @@ paths:
 
         // The validators artifact refuses each dropped keyword by name at the node that carried
         // it, so a preserved node never ships a check that ignores the constraint it dropped.
-        let validators = load_config(Some(&fixture.join("oasts-validators.yaml")), &fixture)
+        let validators = load_single(Some(&fixture.join("oasts-validators.yaml")), &fixture)
             .expect("resolved dialect-siblings validators config");
         let mut sink = DiagnosticSink::new();
         assert!(
@@ -2421,7 +2448,7 @@ paths:
     fn operation_ref_rejection_fixture_emits_only_the_cause_and_no_files() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/operation-ref-rejection-3.0");
-        let config = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
+        let config = load_single(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved rejection fixture config");
         let mut sink = DiagnosticSink::new();
         let files = compile(

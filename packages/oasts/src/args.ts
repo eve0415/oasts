@@ -1,6 +1,6 @@
 /**
- * Argument parsing for the Node CLI, mirroring the Rust CLI's command
- * surface plus the Node-only `--spec`.
+ * Argument parsing for the Node CLI, mirroring the Rust CLI's command and
+ * option surface.
  */
 
 import { ok } from "node:assert";
@@ -27,8 +27,8 @@ Commands:
 Options:
   --config <path>    Use an explicit configuration file
   --check            With generate: check committed output without writing
-  --spec <name>      Select a workspace spec (workspace configs are
-                     unsupported in this build; selecting one fails)
+  --spec <name>      Build only the named workspace spec; repeatable.
+                     Omit it to build every spec the configuration declares
 `;
 
 function parseRaw(argv: readonly string[]) {

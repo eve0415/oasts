@@ -552,7 +552,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::config::{ResolvedConfig, load_config_from_json};
+    use crate::config::{ResolvedConfig, load_single_from_json};
     use crate::diag::DiagnosticSink;
     use crate::semantic::Analyzed;
 
@@ -571,7 +571,7 @@ mod tests {
             .expect("object")
             .extend(patch.as_object().expect("patch object").clone());
         let encoded = serde_json::to_vec(&raw).expect("config JSON");
-        let config = load_config_from_json(&temp.path().join("oasts.json"), &encoded)
+        let config = load_single_from_json(&temp.path().join("oasts.json"), &encoded)
             .expect("resolved config");
         (temp, config)
     }

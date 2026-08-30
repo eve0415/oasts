@@ -26,11 +26,6 @@ async function dispatch(
 ): Promise<number> {
   const args = parse(argv);
   const native = await loadNative();
-  // `--spec` is refused before the config is read, matching where the standalone binary answers it.
-  if (args.specs.length > 0) {
-    const refusal = native.specRefusal();
-    throw new CliFailure(refusal.exitCode, refusal.renderedStderr);
-  }
   if (args.command === "watch") {
     return await session(
       new FsChanges(),

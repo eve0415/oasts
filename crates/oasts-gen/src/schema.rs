@@ -3,7 +3,8 @@ use serde_json::{Map, Value};
 pub fn config_schema() -> Value {
     let mut schema = oasts_core::config::config_json_schema();
     strip_null_variants(&mut schema);
-    set_root_required(&mut schema);
+    derive_shared_config(&mut schema);
+    set_root_shapes(&mut schema);
     finalize_metadata(&mut schema);
     schema
 }
@@ -69,18 +70,149 @@ fn strip_null_from_type_array(map: &mut Map<String, Value>) {
     }
 }
 
-fn set_root_required(schema: &mut Value) {
-    let Some(obj) = schema.as_object_mut() else {
-        return;
-    };
+/// Derives `shared` from `SpecConfig`, minus the two keys that name one spec.
+///
+/// The compiler refuses `input` and `output` under `shared` because they name one document and
+/// one output root, so the published schema refuses them too rather than leaving an editor to
+/// suggest a key the compiler will reject.
+fn derive_shared_config(schema: &mut Value) {
+    constrain_specs(schema);
+    let mut shared = schema["$defs"]["SpecConfig"].clone();
+    // Rebuilt rather than removed key by key: the map is order-preserving, and its `remove` fills
+    // the hole from the end, which would leave `shared` listing its keys in a different order from
+    // the spec it is derived from.
+    let properties = shared["properties"]
+        .as_object()
+        .expect("SpecConfig is an object schema with properties")
+        .iter()
+        .filter(|(key, _)| !spec_only_keys().contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Map<String, Value>>();
+    shared["properties"] = Value::Object(properties);
+    shared
+        .as_object_mut()
+        .expect("SpecConfig is an object schema")
+        .remove("required");
+    shared["description"] = Value::String(
+        "Settings every spec in the workspace inherits. A spec that declares the same block \
+         overrides nothing: declaring a block in both places is an error."
+            .into(),
+    );
+    schema["$defs"]["SharedConfig"] = shared;
+    schema["properties"]["shared"] = Value::Object(Map::from_iter([(
+        "$ref".into(),
+        Value::String("#/$defs/SharedConfig".into()),
+    )]));
+}
+
+/// States on `specs` what the compiler enforces about it.
+///
+/// A spec needs its own document and output root, a name has to be usable on the command line and
+/// in a JSON pointer, and a workspace with no specs in it compiles nothing. `shared` never supplies
+/// `input` or `output`, so requiring them of a spec refuses nothing the compiler accepts.
+fn constrain_specs(schema: &mut Value) {
+    let spec = schema["$defs"]["SpecConfig"]
+        .as_object_mut()
+        .expect("SpecConfig is an object schema");
+    spec.insert(
+        "required".into(),
+        Value::Array(
+            spec_only_keys()
+                .iter()
+                .map(|key| Value::String((*key).into()))
+                .collect(),
+        ),
+    );
+
+    let specs = schema["properties"]["specs"]
+        .as_object_mut()
+        .expect("specs is an object schema");
+    specs.insert("minProperties".into(), Value::from(1));
+    specs.insert(
+        "propertyNames".into(),
+        Value::Object(Map::from_iter([(
+            "pattern".into(),
+            Value::String("^[A-Za-z0-9._-]+$".into()),
+        )])),
+    );
+}
+
+/// The keys that configure one compile target, taken from the one place they are declared.
+fn target_keys(schema: &Value) -> Vec<String> {
+    schema["$defs"]["SpecConfig"]["properties"]
+        .as_object()
+        .expect("SpecConfig is an object schema with properties")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+fn spec_only_keys() -> [&'static str; 2] {
+    ["input", "output"]
+}
+
+/// States the two shapes a configuration can take, and that it takes exactly one of them.
+///
+/// A single-spec config names one document and one output root at the root. A workspace names
+/// several under `specs`, and then the root carries no target keys at all — `shared` is where the
+/// settings they agree on go.
+fn set_root_shapes(schema: &mut Value) {
+    let target = target_keys(schema);
+    let mut workspace_forbids = Map::new();
+    for key in &target {
+        workspace_forbids.insert(key.clone(), Value::Bool(false));
+    }
+    let mut single_forbids = Map::new();
+    for key in ["specs", "shared"] {
+        single_forbids.insert(key.into(), Value::Bool(false));
+    }
+
+    let obj = schema
+        .as_object_mut()
+        .expect("the generated config schema is an object");
     obj.insert(
         "required".into(),
+        Value::Array(vec![Value::String("schemaVersion".into())]),
+    );
+    obj.insert(
+        "oneOf".into(),
         Value::Array(vec![
-            Value::String("schemaVersion".into()),
-            Value::String("input".into()),
-            Value::String("output".into()),
+            shape(
+                "SingleSpecConfig",
+                "One document compiled into one output root.",
+                &["input", "output"],
+                single_forbids,
+            ),
+            shape(
+                "WorkspaceConfig",
+                "Several named specs, each compiled into an output root of its own.",
+                &["specs"],
+                workspace_forbids,
+            ),
         ]),
     );
+}
+
+fn shape(
+    title: &str,
+    description: &str,
+    required: &[&str],
+    forbidden: Map<String, Value>,
+) -> Value {
+    Value::Object(Map::from_iter([
+        ("title".into(), Value::String(title.into())),
+        ("description".into(), Value::String(description.into())),
+        (
+            "required".into(),
+            Value::Array(
+                required
+                    .iter()
+                    .map(|key| Value::String((*key).into()))
+                    .collect(),
+            ),
+        ),
+        ("properties".into(), Value::Object(forbidden)),
+    ]))
 }
 
 fn finalize_metadata(schema: &mut Value) {
@@ -140,7 +272,75 @@ mod tests {
         let schema = config_schema();
         let required = schema["required"].as_array().expect("required array");
         let values: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
-        assert_eq!(values, ["schemaVersion", "input", "output"]);
+        assert_eq!(values, ["schemaVersion"]);
+    }
+
+    #[test]
+    fn the_two_shapes_are_exclusive() {
+        let schema = config_schema();
+        let shapes = schema["oneOf"].as_array().expect("root shape branches");
+        assert_eq!(shapes.len(), 2);
+        assert_eq!(shapes[0]["title"], json!("SingleSpecConfig"));
+        assert_eq!(shapes[0]["required"], json!(["input", "output"]));
+        assert_eq!(shapes[0]["properties"]["specs"], json!(false));
+        assert_eq!(shapes[0]["properties"]["shared"], json!(false));
+
+        assert_eq!(shapes[1]["title"], json!("WorkspaceConfig"));
+        assert_eq!(shapes[1]["required"], json!(["specs"]));
+        let forbidden = shapes[1]["properties"]
+            .as_object()
+            .expect("the workspace shape forbids the target keys");
+        let target = schema["$defs"]["SpecConfig"]["properties"]
+            .as_object()
+            .expect("SpecConfig properties");
+        assert_eq!(
+            forbidden.keys().collect::<Vec<_>>(),
+            target.keys().collect::<Vec<_>>()
+        );
+        assert!(forbidden.values().all(|value| value == &json!(false)));
+    }
+
+    #[test]
+    fn specs_state_what_the_compiler_enforces() {
+        let schema = config_schema();
+        assert_eq!(
+            schema["$defs"]["SpecConfig"]["required"],
+            json!(["input", "output"])
+        );
+        assert_eq!(schema["properties"]["specs"]["minProperties"], json!(1));
+        assert_eq!(
+            schema["properties"]["specs"]["propertyNames"]["pattern"],
+            json!("^[A-Za-z0-9._-]+$")
+        );
+        assert!(
+            schema["$defs"]["SharedConfig"]
+                .as_object()
+                .expect("SharedConfig")
+                .get("required")
+                .is_none(),
+            "shared can never supply input or output"
+        );
+    }
+
+    #[test]
+    fn shared_drops_the_keys_that_name_one_spec() {
+        let schema = config_schema();
+        assert_eq!(
+            schema["properties"]["shared"]["$ref"],
+            json!("#/$defs/SharedConfig")
+        );
+        let shared = schema["$defs"]["SharedConfig"]["properties"]
+            .as_object()
+            .expect("SharedConfig properties");
+        assert!(!shared.contains_key("input") && !shared.contains_key("output"));
+        let spec = schema["$defs"]["SpecConfig"]["properties"]
+            .as_object()
+            .expect("SpecConfig properties");
+        assert_eq!(shared.len() + 2, spec.len());
+        assert_eq!(
+            schema["properties"]["specs"]["additionalProperties"]["$ref"],
+            json!("#/$defs/SpecConfig")
+        );
     }
 
     #[test]
@@ -325,25 +525,10 @@ mod tests {
     }
 
     #[test]
-    fn set_root_required_adds_array() {
-        let mut schema = json!({});
-        set_root_required(&mut schema);
-        let required = schema["required"].as_array().unwrap();
-        assert_eq!(required.len(), 3);
-    }
-
-    #[test]
     fn strip_null_handles_non_object() {
         let mut value = json!("just a string");
         strip_null_variants(&mut value);
         assert_eq!(value, json!("just a string"));
-    }
-
-    #[test]
-    fn set_root_required_noop_on_non_object() {
-        let mut value = json!("not an object");
-        set_root_required(&mut value);
-        assert_eq!(value, json!("not an object"));
     }
 
     #[test]

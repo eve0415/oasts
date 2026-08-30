@@ -1,6 +1,6 @@
 ---
 title: Guides
-description: Working practices — the transport, auth, streaming, dates, filtering, and naming.
+description: Working practices — the transport, auth, streaming, dates, filtering, naming, and multi-spec workspaces.
 sidebar:
   order: 4
   group:
@@ -27,6 +27,10 @@ sidebar:
   <Card title="Generating a slice" icon="ph:funnel">
     Narrow a large document by tag, operation, path, or method — and why a filter that stops matching fails the build.
     [Read more](/guides/filters).
+  </Card>
+  <Card title="Several APIs in one project" icon="ph:squares-four">
+    Declare several specs in one configuration, give each its own output root, and build one of them or all of them.
+    [Read more](/guides/workspaces).
   </Card>
   <Card title="Dates and times" icon="ph:calendar-blank">
     Make a `date-time` schema a `Date` or a `Temporal` value in your code while the wire keeps its string.

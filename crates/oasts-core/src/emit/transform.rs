@@ -2983,7 +2983,7 @@ mod tests {
     use crate::client_model::{
         FieldSerializationPlan, FieldWrapperPlan, PartMediaPlan, PayloadKind, build_client_model,
     };
-    use crate::config::{DateRepresentation, DateTimeRepresentation, ResolvedConfig, load_config};
+    use crate::config::{DateRepresentation, DateTimeRepresentation, ResolvedConfig, load_single};
     use crate::diag::DiagnosticSink;
     use crate::emit::emit_artifacts;
     use crate::loader::load_graph;
@@ -3021,7 +3021,7 @@ mod tests {
             .expect("config JSON"),
         )
         .expect("write config");
-        let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let mut resolved = load_single(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
         let graph =
@@ -3125,7 +3125,7 @@ mod tests {
             .expect("config JSON"),
         )
         .expect("write config");
-        let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let mut resolved = load_single(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
         let graph =
@@ -3850,7 +3850,7 @@ mod tests {
             .expect("config JSON"),
         )
         .expect("write config");
-        let mut resolved = load_config(Some(&config_path), temp.path()).expect("config resolves");
+        let mut resolved = load_single(Some(&config_path), temp.path()).expect("config resolves");
         patch(&mut resolved);
         let mut sink = DiagnosticSink::new();
         let graph =

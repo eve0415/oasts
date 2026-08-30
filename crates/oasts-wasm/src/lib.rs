@@ -136,7 +136,10 @@ fn failed(reason: &str) -> String {
     json!({ "files": [], "diagnostics": [], "error": reason }).to_string()
 }
 
-/// The cross-boundary diagnostic shape, matching the Node binding's field for field.
+/// The cross-boundary diagnostic shape.
+///
+/// This host compiles one document against one config, so it carries no `spec` field: the Node
+/// binding names the workspace spec a diagnostic came from, and there are no specs here.
 fn rendered(diagnostics: &[Diagnostic]) -> Vec<Value> {
     diagnostics
         .iter()

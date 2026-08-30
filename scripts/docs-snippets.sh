@@ -116,6 +116,9 @@ while IFS=$'\t' read -r kind source line snippet; do
   has_root_key "$snippet" schemaVersion && has_schema=true
   has_root_key "$snippet" input && has_input=true
   has_root_key "$snippet" output && has_output=true
+  # A workspace fence names its documents and output roots under `specs`, so it is already
+  # complete without the root-level input/output every other fence is completed with.
+  has_root_key "$snippet" specs && has_input=true && has_output=true
 
   if [[ "$kind" == untitled && "$has_schema" == true && "$has_input" == true && "$has_output" == true ]]; then
     echo "docs-snippets: $source:$line is a complete config without title=\"oasts.yaml\"" >&2
@@ -140,7 +143,7 @@ fi
 # Entries are "source:line OASTSnnnn". An expected refusal passes only when it emits that error
 # code and no other error code; line-keying keeps the exception tied to one exact fence.
 expected_refusals=(
-  "www/src/content/docs/reference/configuration.mdx:67 OASTS2021"
+  "www/src/content/docs/reference/configuration.mdx:68 OASTS2021"
 )
 declare -A expected_by_block=()
 declare -A seen_expected=()
@@ -170,8 +173,13 @@ while IFS=$'\t' read -r kind source line snippet; do
   case_dir="$work/case-$checked"
   mkdir -p "$case_dir"
 
+  is_workspace=false
+  has_root_key "$snippet" specs && is_workspace=true
   is_complete=false
-  if has_root_key "$snippet" schemaVersion && has_root_key "$snippet" input && has_root_key "$snippet" output; then
+  if [[ "$is_workspace" == true ]]; then
+    has_root_key "$snippet" schemaVersion && is_complete=true
+  elif has_root_key "$snippet" schemaVersion && has_root_key "$snippet" input &&
+    has_root_key "$snippet" output; then
     is_complete=true
   fi
   needs_client=false
@@ -181,8 +189,10 @@ while IFS=$'\t' read -r kind source line snippet; do
 
   {
     has_root_key "$snippet" schemaVersion || printf 'schemaVersion: 1\n'
-    has_root_key "$snippet" input || printf 'input:\n  path: ./openapi.yaml\n'
-    has_root_key "$snippet" output || printf 'output: ./generated\n'
+    if [[ "$is_workspace" == false ]]; then
+      has_root_key "$snippet" input || printf 'input:\n  path: ./openapi.yaml\n'
+      has_root_key "$snippet" output || printf 'output: ./generated\n'
+    fi
     if [[ "$is_complete" == false && "$needs_client" == true ]] && ! has_root_key "$snippet" artifacts; then
       printf 'artifacts:\n  types: true\n  client: true\n'
     fi

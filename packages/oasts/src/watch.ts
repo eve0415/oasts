@@ -34,10 +34,21 @@ export interface WatchInput {
   directory: boolean;
 }
 
+/** What one spec of a compile read, and where it writes. */
+export interface SpecWatchPlan {
+  /** The `specs` key this plan answers for; null for a config with one spec at the root. */
+  name: string | null;
+  inputs: readonly WatchInput[];
+  /** The tree this spec writes into; never an input. */
+  outputRoot: string;
+}
+
 /** What one compile left behind for the next wait. */
 export interface WatchPlan {
+  /** The paths the configuration file itself decides, whichever spec is being built. */
   inputs: readonly WatchInput[];
-  outputRoot: string | null;
+  /** One plan per spec the run attempted, in the order the workspace declares them. */
+  specs: readonly SpecWatchPlan[];
   debounceMs: number;
 }
 
@@ -196,21 +207,25 @@ export class FsChanges implements Changes {
 /** The paths a session is watching, and the tree it must ignore its own writes in. */
 export class Watched {
   #inputs = new Map<string, boolean>();
-  #outputRoot: string | null = null;
+  #outputRoots: readonly string[] = [];
   #settled = false;
 
   absorb(plan: WatchPlan, settled: boolean): void {
+    // One session watches every spec the run compiled, so the plans are read as a union: a
+    // document two specs share is one path to watch, and each spec's own inputs are as much a
+    // reason to recompile as the configuration they were selected by.
+    const reported = watchedInputs(plan);
     if (settled) {
-      this.#inputs = new Map(plan.inputs.map((input) => [input.path, input.directory]));
+      this.#inputs = new Map(reported.map((input) => [input.path, input.directory]));
     } else {
       // Never narrow on failure: a run that stopped at a broken document read less than the one
       // before it, and dropping the rest would strand the session.
-      for (const input of plan.inputs) {
+      for (const input of reported) {
         this.#inputs.set(input.path, input.directory);
       }
     }
-    if (plan.outputRoot !== null) {
-      this.#outputRoot = plan.outputRoot;
+    if (plan.specs.length > 0) {
+      this.#outputRoots = plan.specs.map((spec) => spec.outputRoot);
     }
     this.#settled = settled;
   }
@@ -237,7 +252,7 @@ export class Watched {
 
   /** Whether an event on `path` is worth a recompile. */
   triggers(path: string): boolean {
-    if (this.#outputRoot !== null && isInside(path, this.#outputRoot)) {
+    if (this.#outputRoots.some((root) => isInside(path, root))) {
       // Our own writes land here every successful cycle, so nothing under the output tree counts
       // unless the compile itself read it — which one path does, the `tsconfig.json` the ancestor
       // walk looks for beside the emitted files.
@@ -264,6 +279,14 @@ function mergeInputs(
     merged.set(input.path, (merged.get(input.path) ?? false) || input.directory);
   }
   return [...merged].map(([path, directory]) => ({ path, directory }));
+}
+
+/** Every path the run depended on, the workspace's and every spec's alike. */
+export function watchedInputs(plan: WatchPlan): readonly WatchInput[] {
+  return plan.specs.reduce<readonly WatchInput[]>(
+    (merged, spec) => mergeInputs(merged, spec.inputs),
+    plan.inputs,
+  );
 }
 
 function nearestExistingDirectory(from: string): string {
@@ -339,7 +362,7 @@ export function watchFailure(reason: string): Cycle {
   return { exitCode: failure.exitCode, stdout: "", stderr: failure.renderedStderr, plan: null };
 }
 
-const EMPTY_PLAN: WatchPlan = { inputs: [], outputRoot: null, debounceMs: 0 };
+const EMPTY_PLAN: WatchPlan = { inputs: [], specs: [], debounceMs: 0 };
 
 /** Runs one watch session, compiling through `compile` and rendering through `report`. */
 export async function session(
@@ -417,7 +440,7 @@ export async function compileOnce(
     .map((path) => ({ path, directory: false }));
   const fallback: WatchPlan = {
     inputs: candidates,
-    outputRoot: null,
+    specs: [],
     debounceMs: native.watchDefaults().debounceMs,
   };
   try {
@@ -442,7 +465,11 @@ export async function compileOnce(
           ? fallback
           : {
               inputs: mergeInputs(candidates, plan.inputs),
-              outputRoot: plan.outputRoot ?? null,
+              specs: plan.specs.map((spec) => ({
+                name: spec.name ?? null,
+                inputs: spec.inputs,
+                outputRoot: spec.outputRoot,
+              })),
               debounceMs: plan.debounceMs,
             },
     };

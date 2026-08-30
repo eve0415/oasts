@@ -52,6 +52,24 @@ function scriptFixture(): string {
   return directory;
 }
 
+function workspaceFixture(): string {
+  const directory = mkdtempSync(join(tmpdir(), "oasts-cli-"));
+  copyFileSync(join(FIXTURE, "openapi.yaml"), join(directory, "billing.yaml"));
+  copyFileSync(join(FIXTURE, "openapi.yaml"), join(directory, "users.yaml"));
+  writeFileSync(
+    join(directory, "oasts.config.ts"),
+    `export default {
+  schemaVersion: 1,
+  specs: {
+    users: { input: { path: "./users.yaml" }, output: "./generated/users" },
+    billing: { input: { path: "./billing.yaml" }, output: "./generated/billing" },
+  },
+};
+`,
+  );
+  return directory;
+}
+
 function yamlFixture(): string {
   const directory = mkdtempSync(join(tmpdir(), "oasts-cli-"));
   copyFileSync(join(FIXTURE, "openapi.yaml"), join(directory, "openapi.yaml"));
@@ -142,10 +160,10 @@ test("usage, discovery, spec, and config failures exit 2", async () => {
   assert.equal(undiscovered.code, 2);
   assert.match(undiscovered.stderr, /error\[OASTS0011\]/);
 
-  for (const command of ["generate", "check", "watch"]) {
+  for (const command of ["generate", "check"]) {
     const spec = await invoke([command, "--spec", "petstore"], scriptFixture());
     assert.equal(spec.code, 2);
-    assert.match(spec.stderr, /error\[OASTS9002\]/);
+    assert.match(spec.stderr, /error\[OASTS0296\]/);
   }
 
   const ambiguous = scriptFixture();
@@ -224,4 +242,21 @@ test("unexpected non-CliFailure errors exit 2", async () => {
   );
   assert.equal(throwingValue, 2);
   assert.match(stderr, /error: not an error object/);
+});
+
+test("a workspace builds every spec, and --spec builds one", async () => {
+  const directory = workspaceFixture();
+
+  const all = await invoke(["generate"], directory);
+  assert.equal(all.code, 0, all.stderr);
+  assert.equal(all.stdout.split("\n").filter(Boolean).length, 2);
+  assert.match(all.stdout, /^billing: generated \d+ files\nusers: generated \d+ files\n$/);
+
+  const one = await invoke(["generate", "--spec", "users"], directory);
+  assert.equal(one.code, 0, one.stderr);
+  assert.match(one.stdout, /^users: generated \d+ files\n$/);
+
+  const unknown = await invoke(["check", "--spec", "nope"], directory);
+  assert.equal(unknown.code, 2);
+  assert.match(unknown.stderr, /error\[OASTS0295\]: no spec named 'nope'/);
 });
