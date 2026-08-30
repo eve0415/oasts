@@ -163,7 +163,7 @@ test("usage, discovery, spec, and config failures exit 2", async () => {
   for (const command of ["generate", "check"]) {
     const spec = await invoke([command, "--spec", "petstore"], scriptFixture());
     assert.equal(spec.code, 2);
-    assert.match(spec.stderr, /error\[OASTS0295\]/);
+    assert.match(spec.stderr, /error\[OASTS0296\]/);
   }
 
   const ambiguous = scriptFixture();
@@ -258,5 +258,5 @@ test("a workspace builds every spec, and --spec builds one", async () => {
 
   const unknown = await invoke(["check", "--spec", "nope"], directory);
   assert.equal(unknown.code, 2);
-  assert.match(unknown.stderr, /error\[OASTS0294\]: no spec named 'nope'/);
+  assert.match(unknown.stderr, /error\[OASTS0295\]: no spec named 'nope'/);
 });

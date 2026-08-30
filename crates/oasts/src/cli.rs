@@ -805,7 +805,7 @@ mod tests {
             let (code, stdout, stderr) = invoke(&args, configured.path());
             assert_eq!(code, 2, "{args:?}: {stderr}");
             assert!(stdout.is_empty(), "{args:?}: {stdout}");
-            assert!(stderr.contains("error[OASTS0295]"), "{args:?}: {stderr}");
+            assert!(stderr.contains("error[OASTS0296]"), "{args:?}: {stderr}");
         }
     }
 
@@ -1149,7 +1149,7 @@ mod tests {
         assert_eq!(unknown, 2);
         assert!(
             stderr.contains(
-                "error[OASTS0294]: no spec named 'nope'; this workspace declares billing, users"
+                "error[OASTS0295]: no spec named 'nope'; this workspace declares billing, users"
             ),
             "{stderr}"
         );

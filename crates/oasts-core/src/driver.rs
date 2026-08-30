@@ -373,11 +373,13 @@ fn select(
 }
 
 /// Names the spec every diagnostic in `diagnostics` came from, when the run is a workspace.
+///
+/// Compilation reports a configuration key by the pointer a single-spec config would use, because
+/// nothing below the target resolver knows it is in a workspace. Routing every diagnostic through
+/// the same re-anchoring the resolver uses means a pointer names a key that is really there.
 fn attribute(spec: &ResolvedSpec, diagnostics: &mut [Diagnostic]) {
     if let Some(name) = spec.name.as_deref() {
-        for diagnostic in diagnostics {
-            diagnostic.spec = Some(Box::from(name));
-        }
+        config::attribute(diagnostics, name, &spec.origins, &spec.config.config_path);
     }
 }
 
@@ -997,7 +999,7 @@ specs:
 
         assert_eq!(outcome.exit_code, 2);
         assert_eq!(outcome.diagnostics.len(), 1);
-        assert_eq!(outcome.diagnostics[0].code, "OASTS0295");
+        assert_eq!(outcome.diagnostics[0].code, "OASTS0296");
     }
 
     #[test]

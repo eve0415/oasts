@@ -59,12 +59,13 @@ const CODE_REMOTE: &str = "OASTS0271";
 /// The `watch` block, opening rule 28 above the remote block.
 const CODE_WATCH: &str = "OASTS0281";
 /// The `specs` block, opening rule 29 above the watch block.
-const CODE_SPEC_NAME: &str = "OASTS0291";
-const CODE_SPEC_POSITION: &str = "OASTS0292";
-const CODE_SPEC_CONFLICT: &str = "OASTS0293";
-pub(crate) const CODE_SPEC_UNKNOWN: &str = "OASTS0294";
-pub(crate) const CODE_SPEC_SELECTION: &str = "OASTS0295";
-const CODE_SPEC_HOST: &str = "OASTS0296";
+const CODE_SPEC_EMPTY: &str = "OASTS0291";
+const CODE_SPEC_NAME: &str = "OASTS0292";
+const CODE_SPEC_POSITION: &str = "OASTS0293";
+const CODE_SPEC_CONFLICT: &str = "OASTS0294";
+pub(crate) const CODE_SPEC_UNKNOWN: &str = "OASTS0295";
+pub(crate) const CODE_SPEC_SELECTION: &str = "OASTS0296";
+const CODE_SPEC_HOST: &str = "OASTS0297";
 const CODE_CONFIG_READ: &str = "OASTS1001";
 pub(crate) const CODE_BLOCK_UNSUPPORTED: &str = "OASTS9003";
 
@@ -1316,8 +1317,13 @@ pub struct ResolvedConfig {
 pub struct ResolvedSpec {
     /// The `specs` key this target was declared under; `None` for a single-spec config.
     pub name: Option<String>,
+    /// Where each target key was written, for [`attribute`]; empty for a single-spec config.
+    pub origins: SpecOrigins,
     pub config: ResolvedConfig,
 }
+
+/// Each target key's pointer prefix: `/shared` or `/specs/<name>`.
+pub type SpecOrigins = BTreeMap<&'static str, String>;
 
 /// Every compile target one configuration file declares.
 ///
@@ -1752,13 +1758,17 @@ pub fn resolve_config(
         match resolved {
             Ok(mut config) => {
                 if let Some(name) = name.as_deref() {
-                    attribute(&mut config.diagnostics, name, &origins);
+                    attribute(&mut config.diagnostics, name, &origins, &config_path);
                 }
-                specs.push(ResolvedSpec { name, config });
+                specs.push(ResolvedSpec {
+                    name,
+                    origins,
+                    config,
+                });
             }
             Err(mut errors) => {
                 if let Some(name) = name.as_deref() {
-                    attribute(&mut errors, name, &origins);
+                    attribute(&mut errors, name, &origins, &config_path);
                 }
                 failures.append(&mut errors);
             }
@@ -1788,7 +1798,7 @@ pub fn resolve_config(
 struct WorkspaceTarget {
     name: Option<String>,
     target: SpecConfig,
-    origins: BTreeMap<&'static str, String>,
+    origins: SpecOrigins,
 }
 
 /// Moves the target keys out of the root object.
@@ -1854,7 +1864,7 @@ fn workspace_targets(
     }
     if specs.is_empty() {
         sink.push(config_error(
-            CODE_SPEC_NAME,
+            CODE_SPEC_EMPTY,
             "specs must declare at least one spec",
             Some(source_path),
             Some("/specs"),
@@ -1937,10 +1947,21 @@ fn merge_target(entry: SpecConfig, shared: &SpecConfig) -> SpecConfig {
 ///
 /// A target resolves against root-shaped pointers whichever shape it came from, so a workspace
 /// rewrites `/client` into `/shared/client` or `/specs/<name>/client` afterwards — whichever of
-/// the two the block was actually written in.
-fn attribute(diagnostics: &mut [Diagnostic], spec: &str, origins: &BTreeMap<&'static str, String>) {
+/// the two the block was actually written in. Only a pointer into the configuration file is
+/// re-anchored: a document pointer names a place in the OpenAPI document, where `specs` does not
+/// reach.
+pub(crate) fn attribute(
+    diagnostics: &mut [Diagnostic],
+    spec: &str,
+    origins: &SpecOrigins,
+    config_path: &Path,
+) {
+    let config_source = config_path.to_string_lossy();
     for diagnostic in diagnostics {
         diagnostic.spec = Some(Box::from(spec));
+        if diagnostic.source_id.as_deref() != Some(config_source.as_ref()) {
+            continue;
+        }
         if let Some(pointer) = diagnostic.json_pointer.as_deref() {
             let head = pointer.trim_start_matches('/');
             let key = head.split_once('/').map_or(head, |(key, _)| key);
@@ -2321,7 +2342,7 @@ fn resolve_input(
     let Some(input) = input else {
         sink.push(config_error(
             CODE_TARGET_SHAPE,
-            "single-spec config requires input",
+            "input is required",
             Some(source),
             Some("/input"),
         ));
@@ -2524,7 +2545,7 @@ fn resolve_output(
     let Some(output) = output else {
         sink.push(config_error(
             CODE_TARGET_SHAPE,
-            "single-spec config requires output",
+            "output is required",
             Some(source),
             Some("/output"),
         ));
@@ -3261,6 +3282,14 @@ fn resolve_below(base: &Path, relative: &Path, allow_equal: bool) -> Result<Path
         if candidate.exists() {
             return canonicalize_result(fs::canonicalize(&candidate), "path");
         }
+        // A path that does not exist yet still resolves through whatever of it does. Returning the
+        // lexical join instead would let two names for one directory — say a symlinked parent —
+        // look like two directories to anything that compares resolved paths, right up until the
+        // first run creates them and they turn out to be one.
+        let tail = candidate
+            .strip_prefix(&existing_ancestor)
+            .expect("the nearest existing ancestor is a prefix of the path");
+        return Ok(canonical_ancestor.join(tail));
     }
     Ok(candidate)
 }
@@ -5981,7 +6010,7 @@ specs:
     fn an_empty_or_badly_named_specs_block_is_refused() {
         assert_workspace_code(
             load_workspace_yaml("schemaVersion: 1\nspecs: {}\n"),
-            CODE_SPEC_NAME,
+            CODE_SPEC_EMPTY,
         );
         assert_workspace_code(
             load_workspace_yaml(
@@ -6049,20 +6078,32 @@ specs:
     }
 
     #[test]
-    fn attribution_leaves_a_pointer_it_cannot_place_alone() {
-        let origins = BTreeMap::from([("naming", "/shared".to_owned())]);
+    fn attribution_re_anchors_only_a_pointer_into_the_configuration() {
+        let config = Path::new("/workspace/oasts.yaml");
+        let origins = SpecOrigins::from([("naming", "/shared".to_owned())]);
         let mut diagnostics = vec![
-            config_error(CODE_NAMING, "no pointer", None, None),
+            config_error(CODE_NAMING, "no pointer", Some(config), None),
             config_error(
                 CODE_SCHEMA_VERSION,
                 "root key",
-                None,
+                Some(config),
                 Some("/schemaVersion"),
             ),
-            config_error(CODE_NAMING, "shared block", None, Some("/naming/typeCase")),
+            config_error(
+                CODE_NAMING,
+                "shared block",
+                Some(config),
+                Some("/naming/typeCase"),
+            ),
+            config_error(
+                CODE_NAMING,
+                "a document, not the config",
+                Some(Path::new("workspace/openapi.yaml")),
+                Some("/naming/typeCase"),
+            ),
         ];
 
-        attribute(&mut diagnostics, "billing", &origins);
+        attribute(&mut diagnostics, "billing", &origins, config);
 
         assert!(
             diagnostics
@@ -6077,8 +6118,30 @@ specs:
             [
                 None,
                 Some("/schemaVersion"),
-                Some("/shared/naming/typeCase")
+                Some("/shared/naming/typeCase"),
+                Some("/naming/typeCase"),
             ]
+        );
+    }
+
+    #[test]
+    fn two_names_for_one_directory_are_one_output_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        fs::create_dir(directory.path().join("real")).expect("output parent");
+        symlink("real", directory.path().join("link")).expect("aliasing symlink");
+        directory.write("a.yaml", "");
+        directory.write("b.yaml", "");
+        // Neither output root exists yet, which is what a first run looks like.
+        let path = directory.write(
+            "config.yaml",
+            "schemaVersion: 1\nspecs:\n  users:\n    input: {path: ./a.yaml}\n    output: ./real/out\n  billing:\n    input: {path: ./b.yaml}\n    output: ./link/out\n",
+        );
+
+        assert_workspace_code(
+            load_config(Some(&path), directory.path()),
+            CODE_OUTPUT_OVERLAP,
         );
     }
 

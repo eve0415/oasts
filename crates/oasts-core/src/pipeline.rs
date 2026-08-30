@@ -214,7 +214,7 @@ mod tests {
                     .iter()
                     .map(|diagnostic| diagnostic.code)
                     .collect::<Vec<_>>(),
-                ["OASTS0296"]
+                ["OASTS0297"]
             );
         }
     }

@@ -432,7 +432,7 @@ specs:
     output: ./generated/users
 ```
 
-A spec name is one or more ASCII letters, digits, `-`, `_` or `.`; anything else is `OASTS0291`, as is a `specs` block with no specs in it.
+A spec name is one or more ASCII letters, digits, `-`, `_` or `.`; anything else is `OASTS0292`, as is a `specs` block with no specs in it.
 `specs` and a root-level `input`/`output` are the two shapes a configuration can take, and it takes exactly one: any spec key written beside `specs` is `OASTS0062`.
 
 Every spec needs an output root of its own. Two roots that are equal, or one inside the other, are `OASTS0082`, reported before any spec is compiled. Roots that share a parent are fine.
@@ -441,7 +441,7 @@ Every spec needs an output root of its own. Two roots that are equal, or one ins
 
 ## `shared`
 
-The settings every spec inherits. It takes the same keys a spec does, except `input` and `output`, which name one spec's own document and output root and are `OASTS0292` here:
+The settings every spec inherits. It takes the same keys a spec does, except `input` and `output`, which name one spec's own document and output root and are `OASTS0293` here:
 
 ```yaml title="oasts.yaml"
 schemaVersion: 1
@@ -459,7 +459,7 @@ specs:
     output: ./generated/billing
 ```
 
-Blocks are inherited whole. A block declared in both `shared` and a spec is `OASTS0293` — there is no key-by-key merge and no silent precedence. `shared` without `specs` is `OASTS0063`.
+Blocks are inherited whole. A block declared in both `shared` and a spec is `OASTS0294` — there is no key-by-key merge and no silent precedence. `shared` without `specs` is `OASTS0063`.
 
 ## `watch`
 

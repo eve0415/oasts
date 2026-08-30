@@ -426,7 +426,7 @@ mod tests {
         with_spec.specs = vec!["petstore".to_owned()];
         let spec_failure = run(with_spec).expect("a known command");
         assert_eq!(spec_failure.exit_code, 2);
-        assert_eq!(spec_failure.diagnostics[0].code, "OASTS0295");
+        assert_eq!(spec_failure.diagnostics[0].code, "OASTS0296");
         assert_eq!(spec_failure.diagnostics[0].spec, None);
 
         let compile_failure = copy_fixture("petstore-3.0");

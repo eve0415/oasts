@@ -62,11 +62,11 @@ specs:
         include: [pets]
 ```
 
-`input` and `output` name one document and one output root, so they belong to a spec and are refused under `shared` with `OASTS0292`.
+`input` and `output` name one document and one output root, so they belong to a spec and are refused under `shared` with `OASTS0293`.
 Everything else may go in either place.
 
 Blocks are inherited whole, never merged key by key.
-A spec that declares `client` gets its own `client` and none of the shared one's keys — so declaring the same block in both places is refused with `OASTS0293` instead of one silently winning.
+A spec that declares `client` gets its own `client` and none of the shared one's keys — so declaring the same block in both places is refused with `OASTS0294` instead of one silently winning.
 To vary one setting across specs, take the block out of `shared` and write it in each spec.
 
 ## Output roots
@@ -84,8 +84,8 @@ Sharing a *parent* is fine and is what the examples above do: `./generated/billi
 <PackageManagers pkg="oasts" type="exec" args="generate --spec billing" />
 
 Only the named specs are compiled and written; the rest of the workspace is left alone.
-A name that matches nothing exits `2` with `OASTS0294`, which lists the specs the workspace does declare.
-Used against a single-spec configuration, `--spec` exits `2` with `OASTS0295` — there is nothing to select.
+A name that matches nothing exits `2` with `OASTS0295`, which lists the specs the workspace does declare.
+Used against a single-spec configuration, `--spec` exits `2` with `OASTS0296` — there is nothing to select.
 
 The configuration file is validated as a whole whatever you select, so a broken spec elsewhere in the file still fails the run.
 Documents are only read for the specs being built.
