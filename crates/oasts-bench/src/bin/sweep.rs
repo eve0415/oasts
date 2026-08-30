@@ -545,7 +545,12 @@ fn classify(code: &str) -> Outcome {
         // A config knob resolves it, and the diagnostic prints the block to paste. A public type
         // name is the user's to choose, so these stay fatal by design.
         "OASTS3002"     // a component name collision -> naming.overrides.schemas
-        | "OASTS6302"   // a path segment that is not a usable name -> naming.overrides.pathSegments
+        // A path segment with no usable name, or a naming.overrides.pathSegments value that has
+        // to change, are both resolved by that same key. The code's other arms are not: an
+        // unnameable path *parameter* has no knob at all, because the key function takes it
+        // positionally and only the member is overridable, and two paths reducing to one query key
+        // cannot be renamed apart. Neither is reached by any corpus document.
+        | "OASTS6302"
         => Outcome::RefusedWithRemedy,
 
         // Constructs the project documents as out of scope.

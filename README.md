@@ -255,8 +255,11 @@ OpenAPI has no pagination vocabulary, so any such support would be a guess about
 ### When two paths would fight over a name
 
 Key bindings are derived from path text, so `/foo-bar` and `/foo_bar` want the same name — and so do `/foo/bar` and `/foo-bar`, a segment named `all`, and anything that normalizes to a name the generated module already uses.
-Every one of these is refused at generation with the two paths named, never resolved by a compiler-invented suffix that would shift under you the next time the document changes.
-`naming.overrides.pathSegments` is the way out, keyed by the raw segment text:
+No key binding is a name your document declares, so the invented one yields: the loser of each race takes the lowest free numeric suffix, an `OASTS6304` warning names both, and generation continues.
+Both paths keep a key of their own, and each key still carries its own raw segment text, so two paths never share a cache entry however they end up named.
+A name you configured never moves — when one cannot be honored the run refuses and names the entry, rather than emitting something else under it.
+A derived name still can move, when a document later declares a path that sorts earlier.
+`naming.overrides.pathSegments` is how you pin the names you import by hand, keyed by the raw segment text:
 
 ```yaml
 naming:
@@ -264,6 +267,11 @@ naming:
     pathSegments:
       foo_bar: fooBarUnderscore
 ```
+
+Three things are still refused, because no name resolves them: two declared paths whose key elements are identical — `/pets` and `/pets/`, where the separator-only segment contributes nothing; a segment whose text yields no identifier at all, which has no derived name to put a suffix on; and a path *parameter* whose name is not an identifier, which the key function takes positionally and `pathSegments` cannot reach.
+
+A path template naming one parameter twice — `/orders/{orderId}/lines/{orderId}` — is not one of them.
+The key function takes that parameter once and repeats it, because the client substitutes the single declared value into both occurrences; a factory taking two would name a request the client cannot make.
 
 ## Comparison
 

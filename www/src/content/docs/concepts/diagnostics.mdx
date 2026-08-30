@@ -145,10 +145,23 @@ The severity column below is the authority. Read that, not the artifact name.
 | `OASTS6206` | msw | warning | A streaming body has no buffered value to project in either direction |
 | `OASTS6207` | msw | warning | A form body whose schema declares no properties — the handler is emitted projecting no body fields |
 | `OASTS6301` | tanstack | warning | An operation that gets no descriptor: a read with an empty success branch, or a stream, which is excluded on the mutation side too |
-| `OASTS6302` | tanstack | error | Two things collide over one key-factory name — two paths, two sibling segments, a reserved import, or a duplicated path parameter |
+| `OASTS6302` | tanstack | error | Two declared paths produce the same query key; a path segment or path parameter has no usable name; or a `naming.overrides.pathSegments` name cannot be honored — see below |
 | `OASTS6303` | tanstack | warning | A `naming.overrides.pathSegments` entry matched no path segment |
+| `OASTS6304` | tanstack | warning | A derived key name was already taken, so it was emitted with a numeric suffix |
 
 <Aside type="note">
   This is the set you are most likely to hit, not the complete allocation.
   Run [`oasts check`](/reference/cli) to see every diagnostic your own document and config produce, without writing any files.
 </Aside>
+
+## When a name you configured cannot be honored
+
+A configured name is never renamed, so `OASTS6302` is also what you get when one cannot be honored, and each arm names the entry to change:
+
+| The entry names | Why it cannot be honored | What to do |
+| --- | --- | --- |
+| `all` | Every node of the composed key object already gives its own key that member | Choose another name |
+| An identifier the generated modules bind — `ParamValue`, `withInput`, an operation's `…OrThrow` or `…Query` | The emitted module would shadow its own import | Choose another name |
+| A member a second entry under the same parent also selects, or a binding name a second entry also composes | Two configured names are two things you declared, and neither yields | Change one of the two entries |
+| A segment reached from both colliding paths | `pathSegments` is keyed by raw segment text globally, so one entry renames every match and cannot separate two of them | Name the segment where the two paths diverge, which the diagnostic prints |
+

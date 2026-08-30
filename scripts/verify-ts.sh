@@ -564,20 +564,53 @@ pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module es
   --moduleResolution bundler "$work/tanstack-showcase/compile-assert/cases.ts"
 echo "compile-assert matrix ok: tanstack-showcase-3.1"
 
-# The two key-factory naming diagnostics, asserted on exit code rather than only in unit tests: the
-# frozen documents exist to be generable (or not) end to end, and a gate that never runs them would
-# let the fixtures rot.
-cp -r fixtures/tanstack-segment-collision-3.1 "$work/tanstack-collision"
-if (cd "$work/tanstack-collision" && "$OLDPWD/$bin" generate --config oasts-tanstack.yaml) \
-  >"$work/tanstack-collision.log" 2>&1; then
-  echo "verify-ts: the colliding path-segment document generated instead of failing" >&2
+# Colliding path segments generate, end to end. The unit tests pin the allocated names; these pin
+# that the whole tree still compiles with them, and that the compile-assert matrix agrees on which
+# path got which key.
+generate_and_verify tanstack-segment-collision-3.1 oasts-tanstack.yaml "$work/tanstack-collision" \
+  tanstack "tanstack-segment-collision-3.1"
+generate_and_verify tanstack-key-disambiguation-3.1 oasts-tanstack.yaml "$work/tanstack-disambiguation" \
+  tanstack "tanstack-key-disambiguation-3.1"
+pnpm exec tsc --strict --noEmit --skipLibCheck false --target es2022 --module esnext \
+  --moduleResolution bundler "$work/tanstack-disambiguation/compile-assert/cases.ts"
+echo "compile-assert matrix ok: tanstack-key-disambiguation-3.1"
+
+# A run that renamed a binding without saying so would emit exactly the same tree, so the only
+# thing that catches it is asserting the warning itself. The flat arm is the one to assert: it is
+# the arm that has to name the other path and the entry that pins this one.
+(cd "$work/tanstack-disambiguation" && "$OLDPWD/$bin" generate --config oasts-tanstack.yaml) \
+  >"$work/tanstack-disambiguation.log" 2>&1
+grep -q 'warning\[OASTS6304\]' "$work/tanstack-disambiguation.log" \
+  || { echo "verify-ts: a renamed key binding was not reported" >&2; exit 1; }
+grep -q "is already bound by path '/foo/bar'" "$work/tanstack-disambiguation.log" \
+  || { echo "verify-ts: the rename warning did not name the path that kept the name" >&2; exit 1; }
+grep -q 'pin it with `naming.overrides.pathSegments' "$work/tanstack-disambiguation.log" \
+  || { echo "verify-ts: the rename warning named no way to pin the name" >&2; exit 1; }
+echo "renamed key bindings are reported: tanstack-key-disambiguation-3.1"
+
+# What no amount of renaming reaches: two declared paths whose key elements are identical, and a
+# segment whose text yields no identifier to rename. Asserted on exit code rather than only in unit
+# tests, because a gate that never runs the frozen document would let it rot.
+cp -r fixtures/tanstack-key-refusal-3.1 "$work/tanstack-refusal"
+if (cd "$work/tanstack-refusal" && "$OLDPWD/$bin" generate --config oasts-tanstack.yaml) \
+  >"$work/tanstack-refusal.log" 2>&1; then
+  echo "verify-ts: the unnameable key document generated instead of failing" >&2
   exit 1
 fi
-grep -q 'OASTS6302' "$work/tanstack-collision.log" \
-  || { echo "verify-ts: colliding segments did not report OASTS6302" >&2; exit 1; }
-grep -q 'naming.overrides.pathSegments' "$work/tanstack-collision.log" \
-  || { echo "verify-ts: the collision diagnostic named no resolution" >&2; exit 1; }
-echo "segment collision refused: tanstack-segment-collision-3.1"
+grep -q 'produce the same query key' "$work/tanstack-refusal.log" \
+  || { echo "verify-ts: two paths reducing to one key were not reported" >&2; exit 1; }
+grep -q 'is not a usable name' "$work/tanstack-refusal.log" \
+  || { echo "verify-ts: the unnameable segment was not reported" >&2; exit 1; }
+grep -q 'naming.overrides.pathSegments' "$work/tanstack-refusal.log" \
+  || { echo "verify-ts: the unnameable segment named no resolution" >&2; exit 1; }
+# Exactly those two. The document also declares a colliding pair, which is named apart rather than
+# refused — so a count of three is a run that has stopped telling a name apart from a key.
+refusals=$(grep -c 'error\[OASTS6302\]' "$work/tanstack-refusal.log" || true)
+[[ "$refusals" == 2 ]] \
+  || { echo "verify-ts: expected 2 key-factory refusals, got $refusals" >&2; exit 1; }
+grep -q 'warning\[OASTS6304\].*fooBar2' "$work/tanstack-refusal.log" \
+  || { echo "verify-ts: the colliding pair was not named apart" >&2; exit 1; }
+echo "key-factory residue refused, and only it: tanstack-key-refusal-3.1"
 
 generate_and_verify tanstack-segment-override-3.1 oasts-tanstack.yaml "$work/tanstack-override" \
   tanstack "tanstack-segment-override-3.1"

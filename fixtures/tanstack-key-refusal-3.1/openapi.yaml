@@ -1,0 +1,65 @@
+openapi: 3.1.0
+info:
+  title: TanStack key refusal
+  version: 1.0.0
+  description: >-
+    The two things a key factory cannot name its way out of. `/pets` and `/pets/` are distinct
+    OpenAPI paths the client requests separately, but a segment carrying only the separator
+    contributes nothing to a key, so the two would share one cache entry however the nodes are
+    named. A segment whose text yields no identifier at all has no name to disambiguate; the
+    override is the only thing that can give it one. The colliding pair alongside them is what
+    separates the two: it is refused by nothing, so a run that reported three errors here would be
+    one that had stopped telling a name apart from a key.
+servers:
+  - url: https://refusal.example.test
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        '200':
+          description: Every pet.
+          content:
+            application/json:
+              schema:
+                type: object
+  /pets/:
+    get:
+      operationId: listPetsSlashed
+      responses:
+        '200':
+          description: Every pet, again.
+          content:
+            application/json:
+              schema:
+                type: object
+  /日本:
+    get:
+      operationId: readUnnameable
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                type: object
+  /foo-bar:
+    get:
+      operationId: readHyphenated
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                type: object
+  /foo_bar:
+    get:
+      operationId: readUnderscored
+      responses:
+        '200':
+          description: A record.
+          content:
+            application/json:
+              schema:
+                type: object
