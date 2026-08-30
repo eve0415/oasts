@@ -4820,7 +4820,7 @@ mod tests {
     #[test]
     fn schema_known_unavailable_null_block_is_still_present() {
         let mut value = valid_json_value();
-        value["watch"] = Value::Null;
+        value["ci"] = Value::Null;
         assert_code(load_json(&value), CODE_BLOCK_UNSUPPORTED);
     }
 
