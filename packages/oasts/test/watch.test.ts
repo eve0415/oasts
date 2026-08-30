@@ -37,6 +37,8 @@ function cycle(exitCode: number, watchPlan: WatchPlan | null): Cycle {
 class Scripted implements Changes {
   readonly registered: string[][] = [];
   closed = false;
+  /** Returned once the script runs out, for a test that needs a source with no end. */
+  repeat: Wake | null = null;
   #wakes: Wake[];
   #refuse: unknown;
 
@@ -53,7 +55,7 @@ class Scripted implements Changes {
   }
 
   wake(_quietMs: number | null): Promise<Wake> {
-    return Promise.resolve(this.#wakes.shift() ?? { kind: "stopped" });
+    return Promise.resolve(this.#wakes.shift() ?? this.repeat ?? { kind: "stopped" });
   }
 
   close(): void {
@@ -133,10 +135,56 @@ test("a session recompiles per change and exits zero when the source stops", asy
       return finished.exitCode;
     },
   );
-  assert.equal(code, 0);
+  assert.equal(code, 2, "a watcher that stopped is not a clean exit");
   assert.equal(compiles, 2);
-  assert.deepEqual(reported, [0, 1]);
+  assert.deepEqual(reported, [0, 1, 2]);
   assert.ok(changes.closed);
+});
+
+test("churn the filter rejects does not hold a compile back", async () => {
+  const changes = new Scripted([
+    { kind: "changed", path: "/w/oasts.yaml" },
+    // Everything after this is the output tree being written by somebody else. None of it would
+    // start a compile, so none of it may postpone one.
+    { kind: "changed", path: "/w/out/types/a.ts" },
+    { kind: "changed", path: "/w/out/types/b.ts" },
+    { kind: "quiet" },
+    { kind: "stopped" },
+  ]);
+  let compiles = 0;
+  const code = await session(
+    changes,
+    () => {
+      compiles += 1;
+      return Promise.resolve(cycle(0, plan(["/w/oasts.yaml"], "/w/out")));
+    },
+    (finished) => finished.exitCode,
+  );
+  assert.equal(code, 2);
+  assert.equal(compiles, 2);
+});
+
+test("unending churn delays a compile but never cancels it", async () => {
+  const changes = new Scripted([]);
+  // Every wake is a real change, so the settling window is refreshed forever and only the cap can
+  // end the wait.
+  changes.repeat = { kind: "changed", path: "/w/oasts.yaml" };
+  let compiles = 0;
+  const started = Date.now();
+  const code = await session(
+    changes,
+    () => {
+      compiles += 1;
+      if (compiles === 2) {
+        changes.repeat = null;
+      }
+      return Promise.resolve(cycle(0, plan(["/w/oasts.yaml"], "/w/out", 50)));
+    },
+    (finished) => finished.exitCode,
+  );
+  assert.equal(code, 2);
+  assert.equal(compiles, 2, "the cap did not end a wait that never went quiet");
+  assert.ok(Date.now() - started >= 500, "the cap ended the wait far too early");
 });
 
 test("a session that cannot register a watch reports it and exits two", async () => {
@@ -158,6 +206,22 @@ test("a session that cannot register a watch reports it and exits two", async ()
   assert.ok(changes.closed);
 });
 
+test("a first cycle with nothing to watch says so rather than waiting", async () => {
+  const changes = new Scripted([]);
+  let reported = "";
+  const code = await session(
+    changes,
+    () => Promise.resolve(cycle(0, null)),
+    (finished) => {
+      reported = finished.stderr;
+      return finished.exitCode;
+    },
+  );
+  assert.equal(code, 2);
+  assert.match(reported, /error\[OASTS1031\]: .*reported no inputs to watch/);
+  assert.equal(changes.registered.length, 0);
+});
+
 test("a session survives a cycle that reported no plan", async () => {
   const root = mkdtempSync(join(tmpdir(), "oasts-watch-"));
   const config = join(root, "oasts.yaml");
@@ -171,7 +235,7 @@ test("a session survives a cycle that reported no plan", async () => {
     },
     (finished) => finished.exitCode,
   );
-  assert.equal(code, 0);
+  assert.equal(code, 2);
   assert.deepEqual(changes.registered[1], [root]);
 });
 
@@ -250,7 +314,7 @@ test("a desynchronized watcher recompiles without a path to blame", async () => 
     },
     (finished) => finished.exitCode,
   );
-  assert.equal(code, 0);
+  assert.equal(code, 2);
   assert.equal(compiles, 2);
 });
 
@@ -401,6 +465,7 @@ test("a cycle whose compiler reports nothing falls back to the discovery candida
       renderedStderr: "",
       diagnostics: [],
     }),
+    watchDefaults: () => ({ debounceMs: 100 }),
   };
   const compiled = await compileOnce(stub, { specs: [] }, directory);
   assert.deepEqual(compiled.plan?.inputs, [join(directory, "oasts.yaml")]);
@@ -434,22 +499,42 @@ class Armed implements Changes {
   }
 }
 
-function document(operations: readonly string[]): string {
+/**
+ * Every operation answers with the same `$ref`, so the referenced file is reached from the entry
+ * rather than sitting beside it unread.
+ */
+function document(operations: readonly string[], reference = "../shared/components.yaml"): string {
   let text = "openapi: 3.1.0\ninfo: {title: watch, version: 1.0.0}\npaths:\n";
   for (const operation of operations) {
-    text += `  /${operation}:\n    get:\n      operationId: ${operation}\n      responses:\n        '204': {description: no content}\n`;
+    text += `  /${operation}:\n    get:\n      operationId: ${operation}\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json:\n              schema: {$ref: '${reference}#/Thing'}\n`;
   }
   return text;
 }
 
-test("a real session recompiles after a document, a config, and an extends change", async () => {
-  const native = await loadNative();
+function component(properties: readonly string[]): string {
+  let text = "Thing:\n  type: object\n  properties:\n";
+  for (const property of properties) {
+    text += `    ${property}: {type: string}\n`;
+  }
+  return text;
+}
+
+/** A tree whose referenced document lives in a directory of its own. */
+function sessionFixture(): string {
   const directory = mkdtempSync(join(tmpdir(), "oasts-watch-"));
   mkdirSync(join(directory, "spec"));
+  mkdirSync(join(directory, "shared"));
+  writeFileSync(join(directory, "shared/components.yaml"), component(["id"]));
   writeFileSync(join(directory, "spec/openapi.yaml"), document(["listThings"]));
   writeFileSync(join(directory, "base.json"), '{ "compilerOptions": { "lib": ["ES2022"] } }');
   writeFileSync(join(directory, "tsconfig.json"), '{ "extends": "./base.json" }');
   writeFileSync(join(directory, "oasts.yaml"), CONFIG);
+  return directory;
+}
+
+test("a real session recompiles after a document, a config, and an extends change", async () => {
+  const native = await loadNative();
+  const directory = sessionFixture();
 
   const changes = new Armed();
   const cycles: number[] = [];
@@ -486,6 +571,59 @@ test("a real session recompiles after a document, a config, and an extends chang
   await ready;
 
   changes.close();
-  assert.equal(await finished, 0);
-  assert.deepEqual(cycles, [0, 0, 0, 0]);
+  // Closing the source ends the session the only way it can end: saying it can no longer answer.
+  assert.equal(await finished, 2);
+  assert.deepEqual(cycles, [0, 0, 0, 0, 2]);
+});
+
+/**
+ * The ordinary authoring order for a reference that does not resolve yet.
+ *
+ * Retarget a `$ref` at a directory nobody has created, make the directory, then write the file. A
+ * session that only reported the documents a *successful* load returned would have dropped every
+ * `$ref`-reached path the moment the load failed, leaving the directory holding them unwatched and
+ * the session unable to see either step.
+ */
+test("a real session sees a ref target appear after the load that wanted it failed", async () => {
+  const native = await loadNative();
+  const directory = sessionFixture();
+  const changes = new Armed();
+  const cycles: number[] = [];
+  const finished = session(
+    changes,
+    () => compileOnce(native, { specs: [] }, directory),
+    (compiled) => {
+      cycles.push(compiled.exitCode);
+      return compiled.exitCode;
+    },
+  );
+
+  try {
+    await changes.registered();
+
+    // 1. Point the reference at a directory that is not there.
+    let ready = changes.registered();
+    writeFileSync(
+      join(directory, "spec/openapi.yaml"),
+      document(["listThings"], "../later/components.yaml"),
+    );
+    await ready;
+    assert.notEqual(cycles.at(-1), 0, "an unresolvable reference should report, not pass");
+
+    // 2. Create the directory. The compile still fails, and the session must be watching the new
+    //    directory afterwards rather than only the one it used to read.
+    ready = changes.registered();
+    mkdirSync(join(directory, "later"));
+    await ready;
+    assert.notEqual(cycles.at(-1), 0, "the directory alone does not resolve the reference");
+
+    // 3. Write the file the reference names.
+    ready = changes.registered();
+    writeFileSync(join(directory, "later/components.yaml"), component(["id"]));
+    await ready;
+    assert.equal(cycles.at(-1), 0, "the session did not see the file that fixes the reference");
+  } finally {
+    changes.close();
+    await finished;
+  }
 });

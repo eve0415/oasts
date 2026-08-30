@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use oasts_core::diag::Diagnostic;
@@ -37,7 +37,8 @@ pub(crate) enum Wake {
     /// Nothing arrived. Asked with a deadline this means the tree went quiet; asked without one it
     /// only means the source has nothing yet and should be asked again.
     Quiet,
-    /// The source will report nothing further and the session should end.
+    /// The source will report nothing further, so the session cannot answer for freshness and
+    /// must end saying so.
     Stopped,
 }
 
@@ -101,6 +102,18 @@ pub(crate) struct FsChanges {
 }
 
 impl FsChanges {
+    /// Gives up every registration, so the next `watch` reopens the whole set.
+    fn forget_all(&mut self) {
+        if let Ok(watcher) = &mut self.watcher {
+            for directory in &self.watched {
+                // A directory that has since been removed cannot be unwatched and does not need
+                // to be; what matters is that this one stops counting as registered.
+                let _ = watcher.unwatch(directory);
+            }
+        }
+        self.watched.clear();
+    }
+
     fn new() -> Self {
         let (sender, events) = mpsc::channel();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -153,7 +166,13 @@ impl Changes for FsChanges {
             // what the old watch missed in between.
             Ok(Signal::Changed(path)) if self.watched.remove(&path) => Wake::Desynchronized,
             Ok(Signal::Changed(path)) => Wake::Changed(path),
-            Ok(Signal::Desynchronized) => Wake::Desynchronized,
+            // A watcher that lost events or failed outright cannot say which registration it lost
+            // with it, so every one is given up and the next pass reopens them all. Keeping them
+            // would leave a directory silently unwatched for the rest of the session.
+            Ok(Signal::Desynchronized) => {
+                self.forget_all();
+                Wake::Desynchronized
+            }
             Err(RecvTimeoutError::Timeout) => Wake::Quiet,
             Err(RecvTimeoutError::Disconnected) => Wake::Stopped,
         }
@@ -187,11 +206,15 @@ impl Watched {
 
     /// The directories to watch: one per input, or the nearest existing ancestor when the input's
     /// own directory is not there yet.
+    ///
+    /// Nothing is dropped. An input whose whole chain is missing yields the last directory the
+    /// walk reached, and registering that either works or fails loudly — which is the point, since
+    /// a path quietly left out of the watch set is a path the session has stopped answering for.
     fn directories(&self) -> Vec<PathBuf> {
         self.inputs
             .iter()
             .filter_map(|input| input.parent())
-            .filter_map(nearest_existing_directory)
+            .map(nearest_existing_directory)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -215,21 +238,30 @@ impl Watched {
     }
 }
 
-fn nearest_existing_directory(from: &Path) -> Option<PathBuf> {
+fn nearest_existing_directory(from: &Path) -> PathBuf {
     let mut candidate = from;
     loop {
-        if candidate.is_dir() {
-            return Some(candidate.to_path_buf());
+        match candidate.parent() {
+            Some(parent) if !candidate.is_dir() => candidate = parent,
+            _ => return candidate.to_path_buf(),
         }
-        candidate = candidate.parent()?;
     }
 }
+
+/// How long a settling burst may hold a compile back before it runs anyway.
+///
+/// Coalescing waits for quiet, and a directory somebody else is writing into never goes quiet — a
+/// bundler or test runner emitting into the output tree would otherwise hold a recompile off for
+/// as long as it kept going. Churn may delay a compile; it may not cancel one.
+const MAX_SETTLE: Duration = Duration::from_secs(1);
 
 /// Waits until something worth recompiling for has changed and the tree has gone quiet again.
 ///
 /// Coalescing is what makes one save one compile: a single editor write is several events, and an
-/// edit landing while a compile runs queues behind it rather than starting a second one.
-fn wait(watched: &Watched, changes: &mut dyn Changes, quiet: Duration) -> bool {
+/// edit landing while a compile runs queues behind it rather than starting a second one. Only
+/// events that would themselves have started a compile keep the wait open — an event the filter
+/// already rejected cannot postpone the compile it is not part of.
+fn wait(watched: &Watched, changes: &mut dyn Changes, quiet: Duration, cap: Duration) -> bool {
     loop {
         let triggered = match changes.wake(None) {
             Wake::Stopped => return false,
@@ -240,11 +272,26 @@ fn wait(watched: &Watched, changes: &mut dyn Changes, quiet: Duration) -> bool {
         if !triggered {
             continue;
         }
+        let capped = Instant::now() + cap;
+        let mut settled = Instant::now() + quiet;
         loop {
-            match changes.wake(Some(quiet)) {
-                Wake::Changed(_) | Wake::Desynchronized => {}
+            let remaining = settled
+                .min(capped)
+                .saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            match changes.wake(Some(remaining)) {
                 Wake::Quiet => return true,
                 Wake::Stopped => return false,
+                // Only an event that would itself have started a compile keeps the wait open. One
+                // the filter has already rejected cannot postpone the compile it is not part of.
+                Wake::Desynchronized => settled = Instant::now() + quiet,
+                Wake::Changed(path) => {
+                    if watched.triggers(&path) {
+                        settled = Instant::now() + quiet;
+                    }
+                }
             }
         }
     }
@@ -274,18 +321,28 @@ pub(crate) fn session(
         let mut outcome = compile();
         let settled = outcome.exit_code == 0;
         // Only a tracked run reports a plan, and `run` always tracks — so the default here stands
-        // for a caller that asked for no plan at all, which leaves the session with nothing to
-        // watch and ends it on the next wait rather than pretending to be watching something.
+        // for a caller that asked for no plan at all.
         let plan = outcome.watch_plan.take().unwrap_or_default();
         let quiet = Duration::from_millis(u64::from(plan.settings.debounce_ms));
         watched.absorb(&plan, settled);
         report(outcome);
 
-        if let Err(reason) = changes.watch(&watched.directories()) {
+        let directories = watched.directories();
+        // Nothing to watch is not a session: no event could ever arrive, so waiting would be a
+        // process that looks alive and answers for nothing.
+        if directories.is_empty() {
+            return report(watch_failed("the compile reported no inputs to watch"));
+        }
+        if let Err(reason) = changes.watch(&directories) {
             return report(watch_failed(&reason));
         }
-        if !wait(&watched, changes, quiet) {
-            return 0;
+        if !wait(&watched, changes, quiet, MAX_SETTLE) {
+            // Not a clean end: nothing in the product asks a session to stop, so a source that has
+            // stopped reporting is a watcher that died under it. Exiting 0 there would say the run
+            // was fine and leave whoever asked for a watch with no watch and no reason.
+            return report(watch_failed(
+                "the filesystem watcher stopped reporting changes",
+            ));
         }
     }
 }
@@ -336,6 +393,8 @@ mod tests {
         wakes: VecDeque<Wake>,
         registered: Vec<Vec<PathBuf>>,
         refuse: Option<String>,
+        /// Returned once the script runs out, for a test that needs a source with no end.
+        repeat: Option<PathBuf>,
     }
 
     impl Changes for Scripted {
@@ -348,7 +407,13 @@ mod tests {
         }
 
         fn wake(&mut self, _quiet: Option<Duration>) -> Wake {
-            self.wakes.pop_front().unwrap_or(Wake::Stopped)
+            match self.wakes.pop_front() {
+                Some(wake) => wake,
+                None => match &self.repeat {
+                    Some(path) => Wake::Changed(path.clone()),
+                    None => Wake::Stopped,
+                },
+            }
         }
     }
 
@@ -434,8 +499,17 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_path_with_no_existing_ancestor_has_no_directory_to_watch() {
-        assert_eq!(nearest_existing_directory(Path::new("nowhere")), None);
+    fn an_input_whose_whole_chain_is_missing_still_names_a_directory() {
+        // Nothing is dropped: the walk runs out and hands back what it reached, which registers
+        // or fails out loud rather than leaving the input silently unwatched.
+        assert_eq!(
+            nearest_existing_directory(Path::new("/oasts-nowhere-at-all")),
+            PathBuf::from("/")
+        );
+        assert_eq!(
+            nearest_existing_directory(Path::new("nowhere-at-all")),
+            PathBuf::from("")
+        );
     }
 
     #[test]
@@ -455,8 +529,55 @@ mod tests {
             ]),
             ..Scripted::default()
         };
-        assert!(wait(&watched, &mut changes, Duration::from_millis(5)));
+        assert!(wait(
+            &watched,
+            &mut changes,
+            Duration::from_millis(5),
+            MAX_SETTLE
+        ));
         assert!(changes.wakes.is_empty());
+    }
+
+    #[test]
+    fn churn_the_filter_rejects_does_not_hold_a_compile_back() {
+        let mut watched = Watched::default();
+        watched.absorb(&plan(&["/w/oasts.yaml"], Some("/w/out"), 5), true);
+        let mut changes = Scripted {
+            wakes: VecDeque::from(vec![
+                Wake::Changed(PathBuf::from("/w/oasts.yaml")),
+                // Everything after this is the output tree being written by somebody else. None of
+                // it would start a compile, so none of it may postpone one.
+                Wake::Changed(PathBuf::from("/w/out/types/a.ts")),
+                Wake::Changed(PathBuf::from("/w/out/types/b.ts")),
+                Wake::Quiet,
+            ]),
+            ..Scripted::default()
+        };
+        assert!(wait(
+            &watched,
+            &mut changes,
+            Duration::from_millis(5),
+            MAX_SETTLE
+        ));
+        assert!(changes.wakes.is_empty());
+    }
+
+    #[test]
+    fn unending_churn_delays_a_compile_but_never_cancels_it() {
+        let mut watched = Watched::default();
+        watched.absorb(&plan(&["/w/oasts.yaml"], Some("/w/out"), 5), true);
+        // A source that never runs out: every wake is a real change, so the settling window is
+        // refreshed forever and only the cap can end the wait.
+        let mut changes = Scripted {
+            repeat: Some(PathBuf::from("/w/oasts.yaml")),
+            ..Scripted::default()
+        };
+        assert!(wait(
+            &watched,
+            &mut changes,
+            Duration::from_millis(50),
+            Duration::from_millis(20)
+        ));
     }
 
     #[test]
@@ -470,7 +591,12 @@ mod tests {
             ]),
             ..Scripted::default()
         };
-        assert!(!wait(&watched, &mut changes, Duration::from_millis(5)));
+        assert!(!wait(
+            &watched,
+            &mut changes,
+            Duration::from_millis(5),
+            MAX_SETTLE
+        ));
     }
 
     #[test]
@@ -501,9 +627,9 @@ mod tests {
                 outcome.exit_code
             },
         );
-        assert_eq!(code, 0);
+        assert_eq!(code, 2, "a watcher that stopped is not a clean exit");
         assert_eq!(compiles, 3);
-        assert_eq!(reported, vec![0, 1, 0]);
+        assert_eq!(reported, vec![0, 1, 0, 2]);
         assert_eq!(changes.registered.len(), 3);
     }
 
@@ -524,6 +650,19 @@ mod tests {
         );
         assert_eq!(code, 2);
         assert_eq!(reported, vec![CODE_WATCH_IO]);
+    }
+
+    #[test]
+    fn a_first_cycle_with_nothing_to_watch_says_so_rather_than_waiting() {
+        let mut changes = Scripted::default();
+        let mut reported = Vec::new();
+        let code = session(&mut changes, &mut || outcome(0, None), &mut |outcome| {
+            reported.extend(outcome.diagnostics.iter().map(|entry| entry.code));
+            outcome.exit_code
+        });
+        assert_eq!(code, 2);
+        assert_eq!(reported, vec![CODE_WATCH_IO]);
+        assert!(changes.registered.is_empty());
     }
 
     #[test]
@@ -551,7 +690,7 @@ mod tests {
             },
             &mut |outcome| outcome.exit_code,
         );
-        assert_eq!(code, 0);
+        assert_eq!(code, 2);
         assert_eq!(changes.registered[1], vec![root]);
     }
 
@@ -603,7 +742,12 @@ mod tests {
             ]),
             ..Scripted::default()
         };
-        assert!(wait(&watched, &mut changes, Duration::from_millis(5)));
+        assert!(wait(
+            &watched,
+            &mut changes,
+            Duration::from_millis(5),
+            MAX_SETTLE
+        ));
         assert!(changes.wakes.is_empty());
     }
 
@@ -706,9 +850,39 @@ mod tests {
         let mut changes = FsChanges {
             watcher: Err(notify::Error::generic("unused")),
             events,
-            watched: BTreeSet::new(),
+            watched: BTreeSet::from([PathBuf::from("/w")]),
         };
         assert!(matches!(changes.wake(None), Wake::Desynchronized));
+        // Waking on a lost event is what gives the registrations up.
+        assert!(changes.watched.is_empty());
+    }
+
+    #[test]
+    fn a_watcher_that_lost_events_gives_up_every_registration() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir_all(&first).expect("first");
+        fs::create_dir_all(&second).expect("second");
+        let mut changes = FsChanges::new();
+        changes
+            .watch(&[first.clone(), second.clone()])
+            .expect("watch both");
+
+        // Nothing in a pathless failure says which registration went with it, so none may be
+        // assumed to have survived.
+        changes.forget_all();
+        assert!(changes.watched.is_empty());
+
+        // The next pass reopens them, and the reopened watch reports again.
+        changes
+            .watch(&[first.clone(), second])
+            .expect("rewatch after giving up");
+        fs::write(first.join("api.yaml"), "openapi: 3.1.0\n").expect("write");
+        assert!(matches!(
+            changes.wake(Some(Duration::from_secs(5))),
+            Wake::Changed(_)
+        ));
     }
 
     #[test]
@@ -722,6 +896,16 @@ mod tests {
             changes.wake(Some(Duration::from_millis(20))),
             Wake::Quiet
         ));
+    }
+
+    /// Ends the session however the test body leaves — a failed assertion included, which would
+    /// otherwise leave `thread::scope` waiting on a session nothing had told to stop.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
     }
 
     /// The real watcher, ended once the test has seen everything it asked for.
@@ -755,7 +939,13 @@ mod tests {
 
     fn watch_fixture(root: &Path) {
         fs::create_dir_all(root.join("spec")).expect("spec directory");
+        fs::create_dir_all(root.join("shared")).expect("shared directory");
         fs::create_dir_all(root.join("tsconfigs")).expect("tsconfig directory");
+        // The referenced document lives in a directory of its own, and nothing else in the tree
+        // does: a fixture whose only document is the entry cannot tell whether the set of
+        // `$ref`-reached files is watched at all.
+        fs::write(root.join("shared/components.yaml"), component(&["id"]))
+            .expect("referenced document");
         fs::write(
             root.join("spec/openapi.yaml"),
             document(&["listThings"]).as_str(),
@@ -774,13 +964,27 @@ mod tests {
         fs::write(root.join("oasts.yaml"), config(&[])).expect("config");
     }
 
+    /// Every operation answers with the same `$ref`, so the referenced file is reached from the
+    /// entry rather than sitting beside it unread.
     fn document(operations: &[&str]) -> String {
+        document_referencing("../shared/components.yaml", operations)
+    }
+
+    fn document_referencing(reference: &str, operations: &[&str]) -> String {
         let mut text =
             String::from("openapi: 3.1.0\ninfo: {title: watch, version: 1.0.0}\npaths:\n");
         for operation in operations {
             text.push_str(&format!(
-                "  /{operation}:\n    get:\n      operationId: {operation}\n      responses:\n        '204': {{description: no content}}\n"
+                "  /{operation}:\n    get:\n      operationId: {operation}\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json:\n              schema: {{$ref: '{reference}#/Thing'}}\n"
             ));
+        }
+        text
+    }
+
+    fn component(properties: &[&str]) -> String {
+        let mut text = String::from("Thing:\n  type: object\n  properties:\n");
+        for property in properties {
+            text.push_str(&format!("    {property}: {{type: string}}\n"));
         }
         text
     }
@@ -822,6 +1026,7 @@ mod tests {
         let compiles = std::sync::atomic::AtomicU32::new(0);
 
         std::thread::scope(|scope| {
+            let _stop = StopOnDrop(&done);
             let session_root = root.clone();
             let ticks = ticks.clone();
             let done = &done;
@@ -835,6 +1040,7 @@ mod tests {
                 session(
                     &mut changes,
                     &mut || {
+                        compiles.fetch_add(1, Ordering::SeqCst);
                         driver::run(
                             Command::Generate { check: false },
                             ConfigSource::Path {
@@ -845,7 +1051,6 @@ mod tests {
                         )
                     },
                     &mut |outcome| {
-                        compiles.fetch_add(1, Ordering::SeqCst);
                         let code = outcome.exit_code;
                         let _ = ticks.send(code);
                         code
@@ -894,11 +1099,101 @@ mod tests {
                 await_cycle(&tick_reader, &armed_reader, "an extends-chain change"),
                 0
             );
-
-            done.store(true, Ordering::SeqCst);
         });
 
         assert_eq!(compiles.load(Ordering::SeqCst), 4);
+    }
+
+    /// The ordinary authoring order for a reference that does not resolve yet.
+    ///
+    /// Retarget a `$ref` at a directory nobody has created, make the directory, then write the
+    /// file. A session that only reported the documents a *successful* load returned would have
+    /// dropped every `$ref`-reached path the moment the load failed, leaving the directory holding
+    /// them unwatched and the session unable to see either step.
+    #[test]
+    fn a_real_session_sees_a_ref_target_appear_after_the_load_that_wanted_it_failed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        watch_fixture(&root);
+
+        let done = AtomicBool::new(false);
+        let (ticks, tick_reader) = mpsc::channel();
+        let (armed, armed_reader) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let _stop = StopOnDrop(&done);
+            let session_root = root.clone();
+            let ticks = ticks.clone();
+            let done = &done;
+            scope.spawn(move || {
+                let mut changes = UntilDone {
+                    inner: FsChanges::new(),
+                    done,
+                    armed,
+                };
+                session(
+                    &mut changes,
+                    &mut || {
+                        driver::run(
+                            Command::Generate { check: false },
+                            ConfigSource::Path {
+                                explicit: None,
+                                cwd: &session_root,
+                            },
+                            Tracking::Watch,
+                        )
+                    },
+                    &mut |outcome| {
+                        let code = outcome.exit_code;
+                        let _ = ticks.send(code);
+                        code
+                    },
+                );
+            });
+
+            assert_eq!(
+                await_cycle(&tick_reader, &armed_reader, "the first compile"),
+                0
+            );
+
+            // 1. Point the reference at a directory that is not there.
+            fs::write(
+                root.join("spec/openapi.yaml"),
+                document_referencing("../later/components.yaml", &["listThings"]).as_str(),
+            )
+            .expect("retargeted document");
+            assert_ne!(
+                await_cycle(&tick_reader, &armed_reader, "an unresolvable reference"),
+                0,
+                "an unresolvable reference should report, not pass"
+            );
+
+            // 2. Create the directory. The compile still fails, and the session must be watching
+            //    the new directory afterwards rather than only the one it used to read.
+            fs::create_dir_all(root.join("later")).expect("later directory");
+            assert_ne!(
+                await_cycle(
+                    &tick_reader,
+                    &armed_reader,
+                    "the missing directory appearing"
+                ),
+                0,
+                "the directory alone does not resolve the reference"
+            );
+
+            // 3. Write the file the reference names.
+            fs::write(root.join("later/components.yaml"), component(&["id"]))
+                .expect("referenced document");
+            assert_eq!(
+                await_cycle(
+                    &tick_reader,
+                    &armed_reader,
+                    "the referenced document appearing"
+                ),
+                0,
+                "the session did not see the file that fixes the reference"
+            );
+        });
     }
 
     #[test]
@@ -912,6 +1207,7 @@ mod tests {
         let (armed, armed_reader) = mpsc::channel();
 
         std::thread::scope(|scope| {
+            let _stop = StopOnDrop(&done);
             let session_root = root.clone();
             let ticks = ticks.clone();
             let done = &done;
@@ -964,7 +1260,6 @@ mod tests {
                 await_cycle(&tick_reader, &armed_reader, "a repaired document"),
                 0
             );
-            done.store(true, Ordering::SeqCst);
         });
     }
 

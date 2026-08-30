@@ -249,15 +249,27 @@ function isInside(path: string, root: string): boolean {
 }
 
 /**
+ * How long a settling burst may hold a compile back before it runs anyway.
+ *
+ * Coalescing waits for quiet, and a directory somebody else is writing into never goes quiet — a
+ * bundler or test runner emitting into the output tree would otherwise hold a recompile off for as
+ * long as it kept going. Churn may delay a compile; it may not cancel one.
+ */
+const MAX_SETTLE_MS = 1000;
+
+/**
  * Waits until something worth recompiling for has changed and the tree has gone quiet again.
  *
  * Coalescing is what makes one save one compile: a single editor write is several events, and an
- * edit landing while a compile runs queues behind it rather than starting a second one.
+ * edit landing while a compile runs queues behind it rather than starting a second one. Only
+ * events that would themselves have started a compile keep the wait open — an event the filter
+ * already rejected cannot postpone the compile it is not part of.
  */
 async function waitForChange(
   watched: Watched,
   changes: Changes,
   quietMs: number,
+  capMs: number,
 ): Promise<boolean> {
   for (;;) {
     const wake = await changes.wake(null);
@@ -267,13 +279,22 @@ async function waitForChange(
     if (wake.kind === "quiet" || (wake.kind === "changed" && !watched.triggers(wake.path))) {
       continue;
     }
+    const capped = Date.now() + capMs;
+    let settled = Date.now() + quietMs;
     for (;;) {
-      const settling = await changes.wake(quietMs);
+      const remaining = Math.min(settled, capped) - Date.now();
+      if (remaining <= 0) {
+        return true;
+      }
+      const settling = await changes.wake(remaining);
       if (settling.kind === "quiet") {
         return true;
       }
       if (settling.kind === "stopped") {
         return false;
+      }
+      if (settling.kind === "desynchronized" || watched.triggers(settling.path)) {
+        settled = Date.now() + quietMs;
       }
     }
   }
@@ -285,10 +306,7 @@ export function watchFailure(reason: string): Cycle {
   return { exitCode: failure.exitCode, stdout: "", stderr: failure.renderedStderr, plan: null };
 }
 
-/** The `watch.debounceMs` default, for a cycle that never reached a configuration to read it. */
-const DEFAULT_DEBOUNCE_MS = 100;
-
-const EMPTY_PLAN: WatchPlan = { inputs: [], outputRoot: null, debounceMs: DEFAULT_DEBOUNCE_MS };
+const EMPTY_PLAN: WatchPlan = { inputs: [], outputRoot: null, debounceMs: 0 };
 
 /** Runs one watch session, compiling through `compile` and rendering through `report`. */
 export async function session(
@@ -300,21 +318,30 @@ export async function session(
   for (;;) {
     const cycle = await compile();
     // Only a tracked run reports a plan, and every cycle asks for one — so the default here stands
-    // for a caller that asked for no plan at all, which leaves the session with nothing to watch
-    // and ends it on the next wait rather than pretending to be watching something.
+    // for a caller that asked for no plan at all.
     const plan = cycle.plan ?? EMPTY_PLAN;
     watched.absorb(plan, cycle.exitCode === 0);
     report(cycle);
 
+    const directories = watched.directories();
+    // Nothing to watch is not a session: no event could ever arrive, so waiting would be a process
+    // that looks alive and answers for nothing.
+    if (directories.length === 0) {
+      changes.close();
+      return report(watchFailure("the compile reported no inputs to watch"));
+    }
     try {
-      changes.watch(watched.directories());
+      changes.watch(directories);
     } catch (error) {
       changes.close();
       return report(watchFailure(error instanceof Error ? error.message : String(error)));
     }
-    if (!(await waitForChange(watched, changes, plan.debounceMs))) {
+    if (!(await waitForChange(watched, changes, plan.debounceMs, MAX_SETTLE_MS))) {
+      // Not a clean end: nothing in the product asks a session to stop, so a source that has
+      // stopped reporting is a watcher that died under it. Exiting 0 there would say the run was
+      // fine and leave whoever asked for a watch with no watch and no reason.
       changes.close();
-      return 0;
+      return report(watchFailure("the filesystem watcher stopped reporting changes"));
     }
   }
 }
@@ -324,6 +351,8 @@ export interface WatchNative {
   discoveryCandidates(cwd: string, explicitPath?: string | null): string[];
   discoverConfig(cwd: string, explicitPath?: string | null): DiscoveredConfigJs;
   run(options: RunOptions): RunResult;
+  /** Asked for rather than copied, so this side cannot disagree with what the compiler applies. */
+  watchDefaults(): { debounceMs: number };
 }
 
 /** What the invocation selected, as far as a cycle cares. */
@@ -353,7 +382,7 @@ export async function compileOnce(
   const fallback: WatchPlan = {
     inputs: candidates,
     outputRoot: null,
-    debounceMs: DEFAULT_DEBOUNCE_MS,
+    debounceMs: native.watchDefaults().debounceMs,
   };
   try {
     const discovered = native.discoverConfig(cwd, explicit);
