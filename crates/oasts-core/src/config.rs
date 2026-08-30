@@ -1983,20 +1983,26 @@ fn check_output_overlap(specs: &[ResolvedSpec], source_path: &Path) -> Result<()
     let mut diagnostics = Vec::new();
     for (index, spec) in specs.iter().enumerate() {
         for earlier in &specs[..index] {
-            if !contains_or_equals(&earlier.config.output, &spec.config.output)
-                && !contains_or_equals(&spec.config.output, &earlier.config.output)
-            {
+            let earlier_holds = contains_or_equals(&earlier.config.output, &spec.config.output);
+            let spec_holds = contains_or_equals(&spec.config.output, &earlier.config.output);
+            if !earlier_holds && !spec_holds {
                 continue;
             }
+            // The nested root is the one to move, so it is the one named. Equal roots are held by
+            // each other, and the later-sorted spec answers for them.
+            let (offender, host) = if spec_holds && !earlier_holds {
+                (earlier, spec)
+            } else {
+                (spec, earlier)
+            };
             // The inner loop only runs past the first spec, and only a workspace has a second.
-            if let (Some(name), Some(earlier_name)) =
-                (spec.name.as_deref(), earlier.name.as_deref())
+            if let (Some(name), Some(host_name)) = (offender.name.as_deref(), host.name.as_deref())
             {
                 diagnostics.push(config_error(
                     CODE_OUTPUT_OVERLAP,
                     format!(
-                        "spec '{name}' writes into the same tree as spec '{earlier_name}'; every \
-                     spec needs an output root of its own"
+                        "spec '{name}' writes into the tree spec '{host_name}' owns; every spec \
+                         needs an output root of its own"
                     ),
                     Some(source_path),
                     Some(&format!("/specs/{name}/output")),
@@ -6091,11 +6097,12 @@ specs:
     }
 
     #[test]
-    fn two_specs_cannot_write_into_one_tree() {
-        for (first, second) in [
-            ("./generated", "./generated"),
-            ("./generated", "./generated/inner"),
-            ("./generated/inner", "./generated"),
+    fn the_nested_output_root_is_the_one_named() {
+        // `aaa` sorts first either way, so the offender is decided by nesting, not by order.
+        for (first, second, offender, host) in [
+            ("./out/aaa", "./out/aaa/inner", "zzz", "aaa"),
+            ("./out/zzz/inner", "./out/zzz", "aaa", "zzz"),
+            ("./out/same", "./out/same", "zzz", "aaa"),
         ] {
             let diagnostics = assert_workspace_code(
                 load_workspace_yaml(&format!(
@@ -6105,7 +6112,15 @@ specs:
             );
             assert_eq!(
                 diagnostics[0].json_pointer.as_deref(),
-                Some("/specs/zzz/output")
+                Some(&format!("/specs/{offender}/output")[..]),
+                "{first} vs {second}"
+            );
+            assert_eq!(
+                diagnostics[0].message,
+                format!(
+                    "spec '{offender}' writes into the tree spec '{host}' owns; every spec needs \
+                     an output root of its own"
+                )
             );
         }
     }
