@@ -11,8 +11,12 @@ rust_gate() {
 }
 
 ts_gate() {
-  cd packages/oasts && pnpm exec oxfmt --check . && pnpm exec oxlint
-  cd ../../crates/oasts-core/runtime && pnpm exec oxfmt --check . && pnpm exec oxlint
+  # Each half runs in a subshell and its status is kept: a plain sequence would return only the
+  # last command's, so a failure in packages/oasts vanished whenever the runtime half passed.
+  local status=0
+  (cd packages/oasts && pnpm exec oxfmt --check . && pnpm exec oxlint) || status=1
+  (cd crates/oasts-core/runtime && pnpm exec oxfmt --check . && pnpm exec oxlint) || status=1
+  return "$status"
 }
 
 rust_gate &
