@@ -445,9 +445,13 @@ fn drift(
 fn emit(compiled: Vec<Compiled>, mut warnings: Vec<Diagnostic>, tracked: &mut Tracked) -> Outcome {
     let mut summary = Vec::new();
     let mut failure = None;
-    for entry in compiled {
-        let config = &entry.spec.config;
-        let mut inputs = entry.inputs;
+    for Compiled {
+        spec,
+        files,
+        mut inputs,
+    } in compiled
+    {
+        let config = &spec.config;
         // Past a failed write nothing more is written, and the peer manifests answer for a tree
         // this run is no longer going to touch. The plan is still filed for every spec that
         // compiled: a session that stopped watching them could not see the edit that fixes this.
@@ -465,28 +469,32 @@ fn emit(compiled: Vec<Compiled>, mut warnings: Vec<Diagnostic>, tracked: &mut Tr
             {
                 peers.push(diagnostic);
             }
-            attribute(&entry.spec, &mut peers);
+            attribute(&spec, &mut peers);
             warnings.append(&mut peers);
         }
-        tracked.absorb(&entry.spec, inputs);
+        tracked.absorb(&spec, inputs);
         if failure.is_some() {
             continue;
         }
 
         // A successful emitting compile returns `Some`; `None` either means check-only or an
         // error, and both cases returned above.
-        let files = entry
-            .files
-            .expect("successful emitting compilation returns generated files");
+        let files = files.expect("successful emitting compilation returns generated files");
         let generated_count = files.len();
         match write(&config.output, files) {
-            Ok(_) => summary.push(match entry.spec.name.as_deref() {
+            Ok(_) => summary.push(match spec.name.as_deref() {
                 Some(name) => format!("{name}: generated {generated_count} files"),
                 None => format!("generated {generated_count} files"),
             }),
-            // Specs already written stay written; the summary of what did land is reported
-            // beside the failure so the run says exactly how far it got.
-            Err(diagnostics) => failure = Some(diagnostics),
+            Err(mut diagnostics) => {
+                // A write failure belongs to the spec whose output root it happened under, the
+                // same as every other diagnostic here; some of them carry no path of their own,
+                // and would otherwise name nothing at all in a run with several output roots.
+                attribute(&spec, &mut diagnostics);
+                // Specs already written stay written; the summary of what did land is reported
+                // beside the failure so the run says exactly how far it got.
+                failure = Some(diagnostics);
+            }
         }
     }
     let Some(diagnostics) = failure else {
@@ -1089,6 +1097,14 @@ specs:
         let outcome = invoke(&temp, Command::Generate { check: false }, &[]);
 
         assert_eq!(outcome.exit_code, 2, "{:#?}", outcome.diagnostics);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.spec.as_deref() == Some("users")),
+            "{:#?}",
+            outcome.diagnostics
+        );
         assert!(
             outcome
                 .stdout_summary
