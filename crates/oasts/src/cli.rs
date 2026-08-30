@@ -1173,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_write_failure_reports_the_specs_that_did_land() {
+    fn a_root_that_cannot_be_written_is_refused_before_any_root_is_written() {
         let temp = workspace_fixture();
         fs::create_dir_all(temp.path().join("generated")).expect("output parent");
         fs::write(temp.path().join("generated/users"), "not a directory").expect("blocking file");
@@ -1181,8 +1181,9 @@ mod tests {
         let (code, stdout, stderr) = invoke(&["oasts", "generate"], temp.path());
 
         assert_eq!(code, 2, "{stderr}");
-        assert!(stdout.starts_with("billing: generated "), "{stdout}");
-        assert!(temp.path().join("generated/billing").is_dir());
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("spec 'users':"), "{stderr}");
+        assert!(!temp.path().join("generated/billing").exists());
     }
 
     #[test]

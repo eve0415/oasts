@@ -285,6 +285,39 @@ fn prune_emptied_directories(output_root: &Path, emptied: Vec<PathBuf>) {
     }
 }
 
+/// Every refusal a write of `files` into `output_dir` can make before it writes a byte.
+///
+/// A run with several output roots asks this of all of them before committing any, so a refusal
+/// one root could have predicted does not arrive after another root has already been rewritten.
+/// What it cannot answer is the I/O the commit itself does: a disk that fills, a permission that
+/// changes under the run, a rename that fails. Those stay where they are, behind the transaction
+/// that rolls each root back on its own.
+pub fn preflight(output_dir: &Path, files: &[GeneratedFile]) -> Result<(), Vec<Diagnostic>> {
+    validate_generated_paths(files)?;
+    validate_output_path(output_dir)?;
+    if !output_dir.exists() {
+        return Ok(());
+    }
+
+    let canonical_output = canonical_output_dir(output_dir)?;
+    validate_target(&canonical_output, MANIFEST_NAME)?;
+    let previous_read = read_manifest_bytes(&canonical_output)?;
+    let previous = previous_read.as_ref().map(|(manifest, _)| manifest);
+    validate_manifest_paths(previous)?;
+
+    let mut targets = TargetValidator::new(&canonical_output);
+    targets.validate(MANIFEST_NAME)?;
+    for file in files {
+        targets.validate(&file.relative_path)?;
+    }
+    if let Some(previous) = previous {
+        for relative_path in &previous.files {
+            targets.validate(relative_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Writes generated files and updates the output-root ownership manifest.
 pub fn write(output_dir: &Path, files: Vec<GeneratedFile>) -> Result<WriteReport, Vec<Diagnostic>> {
     write_with_renamer(output_dir, files, &FileRenamer)
@@ -894,8 +927,11 @@ fn compare_drift_file(
     })
 }
 
-fn prepare_files(files: Vec<GeneratedFile>) -> Result<Vec<PreparedFile>, Vec<Diagnostic>> {
-    let mut prepared = Vec::with_capacity(files.len());
+/// The rules a generated path must satisfy, checked without touching its content.
+///
+/// [`preflight`] and [`prepare_files`] both ask this, so a path a preflight accepts is one the
+/// write accepts.
+fn validate_generated_paths(files: &[GeneratedFile]) -> Result<(), Vec<Diagnostic>> {
     let mut paths = BTreeSet::new();
     for file in files {
         validate_relative_path(&file.relative_path)?;
@@ -905,17 +941,25 @@ fn prepare_files(files: Vec<GeneratedFile>) -> Result<Vec<PreparedFile>, Vec<Dia
                 "generated files cannot replace the ownership manifest",
             )]);
         }
-        if !paths.insert(file.relative_path.clone()) {
+        if !paths.insert(file.relative_path.as_str()) {
             return Err(vec![Diagnostic::config(
                 CODE_DUPLICATE,
                 format!("duplicate generated path '{}'", file.relative_path),
             )]);
         }
-        prepared.push(PreparedFile {
+    }
+    Ok(())
+}
+
+fn prepare_files(files: Vec<GeneratedFile>) -> Result<Vec<PreparedFile>, Vec<Diagnostic>> {
+    validate_generated_paths(&files)?;
+    let mut prepared = files
+        .into_iter()
+        .map(|file| PreparedFile {
             relative_path: file.relative_path,
             content: normalize_lf(file.content).into_bytes(),
-        });
-    }
+        })
+        .collect::<Vec<_>>();
     prepared.sort_unstable_by(|left, right| {
         left.relative_path
             .as_bytes()

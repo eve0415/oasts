@@ -16,7 +16,7 @@ use crate::diag::{Diagnostic, DiagnosticSink};
 use crate::emit::GeneratedFile;
 use crate::inputs::{InputRecorder, SpecWatchPlan, WatchPlan};
 use crate::source::FetcherHandle;
-use crate::writer::{DriftState, check_drift, write};
+use crate::writer::{DriftState, check_drift, preflight, write};
 use crate::{msw_peer, pipeline, zod_peer};
 
 /// What the host asked the compiler to do.
@@ -442,46 +442,68 @@ fn drift(
     }
 }
 
-fn emit(compiled: Vec<Compiled>, mut warnings: Vec<Diagnostic>, tracked: &mut Tracked) -> Outcome {
-    let mut summary = Vec::new();
-    let mut failure = None;
+fn emit(
+    mut compiled: Vec<Compiled>,
+    mut warnings: Vec<Diagnostic>,
+    tracked: &mut Tracked,
+) -> Outcome {
+    // Every root answers for itself before the first of them is committed, so a refusal one spec
+    // could have predicted — its output root taken by a file, an ownership manifest it cannot
+    // read, a generated path that will not sit inside it — leaves the whole workspace untouched
+    // rather than arriving after an earlier spec has already been rewritten. The peer advice is
+    // gathered in the same pass: it is about what the consumer has installed, and stays true
+    // whether or not the run goes on to write.
+    let mut refusals = Vec::new();
     for Compiled {
         spec,
         files,
-        mut inputs,
-    } in compiled
+        inputs,
+    } in &mut compiled
     {
         let config = &spec.config;
-        // Past a failed write nothing more is written, and the peer manifests answer for a tree
-        // this run is no longer going to touch. The plan is still filed for every spec that
-        // compiled: a session that stopped watching them could not see the edit that fixes this.
-        if failure.is_none() {
-            // Only on the write path: `--check` compares bytes for CI, where the consumer's
-            // node_modules is neither inspected nor relevant.
-            let mut peers = Vec::new();
-            if config.artifacts.zod.enabled
-                && let Some(diagnostic) = zod_peer::diagnose(&config.output, &mut inputs)
-            {
-                peers.push(diagnostic);
-            }
-            if config.artifacts.msw.enabled
-                && let Some(diagnostic) = msw_peer::diagnose(&config.output, &mut inputs)
-            {
-                peers.push(diagnostic);
-            }
-            attribute(&spec, &mut peers);
-            warnings.append(&mut peers);
+        // Only on the write path: `--check` compares bytes for CI, where the consumer's
+        // node_modules is neither inspected nor relevant.
+        let mut peers = Vec::new();
+        if config.artifacts.zod.enabled
+            && let Some(diagnostic) = zod_peer::diagnose(&config.output, inputs)
+        {
+            peers.push(diagnostic);
         }
-        tracked.absorb(&spec, inputs);
-        if failure.is_some() {
-            continue;
+        if config.artifacts.msw.enabled
+            && let Some(diagnostic) = msw_peer::diagnose(&config.output, inputs)
+        {
+            peers.push(diagnostic);
         }
+        attribute(spec, &mut peers);
+        warnings.append(&mut peers);
+        // Filed here, where every spec passes whatever the run goes on to do: a refusal below, or
+        // a write that fails part way, still leaves a watching host the whole set to wait on.
+        tracked.absorb(spec, std::mem::take(inputs));
 
+        // A successful emitting compile returns `Some`; `None` either means check-only or an
+        // error, and both cases returned above.
+        let files = files
+            .as_deref()
+            .expect("successful emitting compilation returns generated files");
+        if let Err(mut diagnostics) = preflight(&config.output, files) {
+            attribute(spec, &mut diagnostics);
+            refusals.append(&mut diagnostics);
+        }
+    }
+    if !refusals.is_empty() {
+        let mut sink = DiagnosticSink::new();
+        sink.extend(warnings);
+        sink.extend(refusals);
+        return Outcome::failed(sink);
+    }
+
+    let mut summary = Vec::new();
+    for Compiled { spec, files, .. } in compiled {
         // A successful emitting compile returns `Some`; `None` either means check-only or an
         // error, and both cases returned above.
         let files = files.expect("successful emitting compilation returns generated files");
         let generated_count = files.len();
-        match write(&config.output, files) {
+        match write(&spec.config.output, files) {
             Ok(_) => summary.push(match spec.name.as_deref() {
                 Some(name) => format!("{name}: generated {generated_count} files"),
                 None => format!("generated {generated_count} files"),
@@ -491,23 +513,21 @@ fn emit(compiled: Vec<Compiled>, mut warnings: Vec<Diagnostic>, tracked: &mut Tr
                 // same as every other diagnostic here; some of them carry no path of their own,
                 // and would otherwise name nothing at all in a run with several output roots.
                 attribute(&spec, &mut diagnostics);
-                // Specs already written stay written; the summary of what did land is reported
-                // beside the failure so the run says exactly how far it got.
-                failure = Some(diagnostics);
+                // Only the I/O of the commit itself reaches here — the preflight above answered
+                // everything that could be known in advance. Specs already written stay written,
+                // and the summary of what did land is reported beside the failure.
+                let mut sink = DiagnosticSink::new();
+                sink.extend(warnings);
+                sink.extend(diagnostics);
+                let mut outcome = Outcome::failed(sink);
+                if !summary.is_empty() {
+                    outcome.stdout_summary = Some(summary.join("\n"));
+                }
+                return outcome;
             }
         }
     }
-    let Some(diagnostics) = failure else {
-        return Outcome::succeeded(&summary.join("\n"), warnings);
-    };
-    let mut sink = DiagnosticSink::new();
-    sink.extend(warnings);
-    sink.extend(diagnostics);
-    let mut outcome = Outcome::failed(sink);
-    if !summary.is_empty() {
-        outcome.stdout_summary = Some(summary.join("\n"));
-    }
-    outcome
+    Outcome::succeeded(&summary.join("\n"), warnings)
 }
 
 #[cfg(test)]
@@ -1089,14 +1109,61 @@ specs:
     }
 
     #[test]
-    fn a_write_failure_reports_the_specs_that_did_land() {
+    fn a_refusal_any_root_could_predict_is_made_before_any_root_is_written() {
+        for blocked in ["users", "billing"] {
+            let temp = workspace(TWO_SPECS);
+            fs::create_dir_all(temp.path().join("generated")).expect("output parent");
+            fs::write(
+                temp.path().join(format!("generated/{blocked}")),
+                "not a directory",
+            )
+            .expect("blocking file");
+
+            let outcome = invoke(&temp, Command::Generate { check: false }, &[]);
+
+            assert_eq!(outcome.exit_code, 2, "{:#?}", outcome.diagnostics);
+            assert_eq!(outcome.stdout_summary, None);
+            assert!(
+                outcome
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.spec.as_deref() == Some(blocked)),
+                "{:#?}",
+                outcome.diagnostics
+            );
+            // The other spec is untouched even though its own root was fine and sorts first.
+            for spec in ["users", "billing"] {
+                assert!(
+                    !temp.path().join(format!("generated/{spec}")).is_dir(),
+                    "{spec} was written despite a refusal {blocked} could have predicted"
+                );
+            }
+        }
+    }
+
+    /// Only the commit's own I/O reaches the write failure path, so this makes some.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_fails_mid_run_reports_the_specs_that_did_land() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = workspace(TWO_SPECS);
-        fs::create_dir_all(temp.path().join("generated")).expect("output parent");
-        fs::write(temp.path().join("generated/users"), "not a directory").expect("blocking file");
+        let parent = temp.path().join("generated");
+        fs::create_dir_all(parent.join("billing")).expect("the first spec's root");
+        // Both roots preflight clean: one exists and is empty, the other does not exist yet. The
+        // second spec then fails creating its own root, after the first has been committed.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).expect("read-only parent");
 
         let outcome = invoke(&temp, Command::Generate { check: false }, &[]);
 
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("restore");
         assert_eq!(outcome.exit_code, 2, "{:#?}", outcome.diagnostics);
+        assert!(
+            outcome
+                .stdout_summary
+                .expect("the specs that were written are reported")
+                .starts_with("billing: generated ")
+        );
         assert!(
             outcome
                 .diagnostics
@@ -1105,25 +1172,6 @@ specs:
             "{:#?}",
             outcome.diagnostics
         );
-        assert!(
-            outcome
-                .stdout_summary
-                .expect("the specs that were written are reported")
-                .starts_with("billing: generated ")
-        );
-        assert!(temp.path().join("generated/billing").is_dir());
-    }
-
-    #[test]
-    fn a_first_spec_that_cannot_be_written_summarizes_nothing() {
-        let temp = workspace(TWO_SPECS);
-        fs::create_dir_all(temp.path().join("generated")).expect("output parent");
-        fs::write(temp.path().join("generated/billing"), "not a directory").expect("blocking file");
-
-        let outcome = invoke(&temp, Command::Generate { check: false }, &[]);
-
-        assert_eq!(outcome.exit_code, 2, "{:#?}", outcome.diagnostics);
-        assert_eq!(outcome.stdout_summary, None);
-        assert!(!temp.path().join("generated/users").exists());
+        assert!(parent.join("billing/types").is_dir());
     }
 }
