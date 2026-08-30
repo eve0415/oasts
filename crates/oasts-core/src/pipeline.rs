@@ -2126,7 +2126,8 @@ paths:
         let types = load_config(Some(&fixture.join("oasts.yaml")), &fixture)
             .expect("resolved dialect-siblings types config");
         let mut sink = DiagnosticSink::new();
-        let files = compile(&types, true, &mut sink).expect("types artifact generates");
+        let files = compile(&types, FetcherHandle::None, true, &mut sink)
+            .expect("types artifact generates");
         assert!(!sink.has_errors(), "{:#?}", sink.as_slice());
         let paths = emitted_paths(&files);
         assert!(paths.contains("types/components/apikey.ts"), "{paths:#?}");
@@ -2167,7 +2168,7 @@ paths:
         let validators = load_config(Some(&fixture.join("oasts-validators.yaml")), &fixture)
             .expect("resolved dialect-siblings validators config");
         let mut sink = DiagnosticSink::new();
-        assert!(compile(&validators, true, &mut sink).is_none());
+        assert!(compile(&validators, FetcherHandle::None, true, &mut sink).is_none());
         assert_eq!(sink.worst_exit_code(), 1);
         let mut refused = sink
             .as_slice()
