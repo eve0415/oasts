@@ -503,6 +503,7 @@ validation:
                 explicit: None,
                 cwd: &root,
             },
+            FetcherHandle::None,
             Tracking::Watch,
         );
         assert_eq!(outcome.exit_code, 0, "{:#?}", outcome.diagnostics);

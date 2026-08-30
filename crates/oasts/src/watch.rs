@@ -369,6 +369,7 @@ pub(crate) fn run(
                     explicit: config_path,
                     cwd,
                 },
+                oasts_fetch::handle(),
                 Tracking::Watch,
             )
         },
@@ -1047,6 +1048,7 @@ mod tests {
                                 explicit: None,
                                 cwd: &session_root,
                             },
+                            oasts_fetch::handle(),
                             Tracking::Watch,
                         )
                     },
@@ -1140,6 +1142,7 @@ mod tests {
                                 explicit: None,
                                 cwd: &session_root,
                             },
+                            oasts_fetch::handle(),
                             Tracking::Watch,
                         )
                     },
@@ -1226,6 +1229,7 @@ mod tests {
                                 explicit: None,
                                 cwd: &session_root,
                             },
+                            oasts_fetch::handle(),
                             Tracking::Watch,
                         )
                     },
