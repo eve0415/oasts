@@ -12,6 +12,7 @@ use napi_derive::napi;
 use oasts_core::config;
 use oasts_core::diag::{Diagnostic, Severity};
 use oasts_core::driver::{self, Command, ConfigSource, Outcome, Tracking, Unsupported};
+use oasts_core::inputs::InputKind;
 
 /// A config discovery result exposed to the Node CLI.
 #[napi(object)]
@@ -43,11 +44,20 @@ pub struct DiagnosticJs {
     pub json_pointer: Option<String>,
 }
 
+/// One path a run depended on, and how a host should watch it.
+#[napi(object)]
+pub struct WatchInputJs {
+    pub path: String,
+    /// Whether the path names a directory, which a host registers as itself rather than through
+    /// its parent. Decided by the compile that recorded it, never by asking the filesystem.
+    pub directory: bool,
+}
+
 /// What one compile left behind for a host that watches its inputs.
 #[napi(object)]
 pub struct WatchPlanJs {
     /// Every path the run read or probed for, sorted and deduplicated.
-    pub inputs: Vec<String>,
+    pub inputs: Vec<WatchInputJs>,
     /// The tree the run writes into; never an input.
     pub output_root: Option<String>,
     /// How long the filesystem must stay quiet before a change is compiled.
@@ -192,7 +202,10 @@ fn render(outcome: Outcome) -> RunResult {
             inputs: plan
                 .inputs
                 .iter()
-                .map(|path| path.to_string_lossy().into_owned())
+                .map(|input| WatchInputJs {
+                    path: input.path.to_string_lossy().into_owned(),
+                    directory: input.kind == InputKind::Directory,
+                })
                 .collect(),
             output_root: plan
                 .output_root

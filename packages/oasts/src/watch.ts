@@ -24,9 +24,19 @@ import { loadScriptConfig } from "./config/load.ts";
 import { CliFailure, CODE_WATCH_IO, configFailure, fromNativeError } from "./diagnostics.ts";
 import type { DiscoveredConfigJs, RunOptions, RunResult } from "./native.ts";
 
+/** One path a compile depended on, and how a session should watch it. */
+export interface WatchInput {
+  path: string;
+  /**
+   * Whether the path names a directory, which is registered as itself rather than through its
+   * parent. Decided by the compile that recorded it, never by asking the filesystem.
+   */
+  directory: boolean;
+}
+
 /** What one compile left behind for the next wait. */
 export interface WatchPlan {
-  inputs: readonly string[];
+  inputs: readonly WatchInput[];
   outputRoot: string | null;
   debounceMs: number;
 }
@@ -185,18 +195,18 @@ export class FsChanges implements Changes {
 
 /** The paths a session is watching, and the tree it must ignore its own writes in. */
 export class Watched {
-  #inputs = new Set<string>();
+  #inputs = new Map<string, boolean>();
   #outputRoot: string | null = null;
   #settled = false;
 
   absorb(plan: WatchPlan, settled: boolean): void {
     if (settled) {
-      this.#inputs = new Set(plan.inputs);
+      this.#inputs = new Map(plan.inputs.map((input) => [input.path, input.directory]));
     } else {
       // Never narrow on failure: a run that stopped at a broken document read less than the one
       // before it, and dropping the rest would strand the session.
       for (const input of plan.inputs) {
-        this.#inputs.add(input);
+        this.#inputs.set(input.path, input.directory);
       }
     }
     if (plan.outputRoot !== null) {
@@ -208,13 +218,19 @@ export class Watched {
   /**
    * One directory per input, deduplicated and in a stable order.
    *
+   * A file is watched through the directory holding it, because that is what survives an editor's
+   * save-and-rename. A directory input — the workspace root, a `local.allowPaths` entry — is
+   * watched as *itself*: taking its parent would register the directory the project sits in, which
+   * is `$HOME` or a monorepo root, and reach far outside what the compile read.
+   *
    * An input whose own directory is not there yet — a document the config names and nobody has
-   * created — falls back to the nearest ancestor that is, so creating it is still noticed.
+   * created, or a trust root still to appear — falls back to the nearest ancestor that is, so
+   * creating it is still noticed.
    */
   directories(): string[] {
     const directories = new Set<string>();
-    for (const input of this.#inputs) {
-      directories.add(nearestExistingDirectory(dirname(input)));
+    for (const [path, isDirectory] of this.#inputs) {
+      directories.add(nearestExistingDirectory(isDirectory ? path : dirname(path)));
     }
     return [...directories].toSorted();
   }
@@ -231,6 +247,23 @@ export class Watched {
     // reached, and one wasted compile is cheaper than a session that cannot recover.
     return this.#inputs.has(path) || !this.#settled;
   }
+}
+
+/**
+ * Every input from both sides, one entry per path.
+ *
+ * A path either side calls a directory stays a directory: that is the wider registration and it
+ * cannot be wrong, and it matches how the compiler deduplicates the same collision.
+ */
+function mergeInputs(
+  left: readonly WatchInput[],
+  right: readonly WatchInput[],
+): readonly WatchInput[] {
+  const merged = new Map<string, boolean>();
+  for (const input of [...left, ...right]) {
+    merged.set(input.path, (merged.get(input.path) ?? false) || input.directory);
+  }
+  return [...merged].map(([path, directory]) => ({ path, directory }));
 }
 
 function nearestExistingDirectory(from: string): string {
@@ -378,7 +411,10 @@ export async function compileOnce(
   // for and cannot report the names it would have accepted instead. They belong in every plan, not
   // only the ones where discovery failed: a second `oasts.*` appearing is what turns a working run
   // into a discovery error, and its removal is what turns one back.
-  const candidates = native.discoveryCandidates(cwd, explicit);
+  // Config names are files, whatever else the compile went on to report.
+  const candidates: readonly WatchInput[] = native
+    .discoveryCandidates(cwd, explicit)
+    .map((path) => ({ path, directory: false }));
   const fallback: WatchPlan = {
     inputs: candidates,
     outputRoot: null,
@@ -405,7 +441,7 @@ export async function compileOnce(
         plan === undefined
           ? fallback
           : {
-              inputs: [...new Set([...candidates, ...plan.inputs])],
+              inputs: mergeInputs(candidates, plan.inputs),
               outputRoot: plan.outputRoot ?? null,
               debounceMs: plan.debounceMs,
             },

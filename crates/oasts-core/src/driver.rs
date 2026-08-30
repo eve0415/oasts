@@ -129,7 +129,7 @@ impl Outcome {
     ) -> Self {
         if recorder.is_recording() {
             self.watch_plan = Some(WatchPlan {
-                inputs: recorder.into_paths(),
+                inputs: recorder.into_inputs(),
                 output_root,
                 settings,
             });
@@ -308,6 +308,7 @@ mod tests {
     use std::fs;
 
     use crate::diag::render_to_string;
+    use crate::inputs::{InputKind, WatchInput};
 
     use super::*;
 
@@ -471,7 +472,7 @@ validation:
             .expect("a tracked run reports its inputs");
         assert_eq!(plan.output_root, Some(root.join("generated")));
 
-        let has = |path: PathBuf| plan.inputs.contains(&path);
+        let has = |path: PathBuf| watched(&plan, &path);
         // Every discovery candidate, not only the one that exists: a second name appearing is what
         // turns a working run into a discovery failure.
         assert!(has(root.join("oasts.yaml")));
@@ -491,11 +492,27 @@ validation:
         assert_eq!(
             plan.inputs
                 .iter()
+                .map(|input| input.path.as_path())
                 .filter(|path| path.starts_with(root.join("generated")))
                 .collect::<Vec<_>>(),
-            vec![&root.join("generated/tsconfig.json")]
+            vec![root.join("generated/tsconfig.json").as_path()]
         );
         assert!(plan.inputs.is_sorted());
+        // The trust root is a directory, and saying so is what stops a host watching the directory
+        // that contains it. Everything else here is a file.
+        assert_eq!(
+            plan.inputs
+                .iter()
+                .filter(|input| input.kind == InputKind::Directory)
+                .map(|input| input.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![root.as_path()]
+        );
+    }
+
+    /// Whether the plan reports `path`, whatever kind it was recorded as.
+    fn watched(plan: &WatchPlan, path: &Path) -> bool {
+        plan.inputs.iter().any(|input| input.path == path)
     }
 
     #[test]
@@ -533,17 +550,17 @@ remote:
             .watch_plan
             .expect("a tracked run reports its inputs");
         assert!(
-            plan.inputs.iter().all(|path| path.has_root()),
+            plan.inputs.iter().all(|input| input.path.has_root()),
             "{:#?}",
             plan.inputs
         );
         assert!(has_no_uri(&plan.inputs), "{:#?}", plan.inputs);
     }
 
-    fn has_no_uri(paths: &[PathBuf]) -> bool {
-        !paths
+    fn has_no_uri(inputs: &[WatchInput]) -> bool {
+        !inputs
             .iter()
-            .any(|path| path.to_string_lossy().contains("://"))
+            .any(|input| input.path.to_string_lossy().contains("://"))
     }
 
     #[test]
@@ -564,12 +581,19 @@ remote:
         let plan = outcome
             .watch_plan
             .expect("a tracked run reports its inputs");
-        // The walk reaches the filesystem root looking for a config that is not there. Only the
-        // probes inside the workspace are reported; watching every directory up to `/` would not be.
-        assert!(plan.inputs.contains(&root.join("tsconfig.json")));
-        assert!(plan.inputs.contains(&root.join("generated/tsconfig.json")));
+        // The walk reaches the filesystem root looking for a config that is not there, and only
+        // the probes inside the workspace are reported.
+        //
+        // This answers for the reported set, not for what a host registers from it: the workspace
+        // root is itself in this set and trivially starts with itself, so the reach above the
+        // workspace lives one step later, where an input becomes a directory to watch. The guard
+        // for that is `watch::tests::a_session_registers_the_workspace_root_itself`.
+        assert!(watched(&plan, &root.join("tsconfig.json")));
+        assert!(watched(&plan, &root.join("generated/tsconfig.json")));
         assert!(
-            plan.inputs.iter().all(|path| path.starts_with(&root)),
+            plan.inputs
+                .iter()
+                .all(|input| input.path.starts_with(&root)),
             "{:#?}",
             plan.inputs
         );
@@ -628,8 +652,8 @@ remote:
         let plan = outcome
             .watch_plan
             .expect("a tracked run reports its inputs");
-        assert!(plan.inputs.contains(&root.join("oasts.yaml")));
-        assert!(!plan.inputs.contains(&root.join("oasts.json")));
+        assert!(watched(&plan, &root.join("oasts.yaml")));
+        assert!(!watched(&plan, &root.join("oasts.json")));
     }
 
     #[test]
@@ -651,6 +675,6 @@ remote:
         let plan = outcome
             .watch_plan
             .expect("a tracked run reports its inputs");
-        assert!(plan.inputs.contains(&config_path));
+        assert!(watched(&plan, &config_path));
     }
 }

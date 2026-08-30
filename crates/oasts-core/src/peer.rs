@@ -64,6 +64,8 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    use crate::inputs::{InputKind, WatchInput};
+
     fn install(root: &Path, package: &str, version: &str) {
         let dir = root.join("node_modules").join(package);
         fs::create_dir_all(&dir).expect("create package dir");
@@ -110,7 +112,13 @@ mod tests {
         fs::write(&manifest, "{ not json").expect("write manifest");
         let mut recorder = InputRecorder::on();
         assert!(installed_version(temp.path(), "msw", &mut recorder).is_none());
-        assert_eq!(recorder.into_paths(), vec![manifest]);
+        assert_eq!(
+            recorder.into_inputs(),
+            vec![WatchInput {
+                path: manifest,
+                kind: InputKind::File,
+            }]
+        );
     }
 
     #[test]

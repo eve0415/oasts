@@ -722,8 +722,8 @@ impl<'a> GraphBuilder<'a> {
         // The trust roots decide what a `$ref` may reach and how every source id is spelled, so
         // repointing one changes emitted bytes. Recorded before they are resolved, because a root
         // that does not exist yet is exactly the one whose appearance changes the answer.
-        inputs.record(&config.workspace_root);
-        inputs.record_all(config.local_allow_paths.iter().map(PathBuf::as_path));
+        inputs.record_directory(&config.workspace_root);
+        inputs.record_all_directories(config.local_allow_paths.iter().map(PathBuf::as_path));
         let workspace_root = source
             .canonicalize(&config.workspace_root)
             .map_err(|error| {
@@ -747,10 +747,10 @@ impl<'a> GraphBuilder<'a> {
                     Some("/local/allowPaths"),
                 )
             })?;
-            inputs.record(&canonical_path);
+            inputs.record_directory(&canonical_path);
             allow_roots.push(AllowRoot { canonical_path });
         }
-        inputs.record(&workspace_root);
+        inputs.record_directory(&workspace_root);
         Ok(Self {
             config,
             source,

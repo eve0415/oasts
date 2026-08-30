@@ -16,11 +16,37 @@ use std::path::{Path, PathBuf};
 
 use crate::config::WatchConfig;
 
+/// Whether a recorded input names a directory or a file.
+///
+/// A watching host registers a directory as itself and a file through the directory containing it,
+/// and it may not decide which by asking the filesystem: a path is a directory because the
+/// configuration means it as one, and whatever happens to exist at that name when a watcher looks
+/// must not change what the run depended on. A trust root that is not there yet is exactly the
+/// case, and it is the case the recording exists for.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum InputKind {
+    /// A directory the run depended on: the workspace root, or a `local.allowPaths` entry.
+    ///
+    /// Ordered before [`InputKind::File`] so that a path recorded both ways deduplicates to the
+    /// directory, which is the wider registration and cannot be wrong.
+    Directory,
+    /// A document, manifest, or configuration file.
+    #[default]
+    File,
+}
+
+/// One path a run depended on, and how a host should watch it.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct WatchInput {
+    pub path: PathBuf,
+    pub kind: InputKind,
+}
+
 /// Accumulates the paths a run depended on, or discards them when no host asked.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct InputRecorder {
     recording: bool,
-    paths: Vec<PathBuf>,
+    inputs: Vec<WatchInput>,
 }
 
 impl InputRecorder {
@@ -29,7 +55,7 @@ impl InputRecorder {
     pub const fn off() -> Self {
         Self {
             recording: false,
-            paths: Vec::new(),
+            inputs: Vec::new(),
         }
     }
 
@@ -38,7 +64,7 @@ impl InputRecorder {
     pub const fn on() -> Self {
         Self {
             recording: true,
-            paths: Vec::new(),
+            inputs: Vec::new(),
         }
     }
 
@@ -48,26 +74,46 @@ impl InputRecorder {
         self.recording
     }
 
-    /// Notes one path the run read, or probed for and did not find.
+    /// Notes one file the run read, or probed for and did not find.
     pub fn record(&mut self, path: &Path) {
-        if self.recording {
-            self.paths.push(path.to_path_buf());
-        }
+        self.push(path, InputKind::File);
     }
 
-    /// Notes several paths at once.
+    /// Notes several files at once.
     pub fn record_all<'a>(&mut self, paths: impl IntoIterator<Item = &'a Path>) {
         for path in paths {
             self.record(path);
         }
     }
 
-    /// The recorded paths, sorted and deduplicated so two runs over the same tree agree.
+    /// Notes one directory the run depended on, whether or not it exists.
+    pub fn record_directory(&mut self, path: &Path) {
+        self.push(path, InputKind::Directory);
+    }
+
+    /// Notes several directories at once.
+    pub fn record_all_directories<'a>(&mut self, paths: impl IntoIterator<Item = &'a Path>) {
+        for path in paths {
+            self.record_directory(path);
+        }
+    }
+
+    fn push(&mut self, path: &Path, kind: InputKind) {
+        if self.recording {
+            self.inputs.push(WatchInput {
+                path: path.to_path_buf(),
+                kind,
+            });
+        }
+    }
+
+    /// The recorded inputs, sorted and deduplicated so two runs over the same tree agree.
     #[must_use]
-    pub fn into_paths(mut self) -> Vec<PathBuf> {
-        self.paths.sort();
-        self.paths.dedup();
-        self.paths
+    pub fn into_inputs(mut self) -> Vec<WatchInput> {
+        self.inputs.sort();
+        // By path alone: a path recorded as both keeps the directory, which sorts first.
+        self.inputs.dedup_by(|left, right| left.path == right.path);
+        self.inputs
     }
 }
 
@@ -80,7 +126,7 @@ impl InputRecorder {
 pub struct WatchPlan {
     /// Every path the run read or probed for, sorted and deduplicated. A path that does not exist
     /// is still listed whenever its appearance would change the result.
-    pub inputs: Vec<PathBuf>,
+    pub inputs: Vec<WatchInput>,
     /// The tree the run writes into, when the configuration resolved far enough to name one.
     ///
     /// Never an input. A watcher is told about it so it can tell its own writes apart from a
@@ -94,13 +140,29 @@ pub struct WatchPlan {
 mod tests {
     use super::*;
 
+    fn file(path: &str) -> WatchInput {
+        WatchInput {
+            path: PathBuf::from(path),
+            kind: InputKind::File,
+        }
+    }
+
+    fn directory(path: &str) -> WatchInput {
+        WatchInput {
+            path: PathBuf::from(path),
+            kind: InputKind::Directory,
+        }
+    }
+
     #[test]
     fn a_recorder_that_is_off_keeps_nothing() {
         let mut recorder = InputRecorder::off();
         assert!(!recorder.is_recording());
         recorder.record(Path::new("/a"));
         recorder.record_all([Path::new("/b"), Path::new("/c")]);
-        assert!(recorder.into_paths().is_empty());
+        recorder.record_directory(Path::new("/d"));
+        recorder.record_all_directories([Path::new("/e")]);
+        assert!(recorder.into_inputs().is_empty());
     }
 
     #[test]
@@ -109,10 +171,26 @@ mod tests {
         assert!(recorder.is_recording());
         recorder.record(Path::new("/b"));
         recorder.record_all([Path::new("/a"), Path::new("/b")]);
+        recorder.record_directory(Path::new("/c"));
+        recorder.record_all_directories([Path::new("/c")]);
         assert_eq!(
-            recorder.into_paths(),
-            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+            recorder.into_inputs(),
+            vec![file("/a"), file("/b"), directory("/c")]
         );
+    }
+
+    #[test]
+    fn a_path_recorded_as_both_keeps_the_directory() {
+        let mut recorder = InputRecorder::on();
+        // Whichever order they arrive in: the wider registration is the one that cannot be wrong.
+        recorder.record(Path::new("/root"));
+        recorder.record_directory(Path::new("/root"));
+        assert_eq!(recorder.into_inputs(), vec![directory("/root")]);
+
+        let mut recorder = InputRecorder::on();
+        recorder.record_directory(Path::new("/root"));
+        recorder.record(Path::new("/root"));
+        assert_eq!(recorder.into_inputs(), vec![directory("/root")]);
     }
 
     #[test]

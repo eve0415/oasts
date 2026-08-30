@@ -26,7 +26,28 @@ const CONFIG =
   "schemaVersion: 1\ninput:\n  path: ./spec/openapi.yaml\noutput: ./generated\nartifacts:\n  types: true\nwatch:\n  debounceMs: 10\n";
 
 function plan(inputs: readonly string[], outputRoot: string | null, debounceMs = 5): WatchPlan {
-  return { inputs, outputRoot, debounceMs };
+  return planWithRoots(inputs, [], outputRoot, debounceMs);
+}
+
+function planWithRoots(
+  files: readonly string[],
+  directories: readonly string[],
+  outputRoot: string | null,
+  debounceMs = 5,
+): WatchPlan {
+  return {
+    inputs: [
+      ...files.map((path) => ({ path, directory: false })),
+      ...directories.map((path) => ({ path, directory: true })),
+    ],
+    outputRoot,
+    debounceMs,
+  };
+}
+
+/** Whether the plan reports `path`, whatever kind it was recorded as. */
+function hasInput(plan: WatchPlan, path: string): boolean {
+  return plan.inputs.some((input) => input.path === path);
 }
 
 function cycle(exitCode: number, watchPlan: WatchPlan | null): Cycle {
@@ -77,6 +98,36 @@ test("a watch set replaces on success and only widens on failure", () => {
   watched.absorb(plan([join(root, "spec/b.yaml")], join(root, "out")), true);
   assert.deepEqual(watched.directories(), [join(root, "spec")]);
   assert.ok(!watched.triggers(join(root, "a.yaml")));
+});
+
+test("a session registers the workspace root itself", () => {
+  // The guard the input set cannot give: a directory input reported as the workspace root is in
+  // that set and trivially starts with itself, so a bound stated over inputs says nothing about
+  // what gets registered. Taking the parent of a directory input is what reached the directory the
+  // project sits in — `$HOME`, a monorepo root, the temp dir below.
+  const root = mkdtempSync(join(tmpdir(), "oasts-watch-"));
+  mkdirSync(join(root, "spec"));
+  const watched = new Watched();
+  watched.absorb(
+    planWithRoots([join(root, "oasts.yaml"), join(root, "spec/openapi.yaml")], [root], null),
+    true,
+  );
+
+  const directories = watched.directories();
+  assert.deepEqual(directories, [root, join(root, "spec")].toSorted());
+  assert.ok(
+    directories.every((path) => path === root || path.startsWith(root + sep)),
+    `nothing above the workspace root may be registered: ${directories.join(", ")}`,
+  );
+});
+
+test("a trust root that does not exist yet registers the nearest ancestor", () => {
+  // The case the recording exists for. The root cannot be watched because it is not there, so the
+  // walk falls back to the directory that will contain it — where its appearance is an event.
+  const root = mkdtempSync(join(tmpdir(), "oasts-watch-"));
+  const watched = new Watched();
+  watched.absorb(planWithRoots([], [join(root, "not-yet")], null), true);
+  assert.deepEqual(watched.directories(), [root]);
 });
 
 test("an input under a directory that does not exist yet watches the nearest one that does", () => {
@@ -405,18 +456,19 @@ test("one cycle compiles, reports its plan, and never throws", async () => {
   assert.equal(compiled.exitCode, 0, compiled.stderr);
   assert.match(compiled.stdout, /^generated \d+ files\n$/);
   assert.ok(compiled.plan !== null);
-  assert.ok(compiled.plan.inputs.includes(join(directory, "oasts.yaml")));
-  assert.ok(compiled.plan.inputs.includes(join(directory, "spec/openapi.yaml")));
+  assert.ok(hasInput(compiled.plan, join(directory, "oasts.yaml")));
+  assert.ok(hasInput(compiled.plan, join(directory, "spec/openapi.yaml")));
   // Discovery runs on this side, so the names it would also have accepted are added here.
-  assert.ok(compiled.plan.inputs.includes(join(directory, "oasts.json")));
-  assert.ok(compiled.plan.inputs.includes(join(directory, "oasts.config.ts")));
+  assert.ok(hasInput(compiled.plan, join(directory, "oasts.json")));
+  assert.ok(hasInput(compiled.plan, join(directory, "oasts.config.ts")));
   assert.equal(compiled.plan.outputRoot, join(directory, "generated"));
   assert.equal(compiled.plan.debounceMs, 10);
 
   // An explicit config path narrows what discovery would have considered to that one file.
   const explicit = await compileOnce(native, { config: "oasts.yaml", specs: [] }, directory);
   assert.equal(explicit.exitCode, 0, explicit.stderr);
-  assert.ok(!explicit.plan?.inputs.includes(join(directory, "oasts.json")));
+  assert.ok(explicit.plan !== null);
+  assert.ok(!hasInput(explicit.plan, join(directory, "oasts.json")));
 
   // A script config is re-evaluated on this side before the compiler sees anything.
   const scripted = mkdtempSync(join(tmpdir(), "oasts-watch-"));
@@ -452,7 +504,8 @@ test("a cycle that never reaches a config still says what to watch", async () =>
   const rejected = await compileOnce(native, { specs: [] }, invalid);
   assert.equal(rejected.exitCode, 2);
   assert.equal(rejected.plan?.outputRoot, null);
-  assert.ok(rejected.plan?.inputs.includes(join(invalid, "oasts.yaml")));
+  assert.ok(rejected.plan !== null);
+  assert.ok(hasInput(rejected.plan, join(invalid, "oasts.yaml")));
 });
 
 test("a cycle whose compiler reports nothing falls back to the discovery candidates", async () => {
@@ -468,7 +521,9 @@ test("a cycle whose compiler reports nothing falls back to the discovery candida
     watchDefaults: () => ({ debounceMs: 100 }),
   };
   const compiled = await compileOnce(stub, { specs: [] }, directory);
-  assert.deepEqual(compiled.plan?.inputs, [join(directory, "oasts.yaml")]);
+  assert.deepEqual(compiled.plan?.inputs, [
+    { path: join(directory, "oasts.yaml"), directory: false },
+  ]);
   assert.equal(compiled.plan?.debounceMs, 100);
   assert.equal(compiled.stdout, "");
 });

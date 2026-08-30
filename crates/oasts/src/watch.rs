@@ -13,7 +13,7 @@
 //! — and it costs nothing extra, because events are filtered against the paths the compile
 //! actually depended on before any of them counts as a change.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use oasts_core::diag::Diagnostic;
 use oasts_core::driver::{self, Command, ConfigSource, Outcome, Tracking, Unsupported};
-use oasts_core::inputs::WatchPlan;
+use oasts_core::inputs::{InputKind, WatchPlan};
 
 /// Failure to register a filesystem watch, which is the only way a session ends unasked.
 const CODE_WATCH_IO: &str = "OASTS1031";
@@ -182,7 +182,8 @@ impl Changes for FsChanges {
 /// What one compile left behind for the next wait.
 #[derive(Default)]
 struct Watched {
-    inputs: BTreeSet<PathBuf>,
+    /// Every path the compile depended on, and whether it names a directory.
+    inputs: BTreeMap<PathBuf, InputKind>,
     output_root: Option<PathBuf>,
     /// Whether the last compile succeeded. A failed one widens what counts as a change, because
     /// the file that would fix it may be one the failed run never got far enough to read.
@@ -191,12 +192,16 @@ struct Watched {
 
 impl Watched {
     fn absorb(&mut self, plan: &WatchPlan, settled: bool) {
+        let reported = plan
+            .inputs
+            .iter()
+            .map(|input| (input.path.clone(), input.kind));
         if settled {
-            self.inputs = plan.inputs.iter().cloned().collect();
+            self.inputs = reported.collect();
         } else {
             // Never narrow on failure: a run that stopped at a broken document read less than the
             // one before it, and dropping the rest would strand the session.
-            self.inputs.extend(plan.inputs.iter().cloned());
+            self.inputs.extend(reported);
         }
         if plan.output_root.is_some() {
             self.output_root.clone_from(&plan.output_root);
@@ -204,8 +209,16 @@ impl Watched {
         self.settled = settled;
     }
 
-    /// The directories to watch: one per input, or the nearest existing ancestor when the input's
-    /// own directory is not there yet.
+    /// The directories to watch: one per input, or the nearest existing ancestor when the one it
+    /// names is not there yet.
+    ///
+    /// A file is watched through the directory holding it, because that is what survives an
+    /// editor's save-and-rename and what makes a sibling appearing visible. A directory input —
+    /// the workspace root, a `local.allowPaths` entry — is watched as *itself*: taking its parent
+    /// would register the directory the project sits in, which is `$HOME` or a monorepo root, and
+    /// reach far outside what the compile read. Which one a path is comes from the compile that
+    /// recorded it, never from asking the filesystem, so a root that does not exist yet is still
+    /// treated as the directory the configuration means it to be.
     ///
     /// Nothing is dropped. An input whose whole chain is missing yields the last directory the
     /// walk reached, and registering that either works or fails loudly — which is the point, since
@@ -213,7 +226,10 @@ impl Watched {
     fn directories(&self) -> Vec<PathBuf> {
         self.inputs
             .iter()
-            .filter_map(|input| input.parent())
+            .filter_map(|(path, kind)| match kind {
+                InputKind::Directory => Some(path.as_path()),
+                InputKind::File => path.parent(),
+            })
             .map(nearest_existing_directory)
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -230,11 +246,11 @@ impl Watched {
             // Our own writes land here every successful cycle, so nothing under the output tree
             // counts unless the compile itself read it — which one path does, the `tsconfig.json`
             // the ancestor walk looks for beside the emitted files.
-            return self.inputs.contains(path);
+            return self.inputs.contains_key(path);
         }
         // Anything else while the last compile is broken: the fix may well be a file that run
         // never reached, and one wasted compile is cheaper than a session that cannot recover.
-        self.inputs.contains(path) || !self.settled
+        self.inputs.contains_key(path) || !self.settled
     }
 }
 
@@ -418,9 +434,32 @@ mod tests {
         }
     }
 
+    use oasts_core::inputs::WatchInput;
+
     fn plan(inputs: &[&str], output_root: Option<&str>, debounce_ms: u32) -> WatchPlan {
+        plan_with_roots(inputs, &[], output_root, debounce_ms)
+    }
+
+    fn plan_with_roots(
+        files: &[&str],
+        directories: &[&str],
+        output_root: Option<&str>,
+        debounce_ms: u32,
+    ) -> WatchPlan {
+        let input = |path: &&str, kind| WatchInput {
+            path: PathBuf::from(path),
+            kind,
+        };
         WatchPlan {
-            inputs: inputs.iter().map(PathBuf::from).collect(),
+            inputs: files
+                .iter()
+                .map(|path| input(path, InputKind::File))
+                .chain(
+                    directories
+                        .iter()
+                        .map(|path| input(path, InputKind::Directory)),
+                )
+                .collect(),
             output_root: output_root.map(PathBuf::from),
             settings: WatchConfig { debounce_ms },
         }
@@ -437,6 +476,58 @@ mod tests {
     }
 
     #[test]
+    fn a_session_registers_the_workspace_root_itself() {
+        // The guard the input set cannot give: a directory input reported as the workspace root is
+        // in that set and trivially starts with itself, so a bound stated over inputs says nothing
+        // about what gets registered. Taking the parent of a directory input is what reached the
+        // directory the project sits in — `$HOME`, a monorepo root, `/tmp`.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let spec = root.join("spec");
+        fs::create_dir_all(&spec).expect("spec dir");
+
+        let mut watched = Watched::default();
+        watched.absorb(
+            &plan_with_roots(
+                &[
+                    &root.join("oasts.yaml").to_string_lossy(),
+                    &spec.join("openapi.yaml").to_string_lossy(),
+                ],
+                &[&root.to_string_lossy()],
+                None,
+                5,
+            ),
+            true,
+        );
+
+        let directories = watched.directories();
+        assert!(directories.contains(&root), "{directories:#?}");
+        assert!(directories.contains(&spec), "{directories:#?}");
+        assert!(
+            directories.iter().all(|path| path.starts_with(&root)),
+            "nothing above the workspace root may be registered: {directories:#?}"
+        );
+    }
+
+    #[test]
+    fn a_trust_root_that_does_not_exist_yet_registers_the_nearest_ancestor() {
+        // The case the recording exists for. The root cannot be watched because it is not there,
+        // so the walk falls back to the directory that will contain it — where its appearance is
+        // an event — rather than dropping it and going blind to the thing being waited for.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let absent = root.join("not-yet");
+
+        let mut watched = Watched::default();
+        watched.absorb(
+            &plan_with_roots(&[], &[&absent.to_string_lossy()], None, 5),
+            true,
+        );
+
+        assert_eq!(watched.directories(), vec![root]);
+    }
+
+    #[test]
     fn a_watch_set_replaces_on_success_and_only_widens_on_failure() {
         let mut watched = Watched::default();
         watched.absorb(&plan(&["/w/a.yaml"], Some("/w/out"), 5), true);
@@ -444,13 +535,13 @@ mod tests {
 
         // A failed run read less; the set it read must not be all that stays watched.
         watched.absorb(&plan(&["/w/oasts.yaml"], None, 5), false);
-        assert!(watched.inputs.contains(Path::new("/w/a.yaml")));
-        assert!(watched.inputs.contains(Path::new("/w/oasts.yaml")));
+        assert!(watched.inputs.contains_key(Path::new("/w/a.yaml")));
+        assert!(watched.inputs.contains_key(Path::new("/w/oasts.yaml")));
         assert_eq!(watched.output_root, Some(PathBuf::from("/w/out")));
 
         // The next success is authoritative again, so a dropped reference stops being watched.
         watched.absorb(&plan(&["/w/oasts.yaml"], Some("/w/out"), 5), true);
-        assert!(!watched.inputs.contains(Path::new("/w/a.yaml")));
+        assert!(!watched.inputs.contains_key(Path::new("/w/a.yaml")));
     }
 
     #[test]
