@@ -54,6 +54,24 @@ pub struct WatchPlanJs {
     pub debounce_ms: u32,
 }
 
+/// The `watch` block's defaults, for a host that must act before it has read a configuration.
+#[napi(object)]
+pub struct WatchDefaultsJs {
+    /// How long the filesystem must stay quiet before a change is compiled.
+    pub debounce_ms: u32,
+}
+
+/// The `watch` settings a run falls back to when no configuration was read.
+///
+/// Asked for rather than copied: a second written-down default is one that can
+/// disagree with the one the compiler actually applies.
+#[napi]
+pub fn watch_defaults() -> WatchDefaultsJs {
+    WatchDefaultsJs {
+        debounce_ms: config::WatchConfig::default().debounce_ms,
+    }
+}
+
 /// Options for one compiler invocation.
 #[napi(object)]
 pub struct RunOptions {
