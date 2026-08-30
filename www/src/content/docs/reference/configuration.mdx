@@ -228,7 +228,7 @@ filters:
   orphans: false      # drop component schemas nothing reaches
 ```
 
-A pattern that matches nothing fails the build with an `OASTS0272` rather than quietly shrinking your client.
+A pattern that matches nothing fails the build with an `OASTS0262` rather than quietly shrinking your client.
 See [Generating a slice](/guides/filters).
 
 ## `naming`
@@ -417,7 +417,7 @@ compat:
 
 ## `specs`
 
-Several APIs in one configuration. Each key names a spec, and each spec takes the keys a single-spec configuration writes at the root:
+Several APIs in one configuration. Each key names a spec, and each spec takes the keys that configure one compile target — everything a single-spec configuration writes at the root except `$schema`, `schemaVersion` and `workspaceRoot`, which describe the file rather than a target:
 
 ```yaml title="oasts.yaml"
 schemaVersion: 1
@@ -432,12 +432,14 @@ specs:
     output: ./generated/users
 ```
 
-A spec name is one or more ASCII letters, digits, `-`, `_` or `.`; anything else is `OASTS0292`, as is a `specs` block with no specs in it.
+A spec name is one or more ASCII letters, digits, `-`, `_` or `.`; anything else is `OASTS0292`. A `specs` block with no specs in it is `OASTS0291`.
 `specs` and a root-level `input`/`output` are the two shapes a configuration can take, and it takes exactly one: any spec key written beside `specs` is `OASTS0062`.
 
 Every spec needs an output root of its own. Two roots that are equal, or one inside the other, are `OASTS0082`, reported before any spec is compiled. Roots that share a parent are fine.
 
 `oasts generate` builds every spec; `--spec <name>` builds one. See [Several APIs in one project](/guides/workspaces) for the whole surface.
+
+The browser playground compiles one document against one configuration, so it refuses a workspace with `OASTS0277`.
 
 ## `shared`
 

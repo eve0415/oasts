@@ -27,7 +27,7 @@ Those are stable across machines, which is what makes diagnostics comparable bet
 
 ## Severity
 
-- **`error`** — a refusal. The run is transactional: oasts builds and stages the whole output before committing it, and rolls back a write that fails part-way. A failed run leaves the previous generated tree and ownership manifest unchanged.
+- **`error`** — a refusal. Each output root is written transactionally: oasts builds and stages the whole output before committing it, and rolls back a write that fails part-way, so a failed run leaves that tree and its ownership manifest unchanged. A [workspace](/guides/workspaces) writes nothing at all if any spec fails to compile; if a *write* fails, the specs written before it stay written and the run says which they were.
 - **`warning`** — generation continues, and the warning names what was skipped or adjusted. A warning always means one operation, one component, or one artifact projection did *not* come out the way an unqualified reading of the document would suggest.
 
 Warnings matter more here than in most tools, because oasts never resolves an ambiguity silently.

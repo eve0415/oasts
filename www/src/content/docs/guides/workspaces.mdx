@@ -104,7 +104,7 @@ error[OASTS2101]: spec 'users': unsupported OpenAPI version '2.0'; expected 3.0.
 
 Two specs that read the same document each report its diagnostics under their own name, because each is a separate compile with its own settings.
 
-A configuration diagnostic points at where the key was actually written — `/shared/validation` when the block came from `shared`, `/specs/users/validation` when the spec declared it.
+A diagnostic about a configuration key points at where the key was actually written — `/shared/validation` when the block came from `shared`, `/specs/users/validation` when the spec declared it. A diagnostic about the document keeps its own pointer into the document.
 
 The write itself is per output root.
 If writing one spec's output fails — a permission the compiler does not have, a path taken by something else — the run stops there, exits `2`, and reports which specs were written before it.
@@ -115,8 +115,8 @@ If writing one spec's output fails — a permission the compiler does not have, 
 In a workspace, drift lines name each file from the workspace root, so two specs' identically named files stay apart:
 
 ```text
-edited: generated/users/types/operations/listusers.ts
 missing: generated/billing/types/headers.ts
+edited: generated/users/types/operations/listusers.ts
 ```
 
 ## Order
