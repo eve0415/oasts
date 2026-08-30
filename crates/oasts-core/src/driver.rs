@@ -193,7 +193,13 @@ fn compile(
     inputs.record(&config.config_path);
     // The entry document as the config names it. The graph reports canonical paths for every
     // document it opened, which is the same file by another name — but only once it opens.
-    inputs.record(&config.input);
+    //
+    // `input.url` leaves the literal URI text here, and a URI is not a path anything can watch:
+    // recorded, it would reach the watcher as a directory that cannot exist. `is_rooted` is the
+    // same question the loader asks before it decides to open a file rather than retrieve one.
+    if crate::source::is_rooted(&config.input) {
+        inputs.record(&config.input);
+    }
     if inputs.is_recording() {
         *output_root = Some(config.output.clone());
     }
@@ -490,6 +496,54 @@ validation:
             vec![&root.join("generated/tsconfig.json")]
         );
         assert!(plan.inputs.is_sorted());
+    }
+
+    #[test]
+    fn a_retrieved_entry_is_never_offered_to_a_watcher_as_a_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        fs::write(
+            root.join("oasts.yaml"),
+            r#"schemaVersion: 1
+input:
+  url: https://example.test/openapi.yaml
+output: ./generated
+artifacts:
+  types: true
+remote:
+  allowHosts: [example.test]
+"#,
+        )
+        .expect("config");
+
+        let outcome = run(
+            Command::Check,
+            ConfigSource::Path {
+                explicit: None,
+                cwd: &root,
+            },
+            FetcherHandle::None,
+            Tracking::Watch,
+        );
+
+        // Retrieval fails with no fetcher, and the plan still has to be usable: a watcher handed
+        // the URI text would resolve it to a directory that cannot exist and end the session.
+        assert_eq!(outcome.exit_code, 1, "{:#?}", outcome.diagnostics);
+        let plan = outcome
+            .watch_plan
+            .expect("a tracked run reports its inputs");
+        assert!(
+            plan.inputs.iter().all(|path| path.has_root()),
+            "{:#?}",
+            plan.inputs
+        );
+        assert!(has_no_uri(&plan.inputs), "{:#?}", plan.inputs);
+    }
+
+    fn has_no_uri(paths: &[PathBuf]) -> bool {
+        !paths
+            .iter()
+            .any(|path| path.to_string_lossy().contains("://"))
     }
 
     #[test]
