@@ -34,6 +34,8 @@ pub struct DiagnosticJs {
     pub severity: String,
     /// Human-readable message.
     pub message: String,
+    /// The workspace spec this diagnostic belongs to, when the run built one.
+    pub spec: Option<String>,
     /// Source file the diagnostic points at, when known.
     pub source_id: Option<String>,
     /// 1-based line, when known.
@@ -124,10 +126,11 @@ fn to_diagnostic_js(diagnostic: &Diagnostic) -> DiagnosticJs {
             Severity::Warning => "warning".to_owned(),
         },
         message: diagnostic.message.clone(),
-        source_id: diagnostic.source_id.clone(),
+        spec: diagnostic.spec.as_deref().map(str::to_owned),
+        source_id: diagnostic.source_id.as_deref().map(str::to_owned),
         line: diagnostic.line,
         col: diagnostic.col,
-        json_pointer: diagnostic.json_pointer.clone(),
+        json_pointer: diagnostic.json_pointer.as_deref().map(str::to_owned),
     }
 }
 

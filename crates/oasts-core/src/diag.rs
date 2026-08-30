@@ -91,10 +91,16 @@ pub struct Diagnostic {
     pub code: &'static str,
     pub severity: Severity,
     pub message: String,
-    pub source_id: Option<String>,
+    /// The workspace spec this diagnostic belongs to; `None` outside a workspace run.
+    ///
+    /// This and the two strings beside it are boxed rather than owned inline: a compile builds
+    /// diagnostics in bulk, and three `String` headers cost more per diagnostic than the pointers
+    /// that replace them.
+    pub spec: Option<Box<str>>,
+    pub source_id: Option<Box<str>>,
     pub line: Option<u32>,
     pub col: Option<u32>,
-    pub json_pointer: Option<String>,
+    pub json_pointer: Option<Box<str>>,
     pub category: Category,
     pub naming_override_suggestions: Option<Box<Vec<NamingOverrideSuggestion>>>,
 }
@@ -107,6 +113,7 @@ impl Diagnostic {
             code,
             severity: Severity::Error,
             message: message.into(),
+            spec: None,
             source_id: None,
             line: None,
             col: None,
@@ -123,6 +130,7 @@ impl Diagnostic {
             code,
             severity: Severity::Error,
             message: message.into(),
+            spec: None,
             source_id: None,
             line: None,
             col: None,
@@ -132,10 +140,17 @@ impl Diagnostic {
         }
     }
 
+    /// Attaches the workspace spec this diagnostic belongs to.
+    #[must_use]
+    pub fn with_spec(mut self, spec: impl Into<String>) -> Self {
+        self.spec = Some(spec.into().into_boxed_str());
+        self
+    }
+
     /// Attaches a source ID to this diagnostic.
     #[must_use]
     pub fn with_source(mut self, source_id: impl Into<String>) -> Self {
-        self.source_id = Some(source_id.into());
+        self.source_id = Some(source_id.into().into_boxed_str());
         self
     }
 
@@ -150,7 +165,7 @@ impl Diagnostic {
     /// Attaches a JSON Pointer to this diagnostic.
     #[must_use]
     pub fn with_json_pointer(mut self, pointer: impl Into<String>) -> Self {
-        self.json_pointer = Some(pointer.into());
+        self.json_pointer = Some(pointer.into().into_boxed_str());
         self
     }
 
@@ -167,8 +182,9 @@ impl Diagnostic {
 
 impl Ord for Diagnostic {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.source_id
-            .cmp(&other.source_id)
+        self.spec
+            .cmp(&other.spec)
+            .then_with(|| self.source_id.cmp(&other.source_id))
             .then_with(|| self.line.cmp(&other.line))
             .then_with(|| self.col.cmp(&other.col))
             .then_with(|| self.code.cmp(other.code))
@@ -246,7 +262,9 @@ impl DiagnosticSink {
 
 /// Renders diagnostics in the stable `severity[CODE]: message` stderr format.
 ///
-/// Diagnostics are sorted before rendering so output order is deterministic.
+/// Diagnostics are sorted before rendering so output order is deterministic. Spec attribution
+/// leads that ordering, so a workspace run reports one spec at a time whatever order the specs
+/// were compiled in.
 pub fn render(
     diagnostics: Vec<Diagnostic>,
     writer: &mut dyn std::io::Write,
@@ -274,8 +292,15 @@ pub fn render_to_string(mut diagnostics: Vec<Diagnostic>) -> String {
             Severity::Error => "error",
             Severity::Warning => "warning",
         };
+        // The spec name leads the message rather than sitting on the `-->` line, which only
+        // appears for a diagnostic that carries a source. A single-spec run attributes nothing,
+        // so its rendering is byte for byte what it was before workspaces existed.
+        let spec = match &diagnostic.spec {
+            Some(name) => format!("spec '{name}': "),
+            None => String::new(),
+        };
         rendered.push_str(&format!(
-            "{severity}[{}]: {}\n",
+            "{severity}[{}]: {spec}{}\n",
             diagnostic.code, diagnostic.message
         ));
         if let Some(source_id) = diagnostic.source_id {
@@ -324,7 +349,8 @@ mod tests {
             code,
             severity: Severity::Error,
             message: message.to_owned(),
-            source_id: source.map(str::to_owned),
+            spec: None,
+            source_id: source.map(Box::from),
             line,
             col,
             json_pointer: None,
