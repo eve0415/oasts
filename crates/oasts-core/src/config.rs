@@ -4775,6 +4775,28 @@ mod tests {
     }
 
     #[test]
+    fn discovery_candidates_answer_for_one_explicit_path_or_every_name() {
+        let directory = TestDirectory::new();
+        // With no `--config`, every name discovery would accept, whether or not it exists.
+        let discovered = discovery_candidates(directory.path(), None);
+        assert_eq!(discovered.len(), DISCOVERY_NAMES.len());
+        assert!(discovered.contains(&normalize_config_path(directory.path().join("oasts.yaml"))));
+
+        // A relative `--config` is anchored the way discovery anchors it.
+        assert_eq!(
+            discovery_candidates(directory.path(), Some(Path::new("oasts.yaml"))),
+            vec![normalize_config_path(directory.path().join("oasts.yaml"))]
+        );
+
+        // An absolute one is taken as it stands, working directory or not.
+        let absolute = directory.path().join("elsewhere.yaml");
+        assert_eq!(
+            discovery_candidates(Path::new("/somewhere/else"), Some(&absolute)),
+            vec![normalize_config_path(absolute)]
+        );
+    }
+
+    #[test]
     fn the_watch_block_defaults_and_bounds_its_debounce() {
         let resolved = load_json(&valid_json_value()).expect("config resolves");
         assert_eq!(resolved.watch, WatchConfig::default());
