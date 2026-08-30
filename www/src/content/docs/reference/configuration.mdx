@@ -417,7 +417,7 @@ compat:
 
 ## `specs`
 
-Several APIs in one configuration. Each key names a spec, and each spec takes the keys that configure one compile target — everything a single-spec configuration writes at the root except `$schema`, `schemaVersion` and `workspaceRoot`, which describe the file rather than a target:
+Several APIs in one configuration. Each key names a spec, and each spec takes the sixteen keys that configure one compile target: `input`, `output`, `namespace`, `filters`, `artifacts`, `types`, `zod`, `client`, `validation`, `naming`, `documentation`, `emit`, `local`, `limits`, `typescript`, `compat`. Anything else is rejected as an unknown key with `OASTS0031` — `$schema`, `schemaVersion` and `workspaceRoot` describe the file, and `remote`, `watch` and `ci` are [reserved](#reserved-keys), so all six stay at the root:
 
 ```yaml title="oasts.yaml"
 schemaVersion: 1
@@ -443,7 +443,7 @@ The browser playground compiles one document against one configuration, so it re
 
 ## `shared`
 
-The settings every spec inherits. It takes the same keys a spec does, except `input` and `output`, which name one spec's own document and output root and are `OASTS0293` here:
+The settings every spec inherits. It takes the same keys a spec does, minus `input` and `output`, which name one spec's own document and output root and are `OASTS0293` here:
 
 ```yaml title="oasts.yaml"
 schemaVersion: 1

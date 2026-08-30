@@ -106,8 +106,11 @@ Two specs that read the same document each report its diagnostics under their ow
 
 A diagnostic about a configuration key points at where the key was actually written — `/shared/validation` when the block came from `shared`, `/specs/users/validation` when the spec declared it. A diagnostic about the document keeps its own pointer into the document.
 
-The write itself is per output root.
-If writing one spec's output fails — a permission the compiler does not have, a path taken by something else — the run stops there, exits `2`, and reports which specs were written before it.
+Every selected output root is then checked before the first of them is written: its root is free, its ownership manifest is readable, and every file it is about to produce lands inside it.
+A refusal any of those could have predicted leaves the whole workspace untouched, whichever spec it belongs to.
+
+What is left is the write itself, which is per output root.
+If the I/O of one spec's commit fails — a disk that fills, a permission that changes under the run — that root rolls back on its own, the run stops there, exits `2`, and reports which specs were written before it.
 
 ## Checking committed output
 
