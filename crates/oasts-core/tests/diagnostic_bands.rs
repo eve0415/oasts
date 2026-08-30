@@ -118,6 +118,29 @@ fn a_code_both_hosts_emit_is_spelled_the_same_in_both() {
 }
 
 #[test]
+fn every_diagnostic_code_is_declared_once() {
+    let mut owners = BTreeMap::<String, BTreeSet<String>>::new();
+    for source in rust_sources() {
+        for (name, code) in source.constants {
+            owners.entry(code).or_default().insert(name);
+        }
+    }
+    for source in node_sources() {
+        for (name, code) in source.constants {
+            owners.entry(code).or_default().insert(name);
+        }
+    }
+    let shared = owners
+        .iter()
+        .filter(|(_, names)| names.len() > 1)
+        .collect::<BTreeMap<_, _>>();
+    assert!(
+        shared.is_empty(),
+        "one code cannot mean two things: {shared:?}"
+    );
+}
+
+#[test]
 fn diagnostic_category_has_only_its_two_constructor_writes() {
     let sources = rust_sources();
     for source in &sources {
