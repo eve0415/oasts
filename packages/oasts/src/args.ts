@@ -1,6 +1,6 @@
 /**
- * Argument parsing for the Node CLI, mirroring the Rust CLI's command
- * surface plus the Node-only `--spec`.
+ * Argument parsing for the Node CLI, mirroring the Rust CLI's command and
+ * option surface.
  */
 
 import { ok } from "node:assert";

@@ -89,7 +89,7 @@ Such a `$ref` is refused with `OASTS2021` unless `remote` authorizes and pins it
 
 `output` is the directory everything is written under.
 `namespace` defaults to `api` and names the aggregate client file (`client/api.ts` — see `aggregate` below) and the TanStack query-key namespace.
-It's also what will prefix the emitted module namespace once more than one API can be generated into one tree.
+Several APIs in one project get one output root each rather than one shared tree — see [`specs`](#specs).
 
 ## `artifacts`
 
