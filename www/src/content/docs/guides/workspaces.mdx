@@ -121,5 +121,5 @@ missing: generated/billing/types/headers.ts
 
 ## Order
 
-Specs build in alphabetical order by name, and diagnostics are grouped in that same order.
+Specs build in name order — lexicographic by byte, so an uppercase name sorts before a lowercase one — and diagnostics are grouped in that same order.
 The same workspace produces the same bytes and the same report every time, which is what makes `--check` a gate rather than a heuristic — see [Determinism](/concepts/determinism).

@@ -105,7 +105,7 @@ Builds only the named spec of a [workspace configuration](/guides/workspaces), a
 
 <PackageManagers pkg="oasts" type="exec" args="generate --spec billing --spec users" />
 
-Omitting it builds every spec the configuration declares, alphabetically by name.
+Omitting it builds every spec the configuration declares, in lexicographic name order.
 A name the configuration does not declare exits `2` with `OASTS0294`, which lists the names it does.
 Against a configuration that declares a single spec at the root, `--spec` exits `2` with `OASTS0295`.
 
