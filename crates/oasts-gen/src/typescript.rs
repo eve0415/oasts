@@ -21,7 +21,14 @@ pub fn emit_config_ts(schema: &Value) -> Result<String, String> {
         } else if is_any_of(&def) {
             emit_any_of_type(&mut out, &name, &def, defs)?;
         } else {
-            emit_interface(&mut out, &name, &def, defs, &[])?;
+            // A definition states its own required keys; `SpecConfig` names the two a spec cannot
+            // omit, so the emitted type demands them too.
+            let required = def
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|keys| keys.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                .unwrap_or_default();
+            emit_interface(&mut out, &name, &def, defs, &required)?;
         }
     }
 
