@@ -89,8 +89,18 @@ put "config-$label.json" "$PWD/schemas/config-v1.json" application/json "$immuta
 
 # Read-modify-write of the one mutable object. Releases are serialised by tag, so there is no
 # concurrent writer to race with. Listing is deliberately avoided: it is R2's costly class.
+#
+# An absent manifest is normal on the first publish and starts an empty one. Any other failure
+# must stop here: rebuilding from empty after a transport or credential fault would rewrite the
+# archive's index without the versions already in it, and hand `current` to this build.
 if ! pnpm -C www exec wrangler r2 object get "$bucket/versions.json" \
-  --file "$work/existing.json" "$scope" "${config[@]}" >/dev/null 2>&1; then
+  --file "$work/existing.json" "$scope" "${config[@]}" >/dev/null 2>"$work/get.err"; then
+  if ! grep -q 'The specified key does not exist' "$work/get.err"; then
+    echo "playground-wasm: could not read $bucket/versions.json, and it is not merely absent." \
+      "Refusing to rewrite the archive index from an empty one:" >&2
+    cat "$work/get.err" >&2
+    exit 1
+  fi
   echo '{"versions":[]}' >"$work/existing.json"
 fi
 
