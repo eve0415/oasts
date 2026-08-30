@@ -93,9 +93,16 @@ put "config-$label.json" "$PWD/schemas/config-v1.json" application/json "$immuta
 # An absent manifest is normal on the first publish and starts an empty one. Any other failure
 # must stop here: rebuilding from empty after a transport or credential fault would rewrite the
 # archive's index without the versions already in it, and hand `current` to this build.
+#
+# Absence is matched on R2's own vocabulary rather than one rendering of it, because the local
+# emulator and the REST API word it differently and only the emulator's wording can be tested
+# from a checkout. An unrecognised message therefore stops the publish rather than emptying the
+# index -- the safe direction, and the first publish into an empty bucket is the only thing it
+# can wrongly refuse.
 if ! pnpm -C www exec wrangler r2 object get "$bucket/versions.json" \
   --file "$work/existing.json" "$scope" "${config[@]}" >/dev/null 2>"$work/get.err"; then
-  if ! grep -q 'The specified key does not exist' "$work/get.err"; then
+  if ! grep -qE 'The specified (object )?key does not exist|NoSuchKey|code: 10007' \
+    "$work/get.err"; then
     echo "playground-wasm: could not read $bucket/versions.json, and it is not merely absent." \
       "Refusing to rewrite the archive index from an empty one:" >&2
     cat "$work/get.err" >&2
