@@ -86,6 +86,7 @@ Sharing a *parent* is fine and is what the examples above do: `./generated/billi
 Only the named specs are compiled and written; the rest of the workspace is left alone.
 A name that matches nothing exits `2` with `OASTS0295`, which lists the specs the workspace does declare.
 Used against a single-spec configuration, `--spec` exits `2` with `OASTS0296` — there is nothing to select.
+Under [`oasts watch`](/reference/cli#oasts-watch) both are reported and waited on rather than exited, the same as every other diagnostic a session meets.
 
 The configuration file is validated as a whole whatever you select, so a broken spec elsewhere in the file still fails the run.
 Documents are only read for the specs being built.

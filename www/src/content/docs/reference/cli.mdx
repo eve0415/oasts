@@ -113,6 +113,7 @@ A name the configuration does not declare exits `2` with `OASTS0295`, which list
 Against a configuration that declares a single spec at the root, `--spec` exits `2` with `OASTS0296`.
 
 `watch` takes it too: a session compiles the specs you selected and watches exactly what those compiles read.
+Both selection refusals reach a session as [diagnostics like any other](#diagnostics-do-not-end-the-session) — reported, and then waited on, because adding the spec to the configuration is an edit the session is there to notice.
 
 ## `--config`
 
