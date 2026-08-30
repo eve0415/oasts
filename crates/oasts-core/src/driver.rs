@@ -194,7 +194,9 @@ fn compile(
     // The entry document as the config names it. The graph reports canonical paths for every
     // document it opened, which is the same file by another name — but only once it opens.
     inputs.record(&config.input);
-    *output_root = Some(config.output.clone());
+    if inputs.is_recording() {
+        *output_root = Some(config.output.clone());
+    }
     *settings = config.watch;
     sink.extend(std::mem::take(&mut config.diagnostics));
 
@@ -219,6 +221,12 @@ fn compile(
 }
 
 fn record_config_candidates(source: ConfigSource<'_>, inputs: &mut InputRecorder) {
+    // Asked before the candidates are built, not after: discovery mints eight owned paths, and a
+    // run nobody is watching must not pay for them. `InputRecorder::record` discarding them is not
+    // the same as never allocating them.
+    if !inputs.is_recording() {
+        return;
+    }
     match source {
         ConfigSource::Path { explicit, cwd } => {
             inputs.record_all(

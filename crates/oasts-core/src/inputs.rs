@@ -4,7 +4,9 @@
 //! and everything its `extends` chain reaches, and the peer manifests the artifact warnings are
 //! judged against. Nothing in an ordinary run needs to know that set, so recording is opt-in — a
 //! host that never asks pays no allocation for it, which keeps the pinned allocation counters in
-//! `bench/allocs.yaml` answering for the same work they always did.
+//! `bench/allocs.yaml` answering for the same work they always did. That only holds if a caller
+//! asks [`InputRecorder::is_recording`] before *building* whatever it would record: handing
+//! `record` a path it goes on to discard has already paid for the path.
 //!
 //! Recorded paths are *candidates*, not survivors: a path that was probed for and found missing is
 //! recorded too, because its appearance would change the next run's answer. Config discovery and
