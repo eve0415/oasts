@@ -27,8 +27,8 @@ Commands:
 Options:
   --config <path>    Use an explicit configuration file
   --check            With generate: check committed output without writing
-  --spec <name>      Select a workspace spec (workspace configs are
-                     unsupported in this build; selecting one fails)
+  --spec <name>      Build only the named workspace spec; repeatable.
+                     Omit it to build every spec the configuration declares
 `;
 
 function parseRaw(argv: readonly string[]) {

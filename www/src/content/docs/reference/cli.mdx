@@ -18,13 +18,9 @@ Commands:
 Options:
   --config <path>    Use an explicit configuration file
   --check            With generate: check committed output without writing
-  --spec <name>      Select a workspace spec (workspace configs are
-                     unsupported in this build; selecting one fails)
+  --spec <name>      Build only the named workspace spec; repeatable.
+                     Omit it to build every spec the configuration declares
 ```
-
-`--spec` is parsed but not implemented in this build.
-It is in the help text because the argument surface is fixed; using it exits `2` with the `OASTS9002` that workspace configs refuse under.
-That is a [provisional](/concepts/diagnostics) code, so it retires when the capability lands.
 
 ## `oasts generate`
 
@@ -102,6 +98,18 @@ How long it waits is [`watch.debounceMs`](/reference/configuration#watch), 100 m
 
 Only events that would themselves have started a compile keep that wait open, so a bundler writing into your output tree cannot postpone a recompile it is not part of.
 And the wait is capped at a second regardless: churn can delay a compile, but nothing can cancel one.
+
+## `--spec`
+
+Builds only the named spec of a [workspace configuration](/guides/workspaces), and repeats:
+
+<PackageManagers pkg="oasts" type="exec" args="generate --spec billing --spec users" />
+
+Omitting it builds every spec the configuration declares, alphabetically by name.
+A name the configuration does not declare exits `2` with `OASTS0294`, which lists the names it does.
+Against a configuration that declares a single spec at the root, `--spec` exits `2` with `OASTS0295`.
+
+`watch` takes it too: a session compiles the specs you selected and watches exactly what those compiles read.
 
 ## `--config`
 

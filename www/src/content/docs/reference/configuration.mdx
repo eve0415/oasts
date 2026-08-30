@@ -38,6 +38,7 @@ validation:
 ```
 
 Three keys are required: `schemaVersion` (always `1`), `input`, and `output`.
+A configuration that describes several APIs replaces `input` and `output` with a [`specs`](#specs) block instead.
 
 Examples on this page pin their values rather than showing defaults — the example above asks for `baseUrl.source: server` and `unchecked: allow` because it is making those choices, not because they are what you get by leaving them out.
 The prose under each section below gives the real default.
@@ -227,7 +228,7 @@ filters:
   orphans: false      # drop component schemas nothing reaches
 ```
 
-A pattern that matches nothing fails the build with an `OASTS0262` rather than quietly shrinking your client.
+A pattern that matches nothing fails the build with an `OASTS0272` rather than quietly shrinking your client.
 See [Generating a slice](/guides/filters).
 
 ## `naming`
@@ -414,6 +415,52 @@ compat:
   Each key exists because a real server disagrees with the specification, and turning one on means the generated client stops matching what your document literally says.
 </Aside>
 
+## `specs`
+
+Several APIs in one configuration. Each key names a spec, and each spec takes the keys a single-spec configuration writes at the root:
+
+```yaml title="oasts.yaml"
+schemaVersion: 1
+specs:
+  billing:
+    input:
+      path: ./openapi.yaml
+    output: ./generated/billing
+  users:
+    input:
+      path: ./openapi.yaml
+    output: ./generated/users
+```
+
+A spec name is one or more ASCII letters, digits, `-`, `_` or `.`; anything else is `OASTS0291`, as is a `specs` block with no specs in it.
+`specs` and a root-level `input`/`output` are the two shapes a configuration can take, and it takes exactly one: any spec key written beside `specs` is `OASTS0062`.
+
+Every spec needs an output root of its own. Two roots that are equal, or one inside the other, are `OASTS0082`, reported before any spec is compiled. Roots that share a parent are fine.
+
+`oasts generate` builds every spec; `--spec <name>` builds one. See [Several APIs in one project](/guides/workspaces) for the whole surface.
+
+## `shared`
+
+The settings every spec inherits. It takes the same keys a spec does, except `input` and `output`, which name one spec's own document and output root and are `OASTS0292` here:
+
+```yaml title="oasts.yaml"
+schemaVersion: 1
+shared:
+  artifacts:
+    types: true
+    client: true
+  validation:
+    engine: off
+    unchecked: allow
+specs:
+  billing:
+    input:
+      path: ./openapi.yaml
+    output: ./generated/billing
+```
+
+Blocks are inherited whole. A block declared in both `shared` and a spec is `OASTS0293` — there is no key-by-key merge and no silent precedence. `shared` without `specs` is `OASTS0063`.
+
 ## `watch`
 
 What [`oasts watch`](/reference/cli#oasts-watch) does between recompiles:
@@ -437,13 +484,6 @@ Which paths a session follows is not a choice — it is whatever the compile rea
 
 ## Reserved keys
 
-`specs`, `shared` and `ci` are accepted by the schema but not implemented in this build.
-They are reserved so a config written today does not have to change shape when they land, and they refuse in the [provisional band](/concepts/diagnostics) rather than as ordinary config errors:
-
-| Key | Code |
-| --- | --- |
-| `specs`, `shared` | `OASTS9002` — workspace configs |
-| `ci` | `OASTS9003` — the surrounding capability |
-
-The CLI has the same arrangement for `--spec`, which refuses with the same `OASTS9002` the `specs` key does, and exits `2`.
+`ci` is accepted by the schema but not implemented in this build.
+It is reserved so a config written today does not have to change shape when the surrounding capability lands, and it refuses with `OASTS9003` in the [provisional band](/concepts/diagnostics) rather than as an ordinary config error, exiting `2`.
 See [CLI](/reference/cli).
