@@ -87,8 +87,9 @@ put() {
 put "oasts-$label.wasm" "$built" application/wasm "$immutable"
 put "config-$label.json" "$PWD/schemas/config-v1.json" application/json "$immutable"
 
-# Read-modify-write of the one mutable object. Releases are serialised by tag, so there is no
-# concurrent writer to race with. Listing is deliberately avoided: it is R2's costly class.
+# Read-modify-write of the one mutable object. The two workflows that publish remotely share a
+# concurrency group so they cannot interleave here, which is what makes read-modify-write safe.
+# Listing is deliberately avoided: it is R2's costly class.
 #
 # An absent manifest is normal on the first publish and starts an empty one. Any other failure
 # must stop here: rebuilding from empty after a transport or credential fault would rewrite the

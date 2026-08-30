@@ -459,6 +459,12 @@ jobs:
     needs:
       - plan
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    # Shared with CI's `main` publish, whose workflow-level group is a different one: both
+    # rewrite the archive's single index object, and `git push --follow-tags` starts them at
+    # once. Queue rather than cancel, so this still publishes after the `main` build.
+    concurrency:
+      group: playground-archive
+      cancel-in-progress: false
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read

@@ -326,6 +326,12 @@ jobs:
   playground:
     name: publish main to the compiler archive
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Shared with the release's publish job, whose workflow-level group is a different one:
+    # both rewrite the archive's single index object, and `git push --follow-tags` starts them
+    # at once. Queue rather than cancel, so the release still publishes after this one.
+    concurrency:
+      group: playground-archive
+      cancel-in-progress: false
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
