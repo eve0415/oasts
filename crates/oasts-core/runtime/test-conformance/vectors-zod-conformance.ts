@@ -27,9 +27,8 @@
 //     permitted divergence precisely because messages and issue shapes are engine-local.
 //   - Constraint semantics that Zod's native methods get differently from this compiler's frozen
 //     contract, which is why the emitter routes them through the shared runtime predicates instead:
-//     `maxLength` counts Unicode code points (an astral emoji is length 1, not 2, so Zod's native
-//     `.max()` over UTF-16 units is wrong here), and `multipleOf` is exact over IEEE-754 (0.3 is
-//     not a multiple of 0.1) rather than tolerance-based.
+//     `maxLength` counts Unicode code points, where Zod's native `.max()` counted UTF-16 units through 4.4 and counts code points from 4.5, so an astral emoji measures 1 here and measured 2 under half the supported peer range.
+//     `multipleOf` is exact over IEEE-754 (0.3 is not a multiple of 0.1) rather than tolerance-based, on every version in that range.
 
 export type ZodConformanceCase = {
   readonly id: string; // unique, stable, e.g. 'looseObject/unknown-key-preserved'
@@ -114,8 +113,9 @@ export const cases: readonly ZodConformanceCase[] = [
 
   // --- constraints the emitter must route through the shared runtime, not Zod's natives ---
   {
-    // Pet.emoji has maxLength 1. U+1F600 is one code point and two UTF-16 units; the contract
-    // counts code points, so this passes. Zod's native `.max(1)` would reject it.
+    // Pet.emoji has maxLength 1.
+    // U+1F600 is one code point and two UTF-16 units; the contract counts code points, so this passes.
+    // Zod's native `.max(1)` rejected it through 4.4 and accepts it from 4.5, which is why the verdict comes from the runtime predicate rather than from Zod.
     id: "maxLength/astral-code-point-accepted",
     matrixRow: "maxLength",
     schema: "petSchema",

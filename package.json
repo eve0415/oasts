@@ -15,7 +15,7 @@
     }
   },
   "devDependencies": {
-    "@napi-rs/cli": "3.8.1",
+    "@napi-rs/cli": "3.8.6",
     "typescript": "7.0.2"
   }
 }

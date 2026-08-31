@@ -5,16 +5,17 @@
 // Why this file exists at all, when zod ships `.min()`, `.multipleOf()`, `z.iso.datetime()` and
 // friends: the zod artifact and the generated-validators artifact must return identical verdicts on
 // the shared capability matrix, and zod's natives differ from this compiler's frozen
-// contract on several rows. Measured against zod 4.4.3:
+// contract on several rows. Two of the rows below hold across the whole supported range and two are
+// version dependent, so the list is measured at both ends of it — zod 4.4.3 and 4.5.4:
 //
-//   - `.min()`/`.max()` on strings count UTF-16 code units, so a single astral code point measures
-//     2. The contract counts code points.
-//   - `.multipleOf(0.1)` accepts 0.3 — it compares against a relative epsilon. The contract is exact
-//     over IEEE-754, so 0.3 is not a multiple of 0.1.
-//   - `.int()` rejects 1e300 and 2**53 as out of range. The contract's integer domain is any finite
-//     number for which `Number.isInteger` holds.
-//   - `z.iso.datetime()` rejects a numeric offset by default and rejects lowercase `t`/`z`, while
-//     accepting a value with no seconds. The contract is RFC 3339 with a required offset.
+//   - `.multipleOf(0.1)` accepts 0.3 on both, comparing against a relative epsilon. The contract is exact over IEEE-754, so 0.3 is not a multiple of 0.1.
+//   - `.int()` rejects 1e300 and 2**53 as out of range on both. The contract's integer domain is any finite number for which `Number.isInteger` holds.
+//   - `.min()`/`.max()` on strings count UTF-16 code units through 4.4, so a single astral code point measures 2, and count code points from 4.5. The contract counts code points, which 4.5 now agrees with.
+//   - `z.iso.datetime()` rejects a numeric offset by default and rejects lowercase `t`/`z` on both, and accepts a value with no seconds through 4.4 while rejecting one from 4.5. The contract is RFC 3339 with a required offset.
+//
+// The two version-dependent rows are why those predicates stay spelled out rather than deferring to
+// zod once it agrees: the peer range is `^4.4.0`, so a consumer may be on either side of the change
+// and the emitted verdict may not depend on which.
 //
 // So every semantically load-bearing predicate is spelled here, mirroring `validators-runtime.ts`
 // exactly. Zod's own checks are used only where the semantics coincide with the contract: the
