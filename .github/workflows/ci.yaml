@@ -84,6 +84,13 @@ jobs:
       - name: Build binding
         run: pnpm -C packages/oasts build:napi
 
+      # The release runs this same script against every binary it builds, on legs whose
+      # host can execute what they compiled. Running it here is what keeps it honest: a
+      # tag push would otherwise be the first time it ever ran, and the release path is
+      # the one part of this repository no pull request exercises.
+      - name: Load the binding
+        run: node scripts/binding-smoke.mjs
+
       - name: Upload binding
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -385,6 +392,29 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: zizmor .github/workflows/
+
+      # The release's publish job checks out nothing, so it cannot read devEngines and
+      # names its own pnpm and Node. That makes these the one pair in the release path
+      # written down twice, and the release is the only thing that runs them — the same
+      # shape as a stale list that a tag push is the first to discover.
+      - name: The release's pinned toolchain must match devEngines
+        run: |
+          set -euo pipefail
+          release=.github/workflows/release.yaml
+          pinned_node=$(grep -oE 'runtime: node@[^ ]+' "$release" | sed 's/.*@//' | sort -u)
+          pinned_pnpm=$(grep -B1 'runtime: node@' "$release" | grep -oE 'version: [^ ]+' | sed 's/version: //' | sort -u)
+          expected_node=$(jq -r .devEngines.runtime.version package.json)
+          expected_pnpm=$(jq -r .devEngines.packageManager.version package.json)
+          drift=0
+          if [ "$pinned_node" != "$expected_node" ]; then
+            echo "::error file=$release::pins node '${pinned_node:-<none found>}', devEngines declares $expected_node"
+            drift=1
+          fi
+          if [ "$pinned_pnpm" != "$expected_pnpm" ]; then
+            echo "::error file=$release::pins pnpm '${pinned_pnpm:-<none found>}', devEngines declares $expected_pnpm"
+            drift=1
+          fi
+          exit "$drift"
 
       # zizmor reads workflows for security, not validity: a job edge pointing at
       # a deleted job passes it and makes GitHub reject the whole file at startup.
