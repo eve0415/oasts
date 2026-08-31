@@ -69,8 +69,9 @@ jobs:
       # One version is written down in this repository: `[workspace.package] version` in
       # the root Cargo.toml. Every crate inherits it, the compiler stamps it into the
       # header of every file it generates, and `stage` stamps it into the nine npm
-      # manifests — whose own committed `version` is never read, so releasing is one
-      # edit and a tag rather than nine files that can disagree with each other.
+      # manifests — so releasing is one edit and a tag rather than nine files that can
+      # disagree with each other. The committed versions are read in exactly one place,
+      # by napi generating the loader, which is why `build` stamps this one too.
       - name: Read the version Cargo.toml declares
         id: version
         run: |
@@ -201,6 +202,21 @@ jobs:
           version: 0.16.0
           use-cache: false
 
+      # napi bakes this manifest's version into the loader it generates, as the version
+      # every `@oasts/binding-*` must carry, once per platform branch. The loader is
+      # generated here — before `stage` stamps the manifests — so the committed value
+      # would otherwise be what the published CLI demands of its bindings, and no one
+      # maintains it. Stamped from the same output `stage` stamps from, so the two
+      # cannot name different versions.
+      - name: Stamp the version the loader will expect
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          jq --arg version "$VERSION" '.version = $version' packages/oasts/package.json >stamped.json
+          mv stamped.json packages/oasts/package.json
+
       - name: Build the binding
         working-directory: packages/oasts
         run: >
@@ -272,6 +288,24 @@ jobs:
           name: loader
           path: packages/oasts/napi/
 
+      # The one artifact in this release whose version was fixed before this job ran.
+      # A loader demanding a version other than the one about to be published would
+      # refuse the bindings published beside it, so the two stamps are compared rather
+      # than trusted. Finding no version at all is a failure too: it means napi changed
+      # the shape this reads, and the comparison stopped comparing anything.
+      - name: The loader must expect the version being released
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected=$(grep -oE "bindingPackageVersion !== '[^']+'" packages/oasts/napi/index.js |
+            grep -oE "'[^']+'" | tr -d "'" | sort -u)
+          if [ "$expected" != "$VERSION" ]; then
+            echo "::error::the loader expects '${expected:-<no version found>}', releasing $VERSION"
+            exit 1
+          fi
+          echo "loader expects $expected"
+
       - name: Build the JavaScript package
         run: pnpm -C packages/oasts build
 
@@ -312,10 +346,10 @@ jobs:
         run: cp README.md LICENSE packages/oasts/
 
       # Whatever version the nine manifests carry in git is overwritten here, from
-      # Cargo.toml by way of `plan` — nothing reads the committed value, so it is left
-      # wherever it last landed rather than maintained. The dependency map is derived
-      # from the package directories rather than restated, so `napi.targets` stays the
-      # one place the platform list is written down.
+      # Cargo.toml by way of `plan` — the same source `build` stamped the loader from,
+      # so the CLI cannot demand a version its bindings do not carry. The dependency map
+      # is derived from the package directories rather than restated, so `napi.targets`
+      # stays the one place the platform list is written down.
       - name: Stamp the version and point the package at its bindings
         env:
           VERSION: ${{ needs.plan.outputs.version }}
