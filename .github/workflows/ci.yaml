@@ -84,6 +84,13 @@ jobs:
       - name: Build binding
         run: pnpm -C packages/oasts build:napi
 
+      # The release runs this same script against every binary it builds, on legs whose
+      # host can execute what they compiled. Running it here is what keeps it honest: a
+      # tag push would otherwise be the first time it ever ran, and the release path is
+      # the one part of this repository no pull request exercises.
+      - name: Load the binding
+        run: node scripts/binding-smoke.mjs
+
       - name: Upload binding
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

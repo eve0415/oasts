@@ -211,29 +211,14 @@ jobs:
       # Four of the eight targets cannot run on any runner GitHub offers, so this is
       # partial by construction — but a binary that does not load at all is the failure
       # worth catching before it is published, and nothing else in the release path
-      # ever executes what it built.
+      # ever executes what it built. The script reads what to expect from the
+      # declarations napi generated beside the binary, so this cannot go stale against
+      # the crate; CI runs the same script on every push, which is what keeps a release
+      # from being the first time it runs.
       - name: Load the binding
         if: matrix.smoke
         shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          binaries=(packages/oasts/napi/oasts.*.node)
-          if [ "${#binaries[@]}" -ne 1 ]; then
-            echo "::error::expected one built binding, found ${#binaries[@]}"
-            exit 1
-          fi
-          # require() reads a bare path as a package name, so the binary is resolved to
-          # an absolute one first — which is also what makes this work under Git Bash,
-          # where the shell's idea of the path and node's do not agree.
-          node -e '
-            const { resolve } = require("node:path");
-            const binding = require(resolve(process.argv[1]));
-            const expected = ["discoveryCandidates", "discoverConfig", "specRefusal", "run", "watchDefaults"];
-            const missing = expected.filter((name) => typeof binding[name] !== "function");
-            if (missing.length > 0) throw new Error("binding is missing " + missing.join(", "));
-            console.log("loaded, exports:", Object.keys(binding).join(", "));
-          ' "${binaries[0]}"
+        run: node scripts/binding-smoke.mjs
 
       - name: Upload the binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
