@@ -13,7 +13,7 @@
     "oxlint-tsgolint": "7.0.2001",
     "rollup": "4.63.1",
     "typescript": "7.0.2",
-    "vite": "8.2.2",
+    "vite": "8.2.4",
     "zod": "4.5.4"
   },
   "engines": {
