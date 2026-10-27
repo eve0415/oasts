@@ -30,7 +30,7 @@
 		"@fontsource-variable/jetbrains-mono": "5.3.0",
 		"@iconify-json/ph": "1.2.2",
 		"@lezer/highlight": "1.2.3",
-		"astro": "7.2.9",
+		"astro": "7.3.3",
 		"astro-og-canvas": "0.13.0",
 		"canvaskit-wasm": "0.42.0",
 		"clsx": "2.1.1",
